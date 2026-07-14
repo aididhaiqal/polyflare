@@ -3,8 +3,11 @@
 //! logged (see the redacting `Debug` on `RefreshedTokens`). See
 //! docs/reference/codex-lb-port-reference.md §OAuth.
 
+use std::time::Duration;
+
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use serde::Deserialize;
 use serde_json::Value;
 
 /// Refresh when the stored token is older than 8 days (`token_refresh_interval_days`).
@@ -129,6 +132,113 @@ pub fn decode_claims(id_token: &str) -> Result<Claims, OAuthError> {
         seat_type: pick("seat_type"),
         exp: v.get("exp").and_then(Value::as_i64),
     })
+}
+
+/// The OAuth client id used by the Codex CLI (a public, non-secret protocol constant).
+const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+/// The refresh scope.
+const SCOPE: &str = "openid profile email";
+
+/// Three OAuth tokens returned by a refresh. Never logged: `Debug` redacts every field.
+#[derive(Clone)]
+pub struct RefreshedTokens {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub id_token: String,
+}
+
+impl std::fmt::Debug for RefreshedTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshedTokens")
+            .field("access_token", &"***")
+            .field("refresh_token", &"***")
+            .field("id_token", &"***")
+            .finish()
+    }
+}
+
+/// A completed refresh: the new tokens plus the identity claims decoded from the new id_token.
+#[derive(Debug, Clone)]
+pub struct Refreshed {
+    pub tokens: RefreshedTokens,
+    pub claims: Claims,
+}
+
+/// The token-endpoint success body. `refresh_token` may be omitted (no rotation) → keep the old.
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    id_token: String,
+}
+
+/// OAuth client for the Codex backend. Holds a `reqwest::Client` + the auth base URL
+/// (default `https://auth.openai.com`; overridable so tests point at `MockOAuth`).
+pub struct OAuthClient {
+    http: reqwest::Client,
+    auth_base_url: String,
+}
+
+impl OAuthClient {
+    pub fn new(auth_base_url: impl Into<String>) -> Result<Self, OAuthError> {
+        let http = reqwest::Client::builder()
+            .build()
+            .map_err(|e| OAuthError::Transport(e.to_string()))?;
+        Ok(Self {
+            http,
+            auth_base_url: auth_base_url.into(),
+        })
+    }
+
+    /// Exchange a refresh token for fresh tokens via `POST {auth_base_url}/oauth/token`. On a
+    /// non-2xx response, the endpoint's `error` code (if present) is surfaced for classification.
+    pub async fn refresh(&self, refresh_token: &str) -> Result<Refreshed, OAuthError> {
+        let url = format!("{}/oauth/token", self.auth_base_url.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "grant_type": "refresh_token",
+            "client_id": CLIENT_ID,
+            "refresh_token": refresh_token,
+            "scope": SCOPE,
+        });
+        let resp = self
+            .http
+            .post(url)
+            .json(&body)
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await
+            .map_err(|e| OAuthError::Transport(e.to_string()))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let code = resp
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string));
+            return Err(OAuthError::Endpoint {
+                status: status.as_u16(),
+                code,
+            });
+        }
+
+        let token: TokenResponse = resp
+            .json()
+            .await
+            .map_err(|e| OAuthError::Transport(e.to_string()))?;
+        let claims = decode_claims(&token.id_token)?;
+        Ok(Refreshed {
+            tokens: RefreshedTokens {
+                access_token: token.access_token,
+                // OpenAI may omit a rotated refresh token → keep the caller's existing one.
+                refresh_token: token
+                    .refresh_token
+                    .unwrap_or_else(|| refresh_token.to_string()),
+                id_token: token.id_token,
+            },
+            claims,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -271,5 +381,25 @@ mod tests {
                 "non-permanent code {code:?} must be Transient"
             );
         }
+    }
+
+    #[test]
+    fn refreshed_tokens_debug_redacts_secrets() {
+        let t = RefreshedTokens {
+            access_token: "secret-access-xyz".to_string(),
+            refresh_token: "secret-refresh-xyz".to_string(),
+            id_token: "secret-id-xyz".to_string(),
+        };
+        let s = format!("{t:?}");
+        assert!(
+            !s.contains("secret-access-xyz"),
+            "must not leak access token"
+        );
+        assert!(
+            !s.contains("secret-refresh-xyz"),
+            "must not leak refresh token"
+        );
+        assert!(!s.contains("secret-id-xyz"), "must not leak id token");
+        assert!(s.contains("***"), "must redact with ***");
     }
 }
