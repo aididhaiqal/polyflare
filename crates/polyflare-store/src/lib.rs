@@ -2,8 +2,10 @@
 //! Fernet), the account repository, and the zero-re-auth codex-lb importer. Token plaintext
 //! is never logged.
 
+pub mod crypto;
 pub mod store;
 
+pub use crypto::TokenCipher;
 pub use store::Store;
 
 /// Errors surfaced by the store, crypto, and importer.
