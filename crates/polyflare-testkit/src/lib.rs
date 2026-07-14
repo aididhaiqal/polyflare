@@ -108,6 +108,7 @@ impl MockUpstream {
     pub async fn spawn(self) -> String {
         let app = Router::new()
             .route("/responses", post(handler))
+            .route("/v1/messages", post(handler))
             // Match the raised polyflare-server body limit so large-body e2e tests
             // don't 413 against the mock upstream itself. Test infra only.
             .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
