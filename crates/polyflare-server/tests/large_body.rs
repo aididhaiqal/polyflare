@@ -46,7 +46,11 @@ async fn large_request_body_is_not_rejected_with_413() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), 200, "large body must not be rejected with 413");
+    assert_eq!(
+        resp.status(),
+        200,
+        "large body must not be rejected with 413"
+    );
 
     let last_body = handle.last_body().unwrap();
     assert_eq!(last_body["model"], "gpt-5.6-sol");
