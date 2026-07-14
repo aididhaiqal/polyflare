@@ -64,14 +64,19 @@ pub fn should_refresh(last_refresh: i64, now: i64) -> bool {
     now - last_refresh > TOKEN_REFRESH_INTERVAL_DAYS * 86_400
 }
 
-/// Classify a token-endpoint error code into a status transition (port reference §permanent
-/// failure codes). Account-terminal codes ⇒ Deactivated; token/session codes ⇒ ReauthRequired;
-/// anything else ⇒ Transient.
+/// Classify a token-endpoint error code into a status transition, verified against the codex-lb
+/// source of truth `app/core/balancer/logic.py`: `PERMANENT_FAILURE_CODES` (12) is the full
+/// permanent set, and `account_status_for_permanent_failure` returns `REAUTH_REQUIRED` when the
+/// code is in `REAUTH_REQUIRED_FAILURE_CODES` (the 9 token/session codes below) else `DEACTIVATED`
+/// — that `else` reaches only the 3 `account_*` account-terminal codes, since the function is only
+/// called for codes already in the permanent set. Any code outside the permanent set ⇒ Transient.
 pub fn classify_failure(code: &str) -> FailureClass {
     match code {
+        // account-terminal (in PERMANENT_FAILURE_CODES, NOT in REAUTH_REQUIRED_FAILURE_CODES)
         "account_deactivated" | "account_suspended" | "account_deleted" => {
             FailureClass::Deactivated
         }
+        // REAUTH_REQUIRED_FAILURE_CODES (codex-lb logic.py:36-48)
         "refresh_token_expired"
         | "refresh_token_reused"
         | "refresh_token_invalidated"
@@ -173,6 +178,19 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_user_id_top_level_wins_over_sub_when_no_auth_claim() {
+        // Middle precedence tier: no nested auth claim, but a top-level `chatgpt_user_id`
+        // that differs from `sub` ⇒ the top-level value wins over `sub`.
+        let claims = decode_claims(&make_jwt(&serde_json::json!({
+            "sub": "sub-fallback",
+            "chatgpt_user_id": "top-level-user"
+        })))
+        .unwrap();
+        assert_eq!(claims.chatgpt_user_id.as_deref(), Some("top-level-user"));
+        assert_eq!(claims.sub.as_deref(), Some("sub-fallback"));
+    }
+
+    #[test]
     fn malformed_jwt_missing_payload_errors() {
         assert!(matches!(
             decode_claims("only-one-segment"),
@@ -208,5 +226,50 @@ mod tests {
         );
         assert_eq!(FailureClass::Deactivated.status(), Some("deactivated"));
         assert_eq!(FailureClass::Transient.status(), None);
+    }
+
+    /// Pin EVERY permanent-failure code to the status codex-lb assigns it, so the split can't
+    /// silently drift. Table verified against codex-lb `app/core/balancer/logic.py`:
+    /// `PERMANENT_FAILURE_CODES` (the 12 keys) + `REAUTH_REQUIRED_FAILURE_CODES` (the 9-code
+    /// frozenset) driving `account_status_for_permanent_failure`.
+    #[test]
+    fn classify_failure_pins_every_permanent_code() {
+        let cases: &[(&str, FailureClass)] = &[
+            // REAUTH_REQUIRED_FAILURE_CODES (9)
+            ("refresh_token_expired", FailureClass::ReauthRequired),
+            ("refresh_token_reused", FailureClass::ReauthRequired),
+            ("refresh_token_invalidated", FailureClass::ReauthRequired),
+            ("invalid_grant", FailureClass::ReauthRequired),
+            ("token_invalidated", FailureClass::ReauthRequired),
+            ("token_expired", FailureClass::ReauthRequired),
+            ("app_session_terminated", FailureClass::ReauthRequired),
+            ("account_session_expired", FailureClass::ReauthRequired),
+            ("account_auth_invalidated", FailureClass::ReauthRequired),
+            // PERMANENT but NOT reauth ⇒ account-terminal ⇒ Deactivated (3)
+            ("account_deactivated", FailureClass::Deactivated),
+            ("account_suspended", FailureClass::Deactivated),
+            ("account_deleted", FailureClass::Deactivated),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(
+                classify_failure(code),
+                *expected,
+                "permanent code {code} must map to {expected:?}"
+            );
+        }
+        // Anything outside PERMANENT_FAILURE_CODES is transient (not a permanent failure).
+        for code in [
+            "",
+            "temporarily_unavailable",
+            "server_error",
+            "rate_limited",
+            "unknown",
+        ] {
+            assert_eq!(
+                classify_failure(code),
+                FailureClass::Transient,
+                "non-permanent code {code:?} must be Transient"
+            );
+        }
     }
 }
