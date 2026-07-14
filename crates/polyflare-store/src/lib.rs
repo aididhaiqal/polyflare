@@ -7,7 +7,7 @@ pub mod crypto;
 pub mod import;
 pub mod store;
 
-pub use account::{Account, AccountRepo, EncryptedTokens, PlainTokens};
+pub use account::{Account, AccountRepo, EncryptedTokens, PlainTokens, UsageSnapshot, WindowUsage};
 pub use crypto::TokenCipher;
 pub use import::{import_from_codex_lb, ImportSummary};
 pub use store::Store;
