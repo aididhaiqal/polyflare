@@ -11,6 +11,7 @@ use polyflare_core::{Continuity, Executor, Selector};
 use polyflare_store::{Store, TokenCipher};
 
 use crate::ingress::responses_handler;
+use crate::refresh_locks::RefreshLocks;
 
 /// Raised request-body limit: axum's `Json` extractor default (2 MB) 413s real
 /// OpenAI-Responses requests. 100 MB is generous for real Codex turns while bounded.
@@ -27,6 +28,10 @@ pub struct AppState {
     pub cipher: TokenCipher,
     pub oauth: OAuthClient,
     pub upstream_base_url: String,
+    /// Per-account OAuth refresh singleflight coordination (F2): serializes concurrent
+    /// refresh-if-stale attempts for the SAME account so only one call reaches the OAuth
+    /// endpoint with a given refresh token.
+    pub refresh_locks: RefreshLocks,
 }
 
 pub fn build_app(state: Arc<AppState>) -> Router {

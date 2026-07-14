@@ -29,6 +29,7 @@ async fn no_eligible_account_returns_503() {
         cipher,
         oauth: OAuthClient::new("http://127.0.0.1:9").unwrap(),
         upstream_base_url: "http://127.0.0.1:9".to_string(),
+        refresh_locks: Default::default(),
     });
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
