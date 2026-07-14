@@ -11,8 +11,9 @@ Design: [docs/POLYFLARE-DESIGN.md](docs/POLYFLARE-DESIGN.md) · Decisions & rati
 - [x] **M1 — Skeleton + Codex identity pass-through** — *merged*
   - Cargo workspace (6 crates); provider-neutral core (`Format` + identity translator registry + the five trait seams); Codex SSE pass-through executor (non-buffering); axum ingress relaying as `text/event-stream`; scriptable mock-upstream testkit; binary + full e2e. 11 tests; CI (fmt/clippy/build/test). Whole-branch-review fixes applied (100 MiB body limit; `Account` Debug token redaction).
 - [ ] **M2 — Store + accounts + selector + OAuth import**
-  - SQLite (`sqlx`); XChaCha20-Poly1305 at-rest crypto; zero-re-auth importer from codex-lb; one default `Selector` (relative-availability + burn/preserve) with the **continuity-ownership-first** ordering; per-API-key capability config groundwork (TA6 / TA6(a)).
-  - **Kickoff gate — M2-GATE1:** reshape the `Selector` / `Continuity` / `Coordinator` trait seams (async + `Result` + richer inputs) *before* building on them. See DESIGN-DECISIONS → M2-GATE1.
+  - **M2a ✅ (merged):** SQLite (`sqlx`) store + accounts/usage schema; XChaCha20-Poly1305 at-rest token crypto (redacting Debug); account repository; transactional + idempotent zero-re-auth codex-lb importer (Fernet→XChaCha, parses real DATETIME-text timestamps); `polyflare serve | accounts import` CLI.
+  - **M2b (next):** OAuth refresh (decode-only JWT claims + `POST /oauth/token` + 8-day `should_refresh`, also refreshes identity fields) + the ported default `capacity_weighted` `Selector` (pure scoring core + parity tests; continuity-ownership-first + TA6 pre-filter) + minimal usage-snapshot assembly + pool wiring into ingress.
+  - **M2b kickoff gate — M2-GATE1:** reshape `Selector` to `pick(&[AccountSnapshot], &SelectionCtx) -> Option<AccountId>` (rich input, owned return, stays sync) before building on it; `Continuity`/`Coordinator` reshaped at their own milestones. See DESIGN-DECISIONS → M2-GATE1.
 - [ ] **M3 — Continuity engine (the wedge fix)**
   - Explicit per-conversation state machine + watchdog + reasoning-replay cache; **wedge-regression e2e**; session capability sticky-flag; stream idle/read-timeout watchdog.
 - [ ] **M4 — Anthropic executor + `Anthropic → Codex` translator**
@@ -27,4 +28,4 @@ Design: [docs/POLYFLARE-DESIGN.md](docs/POLYFLARE-DESIGN.md) · Decisions & rati
 - **Additive later, when data justifies:** inverse `Codex → Anthropic` translator; Gemini / Chat-Completions formats; the other 7 selector strategies (force-finish, priority-drain, …); distributed `Coordinator` (single-binary is the target; the trait seam keeps it additive).
 
 ## Progress
-- **M1: complete** (merged to `main`). Next: **M2**, opening with the M2-GATE1 seam reshape.
+- **M1: complete** (merged). **M2a: complete** (merged — store/crypto/accounts/import/CLI). Next: **M2b** (OAuth refresh + `capacity_weighted` selector + pool wiring), opening with the M2-GATE1 `Selector` reshape.
