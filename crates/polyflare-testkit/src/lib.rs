@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Json, State};
+use axum::extract::{DefaultBodyLimit, Json, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::post;
 use axum::Router;
@@ -36,6 +36,9 @@ impl MockUpstream {
     pub async fn spawn(self) -> String {
         let app = Router::new()
             .route("/responses", post(handler))
+            // Match the raised polyflare-server body limit so large-body e2e tests
+            // don't 413 against the mock upstream itself. Test infra only.
+            .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
             .with_state(self);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
