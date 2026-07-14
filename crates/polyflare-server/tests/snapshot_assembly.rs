@@ -163,3 +163,35 @@ async fn assemble_snapshots_populates_provider_and_filter_narrows_by_it() {
     assert_eq!(anthropic_only.len(), 1);
     assert_eq!(anthropic_only[0].id.as_str(), "anthropic-1");
 }
+
+#[tokio::test]
+async fn assemble_snapshots_excludes_accounts_with_an_unknown_provider() {
+    // A provider value outside the known vocabulary can only exist via data written outside the app
+    // (`AccountRepo` always writes a `Provider::Display` string). Its backend is unknown, so it must
+    // be excluded from selection entirely — not surfaced as a routable (Codex) candidate that would
+    // only hard-fail at `resolve_core_account`. Guards the fail-closed reconciliation.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[9u8; 32]).unwrap();
+
+    store
+        .accounts()
+        .insert(&account("codex-1"), &tokens(), &cipher)
+        .await
+        .unwrap();
+    let mut bogus = account("mystery-1");
+    bogus.provider = "gemini".to_string(); // unknown to Provider::from_str
+    store
+        .accounts()
+        .insert(&bogus, &tokens(), &cipher)
+        .await
+        .unwrap();
+
+    let snaps = assemble_snapshots(&store).await.unwrap();
+    let ids: Vec<&str> = snaps.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["codex-1"],
+        "the unknown-provider account must be excluded from selection"
+    );
+}
