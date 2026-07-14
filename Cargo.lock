@@ -1387,6 +1387,7 @@ dependencies = [
  "polyflare-core",
  "polyflare-testkit",
  "reqwest",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",
