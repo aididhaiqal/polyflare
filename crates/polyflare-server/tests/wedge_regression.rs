@@ -160,12 +160,16 @@ async fn client_disconnect_mid_race_is_clean() {
     let _ = res;
 
     let ok_client = reqwest::Client::new();
-    let resp = ok_client
-        .post(format!("{pf}/responses"))
-        .json(&serde_json::json!({"model":"m","input":"fresh"}))
-        .send()
-        .await
-        .unwrap();
+    let resp = tokio::time::timeout(Duration::from_secs(5), async {
+        ok_client
+            .post(format!("{pf}/responses"))
+            .json(&serde_json::json!({"model":"m","input":"fresh"}))
+            .send()
+            .await
+            .unwrap()
+    })
+    .await
+    .expect("server serves next request within bound (no wedge on follow-up)");
     assert_eq!(
         resp.status(),
         200,
