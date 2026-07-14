@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/polyflare-core",
+    "crates/polyflare-codex",
+    "crates/polyflare-anthropic",
+    "crates/polyflare-store",
+    "crates/polyflare-testkit",
+    "crates/polyflare-server",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-core = "0.3"
+futures-util = "0.3"
+bytes = "1"
+async-trait = "0.1"
+thiserror = "2"
