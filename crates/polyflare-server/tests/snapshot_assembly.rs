@@ -68,8 +68,11 @@ async fn assembles_snapshot_with_latest_usage_per_window() {
         .unwrap();
 
     insert_usage(&store, "acct-1", "primary", 10.0, 1000, 2000).await;
-    insert_usage(&store, "acct-1", "secondary", 30.0, 1000, 3000).await;
-    insert_usage(&store, "acct-1", "secondary", 55.0, 2000, 3500).await; // newer wins
+    // Older secondary row has a HIGHER used_percent than the newer one: this proves the query
+    // selects by recency (ORDER BY recorded_at DESC LIMIT 1), NOT by magnitude (a MAX bug would
+    // pick 80.0 here). The newer, lower value (55.0) must win.
+    insert_usage(&store, "acct-1", "secondary", 80.0, 1000, 3000).await; // older, higher
+    insert_usage(&store, "acct-1", "secondary", 55.0, 2000, 3500).await; // newer, lower — wins
 
     let snaps = assemble_snapshots(&store).await.unwrap();
     assert_eq!(snaps.len(), 1);
@@ -77,7 +80,7 @@ async fn assembles_snapshot_with_latest_usage_per_window() {
     assert_eq!(s.id.as_str(), "acct-1");
     assert_eq!(s.status, "active");
     assert_eq!(s.used_percent, 10.0);
-    assert_eq!(s.secondary_used_percent, 55.0); // newest secondary row
+    assert_eq!(s.secondary_used_percent, 55.0); // newest secondary row (recency, not max)
     assert_eq!(s.reset_at, Some(1_700_100_000)); // durable account column
     assert_eq!(s.plan_type, "pro");
     assert!(s.security_work_authorized);
@@ -102,4 +105,26 @@ async fn account_without_usage_gets_zeroed_windows() {
     assert_eq!(snaps.len(), 1);
     assert_eq!(snaps[0].used_percent, 0.0);
     assert_eq!(snaps[0].secondary_used_percent, 0.0);
+}
+
+#[tokio::test]
+async fn assembles_candidates_in_stable_id_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
+    // Insert OUT of alphabetical order; the assembler must still return them id-sorted. The
+    // selector's seed-reproducibility ("same input order + same seed ⇒ same pick") depends on a
+    // deterministic candidate order, so this guards against a future regression in `list()` /
+    // the assembler that would reorder or shuffle the returned candidates.
+    for id in ["c", "a", "b"] {
+        store
+            .accounts()
+            .insert(&account(id), &tokens(), &cipher)
+            .await
+            .unwrap();
+    }
+
+    let snaps = assemble_snapshots(&store).await.unwrap();
+    let ids: Vec<&str> = snaps.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["a", "b", "c"]);
 }
