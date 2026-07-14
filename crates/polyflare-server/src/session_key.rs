@@ -25,17 +25,23 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Multi-item input array, or a string ≥ 4096 chars, or a single item serializing ≥ 4096 chars.
-/// Faithful to codex-lb `helpers.py:849-861` (VERIFY against `../codex-lb` at implementation).
+/// Multi-item input array, or a string ≥ 4096 code points, or a single item serializing to ≥ 4096
+/// code points. Mirrors codex-lb `helpers.py:849-861`, whose Python `len(string)` measures Unicode
+/// code points — so we count `chars().count()`, NOT UTF-8 bytes (`str::len`), for boundary fidelity.
+///
+/// Fidelity note: codex-lb's single-item branch measures `json.dumps(..., ensure_ascii=True)`, which
+/// escapes non-ASCII to `\uXXXX` (~6 chars/char). PolyFlare serializes with raw (non-escaped) UTF-8
+/// and counts code points, so it intentionally UNDER-counts heavily-non-ASCII single items — an
+/// accepted approximation for this heuristic on the ASCII-dominant path.
 fn is_full_resend(input: Option<&Value>) -> bool {
     match input {
-        Some(Value::String(s)) => s.len() >= 4096,
+        Some(Value::String(s)) => s.chars().count() >= 4096,
         Some(Value::Array(items)) => {
             if items.len() >= 2 {
                 true
             } else if items.len() == 1 {
                 serde_json::to_string(&items[0])
-                    .map(|s| s.len() >= 4096)
+                    .map(|s| s.chars().count() >= 4096)
                     .unwrap_or(false)
             } else {
                 false
@@ -158,11 +164,29 @@ mod tests {
     }
 
     #[test]
+    fn multibyte_string_uses_code_point_count_not_bytes() {
+        // 4095 two-byte chars: 4095 code points (< 4096 ⇒ NOT a full resend) but 8190 UTF-8 bytes
+        // (≥ 4096 ⇒ would be a full resend if we counted bytes). Asserting NOT full-resend proves
+        // the check counts code points, matching codex-lb's `len(string)`.
+        let s = "é".repeat(4095);
+        assert_eq!(s.chars().count(), 4095);
+        assert!(s.len() >= 4096);
+        let ctx = derive_request_ctx(&hdr(&[]), &serde_json::json!({ "input": s }));
+        assert!(!ctx.is_full_resend);
+    }
+
+    #[test]
     fn previous_response_id_is_extracted() {
         let ctx = derive_request_ctx(
             &hdr(&[]),
             &serde_json::json!({"previous_response_id": "resp_9", "input": "hi"}),
         );
         assert_eq!(ctx.client_previous_response_id.as_deref(), Some("resp_9"));
+    }
+
+    #[test]
+    fn absent_previous_response_id_yields_none() {
+        let ctx = derive_request_ctx(&hdr(&[]), &serde_json::json!({"input": "hi"}));
+        assert_eq!(ctx.client_previous_response_id, None);
     }
 }
