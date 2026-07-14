@@ -11,8 +11,8 @@ use axum::response::{IntoResponse, Response};
 
 use polyflare_codex::oauth::{classify_failure, should_refresh, OAuthError};
 use polyflare_core::{
-    Account, AccountId, ContinuityDirective, Prepared, PreparedRequest, Provider, RecoveryPlan,
-    RequestCtx, ResponseStream, SelectionCtx,
+    Account, AccountId, Continuity, ContinuityDirective, NoopContinuity, Prepared, PreparedRequest,
+    Provider, RecoveryPlan, RequestCtx, ResponseStream, SelectionCtx,
 };
 use polyflare_store::PlainTokens;
 
@@ -259,5 +259,65 @@ pub async fn responses_handler(
             }
         }
         RouteDecision::NoEligibleAccount => no_eligible(),
+    }
+}
+
+/// The native Anthropic-Messages ingress path: `POST /v1/messages`. Continuity is a no-op here
+/// (SPEC-M4 §3.7: the Anthropic backend has no `previous_response_id`-style anchor), so every
+/// request is `Disarmed` and `execute_with_watchdog`'s Disarmed branch just relays — the wedge
+/// machinery never arms.
+pub async fn messages_handler(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let now = unix_now();
+    let req = PreparedRequest { body, model };
+    let ctx = RequestCtx::default();
+
+    let prepared = match NoopContinuity.prepare(req, &ctx).await {
+        Ok(p) => p,
+        Err(_) => return internal_error(),
+    };
+
+    let snapshots = match assemble_snapshots(&state.store).await {
+        Ok(s) => s,
+        Err(_) => return internal_error(),
+    };
+    // M4a has no cross-format translator (that's M4b): `/v1/messages` may only ever pick an
+    // Anthropic-provider account — the exact mirror of `/responses`'s Codex-only filter above.
+    let snapshots = filter_by_provider(&snapshots, Provider::Anthropic);
+    let sel_ctx = SelectionCtx {
+        now,
+        require_security_work_authorized: false,
+        rng_seed: None,
+        session_id: None,
+    };
+    let picked = match state.selector.pick(&snapshots, &sel_ctx) {
+        Some(id) => id,
+        None => return no_eligible(),
+    };
+    let (account, provider) = match resolve_core_account(&state, &picked, now).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+
+    match execute_with_watchdog(
+        state.executor_for(provider).as_ref(),
+        Arc::new(NoopContinuity) as Arc<dyn Continuity>,
+        prepared,
+        &account,
+        picked,
+        ctx,
+    )
+    .await
+    {
+        Ok(stream) => stream_response(stream),
+        Err(_) => (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
     }
 }

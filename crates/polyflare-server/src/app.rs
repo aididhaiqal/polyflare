@@ -10,7 +10,7 @@ use polyflare_codex::oauth::OAuthClient;
 use polyflare_core::{Continuity, Executor, Provider, Selector};
 use polyflare_store::{Store, TokenCipher};
 
-use crate::ingress::responses_handler;
+use crate::ingress::{messages_handler, responses_handler};
 
 /// Raised request-body limit: axum's `Json` extractor default (2 MB) 413s real
 /// OpenAI-Responses requests. 100 MB is generous for real Codex turns while bounded.
@@ -52,6 +52,7 @@ impl AppState {
 pub fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/responses", post(responses_handler))
+        .route("/v1/messages", post(messages_handler))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
