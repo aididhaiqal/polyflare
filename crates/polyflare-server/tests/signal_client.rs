@@ -1,7 +1,8 @@
-//! End-to-end: client → polyflare (store-backed selection) → executor → mock upstream.
+//! Strategy B: a bare-tail request carrying a dead anchor to a silent-on-anchor upstream must
+//! surface `previous_response_not_found` within N (bounded) so the client self-heals — not a hang.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use polyflare_codex::oauth::OAuthClient;
@@ -11,7 +12,6 @@ use polyflare_server::app::{build_app, AppState};
 use polyflare_server::continuity::CodexContinuity;
 use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
 use polyflare_testkit::MockUpstream;
-use std::time::Duration;
 
 fn now() -> i64 {
     SystemTime::now()
@@ -20,7 +20,7 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
-fn store_account(id: &str) -> Account {
+fn account(id: &str) -> Account {
     Account {
         id: id.to_string(),
         chatgpt_account_id: None,
@@ -42,18 +42,19 @@ fn store_account(id: &str) -> Account {
     }
 }
 
-async fn spawn_polyflare(upstream: String) -> String {
+#[tokio::test]
+async fn bare_tail_dead_anchor_signals_previous_response_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
-    let cipher = TokenCipher::from_key_bytes(&[5u8; 32]).unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[4u8; 32]).unwrap();
     store
         .accounts()
         .insert(
-            &store_account("e2e"),
+            &account("A"),
             &PlainTokens {
-                access_token: "tok".to_string(),
-                refresh_token: "r".to_string(),
-                id_token: "i".to_string(),
+                access_token: "tokA".into(),
+                refresh_token: "r".into(),
+                id_token: "i".into(),
             },
             &cipher,
         )
@@ -61,10 +62,12 @@ async fn spawn_polyflare(upstream: String) -> String {
         .unwrap();
     let continuity: Arc<dyn Continuity> = Arc::new(CodexContinuity::new(
         store.continuity(),
-        Duration::from_secs(30),
+        Duration::from_millis(150),
     ));
     std::mem::forget(dir);
 
+    let mock = MockUpstream::silent_on_anchor(vec![]);
+    let upstream = mock.spawn().await;
     let state = Arc::new(AppState {
         executor: Arc::new(CodexExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),
@@ -77,40 +80,34 @@ async fn spawn_polyflare(upstream: String) -> String {
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    format!("http://{addr}")
-}
-
-#[tokio::test]
-async fn end_to_end_streaming_passthrough() {
-    let mock = MockUpstream::new(vec![
-        r#"{"type":"response.output_text.delta","delta":"a"}"#.to_string(),
-        r#"{"type":"response.output_text.delta","delta":"b"}"#.to_string(),
-        r#"{"type":"response.completed"}"#.to_string(),
-    ]);
-    let handle = mock.clone();
-    let upstream = mock.spawn().await;
-    let pf = spawn_polyflare(upstream).await;
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let pf = format!("http://{addr}");
 
     let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{pf}/responses"))
-        .json(&serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    let body = tokio::time::timeout(Duration::from_secs(3), async {
+        // Bare tail (short string) + dead anchor => is_full_resend=false => SignalClient.
+        let resp = client
+            .post(format!("{pf}/responses"))
+            .json(
+                &serde_json::json!({"model":"m","previous_response_id":"resp_dead","input":"tail"}),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let mut body = String::new();
+        let mut s = resp.bytes_stream();
+        while let Some(chunk) = s.next().await {
+            body.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        }
+        body
+    })
+    .await
+    .expect("signal must arrive within 3s (no hang)");
 
-    let mut body = String::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        body.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
-    }
-    let first = body.find("delta\":\"a").unwrap();
-    let second = body.find("delta\":\"b").unwrap();
-    let done = body.find("response.completed").unwrap();
-    assert!(first < second && second < done);
-    assert_eq!(handle.last_body().unwrap()["model"], "gpt-5.6-sol");
+    // Assert on the CODE substring only (the exact envelope is a verify-at-impl item).
+    assert!(
+        body.contains("previous_response_not_found"),
+        "client received the self-heal signal: {body}"
+    );
 }

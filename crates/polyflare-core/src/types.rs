@@ -7,10 +7,21 @@ use futures_core::Stream;
 
 /// A request prepared for a specific backend. In M1 this is a thin wrapper over the
 /// raw request JSON plus the target model; continuity/translation enrich it later.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PreparedRequest {
     pub body: serde_json::Value,
     pub model: String,
+}
+
+// `body` carries the full user request/conversation content and must never be printed in clear
+// via `{:?}` (mirrors `Account`'s `bearer_token` redaction below).
+impl std::fmt::Debug for PreparedRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedRequest")
+            .field("model", &self.model)
+            .field("body", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Errors an executor can surface.
@@ -44,10 +55,122 @@ impl std::fmt::Debug for Account {
     }
 }
 
-/// Per-request context threaded through selection/continuity. Minimal in M1.
+/// Per-request context threaded through selection/continuity. `session_key`,
+/// `client_previous_response_id`, and `is_full_resend` are derived at ingress from headers + body
+/// BEFORE `prepare`.
 #[derive(Debug, Clone, Default)]
 pub struct RequestCtx {
     pub session_id: Option<String>,
+    pub session_key: Option<SessionKey>,
+    pub client_previous_response_id: Option<String>,
+    pub is_full_resend: bool,
+}
+
+/// A derived conversation key + its strength (hard binds routing; soft is best-effort).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionKey {
+    pub value: String,
+    pub strength: KeyStrength,
+}
+
+/// How strongly a session key binds routing. `Hard` keys pin; `Soft` keys are best-effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStrength {
+    Hard,
+    Soft,
+}
+
+/// Reasoning-typed output items from a completed turn. Sensitive user data: its `Debug` redacts
+/// content. Populated only in R3 (M3-followup); `None` throughout M3-core.
+#[derive(Clone)]
+pub struct ReasoningItems(pub Vec<serde_json::Value>);
+
+impl std::fmt::Debug for ReasoningItems {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ReasoningItems([{} item(s) redacted])", self.0.len())
+    }
+}
+
+/// Output of `prepare`: the (possibly-rewritten) request + how to route & guard it.
+#[derive(Debug, Clone)]
+pub struct Prepared {
+    pub req: PreparedRequest,
+    pub directive: ContinuityDirective,
+}
+
+/// How to route and guard a prepared request.
+#[derive(Debug, Clone)]
+pub struct ContinuityDirective {
+    /// HARD routing pre-filter. `Some` ⇒ the request MUST route to this account (or Recover).
+    pub pin_account: Option<AccountId>,
+    /// Arm the silence watchdog — set ONLY on anchor-bearing requests.
+    pub watchdog: WatchdogArm,
+    /// What to do if the watchdog fires.
+    pub recovery: RecoveryPlan,
+    /// Threaded back to `observe` so it knows which session/turn this was.
+    pub session_key: Option<SessionKey>,
+}
+
+/// Whether the silence watchdog is armed, and with what timeout.
+#[derive(Debug, Clone, Copy)]
+pub enum WatchdogArm {
+    Disarmed,
+    Armed { timeout: std::time::Duration },
+}
+
+/// What to do when the watchdog fires (or the owner is unavailable at prepare time).
+#[derive(Clone)]
+pub enum RecoveryPlan {
+    /// The outgoing input is self-sufficient (a full-resend): on silence, re-execute this
+    /// anchor-stripped request. Carries conversation content — redacted in `Debug`.
+    ResendFull { anchorless_req: PreparedRequest },
+    /// The outgoing input is a bare tail: on silence, surface `previous_response_not_found` so the
+    /// client self-heals with a full resend.
+    SignalClient,
+    /// No anchor present ⇒ nothing to recover.
+    None,
+}
+
+impl std::fmt::Debug for RecoveryPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecoveryPlan::ResendFull { .. } => {
+                write!(f, "ResendFull {{ anchorless_req: <redacted> }}")
+            }
+            RecoveryPlan::SignalClient => write!(f, "SignalClient"),
+            RecoveryPlan::None => write!(f, "None"),
+        }
+    }
+}
+
+/// What `observe` consumes — built by the watchdog wrapper as the stream resolves.
+#[derive(Debug)]
+pub enum TurnOutcome {
+    /// Upstream produced its first event and we relayed it. `response_id` is sniffed from the
+    /// streamed `response.created`/`response.completed`. `reasoning` is `None` until R3.
+    Completed {
+        session_key: Option<SessionKey>,
+        account: AccountId,
+        response_id: Option<String>,
+        input_fingerprint: String,
+        input_count: u32,
+        reasoning: Option<ReasoningItems>,
+    },
+    /// Watchdog fired; we recovered (Strategy A) or signaled the client (Strategy B).
+    Recovered {
+        session_key: Option<SessionKey>,
+        account: AccountId,
+        new_response_id: Option<String>,
+    },
+    /// A hard upstream error (not silence).
+    Failed { session_key: Option<SessionKey> },
+}
+
+/// Errors `Continuity` can surface. Generic `Display` — never leaks session content.
+#[derive(Debug, thiserror::Error)]
+pub enum ContinuityError {
+    #[error("continuity store error")]
+    Store(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// An owned account identifier — the `Selector`'s return type (M2-GATE1: owned, not a borrow).
@@ -181,6 +304,62 @@ mod tests {
         assert!(
             debug_output.contains("https://example.test"),
             "Debug output must still contain the base_url: {debug_output}"
+        );
+    }
+
+    #[test]
+    fn reasoning_items_debug_redacts_content() {
+        let r = ReasoningItems(vec![
+            serde_json::json!({"text": "super-secret-chain-of-thought"}),
+        ]);
+        let s = format!("{r:?}");
+        assert!(
+            !s.contains("super-secret-chain-of-thought"),
+            "reasoning content must never appear in Debug: {s}"
+        );
+        assert!(
+            s.contains("1 item"),
+            "Debug should summarize count, not content: {s}"
+        );
+    }
+
+    #[test]
+    fn prepared_request_debug_redacts_body() {
+        let req = PreparedRequest {
+            body: serde_json::json!({"input": "super-secret-user-conversation"}),
+            model: "gpt-5.6-sol".to_string(),
+        };
+        let s = format!("{req:?}");
+        assert!(
+            !s.contains("super-secret-user-conversation"),
+            "PreparedRequest Debug must never leak the request body: {s}"
+        );
+        assert!(
+            s.contains("<redacted>"),
+            "Debug should mark the body redacted: {s}"
+        );
+        assert!(
+            s.contains("gpt-5.6-sol"),
+            "Debug should still contain the model: {s}"
+        );
+    }
+
+    #[test]
+    fn recovery_plan_debug_redacts_request_body() {
+        let plan = RecoveryPlan::ResendFull {
+            anchorless_req: PreparedRequest {
+                body: serde_json::json!({"input": "super-secret-conversation"}),
+                model: "m".to_string(),
+            },
+        };
+        let s = format!("{plan:?}");
+        assert!(
+            !s.contains("super-secret-conversation"),
+            "recovery must never leak the request body: {s}"
+        );
+        assert!(
+            s.contains("redacted"),
+            "Debug should mark the body redacted: {s}"
         );
     }
 }
