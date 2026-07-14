@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{DefaultBodyLimit, Json, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::post;
 use axum::Router;
@@ -81,5 +82,102 @@ mod tests {
         assert!(text.contains("data: one"));
         assert!(text.contains("data: two"));
         assert_eq!(handle.last_body().unwrap()["model"], "gpt-5.6-sol");
+    }
+}
+
+/// A scriptable mock of the OpenAI OAuth token endpoint (`POST /oauth/token`). Records the
+/// request body and returns either a success token payload or an error status + code. Test infra
+/// only — never used in production wiring.
+#[derive(Clone)]
+pub struct MockOAuth {
+    response: Arc<OAuthResponse>,
+    last_body: Arc<Mutex<Option<serde_json::Value>>>,
+}
+
+/// The scripted response for a `MockOAuth`.
+#[derive(Clone)]
+pub enum OAuthResponse {
+    Ok {
+        access_token: String,
+        refresh_token: String,
+        id_token: String,
+    },
+    Error {
+        status: u16,
+        code: String,
+    },
+}
+
+impl MockOAuth {
+    /// A mock that returns HTTP 200 with the given tokens.
+    pub fn ok(
+        access_token: impl Into<String>,
+        refresh_token: impl Into<String>,
+        id_token: impl Into<String>,
+    ) -> Self {
+        Self {
+            response: Arc::new(OAuthResponse::Ok {
+                access_token: access_token.into(),
+                refresh_token: refresh_token.into(),
+                id_token: id_token.into(),
+            }),
+            last_body: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A mock that returns the given error status with `{"error": code}`.
+    pub fn error(status: u16, code: impl Into<String>) -> Self {
+        Self {
+            response: Arc::new(OAuthResponse::Error {
+                status,
+                code: code.into(),
+            }),
+            last_body: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// The JSON body of the most recent request, if any.
+    pub fn last_body(&self) -> Option<serde_json::Value> {
+        self.last_body.lock().unwrap().clone()
+    }
+
+    /// Bind an ephemeral port, serve in a background task, and return the base URL.
+    pub async fn spawn(self) -> String {
+        let app = Router::new()
+            .route("/oauth/token", post(oauth_handler))
+            .with_state(self);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+}
+
+async fn oauth_handler(
+    State(mock): State<MockOAuth>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    *mock.last_body.lock().unwrap() = Some(body);
+    match &*mock.response {
+        OAuthResponse::Ok {
+            access_token,
+            refresh_token,
+            id_token,
+        } => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "id_token": id_token,
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })),
+        ),
+        OAuthResponse::Error { status, code } => (
+            StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(serde_json::json!({ "error": code })),
+        ),
     }
 }

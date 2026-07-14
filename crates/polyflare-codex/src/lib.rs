@@ -6,5 +6,6 @@ pub mod oauth;
 
 pub use executor::CodexExecutor;
 pub use oauth::{
-    classify_failure, decode_claims, should_refresh, Claims, FailureClass, OAuthError,
+    classify_failure, decode_claims, should_refresh, Claims, FailureClass, OAuthClient, OAuthError,
+    Refreshed, RefreshedTokens,
 };
