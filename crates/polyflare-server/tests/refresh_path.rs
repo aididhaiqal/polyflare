@@ -213,6 +213,37 @@ async fn refresh_http_error_without_code_marks_reauth() {
 }
 
 #[tokio::test]
+async fn transient_refresh_failure_does_not_mark_account() {
+    // `server_error` is NOT in the permanent set (classify_failure → Transient), so the endpoint
+    // failure must NOT mark the account: it 503s this request but leaves the account `active` and
+    // selectable, so the next request retries the refresh (retry-on-transient).
+    let upstream = MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()]);
+    let upstream_url = upstream.spawn().await;
+    let oauth = MockOAuth::error(503, "server_error"); // transient-classified code
+    let oauth_url = oauth.spawn().await;
+    let (pf, state) = spawn(oauth_url, upstream_url, STALE).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "gpt-5.6-sol"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        503,
+        "the refresh did not complete ⇒ 503 this request"
+    );
+
+    let acct = state.store.accounts().get("acct-1").await.unwrap().unwrap();
+    assert_eq!(
+        acct.status, "active",
+        "a transient endpoint failure must NOT mark the account — it stays selectable to retry"
+    );
+}
+
+#[tokio::test]
 async fn upstream_error_yields_generic_502() {
     let upstream_url = spawn_failing_upstream().await;
     // Fresh account ⇒ no refresh; OAuth is never contacted.
