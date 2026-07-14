@@ -11,16 +11,36 @@ use rand::SeedableRng;
 use crate::traits::Selector;
 use crate::types::{AccountId, AccountSnapshot, SelectionCtx};
 
-/// Secondary-window plan capacity (credits). Source: port reference §Plan capacity.
+/// Plan-type alias map (codex-lb `CAPACITY_PLAN_ALIASES`, logic.py:73-81). Input must already be
+/// trimmed + lowercased. `None` ⇒ not an alias (the caller keeps the normalized string as-is).
+fn plan_alias(normalized: &str) -> Option<&'static str> {
+    match normalized {
+        "education" | "k12" => Some("edu"),
+        "guest" | "go" | "free_workspace" | "quorum" | "unknown" => Some("free"),
+        _ => None,
+    }
+}
+
+/// Secondary-window plan capacity (credits). Faithful port of codex-lb
+/// `_fallback_secondary_capacity_credits` (logic.py:350-356) over `PLAN_CAPACITY_CREDITS_SECONDARY`
+/// (usage/__init__.py:31-40): normalize (`trim().to_lowercase()`), apply the alias map, then map to
+/// capacity. An empty or unrecognized plan falls back to the `free` tier (1134.0) —
+/// `UNKNOWN_PLAN_FALLBACK = "free"` in codex-lb, NOT the plus tier.
 fn plan_capacity_secondary(plan: &str) -> f64 {
-    match plan {
+    let normalized = plan.trim().to_lowercase();
+    // resolved = alias(normalized) OR (normalized if non-empty else "free") — logic.py:352.
+    let resolved = match plan_alias(&normalized) {
+        Some(alias) => alias,
+        None if normalized.is_empty() => "free",
+        None => normalized.as_str(),
+    };
+    match resolved {
         "free" => 1134.0,
         "plus" | "business" | "team" | "edu" => 7560.0,
         "pro" | "enterprise" => 50400.0,
         "prolite" => 37800.0,
-        // Deliberate default: an unknown/future plan string maps to the plus-tier capacity (a
-        // safe mid value) rather than 0, so a mislabelled account still gets a sane weight.
-        _ => 7560.0,
+        // Any still-unrecognized plan → the free tier (codex-lb UNKNOWN_PLAN_FALLBACK), NOT plus.
+        _ => 1134.0,
     }
 }
 
@@ -58,10 +78,11 @@ impl Candidate<'_> {
     /// Reads the *effective* (post-recovery) error state — a recovered rate_limited account whose
     /// `error_count` was zeroed must not be marked draining by its stale count (parity with
     /// codex-lb `evaluate_health_tier`, which runs after the eligibility loop mutates the state).
+    /// The 60s window is strict `<` (codex-lb `DRAIN_ERROR_WINDOW_SECONDS`, evaluate_health_tier).
     fn should_drain(&self, now: i64) -> bool {
         self.eff_used >= 85.0
             || self.eff_secondary_used >= 90.0
-            || (self.eff_error_count >= 2 && self.eff_last_error_at.is_some_and(|t| now - t <= 60))
+            || (self.eff_error_count >= 2 && self.eff_last_error_at.is_some_and(|t| now - t < 60))
     }
 
     /// Effective health tier: base tier, bumped to at least `draining`(1) when `should_drain`.
@@ -84,6 +105,13 @@ impl Candidate<'_> {
 /// state (usage/error), it does NOT admit early — a recovered account still falls through the
 /// cooldown and error-backoff gates below (exactly like `logic.py`, where recovery mutates the
 /// `state` then control continues to the remaining `if` checks).
+///
+/// INTENTIONALLY DEFERRED: codex-lb's anti-starvation backoff-fallback (logic.py:485-548) — when
+/// the eligible pool is empty but accounts sit in error-backoff, it serves the soonest-to-recover
+/// instead of failing. M2b is fail-closed (empty pool ⇒ `pick` returns `None` ⇒ a 503 in the
+/// M2b-2 server) which is acceptable for the MVP. Porting the fallback later needs a richer
+/// eligibility result than `Option<Candidate>` (e.g. an enum `Eligible | InBackoff { recover_at }
+/// | HardBlocked`) so `pick` can pick the earliest-recovering backoff candidate — out of scope here.
 fn eligibility(s: &AccountSnapshot, now: i64) -> Option<Candidate<'_>> {
     // Terminal / operator-held: never eligible (logic.py:444-447).
     if matches!(
@@ -529,5 +557,33 @@ mod tests {
                 "probing(2) must outrank draining(1)"
             );
         }
+    }
+
+    #[test]
+    fn plan_capacity_normalizes_case_and_whitespace() {
+        // codex-lb normalizes `plan.strip().lower()` before lookup.
+        assert_eq!(plan_capacity_secondary("  Pro  "), 50400.0);
+        assert_eq!(plan_capacity_secondary("PLUS"), 7560.0);
+        assert_eq!(plan_capacity_secondary("Free"), 1134.0);
+    }
+
+    #[test]
+    fn plan_capacity_applies_aliases() {
+        // CAPACITY_PLAN_ALIASES (logic.py:73-81).
+        assert_eq!(plan_capacity_secondary("guest"), 1134.0); // → free
+        assert_eq!(plan_capacity_secondary("go"), 1134.0); // → free
+        assert_eq!(plan_capacity_secondary("free_workspace"), 1134.0); // → free
+        assert_eq!(plan_capacity_secondary("quorum"), 1134.0); // → free
+        assert_eq!(plan_capacity_secondary("unknown"), 1134.0); // → free
+        assert_eq!(plan_capacity_secondary("education"), 7560.0); // → edu
+        assert_eq!(plan_capacity_secondary("K12"), 7560.0); // → edu (case-normalized)
+    }
+
+    #[test]
+    fn plan_capacity_unknown_and_empty_default_to_free() {
+        // UNKNOWN_PLAN_FALLBACK = "free" (1134), NOT the plus tier.
+        assert_eq!(plan_capacity_secondary("banana"), 1134.0);
+        assert_eq!(plan_capacity_secondary(""), 1134.0);
+        assert_eq!(plan_capacity_secondary("   "), 1134.0);
     }
 }
