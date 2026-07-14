@@ -5,6 +5,8 @@ use std::pin::Pin;
 use bytes::Bytes;
 use futures_core::Stream;
 
+use crate::provider::Provider;
+
 /// A request prepared for a specific backend. In M1 this is a thin wrapper over the
 /// raw request JSON plus the target model; continuity/translation enrich it later.
 #[derive(Clone)]
@@ -237,6 +239,8 @@ pub struct AccountSnapshot {
     pub security_work_authorized: bool,
     /// In-flight request count (live-tracked later; 0 in M2b).
     pub in_flight: u32,
+    /// Which backend pool this account belongs to — selects the executor + backend wire `Format`.
+    pub provider: Provider,
 }
 
 impl AccountSnapshot {
@@ -260,6 +264,7 @@ impl AccountSnapshot {
             plan_type: "plus".to_string(),
             security_work_authorized: false,
             in_flight: 0,
+            provider: Provider::Codex,
         }
     }
 }
@@ -342,6 +347,12 @@ mod tests {
             s.contains("gpt-5.6-sol"),
             "Debug should still contain the model: {s}"
         );
+    }
+
+    #[test]
+    fn new_snapshot_defaults_to_codex_provider() {
+        let snap = AccountSnapshot::new("a");
+        assert_eq!(snap.provider, Provider::Codex);
     }
 
     #[test]

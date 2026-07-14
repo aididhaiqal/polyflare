@@ -2,7 +2,9 @@
 //! with its latest `usage_history` row per window. Runtime fields (health tier, in-flight,
 //! error/cooldown timestamps) are live-tracked later and default to neutral values here.
 
-use polyflare_core::AccountSnapshot;
+use std::str::FromStr;
+
+use polyflare_core::{AccountSnapshot, Provider};
 use polyflare_store::{Store, StoreError};
 
 /// Build one `AccountSnapshot` per stored account. Capacity is derived from `plan_type` inside
@@ -26,7 +28,25 @@ pub async fn assemble_snapshots(store: &Store) -> Result<Vec<AccountSnapshot>, S
         snap.routing_policy = account.routing_policy;
         snap.plan_type = account.plan_type;
         snap.security_work_authorized = account.security_work_authorized;
+        // Defensive default: the `provider` column is NOT NULL with a DB-level default, and only
+        // this crate's `AccountRepo` ever writes it, so an unparseable value means data written
+        // outside the app's control — fail safe to `Codex` rather than dropping the account.
+        snap.provider = Provider::from_str(&account.provider).unwrap_or(Provider::Codex);
         snapshots.push(snap);
     }
     Ok(snapshots)
+}
+
+/// Narrow candidates to one provider's pool. M4a has no cross-format translator (that's M4b), so
+/// each ingress path must call this before `Selector::pick` — a request can only ever be routed to
+/// an account whose provider matches the ingress path's own wire format.
+pub fn filter_by_provider(
+    snapshots: &[AccountSnapshot],
+    provider: Provider,
+) -> Vec<AccountSnapshot> {
+    snapshots
+        .iter()
+        .filter(|s| s.provider == provider)
+        .cloned()
+        .collect()
 }
