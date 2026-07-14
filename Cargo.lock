@@ -1424,6 +1424,8 @@ dependencies = [
  "polyflare-testkit",
  "reqwest",
  "serde_json",
+ "sqlx",
+ "tempfile",
  "tokio",
 ]
 

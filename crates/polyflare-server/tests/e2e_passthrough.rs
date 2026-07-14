@@ -1,21 +1,71 @@
-//! End-to-end: client → polyflare server → executor → mock upstream, streaming the whole way.
+//! End-to-end: client → polyflare (store-backed selection) → executor → mock upstream.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
+use polyflare_codex::oauth::OAuthClient;
 use polyflare_codex::CodexExecutor;
-use polyflare_core::Account;
+use polyflare_core::CapacityWeighted;
 use polyflare_server::app::{build_app, AppState};
+use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
 use polyflare_testkit::MockUpstream;
 
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+fn store_account(id: &str) -> Account {
+    Account {
+        id: id.to_string(),
+        chatgpt_account_id: None,
+        chatgpt_user_id: None,
+        email: "u@example.test".to_string(),
+        alias: None,
+        workspace_id: None,
+        workspace_label: None,
+        seat_type: None,
+        plan_type: "pro".to_string(),
+        routing_policy: "normal".to_string(),
+        last_refresh: now(),
+        created_at: now(),
+        status: "active".to_string(),
+        deactivation_reason: None,
+        reset_at: None,
+        blocked_at: None,
+        security_work_authorized: false,
+    }
+}
+
 async fn spawn_polyflare(upstream: String) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[5u8; 32]).unwrap();
+    store
+        .accounts()
+        .insert(
+            &store_account("e2e"),
+            &PlainTokens {
+                access_token: "tok".to_string(),
+                refresh_token: "r".to_string(),
+                id_token: "i".to_string(),
+            },
+            &cipher,
+        )
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+
     let state = Arc::new(AppState {
         executor: Arc::new(CodexExecutor::new().unwrap()),
-        account: Account {
-            id: "e2e".into(),
-            base_url: upstream,
-            bearer_token: "tok".into(),
-        },
+        selector: Arc::new(CapacityWeighted),
+        store,
+        cipher,
+        oauth: OAuthClient::new("http://127.0.0.1:9").unwrap(),
+        upstream_base_url: upstream,
     });
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -51,8 +101,6 @@ async fn end_to_end_streaming_passthrough() {
     while let Some(chunk) = stream.next().await {
         body.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
     }
-
-    // All three upstream events relayed, in order, with the model forwarded upstream.
     let first = body.find("delta\":\"a").unwrap();
     let second = body.find("delta\":\"b").unwrap();
     let done = body.find("response.completed").unwrap();

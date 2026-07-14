@@ -68,6 +68,21 @@ impl EncryptedTokens {
     }
 }
 
+/// The latest usage percentage + reset for one window of an account.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WindowUsage {
+    pub used_percent: f64,
+    pub reset_at: Option<i64>,
+}
+
+/// The latest usage per window ("primary"/"secondary") for an account. Missing windows are
+/// `None` (the snapshot assembler treats them as zero usage).
+#[derive(Debug, Clone, Default)]
+pub struct UsageSnapshot {
+    pub primary: Option<WindowUsage>,
+    pub secondary: Option<WindowUsage>,
+}
+
 /// Full column list for `SELECT`ing an `Account` (must match the `FromRow` field order/names).
 const SELECT_ACCOUNT_BY_ID: &str = "SELECT id, chatgpt_account_id, chatgpt_user_id, email, \
     alias, workspace_id, workspace_label, seat_type, plan_type, routing_policy, last_refresh, \
@@ -210,6 +225,31 @@ impl AccountRepo {
             })),
             None => Ok(None),
         }
+    }
+
+    /// The most-recent `usage_history` row for each window ("primary"/"secondary") of an account.
+    pub async fn latest_usage(&self, account_id: &str) -> Result<UsageSnapshot, StoreError> {
+        Ok(UsageSnapshot {
+            primary: self.latest_window_usage(account_id, "primary").await?,
+            secondary: self.latest_window_usage(account_id, "secondary").await?,
+        })
+    }
+
+    /// The most-recent usage row for a single window, or `None` if the account has none.
+    async fn latest_window_usage(
+        &self,
+        account_id: &str,
+        window: &str,
+    ) -> Result<Option<WindowUsage>, StoreError> {
+        let row = sqlx::query_as::<_, WindowUsage>(
+            "SELECT used_percent, reset_at FROM usage_history \
+             WHERE account_id = ? AND \"window\" = ? ORDER BY recorded_at DESC LIMIT 1",
+        )
+        .bind(account_id)
+        .bind(window)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
     }
 }
 

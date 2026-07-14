@@ -6,9 +6,11 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
+use polyflare_codex::oauth::OAuthClient;
 use polyflare_codex::CodexExecutor;
+use polyflare_core::{CapacityWeighted, Selector};
 use polyflare_server::app::{build_app, AppState};
-use polyflare_server::config::{self, Config};
+use polyflare_server::config::{self, ServeConfig};
 use polyflare_store::{import_from_codex_lb, Store, TokenCipher};
 
 #[derive(Parser)]
@@ -61,13 +63,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// The M1 server: identical wiring and behavior to the pre-M2a `main`.
+/// The M2b server: store-backed multi-account pool selection.
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::from_env()?;
+    let config = ServeConfig::from_env()?;
+    let store = Store::open(&config.db_path).await?;
+    let cipher = TokenCipher::load_or_create(&config.key_path)?;
     let executor = Arc::new(CodexExecutor::new()?);
+    let selector: Arc<dyn Selector> = Arc::new(CapacityWeighted);
+    let oauth = OAuthClient::new(config.auth_base_url)?;
+
     let state = Arc::new(AppState {
         executor,
-        account: config.account,
+        selector,
+        store,
+        cipher,
+        oauth,
+        upstream_base_url: config.upstream_base_url,
     });
     let app = build_app(state);
 
