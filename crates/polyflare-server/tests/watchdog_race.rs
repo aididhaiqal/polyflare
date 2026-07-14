@@ -1,17 +1,43 @@
 //! Unit/integration tests for the watchdog first-byte race, driving `execute_with_watchdog`
 //! directly against a MockUpstream + CodexExecutor with a tiny N.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use futures_util::StreamExt;
+use async_trait::async_trait;
+use futures_util::{stream, StreamExt};
 use polyflare_codex::CodexExecutor;
 use polyflare_core::{
-    Account, AccountId, Continuity, ContinuityDirective, NoopContinuity, Prepared, PreparedRequest,
-    RecoveryPlan, RequestCtx, WatchdogArm,
+    Account, AccountId, Continuity, ContinuityDirective, ExecError, Executor, NoopContinuity,
+    Prepared, PreparedRequest, RecoveryPlan, RequestCtx, ResponseStream, WatchdogArm,
 };
 use polyflare_server::watchdog::{execute_with_watchdog, WatchdogError};
 use polyflare_testkit::MockUpstream;
 use std::time::Duration;
+
+/// A test-only `Executor` that always succeeds at `execute` (as if the upstream accepted the
+/// request with 200 headers) but whose returned `ResponseStream` yields a transport ERROR as its
+/// FIRST item. This is the ONLY way to reach `execute_with_watchdog`'s `Ok(Some(Err(_)))` arm: the
+/// real reqwest/HTTP path collapses an immediately-erroring body into a `.send()` failure (an
+/// `execute()` Err before any stream exists), so it can never produce a first-item stream error.
+/// The counter proves whether recovery re-invoked `execute` (it must NOT for a mid-race hard error).
+struct ErrorFirstExecutor {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Executor for ErrorFirstExecutor {
+    async fn execute(
+        &self,
+        _req: PreparedRequest,
+        _account: &Account,
+    ) -> Result<ResponseStream, ExecError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(stream::once(async {
+            Err(ExecError::Stream("connection reset".into()))
+        })))
+    }
+}
 
 fn core_account(base_url: String) -> Account {
     Account {
@@ -152,18 +178,20 @@ async fn hard_upstream_error_is_watchdog_upstream() {
 }
 
 #[tokio::test]
-async fn mid_race_transport_error_is_watchdog_upstream_and_does_not_recover() {
+async fn mid_race_first_item_error_is_watchdog_upstream_and_does_not_recover() {
     // The C5 review flagged `execute_with_watchdog`'s `Ok(Some(Err(_)))` branch (a transport error
-    // arriving as the FIRST stream item, mid-race — i.e. AFTER the upstream accepted the request
-    // with 200 headers, unlike `hard_upstream_error_is_watchdog_upstream` above which never gets a
-    // stream at all) as correct-but-untested. Per SPEC-M3 §Q4 this is a hard error: it must NOT
-    // recover (no second/resend request) and must NOT relay (no stream handed to the caller).
-    let mock = MockUpstream::error_first_on_anchor(vec![
-        r#"{"type":"response.output_text.delta","delta":"unreachable"}"#.to_string(),
-    ]);
-    let handle = mock.clone();
-    let base = mock.spawn().await;
-    let exec = CodexExecutor::new().unwrap();
+    // arriving as the FIRST stream item, mid-race — i.e. AFTER a successful `execute()`, unlike
+    // `hard_upstream_error_is_watchdog_upstream` above where `execute()` itself errors and no stream
+    // exists) as correct-but-untested. This branch is unreachable through the reqwest/HTTP path (an
+    // immediately-erroring body collapses into a `.send()` failure), so we drive it at the unit
+    // level with a stub `Executor` that returns Ok(stream) whose first item is Err. Per SPEC-M3 §Q4
+    // this is a hard error: it must return `Err(Upstream)`, must NOT relay a stream, and must NOT
+    // recover — proven by the stub's `execute` being called EXACTLY ONCE (recovery would call it a
+    // second time).
+    let calls = Arc::new(AtomicUsize::new(0));
+    let stub = ErrorFirstExecutor {
+        calls: calls.clone(),
+    };
     let cont: Arc<dyn Continuity> = Arc::new(NoopContinuity);
 
     let prepared = armed_full_resend(
@@ -172,10 +200,10 @@ async fn mid_race_transport_error_is_watchdog_upstream_and_does_not_recover() {
     let res = tokio::time::timeout(
         Duration::from_secs(3),
         execute_with_watchdog(
-            &exec,
+            &stub,
             cont,
             prepared,
-            &core_account(base),
+            &core_account("http://unused.invalid".into()),
             AccountId::from("acct"),
             RequestCtx::default(),
         ),
@@ -186,11 +214,11 @@ async fn mid_race_transport_error_is_watchdog_upstream_and_does_not_recover() {
     match res {
         Err(WatchdogError::Upstream) => {}
         Err(other) => panic!("expected WatchdogError::Upstream, got {other:?}"),
-        Ok(_) => panic!("mid-race hard error must not relay a stream to the caller"),
+        Ok(_) => panic!("mid-race first-item error must not relay a stream to the caller"),
     }
     assert_eq!(
-        handle.request_count(),
+        calls.load(Ordering::SeqCst),
         1,
-        "mid-race hard error must NOT recover/retry"
+        "mid-race hard error must NOT recover/retry (execute called exactly once)"
     );
 }
