@@ -1,9 +1,13 @@
-//! The five trait seams. M1 implements only `Executor` (in `polyflare-codex`);
-//! `Selector`/`Continuity`/`Coordinator` are defined here and fleshed out in M2/M3.
+//! The five trait seams. M1 implemented only `Executor`; M2b implements `Selector`
+//! (reshaped here per M2-GATE1 + the `CapacityWeighted` impl in `select.rs`).
+//! `Continuity`/`Coordinator` stay PROVISIONAL — reshaped at their own milestones.
 
 use async_trait::async_trait;
 
-use crate::types::{Account, ExecError, PreparedRequest, RequestCtx, ResponseStream};
+use crate::types::{
+    Account, AccountId, AccountSnapshot, ExecError, PreparedRequest, RequestCtx, ResponseStream,
+    SelectionCtx,
+};
 
 /// Executes a prepared request against an upstream using an account, returning a byte stream.
 #[async_trait]
@@ -15,9 +19,11 @@ pub trait Executor: Send + Sync {
     ) -> Result<ResponseStream, ExecError>;
 }
 
-/// Picks an account from a pool for a request. (Skeleton in M1; real scoring in M2.)
+/// Picks an account from a pool of per-account snapshots for a request. Sync + pure: scoring is
+/// deterministic given the snapshots + ctx (async DB snapshot-assembly lives in the caller).
+/// Returns an owned `AccountId` (M2-GATE1).
 pub trait Selector: Send + Sync {
-    fn pick<'a>(&self, pool: &'a [Account], ctx: &RequestCtx) -> Option<&'a Account>;
+    fn pick(&self, candidates: &[AccountSnapshot], ctx: &SelectionCtx) -> Option<AccountId>;
 }
 
 /// Applies continuity (anchor/trim/resend) before execution. (No-op in M1; state machine in M3.)
@@ -33,32 +39,21 @@ pub trait Coordinator: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Account, RequestCtx};
+    use crate::types::{AccountId, AccountSnapshot, SelectionCtx};
 
-    // A trivial Selector proves the trait is object-safe and usable.
-    struct FirstAccount;
-    impl Selector for FirstAccount {
-        fn pick<'a>(&self, pool: &'a [Account], _ctx: &RequestCtx) -> Option<&'a Account> {
-            pool.first()
+    // A trivial Selector proves the reshaped trait is object-safe and returns an owned id.
+    struct FirstCandidate;
+    impl Selector for FirstCandidate {
+        fn pick(&self, candidates: &[AccountSnapshot], _ctx: &SelectionCtx) -> Option<AccountId> {
+            candidates.first().map(|s| s.id.clone())
         }
     }
 
     #[test]
-    fn selector_picks_first_account() {
-        let pool = vec![
-            Account {
-                id: "a".into(),
-                base_url: "http://x".into(),
-                bearer_token: "t".into(),
-            },
-            Account {
-                id: "b".into(),
-                base_url: "http://y".into(),
-                bearer_token: "u".into(),
-            },
-        ];
-        let sel: Box<dyn Selector> = Box::new(FirstAccount);
-        let picked = sel.pick(&pool, &RequestCtx::default()).unwrap();
-        assert_eq!(picked.id, "a");
+    fn selector_returns_owned_account_id() {
+        let pool = vec![AccountSnapshot::new("a"), AccountSnapshot::new("b")];
+        let sel: Box<dyn Selector> = Box::new(FirstCandidate);
+        let picked = sel.pick(&pool, &SelectionCtx::default()).unwrap();
+        assert_eq!(picked.as_str(), "a");
     }
 }
