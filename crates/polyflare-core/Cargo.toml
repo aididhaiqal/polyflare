@@ -12,3 +12,6 @@ bytes = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
