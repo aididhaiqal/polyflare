@@ -158,10 +158,15 @@ impl std::fmt::Debug for RefreshedTokens {
 }
 
 /// A completed refresh: the new tokens plus the identity claims decoded from the new id_token.
+///
+/// `claims` is **best-effort**: a refresh returns fresh access/refresh tokens even when the new
+/// `id_token` can't be decoded (`None`). The refresh path only needs the tokens; discarding a
+/// perfectly good token pair because the cosmetic `id_token` was malformed would wrongly deactivate
+/// an otherwise-healthy account. (Identity claims are populated authoritatively at import, not here.)
 #[derive(Debug, Clone)]
 pub struct Refreshed {
     pub tokens: RefreshedTokens,
-    pub claims: Claims,
+    pub claims: Option<Claims>,
 }
 
 /// The token-endpoint success body. `refresh_token` may be omitted (no rotation) → keep the old.
@@ -226,7 +231,8 @@ impl OAuthClient {
             .json()
             .await
             .map_err(|e| OAuthError::Transport(e.to_string()))?;
-        let claims = decode_claims(&token.id_token)?;
+        // Best-effort: a malformed id_token must NOT discard the valid access/refresh tokens.
+        let claims = decode_claims(&token.id_token).ok();
         Ok(Refreshed {
             tokens: RefreshedTokens {
                 access_token: token.access_token,
