@@ -19,6 +19,16 @@ pub async fn assemble_snapshots(store: &Store) -> Result<Vec<AccountSnapshot>, S
     let accounts = repo.list().await?;
     let mut snapshots = Vec::with_capacity(accounts.len());
     for account in accounts {
+        // The `provider` column is NOT NULL with a DB-level default and only this crate's
+        // `AccountRepo` ever writes it (always a known `Provider::Display` value). An unparseable
+        // value therefore means data written outside the app's control: its backend is unknown, so
+        // it cannot be routed to ANY pool. Exclude it from selection entirely — failing closed here
+        // keeps this consistent with `resolve_core_account` (which also rejects an unknown provider)
+        // and avoids surfacing a zombie candidate that would only hard-fail at resolve time.
+        let provider = match Provider::from_str(&account.provider) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
         let usage = repo.latest_usage(&account.id).await?;
         let mut snap = AccountSnapshot::new(account.id.as_str());
         snap.status = account.status;
@@ -28,10 +38,7 @@ pub async fn assemble_snapshots(store: &Store) -> Result<Vec<AccountSnapshot>, S
         snap.routing_policy = account.routing_policy;
         snap.plan_type = account.plan_type;
         snap.security_work_authorized = account.security_work_authorized;
-        // Defensive default: the `provider` column is NOT NULL with a DB-level default, and only
-        // this crate's `AccountRepo` ever writes it, so an unparseable value means data written
-        // outside the app's control — fail safe to `Codex` rather than dropping the account.
-        snap.provider = Provider::from_str(&account.provider).unwrap_or(Provider::Codex);
+        snap.provider = provider;
         snapshots.push(snap);
     }
     Ok(snapshots)
