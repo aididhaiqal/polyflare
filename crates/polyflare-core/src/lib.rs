@@ -2,6 +2,7 @@
 
 pub mod continuity;
 pub mod format;
+pub mod provider;
 pub mod select;
 pub mod traits;
 pub mod translate;
@@ -9,6 +10,7 @@ pub mod types;
 
 pub use continuity::NoopContinuity;
 pub use format::Format;
+pub use provider::Provider;
 pub use select::CapacityWeighted;
 pub use traits::{Continuity, Coordinator, Executor, Selector};
 pub use translate::{IdentityTranslator, Translator, TranslatorRegistry};
