@@ -1386,12 +1386,15 @@ name = "polyflare-codex"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "futures-util",
  "polyflare-core",
  "polyflare-testkit",
  "reqwest",
+ "serde",
  "serde_json",
+ "thiserror",
  "tokio",
 ]
 
