@@ -105,6 +105,7 @@ async fn no_anchor_request_on_ineligible_owner_fails_over_not_500() {
         cipher: TokenCipher::from_key_bytes(&[11u8; 32]).unwrap(),
         oauth: OAuthClient::new("http://127.0.0.1:9").unwrap(),
         upstream_base_url: upstream,
+        refresh_locks: Default::default(),
     });
     let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

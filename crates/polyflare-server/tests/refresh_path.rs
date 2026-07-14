@@ -90,6 +90,7 @@ async fn spawn(
         cipher,
         oauth: OAuthClient::new(oauth_url).unwrap(),
         upstream_base_url: upstream_url,
+        refresh_locks: Default::default(),
     });
     let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -247,6 +248,73 @@ async fn transient_refresh_failure_does_not_mark_account() {
     assert_eq!(
         acct.status, "active",
         "a transient endpoint failure must NOT mark the account — it stays selectable to retry"
+    );
+}
+
+/// F2: N concurrent requests that all select the SAME stale account must collapse into exactly
+/// ONE call to the OAuth refresh endpoint (a singleflight per account), not one call per request.
+/// Before the fix, all 8 requests observe staleness, all 8 call `refresh` with the account's
+/// (same) stored refresh token — OpenAI-style refresh-token rotation means only the first would
+/// have "succeeded" against a real endpoint, but even against this mock (which always returns the
+/// same success payload) the bug is that the endpoint gets hit 8 times instead of 1, and any
+/// endpoint that classifies reuse as a permanent failure would wrongly deactivate the account.
+/// `MockOAuth`'s handler sleeps ~50ms before responding so all 8 requests reliably enter the stale
+/// branch before the first refresh completes, forcing the race to actually occur.
+#[tokio::test]
+async fn concurrent_stale_requests_collapse_into_one_refresh() {
+    let upstream = MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()]);
+    let upstream_url = upstream.spawn().await;
+
+    let oauth = MockOAuth::ok("new-access", "new-refresh", VALID_JWT);
+    let oauth_handle = oauth.clone();
+    let oauth_url = oauth.spawn().await;
+
+    let (pf, state) = spawn(oauth_url, upstream_url, STALE).await;
+
+    const N: usize = 8;
+    let client = reqwest::Client::new();
+    let futures = (0..N).map(|_| {
+        let client = client.clone();
+        let pf = pf.clone();
+        tokio::spawn(async move {
+            client
+                .post(format!("{pf}/responses"))
+                .json(&serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}))
+                .send()
+                .await
+                .unwrap()
+        })
+    });
+    let responses = futures_util::future::join_all(futures).await;
+
+    for r in responses {
+        let resp = r.unwrap();
+        assert_eq!(resp.status(), 200, "every concurrent request must succeed");
+    }
+
+    assert_eq!(
+        oauth_handle.hit_count(),
+        1,
+        "the singleflight must collapse all 8 concurrent stale-refresh attempts into ONE call \
+         to the OAuth endpoint"
+    );
+
+    let acct = state.store.accounts().get("acct-1").await.unwrap().unwrap();
+    assert_eq!(
+        acct.status, "active",
+        "the account must never be wrongly marked reauth_required by a losing racer"
+    );
+
+    let toks = state
+        .store
+        .accounts()
+        .decrypt_tokens("acct-1", &state.cipher)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        toks.refresh_token, "new-refresh",
+        "the persisted token must be the single winner's rotated refresh token"
     );
 }
 

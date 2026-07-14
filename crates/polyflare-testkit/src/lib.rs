@@ -2,8 +2,9 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Json, State};
@@ -212,6 +213,7 @@ mod tests {
 pub struct MockOAuth {
     response: Arc<OAuthResponse>,
     last_body: Arc<Mutex<Option<serde_json::Value>>>,
+    hit_count: Arc<AtomicUsize>,
 }
 
 /// The scripted response for a `MockOAuth`.
@@ -247,6 +249,7 @@ impl MockOAuth {
                 id_token: id_token.into(),
             }),
             last_body: Arc::new(Mutex::new(None)),
+            hit_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -258,6 +261,7 @@ impl MockOAuth {
                 code: code.into(),
             }),
             last_body: Arc::new(Mutex::new(None)),
+            hit_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -267,12 +271,20 @@ impl MockOAuth {
         Self {
             response: Arc::new(OAuthResponse::ErrorNoCode { status }),
             last_body: Arc::new(Mutex::new(None)),
+            hit_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     /// The JSON body of the most recent request, if any.
     pub fn last_body(&self) -> Option<serde_json::Value> {
         self.last_body.lock().unwrap().clone()
+    }
+
+    /// How many times `POST /oauth/token` has been hit. Used by singleflight tests (F2) to assert
+    /// that N concurrent stale-refresh requests for the same account collapse into exactly one
+    /// call to the OAuth endpoint.
+    pub fn hit_count(&self) -> usize {
+        self.hit_count.load(Ordering::SeqCst)
     }
 
     /// Bind an ephemeral port, serve in a background task, and return the base URL.
@@ -293,7 +305,12 @@ async fn oauth_handler(
     State(mock): State<MockOAuth>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    mock.hit_count.fetch_add(1, Ordering::SeqCst);
     *mock.last_body.lock().unwrap() = Some(body);
+    // A small delay so concurrent callers racing on the same stale account reliably overlap
+    // (all observe staleness before the first refresh completes) — this is what makes
+    // singleflight tests (F2) actually exercise the race instead of serializing by luck.
+    tokio::time::sleep(Duration::from_millis(50)).await;
     match &*mock.response {
         OAuthResponse::Ok {
             access_token,
