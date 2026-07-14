@@ -51,7 +51,8 @@ pub struct RequestCtx {
 }
 
 /// An owned account identifier — the `Selector`'s return type (M2-GATE1: owned, not a borrow).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Hash`/`Ord` are additive to the seam so M2b-2 can key per-account maps + order deterministically.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AccountId(String);
 
 impl AccountId {
