@@ -1,29 +1,33 @@
-//! Process configuration, read from environment. Secrets never logged.
+//! Process configuration for `polyflare serve`, read from environment. Secrets are NOT here —
+//! per-account bearer tokens live in the store; only shared base URLs + data paths are config.
 
 use std::path::{Path, PathBuf};
 
-use polyflare_core::Account;
-
-pub struct Config {
+/// `serve` configuration. The upstream base URL is shared across accounts; per-account bearer
+/// tokens are decrypted from the store per request.
+pub struct ServeConfig {
     pub bind_addr: String,
-    pub account: Account,
+    pub upstream_base_url: String,
+    pub auth_base_url: String,
+    pub db_path: PathBuf,
+    pub key_path: PathBuf,
 }
 
-impl Config {
+impl ServeConfig {
     pub fn from_env() -> Result<Self, String> {
         let bind_addr =
             std::env::var("POLYFLARE_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-        let base_url = std::env::var("POLYFLARE_UPSTREAM_URL")
+        let upstream_base_url = std::env::var("POLYFLARE_UPSTREAM_URL")
             .map_err(|_| "POLYFLARE_UPSTREAM_URL not set".to_string())?;
-        let bearer_token = std::env::var("POLYFLARE_UPSTREAM_TOKEN")
-            .map_err(|_| "POLYFLARE_UPSTREAM_TOKEN not set".to_string())?;
-        Ok(Config {
+        let auth_base_url = std::env::var("POLYFLARE_AUTH_URL")
+            .unwrap_or_else(|_| "https://auth.openai.com".to_string());
+        let data_dir = data_dir_from_env();
+        Ok(ServeConfig {
             bind_addr,
-            account: Account {
-                id: "default".into(),
-                base_url,
-                bearer_token,
-            },
+            upstream_base_url,
+            auth_base_url,
+            db_path: db_path(&data_dir),
+            key_path: key_path(&data_dir),
         })
     }
 }
