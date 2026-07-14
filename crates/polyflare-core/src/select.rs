@@ -18,7 +18,8 @@ fn plan_capacity_secondary(plan: &str) -> f64 {
         "plus" | "business" | "team" | "edu" => 7560.0,
         "pro" | "enterprise" => 50400.0,
         "prolite" => 37800.0,
-        // Unknown plans fall back to the plus-tier capacity (a safe mid value).
+        // Deliberate default: an unknown/future plan string maps to the plus-tier capacity (a
+        // safe mid value) rather than 0, so a mislabelled account still gets a sane weight.
         _ => 7560.0,
     }
 }
@@ -30,12 +31,17 @@ fn error_backoff_secs(error_count: u32) -> i64 {
     raw.min(300)
 }
 
-/// An eligible candidate: a borrowed snapshot + its post-recovery effective usage.
+/// An eligible candidate: a borrowed snapshot + its post-recovery *effective* state. The `eff_*`
+/// fields carry the values codex-lb's eligibility loop mutates on the account (usage zeroed on
+/// reset-recovery, error state cleared on recovery/cooldown-expiry/backoff-expiry) so the
+/// downstream health-tier + weighting stages read the recovered state, not the raw snapshot.
 #[derive(Clone, Copy)]
 struct Candidate<'a> {
     snap: &'a AccountSnapshot,
     eff_used: f64,
     eff_secondary_used: f64,
+    eff_error_count: u32,
+    eff_last_error_at: Option<i64>,
 }
 
 impl Candidate<'_> {
@@ -49,14 +55,21 @@ impl Candidate<'_> {
     }
 
     /// should_drain if used%>=85 OR secondary%>=90 OR (error_count>=2 within 60s of last error).
+    /// Reads the *effective* (post-recovery) error state — a recovered rate_limited account whose
+    /// `error_count` was zeroed must not be marked draining by its stale count (parity with
+    /// codex-lb `evaluate_health_tier`, which runs after the eligibility loop mutates the state).
     fn should_drain(&self, now: i64) -> bool {
         self.eff_used >= 85.0
             || self.eff_secondary_used >= 90.0
-            || (self.snap.error_count >= 2
-                && self.snap.last_error_at.is_some_and(|t| now - t <= 60))
+            || (self.eff_error_count >= 2 && self.eff_last_error_at.is_some_and(|t| now - t <= 60))
     }
 
     /// Effective health tier: base tier, bumped to at least `draining`(1) when `should_drain`.
+    /// NOTE (M2b scope): live health-tier tracking is M3, so `health_tier` is 0 for every snapshot
+    /// in practice here and `max(1)` faithfully mirrors codex-lb's HEALTHY→DRAINING transition. A
+    /// base-`probing`(2) account that `should_drain` is NOT pushed down to `draining`(1) yet
+    /// (codex-lb's evaluate_health_tier does `PROBING→DRAINING`); that path only exists once M3
+    /// populates non-zero base tiers — documented here so the simplification is intentional.
     fn effective_tier(&self, now: i64) -> u8 {
         if self.should_drain(now) {
             self.snap.health_tier.max(1)
@@ -66,47 +79,81 @@ impl Candidate<'_> {
     }
 }
 
-/// Eligibility hard-filter (port reference step 1). `None` ⇒ skip; `Some(Candidate)` with usage
-/// zeroed for auto-recovered rate/quota accounts.
+/// Eligibility hard-filter (port reference step 1; faithful to codex-lb `logic.py:437-483`).
+/// `None` ⇒ skip. The gates are SEQUENTIAL: reset-recovery only mutates the account's effective
+/// state (usage/error), it does NOT admit early — a recovered account still falls through the
+/// cooldown and error-backoff gates below (exactly like `logic.py`, where recovery mutates the
+/// `state` then control continues to the remaining `if` checks).
 fn eligibility(s: &AccountSnapshot, now: i64) -> Option<Candidate<'_>> {
-    match s.status.as_str() {
-        // Terminal / operator-held: never eligible.
-        "reauth_required" | "deactivated" | "paused" => return None,
-        // Rate/quota limited: eligible only once the reset time has passed (usage zeroed).
-        "rate_limited" | "quota_exceeded" => match s.reset_at {
-            Some(reset) if now >= reset => {
-                return Some(Candidate {
-                    snap: s,
-                    eff_used: 0.0,
-                    eff_secondary_used: 0.0,
-                });
-            }
-            _ => return None,
-        },
-        // active (or any other value) → fall through to the cooldown/backoff gates.
-        _ => {}
+    // Terminal / operator-held: never eligible (logic.py:444-447).
+    if matches!(
+        s.status.as_str(),
+        "reauth_required" | "deactivated" | "paused"
+    ) {
+        return None;
     }
 
-    // Generic cooldown gate.
+    // Effective (post-recovery) state, seeded from the raw snapshot; recovery/cooldown/backoff
+    // mutate these below, mirroring the field writes codex-lb makes on the live `state`.
+    let mut eff_used = s.used_percent;
+    let mut eff_secondary_used = s.secondary_used_percent;
+    let mut eff_error_count = s.error_count;
+    let mut eff_last_error_at = s.last_error_at;
+
+    // rate_limited: recover iff the reset time has passed, else skip. Recovery zeros PRIMARY usage
+    // + error_count — but NOT secondary usage (logic.py:448-455).
+    if s.status == "rate_limited" {
+        match s.reset_at {
+            Some(reset) if now >= reset => {
+                eff_used = 0.0;
+                eff_error_count = 0;
+            }
+            _ => return None,
+        }
+    }
+
+    // quota_exceeded: recover iff the reset time has passed, else skip. Recovery zeros PRIMARY +
+    // SECONDARY usage — but NOT error_count (logic.py:456-463).
+    if s.status == "quota_exceeded" {
+        match s.reset_at {
+            Some(reset) if now >= reset => {
+                eff_used = 0.0;
+                eff_secondary_used = 0.0;
+            }
+            _ => return None,
+        }
+    }
+
+    // Cooldown gate (logic.py:464-469): if the cooldown has expired, clear it AND the error state
+    // (error_count/last_error_at); if it is still active, skip. Applies to recovered accounts too.
     if let Some(cd) = s.cooldown_until {
-        if now < cd {
+        if now >= cd {
+            eff_error_count = 0;
+            eff_last_error_at = None;
+        } else {
             return None;
         }
     }
 
-    // Error backoff (only once error_count >= 3, measured from the last error time).
-    if s.error_count >= 3 {
-        if let Some(last) = s.last_error_at {
-            if now < last + error_backoff_secs(s.error_count) {
+    // Error-backoff gate (logic.py:470-483): only once error_count >= 3, measured from the last
+    // error time. While inside the backoff window → skip; once expired → clear the error state so
+    // recovery is not penalised by a stale count.
+    if eff_error_count >= 3 {
+        if let Some(last) = eff_last_error_at {
+            if now < last + error_backoff_secs(eff_error_count) {
                 return None;
             }
         }
+        eff_error_count = 0;
+        eff_last_error_at = None;
     }
 
     Some(Candidate {
         snap: s,
-        eff_used: s.used_percent,
-        eff_secondary_used: s.secondary_used_percent,
+        eff_used,
+        eff_secondary_used,
+        eff_error_count,
+        eff_last_error_at,
     })
 }
 
@@ -400,5 +447,87 @@ mod tests {
         let a = snap("aaa", "plus", 100.0);
         let b = snap("bbb", "plus", 100.0);
         assert_eq!(sel.pick(&[b, a], &ctx(0, 5)).unwrap().as_str(), "aaa");
+    }
+
+    #[test]
+    fn recovered_account_still_blocked_by_active_cooldown() {
+        // Faithfulness regression (logic.py:448-469): a rate_limited account whose reset has
+        // passed auto-recovers, but recovery does NOT admit it early — it still falls through the
+        // cooldown gate. With a cooldown that is still active, it must NOT be selected.
+        let sel = CapacityWeighted;
+        let mut s = snap("a", "plus", 50.0);
+        s.status = "rate_limited".to_string();
+        s.reset_at = Some(1000); // reset has passed at now=1000 → recovers
+        s.cooldown_until = Some(2000); // …but cooldown is still active
+        assert!(
+            sel.pick(&[s.clone()], &ctx(1000, 1)).is_none(),
+            "recovered but cooldown still active ⇒ still gated"
+        );
+        // Once the cooldown also expires, the recovered account becomes selectable.
+        assert_eq!(
+            sel.pick(&[s], &ctx(2000, 1)).unwrap().as_str(),
+            "a",
+            "recovered + cooldown expired ⇒ eligible"
+        );
+    }
+
+    #[test]
+    fn rate_limit_recovery_zeroes_error_count_clearing_backoff_and_drain() {
+        // Faithfulness regression (logic.py:450-452): rate_limited recovery zeroes error_count.
+        // With the recovery now falling through the backoff gate, that zeroing is what keeps the
+        // account eligible (an un-zeroed error_count=5 would trip the backoff) AND stops the stale
+        // count from marking it draining.
+        let sel = CapacityWeighted;
+        let mut recovered = snap("recovered", "plus", 10.0);
+        recovered.status = "rate_limited".to_string();
+        recovered.reset_at = Some(1000);
+        recovered.error_count = 5; // un-zeroed ⇒ backoff = min(300, 30*2^2) = 120s at now=1000
+        recovered.last_error_at = Some(1000); // …and within 60s ⇒ would mark draining too
+
+        // (a) Eligible on its own: error_count zeroed ⇒ not held by the backoff gate.
+        assert_eq!(
+            sel.pick(&[recovered.clone()], &ctx(1000, 1))
+                .unwrap()
+                .as_str(),
+            "recovered",
+            "recovery zeroes error_count ⇒ not backoff-held"
+        );
+
+        // (b) Not draining: paired with a healthy peer it stays in the same (healthy) tier, so it
+        // still wins on some seeds. A stale error_count would have dropped it to `draining`, which
+        // would be excluded whenever a healthy account exists ⇒ it could never win.
+        let healthy = snap("healthy", "plus", 10.0);
+        let recovered_wins = (0..50u64)
+            .filter(|&seed| {
+                sel.pick(&[recovered.clone(), healthy.clone()], &ctx(1000, seed))
+                    .unwrap()
+                    .as_str()
+                    == "recovered"
+            })
+            .count();
+        assert!(
+            recovered_wins > 0,
+            "recovered account must share the healthy tier (not draining), won {recovered_wins}/50"
+        );
+    }
+
+    #[test]
+    fn probing_tier_preferred_over_draining_tier() {
+        // Health-tier ordering (logic.py:598-601): with no healthy accounts, probing(2) is
+        // preferred over draining(1). Deterministic across seeds — no weighting involved.
+        let sel = CapacityWeighted;
+        let mut probing = snap("probing", "plus", 10.0);
+        probing.health_tier = 2;
+        let mut draining = snap("draining", "plus", 10.0);
+        draining.health_tier = 1;
+        for seed in 0..20u64 {
+            assert_eq!(
+                sel.pick(&[draining.clone(), probing.clone()], &ctx(0, seed))
+                    .unwrap()
+                    .as_str(),
+                "probing",
+                "probing(2) must outrank draining(1)"
+            );
+        }
     }
 }
