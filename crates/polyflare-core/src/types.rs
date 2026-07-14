@@ -7,10 +7,21 @@ use futures_core::Stream;
 
 /// A request prepared for a specific backend. In M1 this is a thin wrapper over the
 /// raw request JSON plus the target model; continuity/translation enrich it later.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PreparedRequest {
     pub body: serde_json::Value,
     pub model: String,
+}
+
+// `body` carries the full user request/conversation content and must never be printed in clear
+// via `{:?}` (mirrors `Account`'s `bearer_token` redaction below).
+impl std::fmt::Debug for PreparedRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedRequest")
+            .field("model", &self.model)
+            .field("body", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Errors an executor can surface.
@@ -309,6 +320,27 @@ mod tests {
         assert!(
             s.contains("1 item"),
             "Debug should summarize count, not content: {s}"
+        );
+    }
+
+    #[test]
+    fn prepared_request_debug_redacts_body() {
+        let req = PreparedRequest {
+            body: serde_json::json!({"input": "super-secret-user-conversation"}),
+            model: "gpt-5.6-sol".to_string(),
+        };
+        let s = format!("{req:?}");
+        assert!(
+            !s.contains("super-secret-user-conversation"),
+            "PreparedRequest Debug must never leak the request body: {s}"
+        );
+        assert!(
+            s.contains("<redacted>"),
+            "Debug should mark the body redacted: {s}"
+        );
+        assert!(
+            s.contains("gpt-5.6-sol"),
+            "Debug should still contain the model: {s}"
         );
     }
 

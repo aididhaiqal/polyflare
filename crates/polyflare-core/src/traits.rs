@@ -1,6 +1,7 @@
 //! The five trait seams. M1 implemented only `Executor`; M2b implements `Selector`
-//! (reshaped here per M2-GATE1 + the `CapacityWeighted` impl in `select.rs`).
-//! `Continuity`/`Coordinator` stay PROVISIONAL — reshaped at their own milestones.
+//! (reshaped here per M2-GATE1 + the `CapacityWeighted` impl in `select.rs`); M3 reshapes
+//! `Continuity` (see `prepare`/`observe` below + `CodexContinuity` in the server crate).
+//! `Coordinator` stays PROVISIONAL — reshaped at its own milestone.
 
 use async_trait::async_trait;
 

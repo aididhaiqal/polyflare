@@ -11,7 +11,8 @@ use axum::response::{IntoResponse, Response};
 
 use polyflare_codex::oauth::{classify_failure, should_refresh, OAuthError};
 use polyflare_core::{
-    Account, AccountId, PreparedRequest, RecoveryPlan, RequestCtx, ResponseStream, SelectionCtx,
+    Account, AccountId, ContinuityDirective, Prepared, PreparedRequest, RecoveryPlan, RequestCtx,
+    ResponseStream, SelectionCtx,
 };
 use polyflare_store::PlainTokens;
 
@@ -199,7 +200,47 @@ pub async fn responses_handler(
                             .await;
                     stream_response(stream)
                 }
-                RecoveryPlan::None => internal_error(),
+                RecoveryPlan::None => {
+                    // No anchor ⇒ this request is self-sufficient (nothing to resume), so a
+                    // pinned-but-ineligible owner (cooldown / rate-limited / reauth_required /
+                    // a stale Soft session-row pin) is NOT fatal: fail over to any eligible
+                    // account from the FULL candidate pool, ignoring the pin, and relay as a
+                    // normal (Disarmed) request. `prepared.req` is still owned here — only
+                    // `directive.recovery` was moved by the outer match.
+                    match state.selector.pick(&snapshots, &sel_ctx) {
+                        Some(fresh) => {
+                            let account = match resolve_core_account(&state, &fresh, now).await {
+                                Ok(a) => a,
+                                Err(r) => return r,
+                            };
+                            let fallback = Prepared {
+                                req: prepared.req,
+                                directive: ContinuityDirective {
+                                    pin_account: None,
+                                    watchdog: prepared.directive.watchdog,
+                                    recovery: RecoveryPlan::None,
+                                    session_key: prepared.directive.session_key.clone(),
+                                },
+                            };
+                            match execute_with_watchdog(
+                                state.executor.as_ref(),
+                                state.continuity.clone(),
+                                fallback,
+                                &account,
+                                fresh,
+                                ctx,
+                            )
+                            .await
+                            {
+                                Ok(stream) => stream_response(stream),
+                                Err(_) => {
+                                    (StatusCode::BAD_GATEWAY, "upstream error").into_response()
+                                }
+                            }
+                        }
+                        None => no_eligible(),
+                    }
+                }
             }
         }
         RouteDecision::NoEligibleAccount => no_eligible(),
