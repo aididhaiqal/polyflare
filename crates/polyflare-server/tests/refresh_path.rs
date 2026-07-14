@@ -318,6 +318,62 @@ async fn concurrent_stale_requests_collapse_into_one_refresh() {
     );
 }
 
+/// F2 (failure-path single-mark): N concurrent requests on the SAME stale account whose refresh
+/// PERMANENTLY fails must hit the OAuth endpoint exactly ONCE and mark the account once — not
+/// re-hammer OAuth per waiter. The winner's refresh fails and marks the account non-active; every
+/// waiter, after taking the per-account lock, re-reads the account, sees it is no longer `active`,
+/// and bails without calling `refresh` again (which would present its own now-dead token, re-classify,
+/// and re-mark — serialized amplification on a doomed account). Without the status re-check the
+/// endpoint is hit 8 times; with it, exactly once.
+#[tokio::test]
+async fn concurrent_stale_requests_on_failing_account_mark_once() {
+    let upstream = MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()]);
+    let upstream_url = upstream.spawn().await;
+
+    let oauth = MockOAuth::error(400, "invalid_grant"); // classified permanent (reauth_required)
+    let oauth_handle = oauth.clone();
+    let oauth_url = oauth.spawn().await;
+
+    let (pf, state) = spawn(oauth_url, upstream_url, STALE).await;
+
+    const N: usize = 8;
+    let client = reqwest::Client::new();
+    let futures = (0..N).map(|_| {
+        let client = client.clone();
+        let pf = pf.clone();
+        tokio::spawn(async move {
+            client
+                .post(format!("{pf}/responses"))
+                .json(&serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}))
+                .send()
+                .await
+                .unwrap()
+        })
+    });
+    let responses = futures_util::future::join_all(futures).await;
+
+    for r in responses {
+        assert_eq!(
+            r.unwrap().status(),
+            503,
+            "a doomed (dead-token) account serves 503 to every request"
+        );
+    }
+
+    assert_eq!(
+        oauth_handle.hit_count(),
+        1,
+        "a permanently-failing refresh must be attempted ONCE across all 8 waiters — the losers \
+         must see the winner's mark and bail, not re-hit OAuth with their own dead token"
+    );
+
+    let acct = state.store.accounts().get("acct-1").await.unwrap().unwrap();
+    assert_eq!(
+        acct.status, "reauth_required",
+        "the account is marked exactly once by the single winner"
+    );
+}
+
 #[tokio::test]
 async fn upstream_error_yields_generic_502() {
     let upstream_url = spawn_failing_upstream().await;

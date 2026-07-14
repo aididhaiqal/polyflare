@@ -80,6 +80,14 @@ async fn resolve_core_account(
             Ok(Some(a)) => a,
             Ok(None) | Err(_) => return Err(internal_error()),
         };
+        // F2 (failure-path single-mark): a peer holding this lock before us may have had its
+        // refresh FAIL and marked the account non-active. `last_refresh` is unchanged on failure,
+        // so the staleness re-check below would not catch it — we'd re-hit OAuth with our own
+        // now-dead token, re-classify, and re-mark, once per waiter (serialized amplification on a
+        // doomed account). The winner already marked it; treat it as unavailable without re-refreshing.
+        if fresh_account.status != "active" {
+            return Err(account_unavailable());
+        }
         if should_refresh(fresh_account.last_refresh, now) {
             match state.oauth.refresh(&tokens.refresh_token).await {
                 Ok(refreshed) => {
