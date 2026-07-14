@@ -27,7 +27,10 @@ async fn refresh_returns_new_tokens_and_decoded_claims() {
 
     assert_eq!(refreshed.tokens.access_token, "new-access");
     assert_eq!(refreshed.tokens.refresh_token, "new-refresh");
-    assert_eq!(refreshed.claims.chatgpt_plan_type.as_deref(), Some("pro"));
+    assert_eq!(
+        refreshed.claims.unwrap().chatgpt_plan_type.as_deref(),
+        Some("pro")
+    );
 
     // The request carried the exact grant / client id / scope / refresh token.
     let body = handle.last_body().unwrap();
@@ -66,5 +69,25 @@ async fn refresh_keeps_existing_refresh_token_when_omitted() {
     let client = OAuthClient::new(base).unwrap();
     let refreshed = client.refresh("prev-refresh").await.unwrap();
     assert_eq!(refreshed.tokens.refresh_token, "rot-refresh");
-    assert_eq!(refreshed.claims.sub.as_deref(), Some("s2"));
+    assert_eq!(refreshed.claims.unwrap().sub.as_deref(), Some("s2"));
+}
+
+#[tokio::test]
+async fn refresh_with_malformed_id_token_keeps_tokens_and_yields_none_claims() {
+    // F5: a malformed id_token must NOT discard the valid access/refresh tokens. Previously the
+    // refresh returned Err(MalformedJwt), which the ingress classified as a permanent failure and
+    // wrongly marked the otherwise-healthy account `reauth_required`. Now claims decode is
+    // best-effort: the refresh succeeds with the tokens and `claims == None`.
+    let base = MockOAuth::ok("new-access", "new-refresh", "not-a-jwt")
+        .spawn()
+        .await;
+    let client = OAuthClient::new(base).unwrap();
+
+    let refreshed = client.refresh("old-refresh").await.unwrap();
+    assert_eq!(refreshed.tokens.access_token, "new-access");
+    assert_eq!(refreshed.tokens.refresh_token, "new-refresh");
+    assert!(
+        refreshed.claims.is_none(),
+        "a malformed id_token must yield None claims, not discard the valid tokens"
+    );
 }
