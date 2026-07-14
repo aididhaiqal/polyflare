@@ -7,7 +7,7 @@ use axum::routing::post;
 use axum::Router;
 
 use polyflare_codex::oauth::OAuthClient;
-use polyflare_core::{Executor, Selector};
+use polyflare_core::{Continuity, Executor, Selector};
 use polyflare_store::{Store, TokenCipher};
 
 use crate::ingress::responses_handler;
@@ -16,11 +16,13 @@ use crate::ingress::responses_handler;
 /// OpenAI-Responses requests. 100 MB is generous for real Codex turns while bounded.
 const MAX_REQUEST_BODY_BYTES: usize = 100 * 1024 * 1024;
 
-/// Shared server state: the executor, the account selector, the store + at-rest cipher, the
-/// OAuth refresher, and the shared upstream base URL. Wrapped in `Arc` by the caller.
+/// Shared server state: the executor, the account selector, the continuity engine, the store +
+/// at-rest cipher, the OAuth refresher, and the shared upstream base URL. Wrapped in `Arc` by the
+/// caller.
 pub struct AppState {
     pub executor: Arc<dyn Executor>,
     pub selector: Arc<dyn Selector>,
+    pub continuity: Arc<dyn Continuity>,
     pub store: Store,
     pub cipher: TokenCipher,
     pub oauth: OAuthClient,

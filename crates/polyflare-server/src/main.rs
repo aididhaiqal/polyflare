@@ -8,9 +8,10 @@ use clap::{Parser, Subcommand};
 
 use polyflare_codex::oauth::OAuthClient;
 use polyflare_codex::CodexExecutor;
-use polyflare_core::{CapacityWeighted, Selector};
+use polyflare_core::{CapacityWeighted, Continuity, Selector};
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::config::{self, ServeConfig};
+use polyflare_server::continuity::CodexContinuity;
 use polyflare_store::{import_from_codex_lb, Store, TokenCipher};
 
 #[derive(Parser)]
@@ -71,10 +72,15 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let executor = Arc::new(CodexExecutor::new()?);
     let selector: Arc<dyn Selector> = Arc::new(CapacityWeighted);
     let oauth = OAuthClient::new(config.auth_base_url)?;
+    let continuity: Arc<dyn Continuity> = Arc::new(CodexContinuity::new(
+        store.continuity(),
+        config.continuity_watchdog,
+    ));
 
     let state = Arc::new(AppState {
         executor,
         selector,
+        continuity,
         store,
         cipher,
         oauth,
