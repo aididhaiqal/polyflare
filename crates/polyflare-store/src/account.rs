@@ -212,3 +212,31 @@ impl AccountRepo {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_tokens_debug_redacts_secret_values() {
+        let tokens = PlainTokens {
+            access_token: "super-secret-access-xyz".to_string(),
+            refresh_token: "super-secret-refresh-xyz".to_string(),
+            id_token: "super-secret-id-xyz".to_string(),
+        };
+        let s = format!("{tokens:?}");
+        assert!(
+            !s.contains("super-secret-access-xyz"),
+            "Debug must not leak the access token"
+        );
+        assert!(
+            !s.contains("super-secret-refresh-xyz"),
+            "Debug must not leak the refresh token"
+        );
+        assert!(
+            !s.contains("super-secret-id-xyz"),
+            "Debug must not leak the id token"
+        );
+        assert!(s.contains("***"), "Debug must redact with `***`");
+    }
+}
