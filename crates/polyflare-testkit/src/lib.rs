@@ -2,42 +2,106 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Json, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
-use futures_util::stream::{self, Stream};
+use bytes::Bytes;
+use futures_util::stream;
 use tokio::net::TcpListener;
 
-/// A scriptable mock upstream: serves `POST /responses`, records the request body + the
-/// `Authorization` header, and streams back a fixed list of SSE `data:` payloads.
+/// The response behavior of a `MockUpstream`.
+#[derive(Clone)]
+enum MockMode {
+    /// Legacy: always stream the fixed `events` as SSE `data:` frames (with keep-alive). Never
+    /// injects a `response.id`. Used by the M1/M2 pass-through tests unchanged.
+    Scripted,
+    /// Emit `response.created`(resp_N) + `events` + `response.completed`(resp_N), generating a
+    /// fresh `resp_N` id per response. If `silent_on_anchor` and the body carries
+    /// `previous_response_id`, instead return 200 headers then a never-yielding body (no
+    /// keep-alive) — the wedge (silence-after-accept).
+    WithIds { silent_on_anchor: bool },
+}
+
+/// A scriptable mock upstream: serves `POST /responses`, records every request body + the last
+/// `Authorization` header, and streams SSE per its [`MockMode`].
 #[derive(Clone)]
 pub struct MockUpstream {
     events: Arc<Vec<String>>,
-    last_body: Arc<Mutex<Option<serde_json::Value>>>,
+    mode: MockMode,
+    bodies: Arc<Mutex<Vec<serde_json::Value>>>,
     last_authorization: Arc<Mutex<Option<String>>>,
+    emitted_ids: Arc<Mutex<Vec<String>>>,
+    counter: Arc<AtomicU32>,
 }
 
 impl MockUpstream {
-    pub fn new(events: Vec<String>) -> Self {
+    fn build(events: Vec<String>, mode: MockMode) -> Self {
         Self {
             events: Arc::new(events),
-            last_body: Arc::new(Mutex::new(None)),
+            mode,
+            bodies: Arc::new(Mutex::new(Vec::new())),
             last_authorization: Arc::new(Mutex::new(None)),
+            emitted_ids: Arc::new(Mutex::new(Vec::new())),
+            counter: Arc::new(AtomicU32::new(0)),
         }
     }
 
-    /// The JSON body of the most recent request, if any.
-    pub fn last_body(&self) -> Option<serde_json::Value> {
-        self.last_body.lock().unwrap().clone()
+    /// Legacy scripted mode: stream `events` verbatim (no id injection).
+    pub fn new(events: Vec<String>) -> Self {
+        Self::build(events, MockMode::Scripted)
     }
 
-    /// The `Authorization` header of the most recent request, if any (e.g. `"Bearer <token>"`).
+    /// Always respond, injecting `response.created`/`response.completed` with a generated id.
+    pub fn with_ids(events: Vec<String>) -> Self {
+        Self::build(
+            events,
+            MockMode::WithIds {
+                silent_on_anchor: false,
+            },
+        )
+    }
+
+    /// Respond with ids for anchorless requests; go silent (200 + no body) when the request
+    /// carries `previous_response_id` — the wedge.
+    pub fn silent_on_anchor(events: Vec<String>) -> Self {
+        Self::build(
+            events,
+            MockMode::WithIds {
+                silent_on_anchor: true,
+            },
+        )
+    }
+
+    /// The most recent request body, if any.
+    pub fn last_body(&self) -> Option<serde_json::Value> {
+        self.bodies.lock().unwrap().last().cloned()
+    }
+
+    /// Every recorded request body, in order.
+    pub fn bodies(&self) -> Vec<serde_json::Value> {
+        self.bodies.lock().unwrap().clone()
+    }
+
+    /// How many requests the mock has received.
+    pub fn request_count(&self) -> usize {
+        self.bodies.lock().unwrap().len()
+    }
+
+    /// The `Authorization` header of the most recent request (e.g. `"Bearer <token>"`).
     pub fn last_authorization(&self) -> Option<String> {
         self.last_authorization.lock().unwrap().clone()
+    }
+
+    /// The `response.id`s the mock has emitted, in order.
+    pub fn emitted_response_ids(&self) -> Vec<String> {
+        self.emitted_ids.lock().unwrap().clone()
     }
 
     /// Bind an ephemeral port, serve in a background task, and return the base URL.
@@ -57,19 +121,63 @@ impl MockUpstream {
     }
 }
 
+fn sse_frame(payload: &str) -> Bytes {
+    Bytes::from(format!("data: {payload}\n\n"))
+}
+
 async fn handler(
     State(mock): State<MockUpstream>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    *mock.last_body.lock().unwrap() = Some(body);
+) -> Response {
+    let has_anchor = body.get("previous_response_id").is_some();
+    mock.bodies.lock().unwrap().push(body);
     *mock.last_authorization.lock().unwrap() = headers
-        .get(axum::http::header::AUTHORIZATION)
+        .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let events = (*mock.events).clone();
-    let stream = stream::iter(events.into_iter().map(|d| Ok(Event::default().data(d))));
-    Sse::new(stream).keep_alive(KeepAlive::default())
+
+    match mock.mode {
+        MockMode::Scripted => {
+            let events = (*mock.events).clone();
+            let s = stream::iter(
+                events
+                    .into_iter()
+                    .map(|d| Ok::<Event, Infallible>(Event::default().data(d))),
+            );
+            Sse::new(s).keep_alive(KeepAlive::default()).into_response()
+        }
+        MockMode::WithIds { silent_on_anchor } => {
+            if silent_on_anchor && has_anchor {
+                // The wedge: 200 headers, then a body that never yields a byte (no keep-alive).
+                let pending = stream::pending::<Result<Bytes, std::io::Error>>();
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(pending))
+                    .unwrap();
+            }
+            let n = mock.counter.fetch_add(1, Ordering::SeqCst) + 1;
+            let id = format!("resp_{n}");
+            mock.emitted_ids.lock().unwrap().push(id.clone());
+            let mut frames: Vec<Bytes> = Vec::new();
+            frames.push(sse_frame(&format!(
+                r#"{{"type":"response.created","response":{{"id":"{id}"}}}}"#
+            )));
+            for e in mock.events.iter() {
+                frames.push(sse_frame(e));
+            }
+            frames.push(sse_frame(&format!(
+                r#"{{"type":"response.completed","response":{{"id":"{id}"}}}}"#
+            )));
+            let s = stream::iter(frames.into_iter().map(Ok::<Bytes, std::io::Error>));
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(s))
+                .unwrap()
+        }
+    }
 }
 
 #[cfg(test)]
