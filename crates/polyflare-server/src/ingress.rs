@@ -78,11 +78,18 @@ pub async fn responses_handler(
         }
     };
     if should_refresh(account.last_refresh, now) {
-        // A refresh failure MUST NOT loop: M2b has no live error_count/cooldown tracking, so an
-        // account left `active` after a failed refresh stays eligible, gets re-selected, is still
-        // stale, and would refresh+fail forever. Every non-transport failure therefore marks the
-        // account (making it ineligible next time) and stops THIS request — only a genuine network
-        // blip (`Transport`) is a no-op that proceeds with the current token.
+        // Refresh-failure handling (M2b has no live error_count/cooldown tracking yet):
+        //   * PERMANENT failures — `Endpoint{code:Some}` whose `classify_failure` yields a status,
+        //     plus the unclassifiable `Endpoint{code:None}` / `MalformedJwt` — MARK the account
+        //     (reauth_required / deactivated), so the eligibility filter excludes it next request.
+        //     This is what stops a stale account refreshing+failing forever.
+        //   * A TRANSIENT-classified endpoint error (`Endpoint{code:Some}` where classify → status
+        //     `None`, e.g. `server_error` / `rate_limited`) does NOT mark: it 503s this request but
+        //     the account stays `active` + selectable, so the next request retries the refresh
+        //     (correct retry-on-transient). Damping a persistently-transient endpoint with a
+        //     cooldown/backoff needs a persisted `cooldown_until` and is deferred to M3.
+        //   * `Transport` (genuine network blip) is the ONLY no-op that PROCEEDS with the current
+        //     token (which may still be valid).
         match state.oauth.refresh(&tokens.refresh_token).await {
             Ok(refreshed) => {
                 let new = PlainTokens {
