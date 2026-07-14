@@ -3,6 +3,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, Json, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -19,6 +20,10 @@ pub struct MockUpstream {
     events: Arc<Vec<String>>,
     last_body: Arc<Mutex<Option<serde_json::Value>>>,
     last_authorization: Arc<Mutex<Option<String>>>,
+    /// If set, sleep this long after emitting `events[0]` and before emitting `events[1..]`.
+    /// Used to simulate a real upstream's inter-chunk gap so callers can assert a relay forwards
+    /// the first chunk immediately instead of buffering the whole stream.
+    gap_after_first: Option<Duration>,
 }
 
 impl MockUpstream {
@@ -27,6 +32,25 @@ impl MockUpstream {
             events: Arc::new(events),
             last_body: Arc::new(Mutex::new(None)),
             last_authorization: Arc::new(Mutex::new(None)),
+            gap_after_first: None,
+        }
+    }
+
+    /// Like `new`, but emits `first_chunk` immediately, then sleeps `gap` before emitting
+    /// `later_chunks` back-to-back. Used to test that a relay forwards the first chunk as soon as
+    /// upstream sends it rather than buffering the whole response.
+    pub fn chunked_with_gap(
+        first_chunk: impl Into<String>,
+        later_chunks: Vec<String>,
+        gap: Duration,
+    ) -> Self {
+        let mut events = vec![first_chunk.into()];
+        events.extend(later_chunks);
+        Self {
+            events: Arc::new(events),
+            last_body: Arc::new(Mutex::new(None)),
+            last_authorization: Arc::new(Mutex::new(None)),
+            gap_after_first: Some(gap),
         }
     }
 
@@ -68,7 +92,21 @@ async fn handler(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let events = (*mock.events).clone();
-    let stream = stream::iter(events.into_iter().map(|d| Ok(Event::default().data(d))));
+    let gap_after_first = mock.gap_after_first;
+    // `idx` tracks the position of the item about to be yielded so the gap lands exactly once,
+    // between event 0 and event 1 (i.e. after the first chunk, before the rest).
+    let stream = stream::unfold(
+        (events.into_iter(), 0usize),
+        move |(mut iter, idx)| async move {
+            let item = iter.next()?;
+            if idx == 1 {
+                if let Some(gap) = gap_after_first {
+                    tokio::time::sleep(gap).await;
+                }
+            }
+            Some((Ok(Event::default().data(item)), (iter, idx + 1)))
+        },
+    );
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
@@ -94,6 +132,50 @@ mod tests {
         assert!(text.contains("data: one"));
         assert!(text.contains("data: two"));
         assert_eq!(handle.last_body().unwrap()["model"], "gpt-5.6-sol");
+    }
+
+    #[tokio::test]
+    async fn chunked_with_gap_delays_only_between_first_and_later_chunks() {
+        use futures_util::StreamExt;
+
+        let gap = Duration::from_millis(200);
+        let mock = MockUpstream::chunked_with_gap(
+            "first",
+            vec!["second".to_string(), "third".to_string()],
+            gap,
+        );
+        let base = mock.spawn().await;
+
+        let client = reqwest::Client::new();
+        let start = tokio::time::Instant::now();
+        let resp = client
+            .post(format!("{base}/responses"))
+            .json(&serde_json::json!({"model": "gpt-5.6-sol"}))
+            .send()
+            .await
+            .unwrap();
+
+        let mut stream = resp.bytes_stream();
+        let first = stream.next().await.unwrap().unwrap();
+        let t_first = start.elapsed();
+        assert!(String::from_utf8_lossy(&first).contains("data: first"));
+        // The first chunk must arrive well before the gap elapses (no buffering of it).
+        assert!(
+            t_first < gap / 2,
+            "t_first={t_first:?} should be well under half of gap={gap:?}"
+        );
+
+        let mut rest = String::new();
+        while let Some(chunk) = stream.next().await {
+            rest.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        }
+        let t_full = start.elapsed();
+        assert!(rest.contains("data: second") && rest.contains("data: third"));
+        // The full stream must take at least the injected gap (sanity: the gap really happened).
+        assert!(
+            t_full >= gap,
+            "t_full={t_full:?} should be at least gap={gap:?}"
+        );
     }
 }
 
