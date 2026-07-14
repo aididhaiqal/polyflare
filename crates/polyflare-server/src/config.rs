@@ -1,5 +1,7 @@
 //! Process configuration, read from environment. Secrets never logged.
 
+use std::path::{Path, PathBuf};
+
 use polyflare_core::Account;
 
 pub struct Config {
@@ -24,4 +26,23 @@ impl Config {
             },
         })
     }
+}
+
+/// The PolyFlare data directory: `$POLYFLARE_DATA_DIR`, else `$HOME/.polyflare`.
+pub fn data_dir_from_env() -> PathBuf {
+    if let Ok(dir) = std::env::var("POLYFLARE_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".polyflare")
+}
+
+/// The store DB path within a data directory.
+pub fn db_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("store.db")
+}
+
+/// The at-rest key file path within a data directory (raw 32 bytes).
+pub fn key_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("key")
 }
