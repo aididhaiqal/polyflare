@@ -803,7 +803,9 @@ async fn executor_surfaces_upstream_error_status() {
         body: serde_json::json!({"model": "m"}),
         model: "m".into(),
     };
-    let err = executor.execute(req, &account).await.unwrap_err();
+    // `.err().unwrap()` (not `.unwrap_err()`): the Ok side `ResponseStream`
+    // is `Pin<Box<dyn Stream>>` and has no `Debug` impl, which `unwrap_err` requires.
+    let err = executor.execute(req, &account).await.err().unwrap();
     assert!(matches!(err, polyflare_core::ExecError::Upstream(_)));
 }
 ```
