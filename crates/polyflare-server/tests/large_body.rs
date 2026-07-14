@@ -1,14 +1,43 @@
-//! Regression test: axum's `Json` extractor defaults to a 2 MB body limit, which would
-//! 413 real Codex requests (long conversations / file reads). `build_app` raises this to
-//! 100 MB via `DefaultBodyLimit::max`. This proves the raised limit holds end-to-end:
-//! client -> polyflare server -> executor -> mock upstream, for a body well over 2 MB.
+//! Regression: the raised 100 MB body limit holds through the store-backed serve path.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use polyflare_codex::oauth::OAuthClient;
 use polyflare_codex::CodexExecutor;
-use polyflare_core::Account;
+use polyflare_core::CapacityWeighted;
 use polyflare_server::app::{build_app, AppState};
+use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
 use polyflare_testkit::MockUpstream;
+
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+fn store_account(id: &str) -> Account {
+    Account {
+        id: id.to_string(),
+        chatgpt_account_id: None,
+        chatgpt_user_id: None,
+        email: "u@example.test".to_string(),
+        alias: None,
+        workspace_id: None,
+        workspace_label: None,
+        seat_type: None,
+        plan_type: "pro".to_string(),
+        routing_policy: "normal".to_string(),
+        last_refresh: now(),
+        created_at: now(),
+        status: "active".to_string(),
+        deactivation_reason: None,
+        reset_at: None,
+        blocked_at: None,
+        security_work_authorized: false,
+    }
+}
 
 #[tokio::test]
 async fn large_request_body_is_not_rejected_with_413() {
@@ -16,13 +45,31 @@ async fn large_request_body_is_not_rejected_with_413() {
     let handle = mock.clone();
     let upstream = mock.spawn().await;
 
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[6u8; 32]).unwrap();
+    store
+        .accounts()
+        .insert(
+            &store_account("large-body"),
+            &PlainTokens {
+                access_token: "tok".to_string(),
+                refresh_token: "r".to_string(),
+                id_token: "i".to_string(),
+            },
+            &cipher,
+        )
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+
     let state = Arc::new(AppState {
         executor: Arc::new(CodexExecutor::new().unwrap()),
-        account: Account {
-            id: "large-body".into(),
-            base_url: upstream,
-            bearer_token: "tok".into(),
-        },
+        selector: Arc::new(CapacityWeighted),
+        store,
+        cipher,
+        oauth: OAuthClient::new("http://127.0.0.1:9").unwrap(),
+        upstream_base_url: upstream,
     });
     let app = build_app(state);
 
@@ -32,12 +79,10 @@ async fn large_request_body_is_not_rejected_with_413() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    // Well over axum's default 2 MB Json limit.
     let payload = serde_json::json!({
         "model": "gpt-5.6-sol",
         "input": "x".repeat(2_500_000),
     });
-
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("http://{addr}/responses"))
@@ -45,7 +90,6 @@ async fn large_request_body_is_not_rejected_with_413() {
         .send()
         .await
         .unwrap();
-
     assert_eq!(
         resp.status(),
         200,
@@ -54,9 +98,5 @@ async fn large_request_body_is_not_rejected_with_413() {
 
     let last_body = handle.last_body().unwrap();
     assert_eq!(last_body["model"], "gpt-5.6-sol");
-    assert_eq!(
-        last_body["input"].as_str().unwrap().len(),
-        2_500_000,
-        "mock upstream must have received the full large body"
-    );
+    assert_eq!(last_body["input"].as_str().unwrap().len(), 2_500_000);
 }
