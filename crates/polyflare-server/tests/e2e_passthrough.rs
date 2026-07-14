@@ -11,12 +11,18 @@ use polyflare_testkit::MockUpstream;
 async fn spawn_polyflare(upstream: String) -> String {
     let state = Arc::new(AppState {
         executor: Arc::new(CodexExecutor::new().unwrap()),
-        account: Account { id: "e2e".into(), base_url: upstream, bearer_token: "tok".into() },
+        account: Account {
+            id: "e2e".into(),
+            base_url: upstream,
+            bearer_token: "tok".into(),
+        },
     });
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
     format!("http://{addr}")
 }
 

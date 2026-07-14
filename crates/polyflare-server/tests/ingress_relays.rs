@@ -17,13 +17,19 @@ async fn server_relays_upstream_stream_to_client() {
 
     let state = Arc::new(AppState {
         executor: Arc::new(CodexExecutor::new().unwrap()),
-        account: Account { id: "a".into(), base_url: upstream, bearer_token: "tok".into() },
+        account: Account {
+            id: "a".into(),
+            base_url: upstream,
+            bearer_token: "tok".into(),
+        },
     });
     let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
 
     let client = reqwest::Client::new();
     let resp = client
