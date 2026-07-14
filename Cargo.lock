@@ -1409,23 +1409,30 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
 name = "polyflare-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "bytes",
  "clap",
+ "futures-core",
  "futures-util",
+ "hex",
  "polyflare-codex",
  "polyflare-core",
  "polyflare-store",
  "polyflare-testkit",
  "reqwest",
  "serde_json",
+ "sha2",
  "sqlx",
  "tempfile",
+ "thiserror",
  "tokio",
 ]
 
@@ -1447,6 +1454,7 @@ name = "polyflare-testkit"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "futures-util",
  "reqwest",
  "serde_json",

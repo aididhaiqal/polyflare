@@ -11,10 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::http::StatusCode;
 use polyflare_codex::oauth::OAuthClient;
 use polyflare_codex::CodexExecutor;
-use polyflare_core::CapacityWeighted;
+use polyflare_core::{CapacityWeighted, Continuity};
 use polyflare_server::app::{build_app, AppState};
+use polyflare_server::continuity::CodexContinuity;
 use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
 use polyflare_testkit::{MockOAuth, MockUpstream};
+use std::time::Duration;
 
 /// A decode-able id_token (payload `{}`) so a `MockOAuth::ok` refresh returns `Ok` rather than
 /// `Err(MalformedJwt)` when the client decodes the returned id_token.
@@ -74,11 +76,16 @@ async fn spawn(
         )
         .await
         .unwrap();
+    let continuity: Arc<dyn Continuity> = Arc::new(CodexContinuity::new(
+        store.continuity(),
+        Duration::from_secs(30),
+    ));
     std::mem::forget(dir);
 
     let state = Arc::new(AppState {
         executor: Arc::new(CodexExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),
+        continuity,
         store,
         cipher,
         oauth: OAuthClient::new(oauth_url).unwrap(),

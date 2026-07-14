@@ -1,12 +1,13 @@
 //! The five trait seams. M1 implemented only `Executor`; M2b implements `Selector`
-//! (reshaped here per M2-GATE1 + the `CapacityWeighted` impl in `select.rs`).
-//! `Continuity`/`Coordinator` stay PROVISIONAL — reshaped at their own milestones.
+//! (reshaped here per M2-GATE1 + the `CapacityWeighted` impl in `select.rs`); M3 reshapes
+//! `Continuity` (see `prepare`/`observe` below + `CodexContinuity` in the server crate).
+//! `Coordinator` stays PROVISIONAL — reshaped at its own milestone.
 
 use async_trait::async_trait;
 
 use crate::types::{
-    Account, AccountId, AccountSnapshot, ExecError, PreparedRequest, RequestCtx, ResponseStream,
-    SelectionCtx,
+    Account, AccountId, AccountSnapshot, ContinuityError, ExecError, Prepared, PreparedRequest,
+    RequestCtx, ResponseStream, SelectionCtx, TurnOutcome,
 };
 
 /// Executes a prepared request against an upstream using an account, returning a byte stream.
@@ -26,9 +27,18 @@ pub trait Selector: Send + Sync {
     fn pick(&self, candidates: &[AccountSnapshot], ctx: &SelectionCtx) -> Option<AccountId>;
 }
 
-/// Applies continuity (anchor/trim/resend) before execution. (No-op in M1; state machine in M3.)
+/// The continuity state machine seam (M3). `prepare` resolves session + ownership and decides
+/// routing + watchdog; `observe` advances the machine from how the turn resolved. Both read/write
+/// persisted session state and may fail.
+#[async_trait]
 pub trait Continuity: Send + Sync {
-    fn prepare(&self, req: PreparedRequest, ctx: &RequestCtx) -> PreparedRequest;
+    async fn prepare(
+        &self,
+        req: PreparedRequest,
+        ctx: &RequestCtx,
+    ) -> Result<Prepared, ContinuityError>;
+
+    async fn observe(&self, outcome: TurnOutcome, ctx: &RequestCtx) -> Result<(), ContinuityError>;
 }
 
 /// Coordinates session ownership + admission. (In-process pass in M1.)

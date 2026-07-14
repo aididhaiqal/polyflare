@@ -4,20 +4,27 @@ use std::sync::Arc;
 
 use polyflare_codex::oauth::OAuthClient;
 use polyflare_codex::CodexExecutor;
-use polyflare_core::CapacityWeighted;
+use polyflare_core::{CapacityWeighted, Continuity};
 use polyflare_server::app::{build_app, AppState};
+use polyflare_server::continuity::CodexContinuity;
 use polyflare_store::{Store, TokenCipher};
+use std::time::Duration;
 
 #[tokio::test]
 async fn no_eligible_account_returns_503() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
     let cipher = TokenCipher::from_key_bytes(&[8u8; 32]).unwrap();
+    let continuity: Arc<dyn Continuity> = Arc::new(CodexContinuity::new(
+        store.continuity(),
+        Duration::from_secs(30),
+    ));
     std::mem::forget(dir);
 
     let state = Arc::new(AppState {
         executor: Arc::new(CodexExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),
+        continuity,
         store, // no accounts inserted → empty snapshot pool
         cipher,
         oauth: OAuthClient::new("http://127.0.0.1:9").unwrap(),
