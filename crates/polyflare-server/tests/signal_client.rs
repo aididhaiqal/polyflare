@@ -39,6 +39,7 @@ fn account(id: &str) -> Account {
         reset_at: None,
         blocked_at: None,
         security_work_authorized: false,
+        provider: "codex".to_string(),
     }
 }
 
