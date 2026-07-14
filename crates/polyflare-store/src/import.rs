@@ -88,6 +88,10 @@ pub async fn import_from_codex_lb(
 
     let mut summary = ImportSummary::default();
 
+    // All destination writes go through a single transaction so a mid-import failure (e.g. a
+    // Fernet-decrypt error on a later account) rolls the whole import back — no partial data.
+    let mut tx = store.pool().begin().await?;
+
     // --- accounts (parents first, so usage_history foreign keys resolve) ---
     let src_accounts = sqlx::query_as::<_, SrcAccount>(
         "SELECT id, chatgpt_account_id, chatgpt_user_id, email, alias, \
@@ -99,7 +103,6 @@ pub async fn import_from_codex_lb(
     .fetch_all(&src_pool)
     .await?;
 
-    let repo = store.accounts();
     for src in src_accounts {
         let tokens = PlainTokens {
             access_token: fernet_decrypt(&fernet, &src.access_token_encrypted)?,
@@ -126,11 +129,45 @@ pub async fn import_from_codex_lb(
             blocked_at: src.blocked_at,
             security_work_authorized: src.security_work_authorized,
         };
-        repo.insert_encrypted(&account, &enc).await?;
+        // `OR IGNORE` makes the account insert idempotent: re-running after a fix skips ids
+        // already present instead of erroring on the `id` PRIMARY KEY.
+        sqlx::query(
+            "INSERT OR IGNORE INTO accounts (\
+                id, chatgpt_account_id, chatgpt_user_id, email, alias, \
+                workspace_id, workspace_label, seat_type, plan_type, routing_policy, \
+                access_token_enc, refresh_token_enc, id_token_enc, \
+                last_refresh, created_at, status, deactivation_reason, \
+                reset_at, blocked_at, security_work_authorized\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(account.id.as_str())
+        .bind(account.chatgpt_account_id.as_deref())
+        .bind(account.chatgpt_user_id.as_deref())
+        .bind(account.email.as_str())
+        .bind(account.alias.as_deref())
+        .bind(account.workspace_id.as_deref())
+        .bind(account.workspace_label.as_deref())
+        .bind(account.seat_type.as_deref())
+        .bind(account.plan_type.as_str())
+        .bind(account.routing_policy.as_str())
+        .bind(enc.access_token_enc.as_slice())
+        .bind(enc.refresh_token_enc.as_slice())
+        .bind(enc.id_token_enc.as_slice())
+        .bind(account.last_refresh)
+        .bind(account.created_at)
+        .bind(account.status.as_str())
+        .bind(account.deactivation_reason.as_deref())
+        .bind(account.reset_at)
+        .bind(account.blocked_at)
+        .bind(account.security_work_authorized)
+        .execute(&mut *tx)
+        .await?;
         summary.accounts_imported += 1;
     }
 
     // --- usage_history (copied by value) ---
+    // Append-only within the transaction. Import targets a FRESH store; re-importing into a
+    // populated store may duplicate usage rows, which is acceptable for a one-time migration.
     let src_usage = sqlx::query_as::<_, SrcUsage>(
         "SELECT account_id, recorded_at, \"window\", used_percent, input_tokens, \
          output_tokens, reset_at, window_minutes, credits_has, credits_unlimited, \
@@ -158,10 +195,13 @@ pub async fn import_from_codex_lb(
         .bind(row.credits_has)
         .bind(row.credits_unlimited)
         .bind(row.credits_balance)
-        .execute(store.pool())
+        .execute(&mut *tx)
         .await?;
         summary.usage_rows_imported += 1;
     }
+
+    // Commit only after BOTH loops succeed; any earlier `?` drops `tx` → full rollback.
+    tx.commit().await?;
 
     Ok(summary)
 }

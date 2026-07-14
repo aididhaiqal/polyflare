@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use fernet::Fernet;
-use polyflare_store::{import_from_codex_lb, Store, TokenCipher};
+use polyflare_store::{import_from_codex_lb, Store, StoreError, TokenCipher};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 /// Create a codex-lb-shaped source DB at `path` with one account (tokens Fernet-encrypted with
@@ -127,6 +127,57 @@ async fn build_source_db(path: &Path, fernet_key: &str) {
     .unwrap();
 }
 
+/// Append one more account (id `acct_id`, tokens Fernet-encrypted with `fernet_key`) to an
+/// existing codex-lb-shaped source DB. Used to build a mixed-key fixture for the rollback test.
+async fn append_account(path: &Path, acct_id: &str, fernet_key: &str) {
+    let opts = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .unwrap();
+
+    let fernet = Fernet::new(fernet_key).unwrap();
+    let access = fernet.encrypt(b"ACCESS-plaintext");
+    let refresh = fernet.encrypt(b"REFRESH-plaintext");
+    let id = fernet.encrypt(b"IDTOKEN-plaintext");
+
+    sqlx::query(
+        "INSERT INTO accounts (
+            id, chatgpt_account_id, chatgpt_user_id, email, alias,
+            workspace_id, workspace_label, seat_type, plan_type, routing_policy,
+            access_token_encrypted, refresh_token_encrypted, id_token_encrypted,
+            last_refresh, created_at, status, deactivation_reason,
+            reset_at, blocked_at, security_work_authorized
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(acct_id)
+    .bind(Option::<String>::None)
+    .bind(Option::<String>::None)
+    .bind("second@example.test")
+    .bind(Option::<String>::None)
+    .bind(Option::<String>::None)
+    .bind(Option::<String>::None)
+    .bind(Option::<String>::None)
+    .bind("pro")
+    .bind("normal")
+    .bind(access.into_bytes())
+    .bind(refresh.into_bytes())
+    .bind(id.into_bytes())
+    .bind(1_700_000_000_i64)
+    .bind(1_699_000_000_i64)
+    .bind("active")
+    .bind(Option::<String>::None)
+    .bind(Option::<i64>::None)
+    .bind(Option::<i64>::None)
+    .bind(true)
+    .execute(&pool)
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn imports_accounts_usage_and_tokens_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
@@ -174,4 +225,50 @@ async fn imports_accounts_usage_and_tokens_roundtrip() {
             .await
             .unwrap();
     assert_eq!(usage_count, 1);
+}
+
+/// A mid-import Fernet-decrypt failure must fail cleanly (no panic) AND roll the WHOLE import
+/// back, leaving the destination store empty. The fixture is built so a real write lands before
+/// the failure: `acct-1` (inserted first) is encrypted under the importer's key `key_b` and so
+/// decrypts + inserts successfully, then `acct-bad` (inserted second) is encrypted under a
+/// different key `key_a` and fails to decrypt. If the writes were not wrapped in one transaction,
+/// `acct-1` would survive; asserting the store is empty proves the transaction rolled it back.
+#[tokio::test]
+async fn mid_import_decrypt_failure_errors_and_rolls_back_leaving_store_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_db = dir.path().join("codex-lb-store.db");
+    let key_path = dir.path().join("import.key");
+    let pf_db = dir.path().join("polyflare-store.db");
+    let pf_key = dir.path().join("key");
+
+    // `key_b` is the key the importer is given. `acct-1` (first row) is encrypted under it and
+    // will insert; `acct-bad` (second row) is encrypted under the different `key_a` and fails.
+    let key_a = Fernet::generate_key();
+    let key_b = Fernet::generate_key();
+    assert_ne!(
+        key_a, key_b,
+        "keys must differ for this test to be meaningful"
+    );
+    std::fs::write(&key_path, &key_b).unwrap();
+    build_source_db(&src_db, &key_b).await; // inserts acct-1 (decryptable) first
+    append_account(&src_db, "acct-bad", &key_a).await; // inserts acct-bad (undecryptable) second
+
+    let store = Store::open(&pf_db).await.unwrap();
+    let cipher = TokenCipher::load_or_create(&pf_key).unwrap();
+
+    // (a) It returns Err (no panic) — an import error from the failed decrypt of acct-bad.
+    let result = import_from_codex_lb(&store, &src_db, &key_path, &cipher).await;
+    assert!(
+        matches!(result, Err(StoreError::Import(_))),
+        "expected StoreError::Import on the undecryptable account, got {result:?}"
+    );
+
+    // (b) The transaction rolled back: even acct-1 (which decrypted fine and was inserted before
+    //     the failure) must be gone — the whole import is atomic.
+    let accounts = store.accounts().list().await.unwrap();
+    assert_eq!(
+        accounts.len(),
+        0,
+        "destination store must be empty after a rolled-back import (acct-1 must not survive)"
+    );
 }
