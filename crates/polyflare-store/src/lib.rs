@@ -3,11 +3,13 @@
 //! is never logged.
 
 pub mod account;
+pub mod continuity_repo;
 pub mod crypto;
 pub mod import;
 pub mod store;
 
 pub use account::{Account, AccountRepo, EncryptedTokens, PlainTokens, UsageSnapshot, WindowUsage};
+pub use continuity_repo::{ContinuityRepo, SessionRow};
 pub use crypto::TokenCipher;
 pub use import::{import_from_codex_lb, ImportSummary};
 pub use store::Store;
