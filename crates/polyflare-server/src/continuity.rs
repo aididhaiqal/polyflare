@@ -129,11 +129,55 @@ impl Continuity for CodexContinuity {
 
     async fn observe(
         &self,
-        _outcome: TurnOutcome,
+        outcome: TurnOutcome,
         _ctx: &RequestCtx,
     ) -> Result<(), ContinuityError> {
-        // Implemented in C6.
-        Ok(())
+        let now = now_secs();
+        match outcome {
+            TurnOutcome::Completed {
+                session_key,
+                account,
+                response_id,
+                input_fingerprint,
+                input_count,
+                ..
+            } => {
+                if let (Some(sk), Some(rid)) = (session_key, response_id) {
+                    self.repo
+                        .record_completion(
+                            &sk.value,
+                            strength_str(sk.strength),
+                            account.as_str(),
+                            &rid,
+                            &input_fingerprint,
+                            input_count as i64,
+                            now,
+                        )
+                        .await
+                        .map_err(box_store_err)?;
+                }
+                Ok(())
+            }
+            TurnOutcome::Recovered {
+                session_key,
+                account,
+                new_response_id,
+            } => {
+                if let Some(sk) = session_key {
+                    self.repo
+                        .record_recovery(
+                            &sk.value,
+                            account.as_str(),
+                            new_response_id.as_deref(),
+                            now,
+                        )
+                        .await
+                        .map_err(box_store_err)?;
+                }
+                Ok(())
+            }
+            TurnOutcome::Failed { .. } => Ok(()),
+        }
     }
 }
 
@@ -263,6 +307,88 @@ mod tests {
             p.directive.pin_account,
             Some(AccountId::from("A")),
             "anchor map pins to owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_completed_records_owner_and_anchor() {
+        let (store, cont) = make().await;
+        sqlx::query(
+            "INSERT INTO accounts (id, email, access_token_enc, refresh_token_enc, id_token_enc, created_at) \
+             VALUES ('A', 'e@x', X'00', X'00', X'00', 0)",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let sk = polyflare_core::SessionKey {
+            value: "skC".into(),
+            strength: KeyStrength::Soft,
+        };
+        cont.repo.ensure_session("skC", "soft", 1).await.unwrap();
+        cont.observe(
+            TurnOutcome::Completed {
+                session_key: Some(sk),
+                account: AccountId::from("A"),
+                response_id: Some("resp_7".into()),
+                input_fingerprint: "fp".into(),
+                input_count: 2,
+                reasoning: None,
+            },
+            &RequestCtx::default(),
+        )
+        .await
+        .unwrap();
+        let owner = store.continuity().get_anchor_owner("resp_7").await.unwrap();
+        assert_eq!(owner.as_deref(), Some("A"));
+        let row = store
+            .continuity()
+            .get_session("skC")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "anchored");
+    }
+
+    #[tokio::test]
+    async fn observe_recovered_rehomes_owner() {
+        let (store, cont) = make().await;
+        for id in ["A", "B"] {
+            sqlx::query(
+                "INSERT INTO accounts (id, email, access_token_enc, refresh_token_enc, id_token_enc, created_at) \
+                 VALUES (?, 'e@x', X'00', X'00', X'00', 0)",
+            )
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        cont.repo.ensure_session("skR", "soft", 1).await.unwrap();
+        cont.repo
+            .record_completion("skR", "soft", "A", "resp_1", "fp", 2, 1)
+            .await
+            .unwrap();
+        let sk = polyflare_core::SessionKey {
+            value: "skR".into(),
+            strength: KeyStrength::Soft,
+        };
+        cont.observe(
+            TurnOutcome::Recovered {
+                session_key: Some(sk),
+                account: AccountId::from("B"),
+                new_response_id: Some("resp_2".into()),
+            },
+            &RequestCtx::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .continuity()
+                .get_anchor_owner("resp_2")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("B")
         );
     }
 }
