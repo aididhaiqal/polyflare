@@ -31,3 +31,5 @@ fernet = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
+rand = "0.9"
+base64 = "0.22"
