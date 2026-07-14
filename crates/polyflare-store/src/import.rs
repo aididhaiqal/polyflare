@@ -135,6 +135,7 @@ pub async fn import_from_codex_lb(
             reset_at: src.reset_at,
             blocked_at: src.blocked_at,
             security_work_authorized: src.security_work_authorized,
+            provider: "codex".to_string(),
         };
         // `OR IGNORE` makes the account insert idempotent: re-running after a fix skips ids
         // already present instead of erroring on the `id` PRIMARY KEY.
@@ -144,8 +145,8 @@ pub async fn import_from_codex_lb(
                 workspace_id, workspace_label, seat_type, plan_type, routing_policy, \
                 access_token_enc, refresh_token_enc, id_token_enc, \
                 last_refresh, created_at, status, deactivation_reason, \
-                reset_at, blocked_at, security_work_authorized\
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                reset_at, blocked_at, security_work_authorized, provider\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(account.id.as_str())
         .bind(account.chatgpt_account_id.as_deref())
@@ -167,6 +168,7 @@ pub async fn import_from_codex_lb(
         .bind(account.reset_at)
         .bind(account.blocked_at)
         .bind(account.security_work_authorized)
+        .bind(account.provider.as_str())
         .execute(&mut *tx)
         .await?;
         // `rows_affected()` is 0 when `OR IGNORE` skips an already-present id, 1 when a row is

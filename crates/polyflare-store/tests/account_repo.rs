@@ -21,6 +21,7 @@ fn sample_account(id: &str) -> Account {
         reset_at: None,
         blocked_at: None,
         security_work_authorized: true,
+        provider: "codex".to_string(),
     }
 }
 
@@ -95,5 +96,41 @@ async fn insert_get_list_decrypt_and_update() {
     assert_eq!(
         repo.get("acct-1").await.unwrap().unwrap().last_refresh,
         1_700_500_000
+    );
+}
+
+#[tokio::test]
+async fn provider_round_trips_and_legacy_rows_default_to_codex() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[11u8; 32]).unwrap();
+    let repo = store.accounts();
+
+    // A fresh Anthropic account round-trips its provider through insert/get.
+    let mut anthropic = sample_account("anthropic-1");
+    anthropic.provider = "anthropic".to_string();
+    repo.insert(&anthropic, &sample_tokens(), &cipher)
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.get("anthropic-1").await.unwrap().unwrap().provider,
+        "anthropic"
+    );
+
+    // A legacy row written the way pre-M4a code would (no `provider` column mentioned at all)
+    // must default to 'codex' via the migration's column default — the real regression this
+    // migration protects against.
+    sqlx::query(
+        "INSERT INTO accounts (id, email, plan_type, routing_policy, access_token_enc, \
+         refresh_token_enc, id_token_enc, last_refresh, created_at, status, \
+         security_work_authorized) VALUES ('legacy-1', 'legacy@example.test', 'pro', 'normal', \
+         x'00', x'00', x'00', 0, 0, 'active', 0)",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        repo.get("legacy-1").await.unwrap().unwrap().provider,
+        "codex"
     );
 }
