@@ -5,19 +5,20 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{DefaultBodyLimit, Json, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::post;
 use axum::Router;
 use futures_util::stream::{self, Stream};
 use tokio::net::TcpListener;
 
-/// A scriptable mock upstream: serves `POST /responses`, records the request body,
-/// and streams back a fixed list of SSE `data:` payloads.
+/// A scriptable mock upstream: serves `POST /responses`, records the request body + the
+/// `Authorization` header, and streams back a fixed list of SSE `data:` payloads.
 #[derive(Clone)]
 pub struct MockUpstream {
     events: Arc<Vec<String>>,
     last_body: Arc<Mutex<Option<serde_json::Value>>>,
+    last_authorization: Arc<Mutex<Option<String>>>,
 }
 
 impl MockUpstream {
@@ -25,12 +26,18 @@ impl MockUpstream {
         Self {
             events: Arc::new(events),
             last_body: Arc::new(Mutex::new(None)),
+            last_authorization: Arc::new(Mutex::new(None)),
         }
     }
 
     /// The JSON body of the most recent request, if any.
     pub fn last_body(&self) -> Option<serde_json::Value> {
         self.last_body.lock().unwrap().clone()
+    }
+
+    /// The `Authorization` header of the most recent request, if any (e.g. `"Bearer <token>"`).
+    pub fn last_authorization(&self) -> Option<String> {
+        self.last_authorization.lock().unwrap().clone()
     }
 
     /// Bind an ephemeral port, serve in a background task, and return the base URL.
@@ -52,9 +59,14 @@ impl MockUpstream {
 
 async fn handler(
     State(mock): State<MockUpstream>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     *mock.last_body.lock().unwrap() = Some(body);
+    *mock.last_authorization.lock().unwrap() = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let events = (*mock.events).clone();
     let stream = stream::iter(events.into_iter().map(|d| Ok(Event::default().data(d))));
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -106,6 +118,11 @@ pub enum OAuthResponse {
         status: u16,
         code: String,
     },
+    /// A non-2xx status whose body carries NO parseable `error` code (an empty JSON object),
+    /// exercising the `OAuthError::Endpoint { code: None }` path.
+    ErrorNoCode {
+        status: u16,
+    },
 }
 
 impl MockOAuth {
@@ -132,6 +149,15 @@ impl MockOAuth {
                 status,
                 code: code.into(),
             }),
+            last_body: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A mock that returns the given error status with a body carrying no `error` code (an empty
+    /// JSON object) — drives the `OAuthError::Endpoint { code: None }` classification path.
+    pub fn error_no_code(status: u16) -> Self {
+        Self {
+            response: Arc::new(OAuthResponse::ErrorNoCode { status }),
             last_body: Arc::new(Mutex::new(None)),
         }
     }
@@ -178,6 +204,10 @@ async fn oauth_handler(
         OAuthResponse::Error { status, code } => (
             StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_REQUEST),
             Json(serde_json::json!({ "error": code })),
+        ),
+        OAuthResponse::ErrorNoCode { status } => (
+            StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(serde_json::json!({})),
         ),
     }
 }
