@@ -5,10 +5,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use polyflare_codex::oauth::OAuthClient;
 use polyflare_codex::CodexExecutor;
-use polyflare_core::CapacityWeighted;
+use polyflare_core::{CapacityWeighted, Continuity};
 use polyflare_server::app::{build_app, AppState};
+use polyflare_server::continuity::CodexContinuity;
 use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
 use polyflare_testkit::MockUpstream;
+use std::time::Duration;
 
 fn now() -> i64 {
     SystemTime::now()
@@ -61,11 +63,16 @@ async fn large_request_body_is_not_rejected_with_413() {
         )
         .await
         .unwrap();
+    let continuity: Arc<dyn Continuity> = Arc::new(CodexContinuity::new(
+        store.continuity(),
+        Duration::from_secs(30),
+    ));
     std::mem::forget(dir);
 
     let state = Arc::new(AppState {
         executor: Arc::new(CodexExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),
+        continuity,
         store,
         cipher,
         oauth: OAuthClient::new("http://127.0.0.1:9").unwrap(),
