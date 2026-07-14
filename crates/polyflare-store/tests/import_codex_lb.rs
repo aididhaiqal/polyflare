@@ -7,6 +7,18 @@ use fernet::Fernet;
 use polyflare_store::{import_from_codex_lb, Store, StoreError, TokenCipher};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
+// codex-lb persists timestamps as SQLite DATETIME text (ISO), NOT epoch integers. The fixture
+// models the REAL source schema: TEXT timestamp columns holding these ISO strings, one WITH
+// fractional seconds and one WITHOUT (both real formats). The `*_EPOCH` constants are the UTC
+// epoch seconds those strings must parse to (computed independently, so the assertions are a
+// non-circular check that the importer parses correctly rather than merely that a row landed).
+const LAST_REFRESH_ISO: &str = "2026-07-12 06:00:41.345107"; // with fractional seconds
+const CREATED_AT_ISO: &str = "2026-07-04 06:00:25"; // no fractional seconds
+const RECORDED_AT_ISO: &str = "2026-07-12 06:05:00"; // usage row
+const LAST_REFRESH_EPOCH: i64 = 1_783_836_041; // 2026-07-12 06:00:41 UTC (sub-second truncated)
+const CREATED_AT_EPOCH: i64 = 1_783_144_825; // 2026-07-04 06:00:25 UTC
+const RECORDED_AT_EPOCH: i64 = 1_783_836_300; // 2026-07-12 06:05:00 UTC
+
 /// Create a codex-lb-shaped source DB at `path` with one account (tokens Fernet-encrypted with
 /// `fernet_key`) and one usage_history row.
 async fn build_source_db(path: &Path, fernet_key: &str) {
@@ -34,8 +46,8 @@ async fn build_source_db(path: &Path, fernet_key: &str) {
             access_token_encrypted BLOB NOT NULL,
             refresh_token_encrypted BLOB NOT NULL,
             id_token_encrypted BLOB NOT NULL,
-            last_refresh INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
+            last_refresh TEXT NOT NULL,
+            created_at TEXT NOT NULL,
             status TEXT NOT NULL,
             deactivation_reason TEXT,
             reset_at INTEGER,
@@ -51,8 +63,8 @@ async fn build_source_db(path: &Path, fernet_key: &str) {
         "CREATE TABLE usage_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id TEXT NOT NULL,
-            recorded_at INTEGER NOT NULL,
-            \"window\" TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            \"window\" TEXT,
             used_percent REAL NOT NULL,
             input_tokens INTEGER,
             output_tokens INTEGER,
@@ -94,8 +106,8 @@ async fn build_source_db(path: &Path, fernet_key: &str) {
     .bind(access.into_bytes())
     .bind(refresh.into_bytes())
     .bind(id.into_bytes())
-    .bind(1_700_000_000_i64)
-    .bind(1_699_000_000_i64)
+    .bind(LAST_REFRESH_ISO) // DATETIME text (with fractional seconds), not an epoch int
+    .bind(CREATED_AT_ISO) // DATETIME text (no fractional seconds)
     .bind("active")
     .bind(Option::<String>::None)
     .bind(Option::<i64>::None)
@@ -112,8 +124,8 @@ async fn build_source_db(path: &Path, fernet_key: &str) {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind("acct-1")
-    .bind(1_700_000_500_i64)
-    .bind("secondary")
+    .bind(RECORDED_AT_ISO) // DATETIME text, not an epoch int
+    .bind(Option::<String>::None) // NULL window — codex-lb leaves this null on some rows
     .bind(42.5_f64)
     .bind(Some(1000_i64))
     .bind(Some(200_i64))
@@ -166,8 +178,8 @@ async fn append_account(path: &Path, acct_id: &str, fernet_key: &str) {
     .bind(access.into_bytes())
     .bind(refresh.into_bytes())
     .bind(id.into_bytes())
-    .bind(1_700_000_000_i64)
-    .bind(1_699_000_000_i64)
+    .bind(LAST_REFRESH_ISO) // DATETIME text (matches the real source schema)
+    .bind(CREATED_AT_ISO)
     .bind("active")
     .bind(Option::<String>::None)
     .bind(Option::<i64>::None)
@@ -206,6 +218,27 @@ async fn imports_accounts_usage_and_tokens_roundtrip() {
     assert_eq!(account.plan_type, "pro");
     assert!(account.security_work_authorized);
 
+    // The ISO DATETIME text columns were parsed to the correct UTC epoch seconds — not merely
+    // "a row landed". This is exactly what a real codex-lb store.db would exercise; the old
+    // i64 FromRow would have hit a sqlx ColumnDecode error on these TEXT values.
+    assert_eq!(
+        account.last_refresh, LAST_REFRESH_EPOCH,
+        "last_refresh must parse '{LAST_REFRESH_ISO}' (fractional seconds) to epoch"
+    );
+    assert_eq!(
+        account.created_at, CREATED_AT_EPOCH,
+        "created_at must parse '{CREATED_AT_ISO}' (no fractional seconds) to epoch"
+    );
+    // Cross-check the constants against chrono, mirroring the importer's own parse.
+    {
+        use chrono::NaiveDateTime;
+        let via_chrono = NaiveDateTime::parse_from_str(LAST_REFRESH_ISO, "%Y-%m-%d %H:%M:%S%.f")
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        assert_eq!(via_chrono, LAST_REFRESH_EPOCH);
+    }
+
     // Tokens re-encrypted under XChaCha decrypt back to the originals.
     let tokens = store
         .accounts()
@@ -225,6 +258,20 @@ async fn imports_accounts_usage_and_tokens_roundtrip() {
             .await
             .unwrap();
     assert_eq!(usage_count, 1);
+
+    // usage_history.recorded_at parsed from ISO text to the expected epoch, and the NULL source
+    // window was preserved as NULL (proving the nullable-window relaxation + Option binding).
+    let (recorded_at, window): (i64, Option<String>) =
+        sqlx::query_as("SELECT recorded_at, \"window\" FROM usage_history WHERE account_id = ?")
+            .bind("acct-1")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        recorded_at, RECORDED_AT_EPOCH,
+        "recorded_at must parse to epoch"
+    );
+    assert_eq!(window, None, "a NULL source window must stay NULL");
 }
 
 /// A mid-import Fernet-decrypt failure must fail cleanly (no panic) AND roll the WHOLE import

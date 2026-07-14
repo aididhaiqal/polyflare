@@ -37,7 +37,9 @@ enum Commands {
 enum AccountsCommands {
     /// Import accounts + usage from a codex-lb store.db (zero re-auth).
     Import {
-        /// Path to the codex-lb store.db (opened read-only).
+        /// Path to the codex-lb store.db (opened read-only). Import against a STOPPED codex-lb
+        /// (or a copy of store.db): a live database in WAL mode opened read-only may fail to open
+        /// or read stale data.
         #[arg(long = "from", value_name = "PATH")]
         from: PathBuf,
         /// Path to the codex-lb Fernet key file.

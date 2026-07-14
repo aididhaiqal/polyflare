@@ -1,7 +1,9 @@
 -- PolyFlare initial schema: accounts + usage_history. Forward-only.
--- Timestamps are INTEGER unix-epoch seconds. The three token columns are
--- XChaCha20-Poly1305 ciphertext (a 24-byte nonce prepended) stored as BLOB.
--- "window" is quoted because WINDOW is a SQLite keyword.
+-- Timestamps are INTEGER unix-epoch seconds (the codex-lb importer parses that
+-- source's ISO DATETIME text into these epoch columns). The three token columns
+-- are XChaCha20-Poly1305 ciphertext (a 24-byte nonce prepended) stored as BLOB.
+-- "window" is quoted because WINDOW is a SQLite keyword; it is nullable (codex-lb
+-- leaves it NULL on some rows).
 
 CREATE TABLE IF NOT EXISTS accounts (
     id                        TEXT    PRIMARY KEY,
@@ -30,7 +32,7 @@ CREATE TABLE IF NOT EXISTS usage_history (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id        TEXT    NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     recorded_at       INTEGER NOT NULL,
-    "window"          TEXT    NOT NULL,
+    "window"          TEXT,
     used_percent      REAL    NOT NULL,
     input_tokens      INTEGER,
     output_tokens     INTEGER,

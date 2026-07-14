@@ -38,8 +38,10 @@ struct SrcAccount {
     access_token_encrypted: Vec<u8>,
     refresh_token_encrypted: Vec<u8>,
     id_token_encrypted: Vec<u8>,
-    last_refresh: i64,
-    created_at: i64,
+    // codex-lb stores these as DATETIME (ISO TEXT, e.g. "2026-07-12 06:00:41.345107"), NOT epoch
+    // integers — read as text and parse to epoch seconds before persisting (see `parse_epoch`).
+    last_refresh: String,
+    created_at: String,
     status: String,
     deactivation_reason: Option<String>,
     reset_at: Option<i64>,
@@ -51,8 +53,10 @@ struct SrcAccount {
 #[derive(sqlx::FromRow)]
 struct SrcUsage {
     account_id: String,
-    recorded_at: i64,
-    window: String,
+    // DATETIME (ISO TEXT) in codex-lb — parsed to epoch seconds on import.
+    recorded_at: String,
+    // codex-lb's `usage_history.window` is nullable.
+    window: Option<String>,
     used_percent: f64,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
@@ -110,6 +114,9 @@ pub async fn import_from_codex_lb(
             id_token: fernet_decrypt(&fernet, &src.id_token_encrypted)?,
         };
         let enc = EncryptedTokens::encrypt(&tokens, cipher)?;
+        // codex-lb stores these as ISO DATETIME text; parse to epoch seconds for our schema.
+        let last_refresh = parse_epoch(&src.last_refresh)?;
+        let created_at = parse_epoch(&src.created_at)?;
         let account = Account {
             id: src.id,
             chatgpt_account_id: src.chatgpt_account_id,
@@ -121,8 +128,8 @@ pub async fn import_from_codex_lb(
             seat_type: src.seat_type,
             plan_type: src.plan_type,
             routing_policy: src.routing_policy,
-            last_refresh: src.last_refresh,
-            created_at: src.created_at,
+            last_refresh,
+            created_at,
             status: src.status,
             deactivation_reason: src.deactivation_reason,
             reset_at: src.reset_at,
@@ -131,7 +138,7 @@ pub async fn import_from_codex_lb(
         };
         // `OR IGNORE` makes the account insert idempotent: re-running after a fix skips ids
         // already present instead of erroring on the `id` PRIMARY KEY.
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT OR IGNORE INTO accounts (\
                 id, chatgpt_account_id, chatgpt_user_id, email, alias, \
                 workspace_id, workspace_label, seat_type, plan_type, routing_policy, \
@@ -162,7 +169,9 @@ pub async fn import_from_codex_lb(
         .bind(account.security_work_authorized)
         .execute(&mut *tx)
         .await?;
-        summary.accounts_imported += 1;
+        // `rows_affected()` is 0 when `OR IGNORE` skips an already-present id, 1 when a row is
+        // inserted — so a re-run into a populated store reports the true inserted count.
+        summary.accounts_imported += result.rows_affected() as usize;
     }
 
     // --- usage_history (copied by value) ---
@@ -177,6 +186,9 @@ pub async fn import_from_codex_lb(
     .await?;
 
     for row in src_usage {
+        // recorded_at is ISO DATETIME text in codex-lb; parse to epoch seconds. `window` is
+        // nullable and preserved as-is (NULL stays NULL).
+        let recorded_at = parse_epoch(&row.recorded_at)?;
         sqlx::query(
             "INSERT INTO usage_history (\
                 account_id, recorded_at, \"window\", used_percent, input_tokens, \
@@ -185,8 +197,8 @@ pub async fn import_from_codex_lb(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(row.account_id.as_str())
-        .bind(row.recorded_at)
-        .bind(row.window.as_str())
+        .bind(recorded_at)
+        .bind(row.window.as_deref())
         .bind(row.used_percent)
         .bind(row.input_tokens)
         .bind(row.output_tokens)
@@ -215,4 +227,16 @@ fn fernet_decrypt(fernet: &Fernet, token_bytes: &[u8]) -> Result<String, StoreEr
         .map_err(|_| StoreError::Import("Fernet decryption failed".to_string()))?;
     String::from_utf8(plaintext)
         .map_err(|_| StoreError::Import("decrypted token is not valid UTF-8".to_string()))
+}
+
+/// Parse a codex-lb DATETIME string (ISO `YYYY-MM-DD HH:MM:SS`, with or without fractional
+/// seconds) to unix epoch seconds, interpreting the value as UTC. codex-lb persists timestamps
+/// as SQLite DATETIME text (e.g. `"2026-07-12 06:00:41.345107"`), so PolyFlare parses them to
+/// its own INTEGER-epoch columns on import.
+fn parse_epoch(s: &str) -> Result<i64, StoreError> {
+    use chrono::NaiveDateTime;
+    let dt = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+        .map_err(|e| StoreError::Import(format!("unparseable datetime: {e}")))?;
+    Ok(dt.and_utc().timestamp())
 }

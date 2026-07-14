@@ -20,8 +20,8 @@ Distilled from a full read of codex-lb (2026-07-14) for the M2 store/selector/OA
 | plan_type | TEXT | free,plus,pro,prolite,team,business,enterprise,edu |
 | routing_policy | TEXT | normal | burn_first | preserve (default normal) |
 | access_token_enc / refresh_token_enc / id_token_enc | BLOB | XChaCha ciphertext (+nonce) |
-| last_refresh | INTEGER(epoch) | |
-| created_at | INTEGER(epoch) | |
+| last_refresh | DateTime (ISO TEXT — parse to epoch on import) | codex-lb stores SQLite DATETIME text, e.g. `2026-07-12 06:00:41.345107` (with or without fractional seconds), interpreted UTC |
+| created_at | DateTime (ISO TEXT — parse to epoch on import) | same DATETIME text form |
 | status | TEXT | active,rate_limited,quota_exceeded,paused,reauth_required,deactivated |
 | deactivation_reason | TEXT? | |
 | reset_at | INTEGER? | durable rate-limit/quota reset epoch (selector reads this) |
@@ -30,7 +30,7 @@ Distilled from a full read of codex-lb (2026-07-14) for the M2 store/selector/OA
 - **Not columns (runtime-derived, don't persist in M2):** used_percent, secondary_used_percent, error_count, cooldown_until, last_selected_at, health_tier, capacity_credits, in-flight counts. These are assembled per-request from `usage_history` + an in-memory runtime cache. M2b assembles a minimal snapshot; live health-tier/in-flight tracking is a later refinement.
 
 ## usage_history schema (M2a) — codex-lb `usage_history` (models.py:153-167)
-`id INTEGER PK`, `account_id FK`, `recorded_at epoch`, `window TEXT` ("primary"/"secondary"), `used_percent REAL`, `input_tokens INT?`, `output_tokens INT?`, `reset_at INT?`, `window_minutes INT?`, `credits_has/credits_unlimited BOOL?`, `credits_balance REAL?`. Index `(account_id, recorded_at)`.
+`id INTEGER PK`, `account_id FK`, `recorded_at DateTime (ISO TEXT — parse to epoch on import)`, `window TEXT?` (nullable — "primary"/"secondary" or NULL), `used_percent REAL`, `input_tokens INT?`, `output_tokens INT?`, `reset_at INT?`, `window_minutes INT?`, `credits_has/credits_unlimited BOOL?`, `credits_balance REAL?`. Index `(account_id, recorded_at)`.
 
 ## OAuth (M2b) — `app/core/auth/`
 - **Claims (decode-only, NO signature verify):** split id_token JWT on `.`, base64url-decode payload, json parse. Fields: `email, sub, chatgpt_account_id, chatgpt_user_id, chatgpt_plan_type, workspace_id, workspace_label, seat_type, exp`, plus nested `https://api.openai.com/auth` claim with the same auth-scoped values (`chatgpt_user_id` prefers auth-claim > top-level > sub).
