@@ -25,6 +25,13 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Generic client-facing response for a request whose selected account cannot be served (its
+/// token could not be refreshed and the account was marked, or the token endpoint failed). The
+/// body is generic — never a token, a URL, or an internal error `Display`.
+fn account_unavailable() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, "account unavailable").into_response()
+}
+
 pub async fn responses_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
@@ -71,6 +78,11 @@ pub async fn responses_handler(
         }
     };
     if should_refresh(account.last_refresh, now) {
+        // A refresh failure MUST NOT loop: M2b has no live error_count/cooldown tracking, so an
+        // account left `active` after a failed refresh stays eligible, gets re-selected, is still
+        // stale, and would refresh+fail forever. Every non-transport failure therefore marks the
+        // account (making it ineligible next time) and stops THIS request — only a genuine network
+        // blip (`Transport`) is a no-op that proceeds with the current token.
         match state.oauth.refresh(&tokens.refresh_token).await {
             Ok(refreshed) => {
                 let new = PlainTokens {
@@ -78,22 +90,35 @@ pub async fn responses_handler(
                     refresh_token: refreshed.tokens.refresh_token,
                     id_token: refreshed.tokens.id_token,
                 };
-                // Persist best-effort; a write failure must not drop the request.
+                // Persist best-effort. If the write fails, `last_refresh` stays stale, so the next
+                // request simply re-refreshes (harmless duplicate refresh) — an acceptable
+                // trade-off vs. dropping a request whose refresh actually succeeded.
                 let _ = repo
                     .update_tokens(picked.as_str(), &new, &state.cipher, now)
                     .await;
                 tokens = new;
             }
+            // Token-endpoint error with a parseable code → classify it. Permanent codes mark the
+            // account (reauth_required / deactivated); a Transient-classified code (e.g.
+            // server_error) leaves the account eligible for a later retry. Either way the refresh
+            // did not complete, so this request cannot be served with the 8-day-stale token.
             Err(OAuthError::Endpoint {
                 code: Some(code), ..
             }) => {
-                // Mark the account per the classified failure; proceed with the current token
-                // (re-selection / retry orchestration is M3).
                 if let Some(status) = classify_failure(&code).status() {
                     let _ = repo.update_status(picked.as_str(), status).await;
                 }
+                return account_unavailable();
             }
-            Err(_) => {} // transient / network → proceed with the current token
+            // HTTP failure with no parseable code, or a broken/rotated id_token that won't decode:
+            // unclassifiable, so mark reauth_required to break the loop and stop.
+            Err(OAuthError::Endpoint { code: None, .. }) | Err(OAuthError::MalformedJwt(_)) => {
+                let _ = repo.update_status(picked.as_str(), "reauth_required").await;
+                return account_unavailable();
+            }
+            // Genuine network blip — the ONLY no-op: leave the account eligible and proceed with
+            // the current token (which may still be valid).
+            Err(OAuthError::Transport(_)) => {}
         }
     }
 
