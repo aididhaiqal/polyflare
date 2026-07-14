@@ -11,14 +11,14 @@ use axum::response::{IntoResponse, Response};
 
 use polyflare_codex::oauth::{classify_failure, should_refresh, OAuthError};
 use polyflare_core::{
-    Account, AccountId, ContinuityDirective, Prepared, PreparedRequest, RecoveryPlan, RequestCtx,
-    ResponseStream, SelectionCtx,
+    Account, AccountId, ContinuityDirective, Prepared, PreparedRequest, Provider, RecoveryPlan,
+    RequestCtx, ResponseStream, SelectionCtx,
 };
 use polyflare_store::PlainTokens;
 
 use crate::app::AppState;
 use crate::session_key::derive_request_ctx;
-use crate::snapshot::assemble_snapshots;
+use crate::snapshot::{assemble_snapshots, filter_by_provider};
 use crate::watchdog::{
     apply_ownership, execute_recovery, execute_with_watchdog, signal_client_stream, RouteDecision,
 };
@@ -51,22 +51,29 @@ fn stream_response(stream: ResponseStream) -> Response {
 }
 
 /// Load + decrypt + refresh-if-stale the selected account, returning the core `Account` to execute
-/// with, or a ready client-facing error `Response`.
+/// with plus its `Provider`, or a ready client-facing error `Response`.
 async fn resolve_core_account(
     state: &AppState,
     picked: &AccountId,
     now: i64,
-) -> Result<Account, Response> {
+) -> Result<(Account, Provider), Response> {
     let repo = state.store.accounts();
     let account = match repo.get(picked.as_str()).await {
         Ok(Some(a)) => a,
         Ok(None) | Err(_) => return Err(internal_error()),
     };
+    let provider: Provider = match account.provider.parse() {
+        Ok(p) => p,
+        Err(_) => return Err(internal_error()),
+    };
     let mut tokens = match repo.decrypt_tokens(picked.as_str(), &state.cipher).await {
         Ok(Some(t)) => t,
         Ok(None) | Err(_) => return Err(internal_error()),
     };
-    if should_refresh(account.last_refresh, now) {
+    // Refresh-on-stale is Codex-specific (the only OAuth client AppState holds today); Anthropic
+    // subscription-OAuth refresh is Task 7 (VERIFY-gated — no confirmed endpoint/client_id yet).
+    // An Anthropic account's stored access_token is used as-is until Task 7 lands.
+    if provider == Provider::Codex && should_refresh(account.last_refresh, now) {
         match state.oauth.refresh(&tokens.refresh_token).await {
             Ok(refreshed) => {
                 let new = PlainTokens {
@@ -94,11 +101,14 @@ async fn resolve_core_account(
             Err(OAuthError::Transport(_)) => {}
         }
     }
-    Ok(Account {
-        id: account.id,
-        base_url: state.upstream_base_url.clone(),
-        bearer_token: tokens.access_token,
-    })
+    Ok((
+        Account {
+            id: account.id,
+            base_url: state.upstream_base_url_for(provider).to_string(),
+            bearer_token: tokens.access_token,
+        },
+        provider,
+    ))
 }
 
 pub async fn responses_handler(
@@ -127,6 +137,9 @@ pub async fn responses_handler(
         Ok(s) => s,
         Err(_) => return internal_error(),
     };
+    // M4a has no cross-format translator (that's M4b): `/responses` may only ever pick a
+    // Codex-provider account.
+    let snapshots = filter_by_provider(&snapshots, Provider::Codex);
     let sel_ctx = SelectionCtx {
         now,
         require_security_work_authorized: false,
@@ -143,12 +156,12 @@ pub async fn responses_handler(
         &sel_ctx,
     ) {
         RouteDecision::Route(id) => {
-            let account = match resolve_core_account(&state, &id, now).await {
+            let (account, provider) = match resolve_core_account(&state, &id, now).await {
                 Ok(a) => a,
                 Err(r) => return r,
             };
             match execute_with_watchdog(
-                state.executor.as_ref(),
+                state.executor_for(provider).as_ref(),
                 state.continuity.clone(),
                 prepared,
                 &account,
@@ -170,12 +183,13 @@ pub async fn responses_handler(
                         Some(id) => id,
                         None => return no_eligible(),
                     };
-                    let account = match resolve_core_account(&state, &fresh, now).await {
+                    let (account, provider) = match resolve_core_account(&state, &fresh, now).await
+                    {
                         Ok(a) => a,
                         Err(r) => return r,
                     };
                     match execute_recovery(
-                        state.executor.as_ref(),
+                        state.executor_for(provider).as_ref(),
                         state.continuity.clone(),
                         anchorless_req,
                         &account,
@@ -209,10 +223,11 @@ pub async fn responses_handler(
                     // `directive.recovery` was moved by the outer match.
                     match state.selector.pick(&snapshots, &sel_ctx) {
                         Some(fresh) => {
-                            let account = match resolve_core_account(&state, &fresh, now).await {
-                                Ok(a) => a,
-                                Err(r) => return r,
-                            };
+                            let (account, provider) =
+                                match resolve_core_account(&state, &fresh, now).await {
+                                    Ok(a) => a,
+                                    Err(r) => return r,
+                                };
                             let fallback = Prepared {
                                 req: prepared.req,
                                 directive: ContinuityDirective {
@@ -223,7 +238,7 @@ pub async fn responses_handler(
                                 },
                             };
                             match execute_with_watchdog(
-                                state.executor.as_ref(),
+                                state.executor_for(provider).as_ref(),
                                 state.continuity.clone(),
                                 fallback,
                                 &account,

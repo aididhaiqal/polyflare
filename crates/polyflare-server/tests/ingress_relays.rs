@@ -69,13 +69,15 @@ async fn spawn_polyflare(upstream: String) -> String {
     std::mem::forget(dir);
 
     let state = Arc::new(AppState {
-        executor: Arc::new(CodexExecutor::new().unwrap()),
+        codex_executor: Arc::new(CodexExecutor::new().unwrap()),
+        anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),
         continuity,
         store,
         cipher,
         oauth: OAuthClient::new("http://127.0.0.1:9").unwrap(), // never called (fresh token)
         upstream_base_url: upstream,
+        anthropic_upstream_base_url: "http://127.0.0.1:9".to_string(),
     });
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

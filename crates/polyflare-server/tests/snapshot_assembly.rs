@@ -129,3 +129,37 @@ async fn assembles_candidates_in_stable_id_order() {
     let ids: Vec<&str> = snaps.iter().map(|s| s.id.as_str()).collect();
     assert_eq!(ids, ["a", "b", "c"]);
 }
+
+#[tokio::test]
+async fn assemble_snapshots_populates_provider_and_filter_narrows_by_it() {
+    use polyflare_core::Provider;
+    use polyflare_server::snapshot::filter_by_provider;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[9u8; 32]).unwrap();
+
+    let mut anthro = account("anthropic-1");
+    anthro.provider = "anthropic".to_string();
+    store
+        .accounts()
+        .insert(&anthro, &tokens(), &cipher)
+        .await
+        .unwrap();
+    store
+        .accounts()
+        .insert(&account("codex-1"), &tokens(), &cipher)
+        .await
+        .unwrap();
+
+    let snaps = assemble_snapshots(&store).await.unwrap();
+    assert_eq!(snaps.len(), 2);
+
+    let codex_only = filter_by_provider(&snaps, Provider::Codex);
+    assert_eq!(codex_only.len(), 1);
+    assert_eq!(codex_only[0].id.as_str(), "codex-1");
+
+    let anthropic_only = filter_by_provider(&snaps, Provider::Anthropic);
+    assert_eq!(anthropic_only.len(), 1);
+    assert_eq!(anthropic_only[0].id.as_str(), "anthropic-1");
+}
