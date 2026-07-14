@@ -426,4 +426,13 @@ mod tests {
         assert_eq!(s.take_id().as_deref(), Some("resp_1"));
         assert!(s.done);
     }
+
+    #[test]
+    fn watchdog_error_display_is_generic() {
+        assert_eq!(WatchdogError::Upstream.to_string(), "upstream error");
+        assert_eq!(
+            WatchdogError::Continuity.to_string(),
+            "continuity recovery unavailable"
+        );
+    }
 }

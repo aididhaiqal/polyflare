@@ -150,3 +150,47 @@ async fn hard_upstream_error_is_watchdog_upstream() {
     .await;
     assert!(matches!(res, Err(WatchdogError::Upstream)));
 }
+
+#[tokio::test]
+async fn mid_race_transport_error_is_watchdog_upstream_and_does_not_recover() {
+    // The C5 review flagged `execute_with_watchdog`'s `Ok(Some(Err(_)))` branch (a transport error
+    // arriving as the FIRST stream item, mid-race — i.e. AFTER the upstream accepted the request
+    // with 200 headers, unlike `hard_upstream_error_is_watchdog_upstream` above which never gets a
+    // stream at all) as correct-but-untested. Per SPEC-M3 §Q4 this is a hard error: it must NOT
+    // recover (no second/resend request) and must NOT relay (no stream handed to the caller).
+    let mock = MockUpstream::error_first_on_anchor(vec![
+        r#"{"type":"response.output_text.delta","delta":"unreachable"}"#.to_string(),
+    ]);
+    let handle = mock.clone();
+    let base = mock.spawn().await;
+    let exec = CodexExecutor::new().unwrap();
+    let cont: Arc<dyn Continuity> = Arc::new(NoopContinuity);
+
+    let prepared = armed_full_resend(
+        serde_json::json!({"previous_response_id": "resp_a", "input": [{"a":1},{"b":2}]}),
+    );
+    let res = tokio::time::timeout(
+        Duration::from_secs(3),
+        execute_with_watchdog(
+            &exec,
+            cont,
+            prepared,
+            &core_account(base),
+            AccountId::from("acct"),
+            RequestCtx::default(),
+        ),
+    )
+    .await
+    .expect("bounded: a mid-race hard error must not hang");
+
+    match res {
+        Err(WatchdogError::Upstream) => {}
+        Err(other) => panic!("expected WatchdogError::Upstream, got {other:?}"),
+        Ok(_) => panic!("mid-race hard error must not relay a stream to the caller"),
+    }
+    assert_eq!(
+        handle.request_count(),
+        1,
+        "mid-race hard error must NOT recover/retry"
+    );
+}
