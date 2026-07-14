@@ -3,4 +3,5 @@
 pub mod app;
 pub mod config;
 pub mod ingress;
+pub mod session_key;
 pub mod snapshot;
