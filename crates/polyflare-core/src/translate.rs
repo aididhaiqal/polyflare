@@ -31,7 +31,9 @@ pub struct TranslatorRegistry {
 
 impl TranslatorRegistry {
     pub fn new() -> Self {
-        Self { map: HashMap::new() }
+        Self {
+            map: HashMap::new(),
+        }
     }
 
     /// Registry with the M1 defaults: identity for the two native same-format pairs.
@@ -74,14 +76,20 @@ mod tests {
     #[test]
     fn identity_registered_for_same_format_pairs() {
         let reg = TranslatorRegistry::with_defaults();
-        assert!(reg.get(Format::OpenAIResponses, Format::OpenAIResponses).is_some());
-        assert!(reg.get(Format::AnthropicMessages, Format::AnthropicMessages).is_some());
+        assert!(reg
+            .get(Format::OpenAIResponses, Format::OpenAIResponses)
+            .is_some());
+        assert!(reg
+            .get(Format::AnthropicMessages, Format::AnthropicMessages)
+            .is_some());
     }
 
     #[test]
     fn cross_format_pair_absent_in_m1() {
         let reg = TranslatorRegistry::with_defaults();
-        assert!(reg.get(Format::AnthropicMessages, Format::OpenAIResponses).is_none());
+        assert!(reg
+            .get(Format::AnthropicMessages, Format::OpenAIResponses)
+            .is_none());
     }
 
     #[test]

@@ -17,7 +17,11 @@ impl Config {
             .map_err(|_| "POLYFLARE_UPSTREAM_TOKEN not set".to_string())?;
         Ok(Config {
             bind_addr,
-            account: Account { id: "default".into(), base_url, bearer_token },
+            account: Account {
+                id: "default".into(),
+                base_url,
+                bearer_token,
+            },
         })
     }
 }

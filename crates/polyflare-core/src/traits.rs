@@ -46,8 +46,16 @@ mod tests {
     #[test]
     fn selector_picks_first_account() {
         let pool = vec![
-            Account { id: "a".into(), base_url: "http://x".into(), bearer_token: "t".into() },
-            Account { id: "b".into(), base_url: "http://y".into(), bearer_token: "u".into() },
+            Account {
+                id: "a".into(),
+                base_url: "http://x".into(),
+                bearer_token: "t".into(),
+            },
+            Account {
+                id: "b".into(),
+                base_url: "http://y".into(),
+                bearer_token: "u".into(),
+            },
         ];
         let sel: Box<dyn Selector> = Box::new(FirstAccount);
         let picked = sel.pick(&pool, &RequestCtx::default()).unwrap();

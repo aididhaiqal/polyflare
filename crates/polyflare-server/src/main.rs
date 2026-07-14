@@ -10,7 +10,10 @@ use polyflare_server::config::Config;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let executor = Arc::new(CodexExecutor::new()?);
-    let state = Arc::new(AppState { executor, account: config.account });
+    let state = Arc::new(AppState {
+        executor,
+        account: config.account,
+    });
     let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
