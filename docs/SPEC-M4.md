@@ -107,9 +107,12 @@ The central fact: **the translator is a stateful assembler.** Anthropic's stream
 
 Golden replay tests assert semantic equivalence over real captured fixtures with **no buffering** (byte-timed).
 
-### 3.5a Anthropic rate-limit / error module *(header + error schemas doc-verified)*
+### 3.5a Anthropic rate-limit / error module *(account model matters — see U5)*
 
-The `polyflare-anthropic` rate-limit module classifies from verified signals: HTTP **429** (`rate_limit_error`), **529** (`overloaded_error`, confirmed to exist), 401/403/413/500/504 with their `error.type`s; error body is always `{"type":"error","error":{"type","message"},"request_id"}`. Backoff reads `retry-after` (seconds) and the `anthropic-ratelimit-{requests,tokens,input-tokens,output-tokens}-{limit,remaining,reset}` headers (`reset` = RFC-3339 timestamp; token-bucket, continuous replenishment). This replaces the better-ccflare TS port with the real header/status set. (Mid-stream `error` SSE events reuse the same `error.type` vocabulary — the executor must surface them even after a 200.)
+**Account model (resolved by design intent — confirm at U5):** PolyFlare pools **Claude Max/Pro OAuth subscription** accounts (the codex-lb + better-ccflare subscription-pooling lineage — the same model as the Codex pool), **not** platform API-key accounts. This is load-bearing for rate limits, because the two surfaces signal differently:
+
+- **Doc-verified and shared by both surfaces** (safe to build on): HTTP **429** (`rate_limit_error`), **529** (`overloaded_error`, confirmed to exist), 401/403/413/500/504 with their `error.type`s; the error body is always `{"type":"error","error":{"type","message"},"request_id"}`; mid-stream `error` SSE events reuse the same `error.type` vocabulary (the executor must surface them even after a 200).
+- **API-key-only** (do *not* assume for the subscription pool): the `anthropic-ratelimit-{requests,tokens,…}-{limit,remaining,reset}` headers documented for the platform API. Subscription OAuth uses the **ccflare-style** signals instead (`out_of_credits` / `extra_usage` / windowed reset / 24h-clamp) — port these from better-ccflare and **confirm the exact OAuth rate-limit signals via live capture** (added to §7). The SSE event mapping (§3.5) is identical across both surfaces, so none of that work is affected.
 
 ### 3.6 Model-alias mapping + per-tier payload-override
 
@@ -134,6 +137,7 @@ The shared eligibility machinery already exists (M2 gave `Account.security_work_
 - **U2 — Model-alias config + payload-override scope.** (a) Source: a **static config** (ServeConfig / TOML / env) for M4, DB-backed + dashboard-editable at L5 — OK? (b) How far does payload-override go in M4 — just **reasoning-effort**, or also `service_tier` and others? (c) **The exact pairs + tiers you want:** is it `opus→sol` (which effort?), `sonnet→terra`, `haiku→luna`? Anything else?
 - **U3 — Store provider modeling.** Minimal additive (`provider` column + nullable Codex fields) as proposed, or a cleaner separate-table refactor? (I recommend minimal.)
 - **U4 — Golden-test fixtures.** Do you have real captured **Anthropic Messages SSE** + **Codex Responses SSE** streams I can use as golden fixtures, or should M4 include a capture step (needs one live Claude request + one live Codex request through a tap)?
+- **U5 — Anthropic account model.** Confirm the Anthropic pool is **Claude Max/Pro OAuth subscription** accounts (my assumption, from the codex-lb/ccflare subscription-pooling premise — §3.5a), not platform API-key accounts? This picks the OAuth flow and the rate-limit signal set (ccflare-style vs the platform `anthropic-ratelimit-*` headers). *If it's actually API-key accounts, say so — it changes §3.5a and the OAuth task.*
 
 ## 6. Testing strategy
 
@@ -153,6 +157,7 @@ The event/error/header **schemas are now doc-verified** (§3.5, §3.5a, §3.7) �
 - **`stop_reason` → status and `error.type` → `code` tables** — no canonical mapping exists in either doc; these are our design choices, pin them with a captured example each.
 - **cache-token combination** (`cache_read` vs `cache_creation` → single `cached_tokens`) and **`anthropic-fast-*` / Priority-Tier header exact names** — confirm from real response headers.
 - **Exact model strings each CLI sends** — Claude Code likely sends full IDs (`claude-opus-4-…`), not bare `opus`; the alias-map keys must match reality. (Feeds U2.)
+- **Subscription-OAuth rate-limit signals** (assuming U5 = subscription) — the actual `out_of_credits`/window-reset/quota signals a Claude Max OAuth account returns, vs better-ccflare's port; capture from a real rate-limited OAuth account.
 
 Design/impl risks (not doc-resolvable):
 
