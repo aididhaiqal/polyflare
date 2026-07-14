@@ -1,1 +1,22 @@
-//! SQLite persistence + at-rest crypto. Stub in M1 (built out in M2).
+//! PolyFlare persistence: a SQLite store, at-rest token crypto (XChaCha20-Poly1305, never
+//! Fernet), the account repository, and the zero-re-auth codex-lb importer. Token plaintext
+//! is never logged.
+
+pub mod store;
+
+pub use store::Store;
+
+/// Errors surfaced by the store, crypto, and importer.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+    #[error("migration error: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("crypto error: {0}")]
+    Crypto(String),
+    #[error("import error: {0}")]
+    Import(String),
+}
