@@ -50,6 +50,108 @@ pub struct RequestCtx {
     pub session_id: Option<String>,
 }
 
+/// An owned account identifier — the `Selector`'s return type (M2-GATE1: owned, not a borrow).
+/// `Hash`/`Ord` are additive to the seam so M2b-2 can key per-account maps + order deterministically.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AccountId(String);
+
+impl AccountId {
+    /// The id as a string slice (e.g. for store lookups).
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for AccountId {
+    fn from(s: String) -> Self {
+        AccountId(s)
+    }
+}
+
+impl From<&str> for AccountId {
+    fn from(s: &str) -> Self {
+        AccountId(s.to_string())
+    }
+}
+
+impl std::fmt::Display for AccountId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A per-account snapshot the `Selector` scores over. Durable fields come from the store
+/// `Account`; window fields come from the latest `usage_history` rows; runtime fields
+/// (`health_tier`, `error_count`, `cooldown_until`, `last_error_at`, `last_selected_at`,
+/// `in_flight`) are live-tracked later and default to neutral values in M2b.
+#[derive(Debug, Clone)]
+pub struct AccountSnapshot {
+    pub id: AccountId,
+    /// active | rate_limited | quota_exceeded | paused | reauth_required | deactivated
+    pub status: String,
+    /// Primary-window used percent (0–100).
+    pub used_percent: f64,
+    /// Secondary-window used percent (0–100) — drives the capacity weight.
+    pub secondary_used_percent: f64,
+    /// Durable rate-limit/quota reset epoch (seconds); auto-recovery gate.
+    pub reset_at: Option<i64>,
+    /// Per-account capacity override (credits); `None` ⇒ derive from `plan_type`.
+    pub capacity_credits: Option<f64>,
+    /// normal | burn_first | preserve
+    pub routing_policy: String,
+    /// 0 healthy / 1 draining / 2 probing (defaulted 0 in M2b).
+    pub health_tier: u8,
+    pub error_count: u32,
+    /// Generic "don't select until" epoch (seconds).
+    pub cooldown_until: Option<i64>,
+    /// Epoch (seconds) of the most recent error — drives error-backoff + drain recency.
+    pub last_error_at: Option<i64>,
+    /// Epoch (seconds) this account was last selected — a deterministic tiebreak key.
+    pub last_selected_at: Option<i64>,
+    /// free | plus | pro | prolite | team | business | enterprise | edu
+    pub plan_type: String,
+    /// TA6 hard-pre-filter capability flag.
+    pub security_work_authorized: bool,
+    /// In-flight request count (live-tracked later; 0 in M2b).
+    pub in_flight: u32,
+}
+
+impl AccountSnapshot {
+    /// A snapshot with neutral defaults (active, zero usage, healthy, no runtime state). The
+    /// assembler overrides the durable/window fields it knows; runtime fields stay defaulted
+    /// in M2b (live tracking is deferred).
+    pub fn new(id: impl Into<AccountId>) -> Self {
+        Self {
+            id: id.into(),
+            status: "active".to_string(),
+            used_percent: 0.0,
+            secondary_used_percent: 0.0,
+            reset_at: None,
+            capacity_credits: None,
+            routing_policy: "normal".to_string(),
+            health_tier: 0,
+            error_count: 0,
+            cooldown_until: None,
+            last_error_at: None,
+            last_selected_at: None,
+            plan_type: "plus".to_string(),
+            security_work_authorized: false,
+            in_flight: 0,
+        }
+    }
+}
+
+/// Per-selection context (M2-GATE1). `now`/`rng_seed` keep the `Selector` pure + deterministic:
+/// time and randomness are injected, never read inside the trait. `session_id` is the
+/// session-affinity seam (unused by `capacity_weighted` scoring in M2b).
+#[derive(Debug, Clone, Default)]
+pub struct SelectionCtx {
+    pub now: i64,
+    pub require_security_work_authorized: bool,
+    pub rng_seed: Option<u64>,
+    pub session_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,3 +11,4 @@ futures-core = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+rand = { workspace = true }
