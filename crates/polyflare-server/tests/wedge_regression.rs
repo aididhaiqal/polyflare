@@ -135,3 +135,40 @@ async fn anchor_bearing_request_to_silent_upstream_does_not_wedge() {
     );
     assert_eq!(bodies[1]["input"], input, "R1: full-resend not trimmed");
 }
+
+#[tokio::test]
+async fn client_disconnect_mid_race_is_clean() {
+    let mock = MockUpstream::silent_on_anchor(vec![
+        r#"{"type":"response.output_text.delta","delta":"ok"}"#.to_string(),
+    ]);
+    let upstream = mock.spawn().await;
+    let pf = spawn_polyflare(upstream).await;
+
+    // Client uses a 60ms read budget — shorter than N (150ms) — so it disconnects mid-race.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(60))
+        .build()
+        .unwrap();
+    let input = serde_json::json!([{"role":"user","content":"a"},{"role":"user","content":"b"}]);
+    let res = client
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model":"m","previous_response_id":"resp_dead","input":input}))
+        .send()
+        .await;
+    // The client errors/aborts; the assertion that matters is the server survives (no panic/leak):
+    // a subsequent normal request to the same server must still succeed.
+    let _ = res;
+
+    let ok_client = reqwest::Client::new();
+    let resp = ok_client
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model":"m","input":"fresh"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "server healthy after a mid-race client disconnect"
+    );
+}

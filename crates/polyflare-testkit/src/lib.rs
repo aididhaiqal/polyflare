@@ -23,10 +23,23 @@ enum MockMode {
     /// injects a `response.id`. Used by the M1/M2 pass-through tests unchanged.
     Scripted,
     /// Emit `response.created`(resp_N) + `events` + `response.completed`(resp_N), generating a
-    /// fresh `resp_N` id per response. If `silent_on_anchor` and the body carries
-    /// `previous_response_id`, instead return 200 headers then a never-yielding body (no
-    /// keep-alive) — the wedge (silence-after-accept).
-    WithIds { silent_on_anchor: bool },
+    /// fresh `resp_N` id per response, UNLESS the request carries `previous_response_id`, in which
+    /// case `anchor_behavior` decides what happens instead.
+    WithIds { anchor_behavior: AnchorBehavior },
+}
+
+/// How a `WithIds` mock behaves on an anchor-bearing (`previous_response_id`) request.
+#[derive(Clone, Copy)]
+enum AnchorBehavior {
+    /// Respond exactly like an anchorless request (ids assigned normally).
+    Normal,
+    /// 200 headers, then a body stream that never yields a byte (no keep-alive) — the silent
+    /// wedge (silence-after-accept, no error, just nothing).
+    Silent,
+    /// 200 headers, then a body stream whose first (and only) item is a transport-level error —
+    /// the "200-then-error-first-byte" mid-race hard-error case. Distinct from `Silent`: this
+    /// yields a genuine transport error rather than yielding nothing at all.
+    ErrorFirst,
 }
 
 /// A scriptable mock upstream: serves `POST /responses`, records every request body + the last
@@ -63,18 +76,30 @@ impl MockUpstream {
         Self::build(
             events,
             MockMode::WithIds {
-                silent_on_anchor: false,
+                anchor_behavior: AnchorBehavior::Normal,
             },
         )
     }
 
-    /// Respond with ids for anchorless requests; go silent (200 + no body) when the request
+    /// Respond with ids for anchorless requests; go silent (200 + no body, ever) when the request
     /// carries `previous_response_id` — the wedge.
     pub fn silent_on_anchor(events: Vec<String>) -> Self {
         Self::build(
             events,
             MockMode::WithIds {
-                silent_on_anchor: true,
+                anchor_behavior: AnchorBehavior::Silent,
+            },
+        )
+    }
+
+    /// Respond with ids for anchorless requests; on an anchor-bearing request, return 200 headers
+    /// then a body stream whose first (and only) item is a transport-level error — a mid-race
+    /// hard-error, distinct from `silent_on_anchor` (which yields nothing at all).
+    pub fn error_first_on_anchor(events: Vec<String>) -> Self {
+        Self::build(
+            events,
+            MockMode::WithIds {
+                anchor_behavior: AnchorBehavior::ErrorFirst,
             },
         )
     }
@@ -147,15 +172,36 @@ async fn handler(
             );
             Sse::new(s).keep_alive(KeepAlive::default()).into_response()
         }
-        MockMode::WithIds { silent_on_anchor } => {
-            if silent_on_anchor && has_anchor {
-                // The wedge: 200 headers, then a body that never yields a byte (no keep-alive).
-                let pending = stream::pending::<Result<Bytes, std::io::Error>>();
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .body(Body::from_stream(pending))
-                    .unwrap();
+        MockMode::WithIds { anchor_behavior } => {
+            if has_anchor {
+                match anchor_behavior {
+                    AnchorBehavior::Silent => {
+                        // The wedge: 200 headers, then a body that never yields a byte (no
+                        // keep-alive).
+                        let pending = stream::pending::<Result<Bytes, std::io::Error>>();
+                        return Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "text/event-stream")
+                            .body(Body::from_stream(pending))
+                            .unwrap();
+                    }
+                    AnchorBehavior::ErrorFirst => {
+                        // 200 headers, then a body stream whose first (and only) item is a
+                        // transport-level error — the mid-race hard-error case.
+                        let err_stream = stream::once(async {
+                            Err::<Bytes, std::io::Error>(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "mock transport error mid-race",
+                            ))
+                        });
+                        return Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "text/event-stream")
+                            .body(Body::from_stream(err_stream))
+                            .unwrap();
+                    }
+                    AnchorBehavior::Normal => {}
+                }
             }
             let n = mock.counter.fetch_add(1, Ordering::SeqCst) + 1;
             let id = format!("resp_{n}");
