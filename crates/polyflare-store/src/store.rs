@@ -6,6 +6,7 @@ use std::time::Duration;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 
 use crate::account::AccountRepo;
+use crate::continuity_repo::ContinuityRepo;
 use crate::StoreError;
 
 /// Owns the SQLite connection pool. The pool is reference-counted, so cloning it is cheap.
@@ -44,5 +45,10 @@ impl Store {
     /// The account repository over this store's pool.
     pub fn accounts(&self) -> AccountRepo {
         AccountRepo::new(self.pool.clone())
+    }
+
+    /// The continuity repository over this store's pool.
+    pub fn continuity(&self) -> ContinuityRepo {
+        ContinuityRepo::new(self.pool.clone())
     }
 }
