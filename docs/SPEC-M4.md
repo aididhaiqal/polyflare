@@ -80,21 +80,36 @@ pub trait Translator: Send + Sync {
 
 The registry becomes a **factory** (`fn() -> Box<dyn Translator>`) so each turn gets a fresh stateful instance. Identity translators stay trivial (`translate_request` returns input; `translate_response_event` returns `vec![event]`). This is additive to M1's registry shape but touches its storage type — flagged as a risk (§7).
 
-### 3.5 The Anthropic→OpenAI-Responses event map *(VERIFY at impl — live captures)*
+### 3.5 The Anthropic→OpenAI-Responses event map *(event schemas doc-verified 2026-07-14; a short live-capture list remains — see §7)*
 
-Proposed mapping table (to be confirmed against captured fixtures, per DESIGN §10):
+Both wire formats are `event: <type>` + `data: <json>` SSE. The Anthropic order is fixed: `message_start` → N×[`content_block_start` → M×`content_block_delta` → `content_block_stop`] → 1+×`message_delta` → `message_stop`, with `ping` (keepalive) and `error` interleavable. The OpenAI-Responses side requires a **global monotonic `sequence_number`** on every event plus three coordinated positional counters (`output_index` for items, `content_index` for parts-within-item, `summary_index` for reasoning-summary parts) — **none of which Anthropic supplies.**
 
-| Anthropic Messages SSE | OpenAI-Responses SSE |
-|---|---|
-| `message_start` | `response.created` |
-| `content_block_start` (text) | (open text item; no direct emit) |
-| `content_block_delta` (text_delta) | `response.output_text.delta` |
-| `content_block_start`/`_delta` (tool_use) | `response.function_call_arguments.*` / function-call item |
-| `content_block_stop` | (close item) |
-| `message_delta` (stop_reason, usage) | accumulate usage / finalize |
-| `message_stop` | `response.completed` |
+The central fact: **the translator is a stateful assembler.** Anthropic's stream carries none of `response.id`, `item.id`, `call_id`, `output_index`/`content_index`/`summary_index`, `sequence_number`, `logprobs`, nor the terminal accumulated `text`/`arguments` strings — all must be minted and buffered per-turn. This is exactly why the trait must reshape (§3.4).
 
-Golden replay tests assert semantic equivalence over real captured fixtures with **no buffering**.
+**Verified mapping** (`[S]` = translator must synthesize the field):
+
+| Anthropic | → OpenAI-Responses | Notes |
+|---|---|---|
+| `message_start` | `response.created` + `response.in_progress` | `response.id` `[S]`, `sequence_number` `[S]` (own counter), `usage:null` at this stage |
+| `content_block_start` (text) | `response.output_item.added` (type `message`) + `response.content_part.added` (`output_text`) | `item.id`, `output_index`, `content_index` `[S]` |
+| `content_block_start` (tool_use) | `response.output_item.added` (type `function_call`, `id`/`call_id`/`name`) | `call_id` `[S]` (from Anthropic `tool_use.id`) |
+| `content_block_start` (thinking) | `response.output_item.added` (type `reasoning`) | `item.id` `[S]`; Anthropic `signature` has **no** OpenAI field |
+| `content_block_delta` `text_delta` | `response.output_text.delta` (1:1) | `logprobs:[]` `[S]` (required; Anthropic never provides) |
+| `content_block_delta` `input_json_delta` | `response.function_call_arguments.delta` (1:1) | `partial_json` passes through as-is (compatible partial-JSON) |
+| `content_block_delta` `thinking_delta` | `response.reasoning_summary_text.delta` | `summary_index` `[S]`=0; target-event choice (summary vs raw `reasoning_text`) needs live confirm |
+| `content_block_delta` `signature_delta` | **∅ (one-to-zero)** | no OpenAI event carries a reasoning signature; drop or stash out-of-band |
+| `content_block_stop` | `response.output_text.done` / `.function_call_arguments.done` / `.reasoning_summary_text.done` + `.content_part.done` + `.output_item.done` | full accumulated `text`/`arguments` `[S]` (buffered across deltas) |
+| `message_delta` (`stop_reason`, cumulative `usage`) | folds into terminal `response.completed`/`.incomplete` | `stop_reason`→status: `end_turn`→completed, `max_tokens`→incomplete(`max_output_tokens`) |
+| `message_stop` | `response.completed` (or `.incomplete`/`.failed`) | full `response` object `[S]`-assembled; `usage` `[S]`-mapped (below) |
+| mid-stream `error` event | `error` event | `error.type`→`code` mapping `[S]` (no canonical table) |
+
+**Usage mapping** (all cumulative-at-completion, only on `response.completed`): `input_tokens`→`input_tokens`; `output_tokens`→`output_tokens`; `cache_read_input_tokens`→`input_tokens_details.cached_tokens` (lossy — Anthropic also has `cache_creation_input_tokens` with no OpenAI slot); `thinking_tokens`→`output_tokens_details.reasoning_tokens`; `total_tokens` `[S]` = sum (Anthropic never reports a total).
+
+Golden replay tests assert semantic equivalence over real captured fixtures with **no buffering** (byte-timed).
+
+### 3.5a Anthropic rate-limit / error module *(header + error schemas doc-verified)*
+
+The `polyflare-anthropic` rate-limit module classifies from verified signals: HTTP **429** (`rate_limit_error`), **529** (`overloaded_error`, confirmed to exist), 401/403/413/500/504 with their `error.type`s; error body is always `{"type":"error","error":{"type","message"},"request_id"}`. Backoff reads `retry-after` (seconds) and the `anthropic-ratelimit-{requests,tokens,input-tokens,output-tokens}-{limit,remaining,reset}` headers (`reset` = RFC-3339 timestamp; token-bucket, continuous replenishment). This replaces the better-ccflare TS port with the real header/status set. (Mid-stream `error` SSE events reuse the same `error.type` vocabulary — the executor must surface them even after a 200.)
 
 ### 3.6 Model-alias mapping + per-tier payload-override
 
@@ -102,7 +117,7 @@ An alias map applied at the **request-translation seam** (inside `translate_requ
 
 ### 3.7 TA6 — Anthropic capability
 
-The shared eligibility machinery already exists (M2 gave `Account.security_work_authorized` + the Selector hard-filter; M3 the retry orchestration seam). M4's Anthropic-specific job is only: (a) populate the per-account capability flag (Anthropic approved-org / dual-use entitlement — **VERIFY the signal**), and (b) classify an Anthropic provider rejection into the neutral `NeedsCapability(cap)` error the retry loop already understands. Continuity is a no-op for the Anthropic backend (no `previous_response_id`-style anchor), so the wedge machinery simply doesn't arm.
+The shared eligibility machinery already exists (M2 gave `Account.security_work_authorized` + the Selector hard-filter; M3 the retry orchestration seam). **Research resolved the key uncertainty:** Anthropic exposes **no** documented per-account/org "approved" or entitlement flag in any API response, header, or error — usage tier lives only in the Console, and the only implicit signal is the *presence* of `anthropic-priority-*-tokens-*` headers (Priority Tier). This **confirms the existing design**: the capability flag is **operator-set** (exactly like codex-lb's `security_work_authorized`), never derived from the API. So M4's Anthropic-specific job narrows to just: classify an Anthropic provider rejection (`permission_error` / a policy refusal) into the neutral `NeedsCapability(cap)` error the retry loop already understands — reactive detection is the only path, as TA6 always intended. Continuity is a no-op for the Anthropic backend (no `previous_response_id`-style anchor), so the wedge machinery simply doesn't arm.
 
 ## 4. Resolved decisions (proposed — I'll own these unless you object)
 
@@ -131,8 +146,15 @@ The shared eligibility machinery already exists (M2 gave `Account.security_work_
 
 ## 7. Open risks / VERIFY-at-impl
 
-- **The Anthropic SSE ↔ OpenAI-Responses event map (§3.5)** — the single largest technical risk; build from live captures, not from better-ccflare's TS alone.
-- **Anthropic error / rate-limit header signals + whether an org-"approved" flag is exposed (TA6)** — VERIFY vs the live API.
-- **Exact model strings each CLI sends** — Claude Code likely sends full IDs (`claude-opus-4-…`), not bare `opus`; the alias map keys must match reality. VERIFY.
+The event/error/header **schemas are now doc-verified** (§3.5, §3.5a, §3.7) — the SSE map is no longer a blank unknown. What genuinely remains for **live capture** is a short, specific list (a single real Claude request + one Codex request through a tap resolves most of it):
+
+- **Anthropic flat `index` → OpenAI `output_index` vs `content_index` split** — does each Anthropic content block become its own OpenAI output item, or parts within one message item? Confirm from a real 2-block stream.
+- **`thinking_delta` target** — `response.reasoning_summary_text.delta` vs raw `response.reasoning_text.delta`; pick whichever the downstream OpenAI-shaped consumer actually reads.
+- **`stop_reason` → status and `error.type` → `code` tables** — no canonical mapping exists in either doc; these are our design choices, pin them with a captured example each.
+- **cache-token combination** (`cache_read` vs `cache_creation` → single `cached_tokens`) and **`anthropic-fast-*` / Priority-Tier header exact names** — confirm from real response headers.
+- **Exact model strings each CLI sends** — Claude Code likely sends full IDs (`claude-opus-4-…`), not bare `opus`; the alias-map keys must match reality. (Feeds U2.)
+
+Design/impl risks (not doc-resolvable):
+
 - **Translator reshape ripple** — moving to `&mut self` + `Vec<SseEvent>` + a registry factory touches every identity translator and the registry's storage type; contain it and keep identity zero-cost.
 - **Continuity no-op path** — confirm the Anthropic backend cleanly bypasses the watchdog/ownership (arm-only-on-anchor already guarantees this, but assert it).
