@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 
 use polyflare_codex::oauth::OAuthClient;
@@ -75,6 +75,15 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/responses", post(responses_handler))
         .route("/v1/messages", post(messages_handler))
+        // Model catalog (read-only GETs): real Codex models (bootstrap floor for now) merged with
+        // PolyFlare's synthetic aliases. Routing is by method+path, so these never conflict with
+        // the `/v1/*` POSTs above.
+        .route("/models", get(crate::catalog::codex_models_handler))
+        .route(
+            "/backend-api/codex/models",
+            get(crate::catalog::codex_models_handler),
+        )
+        .route("/v1/models", get(crate::catalog::v1_models_handler))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }

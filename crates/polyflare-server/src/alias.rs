@@ -13,51 +13,72 @@ pub struct ModelAlias {
     pub reasoning_effort: Option<String>,
 }
 
-/// U2: confirm exact model strings + pairs. Proposed defaults per SPEC-M4 §3.6/§7: a client
-/// model containing `opus` -> Codex `gpt-5.6-sol` @ high effort; `sonnet` -> Codex
-/// `gpt-5.6-terra` @ medium; `haiku` -> Codex `gpt-5.6-luna` @ low. Kept as a single
-/// easy-to-edit function (an ordered list of needle/alias pairs, first match wins) so the exact
-/// strings/pairs can be swapped without touching the lookup logic in `lookup_alias`.
-fn default_aliases() -> Vec<(&'static str, ModelAlias)> {
+/// A synthetic model PolyFlare advertises in its catalog AND routes: a client-facing `id` (what a
+/// client selects / what the model list shows) plus the `needle` [`lookup_alias`] matches on
+/// (Claude Code sends full dated ids like `claude-opus-4-1-20250805`, so match by tier substring,
+/// not the exact id), and the `alias` (target provider/model/effort). This one table is the single
+/// source of truth for both `/v1/messages` routing and the served model catalog (see
+/// `crate::catalog`) — the "config/transform" mechanism CLIProxyAPI/codex-lb use for synthetic
+/// models, since the Claude model list can't be fetched with a subscription-OAuth token.
+pub struct SyntheticModel {
+    /// Client-facing model id advertised in the catalog (e.g. `claude-opus-4-1`).
+    pub id: &'static str,
+    /// Case-insensitive substring `lookup_alias` matches an inbound `model` string against.
+    pub needle: &'static str,
+    /// Human-readable name for the catalog.
+    pub display_name: &'static str,
+    /// The routing target.
+    pub alias: ModelAlias,
+}
+
+/// The synthetic model definitions (first match wins in [`lookup_alias`]). U2: confirm exact
+/// strings/pairs. Defaults per SPEC-M4 §3.6/§7: `opus` -> Codex `gpt-5.6-sol` @ high, `sonnet` ->
+/// `gpt-5.6-terra` @ medium, `haiku` -> `gpt-5.6-luna` @ low. Edit here to add/repoint synthetic
+/// models without touching lookup or catalog logic.
+pub fn synthetic_models() -> Vec<SyntheticModel> {
     vec![
-        (
-            "opus",
-            ModelAlias {
+        SyntheticModel {
+            id: "claude-opus-4-1",
+            needle: "opus",
+            display_name: "Claude Opus 4.1 (via Codex gpt-5.6-sol)",
+            alias: ModelAlias {
                 target_provider: Provider::Codex,
                 target_model: "gpt-5.6-sol".to_string(),
                 reasoning_effort: Some("high".to_string()),
             },
-        ),
-        (
-            "sonnet",
-            ModelAlias {
+        },
+        SyntheticModel {
+            id: "claude-sonnet-4-5",
+            needle: "sonnet",
+            display_name: "Claude Sonnet 4.5 (via Codex gpt-5.6-terra)",
+            alias: ModelAlias {
                 target_provider: Provider::Codex,
                 target_model: "gpt-5.6-terra".to_string(),
                 reasoning_effort: Some("medium".to_string()),
             },
-        ),
-        (
-            "haiku",
-            ModelAlias {
+        },
+        SyntheticModel {
+            id: "claude-haiku-4-5",
+            needle: "haiku",
+            display_name: "Claude Haiku 4.5 (via Codex gpt-5.6-luna)",
+            alias: ModelAlias {
                 target_provider: Provider::Codex,
                 target_model: "gpt-5.6-luna".to_string(),
                 reasoning_effort: Some("low".to_string()),
             },
-        ),
+        },
     ]
 }
 
 /// Look up the alias for a client-supplied `model` string: a case-insensitive substring match
-/// against `default_aliases`'s needles, in order (Claude Code sends full IDs like
-/// `claude-opus-4-1-20250805`, not the bare tier name, so substring — not exact — match is
-/// required). `None` means no alias entry: the caller must take the native (same-provider)
-/// ingress path.
+/// against [`synthetic_models`]'s needles, in order. `None` means no alias entry: the caller must
+/// take the native (same-provider) ingress path.
 pub fn lookup_alias(model: &str) -> Option<ModelAlias> {
     let lower = model.to_lowercase();
-    default_aliases()
+    synthetic_models()
         .into_iter()
-        .find(|(needle, _)| lower.contains(needle))
-        .map(|(_, alias)| alias)
+        .find(|m| lower.contains(m.needle))
+        .map(|m| m.alias)
 }
 
 #[cfg(test)]
