@@ -27,6 +27,8 @@ pub struct Account {
     pub reset_at: Option<i64>,
     pub blocked_at: Option<i64>,
     pub security_work_authorized: bool,
+    /// 'codex' | 'anthropic' — which backend pool this account belongs to.
+    pub provider: String,
 }
 
 /// The three OAuth tokens in plaintext. Used as insert/update input and as decrypt output.
@@ -86,13 +88,13 @@ pub struct UsageSnapshot {
 /// Full column list for `SELECT`ing an `Account` (must match the `FromRow` field order/names).
 const SELECT_ACCOUNT_BY_ID: &str = "SELECT id, chatgpt_account_id, chatgpt_user_id, email, \
     alias, workspace_id, workspace_label, seat_type, plan_type, routing_policy, last_refresh, \
-    created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized \
-    FROM accounts WHERE id = ?";
+    created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
+    provider FROM accounts WHERE id = ?";
 
 const SELECT_ALL_ACCOUNTS: &str = "SELECT id, chatgpt_account_id, chatgpt_user_id, email, \
     alias, workspace_id, workspace_label, seat_type, plan_type, routing_policy, last_refresh, \
-    created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized \
-    FROM accounts ORDER BY id";
+    created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
+    provider FROM accounts ORDER BY id";
 
 /// CRUD over the `accounts` table. Cheap to construct (clones the pool handle).
 pub struct AccountRepo {
@@ -127,8 +129,8 @@ impl AccountRepo {
                 workspace_id, workspace_label, seat_type, plan_type, routing_policy, \
                 access_token_enc, refresh_token_enc, id_token_enc, \
                 last_refresh, created_at, status, deactivation_reason, \
-                reset_at, blocked_at, security_work_authorized\
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                reset_at, blocked_at, security_work_authorized, provider\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(account.id.as_str())
         .bind(account.chatgpt_account_id.as_deref())
@@ -150,6 +152,7 @@ impl AccountRepo {
         .bind(account.reset_at)
         .bind(account.blocked_at)
         .bind(account.security_work_authorized)
+        .bind(account.provider.as_str())
         .execute(&self.pool)
         .await?;
         Ok(())

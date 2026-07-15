@@ -51,6 +51,7 @@ fn account(id: &str) -> Account {
         reset_at: None,
         blocked_at: None,
         security_work_authorized: false,
+        provider: "codex".to_string(),
     }
 }
 
@@ -94,13 +95,15 @@ async fn second_turn_pins_back_to_owning_account() {
     let upstream = mock.spawn().await;
 
     let state = Arc::new(AppState {
-        executor: Arc::new(CodexExecutor::new().unwrap()),
+        codex_executor: Arc::new(CodexExecutor::new().unwrap()),
+        anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(PreferB),
         continuity,
         store,
         cipher: TokenCipher::from_key_bytes(&[7u8; 32]).unwrap(),
         oauth: OAuthClient::new("http://127.0.0.1:9").unwrap(),
         upstream_base_url: upstream,
+        anthropic_upstream_base_url: "http://127.0.0.1:9".to_string(),
         refresh_locks: Default::default(),
     });
     let app = build_app(state.clone());

@@ -47,13 +47,15 @@ async fn spawn_polyflare(upstream: String) -> String {
     std::mem::forget(dir);
 
     let state = Arc::new(AppState {
-        executor: Arc::new(CodexExecutor::new().unwrap()),
+        codex_executor: Arc::new(CodexExecutor::new().unwrap()),
+        anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),
         continuity,
         store,
         cipher,
         oauth: OAuthClient::new("http://127.0.0.1:9").unwrap(),
         upstream_base_url: upstream,
+        anthropic_upstream_base_url: "http://127.0.0.1:9".to_string(),
         refresh_locks: Default::default(),
     });
     let app = build_app(state);
@@ -84,6 +86,7 @@ fn store_account_ok(id: &str) -> Account {
         reset_at: None,
         blocked_at: None,
         security_work_authorized: false,
+        provider: "codex".to_string(),
     }
 }
 

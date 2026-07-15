@@ -6,9 +6,10 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
+use polyflare_anthropic::AnthropicExecutor;
 use polyflare_codex::oauth::OAuthClient;
 use polyflare_codex::CodexExecutor;
-use polyflare_core::{CapacityWeighted, Continuity, Selector};
+use polyflare_core::{CapacityWeighted, Continuity, Executor, Selector};
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::config::{self, ServeConfig};
 use polyflare_server::continuity::CodexContinuity;
@@ -69,7 +70,8 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServeConfig::from_env()?;
     let store = Store::open(&config.db_path).await?;
     let cipher = TokenCipher::load_or_create(&config.key_path)?;
-    let executor = Arc::new(CodexExecutor::new()?);
+    let codex_executor: Arc<dyn Executor> = Arc::new(CodexExecutor::new()?);
+    let anthropic_executor: Arc<dyn Executor> = Arc::new(AnthropicExecutor::new()?);
     let selector: Arc<dyn Selector> = Arc::new(CapacityWeighted);
     let oauth = OAuthClient::new(config.auth_base_url)?;
     let continuity: Arc<dyn Continuity> = Arc::new(CodexContinuity::new(
@@ -78,13 +80,15 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     let state = Arc::new(AppState {
-        executor,
+        codex_executor,
+        anthropic_executor,
         selector,
         continuity,
         store,
         cipher,
         oauth,
         upstream_base_url: config.upstream_base_url,
+        anthropic_upstream_base_url: config.anthropic_upstream_base_url,
         refresh_locks: Default::default(),
     });
     let app = build_app(state);

@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 polyflare-core = { path = "../polyflare-core" }
 polyflare-codex = { path = "../polyflare-codex" }
+polyflare-anthropic = { path = "../polyflare-anthropic" }
 polyflare-store = { path = "../polyflare-store" }
 axum = { workspace = true }
 tokio = { workspace = true }
