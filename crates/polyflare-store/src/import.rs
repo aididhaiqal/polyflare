@@ -1,6 +1,18 @@
 //! Zero-re-auth importer: read a codex-lb `store.db` read-only, Fernet-decrypt each account's
-//! three tokens, re-encrypt them XChaCha20-Poly1305, and copy accounts + usage_history into the
-//! PolyFlare schema by column-intersection. Token plaintext is never logged.
+//! three tokens, re-encrypt them XChaCha20-Poly1305, and copy accounts + usage_history +
+//! request_logs (the chat log) into the PolyFlare schema. Token plaintext is never logged.
+//!
+//! # request_logs (chat-log) migration — content safety
+//! The chat-log copy carries ONLY codex-lb's content-safe `request_logs` columns (ids, model,
+//! token counts, cost, latency, outcome/error_code, tiers, plan, timestamps). It deliberately never
+//! SELECTs the free-form / PII columns codex-lb also stores — `useragent`, `useragent_group`,
+//! `client_ip`, `error_message`, `failure_detail` — so they are never even read, let alone
+//! persisted, honoring PolyFlare's stricter no-free-form-request-string rule. codex-lb's TEXT
+//! outcome `status` lands in PolyFlare's `outcome` column (its own `status` is the INTEGER HTTP
+//! code); `latency_ms` maps onto `duration_ms`. Re-import is idempotent: each row carries its
+//! codex-lb `id` as `import_source_id`, and the unique index makes the copy `INSERT OR IGNORE`.
+//! Requires a reasonably current codex-lb schema (the fixed SELECT lists columns added across
+//! codex-lb's migrations); an older source missing one errors clearly rather than silently skipping.
 
 use std::fs;
 use std::path::Path;
@@ -18,6 +30,7 @@ use crate::StoreError;
 pub struct ImportSummary {
     pub accounts_imported: usize,
     pub usage_rows_imported: usize,
+    pub request_logs_imported: usize,
 }
 
 /// A codex-lb `accounts` row: durable columns (the intersection with PolyFlare's schema) plus
@@ -65,6 +78,44 @@ struct SrcUsage {
     credits_has: Option<bool>,
     credits_unlimited: Option<bool>,
     credits_balance: Option<f64>,
+}
+
+/// A codex-lb `request_logs` (chat-log) row — ONLY the content-safe columns are selected (the
+/// free-form/PII columns `useragent`/`client_ip`/`error_message`/`failure_detail` are deliberately
+/// never read; see the module doc). Most columns are nullable in codex-lb, so all but the always-
+/// present `id`/`requested_at` are `Option`. codex-lb's `status` is the TEXT outcome; `latency_ms`
+/// maps onto PolyFlare's `duration_ms`.
+#[derive(sqlx::FromRow)]
+struct SrcRequestLog {
+    /// codex-lb's PK — carried only as `import_source_id` for idempotent re-import.
+    id: i64,
+    account_id: Option<String>,
+    session_id: Option<String>,
+    request_id: Option<String>,
+    model: Option<String>,
+    plan_type: Option<String>,
+    source: Option<String>,
+    request_kind: Option<String>,
+    /// codex-lb outcome: 'success' | 'error' — lands in PolyFlare's `outcome` column.
+    status: Option<String>,
+    error_code: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
+    cost_usd: Option<f64>,
+    reasoning_effort: Option<String>,
+    /// Total latency — maps onto PolyFlare's `duration_ms`.
+    latency_ms: Option<i64>,
+    latency_first_token_ms: Option<i64>,
+    service_tier: Option<String>,
+    requested_service_tier: Option<String>,
+    actual_service_tier: Option<String>,
+    transport: Option<String>,
+    /// DATETIME text (NOT NULL) -> epoch seconds.
+    requested_at: String,
+    /// DATETIME text (nullable) -> epoch seconds.
+    deleted_at: Option<String>,
 }
 
 /// Import accounts + usage from the codex-lb `store.db` at `src_db_path`, using the Fernet key
@@ -214,7 +265,78 @@ pub async fn import_from_codex_lb(
         summary.usage_rows_imported += 1;
     }
 
-    // Commit only after BOTH loops succeed; any earlier `?` drops `tx` → full rollback.
+    // --- request_logs (the chat log) ---
+    // Content-safe subset only (see module doc): the free-form/PII columns are never SELECTed.
+    // Idempotent via `import_source_id` (codex-lb's row id) + the unique index → `INSERT OR IGNORE`.
+    let src_logs = sqlx::query_as::<_, SrcRequestLog>(
+        "SELECT id, account_id, session_id, request_id, model, plan_type, source, \
+         request_kind, status, error_code, input_tokens, output_tokens, cached_input_tokens, \
+         reasoning_tokens, cost_usd, reasoning_effort, latency_ms, latency_first_token_ms, \
+         service_tier, requested_service_tier, actual_service_tier, transport, \
+         requested_at, deleted_at FROM request_logs",
+    )
+    .fetch_all(&src_pool)
+    .await?;
+
+    for src in src_logs {
+        let requested_at = parse_epoch(&src.requested_at)?;
+        let deleted_at = match &src.deleted_at {
+            Some(s) => Some(parse_epoch(s)?),
+            None => None,
+        };
+        // PolyFlare-native NOT NULL columns codex-lb's request_logs has no analog for: all codex-lb
+        // request_logs are Codex `/responses` POSTs, so provider/method/path are fixed; `aliased`
+        // is unknown historically (false); `status` (HTTP int) was never recorded by codex-lb (0 =
+        // "no HTTP status", the outcome/error_code carry the result); `duration_ms` <- `latency_ms`.
+        let duration_ms = src.latency_ms.unwrap_or(0);
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO request_log (\
+                requested_at, provider, method, path, aliased, status, duration_ms, \
+                account_id, session_id, request_id, model, plan_type, source, request_kind, \
+                outcome, error_code, input_tokens, output_tokens, cached_input_tokens, \
+                reasoning_tokens, cost_usd, reasoning_effort, latency_first_token_ms, \
+                service_tier, requested_service_tier, actual_service_tier, transport, \
+                deleted_at, import_source_id\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                      ?, ?, ?, ?)",
+        )
+        .bind(requested_at)
+        .bind("codex")
+        .bind("POST")
+        .bind("/responses")
+        .bind(false)
+        .bind(0_i64)
+        .bind(duration_ms)
+        .bind(src.account_id.as_deref())
+        .bind(src.session_id.as_deref())
+        .bind(src.request_id.as_deref())
+        .bind(src.model.as_deref())
+        .bind(src.plan_type.as_deref())
+        .bind(src.source.as_deref())
+        .bind(src.request_kind.as_deref())
+        .bind(src.status.as_deref())
+        .bind(src.error_code.as_deref())
+        .bind(src.input_tokens)
+        .bind(src.output_tokens)
+        .bind(src.cached_input_tokens)
+        .bind(src.reasoning_tokens)
+        .bind(src.cost_usd)
+        .bind(src.reasoning_effort.as_deref())
+        .bind(src.latency_first_token_ms)
+        .bind(src.service_tier.as_deref())
+        .bind(src.requested_service_tier.as_deref())
+        .bind(src.actual_service_tier.as_deref())
+        .bind(src.transport.as_deref())
+        .bind(deleted_at)
+        .bind(src.id)
+        .execute(&mut *tx)
+        .await?;
+        // `OR IGNORE` yields 0 rows_affected when a source id is already present (idempotent
+        // re-import), 1 when a new row lands — so the count reflects true inserts.
+        summary.request_logs_imported += result.rows_affected() as usize;
+    }
+
+    // Commit only after ALL loops succeed; any earlier `?` drops `tx` → full rollback.
     tx.commit().await?;
 
     Ok(summary)

@@ -136,8 +136,8 @@ async fn accounts_import(from: &Path, fernet_key: &Path) -> Result<(), Box<dyn s
     let cipher = TokenCipher::load_or_create(&key_path)?;
     let summary = import_from_codex_lb(&store, from, fernet_key, &cipher).await?;
     println!(
-        "imported {} account(s) and {} usage row(s)",
-        summary.accounts_imported, summary.usage_rows_imported
+        "imported {} account(s), {} usage row(s), and {} chat-log row(s)",
+        summary.accounts_imported, summary.usage_rows_imported, summary.request_logs_imported
     );
     Ok(())
 }

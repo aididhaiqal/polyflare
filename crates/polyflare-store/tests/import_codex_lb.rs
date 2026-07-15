@@ -18,6 +18,8 @@ const RECORDED_AT_ISO: &str = "2026-07-12 06:05:00"; // usage row
 const LAST_REFRESH_EPOCH: i64 = 1_783_836_041; // 2026-07-12 06:00:41 UTC (sub-second truncated)
 const CREATED_AT_EPOCH: i64 = 1_783_144_825; // 2026-07-04 06:00:25 UTC
 const RECORDED_AT_EPOCH: i64 = 1_783_836_300; // 2026-07-12 06:05:00 UTC
+const REQ_LOG_AT_ISO: &str = "2026-07-12 06:10:15"; // request_logs.requested_at (DATETIME text)
+const REQ_LOG_AT_EPOCH: i64 = 1_783_836_615; // 2026-07-12 06:10:15 UTC (= RECORDED_AT + 315s)
 
 /// Create a codex-lb-shaped source DB at `path` with one account (tokens Fernet-encrypted with
 /// `fernet_key`) and one usage_history row.
@@ -134,6 +136,83 @@ async fn build_source_db(path: &Path, fernet_key: &str) {
     .bind(Some(true))
     .bind(Some(false))
     .bind(Some(12.5_f64))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // codex-lb `request_logs` (the chat log): the content-safe columns the importer carries PLUS
+    // the free-form/PII columns it must NOT read (useragent, client_ip, error_message) — present
+    // here so the test proves they are dropped, not carried.
+    sqlx::query(
+        "CREATE TABLE request_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT,
+            session_id TEXT,
+            request_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            plan_type TEXT,
+            source TEXT,
+            request_kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error_code TEXT,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cached_input_tokens INTEGER,
+            reasoning_tokens INTEGER,
+            cost_usd REAL,
+            reasoning_effort TEXT,
+            latency_ms INTEGER,
+            latency_first_token_ms INTEGER,
+            service_tier TEXT,
+            requested_service_tier TEXT,
+            actual_service_tier TEXT,
+            transport TEXT,
+            requested_at TEXT NOT NULL,
+            deleted_at TEXT,
+            useragent TEXT,
+            client_ip TEXT,
+            error_message TEXT
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO request_logs (
+            account_id, session_id, request_id, model, plan_type, source, request_kind,
+            status, error_code, input_tokens, output_tokens, cached_input_tokens, reasoning_tokens,
+            cost_usd, reasoning_effort, latency_ms, latency_first_token_ms,
+            service_tier, requested_service_tier, actual_service_tier, transport,
+            requested_at, deleted_at, useragent, client_ip, error_message
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("acct-1")
+    .bind(Some("sess-xyz"))
+    .bind("req-abc")
+    .bind("gpt-5.6-sol")
+    .bind(Some("pro"))
+    .bind(Option::<String>::None)
+    .bind("normal")
+    .bind("success")
+    .bind(Option::<String>::None)
+    .bind(Some(1200_i64))
+    .bind(Some(340_i64))
+    .bind(Some(800_i64))
+    .bind(Some(64_i64))
+    .bind(Some(0.0123_f64))
+    .bind(Some("high"))
+    .bind(Some(4200_i64)) // latency_ms -> duration_ms
+    .bind(Some(180_i64))
+    .bind(Some("priority"))
+    .bind(Some("auto"))
+    .bind(Some("priority"))
+    .bind(Some("websocket"))
+    .bind(REQ_LOG_AT_ISO) // DATETIME text -> epoch
+    .bind(Option::<String>::None)
+    .bind(Some("codex_cli_rs/0.44.0 (Mac OS 26.0; arm64) iTerm.app")) // MUST NOT be carried
+    .bind(Some("203.0.113.7")) // MUST NOT be carried
+    .bind(Some("upstream said: invalid value for foo=SECRET")) // MUST NOT be carried
     .execute(&pool)
     .await
     .unwrap();
@@ -272,6 +351,110 @@ async fn imports_accounts_usage_and_tokens_roundtrip() {
         "recorded_at must parse to epoch"
     );
     assert_eq!(window, None, "a NULL source window must stay NULL");
+
+    // --- chat-log (request_logs) migration ---
+    assert_eq!(summary.request_logs_imported, 1);
+
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT requested_at, provider, method, path, aliased, status, duration_ms, outcome, \
+         account_id, session_id, request_id, model, plan_type, request_kind, input_tokens, \
+         output_tokens, cached_input_tokens, reasoning_tokens, cost_usd, reasoning_effort, \
+         latency_first_token_ms, service_tier, actual_service_tier, transport, deleted_at, \
+         import_source_id FROM request_log",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+
+    // ISO DATETIME -> epoch; codex-lb->PolyFlare column mapping applied.
+    assert_eq!(row.get::<i64, _>("requested_at"), REQ_LOG_AT_EPOCH);
+    assert_eq!(row.get::<String, _>("provider"), "codex"); // native default (codex-lb is codex-only)
+    assert_eq!(row.get::<String, _>("method"), "POST");
+    assert_eq!(row.get::<String, _>("path"), "/responses");
+    assert!(!row.get::<bool, _>("aliased"));
+    assert_eq!(row.get::<i64, _>("status"), 0); // codex-lb recorded no HTTP status; see `outcome`
+    assert_eq!(row.get::<i64, _>("duration_ms"), 4200); // <- latency_ms
+    assert_eq!(row.get::<String, _>("outcome"), "success"); // <- codex-lb TEXT `status`
+                                                            // content-safe columns carried verbatim.
+    assert_eq!(row.get::<String, _>("account_id"), "acct-1");
+    assert_eq!(row.get::<String, _>("session_id"), "sess-xyz");
+    assert_eq!(row.get::<String, _>("request_id"), "req-abc");
+    assert_eq!(row.get::<String, _>("model"), "gpt-5.6-sol");
+    assert_eq!(row.get::<String, _>("plan_type"), "pro");
+    assert_eq!(row.get::<String, _>("request_kind"), "normal");
+    assert_eq!(row.get::<i64, _>("input_tokens"), 1200);
+    assert_eq!(row.get::<i64, _>("output_tokens"), 340);
+    assert_eq!(row.get::<i64, _>("cached_input_tokens"), 800);
+    assert_eq!(row.get::<i64, _>("reasoning_tokens"), 64);
+    assert!((row.get::<f64, _>("cost_usd") - 0.0123).abs() < 1e-9);
+    assert_eq!(row.get::<String, _>("reasoning_effort"), "high");
+    assert_eq!(row.get::<i64, _>("latency_first_token_ms"), 180);
+    assert_eq!(row.get::<String, _>("service_tier"), "priority");
+    assert_eq!(row.get::<String, _>("actual_service_tier"), "priority");
+    assert_eq!(row.get::<String, _>("transport"), "websocket");
+    assert_eq!(row.get::<Option<i64>, _>("deleted_at"), None);
+    assert_eq!(row.get::<i64, _>("import_source_id"), 1);
+
+    // Content safety: the free-form / PII columns must not exist in PolyFlare's request_log at all,
+    // so the useragent / client_ip / error_message the fixture carried could never be persisted.
+    let cols: Vec<String> = sqlx::query("PRAGMA table_info(request_log)")
+        .fetch_all(store.pool())
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<String, _>("name"))
+        .collect();
+    for forbidden in [
+        "useragent",
+        "useragent_group",
+        "client_ip",
+        "error_message",
+        "failure_detail",
+    ] {
+        assert!(
+            !cols.contains(&forbidden.to_string()),
+            "forbidden free-form column `{forbidden}` must not exist in request_log"
+        );
+    }
+}
+
+/// Re-importing the same codex-lb DB is idempotent for the chat log: the second run inserts zero
+/// request_log rows (the `import_source_id` unique index + `INSERT OR IGNORE` dedupe), leaving the
+/// row count unchanged.
+#[tokio::test]
+async fn reimport_is_idempotent_for_request_logs() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_db = dir.path().join("codex-lb-store.db");
+    let fernet_key_path = dir.path().join("encryption.key");
+    let pf_db = dir.path().join("polyflare-store.db");
+    let pf_key = dir.path().join("key");
+
+    let fernet_key = Fernet::generate_key();
+    std::fs::write(&fernet_key_path, &fernet_key).unwrap();
+    build_source_db(&src_db, &fernet_key).await;
+
+    let store = Store::open(&pf_db).await.unwrap();
+    let cipher = TokenCipher::load_or_create(&pf_key).unwrap();
+
+    let first = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher)
+        .await
+        .unwrap();
+    assert_eq!(first.request_logs_imported, 1);
+
+    let second = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher)
+        .await
+        .unwrap();
+    assert_eq!(
+        second.request_logs_imported, 0,
+        "re-import must not duplicate chat-log rows"
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_log")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
 }
 
 /// A mid-import Fernet-decrypt failure must fail cleanly (no panic) AND roll the WHOLE import
