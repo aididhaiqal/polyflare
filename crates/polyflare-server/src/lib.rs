@@ -9,6 +9,7 @@ pub mod continuity;
 pub mod fingerprint_capture;
 pub mod ingress;
 pub mod observability;
+pub mod read_api;
 pub mod refresh_locks;
 pub mod session_key;
 pub mod snapshot;

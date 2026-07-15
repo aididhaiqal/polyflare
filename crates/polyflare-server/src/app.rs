@@ -92,6 +92,11 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             get(crate::catalog::codex_models_handler),
         )
         .route("/v1/models", get(crate::catalog::v1_models_handler))
+        // Read-only dashboard API (GET JSON): pools, accounts (+ live usage windows / reset
+        // times), and recent request-log rows. Non-secret metadata only (see `crate::read_api`).
+        .route("/api/pools", get(crate::read_api::pools_handler))
+        .route("/api/accounts", get(crate::read_api::accounts_handler))
+        .route("/api/requests", get(crate::read_api::requests_handler))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
