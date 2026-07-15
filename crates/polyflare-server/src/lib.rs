@@ -6,6 +6,7 @@ pub mod app;
 pub mod catalog;
 pub mod config;
 pub mod continuity;
+pub mod dashboard;
 pub mod fingerprint_capture;
 pub mod ingress;
 pub mod observability;

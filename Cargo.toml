@@ -37,6 +37,9 @@ sha2 = "0.10"
 hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Embeds the built Vite dashboard (crates/polyflare-server/dashboard/dist) into the binary. The
+# `mime-guess` feature lets each embedded file report its own Content-Type.
+rust-embed = { version = "8", features = ["mime-guess"] }
 # M5 TLS fingerprint parity (T-rustls): pinned to the exact rustls/aws-lc-rs versions codex-rs's
 # own Cargo.lock resolves to (verified against a local openai/codex checkout), so the Codex
 # executor's ClientHello is built by the identical rustls release + aws-lc-rs crypto provider.
