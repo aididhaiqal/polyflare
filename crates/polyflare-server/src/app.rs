@@ -97,6 +97,11 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/pools", get(crate::read_api::pools_handler))
         .route("/api/accounts", get(crate::read_api::accounts_handler))
         .route("/api/requests", get(crate::read_api::requests_handler))
+        // Embedded dashboard UI (see `crate::dashboard`). `/dashboard` serves the SPA entrypoint;
+        // `/dashboard/{*path}` serves its bundle assets (with SPA fallback to index.html).
+        .route("/dashboard", get(crate::dashboard::dashboard_index))
+        .route("/dashboard/", get(crate::dashboard::dashboard_index))
+        .route("/dashboard/{*path}", get(crate::dashboard::dashboard_asset))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
