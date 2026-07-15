@@ -77,6 +77,7 @@ async fn large_request_body_is_not_rejected_with_413() {
         cipher,
         oauth: OAuthClient::new("http://127.0.0.1:9").unwrap(),
         upstream_base_url: upstream,
+        refresh_locks: Default::default(),
     });
     let app = build_app(state);
 
