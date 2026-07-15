@@ -9,11 +9,18 @@
 //! `codex-api/src/endpoint/responses.rs`, `codex-api/src/requests/headers.rs`,
 //! `core/src/responses_metadata.rs`, `core/src/session/mod.rs`).
 //!
-//! # Status: PROVISIONAL — pending a real codex-rs capture
-//! This golden was NOT built from a live wire capture of the real Codex CLI. Set
-//! `POLYFLARE_CAPTURE_FINGERPRINT=<path>` (see [`polyflare_server::fingerprint_capture`], already
-//! wired into ingress) against a real `codex` CLI run to obtain one and re-diff this golden once
-//! available.
+//! # Status: CAPTURE-VERIFIED (codex-cli 0.144.1, 2026-07-15)
+//! This golden has been diffed against a live wire capture of the real Codex CLI (`codex-cli
+//! 0.144.1`), obtained by routing a `scripts/codex-polyflare` run through
+//! `POLYFLARE_CAPTURE_FINGERPRINT` (see [`polyflare_server::fingerprint_capture`]). The capture
+//! CONFIRMED [`EXPECTED_CODEX_IDENTITY_HEADER_NAMES`], [`EXPECTED_TURN_METADATA_KEYS`], and the UA
+//! format. It also surfaced two headers a real codex sends CONDITIONALLY, both deliberately absent
+//! from the always-present expected set (and validly absent from PolyFlare's synthesis — see
+//! `polyflare_codex::codex_headers` module doc): `x-codex-beta-features` (present only when the
+//! session enables experimental features) and `x-openai-internal-codex-responses-lite: true`
+//! (present only for responses-lite models). Because this gate asserts the captured egress is a
+//! SUPERSET of the always-present set, those optional headers do not belong in it; the native
+//! forward path relays them verbatim when a real client sends them.
 //!
 //! # What this gate checks (and what it deliberately does NOT)
 //! - Checks: PolyFlare's captured egress header-NAME set is a SUPERSET of
@@ -24,9 +31,8 @@
 //! - Does NOT check header ORDER: `capture_request_fingerprint` sorts headers alphabetically
 //!   because `axum`'s `HeaderMap` does not preserve wire receipt order (see
 //!   `polyflare_server::fingerprint_capture` module docs, "Header-order fidelity").
-//! - Does NOT check exact id VALUES (only presence/shape) or the exact codex-rs release version
-//!   string (`polyflare_codex::codex_headers::CODEX_CLI_VERSION` is a placeholder — U4: confirm
-//!   real codex-rs release version via capture).
+//! - Does NOT check exact id VALUES (only presence/shape). The codex-rs release version string
+//!   (`polyflare_codex::codex_headers::CODEX_CLI_VERSION`) is now capture-verified to `0.144.1`.
 //!
 //! This test must FAIL before the executor sets these headers and PASS after.
 
