@@ -22,7 +22,7 @@ use crate::app::AppState;
 use crate::fingerprint_capture::{append_fingerprint_capture, capture_request_fingerprint};
 use crate::observability::RequestLog;
 use crate::session_key::derive_request_ctx;
-use crate::snapshot::{assemble_snapshots, filter_by_provider};
+use crate::snapshot::filter_by_provider;
 use crate::translate_stream::wrap_translating_stream;
 use crate::watchdog::{
     apply_ownership, execute_recovery, execute_with_watchdog, signal_client_stream, RouteDecision,
@@ -211,6 +211,8 @@ async fn resolve_core_account(
                     {
                         // Refresh succeeded and `new` is valid in-memory for THIS request; don't fail
                         // over a persist error — surface it (content-safe). Observability is M5.
+                        // (A successful write bumps the store generation, auto-invalidating the
+                        // account cache — no explicit invalidation needed here.)
                         eprintln!("polyflare: failed to persist refreshed tokens: {e}");
                     }
                     tokens = new;
@@ -308,7 +310,7 @@ async fn responses_handler_impl(
         Err(_) => return internal_error(),
     };
 
-    let snapshots = match assemble_snapshots(&state.store).await {
+    let snapshots = match state.account_cache.snapshots(&state.store).await {
         Ok(s) => s,
         Err(_) => return internal_error(),
     };
@@ -513,7 +515,7 @@ async fn messages_handler_native(
         Err(_) => return internal_error(),
     };
 
-    let snapshots = match assemble_snapshots(&state.store).await {
+    let snapshots = match state.account_cache.snapshots(&state.store).await {
         Ok(s) => s,
         Err(_) => return internal_error(),
     };
@@ -599,7 +601,7 @@ async fn messages_handler_codex_aliased(
         Err(_) => return internal_error(),
     };
 
-    let snapshots = match assemble_snapshots(&state.store).await {
+    let snapshots = match state.account_cache.snapshots(&state.store).await {
         Ok(s) => s,
         Err(_) => return internal_error(),
     };

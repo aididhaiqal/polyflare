@@ -1,5 +1,6 @@
 //! PolyFlare server edge: ingress, config, snapshot assembly, wiring.
 
+pub mod account_cache;
 pub mod alias;
 pub mod app;
 pub mod config;

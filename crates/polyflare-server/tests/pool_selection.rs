@@ -34,6 +34,7 @@ async fn no_eligible_account_returns_503() {
         refresh_locks: Default::default(),
         capture_fingerprint_path: None,
         codex_version: std::sync::Arc::new(polyflare_codex::CodexVersionCache::new().unwrap()),
+        account_cache: std::sync::Arc::new(polyflare_server::account_cache::AccountCache::new()),
     });
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

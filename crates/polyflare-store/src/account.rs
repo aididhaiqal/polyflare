@@ -1,6 +1,9 @@
 //! Account model + repository. Durable metadata lives in `Account`; the three OAuth tokens are
 //! stored ONLY as XChaCha20-Poly1305 ciphertext and decrypted on demand.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use sqlx::sqlite::SqlitePool;
 
 use crate::crypto::TokenCipher;
@@ -96,14 +99,22 @@ const SELECT_ALL_ACCOUNTS: &str = "SELECT id, chatgpt_account_id, chatgpt_user_i
     created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
     provider FROM accounts ORDER BY id";
 
-/// CRUD over the `accounts` table. Cheap to construct (clones the pool handle).
+/// CRUD over the `accounts` table. Cheap to construct (clones the pool handle + generation Arc).
 pub struct AccountRepo {
     pool: SqlitePool,
+    /// Bumped on every write so the server's `AccountCache` auto-invalidates (see `Store`).
+    generation: Arc<AtomicU64>,
 }
 
 impl AccountRepo {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub fn new(pool: SqlitePool, generation: Arc<AtomicU64>) -> Self {
+        Self { pool, generation }
+    }
+
+    /// Advance the account-write generation. Called after every successful mutation so a cached
+    /// account pool is invalidated by the WRITE itself, not by each caller remembering to.
+    fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Insert an account, encrypting its tokens on the way in.
@@ -155,6 +166,7 @@ impl AccountRepo {
         .bind(account.provider.as_str())
         .execute(&self.pool)
         .await?;
+        self.bump_generation();
         Ok(())
     }
 
@@ -182,6 +194,7 @@ impl AccountRepo {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        self.bump_generation();
         Ok(())
     }
 
@@ -205,6 +218,7 @@ impl AccountRepo {
         .bind(id)
         .execute(&self.pool)
         .await?;
+        self.bump_generation();
         Ok(())
     }
 

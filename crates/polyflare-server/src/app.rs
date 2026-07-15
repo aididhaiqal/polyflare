@@ -10,6 +10,8 @@ use axum::Router;
 use polyflare_codex::oauth::OAuthClient;
 use polyflare_codex::CodexVersionCache;
 use polyflare_core::{Continuity, Executor, Provider, Selector};
+
+use crate::account_cache::AccountCache;
 use polyflare_store::{Store, TokenCipher};
 
 use crate::ingress::{messages_handler, responses_handler};
@@ -45,6 +47,10 @@ pub struct AppState {
     /// User-Agent, so it tracks the real fleet instead of a hardcoded constant. Read on the hot
     /// path via `cached_or_fallback()` (sync, no I/O); warmed by a background task in `serve`.
     pub codex_version: Arc<CodexVersionCache>,
+    /// In-memory cache of the selector-input account snapshots (see `crate::account_cache`): serves
+    /// selection from memory instead of re-running the O(accounts) store query per request.
+    /// Invalidated on account-state writes (status/tokens/add).
+    pub account_cache: Arc<AccountCache>,
 }
 
 impl AppState {
