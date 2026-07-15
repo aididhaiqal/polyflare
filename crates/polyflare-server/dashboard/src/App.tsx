@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, Account, Pool, RequestRow } from "./api";
+import { api, Account, Pool, RequestRow, Window } from "./api";
 
 const REFRESH_MS = 15_000;
 
@@ -29,24 +29,30 @@ function StatusBadge({ status }: { status: string }) {
   return <span className={`badge badge-${status}`}>{status.replace(/_/g, " ")}</span>;
 }
 
-function UsageBar({ pct }: { pct: number }) {
+function UsageBar({ pct, stale }: { pct: number; stale: boolean }) {
   const clamped = Math.max(0, Math.min(100, pct));
   const tone = clamped >= 100 ? "full" : clamped >= 80 ? "high" : "ok";
   return (
-    <div className="usage" title={`${pct.toFixed(1)}%`}>
+    <div className={`usage${stale ? " usage-stale" : ""}`} title={stale ? `${pct.toFixed(1)}% (stale)` : `${pct.toFixed(1)}%`}>
       <div className={`usage-fill usage-${tone}`} style={{ width: `${clamped}%` }} />
       <span className="usage-label">{pct.toFixed(0)}%</span>
     </div>
   );
 }
 
-/** A reset time rendered as a live countdown pill with the absolute time on hover. */
-function Reset({ resetAt, now, absent }: { resetAt: number | null; now: number; absent: string }) {
-  if (resetAt == null) return <span className="reset reset-none">{absent}</span>;
-  const label = countdown(resetAt, now);
+/** A window's reset time as a live countdown pill; dimmed + tagged when the window's data is stale
+ *  (upstream stopped refreshing it), and showing `absent` when the window isn't reported at all. */
+function WindowReset({ w, now, absent }: { w: Window | null; now: number; absent: string }) {
+  if (!w || w.reset_at == null) return <span className="reset reset-none">{absent}</span>;
+  const label = countdown(w.reset_at, now);
+  const cls = ["reset", label === "due" ? "reset-due" : "", w.stale ? "reset-stale" : ""]
+    .filter(Boolean)
+    .join(" ");
+  const title = w.stale ? `stale — last refreshed data; resets ${absTime(w.reset_at)}` : absTime(w.reset_at);
   return (
-    <span className={`reset ${label === "due" ? "reset-due" : ""}`} title={absTime(resetAt)}>
+    <span className={cls} title={title}>
       {label}
+      {w.stale && <span className="stale-tag">stale</span>}
     </span>
   );
 }
@@ -97,12 +103,18 @@ function AccountsTable({ accounts, now }: { accounts: Account[]; now: number }) 
               <StatusBadge status={a.status} />
             </td>
             <td className="muted">{a.plan_type}</td>
-            <td>{a.secondary ? <UsageBar pct={a.secondary.used_percent} /> : <span className="muted">—</span>}</td>
             <td>
-              <Reset resetAt={a.secondary?.reset_at ?? a.reset_at} now={now} absent="—" />
+              {a.weekly ? (
+                <UsageBar pct={a.weekly.used_percent} stale={a.weekly.stale} />
+              ) : (
+                <span className="muted">—</span>
+              )}
             </td>
             <td>
-              <Reset resetAt={a.primary?.reset_at ?? null} now={now} absent="not reported" />
+              <WindowReset w={a.weekly} now={now} absent="—" />
+            </td>
+            <td>
+              <WindowReset w={a.five_hour} now={now} absent="not reported" />
             </td>
           </tr>
         ))}

@@ -313,6 +313,28 @@ code {
   color: var(--flare);
 }
 
+/* Stale window: data upstream stopped refreshing — dim it and tag it so it never reads as live. */
+.reset-stale {
+  color: var(--muted);
+}
+
+.stale-tag {
+  margin-left: 6px;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--warn);
+  border: 1px solid rgba(224, 168, 58, 0.4);
+  padding: 0 4px;
+  border-radius: 4px;
+  vertical-align: middle;
+}
+
+.usage-stale {
+  opacity: 0.45;
+}
+
 .code {
   font-family: var(--mono);
   font-weight: 600;

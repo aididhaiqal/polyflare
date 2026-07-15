@@ -56,19 +56,44 @@ fn usage_url(upstream_base: &str) -> String {
     }
 }
 
-/// Map the two windows onto `(status, reset_at)` — codex-lb's quota rule. Secondary (weekly)
-/// exhausted -> `quota_exceeded` with the weekly reset; primary (5h) exhausted -> `rate_limited`
-/// with the 5h reset; otherwise `active` (gate cleared). An ABSENT window never gates.
+/// A payload window is the short (5h) limit when its duration is under a day; otherwise it's the
+/// weekly limit. An unknown duration is treated as weekly (the durable limit). The real windows are
+/// 5h (18000s) and weekly (604800s).
+fn is_five_hour(w: &UsageWindow) -> bool {
+    w.limit_window_seconds
+        .map(|s| s < 24 * 3600)
+        .unwrap_or(false)
+}
+
+/// Map the present windows onto `(status, reset_at)`, classified by DURATION not slot: upstream
+/// currently emits the weekly window in the `primary` slot (no 5h limit), so gating on the slot
+/// would mislabel an exhausted weekly as `rate_limited`. The weekly (long) window exhausted ->
+/// `quota_exceeded` with the weekly reset; the 5h (short) exhausted -> `rate_limited` with the 5h
+/// reset; otherwise `active` (gate cleared). An ABSENT window never gates.
 fn derive_gate(
     primary: Option<&UsageWindow>,
     secondary: Option<&UsageWindow>,
 ) -> (&'static str, Option<i64>) {
-    let exhausted = |w: &&UsageWindow| w.used_percent.map(|p| p >= 100.0).unwrap_or(false);
-    if let Some(s) = secondary.filter(exhausted) {
-        return ("quota_exceeded", s.reset_at);
+    let exhausted = |w: &UsageWindow| w.used_percent.map(|p| p >= 100.0).unwrap_or(false);
+    // Split the up-to-two present windows into weekly vs 5h by duration.
+    let mut weekly: Option<&UsageWindow> = None;
+    let mut five_hour: Option<&UsageWindow> = None;
+    for w in [primary, secondary].into_iter().flatten() {
+        if is_five_hour(w) {
+            five_hour = Some(w);
+        } else {
+            weekly = Some(w);
+        }
     }
-    if let Some(p) = primary.filter(exhausted) {
-        return ("rate_limited", p.reset_at);
+    if let Some(w) = weekly {
+        if exhausted(w) {
+            return ("quota_exceeded", w.reset_at);
+        }
+    }
+    if let Some(w) = five_hour {
+        if exhausted(w) {
+            return ("rate_limited", w.reset_at);
+        }
     }
     ("active", None)
 }
@@ -191,39 +216,59 @@ mod tests {
         );
     }
 
-    fn window(used: f64, reset: i64) -> UsageWindow {
+    /// A 5h (short) window: 18000s duration.
+    fn five_h(used: f64, reset: i64) -> UsageWindow {
         UsageWindow {
             used_percent: Some(used),
             reset_at: Some(reset),
-            limit_window_seconds: Some(300 * 60),
+            limit_window_seconds: Some(5 * 3600),
+        }
+    }
+
+    /// A weekly (long) window: 604800s duration.
+    fn weekly(used: f64, reset: i64) -> UsageWindow {
+        UsageWindow {
+            used_percent: Some(used),
+            reset_at: Some(reset),
+            limit_window_seconds: Some(7 * 24 * 3600),
         }
     }
 
     #[test]
-    fn secondary_exhausted_gates_quota_exceeded_with_weekly_reset() {
-        let (status, reset) = derive_gate(Some(&window(10.0, 111)), Some(&window(100.0, 999)));
+    fn exhausted_weekly_gates_quota_exceeded_with_weekly_reset() {
+        let (status, reset) = derive_gate(Some(&five_h(10.0, 111)), Some(&weekly(100.0, 999)));
         assert_eq!(status, "quota_exceeded");
         assert_eq!(reset, Some(999));
     }
 
     #[test]
-    fn primary_exhausted_gates_rate_limited() {
-        let (status, reset) = derive_gate(Some(&window(100.0, 111)), Some(&window(50.0, 999)));
+    fn exhausted_5h_gates_rate_limited() {
+        let (status, reset) = derive_gate(Some(&five_h(100.0, 111)), Some(&weekly(50.0, 999)));
         assert_eq!(status, "rate_limited");
         assert_eq!(reset, Some(111));
     }
 
     #[test]
-    fn absent_primary_is_available_not_blocked() {
+    fn absent_5h_is_available_not_blocked() {
         // The 5h window is missing (upstream stopped reporting it); weekly is fine -> active.
-        let (status, reset) = derive_gate(None, Some(&window(40.0, 999)));
+        let (status, reset) = derive_gate(None, Some(&weekly(40.0, 999)));
         assert_eq!(status, "active");
         assert_eq!(reset, None);
     }
 
     #[test]
+    fn promo_weekly_in_primary_slot_gates_quota_exceeded_not_rate_limited() {
+        // Current upstream: the weekly window arrives in the PRIMARY slot with no secondary. It
+        // must be gated as an exhausted WEEKLY (quota_exceeded), not mislabeled `rate_limited` by
+        // its slot. This is the regression the duration-aware gate fixes.
+        let (status, reset) = derive_gate(Some(&weekly(100.0, 777)), None);
+        assert_eq!(status, "quota_exceeded");
+        assert_eq!(reset, Some(777));
+    }
+
+    #[test]
     fn all_clear_is_active() {
-        let (status, reset) = derive_gate(Some(&window(10.0, 1)), Some(&window(20.0, 2)));
+        let (status, reset) = derive_gate(Some(&five_h(10.0, 1)), Some(&weekly(20.0, 2)));
         assert_eq!(status, "active");
         assert_eq!(reset, None);
     }

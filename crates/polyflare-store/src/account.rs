@@ -76,11 +76,16 @@ impl EncryptedTokens {
     }
 }
 
-/// The latest usage percentage + reset for one window of an account.
+/// The latest usage percentage + reset for one window of an account. `window_minutes` is the
+/// window's DURATION (so a consumer can tell a 5h window from a weekly one regardless of which
+/// slot it was stored in), and `recorded_at` is when this row was written (so a consumer can tell
+/// live data from a window upstream stopped refreshing).
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct WindowUsage {
     pub used_percent: f64,
     pub reset_at: Option<i64>,
+    pub window_minutes: Option<i64>,
+    pub recorded_at: i64,
 }
 
 /// The latest usage per window ("primary"/"secondary") for an account. Missing windows are
@@ -341,7 +346,7 @@ impl AccountRepo {
         window: &str,
     ) -> Result<Option<WindowUsage>, StoreError> {
         let row = sqlx::query_as::<_, WindowUsage>(
-            "SELECT used_percent, reset_at FROM usage_history \
+            "SELECT used_percent, reset_at, window_minutes, recorded_at FROM usage_history \
              WHERE account_id = ? AND \"window\" = ? ORDER BY recorded_at DESC LIMIT 1",
         )
         .bind(account_id)
