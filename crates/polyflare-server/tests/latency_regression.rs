@@ -210,3 +210,102 @@ async fn overhead_budget_median_end_to_end_time() {
         measured.len(),
     );
 }
+
+/// Nearest-rank percentile (`p` in 0..=100) over an already-sorted slice.
+fn percentile(sorted: &[Duration], p: usize) -> Duration {
+    if sorted.is_empty() {
+        return Duration::ZERO;
+    }
+    let idx = ((p * sorted.len()) / 100).min(sorted.len() - 1);
+    sorted[idx]
+}
+
+fn mean(samples: &[Duration]) -> Duration {
+    if samples.is_empty() {
+        return Duration::ZERO;
+    }
+    samples.iter().sum::<Duration>() / samples.len() as u32
+}
+
+/// Drive `n` full request→last-byte round-trips against `url` (plus `warmup` discarded ones),
+/// returning the per-request durations.
+async fn measure_round_trips(
+    client: &reqwest::Client,
+    url: &str,
+    n: usize,
+    warmup: usize,
+) -> Vec<Duration> {
+    let mut samples = Vec::with_capacity(n);
+    for i in 0..(n + warmup) {
+        let start = Instant::now();
+        let resp = client
+            .post(url)
+            .json(&serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            chunk.unwrap();
+        }
+        if i >= warmup {
+            samples.push(start.elapsed());
+        }
+    }
+    samples
+}
+
+/// Reports PolyFlare's PROXY OVERHEAD — the latency it adds on top of the upstream — measured
+/// against an INSTANT mock upstream (so the upstream's own time is ~loopback-only and doesn't
+/// dominate). This is the metric comparable to better-ccflare's "<10ms" claim: proxy processing
+/// (selection + account resolve/decrypt + prepare + relay), NOT total end-to-end latency, which is
+/// dominated by the real LLM round-trip + token generation (hundreds of ms) and says nothing about
+/// the proxy. Overhead = median(through-PolyFlare) − median(direct-to-mock), so the fixed loopback
+/// + client cost is subtracted out. The numbers print with `cargo test -- --nocapture`; the
+/// assertion is a generous gross-regression guard, not the SLA.
+#[tokio::test]
+async fn report_proxy_overhead_against_instant_upstream() {
+    const N: usize = 100;
+    const WARMUP: usize = 10;
+
+    let mock = MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()]);
+    let upstream = mock.spawn().await;
+    let client = reqwest::Client::new();
+
+    // Baseline: client -> mock directly (1 hop). The fixed cost that is NOT PolyFlare's doing.
+    let baseline = measure_round_trips(&client, &format!("{upstream}/responses"), N, WARMUP).await;
+
+    // Through PolyFlare: client -> polyflare -> the SAME mock (2 hops + PolyFlare's processing).
+    let pf = spawn_polyflare(upstream).await;
+    let proxy = measure_round_trips(&client, &format!("{pf}/responses"), N, WARMUP).await;
+
+    let mut b = baseline.clone();
+    b.sort();
+    let mut p = proxy.clone();
+    p.sort();
+    let overhead = percentile(&p, 50).saturating_sub(percentile(&b, 50));
+
+    println!("--- PolyFlare proxy overhead vs instant mock (n={N}) ---");
+    println!(
+        "  baseline direct-to-mock : p50={:?}  p99={:?}  mean={:?}",
+        percentile(&b, 50),
+        percentile(&b, 99),
+        mean(&baseline)
+    );
+    println!(
+        "  through PolyFlare       : p50={:?}  p99={:?}  mean={:?}",
+        percentile(&p, 50),
+        percentile(&p, 99),
+        mean(&proxy)
+    );
+    println!("  PROXY OVERHEAD (p50 diff): {overhead:?}   [better-ccflare claims <10ms]");
+
+    // Generous gross-regression guard (NOT an SLA — shared CI runners are slow + noisy, and the
+    // store's sqlite lookup/decrypt is real per-request work). The real figure is printed above.
+    assert!(
+        overhead < Duration::from_millis(25),
+        "proxy overhead p50={overhead:?} exceeds the gross-regression guard — investigate a \
+         hot-path regression (an extra round trip, a blocking call, etc.)"
+    );
+}
