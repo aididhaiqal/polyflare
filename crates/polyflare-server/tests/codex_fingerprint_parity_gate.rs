@@ -100,7 +100,7 @@ async fn codex_egress_header_structure_matches_the_from_source_codex_rs_golden()
     // executor relays it untouched. A `prompt_cache_key` is present so the stable-id derivation
     // exercises its primary path, not the no-key fallback.
     use polyflare_codex::codex_headers::{
-        codex_user_agent, conversation_key, originator, TurnIdentity,
+        codex_user_agent, conversation_key, originator, TurnIdentity, CODEX_CLI_VERSION,
     };
     let body = serde_json::json!({
         "model": "gpt-5.6-sol",
@@ -109,7 +109,12 @@ async fn codex_egress_header_structure_matches_the_from_source_codex_rs_golden()
     });
     let identity = TurnIdentity::derive(&conversation_key(&body));
     let forward_headers = vec![
-        ("user-agent".to_string(), codex_user_agent()),
+        // The synthesized path resolves the version live (GitHub/npm); the from-source floor is the
+        // deterministic value to assert against here.
+        (
+            "user-agent".to_string(),
+            codex_user_agent(CODEX_CLI_VERSION),
+        ),
         ("originator".to_string(), originator().to_string()),
         ("accept".to_string(), "text/event-stream".to_string()),
         ("session-id".to_string(), identity.session_id.clone()),

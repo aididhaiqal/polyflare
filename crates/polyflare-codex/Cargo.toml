@@ -24,11 +24,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
+# Codex-version auto-resolution (`codex_version`): `tokio::sync::Mutex` single-flight guard in
+# library code; `tracing` for the minor/major fingerprint-drift warning.
+tokio = { workspace = true }
+tracing = { workspace = true }
 # Egress header parity (fingerprint-parity gate): the exact crate codex-rs's own
 # `get_codex_user_agent()` calls for the OS/arch segment of its User-Agent string
 # (`login/src/auth/default_client.rs` in `openai/codex`) — see `codex_headers.rs`.
 os_info = "3"
 
 [dev-dependencies]
-tokio = { workspace = true }
 polyflare-testkit = { path = "../polyflare-testkit" }

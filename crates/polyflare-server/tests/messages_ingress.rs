@@ -92,6 +92,7 @@ async fn spawn_polyflare_full(
         anthropic_upstream_base_url: anthropic_upstream,
         refresh_locks: Default::default(),
         capture_fingerprint_path: None,
+        codex_version: std::sync::Arc::new(polyflare_codex::CodexVersionCache::new().unwrap()),
     });
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

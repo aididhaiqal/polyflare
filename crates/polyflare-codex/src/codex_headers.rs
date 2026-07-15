@@ -80,20 +80,22 @@ pub fn originator() -> &'static str {
 /// The codex-rs User-Agent FORMAT: `{originator}/{version} ({os_type} {os_version}; {arch})
 /// {terminal}` — verified from `login/src/auth/default_client.rs::get_codex_user_agent`.
 ///
-/// `version` is [`CODEX_CLI_VERSION`] (capture-verified). `os_type`/`os_version`/`arch` come
-/// from the `os_info` crate exactly as codex-rs itself calls it
+/// `version` is the live codex release resolved by [`crate::codex_version::CodexVersionCache`]
+/// (which itself falls back to [`CODEX_CLI_VERSION`] when upstream sources are down) — passed in so
+/// the synthesized User-Agent tracks the real fleet's current version instead of a stale constant.
+/// `os_type`/`os_version`/`arch` come from the `os_info` crate exactly as codex-rs itself calls it
 /// (`os_info::get().{os_type,version,architecture}`); when `os_info` can't determine the
 /// architecture this falls back to `std::env::consts::ARCH` instead of codex-rs's own literal
 /// `"unknown"` fallback — a deliberate improvement, flagged here as a deviation. `terminal` is the
 /// fixed [`TERMINAL_TOKEN`].
-pub fn codex_user_agent() -> String {
+pub fn codex_user_agent(version: &str) -> String {
     let info = os_info::get();
     let arch = info
         .architecture()
         .map(str::to_string)
         .unwrap_or_else(|| std::env::consts::ARCH.to_string());
     format!(
-        "{ORIGINATOR}/{CODEX_CLI_VERSION} ({} {}; {arch}) {TERMINAL_TOKEN}",
+        "{ORIGINATOR}/{version} ({} {}; {arch}) {TERMINAL_TOKEN}",
         info.os_type(),
         info.version(),
     )
@@ -353,7 +355,7 @@ mod tests {
 
     #[test]
     fn codex_user_agent_matches_captured_codex_rs_shape() {
-        let ua = codex_user_agent();
+        let ua = codex_user_agent(CODEX_CLI_VERSION);
         // Capture-verified prefix: `codex_cli_rs/0.144.4 (`.
         assert!(
             ua.starts_with(&format!("{ORIGINATOR}/{CODEX_CLI_VERSION} (")),

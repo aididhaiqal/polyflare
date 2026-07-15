@@ -8,6 +8,7 @@ use axum::routing::post;
 use axum::Router;
 
 use polyflare_codex::oauth::OAuthClient;
+use polyflare_codex::CodexVersionCache;
 use polyflare_core::{Continuity, Executor, Provider, Selector};
 use polyflare_store::{Store, TokenCipher};
 
@@ -40,6 +41,10 @@ pub struct AppState {
     /// content-safe structural HTTP fingerprint to this path. `None` (the default) disables it
     /// entirely — the ingress never calls into `fingerprint_capture` at all.
     pub capture_fingerprint_path: Option<PathBuf>,
+    /// Resolves the live `codex-rs` release version for the SYNTHESIZED (translated) egress
+    /// User-Agent, so it tracks the real fleet instead of a hardcoded constant. Read on the hot
+    /// path via `cached_or_fallback()` (sync, no I/O); warmed by a background task in `serve`.
+    pub codex_version: Arc<CodexVersionCache>,
 }
 
 impl AppState {
