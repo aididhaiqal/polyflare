@@ -2,9 +2,9 @@
 //! egress-parity half of the fingerprint-parity gate (see `executor.rs` and
 //! `polyflare-server/tests/codex_fingerprint_parity_gate.rs`).
 //!
-//! # Status: CAPTURE-VERIFIED (codex-cli 0.144.1, 2026-07-15)
+//! # Status: CAPTURE-VERIFIED (codex-cli 0.144.4, 2026-07-15)
 //! Originally built from a local `openai/codex` source read, this synthesis has since been
-//! diffed against a live wire capture of the real Codex CLI (`codex-cli 0.144.1`, obtained by
+//! diffed against a live wire capture of the real Codex CLI (`codex-cli 0.144.4`, obtained by
 //! routing a `scripts/codex-polyflare` run through `POLYFLARE_CAPTURE_FINGERPRINT`). The capture
 //! CONFIRMED the base identity-header set, the `x-codex-turn-metadata` field-key set, and the UA
 //! format below. It also revealed two headers this module deliberately does NOT synthesize, both
@@ -61,10 +61,13 @@
 
 use sha2::{Digest, Sha256};
 
-/// The `codex-rs` CLI release version embedded in its User-Agent. Capture-verified against a live
-/// `codex-cli 0.144.1` run (2026-07-15); update in lockstep with the codex-rs release PolyFlare
-/// mirrors on egress (a stale version here is a fingerprint tell against a newer real codex).
-pub const CODEX_CLI_VERSION: &str = "0.144.1";
+/// The `codex-rs` CLI release version embedded in its User-Agent. Capture-verified against live
+/// `codex-cli` runs (2026-07-15); update in lockstep with the codex-rs release PolyFlare mirrors on
+/// egress (a stale version here is a fingerprint tell against a newer real codex). Re-capturing
+/// across the 0.144.x line (0.144.1 → 0.144.4) showed the egress fingerprint is patch-stable — the
+/// header set, turn-metadata key set, and UA FORMAT are identical; only this version string moves —
+/// so a patch bump only requires updating this const, not the synthesis.
+pub const CODEX_CLI_VERSION: &str = "0.144.4";
 
 /// codex-rs's default `originator` (`login/src/auth/default_client.rs::DEFAULT_ORIGINATOR`).
 const ORIGINATOR: &str = "codex_cli_rs";
@@ -351,7 +354,7 @@ mod tests {
     #[test]
     fn codex_user_agent_matches_captured_codex_rs_shape() {
         let ua = codex_user_agent();
-        // Capture-verified prefix: `codex_cli_rs/0.144.1 (`.
+        // Capture-verified prefix: `codex_cli_rs/0.144.4 (`.
         assert!(
             ua.starts_with(&format!("{ORIGINATOR}/{CODEX_CLI_VERSION} (")),
             "unexpected UA prefix: {ua}"

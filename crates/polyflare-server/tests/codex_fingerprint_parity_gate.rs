@@ -9,9 +9,9 @@
 //! `codex-api/src/endpoint/responses.rs`, `codex-api/src/requests/headers.rs`,
 //! `core/src/responses_metadata.rs`, `core/src/session/mod.rs`).
 //!
-//! # Status: CAPTURE-VERIFIED (codex-cli 0.144.1, 2026-07-15)
+//! # Status: CAPTURE-VERIFIED (codex-cli 0.144.4, 2026-07-15)
 //! This golden has been diffed against a live wire capture of the real Codex CLI (`codex-cli
-//! 0.144.1`), obtained by routing a `scripts/codex-polyflare` run through
+//! 0.144.4`), obtained by routing a `scripts/codex-polyflare` run through
 //! `POLYFLARE_CAPTURE_FINGERPRINT` (see [`polyflare_server::fingerprint_capture`]). The capture
 //! CONFIRMED [`EXPECTED_CODEX_IDENTITY_HEADER_NAMES`], [`EXPECTED_TURN_METADATA_KEYS`], and the UA
 //! format. It also surfaced two headers a real codex sends CONDITIONALLY, both deliberately absent
@@ -32,7 +32,7 @@
 //!   because `axum`'s `HeaderMap` does not preserve wire receipt order (see
 //!   `polyflare_server::fingerprint_capture` module docs, "Header-order fidelity").
 //! - Does NOT check exact id VALUES (only presence/shape). The codex-rs release version string
-//!   (`polyflare_codex::codex_headers::CODEX_CLI_VERSION`) is now capture-verified to `0.144.1`.
+//!   (`polyflare_codex::codex_headers::CODEX_CLI_VERSION`) is now capture-verified to `0.144.4`.
 //!
 //! This test must FAIL before the executor sets these headers and PASS after.
 
