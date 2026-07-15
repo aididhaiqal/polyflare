@@ -14,6 +14,10 @@ pub struct ServeConfig {
     pub db_path: PathBuf,
     pub key_path: PathBuf,
     pub continuity_watchdog: Duration,
+    /// M5 capture-fixture mechanism (content-safe, structural-only — see
+    /// `crate::fingerprint_capture`): when set, every ingress request's HTTP fingerprint is
+    /// appended to this path as JSON Lines. Unset ⇒ disabled, zero overhead.
+    pub capture_fingerprint_path: Option<PathBuf>,
 }
 
 impl ServeConfig {
@@ -32,6 +36,12 @@ impl ServeConfig {
             .and_then(|s| s.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(30));
+        // M5 capture-fixture mechanism: unset (the default) ⇒ `None` ⇒ ingress never touches
+        // `fingerprint_capture` at all. Mirrors `POLYFLARE_ANTHROPIC_UPSTREAM_URL` above, but
+        // absence means "disabled" rather than falling back to a default value.
+        let capture_fingerprint_path = std::env::var("POLYFLARE_CAPTURE_FINGERPRINT")
+            .ok()
+            .map(PathBuf::from);
         Ok(ServeConfig {
             bind_addr,
             upstream_base_url,
@@ -40,6 +50,7 @@ impl ServeConfig {
             db_path: db_path(&data_dir),
             key_path: key_path(&data_dir),
             continuity_watchdog,
+            capture_fingerprint_path,
         })
     }
 }

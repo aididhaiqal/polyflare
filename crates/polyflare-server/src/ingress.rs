@@ -19,6 +19,7 @@ use polyflare_store::PlainTokens;
 
 use crate::alias::{self, ModelAlias};
 use crate::app::AppState;
+use crate::fingerprint_capture::{append_fingerprint_capture, capture_request_fingerprint};
 use crate::observability::RequestLog;
 use crate::session_key::derive_request_ctx;
 use crate::snapshot::{assemble_snapshots, filter_by_provider};
@@ -44,6 +45,19 @@ fn internal_error() -> Response {
 
 fn no_eligible() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "no eligible account").into_response()
+}
+
+/// M5 capture-fixture mechanism: if `state.capture_fingerprint_path` is set, append this
+/// request's content-safe structural fingerprint (see `crate::fingerprint_capture`) to it. A
+/// no-op (single `Option` check) when unset — the normal, always-disabled-by-default case. A
+/// write failure (e.g. disk full) is logged content-safely and never fails the request itself.
+fn maybe_capture_fingerprint(state: &AppState, method: &str, path: &str, headers: &HeaderMap) {
+    if let Some(golden_path) = &state.capture_fingerprint_path {
+        let record = capture_request_fingerprint(method, path, headers);
+        if let Err(e) = append_fingerprint_capture(golden_path, &record) {
+            eprintln!("polyflare: fingerprint capture write failed: {e}");
+        }
+    }
 }
 
 fn stream_response(stream: ResponseStream) -> Response {
@@ -154,6 +168,7 @@ pub async fn responses_handler(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let start = Instant::now();
+    maybe_capture_fingerprint(&state, "POST", "/responses", &headers);
     let response = responses_handler_impl(state, headers, body).await;
     RequestLog {
         method: "POST",
@@ -329,10 +344,11 @@ async fn responses_handler_impl(
 /// `responses_handler` above) — see `crate::observability` for the content-safety constraint.
 pub async fn messages_handler(
     State(state): State<Arc<AppState>>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let start = Instant::now();
+    maybe_capture_fingerprint(&state, "POST", "/v1/messages", &headers);
     let model = body
         .get("model")
         .and_then(|m| m.as_str())
