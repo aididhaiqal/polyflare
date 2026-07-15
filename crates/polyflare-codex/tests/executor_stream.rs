@@ -17,6 +17,7 @@ async fn executor_streams_upstream_events_and_forwards_body() {
         id: "test".into(),
         base_url: base,
         bearer_token: "test-token".into(),
+        chatgpt_account_id: None,
     };
     let req = PreparedRequest {
         body: serde_json::json!({"model": "gpt-5.6-sol", "input": "hello"}),
@@ -36,6 +37,45 @@ async fn executor_streams_upstream_events_and_forwards_body() {
 }
 
 #[tokio::test]
+async fn executor_sends_selected_account_chatgpt_account_id_overriding_forwarded() {
+    // The real Codex CLI pairs `ChatGPT-Account-ID` with the Bearer. PolyFlare swaps the Bearer to
+    // the SELECTED account, so it must also send THAT account's id — never a stale forwarded one.
+    let mock = MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()]);
+    let handle = mock.clone();
+    let base = mock.spawn().await;
+
+    let executor = CodexExecutor::new().unwrap();
+    let account = Account {
+        id: "test".into(),
+        base_url: base,
+        bearer_token: "test-token".into(),
+        chatgpt_account_id: Some("acct-selected".into()),
+    };
+    let req = PreparedRequest {
+        body: serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}),
+        model: "gpt-5.6-sol".into(),
+        // A client forwarded a DIFFERENT account's id — it must be replaced, not shipped alongside
+        // our overridden Bearer (a mismatched (token, account) pair is what the backend rejects).
+        forward_headers: vec![(
+            "chatgpt-account-id".to_string(),
+            "client-stale-acct".to_string(),
+        )],
+    };
+
+    let mut stream = executor.execute(req, &account).await.unwrap();
+    while stream.next().await.is_some() {}
+
+    let headers = handle.last_headers().unwrap();
+    assert_eq!(
+        headers
+            .get("chatgpt-account-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("acct-selected"),
+        "must send the SELECTED account's id, overriding any forwarded client value"
+    );
+}
+
+#[tokio::test]
 async fn executor_surfaces_upstream_error_status() {
     // No route for this path on the mock → 404 → ExecError::Upstream.
     let base = MockUpstream::new(vec![]).spawn().await;
@@ -44,6 +84,7 @@ async fn executor_surfaces_upstream_error_status() {
         id: "test".into(),
         base_url: format!("{base}/nonexistent-base"),
         bearer_token: "t".into(),
+        chatgpt_account_id: None,
     };
     let req = PreparedRequest {
         body: serde_json::json!({"model": "m"}),

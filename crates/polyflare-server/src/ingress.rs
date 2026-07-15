@@ -242,6 +242,10 @@ async fn resolve_core_account(
     }
     Ok((
         Account {
+            // The selected account's own ChatGPT id travels as the `chatgpt-account-id` header
+            // paired with its Bearer (see `Account::chatgpt_account_id` / executor). Taken from the
+            // stored row so it always matches the account whose token we're about to send.
+            chatgpt_account_id: account.chatgpt_account_id,
             id: account.id,
             base_url: state.upstream_base_url_for(provider).to_string(),
             bearer_token: tokens.access_token,

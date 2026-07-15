@@ -54,6 +54,13 @@ pub struct Account {
     pub id: String,
     pub base_url: String,
     pub bearer_token: String,
+    /// The ChatGPT account id sent as the `chatgpt-account-id` companion header on Codex
+    /// backend-api requests. The real Codex CLI always sends it paired with the Bearer, and it
+    /// MUST correspond to `bearer_token`'s account — a load balancer that swaps the Bearer to a
+    /// selected account but leaves a client's original account-id header would ship exactly the
+    /// mismatched (token, account) pair the backend rejects. `None` for providers that don't use
+    /// it (e.g. Anthropic).
+    pub chatgpt_account_id: Option<String>,
 }
 
 // `bearer_token` is a secret and must never be printed in clear via `{:?}`.
@@ -63,6 +70,7 @@ impl std::fmt::Debug for Account {
             .field("id", &self.id)
             .field("base_url", &self.base_url)
             .field("bearer_token", &"***")
+            .field("chatgpt_account_id", &self.chatgpt_account_id)
             .finish()
     }
 }
@@ -300,6 +308,7 @@ mod tests {
             id: "acct-1".into(),
             base_url: "https://example.test".into(),
             bearer_token: "super-secret-token-value".into(),
+            chatgpt_account_id: None,
         };
 
         let debug_output = format!("{account:?}");
