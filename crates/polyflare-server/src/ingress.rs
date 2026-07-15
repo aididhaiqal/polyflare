@@ -15,7 +15,7 @@ use polyflare_core::{
     Account, AccountId, Continuity, ContinuityDirective, NoopContinuity, Prepared, PreparedRequest,
     Provider, RecoveryPlan, RequestCtx, ResponseStream, SelectionCtx, Translator,
 };
-use polyflare_store::PlainTokens;
+use polyflare_store::{PlainTokens, RequestLogRecord, RequestLogRepo};
 
 use crate::alias::{self, ModelAlias};
 use crate::app::AppState;
@@ -140,6 +140,23 @@ fn stream_response(stream: ResponseStream) -> Response {
         .expect("valid response")
 }
 
+/// Persist a request-outcome row off the response path: fire-and-forget (a detached task, mirroring
+/// codex-lb's pattern), so a slow or failing DB write never delays or fails the client's request.
+/// The row is content-free by construction — it comes from `RequestLog::record`, the same audited
+/// field set the tracing event carries (see `crate::observability`). `repo` is taken by value (it
+/// owns a cheap pool clone) so the caller can build it before `state` is consumed by the handler.
+fn spawn_persist_request_log(repo: RequestLogRepo, record: RequestLogRecord) {
+    tokio::spawn(async move {
+        if let Err(e) = repo.insert(&record).await {
+            tracing::warn!(
+                target: "polyflare_server::request",
+                error = %e,
+                "request_log persist failed"
+            );
+        }
+    });
+}
+
 /// Load + decrypt + refresh-if-stale the selected account, returning the core `Account` to execute
 /// with plus its `Provider`, or a ready client-facing error `Response`.
 async fn resolve_core_account(
@@ -241,8 +258,10 @@ pub async fn responses_handler(
 ) -> Response {
     let start = Instant::now();
     maybe_capture_fingerprint(&state, "POST", "/responses", &headers);
+    // Build the log repo BEFORE `state` moves into the impl (it owns a cheap pool clone).
+    let log_repo = state.store.request_log();
     let response = responses_handler_impl(state, headers, body).await;
-    RequestLog {
+    let log = RequestLog {
         method: "POST",
         path: "/responses",
         // M4a: `/responses` may only ever route to a Codex-provider account — see this fn's
@@ -253,8 +272,9 @@ pub async fn responses_handler(
         aliased: false,
         status: response.status(),
         duration_ms: start.elapsed().as_millis() as u64,
-    }
-    .emit();
+    };
+    log.emit();
+    spawn_persist_request_log(log_repo, log.record(unix_now()));
     response
 }
 
@@ -429,6 +449,8 @@ pub async fn messages_handler(
 ) -> Response {
     let start = Instant::now();
     maybe_capture_fingerprint(&state, "POST", "/v1/messages", &headers);
+    // Build the log repo BEFORE `state` moves into a sub-handler (it owns a cheap pool clone).
+    let log_repo = state.store.request_log();
     let model = body
         .get("model")
         .and_then(|m| m.as_str())
@@ -453,15 +475,16 @@ pub async fn messages_handler(
         _ => messages_handler_native(state, body, model).await,
     };
 
-    RequestLog {
+    let log = RequestLog {
         method: "POST",
         path: "/v1/messages",
         provider,
         aliased: aliased_to_codex,
         status: response.status(),
         duration_ms: start.elapsed().as_millis() as u64,
-    }
-    .emit();
+    };
+    log.emit();
+    spawn_persist_request_log(log_repo, log.record(unix_now()));
 
     response
 }
