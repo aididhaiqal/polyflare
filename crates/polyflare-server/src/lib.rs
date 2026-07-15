@@ -13,4 +13,5 @@ pub mod refresh_locks;
 pub mod session_key;
 pub mod snapshot;
 pub mod translate_stream;
+pub mod usage_refresh;
 pub mod watchdog;

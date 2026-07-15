@@ -217,6 +217,53 @@ impl AccountRepo {
         Ok(())
     }
 
+    /// Update an account's status AND its `reset_at` routing gate together — the usage-refresh
+    /// quota mapping writes both (e.g. `quota_exceeded` + the weekly window's reset time). Bumps
+    /// the generation so the account cache re-reads fresh usage.
+    pub async fn update_status_and_reset(
+        &self,
+        id: &str,
+        status: &str,
+        reset_at: Option<i64>,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE accounts SET status = ?, reset_at = ? WHERE id = ?")
+            .bind(status)
+            .bind(reset_at)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        self.bump_generation();
+        Ok(())
+    }
+
+    /// Insert one `usage_history` window row (from a runtime usage refresh). `window` is
+    /// `"primary"` (5h) or `"secondary"` (weekly). Append-only, exactly the shape the codex-lb
+    /// importer writes, so `latest_usage` reads it back unchanged.
+    pub async fn insert_usage_window(
+        &self,
+        account_id: &str,
+        window: &str,
+        used_percent: f64,
+        reset_at: Option<i64>,
+        window_minutes: Option<i64>,
+        recorded_at: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO usage_history (account_id, recorded_at, \"window\", used_percent, \
+             reset_at, window_minutes) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(account_id)
+        .bind(recorded_at)
+        .bind(window)
+        .bind(used_percent)
+        .bind(reset_at)
+        .bind(window_minutes)
+        .execute(&self.pool)
+        .await?;
+        self.bump_generation();
+        Ok(())
+    }
+
     /// Replace an account's tokens (re-encrypting) and stamp `last_refresh`.
     pub async fn update_tokens(
         &self,
