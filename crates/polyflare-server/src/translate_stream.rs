@@ -83,10 +83,7 @@ impl TranslatingStream {
     /// chunk.
     fn feed_chunk(&mut self, chunk: &[u8]) {
         self.line_buf.extend_from_slice(chunk);
-        loop {
-            let Some(pos) = self.line_buf.iter().position(|&b| b == b'\n') else {
-                break;
-            };
+        while let Some(pos) = self.line_buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.line_buf.drain(..=pos).collect();
             let line = &line[..line.len() - 1]; // drop the trailing '\n'
             let line = line.strip_suffix(b"\r").unwrap_or(line);
