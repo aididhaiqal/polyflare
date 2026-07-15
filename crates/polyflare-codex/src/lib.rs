@@ -4,10 +4,12 @@
 pub mod codex_headers;
 pub mod codex_version;
 pub mod executor;
+pub mod login;
 pub mod oauth;
 
 pub use codex_version::CodexVersionCache;
 pub use executor::CodexExecutor;
+pub use login::{run_login, LoginError};
 pub use oauth::{
     classify_failure, decode_claims, should_refresh, Claims, FailureClass, OAuthClient, OAuthError,
     Refreshed, RefreshedTokens,

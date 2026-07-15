@@ -1742,6 +1742,7 @@ dependencies = [
  "os_info",
  "polyflare-core",
  "polyflare-testkit",
+ "rand 0.9.5",
  "reqwest",
  "rustls",
  "serde",

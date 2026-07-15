@@ -134,3 +134,24 @@ async fn provider_round_trips_and_legacy_rows_default_to_codex() {
         "codex"
     );
 }
+
+#[tokio::test]
+async fn find_by_chatgpt_account_id_powers_onboard_vs_reauth() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
+    let repo = store.accounts();
+    repo.insert(&sample_account("acct-1"), &sample_tokens(), &cipher)
+        .await
+        .unwrap();
+
+    // Matches the seat by its ChatGPT id (sample_account uses "ws-acct") → re-auth path.
+    let found = repo.find_by_chatgpt_account_id("ws-acct").await.unwrap();
+    assert_eq!(found.map(|a| a.id), Some("acct-1".to_string()));
+    // A new ChatGPT id → None → onboard (insert) path.
+    assert!(repo
+        .find_by_chatgpt_account_id("some-other-account")
+        .await
+        .unwrap()
+        .is_none());
+}

@@ -28,6 +28,8 @@ sha2 = { workspace = true }
 # library code; `tracing` for the minor/major fingerprint-drift warning.
 tokio = { workspace = true }
 tracing = { workspace = true }
+# `polyflare login` (authorization_code + PKCE): random verifier/state bytes.
+rand = { workspace = true }
 # Egress header parity (fingerprint-parity gate): the exact crate codex-rs's own
 # `get_codex_user_agent()` calls for the OS/arch segment of its User-Agent string
 # (`login/src/auth/default_client.rs` in `openai/codex`) — see `codex_headers.rs`.
