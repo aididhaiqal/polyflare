@@ -39,6 +39,7 @@ pub async fn assemble_snapshots(store: &Store) -> Result<Vec<AccountSnapshot>, S
         snap.plan_type = account.plan_type;
         snap.security_work_authorized = account.security_work_authorized;
         snap.provider = provider;
+        snap.pool = account.pool;
         snapshots.push(snap);
     }
     Ok(snapshots)
@@ -56,4 +57,61 @@ pub fn filter_by_provider(
         .filter(|s| s.provider == provider)
         .cloned()
         .collect()
+}
+
+/// Narrow candidates to a named account pool. `None` (the bare ingress paths — `/responses`,
+/// `/v1/messages`) matches ALL accounts, so pre-pool routing is unchanged. `Some(slug)` (a
+/// `/{pool}/...` path) matches ONLY accounts tagged with exactly that slug — an unpooled account
+/// (`pool = None`) is reachable solely via the bare paths, never a named slug. Applied AFTER
+/// `filter_by_provider` on the same shared snapshot slice, so both narrowings compose without a
+/// per-pool cache.
+pub fn filter_by_pool(snapshots: &[AccountSnapshot], pool: Option<&str>) -> Vec<AccountSnapshot> {
+    match pool {
+        None => snapshots.to_vec(),
+        Some(slug) => snapshots
+            .iter()
+            .filter(|s| s.pool.as_deref() == Some(slug))
+            .cloned()
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(id: &str, pool: Option<&str>) -> AccountSnapshot {
+        let mut s = AccountSnapshot::new(id);
+        s.pool = pool.map(str::to_string);
+        s
+    }
+
+    #[test]
+    fn bare_path_matches_all_accounts_regardless_of_pool() {
+        let snaps = vec![
+            snap("a", None),
+            snap("b", Some("p1")),
+            snap("c", Some("p2")),
+        ];
+        let got = filter_by_pool(&snaps, None);
+        assert_eq!(got.len(), 3, "None matches every account (backward compat)");
+    }
+
+    #[test]
+    fn named_slug_matches_only_that_pool() {
+        let snaps = vec![
+            snap("a", None),
+            snap("b", Some("p1")),
+            snap("c", Some("p1")),
+        ];
+        let got = filter_by_pool(&snaps, Some("p1"));
+        let ids: Vec<&str> = got.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "c"], "unpooled + other pools excluded");
+    }
+
+    #[test]
+    fn unknown_slug_matches_nothing() {
+        let snaps = vec![snap("a", None), snap("b", Some("p1"))];
+        assert!(filter_by_pool(&snaps, Some("does-not-exist")).is_empty());
+    }
 }

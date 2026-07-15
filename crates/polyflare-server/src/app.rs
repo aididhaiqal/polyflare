@@ -14,7 +14,9 @@ use polyflare_core::{Continuity, Executor, Provider, Selector};
 use crate::account_cache::AccountCache;
 use polyflare_store::{Store, TokenCipher};
 
-use crate::ingress::{messages_handler, responses_handler};
+use crate::ingress::{
+    messages_handler, pooled_messages_handler, pooled_responses_handler, responses_handler,
+};
 use crate::refresh_locks::RefreshLocks;
 
 /// Raised request-body limit: axum's `Json` extractor default (2 MB) 413s real
@@ -75,6 +77,12 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/responses", post(responses_handler))
         .route("/v1/messages", post(messages_handler))
+        // Pooled variants: `/{pool}/…` narrows selection to accounts tagged with that pool slug
+        // (see `filter_by_pool`). The bare paths above keep selecting over ALL accounts. The
+        // `{pool}` segment is a param, so it never shadows the literal single-segment `/responses`
+        // or the `/v1/*` / `/models` routes — matchit prefers a static segment over a param one.
+        .route("/{pool}/responses", post(pooled_responses_handler))
+        .route("/{pool}/v1/messages", post(pooled_messages_handler))
         // Model catalog (read-only GETs): real Codex models (bootstrap floor for now) merged with
         // PolyFlare's synthetic aliases. Routing is by method+path, so these never conflict with
         // the `/v1/*` POSTs above.

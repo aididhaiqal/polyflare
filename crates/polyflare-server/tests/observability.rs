@@ -46,6 +46,7 @@ fn account(id: &str, provider: &str) -> Account {
         blocked_at: None,
         security_work_authorized: false,
         provider: provider.to_string(),
+        pool: None,
     }
 }
 

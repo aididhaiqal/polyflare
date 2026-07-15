@@ -51,6 +51,7 @@ fn account(id: &str, last_refresh: i64) -> Account {
         blocked_at: None,
         security_work_authorized: false,
         provider: "codex".to_string(),
+        pool: None,
     }
 }
 

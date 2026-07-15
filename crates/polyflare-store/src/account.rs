@@ -32,6 +32,9 @@ pub struct Account {
     pub security_work_authorized: bool,
     /// 'codex' | 'anthropic' — which backend pool this account belongs to.
     pub provider: String,
+    /// Named account pool slug, or `None` (unpooled). Unpooled accounts are reachable only via the
+    /// bare ingress paths; a non-null slug also makes the account reachable via `/{pool}/...`.
+    pub pool: Option<String>,
 }
 
 /// The three OAuth tokens in plaintext. Used as insert/update input and as decrypt output.
@@ -92,18 +95,18 @@ pub struct UsageSnapshot {
 const SELECT_ACCOUNT_BY_ID: &str = "SELECT id, chatgpt_account_id, chatgpt_user_id, email, \
     alias, workspace_id, workspace_label, seat_type, plan_type, routing_policy, last_refresh, \
     created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
-    provider FROM accounts WHERE id = ?";
+    provider, pool FROM accounts WHERE id = ?";
 
 const SELECT_ALL_ACCOUNTS: &str = "SELECT id, chatgpt_account_id, chatgpt_user_id, email, \
     alias, workspace_id, workspace_label, seat_type, plan_type, routing_policy, last_refresh, \
     created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
-    provider FROM accounts ORDER BY id";
+    provider, pool FROM accounts ORDER BY id";
 
 const SELECT_ACCOUNT_BY_CHATGPT_ID: &str =
     "SELECT id, chatgpt_account_id, chatgpt_user_id, email, \
     alias, workspace_id, workspace_label, seat_type, plan_type, routing_policy, last_refresh, \
     created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
-    provider FROM accounts WHERE chatgpt_account_id = ?";
+    provider, pool FROM accounts WHERE chatgpt_account_id = ?";
 
 /// CRUD over the `accounts` table. Cheap to construct (clones the pool handle + generation Arc).
 pub struct AccountRepo {
@@ -146,8 +149,8 @@ impl AccountRepo {
                 workspace_id, workspace_label, seat_type, plan_type, routing_policy, \
                 access_token_enc, refresh_token_enc, id_token_enc, \
                 last_refresh, created_at, status, deactivation_reason, \
-                reset_at, blocked_at, security_work_authorized, provider\
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                reset_at, blocked_at, security_work_authorized, provider, pool\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(account.id.as_str())
         .bind(account.chatgpt_account_id.as_deref())
@@ -170,6 +173,7 @@ impl AccountRepo {
         .bind(account.blocked_at)
         .bind(account.security_work_authorized)
         .bind(account.provider.as_str())
+        .bind(account.pool.as_deref())
         .execute(&self.pool)
         .await?;
         self.bump_generation();
@@ -210,6 +214,18 @@ impl AccountRepo {
     pub async fn update_status(&self, id: &str, status: &str) -> Result<(), StoreError> {
         sqlx::query("UPDATE accounts SET status = ? WHERE id = ?")
             .bind(status)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        self.bump_generation();
+        Ok(())
+    }
+
+    /// Assign (`Some(slug)`) or clear (`None`) an account's pool. Bumps the store generation so the
+    /// server's account cache re-reads on the next selection.
+    pub async fn update_pool(&self, id: &str, pool: Option<&str>) -> Result<(), StoreError> {
+        sqlx::query("UPDATE accounts SET pool = ? WHERE id = ?")
+            .bind(pool)
             .bind(id)
             .execute(&self.pool)
             .await?;

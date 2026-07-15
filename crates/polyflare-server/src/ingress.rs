@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
-use axum::extract::{Json, State};
+use axum::extract::{Json, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
@@ -22,7 +22,7 @@ use crate::app::AppState;
 use crate::fingerprint_capture::{append_fingerprint_capture, capture_request_fingerprint};
 use crate::observability::RequestLog;
 use crate::session_key::derive_request_ctx;
-use crate::snapshot::filter_by_provider;
+use crate::snapshot::{filter_by_pool, filter_by_provider};
 use crate::translate_stream::wrap_translating_stream;
 use crate::watchdog::{
     apply_ownership, execute_recovery, execute_with_watchdog, signal_client_stream, RouteDecision,
@@ -254,19 +254,40 @@ async fn resolve_core_account(
     ))
 }
 
-/// The `/responses` ingress entrypoint. Thin timing + content-safe logging wrapper around
-/// [`responses_handler_impl`] — see `crate::observability` for the content-safety constraint on
-/// what may be logged.
+/// The bare `/responses` ingress entrypoint: selects over ALL Codex accounts (no pool filter).
 pub async fn responses_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    responses_route(state, None, headers, body).await
+}
+
+/// The pooled `/{pool}/responses` ingress entrypoint: selects only over Codex accounts tagged with
+/// the `{pool}` slug (see `filter_by_pool`).
+pub async fn pooled_responses_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pool): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    responses_route(state, Some(pool), headers, body).await
+}
+
+/// Shared `/responses` route: thin timing + content-safe logging wrapper around
+/// [`responses_handler_impl`], parameterized by the optional account-pool slug. See
+/// `crate::observability` for the content-safety constraint on what may be logged.
+async fn responses_route(
+    state: Arc<AppState>,
+    pool: Option<String>,
+    headers: HeaderMap,
+    body: serde_json::Value,
+) -> Response {
     let start = Instant::now();
     maybe_capture_fingerprint(&state, "POST", "/responses", &headers);
     // Build the log repo BEFORE `state` moves into the impl (it owns a cheap pool clone).
     let log_repo = state.store.request_log();
-    let response = responses_handler_impl(state, headers, body).await;
+    let response = responses_handler_impl(state, pool.as_deref(), headers, body).await;
     let log = RequestLog {
         method: "POST",
         path: "/responses",
@@ -286,6 +307,7 @@ pub async fn responses_handler(
 
 async fn responses_handler_impl(
     state: Arc<AppState>,
+    pool: Option<&str>,
     headers: HeaderMap,
     body: serde_json::Value,
 ) -> Response {
@@ -321,6 +343,9 @@ async fn responses_handler_impl(
     // M4a has no cross-format translator (that's M4b): `/responses` may only ever pick a
     // Codex-provider account.
     let snapshots = filter_by_provider(&snapshots, Provider::Codex);
+    // Then narrow to the requested pool: `None` (bare path) keeps all, `Some(slug)` keeps only that
+    // pool's accounts. Composes with the provider filter over the same shared snapshot slice.
+    let snapshots = filter_by_pool(&snapshots, pool);
     let sel_ctx = SelectionCtx {
         now,
         require_security_work_authorized: false,
@@ -448,10 +473,32 @@ async fn responses_handler_impl(
 /// path; everything else (no alias, or an alias whose target is itself Anthropic) takes the native
 /// same-format path, unchanged. Also a thin timing + content-safe logging wrapper (mirrors
 /// `responses_handler` above) — see `crate::observability` for the content-safety constraint.
+/// The bare `/v1/messages` ingress entrypoint: selects over ALL accounts of the resolved provider
+/// (no pool filter).
 pub async fn messages_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
+) -> Response {
+    messages_route(state, None, headers, body).await
+}
+
+/// The pooled `/{pool}/v1/messages` ingress entrypoint: selects only over the resolved provider's
+/// accounts tagged with the `{pool}` slug (see `filter_by_pool`).
+pub async fn pooled_messages_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pool): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    messages_route(state, Some(pool), headers, body).await
+}
+
+async fn messages_route(
+    state: Arc<AppState>,
+    pool: Option<String>,
+    headers: HeaderMap,
+    body: serde_json::Value,
 ) -> Response {
     let start = Instant::now();
     maybe_capture_fingerprint(&state, "POST", "/v1/messages", &headers);
@@ -476,9 +523,9 @@ pub async fn messages_handler(
 
     let response = match alias {
         Some(model_alias) if model_alias.target_provider == Provider::Codex => {
-            messages_handler_codex_aliased(state, body, model_alias).await
+            messages_handler_codex_aliased(state, pool.as_deref(), body, model_alias).await
         }
-        _ => messages_handler_native(state, body, model).await,
+        _ => messages_handler_native(state, pool.as_deref(), body, model).await,
     };
 
     let log = RequestLog {
@@ -501,6 +548,7 @@ pub async fn messages_handler(
 /// `execute_with_watchdog`'s Disarmed branch just relays — the wedge machinery never arms.
 async fn messages_handler_native(
     state: Arc<AppState>,
+    pool: Option<&str>,
     body: serde_json::Value,
     model: String,
 ) -> Response {
@@ -526,6 +574,7 @@ async fn messages_handler_native(
     // M4a has no cross-format translator (that's M4b): `/v1/messages` may only ever pick an
     // Anthropic-provider account — the exact mirror of `/responses`'s Codex-only filter above.
     let snapshots = filter_by_provider(&snapshots, Provider::Anthropic);
+    let snapshots = filter_by_pool(&snapshots, pool);
     let sel_ctx = SelectionCtx {
         now,
         require_security_work_authorized: false,
@@ -570,6 +619,7 @@ async fn messages_handler_native(
 /// above — every request is `Disarmed` and the watchdog never arms.
 async fn messages_handler_codex_aliased(
     state: Arc<AppState>,
+    pool: Option<&str>,
     body: serde_json::Value,
     model_alias: ModelAlias,
 ) -> Response {
@@ -612,6 +662,7 @@ async fn messages_handler_codex_aliased(
     // The mirror of `/responses`'s Codex-only filter: an aliased-to-Codex turn may only ever pick
     // a Codex-provider account, regardless of what `/v1/messages` itself would otherwise select.
     let snapshots = filter_by_provider(&snapshots, Provider::Codex);
+    let snapshots = filter_by_pool(&snapshots, pool);
     let sel_ctx = SelectionCtx {
         now,
         require_security_work_authorized: false,

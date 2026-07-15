@@ -259,6 +259,10 @@ pub struct AccountSnapshot {
     pub in_flight: u32,
     /// Which backend pool this account belongs to — selects the executor + backend wire `Format`.
     pub provider: Provider,
+    /// Named account-pool slug, or `None` (unpooled). The ingress narrows candidates to this via
+    /// `filter_by_pool`: a named `/{pool}/...` path matches only accounts with the same slug; the
+    /// bare paths match all accounts regardless of pool.
+    pub pool: Option<String>,
 }
 
 impl AccountSnapshot {
@@ -283,6 +287,7 @@ impl AccountSnapshot {
             security_work_authorized: false,
             in_flight: 0,
             provider: Provider::Codex,
+            pool: None,
         }
     }
 }

@@ -24,6 +24,7 @@ fn account(id: &str) -> Account {
         blocked_at: None,
         security_work_authorized: true,
         provider: "codex".to_string(),
+        pool: None,
     }
 }
 
