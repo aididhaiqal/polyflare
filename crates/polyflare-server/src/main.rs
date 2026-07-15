@@ -52,8 +52,19 @@ enum AccountsCommands {
     },
 }
 
+/// Content-safe request logging (SPEC-M5 §3.4): env-filtered (`RUST_LOG`, default `info`) plain
+/// `fmt` output. Never initialize a subscriber that echoes request/response bodies — the fields
+/// logged are chosen entirely by `polyflare_server::observability::RequestLog`, not by anything
+/// configured here.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let cli = Cli::parse();
     match cli.command {
         Commands::Serve => serve().await,
