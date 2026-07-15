@@ -80,7 +80,9 @@ pub trait Translator: Send + Sync {
 
 The registry becomes a **factory** (`fn() -> Box<dyn Translator>`) so each turn gets a fresh stateful instance. Identity translators stay trivial (`translate_request` returns input; `translate_response_event` returns `vec![event]`). This is additive to M1's registry shape but touches its storage type — flagged as a risk (§7).
 
-### 3.5 The Anthropic→OpenAI-Responses event map *(event schemas doc-verified 2026-07-14; a short live-capture list remains — see §7)*
+### 3.5 The SSE event map *(event schemas doc-verified 2026-07-14; a short live-capture list remains — see §7)*
+
+> **⚠️ DIRECTION CORRECTION (2026-07-15).** This section was originally written with the RESPONSE event map in the wrong direction (Anthropic→OpenAI). For the headline path — a Claude client (`AnthropicMessages`) routed to a Codex backend (`OpenAIResponses`) — §3.1's rule is `translate_request: client→backend` then "translate response events **back to the client format**" = `backend→client`. So the **request** map is Anthropic→OpenAI (`map_request`, correct as written) but the **streaming response** map is **OpenAI-Responses → Anthropic-Messages** — the INVERSE of the field table below. The implementation (`crates/polyflare-anthropic/src/translate.rs`, `AnthropicToResponses::translate_response_event`) is authoritative for the correct OpenAI→Anthropic response direction; read the table below as the field-level correspondence, inverted. (The Anthropic→OpenAI response direction is the M4c inverse-path translator, deferred.)
 
 Both wire formats are `event: <type>` + `data: <json>` SSE. The Anthropic order is fixed: `message_start` → N×[`content_block_start` → M×`content_block_delta` → `content_block_stop`] → 1+×`message_delta` → `message_stop`, with `ping` (keepalive) and `error` interleavable. The OpenAI-Responses side requires a **global monotonic `sequence_number`** on every event plus three coordinated positional counters (`output_index` for items, `content_index` for parts-within-item, `summary_index` for reasoning-summary parts) — **none of which Anthropic supplies.**
 

@@ -1,9 +1,26 @@
-//! Anthropic Messages → OpenAI-Responses translator (SPEC-M4 §3.4 stateful 1->N seam). This file
-//! builds the mapping in two layers: `map_request` (this task) does the doc-verified *mechanical*
-//! request-body field mapping (SPEC-M4 §3.6's "mechanical direction") — model-alias remap and
-//! reasoning-effort payload-override are explicitly deferred (SPEC-M4 U2, M4b-wiring), so `model`
-//! passes through unchanged here. `AnthropicToResponses` (added on top of this module) is the
-//! stateful streaming response-event translator (SPEC-M4 §3.5).
+//! The M4b headline cross-format translator: Anthropic-Messages client <-> OpenAI-Responses
+//! (Codex) backend (SPEC-M4 §3.4's stateful 1->N seam). `AnthropicToResponses` implements BOTH
+//! `Translator` methods for this one client<->backend pairing, and each method runs the opposite
+//! direction across the wire:
+//!   - `translate_request`: Anthropic-Messages -> OpenAI-Responses (client format -> backend
+//!     format). `map_request` (below) does the doc-verified *mechanical* request-body field
+//!     mapping (SPEC-M4 §3.6's "mechanical direction") -- model-alias remap and reasoning-effort
+//!     payload-override are explicitly deferred (SPEC-M4 U2, M4b-wiring), so `model` passes
+//!     through unchanged here.
+//!   - `translate_response_event`: OpenAI-Responses SSE -> Anthropic-Messages SSE (backend's
+//!     reply -> client format, SPEC-M4 §3.5 inverted). The Codex backend replies in
+//!     OpenAI-Responses shape; the Claude client expects Anthropic-Messages SSE. This is the
+//!     stateful streaming response-event translator: it holds per-turn state (whether
+//!     `message_start` has fired yet, a monotonic Anthropic content-block-index counter, and a
+//!     small per-OpenAI-item index/stopped map keyed by OpenAI's `item_id`) and turns each
+//!     incoming OpenAI event into zero, one, or two outgoing Anthropic events, non-buffering
+//!     (each event's outputs are emitted as soon as it arrives -- the *only* thing held across
+//!     calls is this small bookkeeping state, never accumulated response text).
+//!
+//! (An earlier revision of this file had `translate_response_event` built backwards -- mapping
+//! Anthropic Messages SSE -> OpenAI-Responses SSE, which is actually the *inverse* M4c direction
+//! (OpenAI client -> Anthropic backend), T2-deferred. That logic is not this struct's job; it
+//! remains available in git history if M4c is picked up later.)
 
 use std::collections::HashMap;
 
@@ -59,8 +76,8 @@ use serde_json::{json, Value};
 ///     (`input_text`/`input_image`); an empty/all-unrecognized block array degrades to `output: []`,
 ///     unverified against a real backend's minimum-shape expectations.
 ///
-/// The response-side translator (`AnthropicToResponses`, §3.5) is complete and independent of this
-/// module doc's scope.
+/// The response-side translator (`AnthropicToResponses`, §3.5 inverted) is a separate concern from
+/// this module doc's scope — see the file-level doc comment above.
 fn map_request(body: Value) -> Value {
     let model = body.get("model").cloned().unwrap_or(Value::Null);
     let system = body.get("system").cloned();
@@ -287,38 +304,40 @@ fn map_tools(tools: &Value) -> Value {
     Value::Array(mapped)
 }
 
-/// The kind of an open Anthropic content block, tracked so `content_block_delta`/`_stop` know
-/// which OpenAI-Responses event family to emit.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum BlockKind {
-    Text,
-    ToolUse,
-    Thinking,
-}
-
-/// Per-block per-turn state: the synthesized OpenAI item id, the tool call_id/name (tool_use
-/// only), and the buffered accumulated text/arguments (SPEC-M4 §3.5: "full accumulated
-/// text/arguments [S] (buffered across deltas)").
-#[derive(Clone, Debug)]
+/// Per-OpenAI-item per-turn state for the response-event direction: the Anthropic flat
+/// content-block `index` assigned when this item's block opened, and whether a
+/// `content_block_stop` has already been emitted for it.
+///
+/// Unlike the (deferred, inverse) Anthropic→OpenAI direction, this state buffers **no response
+/// content**: Anthropic's `content_block_stop` carries no accumulated text (the deltas already
+/// delivered it — see `on_block_done` below), so there is nothing to reassemble at block-close
+/// time, only a small index/stopped bookkeeping map.
+#[derive(Clone, Copy, Debug)]
 struct BlockState {
-    kind: BlockKind,
-    item_id: String,
-    call_id: Option<String>,
-    name: Option<String>,
-    buffer: String,
+    index: u64,
+    stopped: bool,
 }
 
-/// Stateful per-turn Anthropic→OpenAI-Responses translator (SPEC-M4 §3.4/§3.5). Construct a
-/// fresh instance per turn via `AnthropicToResponses::new()` — never reuse one across requests.
+/// Stateful per-turn OpenAI-Responses→Anthropic-Messages response-event translator (SPEC-M4
+/// §3.4/§3.5, inverted — see the file-level doc comment). Construct a fresh instance per turn via
+/// `AnthropicToResponses::new()` — never reuse one across requests.
 #[derive(Default)]
 pub struct AnthropicToResponses {
-    seq: u64,
-    response_id: Option<String>,
-    model: Option<Value>,
-    blocks: HashMap<u64, BlockState>,
-    order: Vec<u64>,
-    usage: Option<Value>,
-    stop_reason: Option<String>,
+    /// Anthropic's `message_start` must be emitted exactly once per turn, on the first
+    /// `response.created`/`response.in_progress` seen (SPEC-M4 §3.5 inverted: OpenAI sends both
+    /// back-to-back with the same response snapshot; Anthropic has only one start event).
+    message_start_emitted: bool,
+    /// Anthropic needs its own flat content-block index, synthesized as blocks open (a
+    /// monotonic counter) — OpenAI's `output_index`/`content_index`/`summary_index` have no
+    /// Anthropic equivalent and are dropped, but we still need *some* index, assigned in the
+    /// order each OpenAI item actually opens its Anthropic-visible block.
+    next_block_index: u64,
+    /// Keyed by the OpenAI item id (`item.id` on `output_item.added`/`.done`, `item_id` on the
+    /// delta/part/done family). Used to look up which Anthropic index a later delta/stop event
+    /// belongs to, and to de-duplicate the several OpenAI "done" sub-events (`output_text.done`,
+    /// `content_part.done`, `function_call_arguments.done`, `reasoning_summary_text.done`,
+    /// `output_item.done`) that all collapse into a single Anthropic `content_block_stop`.
+    blocks: HashMap<String, BlockState>,
 }
 
 impl AnthropicToResponses {
@@ -326,446 +345,276 @@ impl AnthropicToResponses {
         Self::default()
     }
 
-    fn next_seq(&mut self) -> u64 {
-        let n = self.seq;
-        self.seq += 1;
-        n
+    /// Assign the next Anthropic block index to `item_id` and record it as open (not yet
+    /// stopped). Returns the assigned index.
+    fn open_block(&mut self, item_id: String) -> u64 {
+        let index = self.next_block_index;
+        self.next_block_index += 1;
+        self.blocks.insert(
+            item_id,
+            BlockState {
+                index,
+                stopped: false,
+            },
+        );
+        index
     }
 
-    /// Shallow-merge an incoming Anthropic `usage` object into accumulated per-turn usage.
-    /// Anthropic splits usage across `message_start` (typically `input_tokens`) and each
-    /// `message_delta` (typically `output_tokens`, updated cumulatively) — merging (rather than
-    /// overwriting) means a partial `message_delta.usage` never drops a field only seen at
-    /// `message_start` (see "Spec gaps hit while planning", item 6).
-    fn merge_usage(&mut self, incoming: &Value) {
-        let entry = self.usage.get_or_insert_with(|| json!({}));
-        if let (Some(obj), Some(inc_obj)) = (entry.as_object_mut(), incoming.as_object()) {
-            for (k, v) in inc_obj {
-                obj.insert(k.clone(), v.clone());
-            }
-        }
-    }
-
-    fn on_message_start(&mut self, event: &Value) -> Vec<Value> {
-        let message = event.get("message").cloned().unwrap_or(Value::Null);
-        let response_id = synth_id("resp");
-        let model = message.get("model").cloned().unwrap_or(Value::Null);
-        self.response_id = Some(response_id.clone());
-        self.model = Some(model.clone());
-        if let Some(usage) = message.get("usage") {
-            self.merge_usage(usage);
-        }
-
-        let response = json!({
-            "id": response_id,
-            "object": "response",
-            "status": "in_progress",
-            "model": model,
-            "output": [],
-            "usage": Value::Null,
-        });
-
-        let created_seq = self.next_seq();
-        let created = json!({
-            "type": "response.created",
-            "sequence_number": created_seq,
-            "response": response.clone(),
-        });
-        let in_progress_seq = self.next_seq();
-        let in_progress = json!({
-            "type": "response.in_progress",
-            "sequence_number": in_progress_seq,
-            "response": response,
-        });
-        vec![created, in_progress]
-    }
-
-    fn on_content_block_start(&mut self, event: &Value) -> Vec<Value> {
-        let Some(idx) = block_index(event) else {
+    /// `response.created` + `response.in_progress` → `message_start`, emitted only once (SPEC-M4
+    /// §3.5 inverted). OpenAI's `response.usage` is `null` at this stage in practice (usage is
+    /// only known at `response.completed`), so the synthesized `message_start.message.usage`
+    /// defaults to zeros when absent — a genuine architecture mismatch (Anthropic's
+    /// `message_start` is documented to carry real `input_tokens` up front; OpenAI has none yet
+    /// at this point in the stream). Flagged for U4 live-capture confirmation.
+    fn on_response_started(&mut self, event: &Value) -> Vec<Value> {
+        if self.message_start_emitted {
             return vec![];
+        }
+        self.message_start_emitted = true;
+
+        let response = event.get("response").cloned().unwrap_or(Value::Null);
+        let model = response.get("model").cloned().unwrap_or(Value::Null);
+        let usage = match response.get("usage") {
+            Some(u) if !u.is_null() => map_usage_from_openai(u),
+            _ => json!({"input_tokens": 0, "output_tokens": 0}),
         };
-        let block = event.get("content_block").cloned().unwrap_or(Value::Null);
-        let kind_str = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-        match kind_str {
-            "text" => {
-                let item_id = synth_id("msg");
-                self.blocks.insert(
-                    idx,
-                    BlockState {
-                        kind: BlockKind::Text,
-                        item_id: item_id.clone(),
-                        call_id: None,
-                        name: None,
-                        buffer: String::new(),
-                    },
-                );
-                self.order.push(idx);
+        vec![json!({
+            "type": "message_start",
+            "message": {
+                "id": synth_id("msg"),
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "usage": usage,
+            },
+        })]
+    }
 
-                let item = json!({
-                    "id": item_id,
-                    "type": "message",
-                    "status": "in_progress",
-                    "role": "assistant",
-                    "content": [],
-                });
-                let added_seq = self.next_seq();
-                let item_added = json!({
-                    "type": "response.output_item.added",
-                    "sequence_number": added_seq,
-                    "output_index": idx,
-                    "item": item,
-                });
+    /// `response.output_item.added`: `function_call` and `reasoning` items open their Anthropic
+    /// block (and get their index) immediately, mirroring how they get no separate "part added"
+    /// event on the OpenAI side. A `message` item opens no Anthropic-visible event yet — its block
+    /// (and index) opens at the paired `response.content_part.added`, which always follows in the
+    /// real event order and carries the `item_id` needed to correlate them.
+    fn on_output_item_added(&mut self, event: &Value) -> Vec<Value> {
+        let item = event.get("item").cloned().unwrap_or(Value::Null);
+        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let item_id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
-                let part = json!({"type": "output_text", "text": "", "annotations": []});
-                let part_seq = self.next_seq();
-                let part_added = json!({
-                    "type": "response.content_part.added",
-                    "sequence_number": part_seq,
-                    "item_id": item_id,
-                    "output_index": idx,
-                    "content_index": 0,
-                    "part": part,
-                });
-
-                vec![item_added, part_added]
-            }
-            "tool_use" => {
-                let call_id = block
-                    .get("id")
+        match item_type {
+            "function_call" => {
+                let call_id = item
+                    .get("call_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let name = block
+                let name = item
                     .get("name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let item_id = synth_id("fc");
-                self.blocks.insert(
-                    idx,
-                    BlockState {
-                        kind: BlockKind::ToolUse,
-                        item_id: item_id.clone(),
-                        call_id: Some(call_id.clone()),
-                        name: Some(name.clone()),
-                        buffer: String::new(),
-                    },
-                );
-                self.order.push(idx);
-
-                let item = json!({
-                    "id": item_id,
-                    "type": "function_call",
-                    "status": "in_progress",
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": "",
-                });
-                let seq = self.next_seq();
+                let index = self.open_block(item_id);
                 vec![json!({
-                    "type": "response.output_item.added",
-                    "sequence_number": seq,
-                    "output_index": idx,
-                    "item": item,
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "tool_use", "id": call_id, "name": name, "input": {}},
                 })]
             }
-            "thinking" => {
-                let item_id = synth_id("rs");
-                self.blocks.insert(
-                    idx,
-                    BlockState {
-                        kind: BlockKind::Thinking,
-                        item_id: item_id.clone(),
-                        call_id: None,
-                        name: None,
-                        buffer: String::new(),
-                    },
-                );
-                self.order.push(idx);
-
-                let item = json!({
-                    "id": item_id,
-                    "type": "reasoning",
-                    "status": "in_progress",
-                    "summary": [],
-                });
-                let seq = self.next_seq();
+            "reasoning" => {
+                let index = self.open_block(item_id);
                 vec![json!({
-                    "type": "response.output_item.added",
-                    "sequence_number": seq,
-                    "output_index": idx,
-                    "item": item,
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "thinking", "thinking": ""},
                 })]
             }
+            // "message" (deferred to content_part.added) and any unrecognized item type: no
+            // Anthropic-visible event yet.
             _ => vec![],
         }
     }
 
-    fn on_content_block_delta(&mut self, event: &Value) -> Vec<Value> {
-        let Some(idx) = block_index(event) else {
+    /// `response.content_part.added` (`output_text` parts only) → opens the Anthropic text
+    /// block: `content_block_start {index, content_block:{type:"text", text:""}}`.
+    fn on_content_part_added(&mut self, event: &Value) -> Vec<Value> {
+        let part = event.get("part").cloned().unwrap_or(Value::Null);
+        if part.get("type").and_then(|v| v.as_str()) != Some("output_text") {
             return vec![];
-        };
-        let delta = event.get("delta").cloned().unwrap_or(Value::Null);
-        let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let Some(block) = self.blocks.get_mut(&idx) else {
-            return vec![];
-        };
-
-        match delta_type {
-            "text_delta" => {
-                let text = delta
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                block.buffer.push_str(&text);
-                let item_id = block.item_id.clone();
-                let seq = self.next_seq();
-                vec![json!({
-                    "type": "response.output_text.delta",
-                    "sequence_number": seq,
-                    "item_id": item_id,
-                    "output_index": idx,
-                    "content_index": 0,
-                    "delta": text,
-                    "logprobs": [],
-                })]
-            }
-            "input_json_delta" => {
-                let partial = delta
-                    .get("partial_json")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                block.buffer.push_str(&partial);
-                let item_id = block.item_id.clone();
-                let seq = self.next_seq();
-                vec![json!({
-                    "type": "response.function_call_arguments.delta",
-                    "sequence_number": seq,
-                    "item_id": item_id,
-                    "output_index": idx,
-                    "delta": partial,
-                })]
-            }
-            "thinking_delta" => {
-                let text = delta
-                    .get("thinking")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                block.buffer.push_str(&text);
-                let item_id = block.item_id.clone();
-                let seq = self.next_seq();
-                vec![json!({
-                    "type": "response.reasoning_summary_text.delta",
-                    "sequence_number": seq,
-                    "item_id": item_id,
-                    "output_index": idx,
-                    "summary_index": 0,
-                    "delta": text,
-                })]
-            }
-            // signature_delta (one-to-zero, SPEC-M4 §3.5: no OpenAI event carries a reasoning
-            // signature) and any unrecognized delta type both emit nothing.
-            _ => vec![],
         }
-    }
-
-    fn on_content_block_stop(&mut self, event: &Value) -> Vec<Value> {
-        let Some(idx) = block_index(event) else {
-            return vec![];
-        };
-        let Some(block) = self.blocks.get(&idx).cloned() else {
-            return vec![];
-        };
-
-        match block.kind {
-            BlockKind::Text => {
-                let text_done_seq = self.next_seq();
-                let text_done = json!({
-                    "type": "response.output_text.done",
-                    "sequence_number": text_done_seq,
-                    "item_id": block.item_id,
-                    "output_index": idx,
-                    "content_index": 0,
-                    "text": block.buffer,
-                });
-                let part = json!({"type": "output_text", "text": block.buffer, "annotations": []});
-                let part_done_seq = self.next_seq();
-                let part_done = json!({
-                    "type": "response.content_part.done",
-                    "sequence_number": part_done_seq,
-                    "item_id": block.item_id,
-                    "output_index": idx,
-                    "content_index": 0,
-                    "part": part,
-                });
-                let item = json!({
-                    "id": block.item_id,
-                    "type": "message",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": block.buffer, "annotations": []}],
-                });
-                let item_done_seq = self.next_seq();
-                let item_done = json!({
-                    "type": "response.output_item.done",
-                    "sequence_number": item_done_seq,
-                    "output_index": idx,
-                    "item": item,
-                });
-                vec![text_done, part_done, item_done]
-            }
-            BlockKind::ToolUse => {
-                let args_done_seq = self.next_seq();
-                let args_done = json!({
-                    "type": "response.function_call_arguments.done",
-                    "sequence_number": args_done_seq,
-                    "item_id": block.item_id,
-                    "output_index": idx,
-                    "arguments": block.buffer,
-                });
-                let item = json!({
-                    "id": block.item_id,
-                    "type": "function_call",
-                    "status": "completed",
-                    "call_id": block.call_id.clone().unwrap_or_default(),
-                    "name": block.name.clone().unwrap_or_default(),
-                    "arguments": block.buffer,
-                });
-                let item_done_seq = self.next_seq();
-                let item_done = json!({
-                    "type": "response.output_item.done",
-                    "sequence_number": item_done_seq,
-                    "output_index": idx,
-                    "item": item,
-                });
-                vec![args_done, item_done]
-            }
-            BlockKind::Thinking => {
-                let summary_done_seq = self.next_seq();
-                let summary_done = json!({
-                    "type": "response.reasoning_summary_text.done",
-                    "sequence_number": summary_done_seq,
-                    "item_id": block.item_id,
-                    "output_index": idx,
-                    "summary_index": 0,
-                    "text": block.buffer,
-                });
-                let item = json!({
-                    "id": block.item_id,
-                    "type": "reasoning",
-                    "status": "completed",
-                    "summary": [{"type": "summary_text", "text": block.buffer}],
-                });
-                let item_done_seq = self.next_seq();
-                let item_done = json!({
-                    "type": "response.output_item.done",
-                    "sequence_number": item_done_seq,
-                    "output_index": idx,
-                    "item": item,
-                });
-                vec![summary_done, item_done]
-            }
-        }
-    }
-
-    fn on_message_delta(&mut self, event: &Value) -> Vec<Value> {
-        if let Some(sr) = event
-            .get("delta")
-            .and_then(|d| d.get("stop_reason"))
+        let item_id = event
+            .get("item_id")
             .and_then(|v| v.as_str())
-        {
-            self.stop_reason = Some(sr.to_string());
+            .unwrap_or("")
+            .to_string();
+        if self.blocks.contains_key(&item_id) {
+            // Defensive: a second content_part.added for an already-open item must not reopen
+            // (and re-index) the block.
+            return vec![];
         }
-        if let Some(usage) = event.get("usage") {
-            self.merge_usage(usage);
-        }
-        // Folds into the terminal `response.completed`/`.incomplete` at `message_stop` (SPEC-M4
-        // §3.5) -- no immediate client-visible event.
-        vec![]
-    }
-
-    fn on_message_stop(&mut self, _event: &Value) -> Vec<Value> {
-        let status = match self.stop_reason.as_deref() {
-            Some("max_tokens") => "incomplete",
-            _ => "completed",
-        };
-
-        let mut output = Vec::new();
-        for idx in &self.order {
-            if let Some(block) = self.blocks.get(idx) {
-                let item = match block.kind {
-                    BlockKind::Text => json!({
-                        "id": block.item_id,
-                        "type": "message",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": block.buffer, "annotations": []}],
-                    }),
-                    BlockKind::ToolUse => json!({
-                        "id": block.item_id,
-                        "type": "function_call",
-                        "status": "completed",
-                        "call_id": block.call_id.clone().unwrap_or_default(),
-                        "name": block.name.clone().unwrap_or_default(),
-                        "arguments": block.buffer,
-                    }),
-                    BlockKind::Thinking => json!({
-                        "id": block.item_id,
-                        "type": "reasoning",
-                        "status": "completed",
-                        "summary": [{"type": "summary_text", "text": block.buffer}],
-                    }),
-                };
-                output.push(item);
-            }
-        }
-
-        let usage = self.usage.as_ref().map(map_usage).unwrap_or(Value::Null);
-
-        let mut response = json!({
-            "id": self.response_id.clone().unwrap_or_default(),
-            "object": "response",
-            "status": status,
-            "model": self.model.clone().unwrap_or(Value::Null),
-            "output": output,
-            "usage": usage,
-        });
-        if status == "incomplete" {
-            response["incomplete_details"] = json!({"reason": "max_output_tokens"});
-        }
-
-        let event_type = if status == "incomplete" {
-            "response.incomplete"
-        } else {
-            "response.completed"
-        };
-        let seq = self.next_seq();
-        vec![json!({"type": event_type, "sequence_number": seq, "response": response})]
-    }
-
-    fn on_error(&mut self, event: &Value) -> Vec<Value> {
-        let error = event.get("error").cloned().unwrap_or(Value::Null);
-        let code = error
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("api_error");
-        let message = error.get("message").and_then(|v| v.as_str()).unwrap_or("");
-        let seq = self.next_seq();
+        let index = self.open_block(item_id);
         vec![json!({
-            "type": "error",
-            "sequence_number": seq,
-            "code": code,
-            "message": message,
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "text", "text": ""},
         })]
+    }
+
+    /// `response.output_text.delta` → `content_block_delta {index, delta:{type:"text_delta",
+    /// text}}` (1:1, immediate — no buffering).
+    fn on_output_text_delta(&mut self, event: &Value) -> Vec<Value> {
+        let Some(block) = self.lookup_flat_item(event) else {
+            return vec![];
+        };
+        let text = event
+            .get("delta")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        vec![json!({
+            "type": "content_block_delta",
+            "index": block.index,
+            "delta": {"type": "text_delta", "text": text},
+        })]
+    }
+
+    /// `response.function_call_arguments.delta` → `content_block_delta
+    /// {index, delta:{type:"input_json_delta", partial_json}}` (1:1, `partial_json` passed
+    /// through as-is).
+    fn on_function_call_arguments_delta(&mut self, event: &Value) -> Vec<Value> {
+        let Some(block) = self.lookup_flat_item(event) else {
+            return vec![];
+        };
+        let partial_json = event
+            .get("delta")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        vec![json!({
+            "type": "content_block_delta",
+            "index": block.index,
+            "delta": {"type": "input_json_delta", "partial_json": partial_json},
+        })]
+    }
+
+    /// `response.reasoning_summary_text.delta` (or the raw `response.reasoning_text.delta` —
+    /// SPEC-M4 §3.5/§7 flags the exact target event as VERIFY-gated; both are treated as
+    /// equivalent input here since it's genuinely unconfirmed which one a live Codex backend
+    /// sends) → `content_block_delta {index, delta:{type:"thinking_delta", thinking}}`.
+    fn on_reasoning_delta(&mut self, event: &Value) -> Vec<Value> {
+        let Some(block) = self.lookup_flat_item(event) else {
+            return vec![];
+        };
+        let thinking = event
+            .get("delta")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        vec![json!({
+            "type": "content_block_delta",
+            "index": block.index,
+            "delta": {"type": "thinking_delta", "thinking": thinking},
+        })]
+    }
+
+    /// The OpenAI "done" family for one item — `response.output_text.done`,
+    /// `.function_call_arguments.done`, `.reasoning_summary_text.done`/`.reasoning_text.done`,
+    /// `.content_part.done`, `.output_item.done` — all collapse into a **single** Anthropic
+    /// `content_block_stop {index}` (SPEC-M4 §3.5 inverted: Anthropic's stop carries no
+    /// accumulated text, so there is nothing to differentiate between these sub-events other than
+    /// "this block is done"). Whichever done-family event for a given item arrives first triggers
+    /// the stop; the `stopped` flag guards every subsequent one for the same item from re-firing.
+    fn on_block_done(&mut self, event: &Value) -> Vec<Value> {
+        let item_id =
+            if event.get("type").and_then(|v| v.as_str()) == Some("response.output_item.done") {
+                event
+                    .get("item")
+                    .and_then(|i| i.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                event
+                    .get("item_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+
+        let Some(block) = self.blocks.get_mut(&item_id) else {
+            return vec![];
+        };
+        if block.stopped {
+            return vec![];
+        }
+        block.stopped = true;
+        let index = block.index;
+        vec![json!({"type": "content_block_stop", "index": index})]
+    }
+
+    /// `response.completed` (or `.incomplete`) → Anthropic `message_delta` (folding in
+    /// `stop_reason` + cumulative usage) followed by `message_stop` (SPEC-M4 §3.5 inverted).
+    /// `status`→`stop_reason`: `completed`→`end_turn`, `incomplete`→`max_tokens`; every other/
+    /// unrecognized status defaults to `end_turn` — no canonical table exists either direction
+    /// (mirrors the forward direction's same fallback-style simplification, e.g. there is no
+    /// OpenAI status signal distinguishing a tool-call-ending turn for an Anthropic `tool_use`
+    /// stop_reason); flagged for U4 live-capture confirmation.
+    fn on_response_completed(&mut self, event: &Value) -> Vec<Value> {
+        let response = event.get("response").cloned().unwrap_or(Value::Null);
+        let status = response
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("completed");
+        let stop_reason = match status {
+            "incomplete" => "max_tokens",
+            _ => "end_turn",
+        };
+        let usage = response
+            .get("usage")
+            .map(map_usage_from_openai)
+            .unwrap_or_else(|| json!({"output_tokens": 0}));
+
+        vec![
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
+                "usage": usage,
+            }),
+            json!({"type": "message_stop"}),
+        ]
+    }
+
+    /// `response.failed` → Anthropic `error` event, reading the nested `response.error` object.
+    fn on_response_failed(&mut self, event: &Value) -> Vec<Value> {
+        let error = event
+            .get("response")
+            .and_then(|r| r.get("error"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        build_error_event(&error)
+    }
+
+    /// A bare mid-stream `error` event (flat `{"type":"error","code":..,"message":..}`, no nested
+    /// `error` object — distinct from `response.failed`'s shape) → Anthropic `error` event.
+    fn on_error(&mut self, event: &Value) -> Vec<Value> {
+        build_error_event(event)
+    }
+
+    /// Look up per-item state off an event's flat `item_id` field (used by every delta/done event
+    /// EXCEPT `response.output_item.done`, which nests the id under `item.id` — see
+    /// `on_block_done`).
+    fn lookup_flat_item(&self, event: &Value) -> Option<BlockState> {
+        let item_id = event.get("item_id").and_then(|v| v.as_str())?;
+        self.blocks.get(item_id).copied()
     }
 }
 
-/// Mint a fresh synthesized id (`resp_...`, `msg_...`, `fc_...`, `rs_...`) — Anthropic's stream
-/// carries none of `response.id`/`item.id`/`call_id` (SPEC-M4 §3.5), so these must be minted.
+/// Mint a fresh synthesized Anthropic message id (`msg_...`) — OpenAI's `response.id` uses a
+/// different prefix convention (`resp_...`) and Anthropic clients expect their own.
 fn synth_id(prefix: &str) -> String {
     let mut rng = rand::rng();
     let bytes: [u8; 12] = rng.random();
@@ -773,39 +622,52 @@ fn synth_id(prefix: &str) -> String {
     format!("{prefix}_{hex}")
 }
 
-/// Read the flat Anthropic content-block `index` off a `content_block_start`/`_delta`/`_stop`
-/// event.
-fn block_index(event: &Value) -> Option<u64> {
-    event.get("index").and_then(|v| v.as_u64())
+/// Build an Anthropic `error` event from an OpenAI-shaped error object (whether nested under
+/// `response.error` or a bare mid-stream `error` event). `code`/`type`→ Anthropic `error.type`: no
+/// canonical mapping exists in either direction's doc (SPEC-M4 §3.5/§7 flags this the other way
+/// too), so the OpenAI code/type string passes through verbatim.
+fn build_error_event(error: &Value) -> Vec<Value> {
+    let error_type = error
+        .get("code")
+        .or_else(|| error.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("api_error");
+    let message = error.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    vec![json!({
+        "type": "error",
+        "error": {"type": error_type, "message": message},
+    })]
 }
 
-/// Map accumulated Anthropic usage to OpenAI-Responses usage (SPEC-M4 §3.5's usage table).
-/// `total_tokens` has no Anthropic equivalent and is synthesized as `input + output`.
-fn map_usage(anthropic: &Value) -> Value {
-    let input_tokens = anthropic
-        .get("input_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let output_tokens = anthropic
+/// Map OpenAI-Responses cumulative usage to Anthropic usage shape (SPEC-M4 §3.5's usage table,
+/// inverted). `total_tokens` has no Anthropic-side equivalent and is dropped (Anthropic's `usage`
+/// object never reports a total); Anthropic's `cache_creation_input_tokens` has no OpenAI-side
+/// source and is never populated (lossy, the same gap SPEC-M4 documents the other way).
+fn map_usage_from_openai(openai: &Value) -> Value {
+    let output_tokens = openai
         .get("output_tokens")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
-    let cached_tokens = anthropic
-        .get("cache_read_input_tokens")
+    let mut usage = json!({"output_tokens": output_tokens});
+    let obj = usage.as_object_mut().expect("json! object literal");
+    if let Some(input_tokens) = openai.get("input_tokens").and_then(|v| v.as_i64()) {
+        obj.insert("input_tokens".to_string(), json!(input_tokens));
+    }
+    if let Some(cached) = openai
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let reasoning_tokens = anthropic
-        .get("thinking_tokens")
+    {
+        obj.insert("cache_read_input_tokens".to_string(), json!(cached));
+    }
+    if let Some(reasoning) = openai
+        .get("output_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-
-    json!({
-        "input_tokens": input_tokens,
-        "input_tokens_details": {"cached_tokens": cached_tokens},
-        "output_tokens": output_tokens,
-        "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
-        "total_tokens": input_tokens + output_tokens,
-    })
+    {
+        obj.insert("thinking_tokens".to_string(), json!(reasoning));
+    }
+    usage
 }
 
 impl Translator for AnthropicToResponses {
@@ -816,12 +678,24 @@ impl Translator for AnthropicToResponses {
     fn translate_response_event(&mut self, event: Value) -> Vec<Value> {
         let ty = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match ty {
-            "message_start" => self.on_message_start(&event),
-            "content_block_start" => self.on_content_block_start(&event),
-            "content_block_delta" => self.on_content_block_delta(&event),
-            "content_block_stop" => self.on_content_block_stop(&event),
-            "message_delta" => self.on_message_delta(&event),
-            "message_stop" => self.on_message_stop(&event),
+            "response.created" | "response.in_progress" => self.on_response_started(&event),
+            "response.output_item.added" => self.on_output_item_added(&event),
+            "response.content_part.added" => self.on_content_part_added(&event),
+            "response.output_text.delta" => self.on_output_text_delta(&event),
+            "response.function_call_arguments.delta" => {
+                self.on_function_call_arguments_delta(&event)
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                self.on_reasoning_delta(&event)
+            }
+            "response.output_text.done"
+            | "response.function_call_arguments.done"
+            | "response.reasoning_summary_text.done"
+            | "response.reasoning_text.done"
+            | "response.content_part.done"
+            | "response.output_item.done" => self.on_block_done(&event),
+            "response.completed" | "response.incomplete" => self.on_response_completed(&event),
+            "response.failed" => self.on_response_failed(&event),
             "error" => self.on_error(&event),
             // `ping` (keepalive) and any unrecognized event type: no client-visible mapping.
             _ => vec![],
@@ -829,21 +703,20 @@ impl Translator for AnthropicToResponses {
     }
 }
 
-// `blocks` buffers accumulated assistant text / tool-call arguments / extended-thinking content
-// per turn and must never be printed in clear via `{:?}` (mirrors `PreparedRequest`/
-// `ReasoningItems` in `polyflare-core::types`).
+// `blocks` holds no response content in this direction (Anthropic's content_block_stop needs no
+// accumulated buffer — see `BlockState`'s doc comment), but the Debug impl stays manual and
+// redacting anyway: it documents the invariant explicitly (mirrors `PreparedRequest`/
+// `ReasoningItems` in `polyflare-core::types`) so that any future field holding streamed text
+// must be a conscious, redacted addition rather than an accidental `#[derive(Debug)]` leak.
 impl std::fmt::Debug for AnthropicToResponses {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnthropicToResponses")
-            .field("seq", &self.seq)
-            .field("response_id", &self.response_id)
-            .field("model", &self.model)
+            .field("message_start_emitted", &self.message_start_emitted)
+            .field("next_block_index", &self.next_block_index)
             .field(
                 "blocks",
                 &format!("[{} block(s) redacted]", self.blocks.len()),
             )
-            .field("stop_reason", &self.stop_reason)
-            .field("usage", &self.usage)
             .finish()
     }
 }
@@ -1107,416 +980,392 @@ mod tests {
         assert_eq!(out["model"], json!("claude-opus-4-1-20250805"));
     }
 
+    // ---- translate_response_event: OpenAI-Responses SSE -> Anthropic-Messages SSE ----
+
+    fn response_created(model: &str) -> Value {
+        json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "object": "response", "status": "in_progress", "model": model, "output": [], "usage": Value::Null}
+        })
+    }
+
     #[test]
-    fn message_start_emits_created_then_in_progress_with_synthesized_response_id() {
+    fn response_created_emits_message_start_once() {
         let mut t = AnthropicToResponses::new();
-        let events = t.translate_response_event(json!({
-            "type": "message_start",
-            "message": {
-                "id": "msg_01XYZ",
-                "model": "claude-opus-4-1-20250805",
-                "role": "assistant",
-                "content": [],
-                "usage": {"input_tokens": 25, "output_tokens": 1}
-            }
-        }));
-
+        let events = t.translate_response_event(response_created("claude-opus-4-1-20250805"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], json!("message_start"));
+        assert_eq!(events[0]["message"]["type"], json!("message"));
+        assert_eq!(events[0]["message"]["role"], json!("assistant"));
         assert_eq!(
-            events.len(),
-            2,
-            "message_start must emit exactly 2 events immediately"
-        );
-        assert_eq!(events[0]["type"], json!("response.created"));
-        assert_eq!(events[1]["type"], json!("response.in_progress"));
-
-        let seq0 = events[0]["sequence_number"].as_u64().unwrap();
-        let seq1 = events[1]["sequence_number"].as_u64().unwrap();
-        assert!(
-            seq1 > seq0,
-            "sequence_number must be monotonically increasing"
-        );
-
-        let resp_id = events[0]["response"]["id"].as_str().unwrap().to_string();
-        assert!(!resp_id.is_empty());
-        assert_eq!(events[1]["response"]["id"], json!(resp_id));
-        assert_eq!(
-            events[0]["response"]["model"],
+            events[0]["message"]["model"],
             json!("claude-opus-4-1-20250805")
         );
-        assert_eq!(events[0]["response"]["status"], json!("in_progress"));
-        assert_eq!(events[0]["response"]["usage"], Value::Null);
-    }
+        assert_eq!(events[0]["message"]["content"], json!([]));
+        assert!(!events[0]["message"]["id"].as_str().unwrap().is_empty());
+        // No sequence_number, no `response` wrapper -- Anthropic events carry neither.
+        assert!(events[0].get("sequence_number").is_none());
 
-    #[test]
-    fn content_block_start_text_emits_item_added_then_part_added() {
-        let mut t = AnthropicToResponses::new();
-        t.translate_response_event(json!({
-            "type": "message_start",
-            "message": {"id": "msg_1", "model": "claude-opus-4-1-20250805", "usage": {"input_tokens": 10, "output_tokens": 0}}
+        // response.in_progress with the same snapshot must NOT re-emit message_start.
+        let events2 = t.translate_response_event(json!({
+            "type": "response.in_progress",
+            "response": {"id": "resp_1", "status": "in_progress", "model": "claude-opus-4-1-20250805", "usage": Value::Null}
         }));
-        let events = t.translate_response_event(json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""}
-        }));
-
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["type"], json!("response.output_item.added"));
-        assert_eq!(events[0]["output_index"], json!(0));
-        assert_eq!(events[0]["item"]["type"], json!("message"));
-        assert_eq!(events[0]["item"]["status"], json!("in_progress"));
-        let item_id = events[0]["item"]["id"].as_str().unwrap().to_string();
-        assert!(!item_id.is_empty());
-
-        assert_eq!(events[1]["type"], json!("response.content_part.added"));
-        assert_eq!(events[1]["item_id"], json!(item_id));
-        assert_eq!(events[1]["output_index"], json!(0));
-        assert_eq!(events[1]["content_index"], json!(0));
-        assert_eq!(events[1]["part"]["type"], json!("output_text"));
-    }
-
-    #[test]
-    fn content_block_start_tool_use_emits_only_item_added_with_call_id_from_anthropic() {
-        let mut t = AnthropicToResponses::new();
-        t.translate_response_event(json!({
-            "type": "message_start",
-            "message": {"id": "msg_2", "model": "claude-opus-4-1-20250805", "usage": {"input_tokens": 10, "output_tokens": 0}}
-        }));
-        let events = t.translate_response_event(json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "tool_use", "id": "toolu_01AAA", "name": "get_weather", "input": {}}
-        }));
-
-        assert_eq!(
-            events.len(),
-            1,
-            "tool_use opens no content_part — only output_item.added"
-        );
-        assert_eq!(events[0]["type"], json!("response.output_item.added"));
-        assert_eq!(events[0]["output_index"], json!(0));
-        assert_eq!(events[0]["item"]["type"], json!("function_call"));
-        assert_eq!(events[0]["item"]["call_id"], json!("toolu_01AAA"));
-        assert_eq!(events[0]["item"]["name"], json!("get_weather"));
-        assert_eq!(events[0]["item"]["arguments"], json!(""));
-    }
-
-    #[test]
-    fn content_block_start_thinking_emits_only_item_added_reasoning() {
-        let mut t = AnthropicToResponses::new();
-        t.translate_response_event(json!({
-            "type": "message_start",
-            "message": {"id": "msg_3", "model": "claude-opus-4-1-20250805", "usage": {"input_tokens": 10, "output_tokens": 0}}
-        }));
-        let events = t.translate_response_event(json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-        }));
-
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["type"], json!("response.output_item.added"));
-        assert_eq!(events[0]["item"]["type"], json!("reasoning"));
-        assert_eq!(events[0]["item"]["status"], json!("in_progress"));
+        assert_eq!(events2, Vec::<Value>::new());
     }
 
     fn started_text_translator() -> AnthropicToResponses {
         let mut t = AnthropicToResponses::new();
+        t.translate_response_event(response_created("claude-opus-4-1-20250805"));
         t.translate_response_event(json!({
-            "type": "message_start",
-            "message": {"id": "msg_1", "model": "claude-opus-4-1-20250805", "usage": {"input_tokens": 10, "output_tokens": 0}}
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": "item_1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}
         }));
         t.translate_response_event(json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""}
+            "type": "response.content_part.added",
+            "item_id": "item_1",
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []}
         }));
         t
     }
 
     #[test]
-    fn text_delta_emits_output_text_delta_immediately_per_event() {
+    fn output_item_added_message_emits_nothing_content_part_added_opens_text_block() {
+        let mut t = AnthropicToResponses::new();
+        t.translate_response_event(response_created("claude-opus-4-1-20250805"));
+        let item_added = t.translate_response_event(json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": "item_1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}
+        }));
+        assert_eq!(
+            item_added,
+            Vec::<Value>::new(),
+            "message items open no Anthropic event until content_part.added"
+        );
+
+        let events = t.translate_response_event(json!({
+            "type": "response.content_part.added",
+            "item_id": "item_1",
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []}
+        }));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], json!("content_block_start"));
+        assert_eq!(events[0]["index"], json!(0));
+        assert_eq!(events[0]["content_block"]["type"], json!("text"));
+        assert_eq!(events[0]["content_block"]["text"], json!(""));
+    }
+
+    #[test]
+    fn output_item_added_function_call_opens_tool_use_block_immediately() {
+        let mut t = AnthropicToResponses::new();
+        t.translate_response_event(response_created("claude-opus-4-1-20250805"));
+        let events = t.translate_response_event(json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": "item_fc", "type": "function_call", "status": "in_progress", "call_id": "call_abc123", "name": "get_weather", "arguments": ""}
+        }));
+        assert_eq!(
+            events.len(),
+            1,
+            "tool_use opens no content_part — only content_block_start"
+        );
+        assert_eq!(events[0]["type"], json!("content_block_start"));
+        assert_eq!(events[0]["index"], json!(0));
+        assert_eq!(events[0]["content_block"]["type"], json!("tool_use"));
+        assert_eq!(events[0]["content_block"]["id"], json!("call_abc123"));
+        assert_eq!(events[0]["content_block"]["name"], json!("get_weather"));
+        assert_eq!(events[0]["content_block"]["input"], json!({}));
+    }
+
+    #[test]
+    fn output_item_added_reasoning_opens_thinking_block_immediately() {
+        let mut t = AnthropicToResponses::new();
+        t.translate_response_event(response_created("claude-opus-4-1-20250805"));
+        let events = t.translate_response_event(json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": "item_r", "type": "reasoning", "status": "in_progress", "summary": []}
+        }));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], json!("content_block_start"));
+        assert_eq!(events[0]["content_block"]["type"], json!("thinking"));
+        assert_eq!(events[0]["content_block"]["thinking"], json!(""));
+    }
+
+    #[test]
+    fn output_text_delta_emits_content_block_delta_immediately_per_event() {
         let mut t = started_text_translator();
         let e1 = t.translate_response_event(json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": "Hello"}
+            "type": "response.output_text.delta",
+            "item_id": "item_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "Hello",
+            "logprobs": []
         }));
         assert_eq!(e1.len(), 1);
-        assert_eq!(e1[0]["type"], json!("response.output_text.delta"));
-        assert_eq!(e1[0]["delta"], json!("Hello"));
-        assert_eq!(e1[0]["content_index"], json!(0));
-        assert_eq!(e1[0]["logprobs"], json!([]));
+        assert_eq!(e1[0]["type"], json!("content_block_delta"));
+        assert_eq!(e1[0]["index"], json!(0));
+        assert_eq!(e1[0]["delta"]["type"], json!("text_delta"));
+        assert_eq!(e1[0]["delta"]["text"], json!("Hello"));
+        // OpenAI's item_id/output_index/content_index/logprobs have no Anthropic slot.
+        assert!(e1[0].get("item_id").is_none());
+        assert!(e1[0].get("logprobs").is_none());
 
         let e2 = t.translate_response_event(json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": " world"}
+            "type": "response.output_text.delta",
+            "item_id": "item_1",
+            "delta": " world"
         }));
-        assert_eq!(e2.len(), 1);
-        assert_eq!(e2[0]["delta"], json!(" world"));
-        assert!(
-            e2[0]["sequence_number"].as_u64().unwrap() > e1[0]["sequence_number"].as_u64().unwrap()
-        );
+        assert_eq!(e2[0]["delta"]["text"], json!(" world"));
     }
 
     #[test]
-    fn input_json_delta_emits_function_call_arguments_delta() {
+    fn function_call_arguments_delta_emits_input_json_delta() {
         let mut t = AnthropicToResponses::new();
+        t.translate_response_event(response_created("claude-opus-4-1-20250805"));
         t.translate_response_event(json!({
-            "type": "message_start",
-            "message": {"id": "msg_2", "model": "claude-opus-4-1-20250805", "usage": {"input_tokens": 10, "output_tokens": 0}}
-        }));
-        t.translate_response_event(json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "tool_use", "id": "toolu_01AAA", "name": "get_weather", "input": {}}
+            "type": "response.output_item.added",
+            "item": {"id": "item_fc", "type": "function_call", "call_id": "call_abc123", "name": "get_weather", "arguments": ""}
         }));
         let events = t.translate_response_event(json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "input_json_delta", "partial_json": "{\"location\":\"SF\"}"}
+            "type": "response.function_call_arguments.delta",
+            "item_id": "item_fc",
+            "delta": "{\"location\":\"SF\"}"
         }));
         assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["delta"]["type"], json!("input_json_delta"));
         assert_eq!(
-            events[0]["type"],
-            json!("response.function_call_arguments.delta")
-        );
-        assert_eq!(events[0]["delta"], json!("{\"location\":\"SF\"}"));
-    }
-
-    #[test]
-    fn thinking_delta_emits_reasoning_summary_text_delta_with_summary_index_zero() {
-        let mut t = AnthropicToResponses::new();
-        t.translate_response_event(json!({
-            "type": "message_start",
-            "message": {"id": "msg_3", "model": "claude-opus-4-1-20250805", "usage": {"input_tokens": 10, "output_tokens": 0}}
-        }));
-        t.translate_response_event(json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-        }));
-        let events = t.translate_response_event(json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "thinking_delta", "thinking": "Let me think..."}
-        }));
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0]["type"],
-            json!("response.reasoning_summary_text.delta")
-        );
-        assert_eq!(events[0]["summary_index"], json!(0));
-        assert_eq!(events[0]["delta"], json!("Let me think..."));
-    }
-
-    #[test]
-    fn signature_delta_emits_nothing() {
-        let mut t = AnthropicToResponses::new();
-        t.translate_response_event(json!({
-            "type": "message_start",
-            "message": {"id": "msg_4", "model": "claude-opus-4-1-20250805", "usage": {"input_tokens": 10, "output_tokens": 0}}
-        }));
-        t.translate_response_event(json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-        }));
-        let events = t.translate_response_event(json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "signature_delta", "signature": "abc123sig"}
-        }));
-        assert_eq!(
-            events,
-            Vec::<Value>::new(),
-            "signature_delta is one-to-zero"
-        );
-    }
-
-    #[test]
-    fn content_block_stop_text_emits_done_triad_with_full_accumulated_text() {
-        let mut t = started_text_translator();
-        t.translate_response_event(json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": "Hello"}
-        }));
-        t.translate_response_event(json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": " world"}
-        }));
-        let events = t.translate_response_event(json!({"type": "content_block_stop", "index": 0}));
-
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0]["type"], json!("response.output_text.done"));
-        assert_eq!(events[0]["text"], json!("Hello world"));
-        assert_eq!(events[1]["type"], json!("response.content_part.done"));
-        assert_eq!(events[1]["part"]["text"], json!("Hello world"));
-        assert_eq!(events[2]["type"], json!("response.output_item.done"));
-        assert_eq!(events[2]["item"]["status"], json!("completed"));
-        assert_eq!(
-            events[2]["item"]["content"][0]["text"],
-            json!("Hello world")
-        );
-    }
-
-    #[test]
-    fn content_block_stop_tool_use_emits_only_two_done_events() {
-        let mut t = AnthropicToResponses::new();
-        t.translate_response_event(json!({
-            "type": "message_start",
-            "message": {"id": "msg_2", "model": "claude-opus-4-1-20250805", "usage": {"input_tokens": 10, "output_tokens": 0}}
-        }));
-        t.translate_response_event(json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "tool_use", "id": "toolu_01AAA", "name": "get_weather", "input": {}}
-        }));
-        t.translate_response_event(json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "input_json_delta", "partial_json": "{\"location\":\"SF\"}"}
-        }));
-        let events = t.translate_response_event(json!({"type": "content_block_stop", "index": 0}));
-
-        assert_eq!(events.len(), 2, "tool_use has no content_part to close");
-        assert_eq!(
-            events[0]["type"],
-            json!("response.function_call_arguments.done")
-        );
-        assert_eq!(events[0]["arguments"], json!("{\"location\":\"SF\"}"));
-        assert_eq!(events[1]["type"], json!("response.output_item.done"));
-        assert_eq!(events[1]["item"]["call_id"], json!("toolu_01AAA"));
-        assert_eq!(
-            events[1]["item"]["arguments"],
+            events[0]["delta"]["partial_json"],
             json!("{\"location\":\"SF\"}")
         );
     }
 
     #[test]
-    fn content_block_stop_thinking_emits_only_two_done_events() {
+    fn reasoning_summary_text_delta_emits_thinking_delta() {
         let mut t = AnthropicToResponses::new();
+        t.translate_response_event(response_created("claude-opus-4-1-20250805"));
         t.translate_response_event(json!({
-            "type": "message_start",
-            "message": {"id": "msg_3", "model": "claude-opus-4-1-20250805", "usage": {"input_tokens": 10, "output_tokens": 0}}
+            "type": "response.output_item.added",
+            "item": {"id": "item_r", "type": "reasoning", "summary": []}
+        }));
+        let events = t.translate_response_event(json!({
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "item_r",
+            "delta": "Let me think..."
+        }));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], json!("content_block_delta"));
+        assert_eq!(events[0]["delta"]["type"], json!("thinking_delta"));
+        assert_eq!(events[0]["delta"]["thinking"], json!("Let me think..."));
+    }
+
+    #[test]
+    fn reasoning_text_delta_alias_also_emits_thinking_delta() {
+        // SPEC-M4 §3.5/§7: which OpenAI event actually carries reasoning text (summary vs raw) is
+        // VERIFY-gated; both are accepted as equivalent input.
+        let mut t = AnthropicToResponses::new();
+        t.translate_response_event(response_created("claude-opus-4-1-20250805"));
+        t.translate_response_event(json!({
+            "type": "response.output_item.added",
+            "item": {"id": "item_r", "type": "reasoning", "summary": []}
+        }));
+        let events = t.translate_response_event(json!({
+            "type": "response.reasoning_text.delta",
+            "item_id": "item_r",
+            "delta": "hmm"
+        }));
+        assert_eq!(events[0]["delta"]["type"], json!("thinking_delta"));
+        assert_eq!(events[0]["delta"]["thinking"], json!("hmm"));
+    }
+
+    #[test]
+    fn text_block_done_family_collapses_to_single_content_block_stop() {
+        let mut t = started_text_translator();
+        t.translate_response_event(json!({
+            "type": "response.output_text.delta", "item_id": "item_1", "delta": "hi"
+        }));
+
+        let first = t.translate_response_event(json!({
+            "type": "response.output_text.done", "item_id": "item_1", "output_index": 0, "content_index": 0, "text": "hi"
+        }));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["type"], json!("content_block_stop"));
+        assert_eq!(first[0]["index"], json!(0));
+        // Anthropic's content_block_stop carries no accumulated text.
+        assert!(first[0].get("text").is_none());
+
+        let second = t.translate_response_event(json!({
+            "type": "response.content_part.done", "item_id": "item_1", "output_index": 0, "content_index": 0,
+            "part": {"type": "output_text", "text": "hi", "annotations": []}
+        }));
+        assert_eq!(
+            second,
+            Vec::<Value>::new(),
+            "already stopped -- must not double-fire"
+        );
+
+        let third = t.translate_response_event(json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "item_1", "type": "message", "status": "completed", "content": [{"type": "output_text", "text": "hi", "annotations": []}]}
+        }));
+        assert_eq!(
+            third,
+            Vec::<Value>::new(),
+            "already stopped -- must not double-fire"
+        );
+    }
+
+    #[test]
+    fn tool_use_done_family_collapses_to_single_content_block_stop() {
+        let mut t = AnthropicToResponses::new();
+        t.translate_response_event(response_created("claude-opus-4-1-20250805"));
+        t.translate_response_event(json!({
+            "type": "response.output_item.added",
+            "item": {"id": "item_fc", "type": "function_call", "call_id": "call_abc123", "name": "get_weather"}
         }));
         t.translate_response_event(json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+            "type": "response.function_call_arguments.delta", "item_id": "item_fc", "delta": "{}"
+        }));
+
+        let first = t.translate_response_event(json!({
+            "type": "response.function_call_arguments.done", "item_id": "item_fc", "arguments": "{}"
+        }));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["type"], json!("content_block_stop"));
+
+        let second = t.translate_response_event(json!({
+            "type": "response.output_item.done",
+            "item": {"id": "item_fc", "type": "function_call", "status": "completed", "call_id": "call_abc123", "name": "get_weather", "arguments": "{}"}
+        }));
+        assert_eq!(second, Vec::<Value>::new());
+    }
+
+    #[test]
+    fn message_stop_family_not_fed_before_open_emits_nothing() {
+        let mut t = AnthropicToResponses::new();
+        let events = t.translate_response_event(json!({
+            "type": "response.output_text.done", "item_id": "never_opened", "text": "x"
+        }));
+        assert_eq!(events, Vec::<Value>::new());
+    }
+
+    #[test]
+    fn response_completed_emits_message_delta_then_message_stop_with_mapped_usage() {
+        let mut t = started_text_translator();
+        t.translate_response_event(json!({
+            "type": "response.output_text.delta", "item_id": "item_1", "delta": "42"
         }));
         t.translate_response_event(json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "thinking_delta", "thinking": "Let me think..."}
+            "type": "response.output_text.done", "item_id": "item_1", "text": "42"
         }));
-        let events = t.translate_response_event(json!({"type": "content_block_stop", "index": 0}));
+
+        let events = t.translate_response_event(json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1", "status": "completed", "model": "claude-opus-4-1-20250805",
+                "output": [], "usage": {
+                    "input_tokens": 25, "output_tokens": 9,
+                    "input_tokens_details": {"cached_tokens": 5},
+                    "output_tokens_details": {"reasoning_tokens": 3},
+                    "total_tokens": 34
+                }
+            }
+        }));
 
         assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[0]["type"],
-            json!("response.reasoning_summary_text.done")
-        );
-        assert_eq!(events[0]["text"], json!("Let me think..."));
-        assert_eq!(events[1]["type"], json!("response.output_item.done"));
-        assert_eq!(
-            events[1]["item"]["summary"][0]["text"],
-            json!("Let me think...")
-        );
+        assert_eq!(events[0]["type"], json!("message_delta"));
+        assert_eq!(events[0]["delta"]["stop_reason"], json!("end_turn"));
+        assert_eq!(events[0]["delta"]["stop_sequence"], Value::Null);
+        assert_eq!(events[0]["usage"]["output_tokens"], json!(9));
+        assert_eq!(events[0]["usage"]["input_tokens"], json!(25));
+        assert_eq!(events[0]["usage"]["cache_read_input_tokens"], json!(5));
+        assert_eq!(events[0]["usage"]["thinking_tokens"], json!(3));
+        // Anthropic's usage has no total_tokens field.
+        assert!(events[0]["usage"].get("total_tokens").is_none());
+
+        assert_eq!(events[1], json!({"type": "message_stop"}));
     }
 
     #[test]
-    fn message_delta_emits_nothing_but_buffers_stop_reason_and_usage() {
+    fn response_incomplete_maps_to_max_tokens_stop_reason() {
         let mut t = started_text_translator();
         let events = t.translate_response_event(json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-            "usage": {"output_tokens": 8}
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_1", "status": "incomplete", "model": "claude-opus-4-1-20250805",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {"output_tokens": 5}
+            }
         }));
-        assert_eq!(
-            events,
-            Vec::<Value>::new(),
-            "message_delta folds into the terminal event only"
-        );
+        assert_eq!(events[0]["delta"]["stop_reason"], json!("max_tokens"));
     }
 
     #[test]
-    fn message_stop_emits_completed_with_merged_usage_and_assembled_output() {
-        let mut t = started_text_translator();
-        t.translate_response_event(json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": "42"}
-        }));
-        t.translate_response_event(json!({"type": "content_block_stop", "index": 0}));
-        t.translate_response_event(json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": "end_turn"},
-            "usage": {"output_tokens": 8}
-        }));
-        let events = t.translate_response_event(json!({"type": "message_stop"}));
+    fn thinking_then_text_turn_assigns_distinct_indices_in_open_order() {
+        let mut t = AnthropicToResponses::new();
+        t.translate_response_event(response_created("claude-opus-4-1-20250805"));
 
+        let reasoning_start = t.translate_response_event(json!({
+            "type": "response.output_item.added",
+            "item": {"id": "item_r", "type": "reasoning", "summary": []}
+        }));
+        assert_eq!(reasoning_start[0]["index"], json!(0));
+
+        t.translate_response_event(json!({
+            "type": "response.reasoning_summary_text.delta", "item_id": "item_r", "delta": "Let me think..."
+        }));
+        let reasoning_stop = t.translate_response_event(json!({
+            "type": "response.reasoning_summary_text.done", "item_id": "item_r", "text": "Let me think..."
+        }));
+        assert_eq!(reasoning_stop[0]["index"], json!(0));
+
+        t.translate_response_event(json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {"id": "item_t", "type": "message", "role": "assistant", "content": []}
+        }));
+        let text_start = t.translate_response_event(json!({
+            "type": "response.content_part.added",
+            "item_id": "item_t",
+            "part": {"type": "output_text", "text": "", "annotations": []}
+        }));
+        assert_eq!(text_start[0]["index"], json!(1));
+        assert_ne!(reasoning_start[0]["index"], text_start[0]["index"]);
+    }
+
+    #[test]
+    fn response_failed_emits_anthropic_error_event() {
+        let mut t = AnthropicToResponses::new();
+        let events = t.translate_response_event(json!({
+            "type": "response.failed",
+            "response": {"id": "resp_1", "status": "failed", "error": {"code": "server_error", "message": "boom"}}
+        }));
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["type"], json!("response.completed"));
-        let response = &events[0]["response"];
-        assert_eq!(response["status"], json!("completed"));
-        // input_tokens came from message_start (10), never overwritten by message_delta's
-        // output_tokens-only usage object -- proves the merge strategy (gap 6).
-        assert_eq!(response["usage"]["input_tokens"], json!(10));
-        assert_eq!(response["usage"]["output_tokens"], json!(8));
-        assert_eq!(response["usage"]["total_tokens"], json!(18));
-        assert_eq!(response["output"][0]["type"], json!("message"));
-        assert_eq!(response["output"][0]["content"][0]["text"], json!("42"));
-    }
-
-    #[test]
-    fn message_stop_maps_max_tokens_to_incomplete() {
-        let mut t = started_text_translator();
-        t.translate_response_event(json!({"type": "content_block_stop", "index": 0}));
-        t.translate_response_event(json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": "max_tokens"},
-            "usage": {"output_tokens": 5}
-        }));
-        let events = t.translate_response_event(json!({"type": "message_stop"}));
-
-        assert_eq!(events[0]["type"], json!("response.incomplete"));
-        assert_eq!(events[0]["response"]["status"], json!("incomplete"));
         assert_eq!(
-            events[0]["response"]["incomplete_details"]["reason"],
-            json!("max_output_tokens")
+            events[0],
+            json!({"type": "error", "error": {"type": "server_error", "message": "boom"}})
         );
     }
 
     #[test]
-    fn usage_maps_cache_read_and_thinking_tokens() {
-        let mut t = started_text_translator();
-        t.translate_response_event(json!({"type": "content_block_stop", "index": 0}));
-        t.translate_response_event(json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": "end_turn"},
-            "usage": {"output_tokens": 15, "cache_read_input_tokens": 5, "thinking_tokens": 3}
-        }));
-        let events = t.translate_response_event(json!({"type": "message_stop"}));
-        let usage = &events[0]["response"]["usage"];
-        assert_eq!(usage["input_tokens_details"]["cached_tokens"], json!(5));
-        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], json!(3));
-    }
-
-    #[test]
-    fn mid_stream_error_passes_through_type_as_code() {
+    fn mid_stream_error_event_passes_through_code_as_error_type() {
         let mut t = AnthropicToResponses::new();
         let events = t.translate_response_event(json!({
             "type": "error",
-            "error": {"type": "overloaded_error", "message": "Overloaded"}
+            "code": "rate_limit_exceeded",
+            "message": "Too many requests"
         }));
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["type"], json!("error"));
-        assert_eq!(events[0]["code"], json!("overloaded_error"));
-        assert_eq!(events[0]["message"], json!("Overloaded"));
+        assert_eq!(
+            events[0],
+            json!({"type": "error", "error": {"type": "rate_limit_exceeded", "message": "Too many requests"}})
+        );
     }
 
     #[test]
@@ -1527,27 +1376,32 @@ mod tests {
     }
 
     #[test]
-    fn debug_redacts_accumulated_block_text() {
-        let mut t = AnthropicToResponses::new();
+    fn each_turn_gets_a_fresh_translator_with_no_cross_turn_state() {
+        let first = {
+            let mut t = AnthropicToResponses::new();
+            t.translate_response_event(response_created("claude-opus-4-1-20250805"))
+        };
+        let second = {
+            let mut t = AnthropicToResponses::new();
+            t.translate_response_event(response_created("claude-opus-4-1-20250805"))
+        };
+        // message.id is freshly minted per turn -- never reused across turns.
+        assert_ne!(first[0]["message"]["id"], second[0]["message"]["id"]);
+    }
+
+    #[test]
+    fn debug_redacts_block_state_defensively() {
+        let mut t = started_text_translator();
         t.translate_response_event(json!({
-            "type": "message_start",
-            "message": {"id": "msg_1", "model": "claude-opus-4-1-20250805", "usage": {"input_tokens": 1, "output_tokens": 1}}
-        }));
-        t.translate_response_event(json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""}
-        }));
-        t.translate_response_event(json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": "super-secret-user-conversation"}
+            "type": "response.output_text.delta",
+            "item_id": "item_1",
+            "delta": "super-secret-user-conversation"
         }));
 
         let s = format!("{t:?}");
         assert!(
             !s.contains("super-secret-user-conversation"),
-            "Debug must never leak accumulated block text: {s}"
+            "Debug must never leak streamed content: {s}"
         );
         assert!(
             s.contains("redacted"),
