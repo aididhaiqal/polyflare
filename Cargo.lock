@@ -1386,6 +1386,7 @@ dependencies = [
  "futures-util",
  "polyflare-core",
  "polyflare-testkit",
+ "rand 0.9.5",
  "reqwest",
  "serde",
  "serde_json",
