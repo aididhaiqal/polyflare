@@ -3,6 +3,7 @@
 pub mod account_cache;
 pub mod alias;
 pub mod app;
+pub mod catalog;
 pub mod config;
 pub mod continuity;
 pub mod fingerprint_capture;
