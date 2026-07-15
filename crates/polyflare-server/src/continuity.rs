@@ -107,6 +107,7 @@ impl Continuity for CodexContinuity {
                 let anchorless_req = PreparedRequest {
                     body: stripped,
                     model: req.model.clone(),
+                    forward_headers: req.forward_headers.clone(),
                 };
                 (arm, RecoveryPlan::ResendFull { anchorless_req })
             } else {
@@ -198,6 +199,7 @@ mod tests {
         PreparedRequest {
             body,
             model: "gpt-5.6-sol".to_string(),
+            forward_headers: vec![],
         }
     }
 

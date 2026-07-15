@@ -38,6 +38,10 @@ pub struct MockUpstream {
     mode: MockMode,
     bodies: Arc<Mutex<Vec<serde_json::Value>>>,
     last_authorization: Arc<Mutex<Option<String>>>,
+    /// The full request `HeaderMap` of the most recent request — used by the Codex
+    /// fingerprint-parity gate to inspect PolyFlare's egress header STRUCTURE (names + shapes),
+    /// not just the single `authorization` header `last_authorization` already exposed.
+    last_headers: Arc<Mutex<Option<HeaderMap>>>,
     emitted_ids: Arc<Mutex<Vec<String>>>,
     counter: Arc<AtomicU32>,
     /// If set (Scripted mode only), sleep this long after emitting `events[0]` and before
@@ -53,6 +57,7 @@ impl MockUpstream {
             mode,
             bodies: Arc::new(Mutex::new(Vec::new())),
             last_authorization: Arc::new(Mutex::new(None)),
+            last_headers: Arc::new(Mutex::new(None)),
             emitted_ids: Arc::new(Mutex::new(Vec::new())),
             counter: Arc::new(AtomicU32::new(0)),
             gap_after_first: None,
@@ -121,6 +126,12 @@ impl MockUpstream {
         self.last_authorization.lock().unwrap().clone()
     }
 
+    /// The full request `HeaderMap` of the most recent request. Used by the Codex
+    /// fingerprint-parity gate to capture PolyFlare's egress header structure.
+    pub fn last_headers(&self) -> Option<HeaderMap> {
+        self.last_headers.lock().unwrap().clone()
+    }
+
     /// The `response.id`s the mock has emitted, in order.
     pub fn emitted_response_ids(&self) -> Vec<String> {
         self.emitted_ids.lock().unwrap().clone()
@@ -159,6 +170,7 @@ async fn handler(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    *mock.last_headers.lock().unwrap() = Some(headers.clone());
 
     match mock.mode {
         MockMode::Scripted => {

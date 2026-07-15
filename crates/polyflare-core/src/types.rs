@@ -9,19 +9,29 @@ use crate::provider::Provider;
 
 /// A request prepared for a specific backend. In M1 this is a thin wrapper over the
 /// raw request JSON plus the target model; continuity/translation enrich it later.
+///
+/// `forward_headers` carries the ordered codex-identity headers the ingress decided the executor
+/// should send upstream: for a native `/responses` request, the client's own surviving inbound
+/// headers (forwarded untouched); for a translated request (no real Codex client fingerprint
+/// exists), a synthesized set (see `polyflare_codex::codex_headers`). The executor itself stays
+/// dumb — it just sets these on the outbound request and overrides auth/accept.
 #[derive(Clone)]
 pub struct PreparedRequest {
     pub body: serde_json::Value,
     pub model: String,
+    pub forward_headers: Vec<(String, String)>,
 }
 
 // `body` carries the full user request/conversation content and must never be printed in clear
-// via `{:?}` (mirrors `Account`'s `bearer_token` redaction below).
+// via `{:?}` (mirrors `Account`'s `bearer_token` redaction below). `forward_headers` carries
+// session/thread/conversation identity (real, forwarded ones for a native request) and must be
+// redacted for the same content-safety reason, not just `body`.
 impl std::fmt::Debug for PreparedRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedRequest")
             .field("model", &self.model)
             .field("body", &"<redacted>")
+            .field("forward_headers", &"<redacted>")
             .finish()
     }
 }
@@ -333,6 +343,7 @@ mod tests {
         let req = PreparedRequest {
             body: serde_json::json!({"input": "super-secret-user-conversation"}),
             model: "gpt-5.6-sol".to_string(),
+            forward_headers: vec![],
         };
         let s = format!("{req:?}");
         assert!(
@@ -350,6 +361,43 @@ mod tests {
     }
 
     #[test]
+    fn prepared_request_debug_redacts_forward_headers() {
+        // forward_headers carries session/thread ids (real, forwarded ones on a native request) —
+        // content-safety-sensitive the same way `body` is, so Debug must never print them either.
+        let req = PreparedRequest {
+            body: serde_json::json!({}),
+            model: "gpt-5.6-sol".to_string(),
+            forward_headers: vec![
+                (
+                    "session-id".to_string(),
+                    "super-secret-session-uuid".to_string(),
+                ),
+                (
+                    "thread-id".to_string(),
+                    "super-secret-thread-uuid".to_string(),
+                ),
+            ],
+        };
+        let s = format!("{req:?}");
+        assert!(
+            !s.contains("super-secret-session-uuid"),
+            "PreparedRequest Debug must never leak a forwarded header value: {s}"
+        );
+        assert!(
+            !s.contains("super-secret-thread-uuid"),
+            "PreparedRequest Debug must never leak a forwarded header value: {s}"
+        );
+        assert!(
+            !s.contains("session-id") && !s.contains("thread-id"),
+            "PreparedRequest Debug must never leak forwarded header names either: {s}"
+        );
+        assert!(
+            s.contains("<redacted>"),
+            "Debug should mark forward_headers redacted: {s}"
+        );
+    }
+
+    #[test]
     fn new_snapshot_defaults_to_codex_provider() {
         let snap = AccountSnapshot::new("a");
         assert_eq!(snap.provider, Provider::Codex);
@@ -361,6 +409,7 @@ mod tests {
             anchorless_req: PreparedRequest {
                 body: serde_json::json!({"input": "super-secret-conversation"}),
                 model: "m".to_string(),
+                forward_headers: vec![],
             },
         };
         let s = format!("{plan:?}");

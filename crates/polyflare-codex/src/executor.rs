@@ -4,12 +4,25 @@
 //! `prefer-post-quantum` X25519MLKEM768 hybrid key share offered) — full byte-for-byte fingerprint
 //! parity against a real codex-rs capture is the fingerprint-parity GATE, deferred pending a live
 //! capture. WS transport comes in a later milestone.
+//!
+//! # Header handling: dumb executor, smart ingress
+//! This executor does NOT synthesize codex-identity headers (`user-agent`, `originator`,
+//! `session-id`, `thread-id`, ...) itself. A real Codex CLI talking to PolyFlare's native
+//! `/responses` endpoint already sends its own genuine identity headers — overwriting them here
+//! would both discard real conversation ids and produce a WORSE fingerprint than simply relaying
+//! what the client sent. Instead, the ingress (`polyflare-server::ingress`) decides what to send
+//! upstream and hands it down via `PreparedRequest::forward_headers`: the client's own surviving
+//! headers, forwarded untouched, for a native request; a synthesized set (via
+//! `polyflare_codex::codex_headers`) for a translated request that has no real Codex client
+//! fingerprint to forward. This executor just sets whatever `forward_headers` it's given, then
+//! overrides `authorization` (the selected account's own bearer) and `accept`.
 
 use std::sync::Once;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION};
 
 use polyflare_core::{Account, ExecError, Executor, PreparedRequest, ResponseStream};
 
@@ -59,12 +72,31 @@ impl Executor for CodexExecutor {
         account: &Account,
     ) -> Result<ResponseStream, ExecError> {
         let url = format!("{}/responses", account.base_url.trim_end_matches('/'));
+
+        // Set whatever headers the ingress decided to forward (native: the client's own genuine
+        // headers, untouched; translated: a synthesized codex identity — see module doc), then
+        // override auth/accept. `HeaderMap::insert` (not `append`) is used throughout so an
+        // override REPLACES a same-named forwarded header instead of sending it twice (e.g. a
+        // native client's own inbound `accept: text/event-stream` is replaced, not duplicated,
+        // by the override below). `content-type` is deliberately not set here: reqwest's `.json`
+        // call sets it only when absent, so a forwarded `content-type` (native path) is preserved.
+        let mut headers = HeaderMap::new();
+        for (name, value) in &req.forward_headers {
+            let header_name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| ExecError::Upstream(e.to_string()))?;
+            let header_value =
+                HeaderValue::from_str(value).map_err(|e| ExecError::Upstream(e.to_string()))?;
+            headers.insert(header_name, header_value);
+        }
+        let bearer = HeaderValue::from_str(&format!("Bearer {}", account.bearer_token))
+            .map_err(|e| ExecError::Upstream(e.to_string()))?;
+        headers.insert(AUTHORIZATION, bearer);
+        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+
         let resp = self
             .client
             .post(&url)
-            .bearer_auth(&account.bearer_token)
-            // Minimal M1 laundering; full byte-parity fingerprint is M5.
-            .header("user-agent", "codex_cli_rs")
+            .headers(headers)
             .json(&req.body)
             .send()
             .await

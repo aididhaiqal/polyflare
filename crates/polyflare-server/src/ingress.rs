@@ -60,6 +60,75 @@ fn maybe_capture_fingerprint(state: &AppState, method: &str, path: &str, headers
     }
 }
 
+/// Inbound headers dropped before a native `/responses` request's surviving codex-identity headers
+/// are captured into `PreparedRequest::forward_headers` (see that field's doc). `host` /
+/// `content-length` / `connection` / `transfer-encoding` are hop-by-hop transport framing that must
+/// never be replayed to a different upstream connection; `authorization` is dropped because the
+/// executor always overrides it with the SELECTED account's own bearer token — forwarding the
+/// client's own (irrelevant to upstream, and never to be logged/relayed) bearer would be at best
+/// ignored and at worst a real secret leaking onto the wire under the wrong identity.
+///
+/// This is deliberately a small, conservative drop-list, not codex-lb's full native-vs-SDK
+/// normalization (`_build_upstream_headers`/`_normalize_non_native_upstream_fingerprint` in
+/// `codex-lb/app/core/clients/proxy.py`) — for now this just forwards what a native client sent;
+/// full normalization is a follow-up.
+const DROPPED_INBOUND_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "connection",
+    "transfer-encoding",
+    "authorization",
+];
+
+/// Filters a native `/responses` request's inbound `HeaderMap` down to the surviving
+/// codex-identity headers to forward upstream untouched (see `DROPPED_INBOUND_HEADERS`). A header
+/// value that isn't valid visible-ASCII (`to_str()` fails) is silently skipped rather than
+/// forwarded lossily.
+fn forward_headers_from_inbound(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            !DROPPED_INBOUND_HEADERS
+                .iter()
+                .any(|dropped| name.as_str().eq_ignore_ascii_case(dropped))
+        })
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// Synthesizes the codex-identity `forward_headers` for a TRANSLATED request (a Claude request
+/// routed to the Codex pool): there is no real Codex client fingerprint to forward here, unlike the
+/// native `/responses` path above, so this is where `polyflare_codex::codex_headers` (built from a
+/// local `openai/codex` source read — see that module's doc) genuinely belongs.
+fn synthesize_codex_forward_headers(body: &serde_json::Value) -> Vec<(String, String)> {
+    use polyflare_codex::codex_headers::{
+        codex_user_agent, conversation_key, originator, TurnIdentity,
+    };
+
+    let identity = TurnIdentity::derive(&conversation_key(body));
+    vec![
+        ("user-agent".to_string(), codex_user_agent()),
+        ("originator".to_string(), originator().to_string()),
+        ("accept".to_string(), "text/event-stream".to_string()),
+        ("session-id".to_string(), identity.session_id.clone()),
+        ("thread-id".to_string(), identity.thread_id.clone()),
+        (
+            "x-client-request-id".to_string(),
+            identity.thread_id.clone(),
+        ),
+        ("x-codex-window-id".to_string(), identity.window_id.clone()),
+        (
+            "x-codex-turn-metadata".to_string(),
+            identity.turn_metadata_json(),
+        ),
+    ]
+}
+
 fn stream_response(stream: ResponseStream) -> Response {
     Response::builder()
         .status(StatusCode::OK)
@@ -200,7 +269,15 @@ async fn responses_handler_impl(
 
     // C3: derive continuity ctx from headers + body.
     let ctx: RequestCtx = derive_request_ctx(&headers, &body);
-    let req = PreparedRequest { body, model };
+    // Native path: forward the REAL Codex client's own surviving inbound headers untouched (see
+    // `forward_headers_from_inbound`) — this is a genuine Codex client, so its fingerprint is
+    // already authentic; synthesizing here would only discard real conversation ids.
+    let forward_headers = forward_headers_from_inbound(&headers);
+    let req = PreparedRequest {
+        body,
+        model,
+        forward_headers,
+    };
 
     // C4: prepare (resolve owner + arm + recovery plan).
     let prepared = match state.continuity.prepare(req, &ctx).await {
@@ -396,7 +473,13 @@ async fn messages_handler_native(
     model: String,
 ) -> Response {
     let now = unix_now();
-    let req = PreparedRequest { body, model };
+    // Native Anthropic path: the AnthropicExecutor does not use `forward_headers` (that field is
+    // the Codex egress identity set), so there is nothing to forward here.
+    let req = PreparedRequest {
+        body,
+        model,
+        forward_headers: vec![],
+    };
     let ctx = RequestCtx::default();
 
     let prepared = match NoopContinuity.prepare(req, &ctx).await {
@@ -469,9 +552,15 @@ async fn messages_handler_codex_aliased(
         translated_body["reasoning"] = serde_json::json!({ "effort": effort });
     }
 
+    // Translated path: there is no real Codex client to forward, so SYNTHESIZE codex-rs's identity
+    // headers (see `synthesize_codex_forward_headers`). Mirrors codex-lb's forward-native /
+    // synthesize-non-native split. PROVISIONAL — validate the exact bytes against a real capture
+    // (POLYFLARE_CAPTURE_FINGERPRINT).
+    let forward_headers = synthesize_codex_forward_headers(&translated_body);
     let req = PreparedRequest {
         body: translated_body,
         model: model_alias.target_model,
+        forward_headers,
     };
     let ctx = RequestCtx::default();
 

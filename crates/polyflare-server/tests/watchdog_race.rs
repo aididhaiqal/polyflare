@@ -67,6 +67,7 @@ fn armed_full_resend(body: serde_json::Value) -> Prepared {
         req: PreparedRequest {
             body,
             model: "m".into(),
+            forward_headers: vec![],
         },
         directive: ContinuityDirective {
             pin_account: None,
@@ -77,6 +78,7 @@ fn armed_full_resend(body: serde_json::Value) -> Prepared {
                 anchorless_req: PreparedRequest {
                     body: stripped,
                     model: "m".into(),
+                    forward_headers: vec![],
                 },
             },
             session_key: None,
