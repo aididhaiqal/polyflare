@@ -138,6 +138,19 @@ pub fn decode_claims(id_token: &str) -> Result<Claims, OAuthError> {
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// The refresh scope.
 const SCOPE: &str = "openid profile email";
+/// The LOGIN (authorization_code) scope. MUST include `offline_access` or the exchange returns no
+/// refresh token; the extra `api.connectors.*` scopes match the real Codex CLI's authorize request.
+/// Deliberately distinct from the refresh-only [`SCOPE`].
+const AUTHORIZE_SCOPE: &str =
+    "openid profile email offline_access api.connectors.read api.connectors.invoke";
+/// The Codex CLI's own `originator` on the authorize URL (fingerprint-faithful — matches
+/// `codex_headers::originator()` and codex-rs `login/src/server.rs`).
+const LOGIN_ORIGINATOR: &str = "codex_cli_rs";
+/// The fixed loopback redirect the OpenAI app registration expects — host/port are NOT changeable
+/// ("OpenAI dislikes port changes"). Both codex-lb and CLIProxyAPI hardcode this exact value.
+pub const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+/// The loopback callback port, matching [`REDIRECT_URI`].
+pub const CALLBACK_PORT: u16 = 1455;
 
 /// Three OAuth tokens returned by a refresh. Never logged: `Debug` redacts every field.
 #[derive(Clone)]
@@ -175,6 +188,26 @@ struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
     id_token: String,
+}
+
+/// Generate a PKCE `(verifier, S256 challenge)` pair (RFC 7636): a 64-random-byte URL-safe-base64
+/// (no-pad) verifier, and `challenge = base64url(SHA256(verifier_ascii))`.
+pub fn generate_pkce() -> (String, String) {
+    use rand::RngCore;
+    use sha2::{Digest, Sha256};
+    let mut bytes = [0u8; 64];
+    rand::rng().fill_bytes(&mut bytes);
+    let verifier = URL_SAFE_NO_PAD.encode(bytes);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+/// Generate a random `state` value (the CSRF / flow-correlation token echoed on the callback).
+pub fn generate_state() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// OAuth client for the Codex backend. Holds a `reqwest::Client` + the auth base URL
@@ -240,6 +273,89 @@ impl OAuthClient {
                 refresh_token: token
                     .refresh_token
                     .unwrap_or_else(|| refresh_token.to_string()),
+                id_token: token.id_token,
+            },
+            claims,
+        })
+    }
+
+    /// The Codex CLI's authorize URL for the authorization_code + PKCE login flow. Parameters and
+    /// order match codex-rs `login/src/server.rs::build_authorize_url` (fingerprint-faithful).
+    pub fn build_authorize_url(&self, state: &str, code_challenge: &str) -> String {
+        let base = format!(
+            "{}/oauth/authorize",
+            self.auth_base_url.trim_end_matches('/')
+        );
+        reqwest::Url::parse_with_params(
+            &base,
+            &[
+                ("response_type", "code"),
+                ("client_id", CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("scope", AUTHORIZE_SCOPE),
+                ("code_challenge", code_challenge),
+                ("code_challenge_method", "S256"),
+                ("id_token_add_organizations", "true"),
+                ("codex_cli_simplified_flow", "true"),
+                ("state", state),
+                ("originator", LOGIN_ORIGINATOR),
+            ],
+        )
+        .expect("authorize URL is always valid")
+        .to_string()
+    }
+
+    /// Exchange an authorization `code` (+ the PKCE `code_verifier`) for tokens. Unlike [`refresh`]
+    /// (JSON), the authorization_code grant is sent **form-urlencoded** — matching both codex-lb and
+    /// CLIProxyAPI. Returns the same [`Refreshed`] shape (tokens + decoded identity claims).
+    ///
+    /// [`refresh`]: Self::refresh
+    pub async fn exchange_code(
+        &self,
+        code: &str,
+        code_verifier: &str,
+        redirect_uri: &str,
+    ) -> Result<Refreshed, OAuthError> {
+        let url = format!("{}/oauth/token", self.auth_base_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .post(url)
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("client_id", CLIENT_ID),
+                ("code", code),
+                ("code_verifier", code_verifier),
+                ("redirect_uri", redirect_uri),
+            ])
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| OAuthError::Transport(e.to_string()))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let code = resp
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string));
+            return Err(OAuthError::Endpoint {
+                status: status.as_u16(),
+                code,
+            });
+        }
+
+        let token: TokenResponse = resp
+            .json()
+            .await
+            .map_err(|e| OAuthError::Transport(e.to_string()))?;
+        let claims = decode_claims(&token.id_token).ok();
+        Ok(Refreshed {
+            tokens: RefreshedTokens {
+                access_token: token.access_token,
+                // The authorization_code grant (with `offline_access`) always returns a refresh
+                // token; default defensively rather than panic if a mock/edge case omits it.
+                refresh_token: token.refresh_token.unwrap_or_default(),
                 id_token: token.id_token,
             },
             claims,
@@ -407,5 +523,40 @@ mod tests {
         );
         assert!(!s.contains("secret-id-xyz"), "must not leak id token");
         assert!(s.contains("***"), "must redact with ***");
+    }
+
+    #[test]
+    fn generate_pkce_challenge_is_s256_of_verifier() {
+        use sha2::{Digest, Sha256};
+        let (verifier, challenge) = generate_pkce();
+        // RFC 7636: challenge = base64url-no-pad(SHA256(ASCII(verifier))).
+        let expected = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        assert_eq!(challenge, expected);
+        // Verifier is a non-trivial URL-safe string; two calls differ (randomness).
+        assert!(verifier.len() >= 43);
+        assert!(!verifier.contains(['+', '/', '=']));
+        assert_ne!(generate_pkce().0, verifier);
+    }
+
+    #[test]
+    fn build_authorize_url_carries_the_codex_login_params() {
+        let client = OAuthClient::new("https://auth.example.test").unwrap();
+        let url = client.build_authorize_url("STATE123", "CHALLENGE456");
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        assert_eq!(parsed.path(), "/oauth/authorize");
+        let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(q["response_type"], "code");
+        assert_eq!(q["client_id"], "app_EMoamEEZ73f0CkXaXp7hrann");
+        assert_eq!(q["redirect_uri"], "http://localhost:1455/auth/callback");
+        assert_eq!(q["code_challenge"], "CHALLENGE456");
+        assert_eq!(q["code_challenge_method"], "S256");
+        assert_eq!(q["state"], "STATE123");
+        assert_eq!(q["originator"], "codex_cli_rs");
+        // MUST request offline_access or no refresh token comes back.
+        assert!(
+            q["scope"].contains("offline_access"),
+            "scope: {}",
+            q["scope"]
+        );
     }
 }

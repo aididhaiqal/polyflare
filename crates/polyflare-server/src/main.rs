@@ -8,12 +8,12 @@ use clap::{Parser, Subcommand};
 
 use polyflare_anthropic::AnthropicExecutor;
 use polyflare_codex::oauth::OAuthClient;
-use polyflare_codex::{CodexExecutor, CodexVersionCache};
+use polyflare_codex::{run_login, CodexExecutor, CodexVersionCache};
 use polyflare_core::{CapacityWeighted, Continuity, Executor, Selector};
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::config::{self, ServeConfig};
 use polyflare_server::continuity::CodexContinuity;
-use polyflare_store::{import_from_codex_lb, Store, TokenCipher};
+use polyflare_store::{import_from_codex_lb, Account, PlainTokens, Store, TokenCipher};
 
 #[derive(Parser)]
 #[command(
@@ -53,6 +53,13 @@ enum AccountsCommands {
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
+    /// Onboard a Codex account via native OAuth login (authorization_code + PKCE). Prints a URL to
+    /// open; catches the loopback callback locally, or paste the redirected URL when headless.
+    Login {
+        /// Also try to auto-open the authorize URL in a browser (default: print only, for headless).
+        #[arg(long = "open")]
+        open: bool,
+    },
 }
 
 /// Content-safe request logging (SPEC-M5 §3.4): env-filtered (`RUST_LOG`, default `info`) plain
@@ -77,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fernet_key,
                 dry_run,
             } => accounts_import(&from, &fernet_key, dry_run).await,
+            AccountsCommands::Login { open } => accounts_login(open).await,
         },
     }
 }
@@ -157,6 +165,85 @@ async fn accounts_import(
         } else {
             ""
         }
+    );
+    Ok(())
+}
+
+/// Onboard (or re-auth) a Codex account via native OAuth login, persisting its tokens to the store.
+/// Prints only identity — never a token (the token types redact their `Debug`).
+async fn accounts_login(open: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = config::data_dir_from_env();
+    let store = Store::open(&config::db_path(&data_dir)).await?;
+    let cipher = TokenCipher::load_or_create(&config::key_path(&data_dir))?;
+    let auth_base = std::env::var("POLYFLARE_AUTH_URL")
+        .unwrap_or_else(|_| "https://auth.openai.com".to_string());
+    let oauth = OAuthClient::new(auth_base)?;
+
+    let refreshed = run_login(&oauth, open).await?;
+    let claims = refreshed
+        .claims
+        .ok_or("login succeeded but the id_token carried no decodable identity claims")?;
+    let tokens = PlainTokens {
+        access_token: refreshed.tokens.access_token,
+        refresh_token: refreshed.tokens.refresh_token,
+        id_token: refreshed.tokens.id_token,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let repo = store.accounts();
+
+    // Onboard vs re-auth: if this ChatGPT account already exists, refresh its tokens in place;
+    // otherwise insert a new row. `update_tokens`/`insert` both bump the store generation, so the
+    // running server's account cache picks the account up without a restart.
+    let existing = match &claims.chatgpt_account_id {
+        Some(cid) => repo.find_by_chatgpt_account_id(cid).await?,
+        None => None,
+    };
+    let (account_id, verb) = if let Some(existing) = existing {
+        repo.update_tokens(&existing.id, &tokens, &cipher, now)
+            .await?;
+        (existing.id, "re-authenticated")
+    } else {
+        let id = format!(
+            "codex_{}",
+            claims
+                .chatgpt_account_id
+                .clone()
+                .or_else(|| claims.sub.clone())
+                .unwrap_or_else(|| now.to_string())
+        );
+        let account = Account {
+            id: id.clone(),
+            chatgpt_account_id: claims.chatgpt_account_id.clone(),
+            chatgpt_user_id: claims.chatgpt_user_id.clone(),
+            email: claims.email.clone().unwrap_or_default(),
+            alias: None,
+            workspace_id: claims.workspace_id.clone(),
+            workspace_label: claims.workspace_label.clone(),
+            seat_type: claims.seat_type.clone(),
+            plan_type: claims
+                .chatgpt_plan_type
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            routing_policy: "normal".to_string(),
+            last_refresh: now,
+            created_at: now,
+            status: "active".to_string(),
+            deactivation_reason: None,
+            reset_at: None,
+            blocked_at: None,
+            security_work_authorized: false,
+            provider: "codex".to_string(),
+        };
+        repo.insert(&account, &tokens, &cipher).await?;
+        (id, "onboarded")
+    };
+    println!(
+        "{verb} {} (account {})",
+        claims.email.as_deref().unwrap_or("<no email>"),
+        account_id
     );
     Ok(())
 }

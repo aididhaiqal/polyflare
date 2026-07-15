@@ -99,6 +99,12 @@ const SELECT_ALL_ACCOUNTS: &str = "SELECT id, chatgpt_account_id, chatgpt_user_i
     created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
     provider FROM accounts ORDER BY id";
 
+const SELECT_ACCOUNT_BY_CHATGPT_ID: &str =
+    "SELECT id, chatgpt_account_id, chatgpt_user_id, email, \
+    alias, workspace_id, workspace_label, seat_type, plan_type, routing_policy, last_refresh, \
+    created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
+    provider FROM accounts WHERE chatgpt_account_id = ?";
+
 /// CRUD over the `accounts` table. Cheap to construct (clones the pool handle + generation Arc).
 pub struct AccountRepo {
     pool: SqlitePool,
@@ -185,6 +191,19 @@ impl AccountRepo {
             .fetch_all(&self.pool)
             .await?;
         Ok(accounts)
+    }
+
+    /// Find an account by its ChatGPT account id — used by `polyflare login` to decide onboard
+    /// (insert) vs re-auth (update the existing seat's tokens) instead of creating a duplicate row.
+    pub async fn find_by_chatgpt_account_id(
+        &self,
+        chatgpt_account_id: &str,
+    ) -> Result<Option<Account>, StoreError> {
+        let account = sqlx::query_as::<_, Account>(SELECT_ACCOUNT_BY_CHATGPT_ID)
+            .bind(chatgpt_account_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(account)
     }
 
     /// Update an account's status string.
