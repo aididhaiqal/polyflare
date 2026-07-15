@@ -7,36 +7,48 @@
 //! on the network boundary; admin auth is a follow-up.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use polyflare_store::WindowUsage;
-
 use crate::app::AppState;
+use crate::usage_windows::{resolve, ResolvedWindow};
 
-/// One rate-limit window as the dashboard consumes it: how full it is and when it resets.
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// One rate-limit window as the dashboard consumes it: how full it is, when it resets, and whether
+/// the data is stale (upstream stopped refreshing it — see `crate::usage_windows`). A stale window
+/// is still returned so the last-known value is visible, but flagged so it never reads as live.
 #[derive(Serialize)]
 struct WindowView {
     used_percent: f64,
     /// Absolute unix-epoch seconds when the window resets, or null if upstream didn't report one.
     reset_at: Option<i64>,
+    stale: bool,
 }
 
-impl From<WindowUsage> for WindowView {
-    fn from(w: WindowUsage) -> Self {
+impl From<ResolvedWindow> for WindowView {
+    fn from(w: ResolvedWindow) -> Self {
         WindowView {
             used_percent: w.used_percent,
             reset_at: w.reset_at,
+            stale: w.stale,
         }
     }
 }
 
-/// One account row for the dashboard. `primary` is the 5h window (often absent — upstream stopped
-/// emitting it for current plans; a null primary means "not reported", NOT blocked). `secondary`
-/// is the weekly window. `reset_at` is the durable routing-gate reset stamped by the usage refresh.
+/// One account row for the dashboard. Windows are resolved by DURATION, not storage slot (see
+/// `crate::usage_windows`): `five_hour` is the 5h limit (null when upstream isn't reporting one —
+/// e.g. the current no-5h-limit promo — which means "not reported", NOT blocked); `weekly` is the
+/// weekly limit. `reset_at` is the durable routing-gate reset stamped by the usage refresh.
 #[derive(Serialize)]
 struct AccountView {
     id: String,
@@ -47,9 +59,9 @@ struct AccountView {
     plan_type: String,
     reset_at: Option<i64>,
     /// 5h window (may be null).
-    primary: Option<WindowView>,
+    five_hour: Option<WindowView>,
     /// Weekly window (may be null).
-    secondary: Option<WindowView>,
+    weekly: Option<WindowView>,
 }
 
 /// `GET /api/accounts` — every account with its latest usage windows + reset times. This is where
@@ -60,10 +72,13 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         Ok(a) => a,
         Err(_) => return Response::error(),
     };
+    let now = unix_now();
     let mut views = Vec::with_capacity(accounts.len());
     for account in accounts {
-        // Per-account latest usage (small N; a dashboard read, never the hot path).
+        // Per-account latest usage (small N; a dashboard read, never the hot path), resolved by
+        // duration + freshness so the right window shows under the right heading.
         let usage = repo.latest_usage(&account.id).await.unwrap_or_default();
+        let resolved = resolve(&usage, now);
         views.push(AccountView {
             id: account.id,
             email: account.email,
@@ -72,8 +87,8 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
             status: account.status,
             plan_type: account.plan_type,
             reset_at: account.reset_at,
-            primary: usage.primary.map(Into::into),
-            secondary: usage.secondary.map(Into::into),
+            five_hour: resolved.five_hour.map(Into::into),
+            weekly: resolved.weekly.map(Into::into),
         });
     }
     Response::ok(views)

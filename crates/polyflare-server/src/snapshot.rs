@@ -3,9 +3,19 @@
 //! error/cooldown timestamps) are live-tracked later and default to neutral values here.
 
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use polyflare_core::{AccountSnapshot, Provider};
 use polyflare_store::{Store, StoreError};
+
+use crate::usage_windows::resolve;
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Build one `AccountSnapshot` per stored account. Capacity is derived from `plan_type` inside
 /// the selector (no per-account override in M2b, so `capacity_credits` stays `None`).
@@ -30,10 +40,15 @@ pub async fn assemble_snapshots(store: &Store) -> Result<Vec<AccountSnapshot>, S
             Err(_) => continue,
         };
         let usage = repo.latest_usage(&account.id).await?;
+        // Resolve by DURATION, not slot: the weekly-usage weight the selector reads must track the
+        // real weekly window even when upstream moves it into the `primary` slot (see
+        // `crate::usage_windows`). The freshest window of each kind wins, so a live weekly beats a
+        // stale one left in the "expected" slot.
+        let resolved = resolve(&usage, unix_now());
         let mut snap = AccountSnapshot::new(account.id.as_str());
         snap.status = account.status;
-        snap.used_percent = usage.primary.as_ref().map_or(0.0, |w| w.used_percent);
-        snap.secondary_used_percent = usage.secondary.as_ref().map_or(0.0, |w| w.used_percent);
+        snap.used_percent = resolved.five_hour.as_ref().map_or(0.0, |w| w.used_percent);
+        snap.secondary_used_percent = resolved.weekly.as_ref().map_or(0.0, |w| w.used_percent);
         snap.reset_at = account.reset_at;
         snap.routing_policy = account.routing_policy;
         snap.plan_type = account.plan_type;

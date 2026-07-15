@@ -149,19 +149,123 @@ async fn accounts_endpoint_surfaces_usage_windows_and_reset_times() {
     assert_eq!(a["id"], "codex-a");
     assert_eq!(a["pool"], "team-a");
     assert_eq!(a["reset_at"], 1_783_900_000_i64);
-    // Weekly (secondary) window present with its own reset; 5h (primary) absent → null.
-    assert_eq!(a["secondary"]["used_percent"], 73.5);
-    assert_eq!(a["secondary"]["reset_at"], 1_783_900_000_i64);
+    // The seeded window is a 10080-min (weekly) window, freshly recorded → it resolves to `weekly`
+    // (by duration, not slot) and is not stale. No 5h-duration window exists → `five_hour` null.
+    assert_eq!(a["weekly"]["used_percent"], 73.5);
+    assert_eq!(a["weekly"]["reset_at"], 1_783_900_000_i64);
+    assert_eq!(
+        a["weekly"]["stale"], false,
+        "freshly recorded → live, not stale"
+    );
     assert!(
-        a["primary"].is_null(),
-        "5h window not reported → null, not blocked"
+        a["five_hour"].is_null(),
+        "no 5h-duration window → null, not blocked"
     );
 
     // codex-b is unpooled and has no usage window yet.
     let b = &arr[1];
     assert_eq!(b["id"], "codex-b");
     assert!(b["pool"].is_null());
-    assert!(b["secondary"].is_null());
+    assert!(b["weekly"].is_null());
+    assert!(b["five_hour"].is_null());
+}
+
+#[tokio::test]
+async fn promo_shape_resolves_weekly_from_primary_slot_and_flags_stale() {
+    // The real-world shape the live API surfaced: during the no-5h-limit promo, upstream writes the
+    // weekly window into the PRIMARY slot (fresh) and leaves an OLD weekly in the secondary slot.
+    // The API must resolve `weekly` from the fresh primary (by duration, not slot), mark nothing
+    // live-but-stale, and report NO 5h window. A second account whose only weekly is old must be
+    // surfaced but flagged stale.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
+    let repo = store.accounts();
+    repo.insert(
+        &account("promo-1", "p@example.test", None),
+        &tokens(),
+        &cipher,
+    )
+    .await
+    .unwrap();
+    repo.insert(
+        &account("stale-2", "s@example.test", None),
+        &tokens(),
+        &cipher,
+    )
+    .await
+    .unwrap();
+    let fresh = now();
+    let old = now() - 300_000; // ~3.5 days ago → stale
+                               // promo-1: fresh weekly in the primary slot, older weekly left in the secondary slot.
+    repo.insert_usage_window(
+        "promo-1",
+        "primary",
+        44.0,
+        Some(1_900_000_000),
+        Some(10080),
+        fresh,
+    )
+    .await
+    .unwrap();
+    repo.insert_usage_window(
+        "promo-1",
+        "secondary",
+        55.0,
+        Some(1_800_000_000),
+        Some(10080),
+        old,
+    )
+    .await
+    .unwrap();
+    // stale-2: only an old weekly, never refreshed live.
+    repo.insert_usage_window(
+        "stale-2",
+        "secondary",
+        30.0,
+        Some(1_800_000_000),
+        Some(10080),
+        old,
+    )
+    .await
+    .unwrap();
+    std::mem::forget(dir);
+
+    let pf = spawn(store).await;
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/accounts"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let by_id = |id: &str| -> serde_json::Value {
+        body.as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+
+    let promo = by_id("promo-1");
+    assert!(promo["five_hour"].is_null(), "no 5h-duration window → null");
+    assert_eq!(
+        promo["weekly"]["used_percent"], 44.0,
+        "fresh primary-slot weekly wins the stale one"
+    );
+    assert_eq!(promo["weekly"]["stale"], false);
+
+    let stale = by_id("stale-2");
+    assert_eq!(
+        stale["weekly"]["used_percent"], 30.0,
+        "last-known value still surfaced"
+    );
+    assert_eq!(
+        stale["weekly"]["stale"], true,
+        "but flagged stale — must not read as live"
+    );
 }
 
 #[tokio::test]

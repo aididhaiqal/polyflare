@@ -4,6 +4,9 @@
 export interface Window {
   used_percent: number;
   reset_at: number | null;
+  // Data older than the refresh cutoff — upstream stopped sending this window (or the server/token
+  // is failing). Shown as the last-known value but never rendered as live.
+  stale: boolean;
 }
 
 export interface Account {
@@ -14,8 +17,10 @@ export interface Account {
   status: string;
   plan_type: string;
   reset_at: number | null;
-  primary: Window | null;
-  secondary: Window | null;
+  // Windows are resolved by duration, not storage slot: `five_hour` is null when upstream isn't
+  // reporting a 5h limit (e.g. the current no-5h promo) — that means "not reported", not blocked.
+  five_hour: Window | null;
+  weekly: Window | null;
 }
 
 export interface Pool {
