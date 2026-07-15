@@ -285,7 +285,7 @@ async fn imports_accounts_usage_and_tokens_roundtrip() {
     let store = Store::open(&pf_db).await.unwrap();
     let cipher = TokenCipher::load_or_create(&pf_key).unwrap();
 
-    let summary = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher)
+    let summary = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false)
         .await
         .unwrap();
     assert_eq!(summary.accounts_imported, 1);
@@ -437,12 +437,12 @@ async fn reimport_is_idempotent_for_request_logs() {
     let store = Store::open(&pf_db).await.unwrap();
     let cipher = TokenCipher::load_or_create(&pf_key).unwrap();
 
-    let first = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher)
+    let first = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false)
         .await
         .unwrap();
     assert_eq!(first.request_logs_imported, 1);
 
-    let second = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher)
+    let second = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false)
         .await
         .unwrap();
     assert_eq!(
@@ -487,7 +487,7 @@ async fn mid_import_decrypt_failure_errors_and_rolls_back_leaving_store_empty() 
     let cipher = TokenCipher::load_or_create(&pf_key).unwrap();
 
     // (a) It returns Err (no panic) — an import error from the failed decrypt of acct-bad.
-    let result = import_from_codex_lb(&store, &src_db, &key_path, &cipher).await;
+    let result = import_from_codex_lb(&store, &src_db, &key_path, &cipher, false).await;
     assert!(
         matches!(result, Err(StoreError::Import(_))),
         "expected StoreError::Import on the undecryptable account, got {result:?}"
@@ -500,5 +500,65 @@ async fn mid_import_decrypt_failure_errors_and_rolls_back_leaving_store_empty() 
         accounts.len(),
         0,
         "destination store must be empty after a rolled-back import (acct-1 must not survive)"
+    );
+}
+
+/// A dry run reports accurate would-write counts but persists NOTHING (it rolls the staged
+/// transaction back); a subsequent real run then writes those same rows.
+#[tokio::test]
+async fn dry_run_previews_counts_but_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_db = dir.path().join("codex-lb-store.db");
+    let fernet_key_path = dir.path().join("encryption.key");
+    let pf_db = dir.path().join("polyflare-store.db");
+    let pf_key = dir.path().join("key");
+
+    let fernet_key = Fernet::generate_key();
+    std::fs::write(&fernet_key_path, &fernet_key).unwrap();
+    build_source_db(&src_db, &fernet_key).await;
+
+    let store = Store::open(&pf_db).await.unwrap();
+    let cipher = TokenCipher::load_or_create(&pf_key).unwrap();
+
+    // Dry run: accurate would-write counts.
+    let preview = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, true)
+        .await
+        .unwrap();
+    assert_eq!(preview.accounts_imported, 1);
+    assert_eq!(preview.usage_rows_imported, 1);
+    assert_eq!(preview.request_logs_imported, 1);
+
+    // ...but nothing was persisted.
+    let count = |sql: &'static str| sqlx::query_scalar::<_, i64>(sql).fetch_one(store.pool());
+    assert_eq!(
+        count("SELECT COUNT(*) FROM accounts").await.unwrap(),
+        0,
+        "dry run wrote accounts"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM usage_history").await.unwrap(),
+        0,
+        "dry run wrote usage"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM request_log").await.unwrap(),
+        0,
+        "dry run wrote chat log"
+    );
+
+    // A real run then actually writes them.
+    let real = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false)
+        .await
+        .unwrap();
+    assert_eq!(real.accounts_imported, 1);
+    assert_eq!(
+        count("SELECT COUNT(*) FROM accounts").await.unwrap(),
+        1,
+        "real run must persist"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM request_log").await.unwrap(),
+        1,
+        "real run must persist the chat log"
     );
 }
