@@ -13,20 +13,54 @@ use serde_json::{json, Value};
 
 /// Map an Anthropic Messages request body to an OpenAI-Responses request body.
 ///
-/// **ENVELOPE-ONLY** (top-level field renames): `model` passthrough (no alias remap — SPEC-M4 U2),
-/// `system`→`instructions`, `messages`→`input`, `stream` passthrough, `max_tokens`→`max_output_tokens`,
-/// `tools`→`tools`.
+/// **Envelope** (top-level field renames): `model` passthrough (no alias remap — SPEC-M4 U2),
+/// `system`→`instructions`, `stream` passthrough, `max_tokens`→`max_output_tokens`.
 ///
-/// ⚠️ **NOT complete for the runtime Anthropic→Codex path** (tracked M4b-wiring prerequisite — SPEC-M4
-/// deferred list + ledger): `messages`/`tools` are copied VERBATIM, so Anthropic-shaped content still
-/// reaches the Responses backend and would be rejected on any real multi-turn request. Still required:
-///   - input content parts: Anthropic `{"type":"text",…}` → OpenAI `{"type":"input_text",…}` (and
-///     `image`/`document` → `input_image`/`input_file`);
-///   - assistant-history blocks: `tool_use`→`function_call`, `tool_result`→`function_call_output`,
-///     `thinking`→`reasoning`;
-///   - tools: Anthropic `{name, input_schema}` → Responses `{type:"function", name, parameters}`.
+/// **Content/tool-shape transform** (T5 — closes the gap this doc comment used to flag): `messages`
+/// and `tools` are no longer copied verbatim; both are reshaped into their doc-verified
+/// OpenAI-Responses request shapes (confirmed against the `openai/openai-openapi` spec —
+/// `FunctionTool`, `InputMessage`/`OutputMessage`, `FunctionToolCall`, `FunctionCallOutputItemParam`
+/// components):
+///   - `messages` → `input` (array of Responses input items). Each Anthropic message's `content`
+///     (a string, or an array of blocks) is mapped per-block: `text` → an `input_text` part on
+///     `user`-role messages, an `output_text` part (with `annotations: []`) on `assistant`-role
+///     messages, packed into a `{"type":"message","role":…,"content":[…]}` item; `image` (base64 or
+///     url source) → an `input_image` part (`image_url` as a `data:`-URL for base64, best-effort —
+///     `document`/PDF blocks are not handled). Anthropic nests `tool_use`/`tool_result` *inside* a
+///     message's content, but Responses represents them as **top-level, sibling** input items — they
+///     are flattened out: `tool_use` → a `function_call` item (`arguments` JSON-stringified from
+///     `input`), `tool_result` → a `function_call_output` item (`output` as a string, or an array of
+///     `input_text`/`input_image` parts when `content` is itself a block array; `is_error` has no
+///     Responses field and is dropped). `thinking` blocks are **dropped**, not translated to a
+///     `reasoning` item: a Responses `reasoning` item's `id`/`encrypted_content` must be the exact
+///     opaque values the model produced for the model to resume that chain of thought, and
+///     Anthropic's `thinking`/`signature` carries no such value — fabricating one would misrepresent
+///     state rather than merely omit it.
+///   - `tools`: Anthropic `{name, description, input_schema}` → Responses `{type:"function", name,
+///     description, parameters}` (flat — confirmed no nested `function` wrapper key, unlike Chat
+///     Completions). `description` is omitted when absent (nullable in the spec); `parameters`
+///     defaults to `{}` when `input_schema` is absent. The spec's `FunctionTool.required` also lists
+///     `strict` (nullable), which this mapping does not emit — out of scope per the task directive.
 ///
-/// The response-side translator (`AnthropicToResponses`, §3.5) is complete and independent of this gap.
+/// ⚠️ **Real-capture end-to-end validation still pending (U4).** Several shape choices above were
+/// resolved against the *documented* schema where the doc itself is ambiguous or internally
+/// inconsistent, and need confirming against a real Responses backend before the runtime
+/// Anthropic→Codex path (M4b-wiring) depends on them:
+///   - an `assistant`-role history message built from `output_text` parts (no `id`/`status`) matches
+///     neither sub-schema exactly: the strict `Item`→`OutputMessage` variant requires `id` + `status`
+///     (which we omit), while the lenient `EasyInputMessage` variant allows omitting them but expects
+///     `input_text`/`input_image`/`input_file` parts (not `output_text`) for its content list. This
+///     mapping follows the task's explicit directive (`output_text` for assistant history) as the
+///     documented default; whether a real backend accepts the resulting hybrid is unverified;
+///   - `thinking` blocks are dropped entirely rather than represented in any form — unverified
+///     whether the live Codex backend needs *something* in their place to avoid re-deriving already
+///     "paid for" reasoning;
+///   - `tool_result` `content` given as an array maps to a Responses `output` content-part array
+///     (`input_text`/`input_image`); an empty/all-unrecognized block array degrades to `output: []`,
+///     unverified against a real backend's minimum-shape expectations.
+///
+/// The response-side translator (`AnthropicToResponses`, §3.5) is complete and independent of this
+/// module doc's scope.
 fn map_request(body: Value) -> Value {
     let model = body.get("model").cloned().unwrap_or(Value::Null);
     let system = body.get("system").cloned();
@@ -40,7 +74,7 @@ fn map_request(body: Value) -> Value {
 
     let mut out = json!({
         "model": model,
-        "input": messages,
+        "input": map_messages(&messages),
         "stream": stream,
     });
     let map = out.as_object_mut().expect("json! object literal");
@@ -51,9 +85,206 @@ fn map_request(body: Value) -> Value {
         map.insert("max_output_tokens".to_string(), mt);
     }
     if let Some(t) = tools {
-        map.insert("tools".to_string(), t);
+        map.insert("tools".to_string(), map_tools(&t));
     }
     out
+}
+
+/// Map Anthropic `messages` to an OpenAI-Responses `input` array, flattening `tool_use`/
+/// `tool_result` blocks out of their enclosing message into top-level `function_call`/
+/// `function_call_output` items (see `map_request`'s doc comment for the full rationale).
+fn map_messages(messages: &Value) -> Value {
+    let mut items: Vec<Value> = Vec::new();
+    let Some(arr) = messages.as_array() else {
+        return Value::Array(items);
+    };
+
+    for message in arr {
+        let role = message
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("user");
+
+        match message.get("content") {
+            Some(Value::String(text)) => {
+                items.push(message_item(role, vec![text_part(role, text)]));
+            }
+            Some(Value::Array(blocks)) => {
+                let mut buffer: Vec<Value> = Vec::new();
+                for block in blocks {
+                    let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    match block_type {
+                        "text" => {
+                            let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                            buffer.push(text_part(role, text));
+                        }
+                        "image" => {
+                            if let Some(part) = image_part(block) {
+                                buffer.push(part);
+                            }
+                        }
+                        "tool_use" => {
+                            flush_message_buffer(&mut items, &mut buffer, role);
+                            items.push(function_call_item(block));
+                        }
+                        "tool_result" => {
+                            flush_message_buffer(&mut items, &mut buffer, role);
+                            items.push(function_call_output_item(block));
+                        }
+                        // `thinking` (and any unrecognized block type) is dropped -- see the
+                        // module doc comment's rationale (no valid reasoning-item id to replay).
+                        _ => {}
+                    }
+                }
+                flush_message_buffer(&mut items, &mut buffer, role);
+            }
+            _ => {}
+        }
+    }
+
+    Value::Array(items)
+}
+
+/// Flush any buffered content parts into a `message` input item, if non-empty. Called both
+/// mid-message (before a `tool_use`/`tool_result` block flattens to a sibling top-level item) and
+/// at message end, so ordering between text/image parts and flattened tool items is preserved.
+fn flush_message_buffer(items: &mut Vec<Value>, buffer: &mut Vec<Value>, role: &str) {
+    if !buffer.is_empty() {
+        items.push(message_item(role, std::mem::take(buffer)));
+    }
+}
+
+fn message_item(role: &str, content: Vec<Value>) -> Value {
+    json!({"type": "message", "role": role, "content": content})
+}
+
+/// A `text` block's part shape depends on which role it renders under: `output_text` (with
+/// `annotations: []`) for `assistant` history, `input_text` for everything else (`user`/`system`/
+/// `developer`).
+fn text_part(role: &str, text: &str) -> Value {
+    if role == "assistant" {
+        json!({"type": "output_text", "text": text, "annotations": []})
+    } else {
+        json!({"type": "input_text", "text": text})
+    }
+}
+
+/// Map an Anthropic `image` content block to a Responses `input_image` part. Best-effort: a
+/// `base64` source becomes a `data:` URL; a `url` source passes the URL through; any other/missing
+/// source is dropped (returns `None`).
+fn image_part(block: &Value) -> Option<Value> {
+    let source = block.get("source")?;
+    let source_type = source.get("type").and_then(|v| v.as_str())?;
+    let image_url = match source_type {
+        "base64" => {
+            let media_type = source
+                .get("media_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("image/png");
+            let data = source.get("data").and_then(|v| v.as_str())?;
+            format!("data:{media_type};base64,{data}")
+        }
+        "url" => source.get("url").and_then(|v| v.as_str())?.to_string(),
+        _ => return None,
+    };
+    Some(json!({"type": "input_image", "image_url": image_url, "detail": "auto"}))
+}
+
+/// Flatten an Anthropic `tool_use` block into a top-level Responses `function_call` item.
+/// `input` (a JSON object) is JSON-stringified into `arguments` per the Responses schema.
+fn function_call_item(block: &Value) -> Value {
+    let call_id = block
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let name = block
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+    let arguments = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+    json!({
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    })
+}
+
+/// Flatten an Anthropic `tool_result` block into a top-level Responses `function_call_output`
+/// item. `content` is a string (passed through as `output`) or an array of blocks (mapped to an
+/// `output` array of `input_text`/`input_image` parts). `is_error` has no Responses field and is
+/// dropped (see the module doc comment).
+fn function_call_output_item(block: &Value) -> Value {
+    let call_id = block
+        .get("tool_use_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let output = match block.get("content") {
+        Some(Value::String(s)) => json!(s),
+        Some(Value::Array(blocks)) => {
+            let parts: Vec<Value> = blocks
+                .iter()
+                .filter_map(|b| {
+                    let block_type = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    match block_type {
+                        "text" => b
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .map(|text| json!({"type": "input_text", "text": text})),
+                        "image" => image_part(b),
+                        _ => None,
+                    }
+                })
+                .collect();
+            json!(parts)
+        }
+        _ => json!(""),
+    };
+    json!({
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": output,
+    })
+}
+
+/// Map Anthropic `tools` to the Responses `tools` shape: `{name, description, input_schema}` →
+/// `{type:"function", name, description, parameters}` (flat, no nested `function` wrapper — see
+/// the module doc comment).
+fn map_tools(tools: &Value) -> Value {
+    let Some(arr) = tools.as_array() else {
+        return tools.clone();
+    };
+
+    let mapped: Vec<Value> = arr
+        .iter()
+        .map(|tool| {
+            let name = tool.get("name").cloned().unwrap_or(Value::Null);
+            let description = tool.get("description").cloned();
+            let parameters = tool
+                .get("input_schema")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+
+            let mut mapped_tool = json!({
+                "type": "function",
+                "name": name,
+                "parameters": parameters,
+            });
+            if let Some(desc) = description {
+                mapped_tool
+                    .as_object_mut()
+                    .expect("json! object literal")
+                    .insert("description".to_string(), desc);
+            }
+            mapped_tool
+        })
+        .collect();
+
+    Value::Array(mapped)
 }
 
 /// The kind of an open Anthropic content block, tracked so `content_block_delta`/`_stop` know
@@ -633,9 +864,161 @@ mod tests {
         assert_eq!(out["model"], json!("claude-opus-4-1-20250805"));
         assert_eq!(out["stream"], json!(true));
         assert_eq!(out["max_output_tokens"], json!(1024));
+        // Content blocks are transformed, not copied verbatim (T5): a `text` block on a `user`
+        // message becomes an `input_text` part inside a Responses `message` input item.
         assert_eq!(
             out["input"],
-            json!([{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+            json!([{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}])
+        );
+    }
+
+    #[test]
+    fn maps_string_content_user_turn_to_single_input_text_part() {
+        // Doc-shaped Anthropic request: `content` may be a plain string, not a block array.
+        let body = json!({
+            "model": "claude-opus-4-1-20250805",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        });
+        let out = map_request(body);
+        assert_eq!(
+            out["input"],
+            json!([{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}])
+        );
+    }
+
+    #[test]
+    fn maps_string_content_assistant_turn_to_single_output_text_part() {
+        let body = json!({
+            "model": "claude-opus-4-1-20250805",
+            "messages": [{"role": "assistant", "content": "hi there"}],
+            "stream": false
+        });
+        let out = map_request(body);
+        assert_eq!(
+            out["input"],
+            json!([{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi there", "annotations": []}]
+            }])
+        );
+    }
+
+    #[test]
+    fn maps_multi_turn_assistant_text_and_tool_use_tool_result_round_trip() {
+        // Doc-shaped: user text -> assistant text+tool_use -> user tool_result. Anthropic nests
+        // tool_use/tool_result INSIDE a message's content blocks; Responses requires them as
+        // TOP-LEVEL function_call/function_call_output items, flattened out of the message.
+        let body = json!({
+            "model": "claude-opus-4-1-20250805",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "What's the weather in SF?"}]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Let me check."},
+                    {"type": "tool_use", "id": "toolu_01AAA", "name": "get_weather", "input": {"location": "SF"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01AAA", "content": "Sunny, 72F"}
+                ]}
+            ],
+            "stream": false
+        });
+        let out = map_request(body);
+        assert_eq!(
+            out["input"],
+            json!([
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "What's the weather in SF?"}
+                ]},
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "Let me check.", "annotations": []}
+                ]},
+                {"type": "function_call", "call_id": "toolu_01AAA", "name": "get_weather", "arguments": "{\"location\":\"SF\"}"},
+                {"type": "function_call_output", "call_id": "toolu_01AAA", "output": "Sunny, 72F"}
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_use_only_message_emits_no_empty_message_item() {
+        // A message whose only block is tool_use must flatten to *just* the function_call item --
+        // no empty {"type":"message", "content":[]} wrapper alongside it.
+        let body = json!({
+            "model": "claude-opus-4-1-20250805",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "noop", "input": {}}
+                ]}
+            ],
+            "stream": false
+        });
+        let out = map_request(body);
+        assert_eq!(
+            out["input"],
+            json!([{"type": "function_call", "call_id": "toolu_1", "name": "noop", "arguments": "{}"}])
+        );
+    }
+
+    #[test]
+    fn maps_image_block_base64_source_to_input_image_data_url() {
+        let body = json!({
+            "model": "claude-opus-4-1-20250805",
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+            ]}],
+            "stream": false
+        });
+        let out = map_request(body);
+        assert_eq!(
+            out["input"],
+            json!([{"type": "message", "role": "user", "content": [
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "auto"}
+            ]}])
+        );
+    }
+
+    #[test]
+    fn drops_thinking_blocks_no_reasoning_item_synthesized() {
+        // A synthesized `reasoning` item would need a stable `id`/`encrypted_content` the model
+        // actually produced (see the updated module doc comment) -- Anthropic's `thinking` block
+        // carries neither, so fabricating one would misrepresent state. Dropped, not translated.
+        let body = json!({
+            "model": "claude-opus-4-1-20250805",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "reasoning...", "signature": "sig"},
+                {"type": "text", "text": "42"}
+            ]}],
+            "stream": false
+        });
+        let out = map_request(body);
+        assert_eq!(
+            out["input"],
+            json!([{"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "42", "annotations": []}
+            ]}])
+        );
+    }
+
+    #[test]
+    fn tool_result_with_array_content_maps_text_blocks_to_input_text_output_parts() {
+        let body = json!({
+            "model": "claude-opus-4-1-20250805",
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_9", "content": [
+                    {"type": "text", "text": "Sunny, 72F"}
+                ]}
+            ]}],
+            "stream": false
+        });
+        let out = map_request(body);
+        assert_eq!(
+            out["input"],
+            json!([{
+                "type": "function_call_output",
+                "call_id": "toolu_9",
+                "output": [{"type": "input_text", "text": "Sunny, 72F"}]
+            }])
         );
     }
 
@@ -652,16 +1035,51 @@ mod tests {
     }
 
     #[test]
-    fn passes_tools_through_when_present() {
-        let tools = json!([{"name": "get_weather", "input_schema": {"type": "object"}}]);
+    fn maps_tools_to_responses_flat_function_shape() {
+        // Anthropic {name, description, input_schema} -> Responses {type:"function", name,
+        // description, parameters} (flat -- no nested "function" wrapper key, verified against
+        // the openai-openapi FunctionTool component).
+        let tools = json!([
+            {
+                "name": "get_weather",
+                "description": "Get the weather for a location",
+                "input_schema": {"type": "object", "properties": {"location": {"type": "string"}}}
+            }
+        ]);
         let body = json!({
             "model": "claude-opus-4-1-20250805",
             "messages": [],
             "stream": true,
-            "tools": tools.clone()
+            "tools": tools
         });
         let out = map_request(body);
-        assert_eq!(out["tools"], tools);
+        assert_eq!(
+            out["tools"],
+            json!([
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Get the weather for a location",
+                    "parameters": {"type": "object", "properties": {"location": {"type": "string"}}}
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn maps_tool_without_description_omits_description_field() {
+        let tools = json!([{"name": "noop", "input_schema": {"type": "object"}}]);
+        let body = json!({
+            "model": "claude-opus-4-1-20250805",
+            "messages": [],
+            "stream": true,
+            "tools": tools
+        });
+        let out = map_request(body);
+        assert_eq!(
+            out["tools"],
+            json!([{"type": "function", "name": "noop", "parameters": {"type": "object"}}])
+        );
     }
 
     #[test]
