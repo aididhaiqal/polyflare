@@ -4,6 +4,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+// The three shared base URLs are the same for every account, so each has a production default and
+// is overridable by its env var (for a mock/staging/self-hosted-proxy upstream) — none is required.
+const DEFAULT_CODEX_UPSTREAM_URL: &str = "https://chatgpt.com/backend-api/codex";
+const DEFAULT_ANTHROPIC_UPSTREAM_URL: &str = "https://api.anthropic.com";
+const DEFAULT_AUTH_URL: &str = "https://auth.openai.com";
+
 /// `serve` configuration. The upstream base URL is shared across accounts; per-account bearer
 /// tokens are decrypted from the store per request.
 pub struct ServeConfig {
@@ -25,11 +31,11 @@ impl ServeConfig {
         let bind_addr =
             std::env::var("POLYFLARE_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
         let upstream_base_url = std::env::var("POLYFLARE_UPSTREAM_URL")
-            .map_err(|_| "POLYFLARE_UPSTREAM_URL not set".to_string())?;
+            .unwrap_or_else(|_| DEFAULT_CODEX_UPSTREAM_URL.to_string());
         let anthropic_upstream_base_url = std::env::var("POLYFLARE_ANTHROPIC_UPSTREAM_URL")
-            .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
-        let auth_base_url = std::env::var("POLYFLARE_AUTH_URL")
-            .unwrap_or_else(|_| "https://auth.openai.com".to_string());
+            .unwrap_or_else(|_| DEFAULT_ANTHROPIC_UPSTREAM_URL.to_string());
+        let auth_base_url =
+            std::env::var("POLYFLARE_AUTH_URL").unwrap_or_else(|_| DEFAULT_AUTH_URL.to_string());
         let data_dir = data_dir_from_env();
         let continuity_watchdog = std::env::var("POLYFLARE_WATCHDOG_SECS")
             .ok()

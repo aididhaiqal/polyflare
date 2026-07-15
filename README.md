@@ -35,16 +35,25 @@ cargo build
 cargo test
 ```
 
-Run the proxy against a Codex-compatible upstream (M1):
+Run the proxy:
 
 ```sh
-POLYFLARE_UPSTREAM_URL="https://<upstream-base>" \
-POLYFLARE_UPSTREAM_TOKEN="<oauth-bearer>" \
-POLYFLARE_BIND="127.0.0.1:8080" \
-cargo run --bin polyflare
+cargo run --bin polyflare -- serve
 ```
 
-Secrets are read from the environment only and never logged.
+The shared upstream base URLs default to production (`https://chatgpt.com/backend-api/codex`,
+`https://api.anthropic.com`, `https://auth.openai.com`), so no configuration is required to run
+against the real backends. Override any of them for a mock/staging/self-hosted-proxy upstream:
+
+```sh
+POLYFLARE_UPSTREAM_URL="https://<codex-upstream-base>" \
+POLYFLARE_ANTHROPIC_UPSTREAM_URL="https://<anthropic-upstream-base>" \
+POLYFLARE_BIND="127.0.0.1:8080" \
+cargo run --bin polyflare -- serve
+```
+
+Per-account bearer tokens live encrypted in the store (added via `accounts login` / `accounts
+import`), not in the environment, and are never logged.
 
 To capture a real Codex CLI request's content-safe structural HTTP fingerprint (the golden fixture
 the M5 fingerprint-parity gate diffs against — method, path, header names, and redacted/structural
