@@ -11,8 +11,22 @@ use polyflare_core::Translator;
 use rand::Rng;
 use serde_json::{json, Value};
 
-/// Map an Anthropic Messages request body to an OpenAI-Responses request body. Mechanical only —
-/// no model-alias remap, no payload-override (SPEC-M4 U2, deferred to M4b-wiring).
+/// Map an Anthropic Messages request body to an OpenAI-Responses request body.
+///
+/// **ENVELOPE-ONLY** (top-level field renames): `model` passthrough (no alias remap — SPEC-M4 U2),
+/// `system`→`instructions`, `messages`→`input`, `stream` passthrough, `max_tokens`→`max_output_tokens`,
+/// `tools`→`tools`.
+///
+/// ⚠️ **NOT complete for the runtime Anthropic→Codex path** (tracked M4b-wiring prerequisite — SPEC-M4
+/// deferred list + ledger): `messages`/`tools` are copied VERBATIM, so Anthropic-shaped content still
+/// reaches the Responses backend and would be rejected on any real multi-turn request. Still required:
+///   - input content parts: Anthropic `{"type":"text",…}` → OpenAI `{"type":"input_text",…}` (and
+///     `image`/`document` → `input_image`/`input_file`);
+///   - assistant-history blocks: `tool_use`→`function_call`, `tool_result`→`function_call_output`,
+///     `thinking`→`reasoning`;
+///   - tools: Anthropic `{name, input_schema}` → Responses `{type:"function", name, parameters}`.
+///
+/// The response-side translator (`AnthropicToResponses`, §3.5) is complete and independent of this gap.
 fn map_request(body: Value) -> Value {
     let model = body.get("model").cloned().unwrap_or(Value::Null);
     let system = body.get("system").cloned();
