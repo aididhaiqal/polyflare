@@ -105,14 +105,17 @@ fn forward_headers_from_inbound(headers: &HeaderMap) -> Vec<(String, String)> {
 /// routed to the Codex pool): there is no real Codex client fingerprint to forward here, unlike the
 /// native `/responses` path above, so this is where `polyflare_codex::codex_headers` (built from a
 /// local `openai/codex` source read — see that module's doc) genuinely belongs.
-fn synthesize_codex_forward_headers(body: &serde_json::Value) -> Vec<(String, String)> {
+fn synthesize_codex_forward_headers(
+    body: &serde_json::Value,
+    codex_version: &str,
+) -> Vec<(String, String)> {
     use polyflare_codex::codex_headers::{
         codex_user_agent, conversation_key, originator, TurnIdentity,
     };
 
     let identity = TurnIdentity::derive(&conversation_key(body));
     vec![
-        ("user-agent".to_string(), codex_user_agent()),
+        ("user-agent".to_string(), codex_user_agent(codex_version)),
         ("originator".to_string(), originator().to_string()),
         ("accept".to_string(), "text/event-stream".to_string()),
         ("session-id".to_string(), identity.session_id.clone()),
@@ -554,9 +557,13 @@ async fn messages_handler_codex_aliased(
 
     // Translated path: there is no real Codex client to forward, so SYNTHESIZE codex-rs's identity
     // headers (see `synthesize_codex_forward_headers`). Mirrors codex-lb's forward-native /
-    // synthesize-non-native split. PROVISIONAL — validate the exact bytes against a real capture
-    // (POLYFLARE_CAPTURE_FINGERPRINT).
-    let forward_headers = synthesize_codex_forward_headers(&translated_body);
+    // synthesize-non-native split. The User-Agent's codex version is resolved live (GitHub/npm,
+    // cached) so it tracks the real fleet instead of a stale constant; `cached_or_fallback` is a
+    // sync, zero-I/O read warmed out-of-band by the background refresh task.
+    let forward_headers = synthesize_codex_forward_headers(
+        &translated_body,
+        &state.codex_version.cached_or_fallback(),
+    );
     let req = PreparedRequest {
         body: translated_body,
         model: model_alias.target_model,

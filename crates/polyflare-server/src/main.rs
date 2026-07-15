@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 use polyflare_anthropic::AnthropicExecutor;
 use polyflare_codex::oauth::OAuthClient;
-use polyflare_codex::CodexExecutor;
+use polyflare_codex::{CodexExecutor, CodexVersionCache};
 use polyflare_core::{CapacityWeighted, Continuity, Executor, Selector};
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::config::{self, ServeConfig};
@@ -90,6 +90,20 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         config.continuity_watchdog,
     ));
 
+    // Resolves the live codex-rs release version for the synthesized egress User-Agent. Warmed
+    // out-of-band on its TTL cadence so the request hot path (`cached_or_fallback`) never blocks on
+    // the GitHub/npm fetch; until the first warm completes it serves the hardcoded version floor.
+    let codex_version = Arc::new(CodexVersionCache::new()?);
+    {
+        let cache = codex_version.clone();
+        tokio::spawn(async move {
+            loop {
+                cache.get_version().await;
+                tokio::time::sleep(cache.refresh_interval()).await;
+            }
+        });
+    }
+
     let state = Arc::new(AppState {
         codex_executor,
         anthropic_executor,
@@ -102,6 +116,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         anthropic_upstream_base_url: config.anthropic_upstream_base_url,
         refresh_locks: Default::default(),
         capture_fingerprint_path: config.capture_fingerprint_path,
+        codex_version,
     });
     let app = build_app(state);
 

@@ -82,6 +82,7 @@ async fn large_request_body_is_not_rejected_with_413() {
         anthropic_upstream_base_url: "http://127.0.0.1:9".to_string(),
         refresh_locks: Default::default(),
         capture_fingerprint_path: None,
+        codex_version: std::sync::Arc::new(polyflare_codex::CodexVersionCache::new().unwrap()),
     });
     let app = build_app(state);
 
