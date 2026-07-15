@@ -49,6 +49,9 @@ enum AccountsCommands {
         /// Path to the codex-lb Fernet key file.
         #[arg(long = "fernet-key", value_name = "PATH")]
         fernet_key: PathBuf,
+        /// Preview only: validate + report what would be imported, then roll back — writes nothing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 }
 
@@ -69,9 +72,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Serve => serve().await,
         Commands::Accounts { command } => match command {
-            AccountsCommands::Import { from, fernet_key } => {
-                accounts_import(&from, &fernet_key).await
-            }
+            AccountsCommands::Import {
+                from,
+                fernet_key,
+                dry_run,
+            } => accounts_import(&from, &fernet_key, dry_run).await,
         },
     }
 }
@@ -126,18 +131,31 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Run the importer against the configured store + at-rest key, printing only counts.
-async fn accounts_import(from: &Path, fernet_key: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// Run the importer against the configured store + at-rest key, printing only counts. A `dry_run`
+/// validates + reports what would be imported, then rolls back — writing nothing.
+async fn accounts_import(
+    from: &Path,
+    fernet_key: &Path,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = config::data_dir_from_env();
     let db_path = config::db_path(&data_dir);
     let key_path = config::key_path(&data_dir);
 
     let store = Store::open(&db_path).await?;
     let cipher = TokenCipher::load_or_create(&key_path)?;
-    let summary = import_from_codex_lb(&store, from, fernet_key, &cipher).await?;
+    let summary = import_from_codex_lb(&store, from, fernet_key, &cipher, dry_run).await?;
+    let verb = if dry_run { "would import" } else { "imported" };
     println!(
-        "imported {} account(s), {} usage row(s), and {} chat-log row(s)",
-        summary.accounts_imported, summary.usage_rows_imported, summary.request_logs_imported
+        "{verb} {} account(s), {} usage row(s), and {} chat-log row(s){}",
+        summary.accounts_imported,
+        summary.usage_rows_imported,
+        summary.request_logs_imported,
+        if dry_run {
+            " (dry run — nothing written)"
+        } else {
+            ""
+        }
     );
     Ok(())
 }
@@ -172,11 +190,38 @@ mod tests {
         .unwrap();
         match cli.command {
             Commands::Accounts {
-                command: AccountsCommands::Import { from, fernet_key },
+                command:
+                    AccountsCommands::Import {
+                        from,
+                        fernet_key,
+                        dry_run,
+                    },
             } => {
                 assert_eq!(from, std::path::PathBuf::from("/tmp/store.db"));
                 assert_eq!(fernet_key, std::path::PathBuf::from("/tmp/encryption.key"));
+                assert!(!dry_run, "dry_run defaults to false without the flag");
             }
+            _ => panic!("expected `accounts import`"),
+        }
+    }
+
+    #[test]
+    fn accounts_import_dry_run_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "polyflare",
+            "accounts",
+            "import",
+            "--from",
+            "/tmp/store.db",
+            "--fernet-key",
+            "/tmp/encryption.key",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Accounts {
+                command: AccountsCommands::Import { dry_run, .. },
+            } => assert!(dry_run, "--dry-run must set dry_run"),
             _ => panic!("expected `accounts import`"),
         }
     }

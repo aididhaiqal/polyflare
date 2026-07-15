@@ -118,13 +118,20 @@ struct SrcRequestLog {
     deleted_at: Option<String>,
 }
 
-/// Import accounts + usage from the codex-lb `store.db` at `src_db_path`, using the Fernet key
-/// file at `fernet_key_path` to decrypt the legacy tokens and `cipher` to re-encrypt them.
+/// Import accounts + usage + chat log from the codex-lb `store.db` at `src_db_path`, using the
+/// Fernet key file at `fernet_key_path` to decrypt the legacy tokens and `cipher` to re-encrypt
+/// them.
+///
+/// When `dry_run` is true, the import does ALL the work — decrypt, re-encrypt, parse, and stage
+/// every row in the transaction, so it genuinely validates the whole migration would succeed — then
+/// rolls back instead of committing, persisting nothing. The returned [`ImportSummary`] reports the
+/// would-write counts either way, so a dry run is an accurate, side-effect-free preview.
 pub async fn import_from_codex_lb(
     store: &Store,
     src_db_path: &Path,
     fernet_key_path: &Path,
     cipher: &TokenCipher,
+    dry_run: bool,
 ) -> Result<ImportSummary, StoreError> {
     // Load the Fernet key (a base64url string, e.g. produced by Fernet.generate_key()).
     let key_text = fs::read_to_string(fernet_key_path)?;
@@ -336,8 +343,14 @@ pub async fn import_from_codex_lb(
         summary.request_logs_imported += result.rows_affected() as usize;
     }
 
-    // Commit only after ALL loops succeed; any earlier `?` drops `tx` → full rollback.
-    tx.commit().await?;
+    // A dry run rolls the whole staged transaction back (persisting nothing) but still reports the
+    // would-write counts; a real run commits. Either way any earlier `?` already dropped `tx` for a
+    // full rollback on failure.
+    if dry_run {
+        tx.rollback().await?;
+    } else {
+        tx.commit().await?;
+    }
 
     Ok(summary)
 }
