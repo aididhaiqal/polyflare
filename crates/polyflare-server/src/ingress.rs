@@ -9,16 +9,19 @@ use axum::extract::{Json, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
+use polyflare_anthropic::AnthropicToResponses;
 use polyflare_codex::oauth::{classify_failure, should_refresh, OAuthError};
 use polyflare_core::{
     Account, AccountId, Continuity, ContinuityDirective, NoopContinuity, Prepared, PreparedRequest,
-    Provider, RecoveryPlan, RequestCtx, ResponseStream, SelectionCtx,
+    Provider, RecoveryPlan, RequestCtx, ResponseStream, SelectionCtx, Translator,
 };
 use polyflare_store::PlainTokens;
 
+use crate::alias::{self, ModelAlias};
 use crate::app::AppState;
 use crate::session_key::derive_request_ctx;
 use crate::snapshot::{assemble_snapshots, filter_by_provider};
+use crate::translate_stream::wrap_translating_stream;
 use crate::watchdog::{
     apply_ownership, execute_recovery, execute_with_watchdog, signal_client_stream, RouteDecision,
 };
@@ -292,10 +295,10 @@ pub async fn responses_handler(
     }
 }
 
-/// The native Anthropic-Messages ingress path: `POST /v1/messages`. Continuity is a no-op here
-/// (SPEC-M4 §3.7: the Anthropic backend has no `previous_response_id`-style anchor), so every
-/// request is `Disarmed` and `execute_with_watchdog`'s Disarmed branch just relays — the wedge
-/// machinery never arms.
+/// The `/v1/messages` ingress entrypoint. A client `model` string that `alias::lookup_alias` maps
+/// to a Codex target (SPEC-M4 §3.6 — the M4b headline feature) takes the cross-provider translated
+/// path; everything else (no alias, or an alias whose target is itself Anthropic) takes the native
+/// same-format path, unchanged.
 pub async fn messages_handler(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
@@ -306,6 +309,24 @@ pub async fn messages_handler(
         .and_then(|m| m.as_str())
         .unwrap_or_default()
         .to_string();
+
+    match alias::lookup_alias(&model) {
+        Some(model_alias) if model_alias.target_provider == Provider::Codex => {
+            messages_handler_codex_aliased(state, body, model_alias).await
+        }
+        _ => messages_handler_native(state, body, model).await,
+    }
+}
+
+/// The native Anthropic-Messages ingress path: no alias applies, so this relays straight to an
+/// Anthropic-provider account. Continuity is a no-op here (SPEC-M4 §3.7: the Anthropic backend has
+/// no `previous_response_id`-style anchor), so every request is `Disarmed` and
+/// `execute_with_watchdog`'s Disarmed branch just relays — the wedge machinery never arms.
+async fn messages_handler_native(
+    state: Arc<AppState>,
+    body: serde_json::Value,
+    model: String,
+) -> Response {
     let now = unix_now();
     let req = PreparedRequest { body, model };
     let ctx = RequestCtx::default();
@@ -348,6 +369,86 @@ pub async fn messages_handler(
     .await
     {
         Ok(stream) => stream_response(stream),
+        Err(_) => (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
+    }
+}
+
+/// M4b-wiring: a client model string aliased to a Codex target (SPEC-M4 §3.6). Translates the
+/// Anthropic-Messages request body into OpenAI-Responses via the per-turn stateful
+/// `AnthropicToResponses` translator (`translate_request`), remaps `model` to the alias's target
+/// and payload-overrides `reasoning.effort` when the alias specifies one, routes to the Codex pool
+/// (the exact mirror of `/responses`'s partitioning), and — on success — wraps the raw
+/// OpenAI-Responses response stream with the SAME translator instance
+/// (`translate_stream::wrap_translating_stream`) so the client sees Anthropic-Messages SSE.
+///
+/// Continuity is a no-op here too: this translated turn never round-trips a Codex
+/// `previous_response_id` back to an Anthropic client (SPEC-M4 §3.7's anchor-based
+/// continuity/watchdog machinery is Codex-native-request-shaped only), so — like the native path
+/// above — every request is `Disarmed` and the watchdog never arms.
+async fn messages_handler_codex_aliased(
+    state: Arc<AppState>,
+    body: serde_json::Value,
+    model_alias: ModelAlias,
+) -> Response {
+    let now = unix_now();
+    let mut translator = AnthropicToResponses::new();
+    let mut translated_body = translator.translate_request(body);
+    translated_body["model"] = serde_json::Value::String(model_alias.target_model.clone());
+    if let Some(effort) = &model_alias.reasoning_effort {
+        // U2/U4: confirm Codex effort payload shape — `{"reasoning":{"effort":...}}` is the
+        // documented OpenAI-Responses request field; unverified end-to-end against a live Codex
+        // backend.
+        translated_body["reasoning"] = serde_json::json!({ "effort": effort });
+    }
+
+    let req = PreparedRequest {
+        body: translated_body,
+        model: model_alias.target_model,
+    };
+    let ctx = RequestCtx::default();
+
+    let prepared = match NoopContinuity.prepare(req, &ctx).await {
+        Ok(p) => p,
+        Err(_) => return internal_error(),
+    };
+
+    let snapshots = match assemble_snapshots(&state.store).await {
+        Ok(s) => s,
+        Err(_) => return internal_error(),
+    };
+    // The mirror of `/responses`'s Codex-only filter: an aliased-to-Codex turn may only ever pick
+    // a Codex-provider account, regardless of what `/v1/messages` itself would otherwise select.
+    let snapshots = filter_by_provider(&snapshots, Provider::Codex);
+    let sel_ctx = SelectionCtx {
+        now,
+        require_security_work_authorized: false,
+        rng_seed: None,
+        session_id: None,
+    };
+    let picked = match state.selector.pick(&snapshots, &sel_ctx) {
+        Some(id) => id,
+        None => return no_eligible(),
+    };
+    let (account, provider) = match resolve_core_account(&state, &picked, now).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+
+    match execute_with_watchdog(
+        state.executor_for(provider).as_ref(),
+        Arc::new(NoopContinuity) as Arc<dyn Continuity>,
+        prepared,
+        &account,
+        picked,
+        ctx,
+    )
+    .await
+    {
+        Ok(stream) => {
+            let translated_stream =
+                wrap_translating_stream(stream, Box::new(translator) as Box<dyn Translator>);
+            stream_response(translated_stream)
+        }
         Err(_) => (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
     }
 }
