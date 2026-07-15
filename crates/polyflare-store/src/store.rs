@@ -7,6 +7,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePo
 
 use crate::account::AccountRepo;
 use crate::continuity_repo::ContinuityRepo;
+use crate::request_log_repo::RequestLogRepo;
 use crate::StoreError;
 
 /// Owns the SQLite connection pool. The pool is reference-counted, so cloning it is cheap.
@@ -50,5 +51,10 @@ impl Store {
     /// The continuity repository over this store's pool.
     pub fn continuity(&self) -> ContinuityRepo {
         ContinuityRepo::new(self.pool.clone())
+    }
+
+    /// The request-log repository over this store's pool.
+    pub fn request_log(&self) -> RequestLogRepo {
+        RequestLogRepo::new(self.pool.clone())
     }
 }

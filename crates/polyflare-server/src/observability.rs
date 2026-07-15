@@ -8,6 +8,11 @@
 //! It must NEVER carry a token/bearer, an account id, a session/thread/turn id, the request or
 //! response body, or the client's `model` string. When in doubt, leave it out — do not add fields
 //! to `RequestLog` without re-reading SPEC-M5 §3.4's content-safety constraint.
+//!
+//! The SAME `RequestLog` also produces the content-free row persisted to the `request_log` table
+//! (the dashboard's history backend) via [`RequestLog::record`] — deliberately routed through this
+//! one struct so there is a single content-safety chokepoint for both the ephemeral event and the
+//! durable row. The constraint above binds the persisted record identically.
 
 use axum::http::StatusCode;
 use polyflare_core::Provider;
@@ -39,6 +44,24 @@ impl RequestLog {
             duration_ms = self.duration_ms,
             "request completed"
         );
+    }
+
+    /// The content-free persistable form of this request outcome, for the `request_log` table (the
+    /// dashboard's history backend). It carries EXACTLY the same audited field set as [`Self::emit`]
+    /// — this method exists so `RequestLog` stays the single content-safety chokepoint for both the
+    /// ephemeral log event and the persisted row. `requested_at` is supplied by the caller (unix
+    /// epoch seconds). Adding a field here means adding it to [`Self`] and re-checking the
+    /// content-safety constraint above — never add a request-derived free-form string.
+    pub fn record(&self, requested_at: i64) -> polyflare_store::RequestLogRecord {
+        polyflare_store::RequestLogRecord {
+            requested_at,
+            provider: self.provider.to_string(),
+            method: self.method.to_string(),
+            path: self.path.to_string(),
+            aliased: self.aliased,
+            status: self.status.as_u16(),
+            duration_ms: self.duration_ms as i64,
+        }
     }
 }
 
