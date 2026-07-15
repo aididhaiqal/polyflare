@@ -74,31 +74,61 @@ async fn resolve_core_account(
     // subscription-OAuth refresh is Task 7 (VERIFY-gated — no confirmed endpoint/client_id yet).
     // An Anthropic account's stored access_token is used as-is until Task 7 lands.
     if provider == Provider::Codex && should_refresh(account.last_refresh, now) {
-        match state.oauth.refresh(&tokens.refresh_token).await {
-            Ok(refreshed) => {
-                let new = PlainTokens {
-                    access_token: refreshed.tokens.access_token,
-                    refresh_token: refreshed.tokens.refresh_token,
-                    id_token: refreshed.tokens.id_token,
-                };
-                let _ = repo
-                    .update_tokens(picked.as_str(), &new, &state.cipher, now)
-                    .await;
-                tokens = new;
-            }
-            Err(OAuthError::Endpoint {
-                code: Some(code), ..
-            }) => {
-                if let Some(status) = classify_failure(&code).status() {
-                    let _ = repo.update_status(picked.as_str(), status).await;
+        // F2: serialize concurrent refreshes of the SAME account. OpenAI rotates the refresh token
+        // on first use, so N parallel refreshes would leave the losers presenting a dead token and
+        // wrongly mark the account `reauth_required`. Acquire the per-account lock, then double-check
+        // staleness — a peer may have already refreshed (and persisted) while we waited for the lock.
+        let lock = state.refresh_locks.handle(picked);
+        let _guard = lock.lock().await;
+        let fresh_account = match repo.get(picked.as_str()).await {
+            Ok(Some(a)) => a,
+            Ok(None) | Err(_) => return Err(internal_error()),
+        };
+        // F2 (failure-path single-mark): a peer that held this lock may have failed its refresh and
+        // marked the account non-active; `last_refresh` is unchanged on failure, so bail here rather
+        // than re-hitting OAuth with our own now-dead token (which would re-mark it once per waiter).
+        if fresh_account.status != "active" {
+            return Err(account_unavailable());
+        }
+        if should_refresh(fresh_account.last_refresh, now) {
+            match state.oauth.refresh(&tokens.refresh_token).await {
+                Ok(refreshed) => {
+                    let new = PlainTokens {
+                        access_token: refreshed.tokens.access_token,
+                        refresh_token: refreshed.tokens.refresh_token,
+                        id_token: refreshed.tokens.id_token,
+                    };
+                    if let Err(e) = repo
+                        .update_tokens(picked.as_str(), &new, &state.cipher, now)
+                        .await
+                    {
+                        // Refresh succeeded and `new` is valid in-memory for THIS request; don't fail
+                        // over a persist error — surface it (content-safe). Observability is M5.
+                        eprintln!("polyflare: failed to persist refreshed tokens: {e}");
+                    }
+                    tokens = new;
                 }
-                return Err(account_unavailable());
+                Err(OAuthError::Endpoint {
+                    code: Some(code), ..
+                }) => {
+                    if let Some(status) = classify_failure(&code).status() {
+                        let _ = repo.update_status(picked.as_str(), status).await;
+                    }
+                    return Err(account_unavailable());
+                }
+                Err(OAuthError::Endpoint { code: None, .. }) | Err(OAuthError::MalformedJwt(_)) => {
+                    let _ = repo.update_status(picked.as_str(), "reauth_required").await;
+                    return Err(account_unavailable());
+                }
+                Err(OAuthError::Transport(_)) => {}
             }
-            Err(OAuthError::Endpoint { code: None, .. }) | Err(OAuthError::MalformedJwt(_)) => {
-                let _ = repo.update_status(picked.as_str(), "reauth_required").await;
-                return Err(account_unavailable());
+        } else {
+            // A peer already refreshed (and persisted) while we waited for the lock: pick up their
+            // fresh tokens instead of calling refresh again with our now-stale copy.
+            match repo.decrypt_tokens(picked.as_str(), &state.cipher).await {
+                Ok(Some(t)) => tokens = t,
+                Ok(None) | Err(_) => return Err(internal_error()),
             }
-            Err(OAuthError::Transport(_)) => {}
         }
     }
     Ok((
