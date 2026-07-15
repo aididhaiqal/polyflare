@@ -1,9 +1,28 @@
 //! Synthesizes the HTTP header STRUCTURE a real `codex-rs` sends on `POST /responses` — the
 //! egress-parity half of the fingerprint-parity gate (see `executor.rs` and
-//! `polyflare-server/tests/codex_fingerprint_parity_gate.rs`). Everything here is PROVISIONAL:
-//! built from a local `openai/codex` source read (this milestone, 2026-07), not from a live wire
-//! capture. `POLYFLARE_CAPTURE_FINGERPRINT` (see `polyflare_server::fingerprint_capture`) is the
-//! mechanism to obtain a real capture and re-diff this module's output against it later.
+//! `polyflare-server/tests/codex_fingerprint_parity_gate.rs`).
+//!
+//! # Status: CAPTURE-VERIFIED (codex-cli 0.144.1, 2026-07-15)
+//! Originally built from a local `openai/codex` source read, this synthesis has since been
+//! diffed against a live wire capture of the real Codex CLI (`codex-cli 0.144.1`, obtained by
+//! routing a `scripts/codex-polyflare` run through `POLYFLARE_CAPTURE_FINGERPRINT`). The capture
+//! CONFIRMED the base identity-header set, the `x-codex-turn-metadata` field-key set, and the UA
+//! format below. It also revealed two headers this module deliberately does NOT synthesize, both
+//! of which represent OPTIONAL codex states (so omitting them is itself a valid codex fingerprint):
+//! - `x-codex-beta-features` — a comma-separated list of the session's enabled experimental
+//!   feature keys (`core/src/session/mod.rs::build_model_client_beta_features_header`). Absent
+//!   entirely when no such feature is enabled (`if beta_features_header.is_empty() { None }`).
+//!   A translated non-codex client has no enabled beta features, so its absence is correct.
+//! - `x-openai-internal-codex-responses-lite: true` — added only for models with
+//!   `use_responses_lite` (`core/src/client.rs::add_responses_lite_header`); absent for non-lite
+//!   models. Omitting it matches a non-lite-model codex.
+//!
+//! Both are relayed untouched on the NATIVE forward path (a real Codex client that sends them has
+//! them forwarded verbatim by the executor) — synthesis only governs the TRANSLATED path.
+//!
+//! Note on the capture's own UA: it read `codex_exec/...` because the capture used `codex exec`;
+//! the interactive `codex` CLI (what a translated client impersonates) uses `codex_cli_rs`, the
+//! `originator` this module synthesizes. Both share the UA FORMAT the capture confirmed.
 //!
 //! # Source verification (local `openai/codex` checkout)
 //! - UA format (`{originator}/{version} ({os_type} {os_version}; {arch}) {terminal}`), the
@@ -42,10 +61,10 @@
 
 use sha2::{Digest, Sha256};
 
-/// PLACEHOLDER for the real `codex-rs` CLI release version embedded in its User-Agent.
-///
-/// U4: confirm real codex-rs release version via capture.
-pub const CODEX_CLI_VERSION: &str = "0.0.0-polyflare-unconfirmed";
+/// The `codex-rs` CLI release version embedded in its User-Agent. Capture-verified against a live
+/// `codex-cli 0.144.1` run (2026-07-15); update in lockstep with the codex-rs release PolyFlare
+/// mirrors on egress (a stale version here is a fingerprint tell against a newer real codex).
+pub const CODEX_CLI_VERSION: &str = "0.144.1";
 
 /// codex-rs's default `originator` (`login/src/auth/default_client.rs::DEFAULT_ORIGINATOR`).
 const ORIGINATOR: &str = "codex_cli_rs";
@@ -58,13 +77,12 @@ pub fn originator() -> &'static str {
 /// The codex-rs User-Agent FORMAT: `{originator}/{version} ({os_type} {os_version}; {arch})
 /// {terminal}` — verified from `login/src/auth/default_client.rs::get_codex_user_agent`.
 ///
-/// `version` is [`CODEX_CLI_VERSION`] (a placeholder — U4). `os_type`/`os_version`/`arch` come
+/// `version` is [`CODEX_CLI_VERSION`] (capture-verified). `os_type`/`os_version`/`arch` come
 /// from the `os_info` crate exactly as codex-rs itself calls it
 /// (`os_info::get().{os_type,version,architecture}`); when `os_info` can't determine the
 /// architecture this falls back to `std::env::consts::ARCH` instead of codex-rs's own literal
-/// `"unknown"` fallback — a deliberate improvement, flagged here as a deviation. `terminal` comes
-/// from [`terminal_name`], a local, deliberately simplified stand-in for codex-rs's internal
-/// `codex_terminal_detection` crate.
+/// `"unknown"` fallback — a deliberate improvement, flagged here as a deviation. `terminal` is the
+/// fixed [`TERMINAL_TOKEN`].
 pub fn codex_user_agent() -> String {
     let info = os_info::get();
     let arch = info
@@ -72,29 +90,23 @@ pub fn codex_user_agent() -> String {
         .map(str::to_string)
         .unwrap_or_else(|| std::env::consts::ARCH.to_string());
     format!(
-        "{ORIGINATOR}/{CODEX_CLI_VERSION} ({} {}; {arch}) {}",
+        "{ORIGINATOR}/{CODEX_CLI_VERSION} ({} {}; {arch}) {TERMINAL_TOKEN}",
         info.os_type(),
         info.version(),
-        terminal_name(),
     )
 }
 
-/// A minimal, LOCAL stand-in for codex-rs's internal `codex_terminal_detection` crate (not a
-/// published dependency — it's an internal `openai/codex` workspace crate, so it can't be reused
-/// directly here). Recognizes a handful of common `TERM_PROGRAM` values; falls back to
-/// `"unknown_terminal"`.
-///
-/// Note: real codex-rs's own fallback literal is `"unknown"`, not `"unknown_terminal"` — this
-/// crate's fallback instead matches the literal already assumed by PolyFlare's own
-/// pre-existing fingerprint-capture test fixture (`polyflare-server/src/fingerprint_capture.rs`).
-/// Harmless either way: the fingerprint-parity gate only checks the UA's masked FORMAT shape, not
-/// this literal's exact text.
-fn terminal_name() -> String {
-    match std::env::var("TERM_PROGRAM").ok().filter(|v| !v.is_empty()) {
-        Some(term) => term,
-        None => "unknown_terminal".to_string(),
-    }
-}
+/// The terminal-identity token codex-rs appends to its User-Agent. codex-rs derives this from the
+/// live terminal (`TERM_PROGRAM`/`TERM` → `codex_terminal_detection`), producing e.g.
+/// `iTerm.app/3.5` — but for a TRANSLATED (non-codex) client PolyFlare has no client terminal, and
+/// reading PolyFlare's OWN `TERM_PROGRAM` would leak the *server's* deployment environment into the
+/// synthesized fingerprint (headless prod → one value, a dev shell in iTerm → another) — an
+/// unstable tell. Instead we pin codex-rs's own unknown-terminal literal (`"unknown"`, from
+/// `codex_terminal_detection`'s `TerminalName::Unknown => "unknown"`), which is exactly what a real
+/// codex emits when run headless / with no `TERM_PROGRAM` — a valid, stable codex fingerprint that
+/// matches the non-interactive nature of a translated API request. Capture-verified: the live
+/// `codex exec` capture confirmed the terminal token occupies this UA position.
+const TERMINAL_TOKEN: &str = "unknown";
 
 /// Derives a stable per-conversation key from a prepared request body.
 ///
@@ -337,11 +349,18 @@ mod tests {
     }
 
     #[test]
-    fn codex_user_agent_starts_with_originator_and_placeholder_version() {
+    fn codex_user_agent_matches_captured_codex_rs_shape() {
         let ua = codex_user_agent();
+        // Capture-verified prefix: `codex_cli_rs/0.144.1 (`.
         assert!(
             ua.starts_with(&format!("{ORIGINATOR}/{CODEX_CLI_VERSION} (")),
             "unexpected UA prefix: {ua}"
+        );
+        // The UA ends with the fixed terminal token (headless-codex `unknown`), never a leaked
+        // server `TERM_PROGRAM`.
+        assert!(
+            ua.ends_with(&format!(" {TERMINAL_TOKEN}")),
+            "UA should end with the pinned terminal token: {ua}"
         );
     }
 }
