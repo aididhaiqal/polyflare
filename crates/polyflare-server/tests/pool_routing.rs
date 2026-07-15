@@ -1,6 +1,7 @@
-//! Provider dispatch: `/responses` must never select — nor execute against — an Anthropic-
-//! provider account. M4a has no cross-format translator yet (that's M4b), so a mixed pool must
-//! stay strictly partitioned by provider at the ingress boundary.
+//! Multi-pool routing: `/{pool}/responses` must select ONLY accounts tagged with that pool slug,
+//! while the bare `/responses` path keeps selecting over ALL accounts. Proven by giving each
+//! account a distinct bearer token and asserting which one reached the (shared) upstream via the
+//! mock's `last_authorization()`.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,7 +21,7 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
-fn account(id: &str, provider: &str) -> Account {
+fn account(id: &str, pool: Option<&str>) -> Account {
     Account {
         id: id.to_string(),
         chatgpt_account_id: None,
@@ -39,14 +40,16 @@ fn account(id: &str, provider: &str) -> Account {
         reset_at: None,
         blocked_at: None,
         security_work_authorized: false,
-        provider: provider.to_string(),
-        pool: None,
+        provider: "codex".to_string(),
+        pool: pool.map(str::to_string),
     }
 }
 
-fn tokens() -> PlainTokens {
+/// One account's distinct bearer token — its fingerprint at the upstream, so `last_authorization()`
+/// reveals which account served a given request.
+fn tokens(access: &str) -> PlainTokens {
     PlainTokens {
-        access_token: "tok".to_string(),
+        access_token: access.to_string(),
         refresh_token: "r".to_string(),
         id_token: "i".to_string(),
     }
@@ -86,66 +89,112 @@ async fn spawn_polyflare(store: Store, upstream: String) -> String {
     format!("http://{addr}")
 }
 
-#[tokio::test]
-async fn responses_returns_503_when_pool_has_only_an_anthropic_account() {
+/// A two-pool store: `codex-a` in `pool-a` (token `tok-a`), `codex-b` in `pool-b` (token `tok-b`).
+async fn two_pool_store() -> Store {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
-    // Must match the cipher `spawn_polyflare` builds `AppState` with ([13u8; 32]) — this path
-    // never reaches decrypt (503s before `resolve_core_account`), but keep it consistent anyway.
     let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
     store
         .accounts()
-        .insert(&account("anthropic-1", "anthropic"), &tokens(), &cipher)
+        .insert(
+            &account("codex-a", Some("pool-a")),
+            &tokens("tok-a"),
+            &cipher,
+        )
+        .await
+        .unwrap();
+    store
+        .accounts()
+        .insert(
+            &account("codex-b", Some("pool-b")),
+            &tokens("tok-b"),
+            &cipher,
+        )
         .await
         .unwrap();
     std::mem::forget(dir);
+    store
+}
 
-    let mock = MockUpstream::new(vec![]);
+fn ok_events() -> Vec<String> {
+    vec![
+        r#"{"type":"response.output_text.delta","delta":"hi"}"#.to_string(),
+        r#"{"type":"response.completed"}"#.to_string(),
+    ]
+}
+
+#[tokio::test]
+async fn pooled_path_routes_only_to_that_pools_account() {
+    let store = two_pool_store().await;
+    let mock = MockUpstream::new(ok_events());
+    let handle = mock.clone();
     let upstream = mock.spawn().await;
     let pf = spawn_polyflare(store, upstream).await;
-
     let client = reqwest::Client::new();
+
+    // /pool-a/responses → only codex-a is eligible → its token reaches upstream.
     let resp = client
-        .post(format!("{pf}/responses"))
-        .json(&serde_json::json!({"model": "gpt-5.6-sol"}))
+        .post(format!("{pf}/pool-a/responses"))
+        .json(&serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        handle.last_authorization().as_deref(),
+        Some("Bearer tok-a"),
+        "pool-a path must route to the pool-a account"
+    );
+
+    // /pool-b/responses → only codex-b.
+    let resp = client
+        .post(format!("{pf}/pool-b/responses"))
+        .json(&serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        handle.last_authorization().as_deref(),
+        Some("Bearer tok-b"),
+        "pool-b path must route to the pool-b account"
+    );
+}
+
+#[tokio::test]
+async fn unknown_pool_slug_has_no_eligible_account() {
+    let store = two_pool_store().await;
+    let mock = MockUpstream::new(ok_events());
+    let handle = mock.clone();
+    let upstream = mock.spawn().await;
+    let pf = spawn_polyflare(store, upstream).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{pf}/pool-zzz/responses"))
+        .json(&serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}))
         .send()
         .await
         .unwrap();
     assert_eq!(
         resp.status(),
         503,
-        "an anthropic-only pool must not serve /responses"
+        "a slug matching no account must yield no-eligible-account"
     );
+    assert_eq!(handle.request_count(), 0, "upstream must never be called");
 }
 
 #[tokio::test]
-async fn responses_routes_only_to_the_codex_account_in_a_mixed_pool() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
-    // Must match the cipher `spawn_polyflare` builds `AppState` with ([13u8; 32]) — otherwise
-    // `resolve_core_account`'s `decrypt_tokens` fails and this 500s instead of routing.
-    let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
-    store
-        .accounts()
-        .insert(&account("anthropic-1", "anthropic"), &tokens(), &cipher)
-        .await
-        .unwrap();
-    store
-        .accounts()
-        .insert(&account("codex-1", "codex"), &tokens(), &cipher)
-        .await
-        .unwrap();
-    std::mem::forget(dir);
-
-    let mock = MockUpstream::new(vec![
-        r#"{"type":"response.output_text.delta","delta":"hi"}"#.to_string(),
-        r#"{"type":"response.completed"}"#.to_string(),
-    ]);
+async fn bare_path_selects_across_all_pools() {
+    let store = two_pool_store().await;
+    let mock = MockUpstream::new(ok_events());
     let handle = mock.clone();
     let upstream = mock.spawn().await;
     let pf = spawn_polyflare(store, upstream).await;
-
     let client = reqwest::Client::new();
+
+    // Bare /responses ignores pool tagging entirely: with only pooled accounts present, it still
+    // finds an eligible one (backward compatibility — pooled accounts remain reachable bare).
     let resp = client
         .post(format!("{pf}/responses"))
         .json(&serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}))
@@ -153,5 +202,9 @@ async fn responses_routes_only_to_the_codex_account_in_a_mixed_pool() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(handle.request_count(), 1, "exactly one upstream call");
+    let auth = handle.last_authorization();
+    assert!(
+        matches!(auth.as_deref(), Some("Bearer tok-a") | Some("Bearer tok-b")),
+        "bare path routes to some pooled account, got {auth:?}"
+    );
 }

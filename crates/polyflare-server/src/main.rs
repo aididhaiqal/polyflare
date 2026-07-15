@@ -59,6 +59,20 @@ enum AccountsCommands {
         /// Also try to auto-open the authorize URL in a browser (default: print only, for headless).
         #[arg(long = "open")]
         open: bool,
+        /// Assign the onboarded account to a named pool (URL slug). Omit for an unpooled account
+        /// (reachable only via the bare `/responses` and `/v1/messages` paths).
+        #[arg(long = "pool", value_name = "SLUG")]
+        pool: Option<String>,
+    },
+    /// Assign (or clear) an existing account's pool. Pass `--pool <slug>` to tag it, or omit
+    /// `--pool` to clear it back to unpooled.
+    SetPool {
+        /// The account id to re-pool (as shown by `accounts` listing / the dashboard).
+        #[arg(long = "id", value_name = "ACCOUNT_ID")]
+        id: String,
+        /// The pool slug to assign; omit to clear the account's pool (make it unpooled).
+        #[arg(long = "pool", value_name = "SLUG")]
+        pool: Option<String>,
     },
 }
 
@@ -84,7 +98,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fernet_key,
                 dry_run,
             } => accounts_import(&from, &fernet_key, dry_run).await,
-            AccountsCommands::Login { open } => accounts_login(open).await,
+            AccountsCommands::Login { open, pool } => accounts_login(open, pool).await,
+            AccountsCommands::SetPool { id, pool } => accounts_set_pool(&id, pool).await,
         },
     }
 }
@@ -175,7 +190,10 @@ async fn accounts_import(
 
 /// Onboard (or re-auth) a Codex account via native OAuth login, persisting its tokens to the store.
 /// Prints only identity — never a token (the token types redact their `Debug`).
-async fn accounts_login(open: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn accounts_login(
+    open: bool,
+    pool: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = config::data_dir_from_env();
     let store = Store::open(&config::db_path(&data_dir)).await?;
     let cipher = TokenCipher::load_or_create(&config::key_path(&data_dir))?;
@@ -208,6 +226,11 @@ async fn accounts_login(open: bool) -> Result<(), Box<dyn std::error::Error>> {
     let (account_id, verb) = if let Some(existing) = existing {
         repo.update_tokens(&existing.id, &tokens, &cipher, now)
             .await?;
+        // Re-auth leaves the pool untouched UNLESS `--pool` was given: an explicit `--pool <slug>`
+        // on a re-auth re-tags the account, while omitting it must never clear an existing pool.
+        if pool.is_some() {
+            repo.update_pool(&existing.id, pool.as_deref()).await?;
+        }
         (existing.id, "re-authenticated")
     } else {
         let id = format!(
@@ -240,6 +263,7 @@ async fn accounts_login(open: bool) -> Result<(), Box<dyn std::error::Error>> {
             blocked_at: None,
             security_work_authorized: false,
             provider: "codex".to_string(),
+            pool: pool.clone(),
         };
         repo.insert(&account, &tokens, &cipher).await?;
         (id, "onboarded")
@@ -249,6 +273,27 @@ async fn accounts_login(open: bool) -> Result<(), Box<dyn std::error::Error>> {
         claims.email.as_deref().unwrap_or("<no email>"),
         account_id
     );
+    Ok(())
+}
+
+/// Assign (or clear) an existing account's pool. `update_pool` bumps the store generation, so a
+/// running server's account cache picks the re-pooling up without a restart. Prints only the id +
+/// the resulting pool — never any secret.
+async fn accounts_set_pool(
+    id: &str,
+    pool: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = config::data_dir_from_env();
+    let store = Store::open(&config::db_path(&data_dir)).await?;
+    let repo = store.accounts();
+    if repo.get(id).await?.is_none() {
+        return Err(format!("no account with id {id}").into());
+    }
+    repo.update_pool(id, pool.as_deref()).await?;
+    match pool.as_deref() {
+        Some(slug) => println!("account {id} assigned to pool {slug}"),
+        None => println!("account {id} pool cleared (unpooled)"),
+    }
     Ok(())
 }
 
@@ -321,5 +366,57 @@ mod tests {
     #[test]
     fn missing_subcommand_is_an_error() {
         assert!(Cli::try_parse_from(["polyflare"]).is_err());
+    }
+
+    #[test]
+    fn login_pool_flag_parses_and_defaults_to_none() {
+        let with =
+            Cli::try_parse_from(["polyflare", "accounts", "login", "--pool", "team-a"]).unwrap();
+        match with.command {
+            Commands::Accounts {
+                command: AccountsCommands::Login { pool, .. },
+            } => assert_eq!(pool.as_deref(), Some("team-a")),
+            _ => panic!("expected `accounts login`"),
+        }
+        let without = Cli::try_parse_from(["polyflare", "accounts", "login"]).unwrap();
+        match without.command {
+            Commands::Accounts {
+                command: AccountsCommands::Login { pool, .. },
+            } => assert!(pool.is_none(), "no --pool ⇒ unpooled"),
+            _ => panic!("expected `accounts login`"),
+        }
+    }
+
+    #[test]
+    fn set_pool_parses_assign_and_clear() {
+        // Assign.
+        let assign = Cli::try_parse_from([
+            "polyflare",
+            "accounts",
+            "set-pool",
+            "--id",
+            "codex_1",
+            "--pool",
+            "p1",
+        ])
+        .unwrap();
+        match assign.command {
+            Commands::Accounts {
+                command: AccountsCommands::SetPool { id, pool },
+            } => {
+                assert_eq!(id, "codex_1");
+                assert_eq!(pool.as_deref(), Some("p1"));
+            }
+            _ => panic!("expected `accounts set-pool`"),
+        }
+        // Clear (no --pool ⇒ None ⇒ unpooled).
+        let clear =
+            Cli::try_parse_from(["polyflare", "accounts", "set-pool", "--id", "codex_1"]).unwrap();
+        match clear.command {
+            Commands::Accounts {
+                command: AccountsCommands::SetPool { pool, .. },
+            } => assert!(pool.is_none(), "omitting --pool clears the pool"),
+            _ => panic!("expected `accounts set-pool`"),
+        }
     }
 }

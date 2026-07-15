@@ -194,6 +194,7 @@ pub async fn import_from_codex_lb(
             blocked_at: src.blocked_at,
             security_work_authorized: src.security_work_authorized,
             provider: "codex".to_string(),
+            pool: None,
         };
         // `OR IGNORE` makes the account insert idempotent: re-running after a fix skips ids
         // already present instead of erroring on the `id` PRIMARY KEY.

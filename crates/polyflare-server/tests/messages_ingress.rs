@@ -41,6 +41,7 @@ fn anthropic_account(id: &str) -> Account {
         blocked_at: None,
         security_work_authorized: false,
         provider: "anthropic".to_string(),
+        pool: None,
     }
 }
 
