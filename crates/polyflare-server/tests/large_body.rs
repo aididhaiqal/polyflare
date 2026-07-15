@@ -83,6 +83,7 @@ async fn large_request_body_is_not_rejected_with_413() {
         refresh_locks: Default::default(),
         capture_fingerprint_path: None,
         codex_version: std::sync::Arc::new(polyflare_codex::CodexVersionCache::new().unwrap()),
+        account_cache: std::sync::Arc::new(polyflare_server::account_cache::AccountCache::new()),
     });
     let app = build_app(state);
 

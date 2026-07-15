@@ -122,6 +122,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         refresh_locks: Default::default(),
         capture_fingerprint_path: config.capture_fingerprint_path,
         codex_version,
+        account_cache: Arc::new(polyflare_server::account_cache::AccountCache::new()),
     });
     let app = build_app(state);
 

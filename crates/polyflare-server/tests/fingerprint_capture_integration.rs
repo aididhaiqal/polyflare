@@ -81,6 +81,7 @@ async fn spawn_polyflare(
         refresh_locks: Default::default(),
         capture_fingerprint_path: Some(capture_path),
         codex_version: std::sync::Arc::new(polyflare_codex::CodexVersionCache::new().unwrap()),
+        account_cache: std::sync::Arc::new(polyflare_server::account_cache::AccountCache::new()),
     });
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

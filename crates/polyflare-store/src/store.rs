@@ -1,6 +1,8 @@
 //! The SQLite-backed store: a pooled connection with embedded, forward-only migrations.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
@@ -13,6 +15,12 @@ use crate::StoreError;
 /// Owns the SQLite connection pool. The pool is reference-counted, so cloning it is cheap.
 pub struct Store {
     pool: SqlitePool,
+    /// In-process account-write generation counter. Every `AccountRepo` write bumps it; a reader
+    /// (the server's `AccountCache`) compares it to auto-invalidate its cached account pool on ANY
+    /// write, so no caller can forget to invalidate. This is process-local and tracks only writes
+    /// made through THIS `Store` instance — correct for PolyFlare's single-process design (a
+    /// multi-instance deploy would need a shared/DB counter instead; see `AccountCache` docs).
+    account_generation: Arc<AtomicU64>,
 }
 
 impl Store {
@@ -35,7 +43,10 @@ impl Store {
             .connect_with(opts)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            account_generation: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     /// The underlying pool, for callers that run raw queries (e.g. the importer, tests).
@@ -43,9 +54,16 @@ impl Store {
         &self.pool
     }
 
-    /// The account repository over this store's pool.
+    /// The current account-write generation (bumped by every `AccountRepo` write). The
+    /// `AccountCache` reads this cheaply (one atomic load) to decide whether its cached pool is
+    /// still valid — any write advances it and forces the next read to rebuild.
+    pub fn account_generation(&self) -> u64 {
+        self.account_generation.load(Ordering::Acquire)
+    }
+
+    /// The account repository over this store's pool, wired to bump the write generation.
     pub fn accounts(&self) -> AccountRepo {
-        AccountRepo::new(self.pool.clone())
+        AccountRepo::new(self.pool.clone(), self.account_generation.clone())
     }
 
     /// The continuity repository over this store's pool.
