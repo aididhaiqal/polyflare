@@ -2,7 +2,7 @@
 //! relay. Client-facing errors carry generic bodies (never a token, URL, or internal Display).
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{Json, State};
@@ -19,6 +19,7 @@ use polyflare_store::PlainTokens;
 
 use crate::alias::{self, ModelAlias};
 use crate::app::AppState;
+use crate::observability::RequestLog;
 use crate::session_key::derive_request_ctx;
 use crate::snapshot::{assemble_snapshots, filter_by_provider};
 use crate::translate_stream::wrap_translating_stream;
@@ -144,10 +145,36 @@ async fn resolve_core_account(
     ))
 }
 
+/// The `/responses` ingress entrypoint. Thin timing + content-safe logging wrapper around
+/// [`responses_handler_impl`] — see `crate::observability` for the content-safety constraint on
+/// what may be logged.
 pub async fn responses_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
+) -> Response {
+    let start = Instant::now();
+    let response = responses_handler_impl(state, headers, body).await;
+    RequestLog {
+        method: "POST",
+        path: "/responses",
+        // M4a: `/responses` may only ever route to a Codex-provider account — see this fn's
+        // `filter_by_provider(&snapshots, Provider::Codex)` call below. The provider is
+        // structurally fixed regardless of which branch produced the response (including the
+        // early-exit error paths, which never resolve an account at all).
+        provider: Provider::Codex,
+        aliased: false,
+        status: response.status(),
+        duration_ms: start.elapsed().as_millis() as u64,
+    }
+    .emit();
+    response
+}
+
+async fn responses_handler_impl(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: serde_json::Value,
 ) -> Response {
     let model = body
         .get("model")
@@ -298,24 +325,49 @@ pub async fn responses_handler(
 /// The `/v1/messages` ingress entrypoint. A client `model` string that `alias::lookup_alias` maps
 /// to a Codex target (SPEC-M4 §3.6 — the M4b headline feature) takes the cross-provider translated
 /// path; everything else (no alias, or an alias whose target is itself Anthropic) takes the native
-/// same-format path, unchanged.
+/// same-format path, unchanged. Also a thin timing + content-safe logging wrapper (mirrors
+/// `responses_handler` above) — see `crate::observability` for the content-safety constraint.
 pub async fn messages_handler(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    let start = Instant::now();
     let model = body
         .get("model")
         .and_then(|m| m.as_str())
         .unwrap_or_default()
         .to_string();
 
-    match alias::lookup_alias(&model) {
+    // Resolved once, up front: which provider this request structurally targets, and whether
+    // that's via a model alias — both are decided entirely by `lookup_alias`, independent of
+    // whether the downstream relay itself succeeds.
+    let alias = alias::lookup_alias(&model);
+    let aliased_to_codex = matches!(&alias, Some(a) if a.target_provider == Provider::Codex);
+    let provider = if aliased_to_codex {
+        Provider::Codex
+    } else {
+        Provider::Anthropic
+    };
+
+    let response = match alias {
         Some(model_alias) if model_alias.target_provider == Provider::Codex => {
             messages_handler_codex_aliased(state, body, model_alias).await
         }
         _ => messages_handler_native(state, body, model).await,
+    };
+
+    RequestLog {
+        method: "POST",
+        path: "/v1/messages",
+        provider,
+        aliased: aliased_to_codex,
+        status: response.status(),
+        duration_ms: start.elapsed().as_millis() as u64,
     }
+    .emit();
+
+    response
 }
 
 /// The native Anthropic-Messages ingress path: no alias applies, so this relays straight to an
