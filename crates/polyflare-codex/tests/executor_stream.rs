@@ -21,6 +21,7 @@ async fn executor_streams_upstream_events_and_forwards_body() {
     let req = PreparedRequest {
         body: serde_json::json!({"model": "gpt-5.6-sol", "input": "hello"}),
         model: "gpt-5.6-sol".into(),
+        forward_headers: vec![],
     };
 
     let mut stream = executor.execute(req, &account).await.unwrap();
@@ -47,6 +48,7 @@ async fn executor_surfaces_upstream_error_status() {
     let req = PreparedRequest {
         body: serde_json::json!({"model": "m"}),
         model: "m".into(),
+        forward_headers: vec![],
     };
     let err = executor.execute(req, &account).await.err().unwrap();
     assert!(matches!(err, polyflare_core::ExecError::Upstream(_)));
