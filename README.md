@@ -46,6 +46,20 @@ cargo run --bin polyflare
 
 Secrets are read from the environment only and never logged.
 
+To capture a real Codex CLI request's content-safe structural HTTP fingerprint (the golden fixture
+the M5 fingerprint-parity gate diffs against — method, path, header names, and redacted/structural
+value descriptors only; never a token, id, or body), set `POLYFLARE_CAPTURE_FINGERPRINT` to a file
+path before routing one real `codex-rs` request through PolyFlare:
+
+```sh
+POLYFLARE_CAPTURE_FINGERPRINT="./fingerprint_golden.jsonl" \
+POLYFLARE_UPSTREAM_URL="https://<upstream-base>" \
+cargo run --bin polyflare -- serve
+```
+
+Each request appends one JSON line to the golden path (JSON Lines); see
+`crates/polyflare-server/src/fingerprint_capture.rs` for the exact redaction rules.
+
 ## Roadmap
 
 - **M1** — Skeleton + Codex identity pass-through ← *in progress*

@@ -1,5 +1,6 @@
 //! Application state and router construction.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
@@ -34,6 +35,11 @@ pub struct AppState {
     /// refresh-if-stale attempts for the SAME account so only one call reaches the OAuth
     /// endpoint with a given refresh token.
     pub refresh_locks: RefreshLocks,
+    /// M5 capture-fixture mechanism (`POLYFLARE_CAPTURE_FINGERPRINT`; see
+    /// `crate::fingerprint_capture`): when `Some`, the ingress appends every request's
+    /// content-safe structural HTTP fingerprint to this path. `None` (the default) disables it
+    /// entirely — the ingress never calls into `fingerprint_capture` at all.
+    pub capture_fingerprint_path: Option<PathBuf>,
 }
 
 impl AppState {

@@ -81,6 +81,7 @@ async fn large_request_body_is_not_rejected_with_413() {
         upstream_base_url: upstream,
         anthropic_upstream_base_url: "http://127.0.0.1:9".to_string(),
         refresh_locks: Default::default(),
+        capture_fingerprint_path: None,
     });
     let app = build_app(state);
 

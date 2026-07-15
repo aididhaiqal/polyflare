@@ -101,6 +101,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         upstream_base_url: config.upstream_base_url,
         anthropic_upstream_base_url: config.anthropic_upstream_base_url,
         refresh_locks: Default::default(),
+        capture_fingerprint_path: config.capture_fingerprint_path,
     });
     let app = build_app(state);
 

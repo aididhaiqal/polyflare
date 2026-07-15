@@ -32,6 +32,7 @@ async fn no_eligible_account_returns_503() {
         upstream_base_url: "http://127.0.0.1:9".to_string(),
         anthropic_upstream_base_url: "http://127.0.0.1:9".to_string(),
         refresh_locks: Default::default(),
+        capture_fingerprint_path: None,
     });
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
