@@ -60,6 +60,23 @@ cargo run --bin polyflare -- serve
 Each request appends one JSON line to the golden path (JSON Lines); see
 `crates/polyflare-server/src/fingerprint_capture.rs` for the exact redaction rules.
 
+### Local dev: `codex-polyflare`
+
+`scripts/codex-polyflare` runs the **real Codex CLI against your local PolyFlare server**, so you
+can exercise PolyFlare with genuine `codex-rs` traffic without touching your normal `codex`
+(your usual `~/.codex` → OpenAI/codex-lb keeps working — the wrapper uses a separate `CODEX_HOME`):
+
+```bash
+polyflare serve                       # terminal 1 (default 127.0.0.1:8080)
+scripts/codex-polyflare "hello"       # terminal 2 — codex, routed to PolyFlare
+```
+
+It writes an isolated `~/.codex-polyflare/config.toml` defining a `polyflare` model provider
+(`base_url` → your PolyFlare, `wire_api = "responses"`, a placeholder bearer PolyFlare ignores —
+no `codex login` needed). Override the target with `POLYFLARE_URL=...`. This is also how you grab
+the fingerprint golden — start PolyFlare with `POLYFLARE_CAPTURE_FINGERPRINT` set, then send one
+`codex-polyflare` request.
+
 ## Roadmap
 
 - **M1** — Skeleton + Codex identity pass-through ← *in progress*
