@@ -44,6 +44,13 @@ fn anthropic_account(id: &str) -> Account {
     }
 }
 
+fn codex_account(id: &str) -> Account {
+    Account {
+        provider: "codex".to_string(),
+        ..anthropic_account(id)
+    }
+}
+
 fn tokens() -> PlainTokens {
     PlainTokens {
         access_token: "tok".to_string(),
@@ -53,6 +60,17 @@ fn tokens() -> PlainTokens {
 }
 
 async fn spawn_polyflare(store: Store, anthropic_upstream: String) -> String {
+    spawn_polyflare_full(store, "http://127.0.0.1:9".to_string(), anthropic_upstream).await
+}
+
+/// Like `spawn_polyflare`, but also lets a test point the Codex upstream at a live mock (needed to
+/// exercise the M4b-wiring cross-provider `/v1/messages` -> Codex path — `spawn_polyflare`'s
+/// hardcoded dummy Codex address is fine for the native-only tests above, which never route there).
+async fn spawn_polyflare_full(
+    store: Store,
+    codex_upstream: String,
+    anthropic_upstream: String,
+) -> String {
     let cipher = TokenCipher::from_key_bytes(&[21u8; 32]).unwrap();
     let continuity: Arc<dyn Continuity> = Arc::new(CodexContinuity::new(
         store.continuity(),
@@ -70,7 +88,7 @@ async fn spawn_polyflare(store: Store, anthropic_upstream: String) -> String {
         store,
         cipher,
         oauth: OAuthClient::new("http://127.0.0.1:9").unwrap(),
-        upstream_base_url: "http://127.0.0.1:9".to_string(),
+        upstream_base_url: codex_upstream,
         anthropic_upstream_base_url: anthropic_upstream,
         refresh_locks: Default::default(),
     });
@@ -110,7 +128,10 @@ async fn messages_relays_to_the_anthropic_executor() {
     let resp = client
         .post(format!("{pf}/v1/messages"))
         .json(&serde_json::json!({
-            "model": "claude-opus-4",
+            // Deliberately NOT an opus/sonnet/haiku substring (M4b-wiring: those now alias to
+            // Codex — see `messages_aliases_opus_to_codex_and_relays_translated_anthropic_sse`
+            // below) so this exercises the genuinely-unaliased native Anthropic path.
+            "model": "claude-3-5-legacy-model",
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .send()
@@ -125,7 +146,10 @@ async fn messages_relays_to_the_anthropic_executor() {
     }
     assert!(body.contains("content_block_delta"));
     assert!(body.contains("message_stop"));
-    assert_eq!(handle.last_body().unwrap()["model"], "claude-opus-4");
+    assert_eq!(
+        handle.last_body().unwrap()["model"],
+        "claude-3-5-legacy-model"
+    );
 }
 
 #[tokio::test]
@@ -138,7 +162,101 @@ async fn messages_returns_503_when_pool_has_no_anthropic_account() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{pf}/v1/messages"))
-        .json(&serde_json::json!({"model": "claude-opus-4", "messages": []}))
+        // Deliberately NOT an opus/sonnet/haiku substring — see the model-choice comment in
+        // `messages_relays_to_the_anthropic_executor` above.
+        .json(&serde_json::json!({"model": "claude-3-5-legacy-model", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+}
+
+/// M4b-wiring, the headline cross-provider path: a `claude-opus-...` model string aliases to
+/// Codex's `gpt-5.6-sol` @ high effort (`polyflare_server::alias::lookup_alias`). This asserts (a)
+/// the upstream Codex mock received the remapped `model` + injected `reasoning.effort`, and (b)
+/// the client-facing body is genuine Anthropic-Messages SSE (`message_start`/`content_block_*`/
+/// `message_stop`), not the raw OpenAI-Responses shape the mock actually emitted.
+#[tokio::test]
+async fn messages_aliases_opus_to_codex_and_relays_translated_anthropic_sse() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[21u8; 32]).unwrap();
+    store
+        .accounts()
+        .insert(&codex_account("codex-1"), &tokens(), &cipher)
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+
+    // A scripted OpenAI-Responses turn: one text block, "hi".
+    let mock = MockUpstream::new(vec![
+        r#"{"type":"response.created","response":{"id":"resp_1","status":"in_progress","model":"gpt-5.6-sol","usage":null}}"#.to_string(),
+        r#"{"type":"response.output_item.added","item":{"id":"item_1","type":"message","role":"assistant","content":[]}}"#.to_string(),
+        r#"{"type":"response.content_part.added","item_id":"item_1","part":{"type":"output_text","text":"","annotations":[]}}"#.to_string(),
+        r#"{"type":"response.output_text.delta","item_id":"item_1","delta":"hi"}"#.to_string(),
+        r#"{"type":"response.output_text.done","item_id":"item_1","text":"hi"}"#.to_string(),
+        r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-5.6-sol","usage":{"output_tokens":1}}}"#.to_string(),
+    ]);
+    let handle = mock.clone();
+    let codex_upstream = mock.spawn().await;
+    let pf = spawn_polyflare_full(store, codex_upstream, "http://127.0.0.1:9".to_string()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{pf}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-opus-4-1-20250805",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // (a) the Codex upstream received the remapped model + injected reasoning effort.
+    let sent = handle.last_body().unwrap();
+    assert_eq!(sent["model"], "gpt-5.6-sol");
+    assert_eq!(sent["reasoning"]["effort"], "high");
+
+    // (b) the client sees Anthropic-Messages SSE, not the raw OpenAI-Responses shape.
+    let mut body = String::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        body.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+    }
+    assert!(body.contains("message_start"), "body: {body}");
+    assert!(body.contains("content_block_delta"), "body: {body}");
+    assert!(body.contains("message_stop"), "body: {body}");
+    assert!(
+        !body.contains("response.output_text.delta"),
+        "client must never see the raw OpenAI-Responses event shape: {body}"
+    );
+}
+
+/// An aliased-to-Codex request with no Codex account in the pool: `filter_by_provider(Codex)`
+/// leaves no candidates, so this 503s exactly like the native path's empty-pool case above — it
+/// must NOT silently fall back to the (present) Anthropic account, since an aliased turn's
+/// translated body is Codex-shaped and would be meaningless sent to an Anthropic backend.
+#[tokio::test]
+async fn messages_aliased_to_codex_returns_503_when_no_codex_account_is_seeded() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[21u8; 32]).unwrap();
+    store
+        .accounts()
+        .insert(&anthropic_account("anthropic-1"), &tokens(), &cipher)
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+
+    let pf = spawn_polyflare(store, "http://127.0.0.1:9".to_string()).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{pf}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-opus-4-1-20250805",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
         .send()
         .await
         .unwrap();
