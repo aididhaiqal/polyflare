@@ -9,6 +9,7 @@ use std::time::Duration;
 pub struct ServeConfig {
     pub bind_addr: String,
     pub upstream_base_url: String,
+    pub anthropic_upstream_base_url: String,
     pub auth_base_url: String,
     pub db_path: PathBuf,
     pub key_path: PathBuf,
@@ -21,6 +22,8 @@ impl ServeConfig {
             std::env::var("POLYFLARE_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
         let upstream_base_url = std::env::var("POLYFLARE_UPSTREAM_URL")
             .map_err(|_| "POLYFLARE_UPSTREAM_URL not set".to_string())?;
+        let anthropic_upstream_base_url = std::env::var("POLYFLARE_ANTHROPIC_UPSTREAM_URL")
+            .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
         let auth_base_url = std::env::var("POLYFLARE_AUTH_URL")
             .unwrap_or_else(|_| "https://auth.openai.com".to_string());
         let data_dir = data_dir_from_env();
@@ -32,6 +35,7 @@ impl ServeConfig {
         Ok(ServeConfig {
             bind_addr,
             upstream_base_url,
+            anthropic_upstream_base_url,
             auth_base_url,
             db_path: db_path(&data_dir),
             key_path: key_path(&data_dir),
