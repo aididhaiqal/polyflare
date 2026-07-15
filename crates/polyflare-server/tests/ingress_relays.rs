@@ -75,6 +75,7 @@ async fn spawn_polyflare(upstream: String) -> String {
         cipher,
         oauth: OAuthClient::new("http://127.0.0.1:9").unwrap(), // never called (fresh token)
         upstream_base_url: upstream,
+        refresh_locks: Default::default(),
     });
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

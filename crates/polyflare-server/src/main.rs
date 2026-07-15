@@ -85,6 +85,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         cipher,
         oauth,
         upstream_base_url: config.upstream_base_url,
+        refresh_locks: Default::default(),
     });
     let app = build_app(state);
 

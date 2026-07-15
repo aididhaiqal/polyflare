@@ -101,6 +101,7 @@ async fn second_turn_pins_back_to_owning_account() {
         cipher: TokenCipher::from_key_bytes(&[7u8; 32]).unwrap(),
         oauth: OAuthClient::new("http://127.0.0.1:9").unwrap(),
         upstream_base_url: upstream,
+        refresh_locks: Default::default(),
     });
     let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

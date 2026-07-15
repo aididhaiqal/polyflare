@@ -76,6 +76,7 @@ async fn bare_tail_dead_anchor_signals_previous_response_not_found() {
         cipher,
         oauth: OAuthClient::new("http://127.0.0.1:9").unwrap(),
         upstream_base_url: upstream,
+        refresh_locks: Default::default(),
     });
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
