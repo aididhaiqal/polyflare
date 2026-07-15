@@ -92,6 +92,17 @@ impl Executor for CodexExecutor {
             .map_err(|e| ExecError::Upstream(e.to_string()))?;
         headers.insert(AUTHORIZATION, bearer);
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        // Pair the SELECTED account's ChatGPT id with its Bearer, exactly as the real Codex CLI
+        // does (`ChatGPT-Account-ID`). `insert` (replace) so a client's forwarded value for a
+        // DIFFERENT account can never survive next to our overridden Bearer — a mismatched
+        // (token, account) pair is precisely what the backend rejects.
+        if let Some(account_id) = &account.chatgpt_account_id {
+            headers.insert(
+                HeaderName::from_static("chatgpt-account-id"),
+                HeaderValue::from_str(account_id)
+                    .map_err(|e| ExecError::Upstream(e.to_string()))?,
+            );
+        }
 
         let resp = self
             .client

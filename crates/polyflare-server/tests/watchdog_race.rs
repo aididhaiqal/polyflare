@@ -44,6 +44,7 @@ fn core_account(base_url: String) -> Account {
         id: "acct".into(),
         base_url,
         bearer_token: "tok".into(),
+        chatgpt_account_id: None,
     }
 }
 

@@ -17,6 +17,7 @@ async fn executor_streams_upstream_events_and_forwards_body() {
         id: "test".into(),
         base_url: base,
         bearer_token: "test-token".into(),
+        chatgpt_account_id: None,
     };
     let req = PreparedRequest {
         body: serde_json::json!({
@@ -48,6 +49,7 @@ async fn executor_surfaces_upstream_error_status() {
         id: "test".into(),
         base_url: format!("{base}/nonexistent-base"),
         bearer_token: "t".into(),
+        chatgpt_account_id: None,
     };
     let req = PreparedRequest {
         body: serde_json::json!({"model": "m"}),
