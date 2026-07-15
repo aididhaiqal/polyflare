@@ -155,3 +155,64 @@ async fn find_by_chatgpt_account_id_powers_onboard_vs_reauth() {
         .unwrap()
         .is_none());
 }
+
+#[tokio::test]
+async fn usage_refresh_persists_windows_and_gate() {
+    // Backs the runtime usage-refresh loop: `insert_usage_window` rows must surface through
+    // `latest_usage` (latest-per-window wins), and `update_status_and_reset` must move both the
+    // routing gate and the reset time together.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[5u8; 32]).unwrap();
+    let repo = store.accounts();
+    repo.insert(&sample_account("acct-1"), &sample_tokens(), &cipher)
+        .await
+        .unwrap();
+
+    // Only the weekly (secondary) window is written — mirrors current upstream, where the 5h
+    // (primary) window is absent. An earlier row for the same window must be superseded.
+    repo.insert_usage_window(
+        "acct-1",
+        "secondary",
+        40.0,
+        Some(1_783_000_000),
+        Some(10080),
+        100,
+    )
+    .await
+    .unwrap();
+    repo.insert_usage_window(
+        "acct-1",
+        "secondary",
+        73.5,
+        Some(1_783_900_000),
+        Some(10080),
+        200,
+    )
+    .await
+    .unwrap();
+
+    let usage = repo.latest_usage("acct-1").await.unwrap();
+    assert!(
+        usage.primary.is_none(),
+        "no 5h window written → primary absent"
+    );
+    let sec = usage.secondary.expect("weekly window present");
+    assert_eq!(sec.used_percent, 73.5, "latest recorded_at wins");
+    assert_eq!(sec.reset_at, Some(1_783_900_000));
+
+    // Gate + reset move together; a cleared gate carries no reset.
+    repo.update_status_and_reset("acct-1", "quota_exceeded", Some(1_783_900_000))
+        .await
+        .unwrap();
+    let acct = repo.get("acct-1").await.unwrap().unwrap();
+    assert_eq!(acct.status, "quota_exceeded");
+    assert_eq!(acct.reset_at, Some(1_783_900_000));
+
+    repo.update_status_and_reset("acct-1", "active", None)
+        .await
+        .unwrap();
+    let acct = repo.get("acct-1").await.unwrap().unwrap();
+    assert_eq!(acct.status, "active");
+    assert_eq!(acct.reset_at, None);
+}

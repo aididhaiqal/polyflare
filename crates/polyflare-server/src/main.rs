@@ -132,6 +132,10 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         codex_version,
         account_cache: Arc::new(polyflare_server::account_cache::AccountCache::new()),
     });
+    // Runtime usage-refresh loop: keeps each Codex account's rate-limit windows (5h + weekly) and
+    // routing gate live, instead of the frozen numbers the importer left.
+    polyflare_server::usage_refresh::spawn_usage_refresh(state.clone());
+
     let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
