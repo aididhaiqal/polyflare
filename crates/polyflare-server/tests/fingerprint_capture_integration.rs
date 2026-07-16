@@ -73,6 +73,7 @@ async fn spawn_polyflare(
         codex_executor,
         anthropic_executor,
         selector: Arc::new(CapacityWeighted),
+        pool_selectors: Default::default(),
         continuity,
         store,
         cipher,

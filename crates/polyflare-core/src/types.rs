@@ -292,15 +292,29 @@ impl AccountSnapshot {
     }
 }
 
+/// Request cost/volume tier, derived at ingress from the model alias / reasoning effort (Claude
+/// Code fans out `opus`→High orchestrator, `sonnet`→Medium subagent, `haiku`→Low searcher). Known
+/// BEFORE routing, so a tier-aware strategy can pack cheap high-volume Low turns onto near-limit
+/// accounts while steering expensive High turns to fresh/preserved capacity. `capacity_weighted`
+/// ignores it; only `cache_affinity_tier` reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    High,
+    Medium,
+    Low,
+}
+
 /// Per-selection context (M2-GATE1). `now`/`rng_seed` keep the `Selector` pure + deterministic:
 /// time and randomness are injected, never read inside the trait. `session_id` is the
-/// session-affinity seam (unused by `capacity_weighted` scoring in M2b).
+/// session-affinity seam (unused by `capacity_weighted` scoring); `tier` is the subagent-tier
+/// signal read only by `cache_affinity_tier`.
 #[derive(Debug, Clone, Default)]
 pub struct SelectionCtx {
     pub now: i64,
     pub require_security_work_authorized: bool,
     pub rng_seed: Option<u64>,
     pub session_id: Option<String>,
+    pub tier: Option<Tier>,
 }
 
 #[cfg(test)]

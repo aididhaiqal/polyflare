@@ -13,7 +13,7 @@ use polyflare_anthropic::AnthropicToResponses;
 use polyflare_codex::oauth::{classify_failure, should_refresh, OAuthError};
 use polyflare_core::{
     Account, AccountId, Continuity, ContinuityDirective, NoopContinuity, Prepared, PreparedRequest,
-    Provider, RecoveryPlan, RequestCtx, ResponseStream, SelectionCtx, Translator,
+    Provider, RecoveryPlan, RequestCtx, ResponseStream, SelectionCtx, Tier, Translator,
 };
 use polyflare_store::{PlainTokens, RequestLogRecord, RequestLogRepo};
 
@@ -33,6 +33,27 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Map a reasoning-effort string to a routing `Tier` (the subagent-tier signal the
+/// `cache_affinity_tier` strategy reads). `minimal`/`low` → Low, `medium` → Medium, `high` → High.
+fn tier_from_effort(effort: Option<&str>) -> Option<Tier> {
+    match effort?.to_ascii_lowercase().as_str() {
+        "high" => Some(Tier::High),
+        "medium" => Some(Tier::Medium),
+        "low" | "minimal" => Some(Tier::Low),
+        _ => None,
+    }
+}
+
+/// Derive the request tier from a native `/responses` body's `reasoning.effort`. `None` when the
+/// request carries no effort hint (the tier-aware strategy then treats it as Medium).
+fn tier_from_body(body: &serde_json::Value) -> Option<Tier> {
+    tier_from_effort(
+        body.get("reasoning")
+            .and_then(|r| r.get("effort"))
+            .and_then(|e| e.as_str()),
+    )
 }
 
 fn account_unavailable() -> Response {
@@ -317,6 +338,8 @@ async fn responses_handler_impl(
         .unwrap_or_default()
         .to_string();
     let now = unix_now();
+    // Tier from the request's reasoning effort (read before `body` moves into `PreparedRequest`).
+    let tier = tier_from_body(&body);
 
     // C3: derive continuity ctx from headers + body.
     let ctx: RequestCtx = derive_request_ctx(&headers, &body);
@@ -346,21 +369,19 @@ async fn responses_handler_impl(
     // Then narrow to the requested pool: `None` (bare path) keeps all, `Some(slug)` keeps only that
     // pool's accounts. Composes with the provider filter over the same shared snapshot slice.
     let snapshots = filter_by_pool(&snapshots, pool);
+    // The selector for this pool (its configured strategy override, else the global default).
+    let selector = state.selector_for(pool);
     let sel_ctx = SelectionCtx {
         now,
         require_security_work_authorized: false,
         rng_seed: None,
         session_id: ctx.session_id.clone(),
+        tier,
     };
     let session_key = prepared.directive.session_key.clone();
 
     // C5: ownership pre-filter.
-    match apply_ownership(
-        &prepared.directive,
-        &snapshots,
-        state.selector.as_ref(),
-        &sel_ctx,
-    ) {
+    match apply_ownership(&prepared.directive, &snapshots, selector.as_ref(), &sel_ctx) {
         RouteDecision::Route(id) => {
             let (account, provider) = match resolve_core_account(&state, &id, now).await {
                 Ok(a) => a,
@@ -385,7 +406,7 @@ async fn responses_handler_impl(
             // signal the client if the input is a bare tail.
             match prepared.directive.recovery {
                 RecoveryPlan::ResendFull { anchorless_req } => {
-                    let fresh = match state.selector.pick(&snapshots, &sel_ctx) {
+                    let fresh = match selector.pick(&snapshots, &sel_ctx) {
                         Some(id) => id,
                         None => return no_eligible(),
                     };
@@ -427,7 +448,7 @@ async fn responses_handler_impl(
                     // account from the FULL candidate pool, ignoring the pin, and relay as a
                     // normal (Disarmed) request. `prepared.req` is still owned here — only
                     // `directive.recovery` was moved by the outer match.
-                    match state.selector.pick(&snapshots, &sel_ctx) {
+                    match selector.pick(&snapshots, &sel_ctx) {
                         Some(fresh) => {
                             let (account, provider) =
                                 match resolve_core_account(&state, &fresh, now).await {
@@ -575,13 +596,17 @@ async fn messages_handler_native(
     // Anthropic-provider account — the exact mirror of `/responses`'s Codex-only filter above.
     let snapshots = filter_by_provider(&snapshots, Provider::Anthropic);
     let snapshots = filter_by_pool(&snapshots, pool);
+    let selector = state.selector_for(pool);
     let sel_ctx = SelectionCtx {
         now,
         require_security_work_authorized: false,
         rng_seed: None,
         session_id: None,
+        // Native Anthropic requests carry no Codex model-alias tier; tier steering is a
+        // Codex-pool concern, so leave it unset here.
+        tier: None,
     };
-    let picked = match state.selector.pick(&snapshots, &sel_ctx) {
+    let picked = match selector.pick(&snapshots, &sel_ctx) {
         Some(id) => id,
         None => return no_eligible(),
     };
@@ -663,13 +688,16 @@ async fn messages_handler_codex_aliased(
     // a Codex-provider account, regardless of what `/v1/messages` itself would otherwise select.
     let snapshots = filter_by_provider(&snapshots, Provider::Codex);
     let snapshots = filter_by_pool(&snapshots, pool);
+    let selector = state.selector_for(pool);
     let sel_ctx = SelectionCtx {
         now,
         require_security_work_authorized: false,
         rng_seed: None,
         session_id: None,
+        // The subagent tier IS the alias's reasoning effort (opus→high, sonnet→medium, haiku→low).
+        tier: tier_from_effort(model_alias.reasoning_effort.as_deref()),
     };
-    let picked = match state.selector.pick(&snapshots, &sel_ctx) {
+    let picked = match selector.pick(&snapshots, &sel_ctx) {
         Some(id) => id,
         None => return no_eligible(),
     };

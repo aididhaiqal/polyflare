@@ -103,6 +103,7 @@ async fn no_anchor_request_on_ineligible_owner_fails_over_not_500() {
         codex_executor: Arc::new(CodexExecutor::new().unwrap()),
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(ExcludeReauth),
+        pool_selectors: Default::default(),
         continuity,
         store,
         cipher: TokenCipher::from_key_bytes(&[11u8; 32]).unwrap(),

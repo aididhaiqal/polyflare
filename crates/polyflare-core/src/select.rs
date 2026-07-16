@@ -3,13 +3,15 @@
 //! deterministic given a seeded RNG: no I/O, no clock reads (time enters via `SelectionCtx::now`,
 //! randomness via `SelectionCtx::rng_seed`).
 
+use std::sync::Arc;
+
 use rand::distr::weighted::WeightedIndex;
 use rand::distr::Distribution;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::traits::Selector;
-use crate::types::{AccountId, AccountSnapshot, SelectionCtx};
+use crate::types::{AccountId, AccountSnapshot, SelectionCtx, Tier};
 
 /// Plan-type alias map (codex-lb `CAPACITY_PLAN_ALIASES`, logic.py:73-81). Input must already be
 /// trimmed + lowercased. `None` ⇒ not an alias (the caller keeps the normalized string as-is).
@@ -65,13 +67,22 @@ struct Candidate<'a> {
 }
 
 impl Candidate<'_> {
+    /// The account's total secondary-window capacity (per-account override, else plan-derived).
+    fn capacity(&self) -> f64 {
+        self.snap
+            .capacity_credits
+            .unwrap_or_else(|| plan_capacity_secondary(&self.snap.plan_type))
+    }
+
     /// remaining_secondary_credits = max(0, capacity * (1 - min(secondary_used%,100)/100)).
     fn remaining_secondary_credits(&self) -> f64 {
-        let capacity = self
-            .snap
-            .capacity_credits
-            .unwrap_or_else(|| plan_capacity_secondary(&self.snap.plan_type));
-        (capacity * (1.0 - self.eff_secondary_used.min(100.0) / 100.0)).max(0.0)
+        (self.capacity() * (1.0 - self.eff_secondary_used.min(100.0) / 100.0)).max(0.0)
+    }
+
+    /// How "warm" the account is (highest current usage across windows) — drives `fill_first`
+    /// prompt-cache locality (saturate the warmest still-eligible account).
+    fn warmth(&self) -> f64 {
+        self.eff_used.max(self.eff_secondary_used)
     }
 
     /// should_drain if used%>=85 OR secondary%>=90 OR (error_count>=2 within 60s of last error).
@@ -237,27 +248,25 @@ fn deterministic_min<'a, 'b>(pool: &'a [Candidate<'b>]) -> &'a Candidate<'b> {
         .expect("pool is non-empty")
 }
 
-/// Weighted-random pick by remaining secondary credits (step 4). All-zero weights fall back to
-/// the deterministic tiebreak. The RNG is seeded from `ctx.rng_seed` when present (parity).
-fn weighted_pick(pool: &[Candidate<'_>], ctx: &SelectionCtx) -> Option<AccountId> {
+/// Sample one account from `pool` by `weights` (seeded from `ctx.rng_seed` when present, for
+/// parity/determinism). All-zero or invalid weights fall back to the deterministic tiebreak. The
+/// weight vector must align 1:1 with `pool`.
+fn sample_weighted(
+    pool: &[Candidate<'_>],
+    weights: &[f64],
+    ctx: &SelectionCtx,
+) -> Option<AccountId> {
     if pool.is_empty() {
         return None;
     }
-    let weights: Vec<f64> = pool
-        .iter()
-        .map(Candidate::remaining_secondary_credits)
-        .collect();
-
     if weights.iter().all(|w| *w <= 0.0) {
         return Some(deterministic_min(pool).snap.id.clone());
     }
-
-    let dist = match WeightedIndex::new(&weights) {
+    let dist = match WeightedIndex::new(weights) {
         Ok(d) => d,
         // Defensive: any weight error (e.g. all-zero slipping through) → deterministic pick.
         Err(_) => return Some(deterministic_min(pool).snap.id.clone()),
     };
-
     let idx = match ctx.rng_seed {
         Some(seed) => dist.sample(&mut StdRng::seed_from_u64(seed)),
         None => dist.sample(&mut rand::rng()),
@@ -265,35 +274,241 @@ fn weighted_pick(pool: &[Candidate<'_>], ctx: &SelectionCtx) -> Option<AccountId
     Some(pool[idx].snap.id.clone())
 }
 
-/// The default selector: (S3 ordering) continuity-ownership + session-affinity are M3 no-op
-/// passthroughs here; TA6 capability pre-filter → eligibility → health-tier → policy waterfall →
-/// capacity-weighted pick.
+/// Weighted-random pick by remaining secondary credits (capacity_weighted step 4).
+fn weighted_pick(pool: &[Candidate<'_>], ctx: &SelectionCtx) -> Option<AccountId> {
+    let weights: Vec<f64> = pool
+        .iter()
+        .map(Candidate::remaining_secondary_credits)
+        .collect();
+    sample_weighted(pool, &weights, ctx)
+}
+
+/// The shared pre-weighting pipeline for the "pool-first" strategies (capacity_weighted,
+/// usage_weighted, round_robin, fill_first, sequential_drain): TA6 capability pre-filter →
+/// eligibility hard-filter → health-tier pooling → burn/normal/preserve waterfall. Returns the
+/// final candidate pool (empty ⇒ no eligible account). Continuity-ownership + session-affinity are
+/// applied by the ingress BEFORE the selector (a hard pre-filter), not here.
+fn standard_pool<'a>(candidates: &'a [AccountSnapshot], ctx: &SelectionCtx) -> Vec<Candidate<'a>> {
+    let eligible: Vec<Candidate> = candidates
+        .iter()
+        .filter(|s| !ctx.require_security_work_authorized || s.security_work_authorized)
+        .filter_map(|s| eligibility(s, ctx.now))
+        .collect();
+    if eligible.is_empty() {
+        return Vec::new();
+    }
+    let pool = health_tier_pool(&eligible, ctx.now);
+    policy_waterfall(&pool)
+}
+
+/// The lexicographic min of `pool` by `key` ascending, then account id ascending (deterministic).
+fn deterministic_by<'a, 'b, F>(pool: &'a [Candidate<'b>], key: F) -> Option<AccountId>
+where
+    F: Fn(&Candidate<'b>) -> f64,
+{
+    pool.iter()
+        .min_by(|a, b| {
+            key(a)
+                .total_cmp(&key(b))
+                .then(a.snap.id.as_str().cmp(b.snap.id.as_str()))
+        })
+        .map(|c| c.snap.id.clone())
+}
+
+/// The default selector: TA6 capability pre-filter → eligibility → health-tier → policy waterfall →
+/// capacity-weighted random pick (weighted by remaining weekly credits). Deterministic under a seed.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CapacityWeighted;
 
 impl Selector for CapacityWeighted {
     fn pick(&self, candidates: &[AccountSnapshot], ctx: &SelectionCtx) -> Option<AccountId> {
-        let now = ctx.now;
+        weighted_pick(&standard_pool(candidates, ctx), ctx)
+    }
+}
 
-        // (S3 steps 1–2) continuity-ownership + session-affinity: M3 hard pre-filters; in M2b
-        // they are no-op passthroughs (every candidate passes).
+/// Deterministic: the least weekly-used eligible account (even utilization; testable). Tiebreak id.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UsageWeighted;
 
-        // TA6 capability hard pre-filter (above scoring), then eligibility hard-filter.
+impl Selector for UsageWeighted {
+    fn pick(&self, candidates: &[AccountSnapshot], ctx: &SelectionCtx) -> Option<AccountId> {
+        deterministic_by(&standard_pool(candidates, ctx), |c| c.eff_secondary_used)
+    }
+}
+
+/// Deterministic: the least-recently-selected eligible account (round-robin fairness). NOTE:
+/// `last_selected_at` is not yet live-tracked (always `None`), so until it is written on selection
+/// this degenerates to the id tiebreak — intentional, documented, and correct the moment tracking
+/// lands.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RoundRobin;
+
+impl Selector for RoundRobin {
+    fn pick(&self, candidates: &[AccountSnapshot], ctx: &SelectionCtx) -> Option<AccountId> {
+        deterministic_by(&standard_pool(candidates, ctx), |c| {
+            c.snap.last_selected_at.unwrap_or(0) as f64
+        })
+    }
+}
+
+/// Deterministic: saturate the WARMEST eligible account (highest current usage) for prompt-cache
+/// locality — max `warmth`, tiebreak id.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FillFirst;
+
+impl Selector for FillFirst {
+    fn pick(&self, candidates: &[AccountSnapshot], ctx: &SelectionCtx) -> Option<AccountId> {
+        // max warmth == min(-warmth); the shared helper does the id tiebreak.
+        deterministic_by(&standard_pool(candidates, ctx), |c| -c.warmth())
+    }
+}
+
+/// Deterministic: the SMALLEST-capacity eligible account first — burn cheap/throwaway accounts
+/// before the big ones. Tiebreak id.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SequentialDrain;
+
+impl Selector for SequentialDrain {
+    fn pick(&self, candidates: &[AccountSnapshot], ctx: &SelectionCtx) -> Option<AccountId> {
+        deterministic_by(&standard_pool(candidates, ctx), Candidate::capacity)
+    }
+}
+
+/// Above this weekly-used%, a High-tier (opus) turn strongly deprioritizes the account (keep fresh
+/// headroom for expensive orchestration).
+const HIGH_RESERVE_CEIL: f64 = 70.0;
+/// A small floor so a fully-fresh account stays weakly reachable for Low-tier (haiku) packing.
+const LOW_FLOOR: f64 = 100.0;
+
+/// Tier-aware routing (Phase 2 of the routing design): eligibility + policy waterfall, then a
+/// TIER-STEERED weighted pick. It deliberately SKIPS the health-tier hard pool so Low-tier searchers
+/// can reach near-limit accounts — the per-tier weights carry the health/fill preference instead:
+/// - **High** (opus orchestrator): weight ≈ remaining credits, strongly deprioritizing near-limit
+///   (`secondary_used ≥ HIGH_RESERVE_CEIL`) and draining accounts → fresh/preserved capacity.
+/// - **Medium** (sonnet): weight ≈ remaining credits (soft draining penalty) — like capacity_weighted.
+/// - **Low** (haiku searcher): weight ≈ CONSUMED credits (+`LOW_FLOOR`) → packs onto near-limit
+///   accounts, sparing fresh capacity for expensive turns.
+///
+/// Absent `ctx.tier` is treated as Medium. Session soft-pin (cache locality for anchor-less first
+/// turns) is Phase 3 and not implemented here — anchor ownership already covers resumed turns.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CacheAffinityTier;
+
+impl CacheAffinityTier {
+    fn tier_weight(c: &Candidate, tier: Tier, now: i64) -> f64 {
+        let remaining = c.remaining_secondary_credits();
+        let consumed = (c.capacity() - remaining).max(0.0);
+        let draining = c.should_drain(now);
+        let w = match tier {
+            Tier::High => {
+                let base = if c.eff_secondary_used < HIGH_RESERVE_CEIL {
+                    remaining
+                } else {
+                    remaining * 0.05
+                };
+                if draining {
+                    base * 0.05
+                } else {
+                    base
+                }
+            }
+            Tier::Medium => {
+                if draining {
+                    remaining * 0.1
+                } else {
+                    remaining
+                }
+            }
+            Tier::Low => consumed + LOW_FLOOR,
+        };
+        w.max(0.0)
+    }
+}
+
+impl Selector for CacheAffinityTier {
+    fn pick(&self, candidates: &[AccountSnapshot], ctx: &SelectionCtx) -> Option<AccountId> {
+        // Eligibility + policy waterfall (respect burn/preserve). Skip the health-tier hard pool so
+        // Low tier can pack onto near-limit accounts — weights carry the health preference.
         let eligible: Vec<Candidate> = candidates
             .iter()
             .filter(|s| !ctx.require_security_work_authorized || s.security_work_authorized)
-            .filter_map(|s| eligibility(s, now))
+            .filter_map(|s| eligibility(s, ctx.now))
             .collect();
         if eligible.is_empty() {
             return None;
         }
+        let pool = policy_waterfall(&eligible);
+        let tier = ctx.tier.unwrap_or(Tier::Medium);
+        let weights: Vec<f64> = pool
+            .iter()
+            .map(|c| Self::tier_weight(c, tier, ctx.now))
+            .collect();
+        sample_weighted(&pool, &weights, ctx)
+    }
+}
 
-        // Health-tier pooling, then burn/normal/preserve waterfall.
-        let pool = health_tier_pool(&eligible, now);
-        let pool = policy_waterfall(&pool);
+/// The config-selectable routing strategies. `CapacityWeighted` is the default. Each maps to a
+/// stateless `Selector` behind the existing trait seam — no per-strategy state, so building one is
+/// cheap (every selector is a ZST).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingStrategy {
+    #[default]
+    CapacityWeighted,
+    UsageWeighted,
+    RoundRobin,
+    FillFirst,
+    SequentialDrain,
+    CacheAffinityTier,
+}
 
-        // Capacity-weighted random pick (deterministic under a seed).
-        weighted_pick(&pool, ctx)
+impl RoutingStrategy {
+    /// Parse a snake_case config string; `None` ⇒ unrecognized.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "capacity_weighted" => Some(Self::CapacityWeighted),
+            "usage_weighted" => Some(Self::UsageWeighted),
+            "round_robin" => Some(Self::RoundRobin),
+            "fill_first" => Some(Self::FillFirst),
+            "sequential_drain" => Some(Self::SequentialDrain),
+            "cache_affinity_tier" => Some(Self::CacheAffinityTier),
+            _ => None,
+        }
+    }
+
+    /// The canonical snake_case name.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::CapacityWeighted => "capacity_weighted",
+            Self::UsageWeighted => "usage_weighted",
+            Self::RoundRobin => "round_robin",
+            Self::FillFirst => "fill_first",
+            Self::SequentialDrain => "sequential_drain",
+            Self::CacheAffinityTier => "cache_affinity_tier",
+        }
+    }
+
+    /// Every strategy's canonical name (for config help / the dashboard).
+    pub fn all() -> [RoutingStrategy; 6] {
+        [
+            Self::CapacityWeighted,
+            Self::UsageWeighted,
+            Self::RoundRobin,
+            Self::FillFirst,
+            Self::SequentialDrain,
+            Self::CacheAffinityTier,
+        ]
+    }
+
+    /// Build the selector for this strategy (cheap — every selector is a ZST).
+    pub fn selector(&self) -> Arc<dyn Selector> {
+        match self {
+            Self::CapacityWeighted => Arc::new(CapacityWeighted),
+            Self::UsageWeighted => Arc::new(UsageWeighted),
+            Self::RoundRobin => Arc::new(RoundRobin),
+            Self::FillFirst => Arc::new(FillFirst),
+            Self::SequentialDrain => Arc::new(SequentialDrain),
+            Self::CacheAffinityTier => Arc::new(CacheAffinityTier),
+        }
     }
 }
 
@@ -309,6 +524,14 @@ mod tests {
             require_security_work_authorized: false,
             rng_seed: Some(seed),
             session_id: None,
+            tier: None,
+        }
+    }
+
+    fn ctx_tier(now: i64, seed: u64, tier: Tier) -> SelectionCtx {
+        SelectionCtx {
+            tier: Some(tier),
+            ..ctx(now, seed)
         }
     }
 
@@ -386,6 +609,7 @@ mod tests {
             require_security_work_authorized: true,
             rng_seed: Some(1),
             session_id: None,
+            tier: None,
         };
         assert_eq!(sel.pick(&[a, b], &c).unwrap().as_str(), "b");
     }
@@ -399,6 +623,7 @@ mod tests {
             require_security_work_authorized: true,
             rng_seed: Some(1),
             session_id: None,
+            tier: None,
         };
         assert!(sel.pick(&[a], &c).is_none());
     }
@@ -585,5 +810,156 @@ mod tests {
         assert_eq!(plan_capacity_secondary("banana"), 1134.0);
         assert_eq!(plan_capacity_secondary(""), 1134.0);
         assert_eq!(plan_capacity_secondary("   "), 1134.0);
+    }
+
+    // ---- Strategy factory ----
+
+    #[test]
+    fn routing_strategy_parses_names_round_trip_and_defaults() {
+        for s in RoutingStrategy::all() {
+            assert_eq!(RoutingStrategy::parse(s.name()), Some(s));
+        }
+        assert_eq!(
+            RoutingStrategy::parse("  Capacity_Weighted "),
+            Some(RoutingStrategy::CapacityWeighted)
+        );
+        assert_eq!(RoutingStrategy::parse("bogus"), None);
+        assert_eq!(
+            RoutingStrategy::default(),
+            RoutingStrategy::CapacityWeighted
+        );
+    }
+
+    // ---- Deterministic ported strategies ----
+
+    #[test]
+    fn usage_weighted_picks_least_weekly_used() {
+        let low = snap("low", "pro", 20.0);
+        let high = snap("high", "pro", 70.0);
+        assert_eq!(
+            UsageWeighted
+                .pick(&[high, low], &ctx(0, 1))
+                .unwrap()
+                .as_str(),
+            "low"
+        );
+    }
+
+    #[test]
+    fn fill_first_saturates_the_warmest_eligible_account() {
+        // "warm" but still eligible (secondary 80% < the 90% drain line) beats a fresh one.
+        let warm = snap("warm", "pro", 80.0);
+        let fresh = snap("fresh", "pro", 5.0);
+        assert_eq!(
+            FillFirst.pick(&[fresh, warm], &ctx(0, 1)).unwrap().as_str(),
+            "warm"
+        );
+    }
+
+    #[test]
+    fn sequential_drain_burns_the_smallest_capacity_first() {
+        let big = snap("big", "pro", 0.0); // capacity 50400
+        let small = snap("small", "free", 0.0); // capacity 1134
+        assert_eq!(
+            SequentialDrain
+                .pick(&[big, small], &ctx(0, 1))
+                .unwrap()
+                .as_str(),
+            "small"
+        );
+    }
+
+    // ---- Tier-aware (cache_affinity_tier) ----
+
+    #[test]
+    fn low_tier_packs_onto_the_near_limit_account() {
+        // A haiku searcher (Low) should pack onto the busy account, sparing the fresh one — the
+        // OPPOSITE of capacity_weighted, which favors the account with more headroom.
+        let busy = snap("busy", "pro", 75.0); // lots consumed
+        let fresh = snap("fresh", "pro", 5.0); // lots remaining
+        let mut busy_wins = 0;
+        for seed in 0..400u64 {
+            if CacheAffinityTier
+                .pick(
+                    &[busy.clone(), fresh.clone()],
+                    &ctx_tier(0, seed, Tier::Low),
+                )
+                .unwrap()
+                .as_str()
+                == "busy"
+            {
+                busy_wins += 1;
+            }
+        }
+        assert!(
+            busy_wins > 300,
+            "Low tier should pack onto the busy account, got {busy_wins}/400"
+        );
+    }
+
+    #[test]
+    fn high_tier_prefers_fresh_capacity_over_near_limit() {
+        // An opus orchestrator (High) should land on the fresh account, avoiding the near-limit one
+        // (secondary 80% > HIGH_RESERVE_CEIL 70 ⇒ 0.05x weight).
+        let near_limit = snap("near", "pro", 80.0);
+        let fresh = snap("fresh", "pro", 10.0);
+        let mut fresh_wins = 0;
+        for seed in 0..400u64 {
+            if CacheAffinityTier
+                .pick(
+                    &[near_limit.clone(), fresh.clone()],
+                    &ctx_tier(0, seed, Tier::High),
+                )
+                .unwrap()
+                .as_str()
+                == "fresh"
+            {
+                fresh_wins += 1;
+            }
+        }
+        assert!(
+            fresh_wins > 350,
+            "High tier should prefer fresh capacity, got {fresh_wins}/400"
+        );
+    }
+
+    #[test]
+    fn cache_affinity_absent_tier_behaves_like_medium_capacity_weighting() {
+        // No tier ⇒ Medium ⇒ weight ~ remaining credits, so the higher-headroom account dominates
+        // (same shape as capacity_weighted).
+        let big = snap("big", "pro", 0.0);
+        let small = snap("small", "free", 0.0);
+        let mut big_wins = 0;
+        for seed in 0..500u64 {
+            if CacheAffinityTier
+                .pick(&[big.clone(), small.clone()], &ctx(0, seed))
+                .unwrap()
+                .as_str()
+                == "big"
+            {
+                big_wins += 1;
+            }
+        }
+        assert!(
+            big_wins > 450,
+            "absent tier ⇒ medium ⇒ headroom-weighted, got {big_wins}/500"
+        );
+    }
+
+    #[test]
+    fn all_strategies_respect_eligibility_and_empty_pool() {
+        // A paused account is ineligible under every strategy → no pick.
+        let mut paused = snap("p", "pro", 0.0);
+        paused.status = "paused".to_string();
+        for strat in RoutingStrategy::all() {
+            assert!(
+                strat
+                    .selector()
+                    .pick(&[paused.clone()], &ctx(0, 1))
+                    .is_none(),
+                "{} must skip a paused account",
+                strat.name()
+            );
+        }
     }
 }
