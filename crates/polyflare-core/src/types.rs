@@ -49,13 +49,38 @@ impl std::fmt::Debug for PreparedRequest {
     }
 }
 
+/// A classified upstream-failure signal extracted from a non-2xx response — the routing-health
+/// inputs the ingress uses to bench / cool-down the account that produced the failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailureSignal {
+    /// The upstream HTTP status code.
+    pub status: u16,
+    /// The upstream `Retry-After`, in seconds, if it sent a parseable one.
+    pub retry_after: Option<i64>,
+}
+
 /// Errors an executor can surface.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
+    /// A transport / connection failure with no upstream HTTP status.
     #[error("upstream request failed: {0}")]
     Upstream(String),
+    /// A non-2xx upstream response, carrying its status + optional `Retry-After` so the ingress can
+    /// classify the failure (429 ⇒ rate-limit cooldown, 5xx ⇒ transient error, etc.).
+    #[error("upstream returned status {}", .0.status)]
+    UpstreamStatus(FailureSignal),
     #[error("stream error: {0}")]
     Stream(String),
+}
+
+impl ExecError {
+    /// The failure signal for routing-health writeback, when this error carries an upstream status.
+    pub fn failure_signal(&self) -> Option<FailureSignal> {
+        match self {
+            ExecError::UpstreamStatus(s) => Some(*s),
+            _ => None,
+        }
+    }
 }
 
 /// A non-buffering streaming response body: pinned, boxed, `Send` stream of byte chunks.

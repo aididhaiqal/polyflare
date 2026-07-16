@@ -138,5 +138,9 @@ async fn executor_surfaces_upstream_error_status() {
         raw_body: None,
     };
     let err = executor.execute(req, &account).await.err().unwrap();
-    assert!(matches!(err, polyflare_core::ExecError::Upstream(_)));
+    // A non-2xx (404 here) now surfaces the structured status for routing-health classification.
+    assert!(
+        matches!(err, polyflare_core::ExecError::UpstreamStatus(s) if s.status == 404),
+        "expected UpstreamStatus(404), got {err:?}"
+    );
 }

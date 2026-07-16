@@ -26,6 +26,7 @@ use crate::snapshot::filter_by_provider_and_pool;
 use crate::translate_stream::wrap_translating_stream;
 use crate::watchdog::{
     apply_ownership, execute_recovery, execute_with_watchdog, signal_client_stream, RouteDecision,
+    WatchdogError,
 };
 
 fn unix_now() -> i64 {
@@ -62,6 +63,26 @@ fn internal_error() -> Response {
 
 fn no_eligible() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "no eligible account").into_response()
+}
+
+/// Classify a watchdog failure and write the routing-health signal for the account `id` that
+/// produced it, so the selector benches / cools it down on the NEXT request (via the runtime
+/// overlay). A 429 ⇒ rate-limit cooldown (honoring `Retry-After`); a 5xx or a transport / mid-stream
+/// drop ⇒ a transient error (the selector's error-backoff gate handles repeat offenders). Other 4xx
+/// (a bad request, a 404) are a client/request problem, NOT an account-health signal, so they don't
+/// bench the account. A `Continuity` error is not an account-health signal either.
+fn record_failure(state: &AppState, id: &AccountId, err: &WatchdogError, now: i64) {
+    let WatchdogError::Upstream(signal) = err else {
+        return;
+    };
+    match signal {
+        Some(sig) if sig.status == 429 => state.runtime.record_rate_limit(id, sig.retry_after, now),
+        Some(sig) if (500..=599).contains(&sig.status) => {
+            state.runtime.record_transient_error(id, now)
+        }
+        Some(_) => {} // other 4xx: request-level, not account-health.
+        None => state.runtime.record_transient_error(id, now), // transport error / mid-stream drop.
+    }
 }
 
 /// M5 capture-fixture mechanism: if `state.capture_fingerprint_path` is set, append this
@@ -438,6 +459,7 @@ async fn responses_handler_impl(
                 Ok(a) => a,
                 Err(r) => return r,
             };
+            let health_id = id.clone(); // `id` is moved into the executor below.
             match execute_with_watchdog(
                 state.executor_for(provider).as_ref(),
                 state.continuity.clone(),
@@ -449,7 +471,10 @@ async fn responses_handler_impl(
             .await
             {
                 Ok(stream) => stream_response(stream),
-                Err(_) => (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
+                Err(e) => {
+                    record_failure(&state, &health_id, &e, now);
+                    (StatusCode::BAD_GATEWAY, "upstream error").into_response()
+                }
             }
         }
         RouteDecision::Recover => {
@@ -466,6 +491,7 @@ async fn responses_handler_impl(
                         Ok(a) => a,
                         Err(r) => return r,
                     };
+                    let health_id = fresh.clone(); // `fresh` is moved into the executor below.
                     match execute_recovery(
                         state.executor_for(provider).as_ref(),
                         state.continuity.clone(),
@@ -478,7 +504,10 @@ async fn responses_handler_impl(
                     .await
                     {
                         Ok(stream) => stream_response(stream),
-                        Err(_) => (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
+                        Err(e) => {
+                            record_failure(&state, &health_id, &e, now);
+                            (StatusCode::BAD_GATEWAY, "upstream error").into_response()
+                        }
                     }
                 }
                 RecoveryPlan::SignalClient => {
@@ -515,6 +544,7 @@ async fn responses_handler_impl(
                                     session_key: prepared.directive.session_key.clone(),
                                 },
                             };
+                            let health_id = fresh.clone(); // moved into the executor below.
                             match execute_with_watchdog(
                                 state.executor_for(provider).as_ref(),
                                 state.continuity.clone(),
@@ -526,7 +556,8 @@ async fn responses_handler_impl(
                             .await
                             {
                                 Ok(stream) => stream_response(stream),
-                                Err(_) => {
+                                Err(e) => {
+                                    record_failure(&state, &health_id, &e, now);
                                     (StatusCode::BAD_GATEWAY, "upstream error").into_response()
                                 }
                             }
@@ -668,6 +699,7 @@ async fn messages_handler_native(
         Err(r) => return r,
     };
 
+    let health_id = picked.clone(); // moved into the executor below.
     match execute_with_watchdog(
         state.executor_for(provider).as_ref(),
         Arc::new(NoopContinuity) as Arc<dyn Continuity>,
@@ -679,7 +711,10 @@ async fn messages_handler_native(
     .await
     {
         Ok(stream) => stream_response(stream),
-        Err(_) => (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
+        Err(e) => {
+            record_failure(&state, &health_id, &e, now);
+            (StatusCode::BAD_GATEWAY, "upstream error").into_response()
+        }
     }
 }
 
@@ -761,6 +796,7 @@ async fn messages_handler_codex_aliased(
         Err(r) => return r,
     };
 
+    let health_id = picked.clone(); // moved into the executor below.
     match execute_with_watchdog(
         state.executor_for(provider).as_ref(),
         Arc::new(NoopContinuity) as Arc<dyn Continuity>,
@@ -776,6 +812,9 @@ async fn messages_handler_codex_aliased(
                 wrap_translating_stream(stream, Box::new(translator) as Box<dyn Translator>);
             stream_response(translated_stream)
         }
-        Err(_) => (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
+        Err(e) => {
+            record_failure(&state, &health_id, &e, now);
+            (StatusCode::BAD_GATEWAY, "upstream error").into_response()
+        }
     }
 }

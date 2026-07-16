@@ -179,7 +179,7 @@ async fn hard_upstream_error_is_watchdog_upstream() {
         RequestCtx::default(),
     )
     .await;
-    assert!(matches!(res, Err(WatchdogError::Upstream)));
+    assert!(matches!(res, Err(WatchdogError::Upstream(_))));
 }
 
 #[tokio::test]
@@ -217,7 +217,7 @@ async fn mid_race_first_item_error_is_watchdog_upstream_and_does_not_recover() {
     .expect("bounded: a mid-race hard error must not hang");
 
     match res {
-        Err(WatchdogError::Upstream) => {}
+        Err(WatchdogError::Upstream(_)) => {}
         Err(other) => panic!("expected WatchdogError::Upstream, got {other:?}"),
         Ok(_) => panic!("mid-race first-item error must not relay a stream to the caller"),
     }

@@ -22,9 +22,22 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER,
+};
 
 use polyflare_core::{Account, ExecError, Executor, PreparedRequest, ResponseStream};
+
+/// Parse the numeric-seconds form of `Retry-After` (the form the Codex/OpenAI backend sends on a
+/// 429). The HTTP-date form is ignored (returns `None` ⇒ the caller falls back to exponential
+/// backoff). Negative values are rejected.
+fn retry_after_secs(headers: &HeaderMap) -> Option<i64> {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|&s| s >= 0)
+}
 
 // Pins the exact aws-lc-rs version (see workspace Cargo.toml) that rustls's `aws_lc_rs` feature
 // resolves to transitively; never called directly ourselves — `rustls::crypto::aws_lc_rs` is the
@@ -131,7 +144,10 @@ impl Executor for CodexExecutor {
             .map_err(|e| ExecError::Upstream(e.to_string()))?;
 
         if !resp.status().is_success() {
-            return Err(ExecError::Upstream(format!("status {}", resp.status())));
+            return Err(ExecError::UpstreamStatus(polyflare_core::FailureSignal {
+                status: resp.status().as_u16(),
+                retry_after: retry_after_secs(resp.headers()),
+            }));
         }
 
         let stream = resp
