@@ -17,7 +17,15 @@ use polyflare_core::{
     SessionKey, TurnOutcome, WatchdogArm,
 };
 
+use crate::runtime_state::RuntimeStates;
 use crate::session_key::sha256_hex;
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// VERIFY-at-implementation (SPEC-M3 risk 7): capture the exact `previous_response_not_found` shape
 /// the real Codex CLI / Claude Code self-heals from (codex-lb masking behavior or a live capture)
@@ -109,6 +117,7 @@ pub async fn execute_with_watchdog(
     account: &Account,
     account_id: AccountId,
     ctx: RequestCtx,
+    runtime: Arc<RuntimeStates>,
 ) -> Result<ResponseStream, WatchdogError> {
     let Prepared { req, directive } = prepared;
     let session_key = directive.session_key.clone();
@@ -128,6 +137,7 @@ pub async fn execute_with_watchdog(
                 account_id,
                 session_key,
                 OutcomeKind::Completed { fp, count },
+                runtime,
             ))
         }
         WatchdogArm::Armed { timeout } => {
@@ -148,6 +158,7 @@ pub async fn execute_with_watchdog(
                         account_id,
                         session_key,
                         OutcomeKind::Completed { fp, count },
+                        runtime,
                     ))
                 }
                 Ok(Some(Err(e))) => {
@@ -178,6 +189,7 @@ pub async fn execute_with_watchdog(
                                 account_id,
                                 ctx,
                                 session_key,
+                                runtime,
                             )
                             .await
                         }
@@ -197,6 +209,7 @@ pub async fn execute_with_watchdog(
 
 /// Re-execute an anchor-stripped request (Strategy A). Anchorless ⇒ cannot be silent, so no second
 /// watchdog. Sniffs the new id and observes `Recovered`.
+#[allow(clippy::too_many_arguments)] // internal fn; each param is a distinct, clearly-named handle.
 pub async fn execute_recovery(
     executor: &dyn Executor,
     continuity: Arc<dyn Continuity>,
@@ -205,6 +218,7 @@ pub async fn execute_recovery(
     account_id: AccountId,
     ctx: RequestCtx,
     session_key: Option<SessionKey>,
+    runtime: Arc<RuntimeStates>,
 ) -> Result<ResponseStream, WatchdogError> {
     let stream = executor
         .execute(anchorless_req, account)
@@ -217,6 +231,7 @@ pub async fn execute_recovery(
         account_id,
         session_key,
         OutcomeKind::Recovered,
+        runtime,
     ))
 }
 
@@ -355,6 +370,12 @@ struct ObservingStream {
     session_key: Option<SessionKey>,
     kind: OutcomeKind,
     state: ObserveState,
+    /// A3: records the account's routing-health at TRUE stream completion — clean EOF ⇒ success
+    /// (clear the error state), a mid-stream error ⇒ transient error. This is why success recording
+    /// lives here and NOT at the `Ok(stream)` return: only here is the account's ACTUAL outcome
+    /// known, and the synthetic `signal_client_stream` (not wrapped in `ObservingStream`) is
+    /// correctly excluded.
+    runtime: Arc<RuntimeStates>,
 }
 
 impl Stream for ObservingStream {
@@ -369,8 +390,17 @@ impl Stream for ObservingStream {
                         this.sniffer.feed(&bytes);
                         return Poll::Ready(Some(Ok(bytes)));
                     }
-                    Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                    Poll::Ready(Some(Err(e))) => {
+                        // A3: a mid-stream drop (after the first byte) — the account served a partial
+                        // response then failed. Count it as a transient error, then forward the error.
+                        this.runtime
+                            .record_transient_error(&this.account, unix_now());
+                        return Poll::Ready(Some(Err(e)));
+                    }
                     Poll::Ready(None) => {
+                        // A3: clean EOF ⇒ the account completed the turn — clear its error state so
+                        // intermittent blips don't accumulate it into permanent backoff/drain.
+                        this.runtime.record_success(&this.account, unix_now());
                         let outcome = build_outcome(
                             this.kind.clone(),
                             this.session_key.clone(),
@@ -407,6 +437,7 @@ fn wrap_stream(
     account: AccountId,
     session_key: Option<SessionKey>,
     kind: OutcomeKind,
+    runtime: Arc<RuntimeStates>,
 ) -> ResponseStream {
     Box::pin(ObservingStream {
         inner,
@@ -417,6 +448,7 @@ fn wrap_stream(
         session_key,
         kind,
         state: ObserveState::Streaming,
+        runtime,
     })
 }
 
