@@ -217,3 +217,40 @@ async fn usage_refresh_persists_windows_and_gate() {
     assert_eq!(acct.status, "active");
     assert_eq!(acct.reset_at, None);
 }
+
+#[tokio::test]
+async fn get_with_tokens_returns_account_and_decrypted_tokens_in_one_call() {
+    // The request hot path's single-read replacement for `get` + `decrypt_tokens`: it must return
+    // the SAME account row and the SAME decrypted tokens as the two-call sequence.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[21u8; 32]).unwrap();
+    let repo = store.accounts();
+    repo.insert(&sample_account("acct-1"), &sample_tokens(), &cipher)
+        .await
+        .unwrap();
+
+    let (account, tokens) = repo
+        .get_with_tokens("acct-1", &cipher)
+        .await
+        .unwrap()
+        .expect("account present");
+    // Account row matches `get`.
+    let via_get = repo.get("acct-1").await.unwrap().unwrap();
+    assert_eq!(account.id, via_get.id);
+    assert_eq!(account.email, via_get.email);
+    assert_eq!(account.provider, via_get.provider);
+    assert_eq!(account.chatgpt_account_id, via_get.chatgpt_account_id);
+    // Tokens match `decrypt_tokens` (== the originals).
+    assert_eq!(tokens.access_token, "access-abc");
+    assert_eq!(tokens.refresh_token, "refresh-def");
+    assert_eq!(tokens.id_token, "id-ghi");
+
+    assert!(
+        repo.get_with_tokens("missing", &cipher)
+            .await
+            .unwrap()
+            .is_none(),
+        "absent id → None"
+    );
+}

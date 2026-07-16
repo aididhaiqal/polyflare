@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use sqlx::sqlite::SqlitePool;
+use sqlx::FromRow;
 
 use crate::crypto::TokenCipher;
 use crate::StoreError;
@@ -113,6 +114,14 @@ const SELECT_ACCOUNT_BY_CHATGPT_ID: &str =
     created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
     provider, pool FROM accounts WHERE chatgpt_account_id = ?";
 
+/// The account row + its three token blobs in ONE row, so the request hot path resolves an account
+/// with a single SELECT instead of `get` + `decrypt_tokens` (two round-trips for the same row).
+/// Columns cover both `Account`'s and `EncryptedTokens`' `FromRow` impls.
+const SELECT_ACCOUNT_WITH_TOKENS: &str = "SELECT id, chatgpt_account_id, chatgpt_user_id, email, \
+    alias, workspace_id, workspace_label, seat_type, plan_type, routing_policy, last_refresh, \
+    created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
+    provider, pool, access_token_enc, refresh_token_enc, id_token_enc FROM accounts WHERE id = ?";
+
 /// CRUD over the `accounts` table. Cheap to construct (clones the pool handle + generation Arc).
 pub struct AccountRepo {
     pool: SqlitePool,
@@ -192,6 +201,35 @@ impl AccountRepo {
             .fetch_optional(&self.pool)
             .await?;
         Ok(account)
+    }
+
+    /// Fetch an account AND its decrypted tokens in a SINGLE SELECT — the request hot path's
+    /// `resolve_core_account` uses this instead of `get` + `decrypt_tokens` (which read the same
+    /// row twice). Tokens remain encrypted at rest; they are decrypted here only in memory for the
+    /// caller, exactly as `decrypt_tokens` does.
+    pub async fn get_with_tokens(
+        &self,
+        id: &str,
+        cipher: &TokenCipher,
+    ) -> Result<Option<(Account, PlainTokens)>, StoreError> {
+        let row = sqlx::query(SELECT_ACCOUNT_WITH_TOKENS)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => {
+                // Both derive `FromRow`; the SELECT includes every column each needs.
+                let account = Account::from_row(&row)?;
+                let enc = EncryptedTokens::from_row(&row)?;
+                let tokens = PlainTokens {
+                    access_token: cipher.decrypt(&enc.access_token_enc)?,
+                    refresh_token: cipher.decrypt(&enc.refresh_token_enc)?,
+                    id_token: cipher.decrypt(&enc.id_token_enc)?,
+                };
+                Ok(Some((account, tokens)))
+            }
+            None => Ok(None),
+        }
     }
 
     /// List all accounts' metadata, ordered by id.

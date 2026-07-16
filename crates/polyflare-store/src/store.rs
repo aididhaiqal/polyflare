@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+};
 
 use crate::account::AccountRepo;
 use crate::continuity_repo::ContinuityRepo;
@@ -36,10 +38,26 @@ impl Store {
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            // `synchronous=NORMAL` is the safe+fast pairing for WAL: fsync only on checkpoint, not on
+            // every commit, so a per-request write (the continuity session-state UPSERT) no longer
+            // pays an `F_FULLFSYNC` on the hot path — this is the main p99-tail reduction. Under WAL
+            // it costs at most the LAST committed transaction on an OS crash (never corruption), and
+            // all continuity state is reconstructible, so the durability trade is acceptable here.
+            .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
+            // Read-side tuning: a larger page cache (16 MB; negative ⇒ KiB), memory-mapped reads
+            // (256 MB) to skip the read syscall, and in-memory temp tables — all reduce read-path
+            // syscalls + tail jitter.
+            .pragma("cache_size", "-16384")
+            .pragma("mmap_size", "268435456")
+            .pragma("temp_store", "MEMORY")
             .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
+            // Keep 2 warm connections so a hot-path acquire never pays a cold open, and skip the
+            // per-acquire liveness ping (the pool is process-local and short-lived per query).
+            .min_connections(2)
+            .test_before_acquire(false)
             .connect_with(opts)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;

@@ -91,6 +91,24 @@ pub fn filter_by_pool(snapshots: &[AccountSnapshot], pool: Option<&str>) -> Vec<
     }
 }
 
+/// The provider + pool narrowings in a SINGLE pass — semantically identical to `filter_by_provider`
+/// followed by `filter_by_pool`, but clones the surviving snapshots ONCE instead of building an
+/// intermediate Vec. The ingress hot path uses this; the two functions above remain for callers
+/// (and tests) that narrow by only one axis.
+pub fn filter_by_provider_and_pool(
+    snapshots: &[AccountSnapshot],
+    provider: Provider,
+    pool: Option<&str>,
+) -> Vec<AccountSnapshot> {
+    snapshots
+        .iter()
+        .filter(|s| {
+            s.provider == provider && pool.is_none_or(|slug| s.pool.as_deref() == Some(slug))
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
