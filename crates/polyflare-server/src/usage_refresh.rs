@@ -190,6 +190,15 @@ pub fn spawn_usage_refresh(state: Arc<AppState>) {
                     tracing::warn!(error = %e, "usage refresh failed for an account");
                 }
             }
+            // Warm the account snapshot cache off the request path: this cycle's usage/status writes
+            // bumped the account generation, so rebuild the O(accounts) snapshot pool HERE instead of
+            // making the next real request pay it. (Idempotent — `snapshots` single-flights the
+            // rebuild, and the token cache is untouched by usage writes now, so it stays warm.)
+            let _ = state.account_cache.snapshots(&state.store).await;
+            // Evict expired decrypted tokens each cycle: since usage writes no longer wipe the token
+            // cache, this bounds an idle account's token lifetime to ~one refresh interval past its
+            // TTL (independent of any cache miss triggering the insert-time sweep).
+            state.token_cache.sweep(unix_now());
             tokio::time::sleep(REFRESH_INTERVAL).await;
         }
     });

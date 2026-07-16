@@ -124,22 +124,40 @@ const SELECT_ACCOUNT_WITH_TOKENS: &str = "SELECT id, chatgpt_account_id, chatgpt
     created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
     provider, pool, access_token_enc, refresh_token_enc, id_token_enc FROM accounts WHERE id = ?";
 
-/// CRUD over the `accounts` table. Cheap to construct (clones the pool handle + generation Arc).
+/// CRUD over the `accounts` table. Cheap to construct (clones the pool handle + generation Arcs).
 pub struct AccountRepo {
     pool: SqlitePool,
-    /// Bumped on every write so the server's `AccountCache` auto-invalidates (see `Store`).
+    /// Bumped on every write that changes SNAPSHOT data, so the server's `AccountCache`
+    /// auto-invalidates (see `Store`).
     generation: Arc<AtomicU64>,
+    /// Bumped ONLY on writes that change the TOKEN cache's data — tokens + stable identity, i.e.
+    /// `insert` and `update_tokens`. Usage/status/pool/routing writes do NOT bump it, so the token
+    /// cache survives the usage-refresh loop's periodic writes (see `Store::token_generation`).
+    token_generation: Arc<AtomicU64>,
 }
 
 impl AccountRepo {
-    pub fn new(pool: SqlitePool, generation: Arc<AtomicU64>) -> Self {
-        Self { pool, generation }
+    pub fn new(
+        pool: SqlitePool,
+        generation: Arc<AtomicU64>,
+        token_generation: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            pool,
+            generation,
+            token_generation,
+        }
     }
 
-    /// Advance the account-write generation. Called after every successful mutation so a cached
-    /// account pool is invalidated by the WRITE itself, not by each caller remembering to.
+    /// Advance the account (snapshot) write generation. Called after a mutation that changes any
+    /// snapshot field so a cached account pool is invalidated by the WRITE itself.
     fn bump_generation(&self) {
         self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Advance the token/identity write generation (invalidates the `TokenCache`).
+    fn bump_token_generation(&self) {
+        self.token_generation.fetch_add(1, Ordering::Release);
     }
 
     /// Insert an account, encrypting its tokens on the way in.
@@ -192,7 +210,10 @@ impl AccountRepo {
         .bind(account.pool.as_deref())
         .execute(&self.pool)
         .await?;
+        // A new account affects BOTH caches: the snapshot pool (a new candidate) and the token
+        // cache (new identity + tokens).
         self.bump_generation();
+        self.bump_token_generation();
         Ok(())
     }
 
@@ -360,7 +381,10 @@ impl AccountRepo {
         .bind(id)
         .execute(&self.pool)
         .await?;
-        self.bump_generation();
+        // Tokens + last_refresh are NOT snapshot fields, so this bumps only the TOKEN generation:
+        // the token cache re-reads the rotated tokens, while the (unchanged) snapshot cache stays
+        // warm across an OAuth refresh.
+        self.bump_token_generation();
         Ok(())
     }
 

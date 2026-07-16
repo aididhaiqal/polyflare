@@ -23,6 +23,13 @@ pub struct Store {
     /// made through THIS `Store` instance — correct for PolyFlare's single-process design (a
     /// multi-instance deploy would need a shared/DB counter instead; see `AccountCache` docs).
     account_generation: Arc<AtomicU64>,
+    /// In-process TOKEN/identity-write generation counter. Bumped ONLY by writes that change what
+    /// the server's `TokenCache` holds — the tokens + stable identity fields (`insert` and
+    /// `update_tokens`). A usage-window / status / pool / routing-policy write does NOT bump this,
+    /// so the token cache survives the usage-refresh loop's periodic writes (it only reads
+    /// provider/chatgpt_account_id/last_refresh/id + tokens, none of which those writes touch),
+    /// while the `AccountCache` still invalidates on them via `account_generation`.
+    token_generation: Arc<AtomicU64>,
 }
 
 impl Store {
@@ -64,6 +71,7 @@ impl Store {
         Ok(Self {
             pool,
             account_generation: Arc::new(AtomicU64::new(0)),
+            token_generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -79,9 +87,20 @@ impl Store {
         self.account_generation.load(Ordering::Acquire)
     }
 
-    /// The account repository over this store's pool, wired to bump the write generation.
+    /// The current token/identity-write generation (see `token_generation` field). The server's
+    /// `TokenCache` reads this to invalidate ONLY on token/identity writes, not on usage/status
+    /// churn.
+    pub fn token_generation(&self) -> u64 {
+        self.token_generation.load(Ordering::Acquire)
+    }
+
+    /// The account repository over this store's pool, wired to bump both write generations.
     pub fn accounts(&self) -> AccountRepo {
-        AccountRepo::new(self.pool.clone(), self.account_generation.clone())
+        AccountRepo::new(
+            self.pool.clone(),
+            self.account_generation.clone(),
+            self.token_generation.clone(),
+        )
     }
 
     /// The continuity repository over this store's pool.
