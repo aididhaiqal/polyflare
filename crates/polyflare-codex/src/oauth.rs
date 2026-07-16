@@ -1,6 +1,7 @@
-//! OpenAI OAuth for the Codex backend: decode-only JWT claims, an 8-day refresh gate,
-//! `POST /oauth/token` refresh (Task 4), and permanent-failure classification. Tokens are never
-//! logged (see the redacting `Debug` on `RefreshedTokens`). See
+//! OpenAI OAuth for the Codex backend: decode-only JWT claims, an expiry-driven refresh gate
+//! (`should_refresh`/`token_exp` — refresh within a margin of the access token's own `exp`, with an
+//! age-gate fallback), `POST /oauth/token` refresh (Task 4), and permanent-failure classification.
+//! Tokens are never logged (see the redacting `Debug` on `RefreshedTokens`). See
 //! docs/reference/codex-lb-port-reference.md §OAuth.
 
 use std::time::Duration;
@@ -10,8 +11,17 @@ use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::Value;
 
-/// Refresh when the stored token is older than 8 days (`token_refresh_interval_days`).
-const TOKEN_REFRESH_INTERVAL_DAYS: i64 = 8;
+/// Refresh once the access token is within this window of its own `exp` — a GENEROUS margin (2
+/// days) so a transient refresh failure still has ~2 days of request-opportunities to retry before
+/// the token actually dies. The real Codex access-token TTL is ~10 days, so this refreshes ~2 days
+/// early: it adapts to whatever TTL the auth server issues (unlike a hardcoded age gate, it can't
+/// silently start refreshing AFTER expiry if OpenAI shortens the TTL) while keeping the early-refresh
+/// resilience of the prior fixed 8-day gate.
+const REFRESH_MARGIN_SECS: i64 = 2 * 86_400;
+/// Fallback age gate, used ONLY when the access token's `exp` can't be decoded (malformed / missing):
+/// refresh when the stored token is older than this. Ensures we still refresh eventually rather than
+/// never if we somehow can't read an expiry.
+const TOKEN_REFRESH_FALLBACK_DAYS: i64 = 8;
 /// The nested OpenAI auth claim carrying auth-scoped identity fields.
 const AUTH_CLAIM: &str = "https://api.openai.com/auth";
 
@@ -62,9 +72,28 @@ pub enum OAuthError {
     Endpoint { status: u16, code: Option<String> },
 }
 
-/// `true` when the token was last refreshed more than 8 days before `now` (epoch seconds).
-pub fn should_refresh(last_refresh: i64, now: i64) -> bool {
-    now - last_refresh > TOKEN_REFRESH_INTERVAL_DAYS * 86_400
+/// Decode (WITHOUT verifying) a JWT's `exp` claim (unix seconds) — used to time refresh against the
+/// access token's ACTUAL expiry. `None` for a malformed / exp-less token (caller falls back to the
+/// age gate). The access token is a JWT just like the id_token; this reads only its `exp`.
+pub fn token_exp(jwt: &str) -> Option<i64> {
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("exp").and_then(Value::as_i64)
+}
+
+/// Whether the account's access token should be refreshed now (epoch seconds). Primary signal is the
+/// token's own `exp`: refresh once within [`REFRESH_MARGIN_SECS`] of expiry, so timing adapts to the
+/// server-issued TTL. If `exp` can't be decoded (`access_exp` is `None`), fall back to the fixed
+/// age gate on `last_refresh` so we still refresh eventually.
+pub fn should_refresh(access_exp: Option<i64>, last_refresh: i64, now: i64) -> bool {
+    match access_exp {
+        // `saturating_sub`: `exp` comes from an UNVERIFIED token, so a pathological value near
+        // `i64::MIN` must not underflow (debug/CI panic; release wrap-to-huge ⇒ never refresh a dead
+        // token). Saturating keeps the intended meaning — a garbage/very-past `exp` ⇒ refresh.
+        Some(exp) => now >= exp.saturating_sub(REFRESH_MARGIN_SECS),
+        None => now - last_refresh > TOKEN_REFRESH_FALLBACK_DAYS * 86_400,
+    }
 }
 
 /// Classify a token-endpoint error code into a status transition, verified against the codex-lb
@@ -376,11 +405,79 @@ mod tests {
     }
 
     #[test]
-    fn should_refresh_at_8_day_boundary() {
+    fn should_refresh_is_driven_by_token_exp() {
         let day = 86_400;
-        assert!(!should_refresh(0, 8 * day), "exactly 8 days ⇒ not yet");
-        assert!(should_refresh(0, 8 * day + 1), "just over 8 days ⇒ refresh");
-        assert!(!should_refresh(1000, 1000), "fresh");
+        let now = 1_000_000_000;
+        // Token expires in 3 days ⇒ outside the 2-day margin ⇒ don't refresh yet.
+        assert!(
+            !should_refresh(Some(now + 3 * day), 0, now),
+            "3d to exp ⇒ wait"
+        );
+        // Exactly at the 2-day margin ⇒ refresh.
+        assert!(
+            should_refresh(Some(now + 2 * day), 0, now),
+            "at margin ⇒ refresh"
+        );
+        // Within 2 days of expiry ⇒ refresh.
+        assert!(
+            should_refresh(Some(now + day), 0, now),
+            "1d to exp ⇒ refresh"
+        );
+        // Already expired ⇒ refresh.
+        assert!(should_refresh(Some(now - day), 0, now), "expired ⇒ refresh");
+        // A fresh 10-day token (the real Codex TTL) is NOT refreshed — regardless of last_refresh.
+        assert!(
+            !should_refresh(Some(now + 10 * day), now - 9 * day, now),
+            "fresh 10d token ⇒ no refresh even if last_refresh is old"
+        );
+    }
+
+    #[test]
+    fn should_refresh_falls_back_to_age_gate_without_exp() {
+        let day = 86_400;
+        // No decodable exp ⇒ the 8-day age gate on last_refresh applies.
+        assert!(
+            !should_refresh(None, 0, 8 * day),
+            "None + exactly 8d ⇒ not yet"
+        );
+        assert!(
+            should_refresh(None, 0, 8 * day + 1),
+            "None + over 8d ⇒ refresh"
+        );
+        assert!(
+            !should_refresh(None, 1000, 1000),
+            "None + fresh ⇒ no refresh"
+        );
+    }
+
+    #[test]
+    fn should_refresh_saturates_on_pathological_exp() {
+        // A corrupt/hostile token's `exp` near i64::MIN must NOT underflow the margin subtraction
+        // (debug panic / release wrap). Saturating ⇒ a garbage very-past exp is treated as "refresh".
+        let now = 1_000_000_000;
+        assert!(
+            should_refresh(Some(i64::MIN), 0, now),
+            "i64::MIN exp ⇒ refresh, no panic"
+        );
+        assert!(should_refresh(Some(i64::MIN + 1), 0, now));
+        // The far-future end can't underflow and must NOT trigger a refresh.
+        assert!(
+            !should_refresh(Some(i64::MAX), 0, now),
+            "i64::MAX exp ⇒ no refresh"
+        );
+    }
+
+    #[test]
+    fn token_exp_decodes_exp_or_none() {
+        let jwt = make_jwt(&serde_json::json!({ "exp": 1_800_000_000i64, "sub": "s" }));
+        assert_eq!(token_exp(&jwt), Some(1_800_000_000));
+        // No exp claim ⇒ None (caller falls back to the age gate).
+        assert_eq!(
+            token_exp(&make_jwt(&serde_json::json!({ "sub": "s" }))),
+            None
+        );
+        // Malformed JWT ⇒ None.
+        assert_eq!(token_exp("not-a-jwt"), None);
     }
 
     #[test]

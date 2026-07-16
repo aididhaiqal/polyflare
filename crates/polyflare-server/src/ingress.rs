@@ -10,7 +10,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use polyflare_anthropic::AnthropicToResponses;
-use polyflare_codex::oauth::{classify_failure, should_refresh, OAuthError};
+use polyflare_codex::oauth::{classify_failure, should_refresh, token_exp, OAuthError};
 use polyflare_core::{
     Account, AccountId, Continuity, ContinuityDirective, NoopContinuity, Prepared, PreparedRequest,
     Provider, RecoveryPlan, RequestCtx, ResponseStream, SelectionCtx, Tier, Translator,
@@ -206,25 +206,35 @@ async fn resolve_core_account(
     // Refresh-on-stale is Codex-specific (the only OAuth client AppState holds today); Anthropic
     // subscription-OAuth refresh is Task 7 (VERIFY-gated — no confirmed endpoint/client_id yet).
     // An Anthropic account's stored access_token is used as-is until Task 7 lands.
-    if provider == Provider::Codex && should_refresh(account.last_refresh, now) {
+    if provider == Provider::Codex
+        && should_refresh(token_exp(&tokens.access_token), account.last_refresh, now)
+    {
         // F2: serialize concurrent refreshes of the SAME account. OpenAI rotates the refresh token
         // on first use, so N parallel refreshes would leave the losers presenting a dead token and
         // wrongly mark the account `reauth_required`. Acquire the per-account lock, then double-check
-        // staleness — a peer may have already refreshed (and persisted) while we waited for the lock.
+        // staleness AGAINST THE STORED token — a peer may have already refreshed (and persisted) while
+        // we waited for the lock, in which case the stored access token now has a far-future `exp`.
         let lock = state.refresh_locks.handle(picked);
         let _guard = lock.lock().await;
-        let fresh_account = match repo.get(picked.as_str()).await {
-            Ok(Some(a)) => a,
-            Ok(None) | Err(_) => return Err(internal_error()),
-        };
+        let (fresh_account, fresh_tokens) =
+            match repo.get_with_tokens(picked.as_str(), &state.cipher).await {
+                Ok(Some(p)) => p,
+                Ok(None) | Err(_) => return Err(internal_error()),
+            };
         // F2 (failure-path single-mark): a peer that held this lock may have failed its refresh and
         // marked the account non-active; `last_refresh` is unchanged on failure, so bail here rather
         // than re-hitting OAuth with our own now-dead token (which would re-mark it once per waiter).
         if fresh_account.status != "active" {
             return Err(account_unavailable());
         }
-        if should_refresh(fresh_account.last_refresh, now) {
-            match state.oauth.refresh(&tokens.refresh_token).await {
+        if should_refresh(
+            token_exp(&fresh_tokens.access_token),
+            fresh_account.last_refresh,
+            now,
+        ) {
+            // Still stale after the lock ⇒ we own the refresh. Use the FRESHLY-read refresh token (a
+            // peer's rotation, if any, is already reflected here) rather than our pre-lock copy.
+            match state.oauth.refresh(&fresh_tokens.refresh_token).await {
                 Ok(refreshed) => {
                     let new = PlainTokens {
                         access_token: refreshed.tokens.access_token,
@@ -258,12 +268,10 @@ async fn resolve_core_account(
                 Err(OAuthError::Transport(_)) => {}
             }
         } else {
-            // A peer already refreshed (and persisted) while we waited for the lock: pick up their
-            // fresh tokens instead of calling refresh again with our now-stale copy.
-            match repo.decrypt_tokens(picked.as_str(), &state.cipher).await {
-                Ok(Some(t)) => tokens = t,
-                Ok(None) | Err(_) => return Err(internal_error()),
-            }
+            // Not stale after the lock — a peer refreshed while we waited (the fresh token we just
+            // read IS theirs), or it simply isn't due yet. Adopt the stored token for this request
+            // instead of calling refresh again with our pre-lock copy.
+            tokens = fresh_tokens;
         }
     }
     Ok((
