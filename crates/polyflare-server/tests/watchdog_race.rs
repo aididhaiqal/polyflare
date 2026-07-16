@@ -110,6 +110,7 @@ async fn relays_when_first_byte_arrives_before_timeout() {
         &core_account(base),
         AccountId::from("acct"),
         RequestCtx::default(),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -137,6 +138,7 @@ async fn recovers_on_silence_via_resend_full() {
         &core_account(base),
         AccountId::from("acct"),
         RequestCtx::default(),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -177,6 +179,7 @@ async fn hard_upstream_error_is_watchdog_upstream() {
         &core_account("http://127.0.0.1:1".into()),
         AccountId::from("acct"),
         RequestCtx::default(),
+        Default::default(),
     )
     .await;
     assert!(matches!(res, Err(WatchdogError::Upstream(_))));
@@ -211,6 +214,7 @@ async fn mid_race_first_item_error_is_watchdog_upstream_and_does_not_recover() {
             &core_account("http://unused.invalid".into()),
             AccountId::from("acct"),
             RequestCtx::default(),
+            Default::default(),
         ),
     )
     .await

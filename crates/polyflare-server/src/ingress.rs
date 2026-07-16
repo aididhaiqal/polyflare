@@ -469,6 +469,7 @@ async fn responses_handler_impl(
                 &account,
                 id,
                 ctx,
+                state.runtime.clone(),
             )
             .await
             {
@@ -502,6 +503,7 @@ async fn responses_handler_impl(
                         fresh,
                         ctx,
                         session_key,
+                        state.runtime.clone(),
                     )
                     .await
                     {
@@ -554,6 +556,7 @@ async fn responses_handler_impl(
                                 &account,
                                 fresh,
                                 ctx,
+                                state.runtime.clone(),
                             )
                             .await
                             {
@@ -709,6 +712,7 @@ async fn messages_handler_native(
         &account,
         picked,
         ctx,
+        state.runtime.clone(),
     )
     .await
     {
@@ -806,6 +810,7 @@ async fn messages_handler_codex_aliased(
         &account,
         picked,
         ctx,
+        state.runtime.clone(),
     )
     .await
     {

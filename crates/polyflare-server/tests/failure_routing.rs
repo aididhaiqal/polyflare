@@ -3,15 +3,23 @@
 //! → runtime-overlay → eligibility loop against an inline 429 upstream.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
 use polyflare_codex::oauth::OAuthClient;
 use polyflare_codex::CodexExecutor;
-use polyflare_core::{AccountSnapshot, CapacityWeighted, Continuity};
+use polyflare_core::{AccountId, AccountSnapshot, CapacityWeighted, Continuity};
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::continuity::CodexContinuity;
 use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
+use polyflare_testkit::MockUpstream;
+
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
 
 fn account(id: &str) -> Account {
     Account {
@@ -105,6 +113,45 @@ async fn spawn(upstream_url: String) -> (String, Arc<AppState>) {
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), state)
+}
+
+#[tokio::test]
+async fn a_clean_completion_clears_prior_error_state() {
+    // A3: record_success fires at TRUE stream completion (inside the watchdog observer). Pre-seed an
+    // error on the account, then a request that completes cleanly must clear it — proving success is
+    // recorded at completion, not (as the reverted version did) at stream START.
+    let upstream = MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()]);
+    let upstream_url = upstream.spawn().await;
+    let (pf, state) = spawn(upstream_url).await;
+
+    // Seed error_count = 2 (draining-tier territory) for the only account.
+    state
+        .runtime
+        .record_transient_error(&AccountId::from("acct-1"), now());
+    state
+        .runtime
+        .record_transient_error(&AccountId::from("acct-1"), now());
+    let mut before = vec![AccountSnapshot::new("acct-1")];
+    state.runtime.overlay(&mut before);
+    assert_eq!(before[0].error_count, 2, "seeded");
+
+    let resp = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // Drain the body to EOF so the server's ObservingStream reaches clean completion → record_success
+    // (which awaits INLINE before yielding the terminal chunk, so it is done by the time this returns).
+    let _ = resp.bytes().await.unwrap();
+
+    let mut after = vec![AccountSnapshot::new("acct-1")];
+    state.runtime.overlay(&mut after);
+    assert_eq!(
+        after[0].error_count, 0,
+        "a clean completion cleared the pre-seeded error state"
+    );
 }
 
 #[tokio::test]
