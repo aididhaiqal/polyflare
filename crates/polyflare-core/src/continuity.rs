@@ -48,7 +48,7 @@ mod tests {
     async fn noop_prepare_disarms_and_never_pins() {
         let noop = NoopContinuity;
         let req = PreparedRequest {
-            body: serde_json::json!({}),
+            body: Some(serde_json::json!({})),
             model: "m".to_string(),
             forward_headers: vec![],
             raw_body: None,

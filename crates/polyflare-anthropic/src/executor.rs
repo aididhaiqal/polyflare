@@ -45,7 +45,12 @@ impl Executor for AnthropicExecutor {
             .post(&url)
             .bearer_auth(&account.bearer_token)
             .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(&req.body)
+            // Anthropic paths never set `raw_body`, so `body` is always `Some` here (invariant).
+            .json(
+                req.body
+                    .as_ref()
+                    .expect("PreparedRequest: raw_body None ⇒ body Some"),
+            )
             .send()
             .await
             .map_err(|e| ExecError::Upstream(e.to_string()))?;

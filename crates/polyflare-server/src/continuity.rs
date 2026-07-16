@@ -103,15 +103,36 @@ impl Continuity for CodexContinuity {
                 timeout: self.watchdog_timeout,
             };
             if ctx.is_full_resend {
-                let mut stripped = req.body.clone();
-                if let Some(obj) = stripped.as_object_mut() {
-                    obj.remove("previous_response_id");
-                }
-                let anchorless_req = PreparedRequest {
-                    body: stripped,
-                    model: req.model.clone(),
-                    forward_headers: req.forward_headers.clone(),
-                    raw_body: None,
+                // Build the anchor-stripped full-resend body. On the native pass-through the body is
+                // NOT materialized (the wire bytes live in `raw_body`), so parse it from there — this
+                // is the COLD recovery path, reached only when an armed owner turned out ineligible.
+                // A translated request carries a materialized `body` instead. Either way we drop
+                // `previous_response_id` and re-serialize (the executor serializes `body`).
+                let base: Option<serde_json::Value> = match &req.raw_body {
+                    Some(raw) => serde_json::from_slice(raw).ok(),
+                    None => req.body.clone(),
+                };
+                let anchorless_req = match base {
+                    Some(mut v) => {
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.remove("previous_response_id");
+                        }
+                        PreparedRequest {
+                            body: Some(v),
+                            model: req.model.clone(),
+                            forward_headers: req.forward_headers.clone(),
+                            raw_body: None,
+                        }
+                    }
+                    // Degenerate (a `raw_body` that somehow fails to re-parse): forward the original
+                    // bytes rather than panicking on an empty body — the anchor stays, but the
+                    // executor invariant (something to send) holds.
+                    None => PreparedRequest {
+                        body: None,
+                        model: req.model.clone(),
+                        forward_headers: req.forward_headers.clone(),
+                        raw_body: req.raw_body.clone(),
+                    },
                 };
                 (arm, RecoveryPlan::ResendFull { anchorless_req })
             } else {
@@ -199,12 +220,24 @@ mod tests {
         (store, cont)
     }
 
+    /// A translated-style request: a materialized `body`, no raw pass-through.
     fn req(body: serde_json::Value) -> PreparedRequest {
         PreparedRequest {
-            body,
+            body: Some(body),
             model: "gpt-5.6-sol".to_string(),
             forward_headers: vec![],
             raw_body: None,
+        }
+    }
+
+    /// A native-style request: the wire bytes in `raw_body`, no materialized `body` (mirrors the
+    /// `/responses` pass-through). The recovery path must reparse the resend body from these bytes.
+    fn native_req(body: serde_json::Value) -> PreparedRequest {
+        PreparedRequest {
+            body: None,
+            model: "gpt-5.6-sol".to_string(),
+            forward_headers: vec![],
+            raw_body: Some(bytes::Bytes::from(serde_json::to_vec(&body).unwrap())),
         }
     }
 
@@ -245,13 +278,59 @@ mod tests {
         assert!(matches!(p.directive.watchdog, WatchdogArm::Armed { .. }));
         match p.directive.recovery {
             RecoveryPlan::ResendFull { anchorless_req } => {
+                let body = anchorless_req
+                    .body
+                    .as_ref()
+                    .expect("resend body materialized");
                 assert!(
-                    anchorless_req.body.get("previous_response_id").is_none(),
+                    body.get("previous_response_id").is_none(),
                     "anchor stripped"
                 );
+                assert!(body.get("input").is_some(), "full input preserved");
+            }
+            other => panic!("expected ResendFull, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn native_anchor_full_resend_reparses_stripped_body_from_raw() {
+        // The native pass-through carries NO materialized `body` (only `raw_body`). The recovery
+        // path must reparse the resend body FROM those wire bytes, strip the anchor, and preserve
+        // the full input — proving the `Option<body>` split didn't drop the native recovery.
+        let (_s, cont) = make().await;
+        let ctx = RequestCtx {
+            session_key: Some(polyflare_core::SessionKey {
+                value: "sk".into(),
+                strength: KeyStrength::Soft,
+            }),
+            client_previous_response_id: Some("resp_dead".into()),
+            is_full_resend: true,
+            ..Default::default()
+        };
+        let body =
+            serde_json::json!({"previous_response_id": "resp_dead", "input": [{"a":1},{"b":2}]});
+        let p = cont.prepare(native_req(body), &ctx).await.unwrap();
+        match p.directive.recovery {
+            RecoveryPlan::ResendFull { anchorless_req } => {
+                let rebuilt = anchorless_req
+                    .body
+                    .as_ref()
+                    .expect("resend body reparsed from raw_body");
                 assert!(
-                    anchorless_req.body.get("input").is_some(),
-                    "full input preserved"
+                    rebuilt.get("previous_response_id").is_none(),
+                    "anchor stripped from reparsed body"
+                );
+                assert_eq!(
+                    rebuilt
+                        .get("input")
+                        .and_then(|i| i.as_array())
+                        .map(|a| a.len()),
+                    Some(2),
+                    "full input preserved through the reparse"
+                );
+                assert!(
+                    anchorless_req.raw_body.is_none(),
+                    "resend forwards the stripped body, not the original bytes"
                 );
             }
             other => panic!("expected ResendFull, got {other:?}"),

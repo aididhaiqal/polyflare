@@ -20,10 +20,10 @@ async fn executor_streams_upstream_events_and_forwards_body() {
         chatgpt_account_id: None,
     };
     let req = PreparedRequest {
-        body: serde_json::json!({
+        body: Some(serde_json::json!({
             "model": "claude-opus-4",
             "messages": [{"role": "user", "content": "hi"}]
-        }),
+        })),
         model: "claude-opus-4".into(),
         forward_headers: vec![],
         raw_body: None,
@@ -53,7 +53,7 @@ async fn executor_surfaces_upstream_error_status() {
         chatgpt_account_id: None,
     };
     let req = PreparedRequest {
-        body: serde_json::json!({"model": "m"}),
+        body: Some(serde_json::json!({"model": "m"})),
         model: "m".into(),
         forward_headers: vec![],
         raw_body: None,

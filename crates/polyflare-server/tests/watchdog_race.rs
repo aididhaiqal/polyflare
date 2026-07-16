@@ -66,7 +66,7 @@ fn armed_full_resend(body: serde_json::Value) -> Prepared {
         .remove("previous_response_id");
     Prepared {
         req: PreparedRequest {
-            body,
+            body: Some(body),
             model: "m".into(),
             forward_headers: vec![],
             raw_body: None,
@@ -78,7 +78,7 @@ fn armed_full_resend(body: serde_json::Value) -> Prepared {
             },
             recovery: RecoveryPlan::ResendFull {
                 anchorless_req: PreparedRequest {
-                    body: stripped,
+                    body: Some(stripped),
                     model: "m".into(),
                     forward_headers: vec![],
                     raw_body: None,

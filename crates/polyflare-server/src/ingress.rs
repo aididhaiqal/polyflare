@@ -21,7 +21,7 @@ use crate::alias::{self, ModelAlias};
 use crate::app::AppState;
 use crate::fingerprint_capture::{append_fingerprint_capture, capture_request_fingerprint};
 use crate::observability::RequestLog;
-use crate::session_key::derive_request_ctx;
+use crate::session_key::parse_inbound;
 use crate::snapshot::filter_by_provider_and_pool;
 use crate::translate_stream::wrap_translating_stream;
 use crate::watchdog::{
@@ -44,16 +44,6 @@ fn tier_from_effort(effort: Option<&str>) -> Option<Tier> {
         "low" | "minimal" => Some(Tier::Low),
         _ => None,
     }
-}
-
-/// Derive the request tier from a native `/responses` body's `reasoning.effort`. `None` when the
-/// request carries no effort hint (the tier-aware strategy then treats it as Medium).
-fn tier_from_body(body: &serde_json::Value) -> Option<Tier> {
-    tier_from_effort(
-        body.get("reasoning")
-            .and_then(|r| r.get("effort"))
-            .and_then(|e| e.as_str()),
-    )
 }
 
 fn account_unavailable() -> Response {
@@ -351,29 +341,29 @@ async fn responses_handler_impl(
     headers: HeaderMap,
     raw: Bytes,
 ) -> Response {
-    // Parse ONCE for routing + the continuity heuristic + the diagnostic fingerprint. The parsed
-    // `body` is not re-serialized on the wire — the ORIGINAL `raw` bytes are forwarded verbatim
-    // (see `PreparedRequest::raw_body`). A malformed body 400s here, as the `Json` extractor did.
-    let body: serde_json::Value = match serde_json::from_slice(&raw) {
-        Ok(v) => v,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response(),
+    // Parse ONCE — but only the scalars + the `input` SHAPE, NOT the deep conversation tree. The
+    // wire bytes are forwarded verbatim (see `PreparedRequest::raw_body`), so `body` stays `None`
+    // here; everything the request path needs (model, tier, continuity ctx, input count) comes off
+    // this cheap parse. Only a MALFORMED body (invalid JSON, or a non-object root) 400s here;
+    // semantic/schema checks (field types, numeric ranges, duplicate keys) are deferred to upstream,
+    // the schema authority — a genuine pass-through, matching the old full-`Value` parse's tolerance.
+    let facts = match parse_inbound(&headers, &raw) {
+        Some(f) => f,
+        None => return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response(),
     };
-    let model = body
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or_default()
-        .to_string();
+    let model = facts.model;
     let now = unix_now();
-    let tier = tier_from_body(&body);
+    let tier = tier_from_effort(facts.effort.as_deref());
 
-    // C3: derive continuity ctx from headers + body.
-    let ctx: RequestCtx = derive_request_ctx(&headers, &body);
+    // C3: continuity ctx derived from headers + body at parse time.
+    let ctx: RequestCtx = facts.ctx;
     // Native path: forward the REAL Codex client's own surviving inbound headers untouched (see
     // `forward_headers_from_inbound`) — this is a genuine Codex client, so its fingerprint is
     // already authentic; synthesizing here would only discard real conversation ids.
     let forward_headers = forward_headers_from_inbound(&headers);
     let req = PreparedRequest {
-        body,
+        // Native pass-through: the wire bytes ARE the body (below); no materialized `body` needed.
+        body: None,
         model,
         forward_headers,
         // Forward the client's exact bytes upstream — no re-serialize, byte-identical fingerprint.
@@ -601,7 +591,8 @@ async fn messages_handler_native(
     // Native Anthropic path: the AnthropicExecutor does not use `forward_headers` (that field is
     // the Codex egress identity set), so there is nothing to forward here.
     let req = PreparedRequest {
-        body,
+        // No raw pass-through on the Anthropic wire path ⇒ the materialized body is what's sent.
+        body: Some(body),
         model,
         forward_headers: vec![],
         raw_body: None,
@@ -693,7 +684,8 @@ async fn messages_handler_codex_aliased(
         &state.codex_version.cached_or_fallback(),
     );
     let req = PreparedRequest {
-        body: translated_body,
+        // Translated alias body is built, not a raw pass-through ⇒ serialized by the executor.
+        body: Some(translated_body),
         model: model_alias.target_model,
         forward_headers,
         raw_body: None,

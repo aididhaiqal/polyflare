@@ -17,15 +17,21 @@ use crate::provider::Provider;
 /// dumb — it just sets these on the outbound request and overrides auth/accept.
 #[derive(Clone)]
 pub struct PreparedRequest {
-    pub body: serde_json::Value,
+    /// The materialized request body — present ONLY when there are no `raw_body` bytes to forward
+    /// verbatim (a translated alias, an anchor-stripped full-resend recovery, or the Anthropic wire
+    /// path). On the native `/responses` pass-through it is `None`: the wire bytes live in
+    /// `raw_body`, and everything ingress needs from the body (model, tier, the continuity heuristic,
+    /// the input count) is extracted once at parse time WITHOUT materializing the deep `input` tree.
+    /// INVARIANT: `raw_body.is_none()` ⇒ `body.is_some()` — the executor always has something to send.
+    pub body: Option<serde_json::Value>,
     pub model: String,
     pub forward_headers: Vec<(String, String)>,
     /// The client's ORIGINAL request bytes, when they can be forwarded upstream verbatim (the native
     /// `/responses` pass-through). `Some` ⇒ the executor sends these bytes as-is — no parse→
     /// re-serialize round-trip, and byte-identical to what the client sent (better fingerprint
     /// fidelity). `None` ⇒ the body was built or mutated (a translated alias, or an anchor-stripped
-    /// full-resend recovery), so the executor serializes `body`. `body` is still populated either
-    /// way for routing / the continuity heuristic / the diagnostic input fingerprint.
+    /// full-resend recovery), so the executor serializes `body` (which is then `Some` per the
+    /// invariant above).
     pub raw_body: Option<bytes::Bytes>,
 }
 
@@ -91,6 +97,10 @@ pub struct RequestCtx {
     pub session_key: Option<SessionKey>,
     pub client_previous_response_id: Option<String>,
     pub is_full_resend: bool,
+    /// Number of top-level `input` items, derived once at ingress (array length; a non-array present
+    /// input counts as 1; absent as 0). Carried here so the watchdog's diagnostic input count no
+    /// longer has to re-read the request body — which, on the native path, is never materialized.
+    pub input_count: u32,
 }
 
 /// A derived conversation key + its strength (hard binds routing; soft is best-effort).
@@ -376,7 +386,7 @@ mod tests {
     #[test]
     fn prepared_request_debug_redacts_body() {
         let req = PreparedRequest {
-            body: serde_json::json!({"input": "super-secret-user-conversation"}),
+            body: Some(serde_json::json!({"input": "super-secret-user-conversation"})),
             model: "gpt-5.6-sol".to_string(),
             forward_headers: vec![],
             raw_body: None,
@@ -401,7 +411,7 @@ mod tests {
         // forward_headers carries session/thread ids (real, forwarded ones on a native request) —
         // content-safety-sensitive the same way `body` is, so Debug must never print them either.
         let req = PreparedRequest {
-            body: serde_json::json!({}),
+            body: Some(serde_json::json!({})),
             model: "gpt-5.6-sol".to_string(),
             forward_headers: vec![
                 (
@@ -444,7 +454,7 @@ mod tests {
     fn recovery_plan_debug_redacts_request_body() {
         let plan = RecoveryPlan::ResendFull {
             anchorless_req: PreparedRequest {
-                body: serde_json::json!({"input": "super-secret-conversation"}),
+                body: Some(serde_json::json!({"input": "super-secret-conversation"})),
                 model: "m".to_string(),
                 forward_headers: vec![],
                 raw_body: None,
