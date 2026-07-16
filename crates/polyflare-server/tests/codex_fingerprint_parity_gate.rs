@@ -134,6 +134,7 @@ async fn codex_egress_header_structure_matches_the_from_source_codex_rs_golden()
         body,
         model: "gpt-5.6-sol".into(),
         forward_headers,
+        raw_body: None,
     };
 
     let mut stream = executor.execute(req, &account).await.unwrap();

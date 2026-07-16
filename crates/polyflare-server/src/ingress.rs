@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Json, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -291,10 +291,12 @@ async fn resolve_core_account(
 }
 
 /// The bare `/responses` ingress entrypoint: selects over ALL Codex accounts (no pool filter).
+/// Takes the RAW request bytes (not the `Json` extractor) so the native path can forward them
+/// upstream verbatim — no parse→re-serialize round-trip (see `PreparedRequest::raw_body`).
 pub async fn responses_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    body: Bytes,
 ) -> Response {
     responses_route(state, None, headers, body).await
 }
@@ -305,7 +307,7 @@ pub async fn pooled_responses_handler(
     State(state): State<Arc<AppState>>,
     Path(pool): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    body: Bytes,
 ) -> Response {
     responses_route(state, Some(pool), headers, body).await
 }
@@ -317,7 +319,7 @@ async fn responses_route(
     state: Arc<AppState>,
     pool: Option<String>,
     headers: HeaderMap,
-    body: serde_json::Value,
+    body: Bytes,
 ) -> Response {
     let start = Instant::now();
     maybe_capture_fingerprint(&state, "POST", "/responses", &headers);
@@ -345,15 +347,21 @@ async fn responses_handler_impl(
     state: Arc<AppState>,
     pool: Option<&str>,
     headers: HeaderMap,
-    body: serde_json::Value,
+    raw: Bytes,
 ) -> Response {
+    // Parse ONCE for routing + the continuity heuristic + the diagnostic fingerprint. The parsed
+    // `body` is not re-serialized on the wire — the ORIGINAL `raw` bytes are forwarded verbatim
+    // (see `PreparedRequest::raw_body`). A malformed body 400s here, as the `Json` extractor did.
+    let body: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response(),
+    };
     let model = body
         .get("model")
         .and_then(|m| m.as_str())
         .unwrap_or_default()
         .to_string();
     let now = unix_now();
-    // Tier from the request's reasoning effort (read before `body` moves into `PreparedRequest`).
     let tier = tier_from_body(&body);
 
     // C3: derive continuity ctx from headers + body.
@@ -366,6 +374,8 @@ async fn responses_handler_impl(
         body,
         model,
         forward_headers,
+        // Forward the client's exact bytes upstream — no re-serialize, byte-identical fingerprint.
+        raw_body: Some(raw),
     };
 
     // C4: prepare (resolve owner + arm + recovery plan).
@@ -592,6 +602,7 @@ async fn messages_handler_native(
         body,
         model,
         forward_headers: vec![],
+        raw_body: None,
     };
     let ctx = RequestCtx::default();
 
@@ -683,6 +694,7 @@ async fn messages_handler_codex_aliased(
         body: translated_body,
         model: model_alias.target_model,
         forward_headers,
+        raw_body: None,
     };
     let ctx = RequestCtx::default();
 
