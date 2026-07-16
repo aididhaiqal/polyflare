@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api, Account, Pool, RequestRow, Window } from "./api";
 
 const REFRESH_MS = 15_000;
@@ -75,14 +75,158 @@ function PoolCards({ pools }: { pools: Pool[] }) {
   );
 }
 
-function AccountsTable({ accounts, now }: { accounts: Account[]; now: number }) {
+/** Inline pool editor: shows the current pool (click to edit); type an existing or NEW name to
+ *  assign/create, or clear it to unpool. Submits a PATCH and refreshes on success. */
+function PoolEditor({
+  account,
+  onSaved,
+}: {
+  account: Account;
+  onSaved: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(account.pool ?? "");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(false);
+
+  async function save(pool: string | null) {
+    setBusy(true);
+    setErr(false);
+    try {
+      await api.patchAccount(account.id, { pool });
+      setEditing(false);
+      onSaved();
+    } catch {
+      setErr(true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!editing) {
+    return (
+      <button
+        className="cell-edit"
+        title="Edit pool"
+        onClick={() => {
+          setValue(account.pool ?? "");
+          setEditing(true);
+        }}
+      >
+        {account.pool ? <span className="pill">{account.pool}</span> : <span className="muted">— set pool</span>}
+      </button>
+    );
+  }
+  return (
+    <span className={`pool-edit${err ? " has-err" : ""}`}>
+      <input
+        list="pf-pool-names"
+        className="pool-input"
+        value={value}
+        autoFocus
+        disabled={busy}
+        placeholder="pool name"
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") save(value.trim() || null);
+          if (e.key === "Escape") setEditing(false);
+        }}
+      />
+      <button className="mini" disabled={busy} title="Save" onClick={() => save(value.trim() || null)}>
+        ✓
+      </button>
+      <button className="mini" disabled={busy} title="Cancel" onClick={() => setEditing(false)}>
+        ✕
+      </button>
+    </span>
+  );
+}
+
+/** Routing-policy dropdown; PATCHes on change. */
+function RoutingPolicySelect({ account, onSaved }: { account: Account; onSaved: () => void }) {
+  const [busy, setBusy] = useState(false);
+  async function change(rp: string) {
+    setBusy(true);
+    try {
+      await api.patchAccount(account.id, { routing_policy: rp });
+      onSaved();
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <select
+      className="policy-select"
+      value={account.routing_policy}
+      disabled={busy}
+      onChange={(e) => change(e.target.value)}
+      title="Routing policy"
+    >
+      <option value="normal">normal</option>
+      <option value="burn_first">burn first</option>
+      <option value="preserve">preserve</option>
+    </select>
+  );
+}
+
+/** Status badge + a pause/resume toggle (only for accounts in a togglable active/paused state — the
+ *  rate-limit / reauth statuses are owned by the server and shown read-only). */
+function StatusCell({ account, onSaved }: { account: Account; onSaved: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const paused = account.status === "paused";
+  const togglable = account.status === "active" || account.status === "paused";
+  async function toggle() {
+    setBusy(true);
+    try {
+      await api.patchAccount(account.id, { status: paused ? "active" : "paused" });
+      onSaved();
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <span className="status-cell">
+      <StatusBadge status={account.status} />
+      {togglable && (
+        <button
+          className="mini"
+          disabled={busy}
+          onClick={toggle}
+          title={paused ? "Resume (make eligible)" : "Pause (hold out of rotation)"}
+        >
+          {paused ? "▶" : "⏸"}
+        </button>
+      )}
+    </span>
+  );
+}
+
+function AccountsTable({
+  accounts,
+  now,
+  onMutate,
+}: {
+  accounts: Account[];
+  now: number;
+  onMutate: () => void;
+}) {
+  // Existing pool names power the input's datalist (pick an existing pool or type a new one).
+  const poolNames = Array.from(
+    new Set(accounts.map((a) => a.pool).filter((p): p is string => !!p)),
+  ).sort();
   return (
     <table className="grid">
+      <datalist id="pf-pool-names">
+        {poolNames.map((p) => (
+          <option key={p} value={p} />
+        ))}
+      </datalist>
       <thead>
         <tr>
           <th>Account</th>
           <th>Pool</th>
           <th>Status</th>
+          <th>Policy</th>
           <th>Plan</th>
           <th>Weekly</th>
           <th>Weekly reset</th>
@@ -97,10 +241,13 @@ function AccountsTable({ accounts, now }: { accounts: Account[]; now: number }) 
               <div className="acct-id">{a.id}</div>
             </td>
             <td>
-              {a.pool ? <span className="pill">{a.pool}</span> : <span className="muted">—</span>}
+              <PoolEditor account={a} onSaved={onMutate} />
             </td>
             <td>
-              <StatusBadge status={a.status} />
+              <StatusCell account={a} onSaved={onMutate} />
+            </td>
+            <td>
+              <RoutingPolicySelect account={a} onSaved={onMutate} />
             </td>
             <td className="muted">{a.plan_type}</td>
             <td>
@@ -120,7 +267,7 @@ function AccountsTable({ accounts, now }: { accounts: Account[]; now: number }) 
         ))}
         {accounts.length === 0 && (
           <tr>
-            <td colSpan={7} className="empty">
+            <td colSpan={8} className="empty">
               No accounts yet. Add one with <code>polyflare accounts login</code>.
             </td>
           </tr>
@@ -201,30 +348,30 @@ export function App() {
     }
   }
 
-  useEffect(() => {
-    let alive = true;
-    async function load() {
-      try {
-        const [p, a, r] = await Promise.all([api.pools(), api.accounts(), api.requests(50)]);
-        if (!alive) return;
-        setPools(p);
-        setAccounts(a);
-        setRequests(r.rows);
-        setUpdatedAt(Date.now());
-        setError(null);
-      } catch (e) {
-        if (alive) setError(String(e));
-      }
+  // Lifted out of the effect so the account-settings controls can trigger an immediate refresh
+  // after a mutation (in addition to the 15s poll).
+  const load = useCallback(async () => {
+    try {
+      const [p, a, r] = await Promise.all([api.pools(), api.accounts(), api.requests(50)]);
+      setPools(p);
+      setAccounts(a);
+      setRequests(r.rows);
+      setUpdatedAt(Date.now());
+      setError(null);
+    } catch (e) {
+      setError(String(e));
     }
+  }, []);
+
+  useEffect(() => {
     load();
     const dataTimer = setInterval(load, REFRESH_MS);
-    const clockTimer = setInterval(() => alive && setNow(Date.now()), 1000);
+    const clockTimer = setInterval(() => setNow(Date.now()), 1000);
     return () => {
-      alive = false;
       clearInterval(dataTimer);
       clearInterval(clockTimer);
     };
-  }, []);
+  }, [load]);
 
   return (
     <div className="app">
@@ -260,7 +407,7 @@ export function App() {
 
         <section>
           <h2>Accounts</h2>
-          <AccountsTable accounts={accounts} now={now} />
+          <AccountsTable accounts={accounts} now={now} onMutate={load} />
         </section>
 
         <section>

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::Router;
 
 use polyflare_codex::oauth::OAuthClient;
@@ -96,6 +96,12 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         // times), and recent request-log rows. Non-secret metadata only (see `crate::read_api`).
         .route("/api/pools", get(crate::read_api::pools_handler))
         .route("/api/accounts", get(crate::read_api::accounts_handler))
+        // Dashboard-driven account settings (pool / routing policy / pause-resume). Unauthenticated
+        // like the reads (see `crate::write_api`); mutates non-secret settings only.
+        .route(
+            "/api/accounts/{id}",
+            patch(crate::write_api::patch_account_handler),
+        )
         .route("/api/requests", get(crate::read_api::requests_handler))
         // Embedded dashboard UI (see `crate::dashboard`). `/dashboard` serves the SPA entrypoint;
         // `/dashboard/{*path}` serves its bundle assets (with SPA fallback to index.html).

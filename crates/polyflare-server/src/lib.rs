@@ -18,3 +18,4 @@ pub mod translate_stream;
 pub mod usage_refresh;
 pub mod usage_windows;
 pub mod watchdog;
+pub mod write_api;
