@@ -14,6 +14,11 @@ of what PolyFlare **has**, **partially has**, and **does not have yet**.
 > locally, CLIProxyAPI from its docs) cross-checked against `docs/CAPABILITY-MARKUP.md`. PolyFlare's
 > column is grounded strictly in what is **actually built and wired** in this repo — designed-but-unbuilt
 > items are marked 🟡 or ❌ with a note, never credited as ✅.
+>
+> **This matrix compares the *distinguishing* features across all four systems.** For the exhaustive,
+> per-feature inventories (every feature of each system mapped to PolyFlare built/partial/absent), see:
+> - [`FEATURE-MAP-CODEXLB.md`](FEATURE-MAP-CODEXLB.md) — 360 codex-lb features (✅ 84 / 🟡 61 / ❌ 215)
+> - [`FEATURE-MAP-CCFLARE.md`](FEATURE-MAP-CCFLARE.md) — 359 better-ccflare features (✅ 30 / 🟡 83 / ❌ 246)
 
 **Legend:** ✅ built · 🟡 partial / scaffolded · ❌ not yet · — not applicable
 
