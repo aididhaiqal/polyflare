@@ -400,7 +400,7 @@ impl Stream for ObservingStream {
                     Poll::Ready(None) => {
                         // A3: clean EOF ⇒ the account completed the turn — clear its error state so
                         // intermittent blips don't accumulate it into permanent backoff/drain.
-                        this.runtime.record_success(&this.account, unix_now());
+                        this.runtime.record_success(&this.account);
                         let outcome = build_outcome(
                             this.kind.clone(),
                             this.session_key.clone(),

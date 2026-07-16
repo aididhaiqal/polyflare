@@ -150,13 +150,13 @@ impl RuntimeStates {
 
     /// Record a successful completion: clear the error state (error_count → 0, last_error_at → None)
     /// — MANDATORY, or errors accumulate forever and every account eventually looks unhealthy.
-    /// Leaves any active `cooldown_until` alone (a success mid-cooldown shouldn't happen, but if it
-    /// does the cooldown still expires on its own).
-    pub fn record_success(&self, id: &AccountId, now: i64) {
+    /// Leaves `cooldown_until` alone (it expires on its own) and does NOT touch `last_selected_at`:
+    /// that marker is owned by [`record_selected`] (stamped at SELECTION), so an error-only entry
+    /// that succeeds decays back to neutral here and is GC'd — keeping the map bounded.
+    pub fn record_success(&self, id: &AccountId) {
         self.mutate(id, |rt| {
             rt.error_count = 0;
             rt.last_error_at = None;
-            rt.last_selected_at = Some(now);
         });
     }
 
@@ -293,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn record_success_clears_error_state_and_drops_the_entry() {
+    fn record_success_clears_error_state_and_gcs_the_now_neutral_entry() {
         let rs = RuntimeStates::new();
         let id = AccountId::from("a");
         rs.record_transient_error(&id, 1000);
@@ -302,15 +302,34 @@ mod tests {
         rs.overlay(&mut snaps, 1000);
         assert_eq!(snaps[0].error_count, 2);
 
-        // Success clears error state; since nothing else is set, the entry decays to neutral and is
-        // dropped (map stays bounded).
-        rs.record_success(&id, 1002);
+        // Success clears the error state; with no selection stamp (record_selected wasn't called),
+        // the entry is now fully neutral and is GC'd — the overlay finds nothing and leaves defaults.
+        rs.record_success(&id);
         let mut snaps2 = vec![snap("a")];
-        rs.overlay(&mut snaps2, 1000);
+        rs.overlay(&mut snaps2, 1002);
         assert_eq!(snaps2[0].error_count, 0);
         assert_eq!(snaps2[0].last_error_at, None);
-        // last_selected_at was set by record_success, so the entry is NOT neutral — it persists.
-        assert_eq!(snaps2[0].last_selected_at, Some(1002));
+        assert_eq!(snaps2[0].last_selected_at, None);
+    }
+
+    #[test]
+    fn record_selected_owns_last_selected_and_survives_a_success() {
+        // record_selected (called at selection) is the sole source of last_selected_at; a later
+        // success clears only the error state, so a selected account's entry persists for the
+        // round_robin tiebreak.
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        rs.record_selected(&id, 500);
+        rs.record_transient_error(&id, 1000);
+        rs.record_success(&id);
+        let mut snaps = vec![snap("a")];
+        rs.overlay(&mut snaps, 2000);
+        assert_eq!(snaps[0].error_count, 0, "success cleared the error");
+        assert_eq!(
+            snaps[0].last_selected_at,
+            Some(500),
+            "the selection stamp survives (round_robin needs it)"
+        );
     }
 
     #[test]
