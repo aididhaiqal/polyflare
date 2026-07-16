@@ -472,12 +472,7 @@ async fn responses_handler_impl(
             )
             .await
             {
-                Ok(stream) => {
-                    // Success (upstream accepted + started streaming) ⇒ clear this account's error
-                    // state so intermittent blips don't accumulate it into permanent backoff/drain.
-                    state.runtime.record_success(&health_id, unix_now());
-                    stream_response(stream)
-                }
+                Ok(stream) => stream_response(stream),
                 Err(e) => {
                     record_failure(&state, &health_id, &e, unix_now());
                     (StatusCode::BAD_GATEWAY, "upstream error").into_response()
@@ -510,12 +505,7 @@ async fn responses_handler_impl(
                     )
                     .await
                     {
-                        Ok(stream) => {
-                            // Success (upstream accepted + started streaming) ⇒ clear this account's error
-                            // state so intermittent blips don't accumulate it into permanent backoff/drain.
-                            state.runtime.record_success(&health_id, unix_now());
-                            stream_response(stream)
-                        }
+                        Ok(stream) => stream_response(stream),
                         Err(e) => {
                             record_failure(&state, &health_id, &e, unix_now());
                             (StatusCode::BAD_GATEWAY, "upstream error").into_response()
@@ -567,12 +557,7 @@ async fn responses_handler_impl(
                             )
                             .await
                             {
-                                Ok(stream) => {
-                                    // Success (upstream accepted + started streaming) ⇒ clear this account's error
-                                    // state so intermittent blips don't accumulate it into permanent backoff/drain.
-                                    state.runtime.record_success(&health_id, unix_now());
-                                    stream_response(stream)
-                                }
+                                Ok(stream) => stream_response(stream),
                                 Err(e) => {
                                     record_failure(&state, &health_id, &e, unix_now());
                                     (StatusCode::BAD_GATEWAY, "upstream error").into_response()
@@ -727,10 +712,7 @@ async fn messages_handler_native(
     )
     .await
     {
-        Ok(stream) => {
-            state.runtime.record_success(&health_id, unix_now());
-            stream_response(stream)
-        }
+        Ok(stream) => stream_response(stream),
         Err(e) => {
             record_failure(&state, &health_id, &e, unix_now());
             (StatusCode::BAD_GATEWAY, "upstream error").into_response()
@@ -828,7 +810,6 @@ async fn messages_handler_codex_aliased(
     .await
     {
         Ok(stream) => {
-            state.runtime.record_success(&health_id, unix_now());
             let translated_stream =
                 wrap_translating_stream(stream, Box::new(translator) as Box<dyn Translator>);
             stream_response(translated_stream)
