@@ -29,6 +29,9 @@ const BACKOFF_MAX_SHIFT: u32 = 16;
 /// Floor on a rate-limit cooldown (codex-lb `RATE_LIMITED_MIN_COOLDOWN_SECONDS`): even a tiny
 /// upstream `Retry-After` benches the account for at least this long.
 pub const RATE_LIMITED_MIN_COOLDOWN_SECS: i64 = 30;
+/// Ceiling on any single cooldown — clamps a pathological / hostile upstream `Retry-After` (mirrors
+/// ccflare's 24h reset clamp) so it can neither pin an account off for days nor overflow `now + delay`.
+pub const MAX_COOLDOWN_SECS: i64 = 24 * 3600;
 /// Fixed cooldown applied to a quota-exceeded account (codex-lb `QUOTA_EXCEEDED_COOLDOWN_SECONDS`).
 pub const QUOTA_EXCEEDED_COOLDOWN_SECS: i64 = 120;
 
@@ -74,7 +77,10 @@ impl RuntimeStates {
     /// entry are left at their neutral defaults. Called by ingress on the already-filtered (cloned)
     /// slice right before selection — never touches the account cache.
     pub fn overlay(&self, snapshots: &mut [AccountSnapshot]) {
-        let map = self.inner.read().expect("runtime state lock poisoned");
+        // Recover from a poisoned lock (a prior writer panic) rather than cascading the panic into a
+        // pool-wide routing DoS: the mutations are trivial field writes, so the data is always a
+        // valid `RuntimeState` even if a writer unwound mid-update.
+        let map = self.inner.read().unwrap_or_else(|e| e.into_inner());
         for snap in snapshots.iter_mut() {
             if let Some(rt) = map.get(&snap.id) {
                 snap.error_count = rt.error_count;
@@ -88,7 +94,7 @@ impl RuntimeStates {
     /// Apply `f` to `id`'s entry (creating it from default), then drop it if it decayed back to
     /// neutral so the map stays bounded.
     fn mutate(&self, id: &AccountId, f: impl FnOnce(&mut RuntimeState)) {
-        let mut map = self.inner.write().expect("runtime state lock poisoned");
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let entry = map.entry(id.clone()).or_default();
         f(entry);
         if entry.is_neutral() {
@@ -104,10 +110,13 @@ impl RuntimeStates {
         self.mutate(id, |rt| {
             rt.error_count = rt.error_count.saturating_add(1);
             rt.last_error_at = Some(now);
+            // Clamp the (upstream-controlled) delay into [floor, ceiling] — the floor guarantees a
+            // real bench, the ceiling defuses a hostile `Retry-After`; `saturating_add` then can't
+            // overflow `i64`.
             let delay = retry_after
                 .unwrap_or_else(|| backoff_secs(rt.error_count))
-                .max(RATE_LIMITED_MIN_COOLDOWN_SECS);
-            let until = now + delay;
+                .clamp(RATE_LIMITED_MIN_COOLDOWN_SECS, MAX_COOLDOWN_SECS);
+            let until = now.saturating_add(delay);
             rt.cooldown_until = Some(rt.cooldown_until.map_or(until, |c| c.max(until)));
         });
     }
@@ -117,7 +126,7 @@ impl RuntimeStates {
     /// penalize a merely-full account into the drain tier). The later cooldown wins.
     pub fn record_quota_exceeded(&self, id: &AccountId, now: i64) {
         self.mutate(id, |rt| {
-            let until = now + QUOTA_EXCEEDED_COOLDOWN_SECS;
+            let until = now.saturating_add(QUOTA_EXCEEDED_COOLDOWN_SECS);
             rt.cooldown_until = Some(rt.cooldown_until.map_or(until, |c| c.max(until)));
         });
     }
@@ -202,6 +211,32 @@ mod tests {
         rs.overlay(&mut snaps);
         assert_eq!(snaps[0].cooldown_until, Some(1600), "later cooldown wins");
         assert_eq!(snaps[0].error_count, 2);
+    }
+
+    #[test]
+    fn rate_limit_clamps_hostile_retry_after_and_never_overflows() {
+        // A huge Retry-After with a near-max `now` must saturate, not panic/overflow.
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        rs.record_rate_limit(&id, Some(i64::MAX), i64::MAX - 10);
+        let mut snaps = vec![snap("a")];
+        rs.overlay(&mut snaps);
+        assert_eq!(
+            snaps[0].cooldown_until,
+            Some(i64::MAX),
+            "saturating_add caps, no overflow"
+        );
+
+        // A finite-but-excessive Retry-After (48h) is clamped to the 24h ceiling.
+        let rs2 = RuntimeStates::new();
+        rs2.record_rate_limit(&id, Some(48 * 3600), 1000);
+        let mut s2 = vec![snap("a")];
+        rs2.overlay(&mut s2);
+        assert_eq!(
+            s2[0].cooldown_until,
+            Some(1000 + MAX_COOLDOWN_SECS),
+            "48h Retry-After clamped to the 24h ceiling"
+        );
     }
 
     #[test]

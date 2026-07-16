@@ -77,10 +77,12 @@ fn record_failure(state: &AppState, id: &AccountId, err: &WatchdogError, now: i6
     };
     match signal {
         Some(sig) if sig.status == 429 => state.runtime.record_rate_limit(id, sig.retry_after, now),
-        Some(sig) if (500..=599).contains(&sig.status) => {
+        // 5xx (server error), 401/403 (bad credential / account-scoped auth), 408 (request timeout):
+        // an ACCOUNT-health problem — bump the error count so a repeat offender hits the backoff gate.
+        Some(sig) if (500..=599).contains(&sig.status) || matches!(sig.status, 401 | 403 | 408) => {
             state.runtime.record_transient_error(id, now)
         }
-        Some(_) => {} // other 4xx: request-level, not account-health.
+        Some(_) => {} // other 4xx (400/404/422/…): request-level, not account-health.
         None => state.runtime.record_transient_error(id, now), // transport error / mid-stream drop.
     }
 }
@@ -470,9 +472,14 @@ async fn responses_handler_impl(
             )
             .await
             {
-                Ok(stream) => stream_response(stream),
+                Ok(stream) => {
+                    // Success (upstream accepted + started streaming) ⇒ clear this account's error
+                    // state so intermittent blips don't accumulate it into permanent backoff/drain.
+                    state.runtime.record_success(&health_id, unix_now());
+                    stream_response(stream)
+                }
                 Err(e) => {
-                    record_failure(&state, &health_id, &e, now);
+                    record_failure(&state, &health_id, &e, unix_now());
                     (StatusCode::BAD_GATEWAY, "upstream error").into_response()
                 }
             }
@@ -503,9 +510,14 @@ async fn responses_handler_impl(
                     )
                     .await
                     {
-                        Ok(stream) => stream_response(stream),
+                        Ok(stream) => {
+                            // Success (upstream accepted + started streaming) ⇒ clear this account's error
+                            // state so intermittent blips don't accumulate it into permanent backoff/drain.
+                            state.runtime.record_success(&health_id, unix_now());
+                            stream_response(stream)
+                        }
                         Err(e) => {
-                            record_failure(&state, &health_id, &e, now);
+                            record_failure(&state, &health_id, &e, unix_now());
                             (StatusCode::BAD_GATEWAY, "upstream error").into_response()
                         }
                     }
@@ -555,9 +567,14 @@ async fn responses_handler_impl(
                             )
                             .await
                             {
-                                Ok(stream) => stream_response(stream),
+                                Ok(stream) => {
+                                    // Success (upstream accepted + started streaming) ⇒ clear this account's error
+                                    // state so intermittent blips don't accumulate it into permanent backoff/drain.
+                                    state.runtime.record_success(&health_id, unix_now());
+                                    stream_response(stream)
+                                }
                                 Err(e) => {
-                                    record_failure(&state, &health_id, &e, now);
+                                    record_failure(&state, &health_id, &e, unix_now());
                                     (StatusCode::BAD_GATEWAY, "upstream error").into_response()
                                 }
                             }
@@ -710,9 +727,12 @@ async fn messages_handler_native(
     )
     .await
     {
-        Ok(stream) => stream_response(stream),
+        Ok(stream) => {
+            state.runtime.record_success(&health_id, unix_now());
+            stream_response(stream)
+        }
         Err(e) => {
-            record_failure(&state, &health_id, &e, now);
+            record_failure(&state, &health_id, &e, unix_now());
             (StatusCode::BAD_GATEWAY, "upstream error").into_response()
         }
     }
@@ -808,12 +828,13 @@ async fn messages_handler_codex_aliased(
     .await
     {
         Ok(stream) => {
+            state.runtime.record_success(&health_id, unix_now());
             let translated_stream =
                 wrap_translating_stream(stream, Box::new(translator) as Box<dyn Translator>);
             stream_response(translated_stream)
         }
         Err(e) => {
-            record_failure(&state, &health_id, &e, now);
+            record_failure(&state, &health_id, &e, unix_now());
             (StatusCode::BAD_GATEWAY, "upstream error").into_response()
         }
     }
