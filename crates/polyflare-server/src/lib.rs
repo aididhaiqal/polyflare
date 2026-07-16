@@ -14,6 +14,7 @@ pub mod read_api;
 pub mod refresh_locks;
 pub mod session_key;
 pub mod snapshot;
+pub mod token_cache;
 pub mod translate_stream;
 pub mod usage_refresh;
 pub mod usage_windows;

@@ -39,8 +39,10 @@ pub struct Account {
 }
 
 /// The three OAuth tokens in plaintext. Used as insert/update input and as decrypt output.
-/// Never logged: its `Debug` redacts every field.
-#[derive(Clone)]
+/// Never logged: its `Debug` redacts every field. `ZeroizeOnDrop` wipes the token bytes from
+/// memory when a value is dropped (cache eviction, end of request, refresh), so decrypted tokens
+/// don't linger in freed heap or a core dump.
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct PlainTokens {
     pub access_token: String,
     pub refresh_token: String,

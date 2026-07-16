@@ -121,6 +121,7 @@ async fn spawn(store: Store) -> String {
         capture_fingerprint_path: None,
         codex_version: Arc::new(polyflare_codex::CodexVersionCache::new().unwrap()),
         account_cache: Arc::new(polyflare_server::account_cache::AccountCache::new()),
+        token_cache: Default::default(),
     });
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

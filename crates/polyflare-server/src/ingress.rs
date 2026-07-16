@@ -186,11 +186,26 @@ async fn resolve_core_account(
     now: i64,
 ) -> Result<(Account, Provider), Response> {
     let repo = state.store.accounts();
-    // Single SELECT for the account row + its tokens (was `get` + `decrypt_tokens` — two reads of
-    // the same row on every request).
-    let (account, mut tokens) = match repo.get_with_tokens(picked.as_str(), &state.cipher).await {
-        Ok(Some(pair)) => pair,
-        Ok(None) | Err(_) => return Err(internal_error()),
+    // Resolve the account + tokens from the in-memory cache when possible (zero SQLite reads, zero
+    // decrypt); on a miss, ONE `get_with_tokens` SELECT loads + populates it. The cache is cleared
+    // on any account-generation bump (token refresh included), so a rotated token is never served.
+    let store_gen = state.store.account_generation();
+    let (account, mut tokens) = match state.token_cache.get(picked.as_str(), store_gen, now) {
+        Some(pair) => pair,
+        None => {
+            let pair = match repo.get_with_tokens(picked.as_str(), &state.cipher).await {
+                Ok(Some(p)) => p,
+                Ok(None) | Err(_) => return Err(internal_error()),
+            };
+            state.token_cache.insert(
+                picked.as_str(),
+                pair.0.clone(),
+                pair.1.clone(),
+                store_gen,
+                now,
+            );
+            pair
+        }
     };
     let provider: Provider = match account.provider.parse() {
         Ok(p) => p,
@@ -267,7 +282,9 @@ async fn resolve_core_account(
             chatgpt_account_id: account.chatgpt_account_id,
             id: account.id,
             base_url: state.upstream_base_url_for(provider).to_string(),
-            bearer_token: tokens.access_token,
+            // Clone (not move) the token out: `PlainTokens` is `ZeroizeOnDrop`, so `tokens` can't be
+            // partially moved from — and this way the original is wiped when `tokens` drops here.
+            bearer_token: tokens.access_token.clone(),
         },
         provider,
     ))

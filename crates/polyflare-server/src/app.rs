@@ -58,6 +58,10 @@ pub struct AppState {
     /// selection from memory instead of re-running the O(accounts) store query per request.
     /// Invalidated on account-state writes (status/tokens/add).
     pub account_cache: Arc<AccountCache>,
+    /// In-memory cache of resolved (account row + decrypted tokens) keyed by account id (see
+    /// `crate::token_cache`): keeps the per-request account read+decrypt off SQLite. TTL'd +
+    /// invalidated on the store account-generation bump; tokens are zeroized on eviction.
+    pub token_cache: Arc<crate::token_cache::TokenCache>,
 }
 
 impl AppState {
