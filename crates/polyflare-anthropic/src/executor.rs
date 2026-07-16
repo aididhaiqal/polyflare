@@ -56,7 +56,16 @@ impl Executor for AnthropicExecutor {
             .map_err(|e| ExecError::Upstream(e.to_string()))?;
 
         if !resp.status().is_success() {
-            return Err(ExecError::Upstream(format!("status {}", resp.status())));
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .filter(|&s| s >= 0);
+            return Err(ExecError::UpstreamStatus(polyflare_core::FailureSignal {
+                status: resp.status().as_u16(),
+                retry_after,
+            }));
         }
 
         let stream = resp

@@ -39,11 +39,13 @@ pub enum RouteDecision {
     NoEligibleAccount,
 }
 
-/// Errors the watchdog surfaces. Generic — never leaks a token, URL, or internal `Display`.
+/// Errors the watchdog surfaces. Generic `Display` — never leaks a token, URL, or internal detail.
+/// `Upstream` carries an optional [`FailureSignal`] (the upstream status + `Retry-After`) purely for
+/// the ingress's routing-health writeback; it is never rendered into a client-facing message.
 #[derive(Debug, thiserror::Error)]
 pub enum WatchdogError {
     #[error("upstream error")]
-    Upstream,
+    Upstream(Option<polyflare_core::FailureSignal>),
     #[error("continuity recovery unavailable")]
     Continuity,
 }
@@ -118,7 +120,7 @@ pub async fn execute_with_watchdog(
             let stream = executor
                 .execute(req, account)
                 .await
-                .map_err(|_| WatchdogError::Upstream)?;
+                .map_err(|e| WatchdogError::Upstream(e.failure_signal()))?;
             Ok(wrap_stream(
                 stream,
                 continuity,
@@ -132,7 +134,7 @@ pub async fn execute_with_watchdog(
             let mut stream = executor
                 .execute(req, account)
                 .await
-                .map_err(|_| WatchdogError::Upstream)?;
+                .map_err(|e| WatchdogError::Upstream(e.failure_signal()))?;
             match tokio::time::timeout(timeout, stream.next()).await {
                 Ok(Some(Ok(first))) => {
                     // ALIVE: rebuild the full stream (peek-before-relay) + sniff + observe(Completed).
@@ -148,8 +150,10 @@ pub async fn execute_with_watchdog(
                         OutcomeKind::Completed { fp, count },
                     ))
                 }
-                Ok(Some(Err(_))) => {
-                    // Hard upstream error before any client byte ⇒ observe(Failed) + 502.
+                Ok(Some(Err(e))) => {
+                    // Hard upstream error before any client byte ⇒ observe(Failed) + 502. Carry any
+                    // failure signal (a non-2xx caught mid-stream) for the ingress writeback.
+                    let signal = e.failure_signal();
                     let _ = continuity
                         .observe(
                             TurnOutcome::Failed {
@@ -158,7 +162,7 @@ pub async fn execute_with_watchdog(
                             &ctx,
                         )
                         .await;
-                    Err(WatchdogError::Upstream)
+                    Err(WatchdogError::Upstream(signal))
                 }
                 Ok(None) | Err(_) => {
                     // Ok(None): upstream closed with zero events on an anchored req == dead anchor.
@@ -205,7 +209,7 @@ pub async fn execute_recovery(
     let stream = executor
         .execute(anchorless_req, account)
         .await
-        .map_err(|_| WatchdogError::Upstream)?;
+        .map_err(|e| WatchdogError::Upstream(e.failure_signal()))?;
     Ok(wrap_stream(
         stream,
         continuity,
@@ -438,7 +442,7 @@ mod tests {
 
     #[test]
     fn watchdog_error_display_is_generic() {
-        assert_eq!(WatchdogError::Upstream.to_string(), "upstream error");
+        assert_eq!(WatchdogError::Upstream(None).to_string(), "upstream error");
         assert_eq!(
             WatchdogError::Continuity.to_string(),
             "continuity recovery unavailable"
