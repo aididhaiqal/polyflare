@@ -1,8 +1,10 @@
 //! In-memory decrypted-token cache: keeps `resolve_core_account`'s result (the account row + its
 //! decrypted tokens) OFF the SQLite hot path, so a cached-account request does zero DB reads and
-//! zero decrypts. Entries expire on a short TTL AND are cleared whenever the store's account
-//! generation bumps (any account write — token refresh, status/pool/usage change), so a rotated
-//! token is never served.
+//! zero decrypts. Entries expire on a short TTL AND are cleared whenever the store's TOKEN
+//! generation bumps — bumped ONLY by writes that change what this cache holds (a new account, or a
+//! token refresh via `update_tokens`), so a rotated token is never served. Usage/status/pool/routing
+//! writes bump the *account* generation instead (they don't touch tokens or the stable identity
+//! fields resolve reads), so they leave this cache warm — that's the point of the split.
 //!
 //! # Security posture
 //! This holds decrypted OAuth tokens in memory. That is the same secret already present in process
@@ -12,11 +14,11 @@
 //! The cache only widens the in-memory window, so the mitigation is proportionate hygiene, not
 //! enclaves: `PlainTokens` is `ZeroizeOnDrop`, so every evicted/expired entry (and every clone the
 //! request uses) is wiped from memory on drop; `PlainTokens`' `Debug` is redacted so it never logs;
-//! and the TTL bounds how long any token lives here — expired entries are swept on the next
-//! `insert` (any cache miss) and cleared wholesale on every generation bump (the usage-refresh loop
-//! bumps it ~every 600s), so an idle token doesn't linger indefinitely. (`mlock`-ing the pages to
-//! bar swap is a possible follow-up, but it's the only thing that would improve on the `auth.json`
-//! baseline.)
+//! and the TTL bounds how long any token lives here — expired entries are dropped on the next `get`
+//! for that id, on the next `insert`'s sweep (any cache miss), and by a periodic background `sweep`
+//! the usage-refresh loop runs each cycle (so even a fully idle account's tokens are evicted within
+//! ~one refresh interval of expiry, not left to linger). (`mlock`-ing the pages to bar swap is a
+//! possible follow-up, but it's the only thing that would improve on the `auth.json` baseline.)
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -122,6 +124,17 @@ impl TokenCache {
                 expires_at: now + TTL_SECS,
             },
         );
+    }
+
+    /// Drop (and zeroize) every entry past its TTL. Called periodically by the usage-refresh loop so
+    /// an idle account's tokens are evicted within ~one refresh interval of expiry, even with no
+    /// cache miss to trigger the insert-time sweep. `now` is unix-epoch seconds.
+    pub fn sweep(&self, now: i64) {
+        self.inner
+            .lock()
+            .unwrap()
+            .entries
+            .retain(|_, e| e.expires_at > now);
     }
 }
 
@@ -239,6 +252,24 @@ mod tests {
         assert!(
             cache.get("idle", 1, 1000 + TTL_SECS + 2).is_none(),
             "swept on the later insert"
+        );
+    }
+
+    #[test]
+    fn sweep_drops_expired_entries_but_keeps_live_ones() {
+        // The periodic background sweep bounds idle-token lifetime independent of any cache miss.
+        let cache = TokenCache::new();
+        cache.insert("old", account("old"), tokens("o"), 1, 1000); // expires at 1000+TTL
+        cache.insert("new", account("new"), tokens("n"), 1, 2000); // expires at 2000+TTL
+        cache.sweep(1000 + TTL_SECS + 1); // past "old"'s expiry, before "new"'s
+        assert!(
+            cache.get("old", 1, 1000 + TTL_SECS + 1).is_none(),
+            "expired entry swept"
+        );
+        assert_eq!(
+            cache.get("new", 1, 2001).unwrap().1.access_token,
+            "n",
+            "unexpired entry survives the sweep"
         );
     }
 

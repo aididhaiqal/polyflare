@@ -187,9 +187,11 @@ async fn resolve_core_account(
 ) -> Result<(Account, Provider), Response> {
     let repo = state.store.accounts();
     // Resolve the account + tokens from the in-memory cache when possible (zero SQLite reads, zero
-    // decrypt); on a miss, ONE `get_with_tokens` SELECT loads + populates it. The cache is cleared
-    // on any account-generation bump (token refresh included), so a rotated token is never served.
-    let store_gen = state.store.account_generation();
+    // decrypt); on a miss, ONE `get_with_tokens` SELECT loads + populates it. Keyed to the TOKEN
+    // generation (bumped by insert + update_tokens), so a rotated token is never served — but the
+    // usage-refresh loop's periodic usage/status writes DON'T evict tokens (they bump only the
+    // account/snapshot generation), keeping the token cache warm across refresh cycles.
+    let store_gen = state.store.token_generation();
     let (account, mut tokens) = match state.token_cache.get(picked.as_str(), store_gen, now) {
         Some(pair) => pair,
         None => {

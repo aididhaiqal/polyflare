@@ -219,6 +219,75 @@ async fn usage_refresh_persists_windows_and_gate() {
 }
 
 #[tokio::test]
+async fn account_and_token_generations_decouple_by_write_kind() {
+    // #4: usage/status/pool/routing writes bump ONLY the account (snapshot) generation; token writes
+    // bump ONLY the token generation; an insert bumps BOTH. This is what keeps the token cache warm
+    // across the usage-refresh loop's periodic writes while the snapshot cache still invalidates.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[17u8; 32]).unwrap();
+    let repo = store.accounts();
+
+    let (a0, t0) = (store.account_generation(), store.token_generation());
+    // insert → BOTH bump.
+    repo.insert(&sample_account("acct-1"), &sample_tokens(), &cipher)
+        .await
+        .unwrap();
+    assert!(store.account_generation() > a0, "insert bumps account gen");
+    assert!(store.token_generation() > t0, "insert bumps token gen");
+
+    // A usage write → account gen bumps, token gen UNCHANGED (the key decoupling).
+    let (a1, t1) = (store.account_generation(), store.token_generation());
+    repo.insert_usage_window(
+        "acct-1",
+        "secondary",
+        50.0,
+        Some(1_800_000_000),
+        Some(10080),
+        100,
+    )
+    .await
+    .unwrap();
+    assert!(
+        store.account_generation() > a1,
+        "usage write bumps account gen"
+    );
+    assert_eq!(
+        store.token_generation(),
+        t1,
+        "usage write must NOT evict the token cache"
+    );
+
+    // Status + pool + routing writes → account gen only.
+    let t_before_meta = store.token_generation();
+    repo.update_status("acct-1", "rate_limited").await.unwrap();
+    repo.update_pool("acct-1", Some("team-a")).await.unwrap();
+    repo.update_routing_policy("acct-1", "burn_first")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.token_generation(),
+        t_before_meta,
+        "metadata writes must NOT evict tokens"
+    );
+
+    // A token write → token gen bumps, account gen UNCHANGED (tokens aren't snapshot data).
+    let (a2, t2) = (store.account_generation(), store.token_generation());
+    repo.update_tokens("acct-1", &sample_tokens(), &cipher, 1_700_600_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.account_generation(),
+        a2,
+        "token refresh must NOT rebuild the snapshot cache"
+    );
+    assert!(
+        store.token_generation() > t2,
+        "token refresh bumps token gen"
+    );
+}
+
+#[tokio::test]
 async fn get_with_tokens_returns_account_and_decrypted_tokens_in_one_call() {
     // The request hot path's single-read replacement for `get` + `decrypt_tokens`: it must return
     // the SAME account row and the SAME decrypted tokens as the two-call sequence.
