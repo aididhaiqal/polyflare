@@ -4,6 +4,21 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PolyFlare</title>
+    <script>
+      // Resolve the theme before first paint (saved choice, else OS preference) so there is no
+      // flash of the wrong theme. The React app reads/writes the same key + attribute.
+      (function () {
+        try {
+          var saved = localStorage.getItem("pf-theme");
+          var theme =
+            saved ||
+            (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "dark");
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

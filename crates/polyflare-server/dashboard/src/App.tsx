@@ -185,6 +185,21 @@ export function App() {
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
   // A 1s-ticking clock so the reset countdowns advance live without refetching.
   const [now, setNow] = useState<number>(() => Date.now());
+  // Theme: initialized from the attribute the pre-paint script in index.html already set.
+  const [theme, setTheme] = useState<string>(
+    () => document.documentElement.getAttribute("data-theme") || "dark",
+  );
+
+  function toggleTheme() {
+    const next = theme === "dark" ? "light" : "dark";
+    setTheme(next);
+    document.documentElement.setAttribute("data-theme", next);
+    try {
+      localStorage.setItem("pf-theme", next);
+    } catch {
+      /* private mode / storage disabled — the in-memory toggle still works for this session */
+    }
+  }
 
   useEffect(() => {
     let alive = true;
@@ -226,6 +241,14 @@ export function App() {
               {updatedAt ? `updated ${new Date(updatedAt).toLocaleTimeString()}` : "loading…"}
             </span>
           )}
+          <button
+            className="theme-toggle"
+            onClick={toggleTheme}
+            title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+            aria-label="Toggle color theme"
+          >
+            {theme === "dark" ? "☀" : "☾"}
+          </button>
         </div>
       </header>
 
