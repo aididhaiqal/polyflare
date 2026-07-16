@@ -200,8 +200,7 @@ Columns: **PF** = PolyFlare · **CLB** = codex-lb · **CC** = better-ccflare · 
 1. **Live failure-driven health/cooldown tracking.** `health_tier`/`error_count`/`cooldown_until`/
    `last_error_at` exist as columns but nothing writes them on an upstream failure, so
    `capacity_weighted` runs on neutral data and `round_robin` degenerates to an id tiebreak.
-   *(codex-lb is the same-domain reference for the port; a focused codex-lb deep-study feeds the
-   detailed porting recipes.)*
+   **Full porting plan (file-precise, phased): [`docs/PORTING-CODEXLB.md`](PORTING-CODEXLB.md).**
 2. **Admin / API-key auth.** Every endpoint (ingress, `/api/*`, dashboard) is unauthenticated,
    relying only on the network boundary. Planned `POLYFLARE_ADMIN_TOKEN`. **Headline security caveat.**
 3. **Anti-starvation fallback + general retry/failover across accounts.** PolyFlare 503s an empty
