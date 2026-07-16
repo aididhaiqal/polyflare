@@ -132,7 +132,7 @@ async fn a_clean_completion_clears_prior_error_state() {
         .runtime
         .record_transient_error(&AccountId::from("acct-1"), now());
     let mut before = vec![AccountSnapshot::new("acct-1")];
-    state.runtime.overlay(&mut before);
+    state.runtime.overlay(&mut before, now());
     assert_eq!(before[0].error_count, 2, "seeded");
 
     let resp = reqwest::Client::new()
@@ -147,7 +147,7 @@ async fn a_clean_completion_clears_prior_error_state() {
     let _ = resp.bytes().await.unwrap();
 
     let mut after = vec![AccountSnapshot::new("acct-1")];
-    state.runtime.overlay(&mut after);
+    state.runtime.overlay(&mut after, now());
     assert_eq!(
         after[0].error_count, 0,
         "a clean completion cleared the pre-seeded error state"
@@ -173,7 +173,7 @@ async fn a_429_cools_the_account_down_and_benches_it_next_request() {
 
     // The runtime state now carries a cooldown honoring the Retry-After (90s ≥ the 30s floor).
     let mut snaps = vec![AccountSnapshot::new("acct-1")];
-    state.runtime.overlay(&mut snaps);
+    state.runtime.overlay(&mut snaps, now());
     assert_eq!(snaps[0].error_count, 1, "the 429 bumped the error count");
     assert_eq!(
         snaps[0].cooldown_until,

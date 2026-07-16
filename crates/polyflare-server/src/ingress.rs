@@ -442,7 +442,7 @@ async fn responses_handler_impl(
     let mut snapshots = filter_by_provider_and_pool(&snapshots, Provider::Codex, pool);
     // Overlay live per-account routing state (error_count/cooldown/last_error) onto the filtered
     // slice so the selector's eligibility gates see real failure signal, not neutral defaults.
-    state.runtime.overlay(&mut snapshots);
+    state.runtime.overlay(&mut snapshots, now);
     // The selector for this pool (its configured strategy override, else the global default).
     let selector = state.selector_for(pool);
     let sel_ctx = SelectionCtx {
@@ -457,6 +457,9 @@ async fn responses_handler_impl(
     // C5: ownership pre-filter.
     match apply_ownership(&prepared.directive, &snapshots, selector.as_ref(), &sel_ctx) {
         RouteDecision::Route(id) => {
+            // Stamp last_selected_at NOW (not at completion) so concurrent picks in a burst see this
+            // one — the round_robin + capacity_weighted tiebreaks read it.
+            state.runtime.record_selected(&id, now);
             let (account, provider) = match resolve_core_account(&state, &id, now).await {
                 Ok(a) => a,
                 Err(r) => return r,
@@ -489,6 +492,7 @@ async fn responses_handler_impl(
                         Some(id) => id,
                         None => return no_eligible(),
                     };
+                    state.runtime.record_selected(&fresh, now);
                     let (account, provider) = match resolve_core_account(&state, &fresh, now).await
                     {
                         Ok(a) => a,
@@ -534,6 +538,7 @@ async fn responses_handler_impl(
                     // `directive.recovery` was moved by the outer match.
                     match selector.pick(&snapshots, &sel_ctx) {
                         Some(fresh) => {
+                            state.runtime.record_selected(&fresh, now);
                             let (account, provider) =
                                 match resolve_core_account(&state, &fresh, now).await {
                                     Ok(a) => a,
@@ -684,7 +689,7 @@ async fn messages_handler_native(
     // M4a has no cross-format translator (that's M4b): `/v1/messages` may only ever pick an
     // Anthropic-provider account — the exact mirror of `/responses`'s Codex-only filter above.
     let mut snapshots = filter_by_provider_and_pool(&snapshots, Provider::Anthropic, pool);
-    state.runtime.overlay(&mut snapshots);
+    state.runtime.overlay(&mut snapshots, now);
     let selector = state.selector_for(pool);
     let sel_ctx = SelectionCtx {
         now,
@@ -699,6 +704,7 @@ async fn messages_handler_native(
         Some(id) => id,
         None => return no_eligible(),
     };
+    state.runtime.record_selected(&picked, now);
     let (account, provider) = match resolve_core_account(&state, &picked, now).await {
         Ok(a) => a,
         Err(r) => return r,
@@ -783,7 +789,7 @@ async fn messages_handler_codex_aliased(
     // The mirror of `/responses`'s Codex-only filter: an aliased-to-Codex turn may only ever pick
     // a Codex-provider account, regardless of what `/v1/messages` itself would otherwise select.
     let mut snapshots = filter_by_provider_and_pool(&snapshots, Provider::Codex, pool);
-    state.runtime.overlay(&mut snapshots);
+    state.runtime.overlay(&mut snapshots, now);
     let selector = state.selector_for(pool);
     let sel_ctx = SelectionCtx {
         now,
@@ -797,6 +803,7 @@ async fn messages_handler_codex_aliased(
         Some(id) => id,
         None => return no_eligible(),
     };
+    state.runtime.record_selected(&picked, now);
     let (account, provider) = match resolve_core_account(&state, &picked, now).await {
         Ok(a) => a,
         Err(r) => return r,
