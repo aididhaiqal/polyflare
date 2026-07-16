@@ -88,6 +88,7 @@ async fn spawn(
         codex_executor: Arc::new(CodexExecutor::new().unwrap()),
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),
+        pool_selectors: Default::default(),
         continuity,
         store,
         cipher,

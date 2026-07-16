@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use polyflare_anthropic::AnthropicExecutor;
 use polyflare_codex::oauth::OAuthClient;
 use polyflare_codex::{run_login, CodexExecutor, CodexVersionCache};
-use polyflare_core::{CapacityWeighted, Continuity, Executor, Selector};
+use polyflare_core::{Continuity, Executor, Selector};
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::config::{self, ServeConfig};
 use polyflare_server::continuity::CodexContinuity;
@@ -111,7 +111,13 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let cipher = TokenCipher::load_or_create(&config.key_path)?;
     let codex_executor: Arc<dyn Executor> = Arc::new(CodexExecutor::new()?);
     let anthropic_executor: Arc<dyn Executor> = Arc::new(AnthropicExecutor::new()?);
-    let selector: Arc<dyn Selector> = Arc::new(CapacityWeighted);
+    // Routing: the global default strategy + any per-pool overrides, both from config.
+    let selector: Arc<dyn Selector> = config.routing_strategy.selector();
+    let pool_selectors: std::collections::HashMap<String, Arc<dyn Selector>> = config
+        .pool_strategies
+        .iter()
+        .map(|(slug, strat)| (slug.clone(), strat.selector()))
+        .collect();
     let oauth = OAuthClient::new(config.auth_base_url)?;
     let continuity: Arc<dyn Continuity> = Arc::new(CodexContinuity::new(
         store.continuity(),
@@ -136,6 +142,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         codex_executor,
         anthropic_executor,
         selector,
+        pool_selectors,
         continuity,
         store,
         cipher,

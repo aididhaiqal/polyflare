@@ -1,8 +1,11 @@
 //! Process configuration for `polyflare serve`, read from environment. Secrets are NOT here —
 //! per-account bearer tokens live in the store; only shared base URLs + data paths are config.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use polyflare_core::RoutingStrategy;
 
 // The three shared base URLs are the same for every account, so each has a production default and
 // is overridable by its env var (for a mock/staging/self-hosted-proxy upstream) — none is required.
@@ -24,6 +27,40 @@ pub struct ServeConfig {
     /// `crate::fingerprint_capture`): when set, every ingress request's HTTP fingerprint is
     /// appended to this path as JSON Lines. Unset ⇒ disabled, zero overhead.
     pub capture_fingerprint_path: Option<PathBuf>,
+    /// Global default routing strategy (`POLYFLARE_ROUTING_STRATEGY`, default `capacity_weighted`).
+    pub routing_strategy: RoutingStrategy,
+    /// Per-pool routing-strategy overrides (`POLYFLARE_POOL_STRATEGY="slug=strategy,slug2=..."`).
+    pub pool_strategies: HashMap<String, RoutingStrategy>,
+}
+
+/// Parse `POLYFLARE_POOL_STRATEGY` — a comma-separated list of `slug=strategy` pairs. Whitespace
+/// around each token is tolerated; empty segments are skipped. An unknown strategy name or a
+/// malformed pair is a hard error (fail fast at startup rather than silently misroute a pool).
+fn parse_pool_strategies(raw: &str) -> Result<HashMap<String, RoutingStrategy>, String> {
+    let mut map = HashMap::new();
+    for pair in raw.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (slug, strat) = pair.split_once('=').ok_or_else(|| {
+            format!("POLYFLARE_POOL_STRATEGY: expected 'slug=strategy', got '{pair}'")
+        })?;
+        let slug = slug.trim();
+        if slug.is_empty() {
+            return Err(format!(
+                "POLYFLARE_POOL_STRATEGY: empty pool slug in '{pair}'"
+            ));
+        }
+        let strategy = RoutingStrategy::parse(strat.trim()).ok_or_else(|| {
+            format!(
+                "POLYFLARE_POOL_STRATEGY: unknown strategy '{}'",
+                strat.trim()
+            )
+        })?;
+        map.insert(slug.to_string(), strategy);
+    }
+    Ok(map)
 }
 
 impl ServeConfig {
@@ -48,6 +85,16 @@ impl ServeConfig {
         let capture_fingerprint_path = std::env::var("POLYFLARE_CAPTURE_FINGERPRINT")
             .ok()
             .map(PathBuf::from);
+        // Routing strategy: global default + optional per-pool overrides. Unknown names fail fast.
+        let routing_strategy = match std::env::var("POLYFLARE_ROUTING_STRATEGY") {
+            Ok(s) => RoutingStrategy::parse(&s)
+                .ok_or_else(|| format!("POLYFLARE_ROUTING_STRATEGY: unknown strategy '{s}'"))?,
+            Err(_) => RoutingStrategy::default(),
+        };
+        let pool_strategies = match std::env::var("POLYFLARE_POOL_STRATEGY") {
+            Ok(raw) => parse_pool_strategies(&raw)?,
+            Err(_) => HashMap::new(),
+        };
         Ok(ServeConfig {
             bind_addr,
             upstream_base_url,
@@ -57,6 +104,8 @@ impl ServeConfig {
             key_path: key_path(&data_dir),
             continuity_watchdog,
             capture_fingerprint_path,
+            routing_strategy,
+            pool_strategies,
         })
     }
 }
@@ -78,4 +127,30 @@ pub fn db_path(data_dir: &Path) -> PathBuf {
 /// The at-rest key file path within a data directory (raw 32 bytes).
 pub fn key_path(data_dir: &Path) -> PathBuf {
     data_dir.join("key")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_pool_strategies_reads_pairs_and_rejects_bad_input() {
+        let m = parse_pool_strategies("a=fill_first, b = cache_affinity_tier ,").unwrap();
+        assert_eq!(m.get("a"), Some(&RoutingStrategy::FillFirst));
+        assert_eq!(m.get("b"), Some(&RoutingStrategy::CacheAffinityTier));
+        assert_eq!(m.len(), 2, "trailing empty segment skipped");
+        assert!(
+            parse_pool_strategies("a=bogus").is_err(),
+            "unknown strategy → err"
+        );
+        assert!(
+            parse_pool_strategies("noequals").is_err(),
+            "malformed pair → err"
+        );
+        assert!(
+            parse_pool_strategies("=fill_first").is_err(),
+            "empty slug → err"
+        );
+        assert!(parse_pool_strategies("").unwrap().is_empty());
+    }
 }

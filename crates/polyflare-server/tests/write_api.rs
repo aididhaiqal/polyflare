@@ -63,6 +63,7 @@ async fn spawn_with(store: Store) -> String {
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap())
             as Arc<dyn Executor>,
         selector: Arc::new(CapacityWeighted),
+        pool_selectors: Default::default(),
         continuity,
         store,
         cipher,

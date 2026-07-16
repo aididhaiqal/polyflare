@@ -99,6 +99,7 @@ async fn second_turn_pins_back_to_owning_account() {
         codex_executor: Arc::new(CodexExecutor::new().unwrap()),
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(PreferB),
+        pool_selectors: Default::default(),
         continuity,
         store,
         cipher: TokenCipher::from_key_bytes(&[7u8; 32]).unwrap(),

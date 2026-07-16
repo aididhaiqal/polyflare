@@ -29,7 +29,12 @@ const MAX_REQUEST_BODY_BYTES: usize = 100 * 1024 * 1024;
 pub struct AppState {
     pub codex_executor: Arc<dyn Executor>,
     pub anthropic_executor: Arc<dyn Executor>,
+    /// The DEFAULT (global) routing selector — used for the bare paths and for any pool without an
+    /// explicit override in `pool_selectors`.
     pub selector: Arc<dyn Selector>,
+    /// Per-pool routing-strategy overrides (pool slug → selector). Empty by default; populated from
+    /// `POLYFLARE_POOL_STRATEGY`. A pool absent here routes with `selector`.
+    pub pool_selectors: std::collections::HashMap<String, Arc<dyn Selector>>,
     pub continuity: Arc<dyn Continuity>,
     pub store: Store,
     pub cipher: TokenCipher,
@@ -70,6 +75,13 @@ impl AppState {
             Provider::Codex => &self.upstream_base_url,
             Provider::Anthropic => &self.anthropic_upstream_base_url,
         }
+    }
+
+    /// The routing selector for a request narrowed to `pool`: the pool's configured strategy
+    /// override if any, else the global default. The bare paths pass `None` ⇒ the default.
+    pub fn selector_for(&self, pool: Option<&str>) -> &Arc<dyn Selector> {
+        pool.and_then(|p| self.pool_selectors.get(p))
+            .unwrap_or(&self.selector)
     }
 }
 
