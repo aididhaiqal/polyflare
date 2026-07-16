@@ -36,6 +36,10 @@ impl Executor for AnthropicExecutor {
         account: &Account,
     ) -> Result<ResponseStream, ExecError> {
         let url = format!("{}/v1/messages", account.base_url.trim_end_matches('/'));
+        // No Anthropic ingress path forwards raw bytes today (the native + aliased `/v1/messages`
+        // paths both build a JSON body), so this serializes `body` via `.json()`. When Anthropic
+        // native raw-forwarding is added, add a `raw_body` branch here — mirroring the Codex
+        // executor's CONDITIONAL content-type insert to avoid duplicating a forwarded header.
         let resp = self
             .client
             .post(&url)

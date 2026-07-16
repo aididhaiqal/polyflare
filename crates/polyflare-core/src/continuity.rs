@@ -51,6 +51,7 @@ mod tests {
             body: serde_json::json!({}),
             model: "m".to_string(),
             forward_headers: vec![],
+            raw_body: None,
         };
         let prepared = noop.prepare(req, &RequestCtx::default()).await.unwrap();
         assert!(prepared.directive.pin_account.is_none());

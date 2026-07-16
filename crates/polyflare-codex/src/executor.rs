@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 
 use polyflare_core::{Account, ExecError, Executor, PreparedRequest, ResponseStream};
 
@@ -78,8 +78,8 @@ impl Executor for CodexExecutor {
         // override auth/accept. `HeaderMap::insert` (not `append`) is used throughout so an
         // override REPLACES a same-named forwarded header instead of sending it twice (e.g. a
         // native client's own inbound `accept: text/event-stream` is replaced, not duplicated,
-        // by the override below). `content-type` is deliberately not set here: reqwest's `.json`
-        // call sets it only when absent, so a forwarded `content-type` (native path) is preserved.
+        // by the override below). `content-type` is set below only for the raw path, and only when
+        // absent — the `.json()` (serialized) path sets it itself, also only when absent.
         let mut headers = HeaderMap::new();
         for (name, value) in &req.forward_headers {
             let header_name = HeaderName::from_bytes(name.as_bytes())
@@ -104,11 +104,23 @@ impl Executor for CodexExecutor {
             );
         }
 
-        let resp = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .json(&req.body)
+        // Content-Type on the raw path: mirror `.json()`'s CONDITIONAL insert (set only when absent)
+        // so a native client's own forwarded `content-type` is PRESERVED byte-identically and never
+        // duplicated. `RequestBuilder::header` APPENDS (unlike `.json()`'s insert-if-absent), so we
+        // must set it on the `HeaderMap` (insert = replace/one value) here, not on the builder.
+        if req.raw_body.is_some() && !headers.contains_key(CONTENT_TYPE) {
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        }
+
+        // Forward the client's ORIGINAL bytes verbatim when present (native pass-through — no
+        // parse→re-serialize round-trip, byte-identical to what the client sent); otherwise
+        // serialize the (built/mutated) body.
+        let builder = self.client.post(&url).headers(headers);
+        let builder = match &req.raw_body {
+            Some(raw) => builder.body(raw.clone()),
+            None => builder.json(&req.body),
+        };
+        let resp = builder
             .send()
             .await
             .map_err(|e| ExecError::Upstream(e.to_string()))?;

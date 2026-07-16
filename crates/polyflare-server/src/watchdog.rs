@@ -75,17 +75,23 @@ pub fn apply_ownership(
     }
 }
 
-/// Diagnostic input fingerprint (sha256 hex of the `input` JSON) + item count. Not used to gate a
-/// trim in M3-core (we never trim) — recorded by `observe` for diagnostics only.
-fn input_fingerprint_and_count(body: &serde_json::Value) -> (String, u32) {
-    let input = body.get("input");
+/// Diagnostic input fingerprint + item count. Not used to gate a trim in M3-core (we never trim) —
+/// recorded by `observe` for diagnostics only, so the fingerprint BASIS just needs to be stable per
+/// request. When the original wire bytes are available (native pass-through), hash THOSE (no `input`
+/// re-serialize, and byte-identical to what the client sent); otherwise fall back to hashing the
+/// canonical `input` serialization of the built body.
+fn input_fingerprint_and_count(req: &PreparedRequest) -> (String, u32) {
+    let input = req.body.get("input");
     let count = match input {
         Some(serde_json::Value::Array(a)) => a.len() as u32,
         Some(_) => 1,
         None => 0,
     };
-    let canon = input.map(|v| v.to_string()).unwrap_or_default();
-    (sha256_hex(canon.as_bytes()), count)
+    let fp = match &req.raw_body {
+        Some(raw) => sha256_hex(raw.as_ref()),
+        None => sha256_hex(input.map(|v| v.to_string()).unwrap_or_default().as_bytes()),
+    };
+    (fp, count)
 }
 
 /// Execute a prepared request under the watchdog. Disarmed (no anchor) ⇒ relay + sniff + observe
@@ -101,7 +107,7 @@ pub async fn execute_with_watchdog(
 ) -> Result<ResponseStream, WatchdogError> {
     let Prepared { req, directive } = prepared;
     let session_key = directive.session_key.clone();
-    let (fp, count) = input_fingerprint_and_count(&req.body);
+    let (fp, count) = input_fingerprint_and_count(&req);
 
     match directive.watchdog {
         WatchdogArm::Disarmed => {

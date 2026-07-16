@@ -23,6 +23,7 @@ async fn executor_streams_upstream_events_and_forwards_body() {
         body: serde_json::json!({"model": "gpt-5.6-sol", "input": "hello"}),
         model: "gpt-5.6-sol".into(),
         forward_headers: vec![],
+        raw_body: None,
     };
 
     let mut stream = executor.execute(req, &account).await.unwrap();
@@ -34,6 +35,48 @@ async fn executor_streams_upstream_events_and_forwards_body() {
     assert!(collected.contains("response.output_text.delta"));
     assert!(collected.contains("response.completed"));
     assert_eq!(handle.last_body().unwrap()["model"], "gpt-5.6-sol");
+}
+
+#[tokio::test]
+async fn raw_body_is_forwarded_verbatim_with_exactly_one_content_type() {
+    // Native pass-through: `raw_body` is sent as-is, and a native client's OWN forwarded
+    // `content-type` must be preserved WITHOUT being duplicated (the executor must not append a
+    // second one on top of the forwarded header).
+    let mock = MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()]);
+    let handle = mock.clone();
+    let base = mock.spawn().await;
+
+    let executor = CodexExecutor::new().unwrap();
+    let account = Account {
+        id: "test".into(),
+        base_url: base,
+        bearer_token: "test-token".into(),
+        chatgpt_account_id: None,
+    };
+    // Bytes a real client sent — note the deliberate key order / spacing that a re-serialize would
+    // NOT reproduce, proving verbatim forwarding.
+    let raw = br#"{"model":"gpt-5.6-sol","input":"hi","extra_field":true}"#.to_vec();
+    let req = PreparedRequest {
+        body: serde_json::from_slice(&raw).unwrap(),
+        model: "gpt-5.6-sol".into(),
+        // A native client always sends its own content-type; it is forwarded (not in the drop-list).
+        forward_headers: vec![("content-type".to_string(), "application/json".to_string())],
+        raw_body: Some(bytes::Bytes::from(raw.clone())),
+    };
+
+    let mut stream = executor.execute(req, &account).await.unwrap();
+    while stream.next().await.is_some() {}
+
+    // Body reached upstream (content preserved).
+    assert_eq!(handle.last_body().unwrap()["extra_field"], true);
+    // EXACTLY ONE content-type on the wire — not the duplicate the append bug produced.
+    let headers = handle.last_headers().unwrap();
+    assert_eq!(
+        headers.get_all("content-type").iter().count(),
+        1,
+        "native raw path must send exactly one content-type, got {:?}",
+        headers.get_all("content-type").iter().collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]
@@ -60,6 +103,7 @@ async fn executor_sends_selected_account_chatgpt_account_id_overriding_forwarded
             "chatgpt-account-id".to_string(),
             "client-stale-acct".to_string(),
         )],
+        raw_body: None,
     };
 
     let mut stream = executor.execute(req, &account).await.unwrap();
@@ -90,6 +134,7 @@ async fn executor_surfaces_upstream_error_status() {
         body: serde_json::json!({"model": "m"}),
         model: "m".into(),
         forward_headers: vec![],
+        raw_body: None,
     };
     let err = executor.execute(req, &account).await.err().unwrap();
     assert!(matches!(err, polyflare_core::ExecError::Upstream(_)));

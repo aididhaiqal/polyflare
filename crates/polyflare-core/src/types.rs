@@ -20,6 +20,13 @@ pub struct PreparedRequest {
     pub body: serde_json::Value,
     pub model: String,
     pub forward_headers: Vec<(String, String)>,
+    /// The client's ORIGINAL request bytes, when they can be forwarded upstream verbatim (the native
+    /// `/responses` pass-through). `Some` ⇒ the executor sends these bytes as-is — no parse→
+    /// re-serialize round-trip, and byte-identical to what the client sent (better fingerprint
+    /// fidelity). `None` ⇒ the body was built or mutated (a translated alias, or an anchor-stripped
+    /// full-resend recovery), so the executor serializes `body`. `body` is still populated either
+    /// way for routing / the continuity heuristic / the diagnostic input fingerprint.
+    pub raw_body: Option<bytes::Bytes>,
 }
 
 // `body` carries the full user request/conversation content and must never be printed in clear
@@ -372,6 +379,7 @@ mod tests {
             body: serde_json::json!({"input": "super-secret-user-conversation"}),
             model: "gpt-5.6-sol".to_string(),
             forward_headers: vec![],
+            raw_body: None,
         };
         let s = format!("{req:?}");
         assert!(
@@ -405,6 +413,7 @@ mod tests {
                     "super-secret-thread-uuid".to_string(),
                 ),
             ],
+            raw_body: None,
         };
         let s = format!("{req:?}");
         assert!(
@@ -438,6 +447,7 @@ mod tests {
                 body: serde_json::json!({"input": "super-secret-conversation"}),
                 model: "m".to_string(),
                 forward_headers: vec![],
+                raw_body: None,
             },
         };
         let s = format!("{plan:?}");
