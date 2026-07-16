@@ -238,6 +238,21 @@ impl AccountRepo {
         Ok(())
     }
 
+    /// Set an account's routing policy (`normal` | `burn_first` | `preserve`). Bumps the generation.
+    pub async fn update_routing_policy(
+        &self,
+        id: &str,
+        routing_policy: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE accounts SET routing_policy = ? WHERE id = ?")
+            .bind(routing_policy)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        self.bump_generation();
+        Ok(())
+    }
+
     /// Update an account's status AND its `reset_at` routing gate together — the usage-refresh
     /// quota mapping writes both (e.g. `quota_exceeded` + the weekly window's reset time). Bumps
     /// the generation so the account cache re-reads fresh usage.

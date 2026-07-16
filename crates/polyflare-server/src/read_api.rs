@@ -57,6 +57,7 @@ struct AccountView {
     provider: String,
     status: String,
     plan_type: String,
+    routing_policy: String,
     reset_at: Option<i64>,
     /// 5h window (may be null).
     five_hour: Option<WindowView>,
@@ -86,6 +87,7 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
             provider: account.provider,
             status: account.status,
             plan_type: account.plan_type,
+            routing_policy: account.routing_policy,
             reset_at: account.reset_at,
             five_hour: resolved.five_hour.map(Into::into),
             weekly: resolved.weekly.map(Into::into),

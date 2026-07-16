@@ -16,6 +16,7 @@ export interface Account {
   provider: string;
   status: string;
   plan_type: string;
+  routing_policy: string;
   reset_at: number | null;
   // Windows are resolved by duration, not storage slot: `five_hour` is null when upstream isn't
   // reporting a 5h limit (e.g. the current no-5h promo) — that means "not reported", not blocked.
@@ -51,8 +52,27 @@ async function getJson<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+// A partial account-settings update. `pool: null` clears (unpools); omit a field to leave it as-is.
+export interface AccountPatch {
+  pool?: string | null;
+  routing_policy?: string;
+  status?: string;
+}
+
+async function patchAccount(id: string, patch: AccountPatch): Promise<void> {
+  const res = await fetch(`/api/accounts/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    throw new Error((await res.text()) || `PATCH ${id} → ${res.status}`);
+  }
+}
+
 export const api = {
   accounts: () => getJson<Account[]>("/api/accounts"),
   pools: () => getJson<Pool[]>("/api/pools"),
   requests: (limit = 100) => getJson<RequestsPage>(`/api/requests?limit=${limit}`),
+  patchAccount,
 };
