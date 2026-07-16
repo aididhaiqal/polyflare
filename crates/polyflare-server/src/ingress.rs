@@ -22,7 +22,7 @@ use crate::app::AppState;
 use crate::fingerprint_capture::{append_fingerprint_capture, capture_request_fingerprint};
 use crate::observability::RequestLog;
 use crate::session_key::derive_request_ctx;
-use crate::snapshot::{filter_by_pool, filter_by_provider};
+use crate::snapshot::filter_by_provider_and_pool;
 use crate::translate_stream::wrap_translating_stream;
 use crate::watchdog::{
     apply_ownership, execute_recovery, execute_with_watchdog, signal_client_stream, RouteDecision,
@@ -186,17 +186,15 @@ async fn resolve_core_account(
     now: i64,
 ) -> Result<(Account, Provider), Response> {
     let repo = state.store.accounts();
-    let account = match repo.get(picked.as_str()).await {
-        Ok(Some(a)) => a,
+    // Single SELECT for the account row + its tokens (was `get` + `decrypt_tokens` — two reads of
+    // the same row on every request).
+    let (account, mut tokens) = match repo.get_with_tokens(picked.as_str(), &state.cipher).await {
+        Ok(Some(pair)) => pair,
         Ok(None) | Err(_) => return Err(internal_error()),
     };
     let provider: Provider = match account.provider.parse() {
         Ok(p) => p,
         Err(_) => return Err(internal_error()),
-    };
-    let mut tokens = match repo.decrypt_tokens(picked.as_str(), &state.cipher).await {
-        Ok(Some(t)) => t,
-        Ok(None) | Err(_) => return Err(internal_error()),
     };
     // Refresh-on-stale is Codex-specific (the only OAuth client AppState holds today); Anthropic
     // subscription-OAuth refresh is Task 7 (VERIFY-gated — no confirmed endpoint/client_id yet).
@@ -364,11 +362,8 @@ async fn responses_handler_impl(
         Err(_) => return internal_error(),
     };
     // M4a has no cross-format translator (that's M4b): `/responses` may only ever pick a
-    // Codex-provider account.
-    let snapshots = filter_by_provider(&snapshots, Provider::Codex);
-    // Then narrow to the requested pool: `None` (bare path) keeps all, `Some(slug)` keeps only that
-    // pool's accounts. Composes with the provider filter over the same shared snapshot slice.
-    let snapshots = filter_by_pool(&snapshots, pool);
+    // Codex-provider account. One pass also narrows to the requested pool (`None` = all accounts).
+    let snapshots = filter_by_provider_and_pool(&snapshots, Provider::Codex, pool);
     // The selector for this pool (its configured strategy override, else the global default).
     let selector = state.selector_for(pool);
     let sel_ctx = SelectionCtx {
@@ -594,8 +589,7 @@ async fn messages_handler_native(
     };
     // M4a has no cross-format translator (that's M4b): `/v1/messages` may only ever pick an
     // Anthropic-provider account — the exact mirror of `/responses`'s Codex-only filter above.
-    let snapshots = filter_by_provider(&snapshots, Provider::Anthropic);
-    let snapshots = filter_by_pool(&snapshots, pool);
+    let snapshots = filter_by_provider_and_pool(&snapshots, Provider::Anthropic, pool);
     let selector = state.selector_for(pool);
     let sel_ctx = SelectionCtx {
         now,
@@ -686,8 +680,7 @@ async fn messages_handler_codex_aliased(
     };
     // The mirror of `/responses`'s Codex-only filter: an aliased-to-Codex turn may only ever pick
     // a Codex-provider account, regardless of what `/v1/messages` itself would otherwise select.
-    let snapshots = filter_by_provider(&snapshots, Provider::Codex);
-    let snapshots = filter_by_pool(&snapshots, pool);
+    let snapshots = filter_by_provider_and_pool(&snapshots, Provider::Codex, pool);
     let selector = state.selector_for(pool);
     let sel_ctx = SelectionCtx {
         now,

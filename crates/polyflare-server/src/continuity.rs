@@ -81,14 +81,17 @@ impl Continuity for CodexContinuity {
         }
 
         // Ensure a session row exists (Fresh on miss); mark reattaching when an anchor is in flight.
+        // The anchored case does both in ONE UPSERT (`ensure_session_reattaching`) instead of
+        // ensure-then-set_state — one fewer per-request write/fsync on the hot path.
         if let Some(sk) = session_key.as_ref() {
-            self.repo
-                .ensure_session(&sk.value, strength_str(sk.strength), now)
-                .await
-                .map_err(box_store_err)?;
             if anchor.is_some() {
                 self.repo
-                    .set_state(&sk.value, "reattaching", now)
+                    .ensure_session_reattaching(&sk.value, strength_str(sk.strength), now)
+                    .await
+                    .map_err(box_store_err)?;
+            } else {
+                self.repo
+                    .ensure_session(&sk.value, strength_str(sk.strength), now)
                     .await
                     .map_err(box_store_err)?;
             }

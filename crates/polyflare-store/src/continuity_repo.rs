@@ -78,6 +78,37 @@ impl ContinuityRepo {
     }
 
     /// Set the session state (e.g. `'reattaching'`) + bump activity timestamps.
+    /// Anchored-path fast path: ensure the session row exists AND mark it `reattaching` in ONE
+    /// UPSERT — behavior-equivalent to `ensure_session` + `set_state("reattaching")` but a single
+    /// write/commit per anchored request (one fewer fsync on the hot path). A missing row is
+    /// inserted directly in `reattaching`; an existing row is moved to `reattaching` with its
+    /// `updated_at`/`last_activity_at` bumped (its `created_at` and `key_strength` preserved,
+    /// exactly as the two-call sequence left them).
+    pub async fn ensure_session_reattaching(
+        &self,
+        session_key: &str,
+        key_strength: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO continuity_sessions \
+             (session_key, key_strength, state, created_at, updated_at, last_activity_at) \
+             VALUES (?, ?, 'reattaching', ?, ?, ?) \
+             ON CONFLICT(session_key) DO UPDATE SET \
+             state = 'reattaching', updated_at = ?, last_activity_at = ?",
+        )
+        .bind(session_key)
+        .bind(key_strength)
+        .bind(now) // created_at (insert path only)
+        .bind(now) // updated_at (insert path)
+        .bind(now) // last_activity_at (insert path)
+        .bind(now) // updated_at (conflict update)
+        .bind(now) // last_activity_at (conflict update)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn set_state(
         &self,
         session_key: &str,
