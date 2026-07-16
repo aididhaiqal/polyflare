@@ -4,7 +4,14 @@ A multi-provider LLM-CLI load balancer, in Rust.
 
 PolyFlare fronts a pool of provider accounts (OpenAI Codex / ChatGPT and Anthropic to start), speaks multiple client wire formats, translates between them where needed, and routes each request to the best available account — presenting the native CLI's fingerprint on egress. It is the Rust successor to [codex-lb](https://github.com/Soju06/codex-lb), adopting the multi-provider translation model from [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) and the Anthropic-pool + dashboard ideas from [better-ccflare](https://github.com/tombii/better-ccflare).
 
-> **Status: early / work in progress.** Milestone 1 (Codex identity pass-through) is underway. Not yet a daily driver.
+> **Status: functional, still early.** The core is built and green — Codex-native `/responses`
+> pass-through over pinned TLS, the continuity watchdog + `store:false` wedge fix, `Anthropic → Codex`
+> translation, multi-account/multi-pool selection, OAuth (exp-driven refresh + PKCE login), a
+> zero-re-auth importer from codex-lb, and an embedded dashboard — all under e2e / wedge-regression /
+> latency / fingerprint-parity CI gates. It runs against the real backends today, but it is **not yet a
+> daily driver**: notably there is **no admin auth**, and failure-driven health/cooldown routing,
+> retry/failover, and prompt-cache stickiness are **not built yet**. See
+> [`docs/COMPARISON.md`](docs/COMPARISON.md) for the full have / don't-have ledger.
 
 ## Why a rebuild
 
@@ -22,9 +29,9 @@ A single [tokio](https://tokio.rs) binary. A provider-neutral core — a `Format
 | Crate | Responsibility |
 |---|---|
 | `polyflare-core` | `Format` enum, translator registry, core types, the five traits |
-| `polyflare-codex` | Codex backend: WS/SSE transport, fingerprint laundering, continuity |
-| `polyflare-anthropic` | Anthropic backend: HTTP transport, rate-limit semantics *(M4)* |
-| `polyflare-store` | SQLite persistence + at-rest crypto *(M2)* |
+| `polyflare-codex` | Codex backend: SSE transport, fingerprint laundering, continuity, OAuth |
+| `polyflare-anthropic` | Anthropic backend: HTTP transport + `Anthropic → Codex` translator |
+| `polyflare-store` | SQLite persistence + at-rest crypto (XChaCha20-Poly1305) |
 | `polyflare-testkit` | Scriptable mock upstreams for e2e tests |
 | `polyflare-server` | axum ingress, auth, config, wiring — and the `polyflare` binary |
 
@@ -88,11 +95,23 @@ the fingerprint golden — start PolyFlare with `POLYFLARE_CAPTURE_FINGERPRINT` 
 
 ## Roadmap
 
-- **M1** — Skeleton + Codex identity pass-through ← *in progress*
-- **M2** — Store + accounts + selector + zero-re-auth OAuth import
-- **M3** — Continuity engine (the wedge fix)
-- **M4** — Anthropic executor + `Anthropic → Codex` translator
-- **M5** — Byte-identical fingerprint + latency/parity CI gates + observability
+Core milestones — **built and CI-gated:**
+
+- **M1** — Skeleton + Codex identity pass-through ✅
+- **M2** — Store + accounts + selector + zero-re-auth OAuth import ✅
+- **M3** — Continuity engine (the wedge fix) ✅
+- **M4** — Anthropic executor + `Anthropic → Codex` translator ✅
+- **M5** — Fingerprint parity + latency/wedge CI gates + content-safe observability ✅
+
+Next up, in rough priority (full ledger in [`docs/COMPARISON.md`](docs/COMPARISON.md)):
+
+1. **Failure-driven health/cooldown tracking** — make the already-built `capacity_weighted` routing
+   run on real data instead of inert neutral defaults.
+2. **Admin / API-key auth** (`POLYFLARE_ADMIN_TOKEN`) on management + proxy endpoints.
+3. **Retry/failover across accounts** + anti-starvation "serve soonest-to-recover" fallback.
+4. **Prompt-cache stickiness** — derive a `prompt_cache_key` on the translated path for ~10× cheaper
+   cached input tokens (design in `docs/COMPARISON.md`).
+5. Verify the speculative Codex alias/`reasoning.effort` wire shape against a live backend.
 
 ## Responsible use
 
