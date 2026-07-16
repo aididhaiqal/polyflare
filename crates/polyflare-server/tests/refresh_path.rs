@@ -269,6 +269,62 @@ async fn fresh_token_far_from_expiry_is_not_refreshed() {
 }
 
 #[tokio::test]
+async fn persist_failure_after_successful_refresh_still_serves_with_fresh_token() {
+    // Graceful degradation: if the refresh SUCCEEDS but persisting the rotated tokens fails on every
+    // retry (fault-injected here by a trigger that aborts all UPDATEs), the request the refresh was
+    // for must STILL be served — with the fresh in-memory token — rather than 5xx. (The DB is left
+    // holding the old token; that account will need re-auth later, which is the honest end-state.)
+    let upstream = MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()]);
+    let up_handle = upstream.clone();
+    let upstream_url = upstream.spawn().await;
+
+    let oauth = MockOAuth::ok("new-access", "new-refresh", VALID_JWT);
+    let oauth_url = oauth.spawn().await;
+
+    let near_expiry = jwt_expiring_in(3600); // 1h ⇒ inside the 2-day margin ⇒ refresh fires
+    let (pf, state) = spawn_with_access_token(oauth_url, upstream_url, now(), &near_expiry).await;
+
+    // Fault injection: abort every UPDATE to `accounts`, so the post-refresh persist fails all retries.
+    sqlx::query(
+        "CREATE TRIGGER block_account_updates BEFORE UPDATE ON accounts \
+         BEGIN SELECT RAISE(ABORT, 'injected persist failure'); END;",
+    )
+    .execute(state.store.pool())
+    .await
+    .unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "a persist failure must not fail the request the refresh already succeeded for"
+    );
+    assert_eq!(
+        up_handle.last_authorization().unwrap(),
+        "Bearer new-access",
+        "the fresh in-memory token is used for this request despite the persist failure"
+    );
+    // The persist genuinely failed ⇒ the store still holds the OLD (near-expiry) token.
+    let toks = state
+        .store
+        .accounts()
+        .decrypt_tokens("acct-1", &state.cipher)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        toks.access_token, near_expiry,
+        "the aborted persist left the stored token unchanged"
+    );
+}
+
+#[tokio::test]
 async fn permanent_refresh_failure_marks_reauth_and_excludes_account() {
     let upstream = MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()]);
     let upstream_url = upstream.spawn().await;
