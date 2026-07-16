@@ -2,7 +2,7 @@
 //! relay. Client-facing errors carry generic bodies (never a token, URL, or internal Display).
 
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Json, Path, State};
@@ -34,6 +34,12 @@ fn unix_now() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+/// Bounded retries for the post-refresh token persist (the one write whose loss kills an account —
+/// see the call site). `busy_timeout` is the first line of defense; this is the backstop.
+const PERSIST_MAX_ATTEMPTS: u32 = 3;
+/// Fixed backoff between persist retries (small — the write is on the hot lock).
+const PERSIST_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Map a reasoning-effort string to a routing `Tier` (the subagent-tier signal the
 /// `cache_affinity_tier` strategy reads). `minimal`/`low` → Low, `medium` → Medium, `high` → High.
@@ -241,15 +247,35 @@ async fn resolve_core_account(
                         refresh_token: refreshed.tokens.refresh_token,
                         id_token: refreshed.tokens.id_token,
                     };
-                    if let Err(e) = repo
-                        .update_tokens(picked.as_str(), &new, &state.cipher, now)
-                        .await
-                    {
-                        // Refresh succeeded and `new` is valid in-memory for THIS request; don't fail
-                        // over a persist error — surface it (content-safe). Observability is M5.
-                        // (A successful write bumps the store generation, auto-invalidating the
-                        // account cache — no explicit invalidation needed here.)
-                        eprintln!("polyflare: failed to persist refreshed tokens: {e}");
+                    // Persist the rotated tokens — the ONE uniquely critical write on this path: the
+                    // refresh already rotated the upstream refresh token, so LOSING this write leaves
+                    // a dead refresh token in the DB and the account dies on its next refresh. The
+                    // pool's `busy_timeout` (5s) already absorbs lock contention at the driver; these
+                    // bounded retries add a backstop for a post-timeout busy or a transient IO blip.
+                    // `update_tokens` is an idempotent UPDATE, so retrying is safe. On FINAL failure
+                    // the refresh still succeeded and `new` is valid in-memory for THIS request —
+                    // serve it rather than 5xx — but the stored token is now stale (a later refresh
+                    // will need re-auth); log loudly (content-safe: no token material).
+                    for attempt in 1..=PERSIST_MAX_ATTEMPTS {
+                        match repo
+                            .update_tokens(picked.as_str(), &new, &state.cipher, now)
+                            .await
+                        {
+                            Ok(()) => break, // success bumps the store generation, invalidating caches
+                            Err(e) if attempt < PERSIST_MAX_ATTEMPTS => {
+                                tracing::warn!(
+                                    attempt,
+                                    error = %e,
+                                    "persist of refreshed tokens failed; retrying"
+                                );
+                                tokio::time::sleep(PERSIST_RETRY_BACKOFF).await;
+                            }
+                            Err(e) => tracing::error!(
+                                error = %e,
+                                "failed to persist refreshed tokens after {PERSIST_MAX_ATTEMPTS} \
+                                 attempts; stored refresh token is now stale — account will need re-auth"
+                            ),
+                        }
                     }
                     tokens = new;
                 }
