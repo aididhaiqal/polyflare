@@ -20,7 +20,7 @@ async fn executor_streams_upstream_events_and_forwards_body() {
         chatgpt_account_id: None,
     };
     let req = PreparedRequest {
-        body: serde_json::json!({"model": "gpt-5.6-sol", "input": "hello"}),
+        body: Some(serde_json::json!({"model": "gpt-5.6-sol", "input": "hello"})),
         model: "gpt-5.6-sol".into(),
         forward_headers: vec![],
         raw_body: None,
@@ -57,7 +57,8 @@ async fn raw_body_is_forwarded_verbatim_with_exactly_one_content_type() {
     // NOT reproduce, proving verbatim forwarding.
     let raw = br#"{"model":"gpt-5.6-sol","input":"hi","extra_field":true}"#.to_vec();
     let req = PreparedRequest {
-        body: serde_json::from_slice(&raw).unwrap(),
+        // Native pass-through: no materialized body — the wire bytes in `raw_body` are forwarded.
+        body: None,
         model: "gpt-5.6-sol".into(),
         // A native client always sends its own content-type; it is forwarded (not in the drop-list).
         forward_headers: vec![("content-type".to_string(), "application/json".to_string())],
@@ -95,7 +96,7 @@ async fn executor_sends_selected_account_chatgpt_account_id_overriding_forwarded
         chatgpt_account_id: Some("acct-selected".into()),
     };
     let req = PreparedRequest {
-        body: serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}),
+        body: Some(serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"})),
         model: "gpt-5.6-sol".into(),
         // A client forwarded a DIFFERENT account's id — it must be replaced, not shipped alongside
         // our overridden Bearer (a mismatched (token, account) pair is what the backend rejects).
@@ -131,7 +132,7 @@ async fn executor_surfaces_upstream_error_status() {
         chatgpt_account_id: None,
     };
     let req = PreparedRequest {
-        body: serde_json::json!({"model": "m"}),
+        body: Some(serde_json::json!({"model": "m"})),
         model: "m".into(),
         forward_headers: vec![],
         raw_body: None,

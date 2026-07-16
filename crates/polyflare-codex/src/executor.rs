@@ -118,7 +118,12 @@ impl Executor for CodexExecutor {
         let builder = self.client.post(&url).headers(headers);
         let builder = match &req.raw_body {
             Some(raw) => builder.body(raw.clone()),
-            None => builder.json(&req.body),
+            // No raw pass-through ⇒ `body` is `Some` per `PreparedRequest`'s invariant.
+            None => builder.json(
+                req.body
+                    .as_ref()
+                    .expect("PreparedRequest: raw_body None ⇒ body Some"),
+            ),
         };
         let resp = builder
             .send()

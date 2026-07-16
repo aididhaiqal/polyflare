@@ -131,7 +131,7 @@ async fn codex_egress_header_structure_matches_the_from_source_codex_rs_golden()
         ),
     ];
     let req = PreparedRequest {
-        body,
+        body: Some(body),
         model: "gpt-5.6-sol".into(),
         forward_headers,
         raw_body: None,

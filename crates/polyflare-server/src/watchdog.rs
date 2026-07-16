@@ -77,21 +77,24 @@ pub fn apply_ownership(
 
 /// Diagnostic input fingerprint + item count. Not used to gate a trim in M3-core (we never trim) —
 /// recorded by `observe` for diagnostics only, so the fingerprint BASIS just needs to be stable per
-/// request. When the original wire bytes are available (native pass-through), hash THOSE (no `input`
-/// re-serialize, and byte-identical to what the client sent); otherwise fall back to hashing the
-/// canonical `input` serialization of the built body.
-fn input_fingerprint_and_count(req: &PreparedRequest) -> (String, u32) {
-    let input = req.body.get("input");
-    let count = match input {
-        Some(serde_json::Value::Array(a)) => a.len() as u32,
-        Some(_) => 1,
-        None => 0,
-    };
+/// request. The COUNT is derived once at ingress and carried on `ctx` (`input_count`), so this never
+/// re-reads the request body — which, on the native pass-through, is never materialized. The
+/// FINGERPRINT hashes the original wire bytes when present (byte-identical to what the client sent,
+/// no `input` re-serialize); otherwise (a built/translated body) it hashes the canonical `input`
+/// serialization of that body.
+fn input_fingerprint_and_count(req: &PreparedRequest, ctx: &RequestCtx) -> (String, u32) {
     let fp = match &req.raw_body {
         Some(raw) => sha256_hex(raw.as_ref()),
-        None => sha256_hex(input.map(|v| v.to_string()).unwrap_or_default().as_bytes()),
+        None => sha256_hex(
+            req.body
+                .as_ref()
+                .and_then(|b| b.get("input"))
+                .map(|v| v.to_string())
+                .unwrap_or_default()
+                .as_bytes(),
+        ),
     };
-    (fp, count)
+    (fp, ctx.input_count)
 }
 
 /// Execute a prepared request under the watchdog. Disarmed (no anchor) ⇒ relay + sniff + observe
@@ -107,7 +110,7 @@ pub async fn execute_with_watchdog(
 ) -> Result<ResponseStream, WatchdogError> {
     let Prepared { req, directive } = prepared;
     let session_key = directive.session_key.clone();
-    let (fp, count) = input_fingerprint_and_count(&req);
+    let (fp, count) = input_fingerprint_and_count(&req, &ctx);
 
     match directive.watchdog {
         WatchdogArm::Disarmed => {
