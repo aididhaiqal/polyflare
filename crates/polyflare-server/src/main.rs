@@ -154,6 +154,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         codex_version,
         account_cache: Arc::new(polyflare_server::account_cache::AccountCache::new()),
         token_cache: Arc::new(polyflare_server::token_cache::TokenCache::new()),
+        runtime: Default::default(),
     });
     // Runtime usage-refresh loop: keeps each Codex account's rate-limit windows (5h + weekly) and
     // routing gate live, instead of the frozen numbers the importer left.

@@ -115,6 +115,7 @@ async fn no_anchor_request_on_ineligible_owner_fails_over_not_500() {
         codex_version: std::sync::Arc::new(polyflare_codex::CodexVersionCache::new().unwrap()),
         account_cache: std::sync::Arc::new(polyflare_server::account_cache::AccountCache::new()),
         token_cache: Default::default(),
+        runtime: Default::default(),
     });
     let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
