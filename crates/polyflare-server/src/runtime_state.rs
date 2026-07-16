@@ -76,7 +76,7 @@ impl RuntimeStates {
     /// Patch the live runtime fields onto each snapshot from the map. Snapshots for accounts with no
     /// entry are left at their neutral defaults. Called by ingress on the already-filtered (cloned)
     /// slice right before selection — never touches the account cache.
-    pub fn overlay(&self, snapshots: &mut [AccountSnapshot]) {
+    pub fn overlay(&self, snapshots: &mut [AccountSnapshot], now: i64) {
         // Recover from a poisoned lock (a prior writer panic) rather than cascading the panic into a
         // pool-wide routing DoS: the mutations are trivial field writes, so the data is always a
         // valid `RuntimeState` even if a writer unwound mid-update.
@@ -85,7 +85,15 @@ impl RuntimeStates {
             if let Some(rt) = map.get(&snap.id) {
                 snap.error_count = rt.error_count;
                 snap.last_error_at = rt.last_error_at;
-                snap.cooldown_until = rt.cooldown_until;
+                // Supply the cooldown ONLY while it is still active. An ELAPSED cooldown must NOT be
+                // handed to the selector: its `now >= cd ⇒ clear error state` branch (`select.rs`)
+                // would otherwise re-fire on EVERY read (the stored timestamp never changes),
+                // permanently zeroing `eff_error_count` and silently disabling transient-error
+                // benching + drain demotion for any account that has ever been 429'd. Dropping the
+                // expired cooldown here lets `error_count` accumulate normally again; the 429's own
+                // error contribution is cleared for real by `record_success` on the next completed
+                // turn (or the entry is GC'd once neutral).
+                snap.cooldown_until = rt.cooldown_until.filter(|&cd| now < cd);
                 snap.last_selected_at = rt.last_selected_at;
             }
         }
@@ -179,7 +187,7 @@ mod tests {
     fn overlay_is_a_noop_for_unknown_accounts() {
         let rs = RuntimeStates::new();
         let mut snaps = vec![snap("a"), snap("b")];
-        rs.overlay(&mut snaps);
+        rs.overlay(&mut snaps, 1000);
         assert_eq!(snaps[0].error_count, 0);
         assert_eq!(snaps[0].cooldown_until, None);
     }
@@ -191,7 +199,7 @@ mod tests {
         // No Retry-After ⇒ backoff, but floored to the 30s minimum.
         rs.record_rate_limit(&id, None, 1000);
         let mut snaps = vec![snap("a")];
-        rs.overlay(&mut snaps);
+        rs.overlay(&mut snaps, 1000);
         assert_eq!(snaps[0].error_count, 1);
         assert_eq!(snaps[0].last_error_at, Some(1000));
         assert_eq!(
@@ -208,7 +216,7 @@ mod tests {
         rs.record_rate_limit(&id, Some(600), 1000); // cooldown until 1600
         rs.record_rate_limit(&id, Some(60), 1010); // shorter → must NOT shorten the bench
         let mut snaps = vec![snap("a")];
-        rs.overlay(&mut snaps);
+        rs.overlay(&mut snaps, 1000);
         assert_eq!(snaps[0].cooldown_until, Some(1600), "later cooldown wins");
         assert_eq!(snaps[0].error_count, 2);
     }
@@ -220,7 +228,7 @@ mod tests {
         let id = AccountId::from("a");
         rs.record_rate_limit(&id, Some(i64::MAX), i64::MAX - 10);
         let mut snaps = vec![snap("a")];
-        rs.overlay(&mut snaps);
+        rs.overlay(&mut snaps, 1000);
         assert_eq!(
             snaps[0].cooldown_until,
             Some(i64::MAX),
@@ -231,11 +239,39 @@ mod tests {
         let rs2 = RuntimeStates::new();
         rs2.record_rate_limit(&id, Some(48 * 3600), 1000);
         let mut s2 = vec![snap("a")];
-        rs2.overlay(&mut s2);
+        rs2.overlay(&mut s2, 1000);
         assert_eq!(
             s2[0].cooldown_until,
             Some(1000 + MAX_COOLDOWN_SECS),
             "48h Retry-After clamped to the 24h ceiling"
+        );
+    }
+
+    #[test]
+    fn expired_cooldown_is_dropped_so_transient_benching_survives_a_prior_429() {
+        // Regression: an ELAPSED cooldown must NOT be handed to the selector. Otherwise select.rs's
+        // `now >= cd ⇒ clear error state` branch re-fires on every read (the stored timestamp never
+        // changes), permanently zeroing error_count and disabling transient-error benching for any
+        // account that has ever been 429'd.
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        rs.record_rate_limit(&id, Some(30), 1000); // cooldown until 1030 (error_count → 1)
+                                                   // Within the cooldown window ⇒ it IS supplied (the account is benched).
+        let mut during = vec![snap("a")];
+        rs.overlay(&mut during, 1000);
+        assert_eq!(during[0].cooldown_until, Some(1030));
+        // The account then reaches the backoff threshold on transient errors after the cooldown.
+        rs.record_transient_error(&id, 1040);
+        rs.record_transient_error(&id, 1041); // error_count now 3 in the map
+        let mut after = vec![snap("a")];
+        rs.overlay(&mut after, 1050); // now > 1030 ⇒ cooldown elapsed
+        assert_eq!(
+            after[0].cooldown_until, None,
+            "an elapsed cooldown is dropped, not re-supplied"
+        );
+        assert_eq!(
+            after[0].error_count, 3,
+            "error_count stays visible so the select.rs backoff gate can fire"
         );
     }
 
@@ -245,7 +281,7 @@ mod tests {
         let id = AccountId::from("a");
         rs.record_quota_exceeded(&id, 1000);
         let mut snaps = vec![snap("a")];
-        rs.overlay(&mut snaps);
+        rs.overlay(&mut snaps, 1000);
         assert_eq!(
             snaps[0].error_count, 0,
             "quota is a capacity signal, not an error"
@@ -263,14 +299,14 @@ mod tests {
         rs.record_transient_error(&id, 1000);
         rs.record_transient_error(&id, 1001);
         let mut snaps = vec![snap("a")];
-        rs.overlay(&mut snaps);
+        rs.overlay(&mut snaps, 1000);
         assert_eq!(snaps[0].error_count, 2);
 
         // Success clears error state; since nothing else is set, the entry decays to neutral and is
         // dropped (map stays bounded).
         rs.record_success(&id, 1002);
         let mut snaps2 = vec![snap("a")];
-        rs.overlay(&mut snaps2);
+        rs.overlay(&mut snaps2, 1000);
         assert_eq!(snaps2[0].error_count, 0);
         assert_eq!(snaps2[0].last_error_at, None);
         // last_selected_at was set by record_success, so the entry is NOT neutral — it persists.
@@ -285,7 +321,7 @@ mod tests {
             rs.record_transient_error(&id, 1000 + t);
         }
         let mut snaps = vec![snap("a")];
-        rs.overlay(&mut snaps);
+        rs.overlay(&mut snaps, 1000);
         assert_eq!(
             snaps[0].error_count, 3,
             "reaches the select.rs error-backoff threshold"
