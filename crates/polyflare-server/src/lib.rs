@@ -12,6 +12,7 @@ pub mod ingress;
 pub mod observability;
 pub mod read_api;
 pub mod refresh_locks;
+pub mod runtime_state;
 pub mod session_key;
 pub mod snapshot;
 pub mod token_cache;

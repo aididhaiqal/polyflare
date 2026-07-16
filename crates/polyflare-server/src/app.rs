@@ -62,6 +62,10 @@ pub struct AppState {
     /// `crate::token_cache`): keeps the per-request account read+decrypt off SQLite. TTL'd +
     /// invalidated on the store account-generation bump; tokens are zeroized on eviction.
     pub token_cache: Arc<crate::token_cache::TokenCache>,
+    /// Live per-account routing runtime state (see `crate::runtime_state`): failure-driven
+    /// `error_count`/`cooldown_until`/`last_error_at`/`last_selected_at` overlaid onto snapshots at
+    /// selection time. In-memory only (churns per request); resets on restart.
+    pub runtime: Arc<crate::runtime_state::RuntimeStates>,
 }
 
 impl AppState {
