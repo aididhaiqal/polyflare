@@ -55,12 +55,34 @@ fn account(id: &str, last_refresh: i64) -> Account {
     }
 }
 
+/// A JWT access token whose `exp` is `secs_from_now` seconds from now (unsigned; only `exp` is read
+/// for refresh timing). Header `{"alg":"none"}`, payload `{"exp":<epoch>}`.
+fn jwt_expiring_in(secs_from_now: i64) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    let exp = now() + secs_from_now;
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+    let payload = URL_SAFE_NO_PAD.encode(format!("{{\"exp\":{exp}}}").as_bytes());
+    format!("{header}.{payload}.sig")
+}
+
 /// Spawn a store-backed polyflare server with one account (tokens `old-*`). Returns the base URL
 /// and the shared `AppState` so the test can inspect the store after a request.
 async fn spawn(
     oauth_url: String,
     upstream_url: String,
     last_refresh: i64,
+) -> (String, Arc<AppState>) {
+    spawn_with_access_token(oauth_url, upstream_url, last_refresh, "old-access").await
+}
+
+/// As [`spawn`], but with a caller-chosen stored access token (so a test can control whether the
+/// refresh trigger comes from the token's `exp` or the `last_refresh` age-gate fallback).
+async fn spawn_with_access_token(
+    oauth_url: String,
+    upstream_url: String,
+    last_refresh: i64,
+    access_token: &str,
 ) -> (String, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
@@ -70,7 +92,7 @@ async fn spawn(
         .insert(
             &account("acct-1", last_refresh),
             &PlainTokens {
-                access_token: "old-access".to_string(),
+                access_token: access_token.to_string(),
                 refresh_token: "old-refresh".to_string(),
                 id_token: "old-id".to_string(),
             },
@@ -167,6 +189,82 @@ async fn stale_account_refreshes_persists_and_relays_with_new_token() {
         up_handle.last_authorization().unwrap(),
         "Bearer new-access",
         "the refreshed access token must be used for the upstream call"
+    );
+}
+
+#[tokio::test]
+async fn refresh_is_triggered_by_token_expiry_not_just_age() {
+    // The account was refreshed just NOW (age gate would say "don't refresh"), but its access token
+    // expires in 1 day — inside the 2-day refresh margin. So ONLY the exp-based trigger can fire the
+    // refresh. Proves ingress times refresh off the token's actual `exp`, not the `last_refresh` age.
+    let upstream = MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()]);
+    let up_handle = upstream.clone();
+    let upstream_url = upstream.spawn().await;
+
+    let oauth = MockOAuth::ok("new-access", "new-refresh", VALID_JWT);
+    let oauth_url = oauth.spawn().await;
+
+    // Fresh by age (last_refresh = now) but the stored access token is near expiry.
+    let near_expiry = jwt_expiring_in(86_400); // 1 day ⇒ within the 2-day margin
+    let (pf, _state) = spawn_with_access_token(oauth_url, upstream_url, now(), &near_expiry).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The refresh fired purely on `exp` ⇒ the NEW token reached the upstream.
+    assert_eq!(
+        up_handle.last_authorization().unwrap(),
+        "Bearer new-access",
+        "a near-expiry token must be refreshed even when last_refresh is fresh"
+    );
+}
+
+#[tokio::test]
+async fn fresh_token_far_from_expiry_is_not_refreshed() {
+    // The mirror: a stored access token valid for 5 more days (outside the 2-day margin) and a fresh
+    // last_refresh ⇒ NO refresh. Wire a hit-COUNTING OAuth mock and assert it is contacted ZERO
+    // times — a dead port wouldn't prove this, since a wrongly-attempted refresh would fail as
+    // Transport and fall through to the old token, passing the request regardless.
+    let upstream = MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()]);
+    let up_handle = upstream.clone();
+    let upstream_url = upstream.spawn().await;
+
+    // If ingress WRONGLY attempted a refresh, this mock records the hit (and would rotate the token).
+    let oauth = MockOAuth::ok("should-not-be-used", "should-not-be-used", VALID_JWT);
+    let oauth_handle = oauth.clone();
+    let oauth_url = oauth.spawn().await;
+
+    let far_from_expiry = jwt_expiring_in(5 * 86_400); // 5 days ⇒ outside the 2-day margin
+    let (pf, _state) =
+        spawn_with_access_token(oauth_url, upstream_url, now(), &far_from_expiry).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "a token far from expiry needs no refresh"
+    );
+    assert_eq!(
+        oauth_handle.hit_count(),
+        0,
+        "a token far from expiry must trigger NO refresh call at all"
+    );
+    assert_eq!(
+        up_handle.last_authorization().unwrap(),
+        format!("Bearer {far_from_expiry}"),
+        "the existing (unrefreshed) token must be forwarded verbatim"
     );
 }
 
