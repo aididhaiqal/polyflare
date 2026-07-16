@@ -4,8 +4,23 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PolyFlare</title>
-    <script type="module" crossorigin src="/dashboard/assets/index-B3gzS1ua.js"></script>
-    <link rel="stylesheet" crossorigin href="/dashboard/assets/index-8-fJ_rcJ.css">
+    <script>
+      // Resolve the theme before first paint (saved choice, else OS preference) so there is no
+      // flash of the wrong theme. The React app reads/writes the same key + attribute.
+      (function () {
+        try {
+          var saved = localStorage.getItem("pf-theme");
+          var theme =
+            saved ||
+            (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "dark");
+        }
+      })();
+    </script>
+    <script type="module" crossorigin src="/dashboard/assets/index-CRiUU20f.js"></script>
+    <link rel="stylesheet" crossorigin href="/dashboard/assets/index-BiaKbtcX.css">
   </head>
   <body>
     <div id="root"></div>
