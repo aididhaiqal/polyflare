@@ -42,3 +42,4 @@ reqwest = { workspace = true }
 futures-util = { workspace = true }
 sqlx = { workspace = true }
 tempfile = { workspace = true }
+zeroize = { workspace = true }
