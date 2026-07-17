@@ -2,13 +2,18 @@
 //! (`spawn() -> String`, `Arc<Mutex<..>>` recorders, scripted-response modes) but speaking the
 //! codex WS wire protocol instead of HTTP-SSE.
 //!
-//! The wire shapes scripted here are not invented: every frame this mock can emit matches
-//! `docs/WS-GROUND-TRUTH-CODEX.md` §3 (framing) — the wrapped error envelope
-//! (`{"type":"error","status":u16,"error":{"code","message"},"headers":{...}}`), the terminal
-//! `response.failed`/`response.completed` shapes, and the `previous_response_not_found` code +
-//! message string, which is the exact literal `watchdog.rs`'s Strategy B already synthesizes on
-//! the HTTP-SSE path (`watchdog.rs:34-36`) — reused here so both transports' tests can assert the
-//! same string.
+//! **Evidence provenance (per `WS-GROUND-TRUTH-CODEX.md`'s scope note — do not conflate the two):**
+//! most shapes here are *source facts*, cited to `docs/WS-GROUND-TRUTH-CODEX.md` §3 (framing) — the
+//! generic wrapped error envelope (`{"type":"error","status":u16,"error":{"code","message"},
+//! "headers":{...}}`) and the terminal `response.completed`/`response.failed` shapes. One shape,
+//! [`ScriptedTurn::previous_response_not_found`], is instead a *live-measured fact*: it is NOT
+//! `response.failed` (an earlier, corrected revision of the ground-truth doc got this wrong by
+//! inferring server behavior from the client's lack of a special case — see that doc's §5 and its
+//! scope note for the exact trap). Its actual shape comes from probing the real backend
+//! (`docs/TRANSPORT-FINDINGS-2026-07-17.md` §3, `crates/polyflare-server/examples/ws_wedge_demo.rs`),
+//! not from `watchdog.rs`'s `SIGNAL_SSE` — that constant is a different thing, the HTTP-SSE frame
+//! PolyFlare *synthesizes downstream to its own client*, itself flagged VERIFY-at-implementation
+//! (`watchdog.rs:29-33`), and not an authority for this mock's upstream-facing shape.
 //!
 //! Content-safety: [`RecordedFrame`] retains only structural facts (an anchor id — an opaque
 //! backend-issued identifier, not conversation content — and an item count), never the frame's
@@ -20,6 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
@@ -46,15 +52,21 @@ pub enum ScriptedTurn {
     /// `response.completed` carrying a freshly generated `resp_N` id.
     Turn { events: Vec<String> },
     /// A terminal `response.failed` carrying `error.code` / `error.message` — no preceding
-    /// `events`. Use [`ScriptedTurn::previous_response_not_found`] for the specific anchor-miss
-    /// case Task 6/7 script against.
+    /// `events`. This is a genuine terminal-failure shape (ground truth §3: `ContextWindowExceeded`
+    /// / `QuotaExceeded` / etc.) — NOT what a dead anchor emits; see
+    /// [`ScriptedTurn::previous_response_not_found`] for that (it is a wrapped error envelope, not
+    /// this variant).
     Failed { code: String, message: String },
     /// The WS-only wrapped error envelope (ground truth §3):
-    /// `{"type":"error","status":u16,"error":{"code","message"},"headers":{...}}`.
+    /// `{"type":"error","status":u16,"error":{"code","message",..error_extra},"headers":{...}}`.
     ErrorEnvelope {
         status: u16,
         code: String,
         message: String,
+        /// Extra fields nested inside `error` beyond `code`/`message` (e.g. the live-probed
+        /// `type`/`param` on [`ScriptedTurn::previous_response_not_found`]). Empty for the other
+        /// envelope constructors since ground truth doesn't cite these fields for them.
+        error_extra: Vec<(String, String)>,
         headers: Vec<(String, String)>,
     },
     /// Emit `events_before_close` (non-terminal — no `response.completed`/`.failed`), then close
@@ -72,13 +84,33 @@ impl ScriptedTurn {
         ScriptedTurn::Turn { events }
     }
 
-    /// `response.failed` carrying `previous_response_not_found` — the exact code + message
-    /// `watchdog.rs`'s Strategy B synthesizes on the HTTP-SSE path (`watchdog.rs:34-36`), reused
-    /// verbatim so WS tests can share the same string-matching assertions.
-    pub fn previous_response_not_found() -> Self {
-        ScriptedTurn::Failed {
+    /// The wrapped error envelope a dead `previous_response_id` actually gets, per the
+    /// **live-measured fact** in `docs/TRANSPORT-FINDINGS-2026-07-17.md` §3 (confirmed against the
+    /// real backend by `crates/polyflare-server/examples/ws_wedge_demo.rs`, both cross-account and
+    /// same-account fresh-reattach) — NOT a terminal `response.failed`. An earlier revision of
+    /// `WS-GROUND-TRUTH-CODEX.md` (and of this mock) asserted `response.failed`; that was an
+    /// inference from the client having no special-case handling, contradicted by the probe, and
+    /// corrected 2026-07-17 (see that doc's §5). The captured shape:
+    /// ```json
+    /// {"type":"error","error":{"type":"invalid_request_error","code":"previous_response_not_found",
+    ///  "message":"Previous response with id 'resp_...' not found.","param":"previous_response_id"},"status":400}
+    /// ```
+    /// `dead_anchor` is interpolated into the message purely for realism (the real server echoes
+    /// the specific dead id back) — callers must NOT assert on the message string. The `code`
+    /// field is the only verified, stable part of this shape; assert on it alone, matching the
+    /// existing precedent for `watchdog.rs`'s `SIGNAL_SSE` (its own tests key off the `code`
+    /// substring for the identical reason: message text is provisional).
+    pub fn previous_response_not_found(dead_anchor: impl Into<String>) -> Self {
+        let dead_anchor = dead_anchor.into();
+        ScriptedTurn::ErrorEnvelope {
+            status: 400,
             code: "previous_response_not_found".to_string(),
-            message: "anchor not resumable; resend full history".to_string(),
+            message: format!("Previous response with id '{dead_anchor}' not found."),
+            error_extra: vec![
+                ("type".to_string(), "invalid_request_error".to_string()),
+                ("param".to_string(), "previous_response_id".to_string()),
+            ],
+            headers: Vec::new(),
         }
     }
 
@@ -91,6 +123,7 @@ impl ScriptedTurn {
             status,
             code: "websocket_connection_limit_reached".to_string(),
             message: "the websocket connection limit was reached".to_string(),
+            error_extra: Vec::new(),
             headers: Vec::new(),
         }
     }
@@ -98,11 +131,19 @@ impl ScriptedTurn {
     /// The wrapped error envelope, pre-filled for a 429 carrying `Retry-After` inside the
     /// envelope's own `headers` map (ground truth §3's `"headers":{...}` field) rather than a real
     /// HTTP response header — this is the shape Task 7's 429 test parses `retry_after` out of.
+    ///
+    /// **UNVERIFIED surface, disclosed:** neither the `"retry-after"` header key's name/casing nor
+    /// `error.code == "rate_limit_exceeded"` is cited anywhere in ground truth — §3 only documents
+    /// the envelope's `"headers":{...}` field generically, never a specific key, and never a 429
+    /// `code` string. Both are plausible-but-invented placeholders pending a live capture of a real
+    /// 429 over WS (nothing like `ws_wedge_demo.rs` has forced one yet). If a future capture shows a
+    /// different key/casing or code, this is the one spot that needs to change.
     pub fn rate_limited_429(retry_after_secs: u64) -> Self {
         ScriptedTurn::ErrorEnvelope {
             status: 429,
             code: "rate_limit_exceeded".to_string(),
             message: "rate limit exceeded".to_string(),
+            error_extra: Vec::new(),
             headers: vec![("retry-after".to_string(), retry_after_secs.to_string())],
         }
     }
@@ -131,6 +172,9 @@ pub struct MockWsUpstream {
     handshake_count: Arc<AtomicUsize>,
     frames: Arc<Mutex<Vec<RecordedFrame>>>,
     id_counter: Arc<AtomicU32>,
+    /// When set, every upgrade attempt is answered with a plain HTTP 426 instead of upgrading —
+    /// see [`Self::rejecting_handshake`].
+    reject_handshake: bool,
 }
 
 impl MockWsUpstream {
@@ -152,7 +196,21 @@ impl MockWsUpstream {
             handshake_count: Arc::new(AtomicUsize::new(0)),
             frames: Arc::new(Mutex::new(Vec::new())),
             id_counter: Arc::new(AtomicU32::new(0)),
+            reject_handshake: false,
         }
+    }
+
+    /// A mock that answers every WS upgrade attempt with a plain HTTP 426 (`Upgrade Required`)
+    /// instead of upgrading — no socket is ever established, so [`Self::handshake_count`] stays at
+    /// `0`. Models `WS-GROUND-TRUTH-CODEX.md` §5's ONLY `FallbackToHttp` trigger: HTTP 426 at
+    /// handshake time, checked before any frame is sent (`client.rs:1596-1600`). Task 7/SPEC-M5's
+    /// fallback table needs this exercised ("handshake 426 → HTTP-SSE for this session"). The
+    /// script is never consulted since no `response.create` can ever arrive; a placeholder turn is
+    /// still required to satisfy [`Self::scripted`]'s non-empty invariant.
+    pub fn rejecting_handshake() -> Self {
+        let mut mock = Self::scripted(vec![ScriptedTurn::stall()]);
+        mock.reject_handshake = true;
+        mock
     }
 
     /// How many WS connections (handshakes) this mock has accepted. The central proof of
@@ -228,8 +286,15 @@ impl MockWsUpstream {
 async fn ws_handler(
     State(mock): State<MockWsUpstream>,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    if mock.reject_handshake {
+        // Ground truth §5: `FallbackToHttp`'s ONLY trigger is HTTP 426 at handshake time, checked
+        // BEFORE any frame is sent. Answering here — before `on_upgrade` — means no socket is ever
+        // established for this connection attempt.
+        return (StatusCode::UPGRADE_REQUIRED, "Upgrade Required").into_response();
+    }
     ws.on_upgrade(move |socket| handle_socket(socket, mock))
+        .into_response()
 }
 
 async fn handle_socket(mut socket: WebSocket, mock: MockWsUpstream) {
@@ -270,6 +335,10 @@ async fn handle_socket(mut socket: WebSocket, mock: MockWsUpstream) {
                 // Loop back around: the socket stays open for a POSSIBLE next turn (the whole
                 // point of the connection-reuse proof) instead of closing after one exchange.
             }
+            // `Failed` and `ErrorEnvelope` both deliberately leave the socket OPEN afterward (the
+            // loop falls through, no `return`): this mock only ever models client-driven reconnect
+            // — ground truth §2's "ordinary reconnect" — never server-side termination. A caller
+            // that wants the socket to actually close should script `CloseMidStream` instead.
             ScriptedTurn::Failed { code, message } => {
                 let frame = json!({
                     "type": "response.failed",
@@ -282,16 +351,23 @@ async fn handle_socket(mut socket: WebSocket, mock: MockWsUpstream) {
                 status,
                 code,
                 message,
+                error_extra,
                 headers,
             } => {
                 let headers_obj: serde_json::Map<String, Value> = headers
                     .into_iter()
                     .map(|(k, v)| (k, Value::String(v)))
                     .collect();
+                let mut error_obj = serde_json::Map::new();
+                error_obj.insert("code".to_string(), Value::String(code));
+                error_obj.insert("message".to_string(), Value::String(message));
+                for (k, v) in error_extra {
+                    error_obj.insert(k, Value::String(v));
+                }
                 let frame = json!({
                     "type": "error",
                     "status": status,
-                    "error": {"code": code, "message": message},
+                    "error": error_obj,
                     "headers": headers_obj,
                 })
                 .to_string();
@@ -433,8 +509,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn previous_response_not_found_is_a_terminal_response_failed() {
-        let mock = MockWsUpstream::new(ScriptedTurn::previous_response_not_found());
+    async fn previous_response_not_found_is_a_wrapped_error_envelope_with_status_400() {
+        // Live-probe-backed (TRANSPORT-FINDINGS-2026-07-17.md §3): a dead anchor is the wrapped
+        // error envelope with status 400 — NOT a terminal `response.failed`.
+        let mock = MockWsUpstream::new(ScriptedTurn::previous_response_not_found("resp_dead"));
         let base = mock.clone().spawn().await;
         let mut ws = connect(&base).await;
 
@@ -446,12 +524,86 @@ mod tests {
             panic!("expected a text frame");
         };
         let v: Value = serde_json::from_str(&t).unwrap();
-        assert_eq!(v["type"], "response.failed");
-        assert_eq!(v["response"]["error"]["code"], "previous_response_not_found");
-        assert_eq!(
-            v["response"]["error"]["message"],
-            "anchor not resumable; resend full history"
-        );
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["status"], 400);
+        // Assert the `code` field ONLY — same precedent as `watchdog.rs`'s SIGNAL_SSE tests
+        // (message text is provisional/caller-specific, never asserted verbatim).
+        assert_eq!(v["error"]["code"], "previous_response_not_found");
+    }
+
+    #[tokio::test]
+    async fn third_turn_repeats_the_last_scripted_entry_with_real_values() {
+        // `next_turn()`'s "last entry repeats past script exhaustion" is what Task 7's
+        // bounded-retry/reconnect tests depend on hardest — this proves it with a 2-entry script
+        // driven for a 3rd turn on the SAME socket.
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::rate_limited_429(5),
+        ]);
+        let base = mock.clone().spawn().await;
+        let mut ws = connect(&base).await;
+
+        // Turn 1 consumes entry 0 (the only entry that ever gets POPPED, since the script drops
+        // to length 1 afterward).
+        ws.send(TMessage::Text(create_frame(1, None).into()))
+            .await
+            .unwrap();
+        let mut first_id = None;
+        while let Some(Ok(TMessage::Text(t))) = ws.next().await {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v["type"] == "response.completed" {
+                first_id = v["response"]["id"].as_str().map(str::to_string);
+                break;
+            }
+        }
+        assert_eq!(first_id.as_deref(), Some("resp_1"));
+
+        // Turn 2: the script is down to its last entry (`rate_limited_429`) — served without
+        // being removed.
+        ws.send(TMessage::Text(create_frame(1, Some("resp_1")).into()))
+            .await
+            .unwrap();
+        let TMessage::Text(t2) = ws.next().await.unwrap().unwrap() else {
+            panic!("expected a text frame");
+        };
+        let v2: Value = serde_json::from_str(&t2).unwrap();
+        assert_eq!(v2["status"], 429);
+        assert_eq!(v2["headers"]["retry-after"], "5");
+
+        // Turn 3 — PAST script exhaustion, the case this test exists for. `next_turn()` must
+        // repeat the LAST entry (`rate_limited_429`) again, not panic on an empty `Vec` and not
+        // wrongly cycle back to entry 0 (which would emit a SECOND `response.completed` instead).
+        ws.send(TMessage::Text(create_frame(1, Some("resp_1")).into()))
+            .await
+            .unwrap();
+        let TMessage::Text(t3) = ws.next().await.unwrap().unwrap() else {
+            panic!("expected a text frame");
+        };
+        let v3: Value = serde_json::from_str(&t3).unwrap();
+        assert_eq!(v3["type"], "error");
+        assert_eq!(v3["status"], 429);
+        assert_eq!(v3["error"]["code"], "rate_limit_exceeded");
+        assert_eq!(v3["headers"]["retry-after"], "5");
+
+        // All three turns happened on the SAME socket — the repeat is not a reconnect.
+        assert_eq!(mock.handshake_count(), 1);
+        assert_eq!(mock.frames().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn rejecting_handshake_returns_426_and_never_upgrades() {
+        let mock = MockWsUpstream::rejecting_handshake();
+        let base = mock.clone().spawn().await;
+
+        let err = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect_err("the mock must refuse the upgrade, not accept it");
+        let tokio_tungstenite::tungstenite::Error::Http(response) = err else {
+            panic!("expected an HTTP-level rejection from the failed handshake");
+        };
+        assert_eq!(response.status().as_u16(), 426);
+        // No socket was ever established.
+        assert_eq!(mock.handshake_count(), 0);
     }
 
     #[tokio::test]
