@@ -14,6 +14,18 @@ use sqlx::{QueryBuilder, Sqlite};
 
 use crate::StoreError;
 
+/// Defines the HTTP status code threshold that classifies a request as an error across all read
+/// surfaces: [`RequestLogRepo::aggregate_since`], [`RequestLogRepo::series_since`],
+/// [`RequestLogRepo::recent_errors`], and [`RequestLogRepo::page`] filtering. Errors are
+/// requests with status >= this value; success are status < 300; 3xx redirects count toward
+/// total but not toward success or error.
+///
+/// **IMPORTANT:** This constant defines error classification EVERYWHERE in this module. If this
+/// value changes, all SQL queries and filters that reference it MUST be updated together to
+/// maintain consistency across the dashboard's request metrics. See the four usage sites:
+/// `aggregate_since`, `series_since`, `recent_errors`, and `push_where`.
+const ERROR_STATUS_MIN: i64 = 400;
+
 /// A content-free request-outcome record to persist. Every field is a bounded enum-like string, a
 /// number, or an epoch timestamp — never request content. This is the insert input; the persisted
 /// row (with its surrogate id) is [`RequestLogRow`].
@@ -227,14 +239,15 @@ impl RequestLogRepo {
     /// `avg_latency_ms`/`total_tokens` default to `0.0`/`0` (via `COALESCE`) when no row matches,
     /// so an empty window renders as zeroed KPIs rather than nulls.
     pub async fn aggregate_since(&self, since_ts: i64) -> Result<RequestAggregate, StoreError> {
-        let row: (i64, i64, i64, f64, i64) = sqlx::query_as(
+        let row: (i64, i64, i64, f64, i64) = sqlx::query_as(&format!(
             "SELECT COUNT(*), \
                     COALESCE(SUM(CASE WHEN status < 300 THEN 1 ELSE 0 END), 0), \
-                    COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN status >= {} THEN 1 ELSE 0 END), 0), \
                     COALESCE(AVG(duration_ms), 0.0), \
                     COALESCE(SUM(total_tokens), 0) \
              FROM request_log WHERE requested_at >= ?",
-        )
+            ERROR_STATUS_MIN
+        ))
         .bind(since_ts)
         .fetch_one(&self.pool)
         .await?;
@@ -272,15 +285,16 @@ impl RequestLogRepo {
         bucket_secs: i64,
     ) -> Result<Vec<RequestBucket>, StoreError> {
         let bucket_secs = bucket_secs.max(1);
-        let rows: Vec<(i64, i64, i64, f64, i64)> = sqlx::query_as(
+        let rows: Vec<(i64, i64, i64, f64, i64)> = sqlx::query_as(&format!(
             "SELECT (requested_at / ?) * ? AS bucket_ts, \
                     COUNT(*), \
-                    COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN status >= {} THEN 1 ELSE 0 END), 0), \
                     COALESCE(AVG(duration_ms), 0.0), \
                     COALESCE(SUM(total_tokens), 0) \
              FROM request_log WHERE requested_at >= ? \
              GROUP BY bucket_ts ORDER BY bucket_ts ASC",
-        )
+            ERROR_STATUS_MIN
+        ))
         .bind(bucket_secs)
         .bind(bucket_secs)
         .bind(since_ts)
@@ -306,10 +320,11 @@ impl RequestLogRepo {
     /// `RequestLogRecord`/`RequestLogRow` call site would need updating) that this dashboard-read
     /// feature doesn't need.
     pub async fn recent_errors(&self, limit: i64) -> Result<Vec<RecentErrorRow>, StoreError> {
-        let rows = sqlx::query_as::<_, RecentErrorRow>(
+        let rows = sqlx::query_as::<_, RecentErrorRow>(&format!(
             "SELECT status, account_id, error_code, requested_at FROM request_log \
-             WHERE status >= 400 ORDER BY requested_at DESC, id DESC LIMIT ?",
-        )
+             WHERE status >= {} ORDER BY requested_at DESC, id DESC LIMIT ?",
+            ERROR_STATUS_MIN
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -348,7 +363,8 @@ impl RequestLogRepo {
             }
             Some("error") => {
                 sep(qb, &mut first);
-                qb.push("status >= 400");
+                qb.push("status >= ");
+                qb.push_bind(ERROR_STATUS_MIN);
             }
             _ => {}
         }
