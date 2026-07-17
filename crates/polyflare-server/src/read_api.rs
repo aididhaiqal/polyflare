@@ -404,48 +404,79 @@ pub async fn account_trends_handler(
 }
 
 /// One pool as the dashboard lists it. `pool = null` is the unpooled group (accounts reachable only
-/// via the bare ingress paths). `active` counts accounts whose status is `active`.
+/// via the bare ingress paths). `active` counts accounts whose DURABLE status is `active`;
+/// `available` narrows that further to accounts also not currently benched by the live runtime
+/// overlay (see [`is_available`]) — the same eligibility rule `/api/overview` uses, scoped to this
+/// pool. `usage_percent` is the mean primary-window `used_percent` across the pool's accounts (0.0
+/// for an empty pool). `strategy` is the pool's configured routing-selector name (`AppState::
+/// selector_for`) — the global default when the pool has no override.
 #[derive(Serialize)]
 struct PoolView {
     pool: Option<String>,
     accounts: usize,
     active: usize,
+    available: usize,
+    usage_percent: f64,
+    strategy: String,
 }
 
-/// `GET /api/pools` — the configured pools with account + active counts, aggregated from the
-/// account list. Sorted with the unpooled group last, named pools alphabetically before it.
+/// `GET /api/pools` — the configured pools with account/active/available counts, mean usage, and
+/// routing strategy, aggregated from the live account-cache snapshots (overlaid with runtime
+/// cooldown state, same source `/api/overview` reads). Sorted with the unpooled group last, named
+/// pools alphabetically before it.
 pub async fn pools_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let accounts = match state.store.accounts().list().await {
-        Ok(a) => a,
+    let now = unix_now();
+    let snapshots = match state.account_cache.snapshots(&state.store).await {
+        Ok(s) => s,
         Err(_) => return Response::error(),
     };
-    // (accounts, active) per pool key. `None` collects the unpooled accounts.
-    let mut by_pool: std::collections::BTreeMap<Option<String>, (usize, usize)> =
+    // The cache's `Arc<Vec<..>>` is shared; the runtime overlay mutates in place, so clone the
+    // slice into an owned `Vec` first (same pattern `overview_handler` uses).
+    let mut snapshots = (*snapshots).clone();
+    state.runtime.overlay(&mut snapshots, now);
+
+    // (accounts, active, available, used_percent sum) per pool key. `None` collects the unpooled
+    // accounts.
+    let mut by_pool: std::collections::BTreeMap<Option<String>, (usize, usize, usize, f64)> =
         std::collections::BTreeMap::new();
-    for account in &accounts {
-        let entry = by_pool.entry(account.pool.clone()).or_insert((0, 0));
+    for snap in &snapshots {
+        let entry = by_pool.entry(snap.pool.clone()).or_insert((0, 0, 0, 0.0));
         entry.0 += 1;
-        if account.status == "active" {
+        if snap.status == "active" {
             entry.1 += 1;
         }
+        if is_available(snap, now) {
+            entry.2 += 1;
+        }
+        entry.3 += snap.used_percent;
     }
     // BTreeMap orders `None` before `Some(..)`; the dashboard wants named pools first, unpooled
     // last, so pull the unpooled group out and append it.
     let unpooled = by_pool.remove(&None);
+    let to_view =
+        |pool: Option<String>,
+         (accounts, active, available, used_sum): (usize, usize, usize, f64)| {
+            let usage_percent = if accounts > 0 {
+                used_sum / accounts as f64
+            } else {
+                0.0
+            };
+            let strategy = state.selector_for(pool.as_deref()).name().to_string();
+            PoolView {
+                pool,
+                accounts,
+                active,
+                available,
+                usage_percent,
+                strategy,
+            }
+        };
     let mut views: Vec<PoolView> = by_pool
         .into_iter()
-        .map(|(pool, (accounts, active))| PoolView {
-            pool,
-            accounts,
-            active,
-        })
+        .map(|(pool, counts)| to_view(pool, counts))
         .collect();
-    if let Some((accounts, active)) = unpooled {
-        views.push(PoolView {
-            pool: None,
-            accounts,
-            active,
-        });
+    if let Some(counts) = unpooled {
+        views.push(to_view(None, counts));
     }
     Response::ok(views)
 }
