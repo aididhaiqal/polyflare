@@ -6,6 +6,7 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 
 import { AuthProvider, RequireAuth } from "./auth/AuthProvider";
 import { CapabilitiesProvider } from "./capabilities/CapabilitiesProvider";
+import { Accounts } from "./pages/Accounts";
 import { Login } from "./pages/Login";
 import { Overview } from "./pages/Overview";
 import { Shell } from "./shell/Shell";
@@ -42,7 +43,7 @@ export function App() {
               }
             >
               <Route index element={<Overview />} />
-              <Route path="accounts" element={<RoutePlaceholder label="Accounts" />} />
+              <Route path="accounts" element={<Accounts />} />
               <Route path="accounts/:id" element={<RoutePlaceholder label="Account detail" />} />
               <Route path="pools" element={<RoutePlaceholder label="Pools" />} />
               <Route path="requests" element={<RoutePlaceholder label="Requests" />} />
