@@ -246,8 +246,13 @@ unconditional 2× cost. Removing the HTTP path — it stays the fallback and the
 
 - **The 86× is an upload measurement.** Billing follows `previous_response_id` prefill-once, which the probe
   observed but did not price. Whether cached/prefilled tokens count against *rate* limits the way they count
-  for billing is **unverified** — and rate limits are the actual constraint. Measure this in M5a before
-  claiming a quota win.
+  for billing is **unverified** — and rate limits are the actual constraint. **Pending validation:**
+  `crates/polyflare-server/examples/ws_ratelimit_probe.rs` (M5a Task 10) is built and ready to run — N
+  identical continuation turns over WS vs HTTP, `/wham/usage` `used_percent` read before/after each,
+  compared per turn — but has **not been run live** (it spends the exact quota it measures). See
+  `docs/TRANSPORT-FINDINGS-2026-07-17.md` § "Rate-limit consumption (UNRUN / result pending)" for the
+  current status; that section gets the real number (and this line gets rewritten to a measured
+  statement) once someone runs the probe with headroom.
 - **Version coupling.** Wire constants are pinned to codex 0.144.x. A CLI bump can move the `OpenAI-Beta`
   value or the header set; the parity gate catches it, that's its job.
 - **M5b is where wedges live.** Every mitigation in §5 exists because codex-lb has the scars. If the wedge
