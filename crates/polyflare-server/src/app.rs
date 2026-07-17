@@ -116,6 +116,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         // times), and recent request-log rows. Non-secret metadata only (see `crate::read_api`).
         .route("/api/pools", get(crate::read_api::pools_handler))
         .route("/api/accounts", get(crate::read_api::accounts_handler))
+        // Dashboard landing-page aggregates: KPIs, per-provider quota, per-pool availability,
+        // recent errors (see `crate::read_api::overview_handler`). Like the reads above,
+        // unauthenticated for now — a later task moves all `/api/*` behind auth.
+        .route("/api/overview", get(crate::read_api::overview_handler))
         // Dashboard-driven account settings (pool / routing policy / pause-resume). Unauthenticated
         // like the reads (see `crate::write_api`); mutates non-secret settings only.
         .route(

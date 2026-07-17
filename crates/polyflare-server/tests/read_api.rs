@@ -448,6 +448,114 @@ async fn requests_endpoint_filters_by_provider_and_carries_content_free_metrics(
     assert!(partial["ttft_ms"].is_null());
 }
 
+/// A minimal content-free `request_log` row for the overview KPI test: only the fields the
+/// overview aggregation reads (`status`, `total_tokens`, `duration_ms`) are set; everything else
+/// (`account_id`, `model`, `reasoning_effort`, `service_tier`, `transport`, `ttft_ms`,
+/// `cached_tokens`) is `None` — those aren't exercised by `/api/overview`'s KPI tile.
+fn req_row(status: u16, total_tokens: i64) -> RequestLogRecord {
+    RequestLogRecord {
+        requested_at: now(),
+        provider: "codex".to_string(),
+        method: "POST".to_string(),
+        path: "/responses".to_string(),
+        aliased: false,
+        status,
+        duration_ms: 100,
+        account_id: None,
+        model: None,
+        reasoning_effort: None,
+        service_tier: None,
+        transport: None,
+        ttft_ms: None,
+        total_tokens: Some(total_tokens),
+        cached_tokens: None,
+    }
+}
+
+#[tokio::test]
+async fn overview_reports_kpis_and_recent_errors_from_request_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let repo = store.request_log();
+    for (status, tokens) in [(200, 1000), (200, 2000), (429, 0)] {
+        repo.insert(&req_row(status, tokens)).await.unwrap();
+    }
+    std::mem::forget(dir);
+
+    let pf = spawn(store).await;
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/overview"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(v["kpis"]["requests"], 3);
+    assert_eq!(v["kpis"]["success"], 2);
+    assert_eq!(v["kpis"]["errors"], 1);
+    let success_rate = v["kpis"]["success_rate"].as_f64().unwrap();
+    assert!(
+        (success_rate - (2.0 / 3.0)).abs() < 0.001,
+        "expected ~0.667, got {success_rate}"
+    );
+    assert_eq!(v["kpis"]["total_tokens"], 3000);
+
+    let recent_errors = v["recent_errors"].as_array().unwrap();
+    assert!(
+        !recent_errors.is_empty(),
+        "the 429 row must surface in recent_errors"
+    );
+    assert_eq!(recent_errors[0]["status"], 429);
+
+    // Shape smoke-check for the other top-level fields (no accounts seeded in this test → empty).
+    assert!(v["pools"].as_array().unwrap().is_empty());
+    assert_eq!(v["accounts_available"], 0);
+    assert!(v["quota"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn overview_reports_pools_and_quota_from_seeded_accounts() {
+    // `seed_store()` seeds two active codex accounts: codex-a in pool "team-a" with a 73.5%-used
+    // weekly window (no 5h window reported), and codex-b unpooled with no usage window at all.
+    let pf = spawn(seed_store().await).await;
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/overview"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Both accounts are active with no runtime cooldown → both available.
+    assert_eq!(v["accounts_available"], 2);
+
+    let pools = v["pools"].as_array().unwrap();
+    let team_a = pools
+        .iter()
+        .find(|p| p["pool"] == "team-a")
+        .expect("team-a present");
+    assert_eq!(team_a["accounts"], 1);
+    assert_eq!(team_a["available"], 1);
+    let unpooled = pools
+        .iter()
+        .find(|p| p["pool"].is_null())
+        .expect("unpooled group present");
+    assert_eq!(unpooled["accounts"], 1);
+    assert_eq!(unpooled["available"], 1);
+
+    // Single provider ("codex"): five_hour has no reported window on either account → remaining
+    // 100%; weekly is the worst case across the two accounts — codex-a's 73.5%-used window
+    // (26.5% remaining) beats codex-b's no-window default (100% remaining).
+    let quota = v["quota"].as_array().unwrap();
+    assert_eq!(quota.len(), 1);
+    assert_eq!(quota[0]["provider"], "codex");
+    assert_eq!(quota[0]["five_hour"], 100.0);
+    assert_eq!(quota[0]["weekly"], 26.5);
+}
+
 #[tokio::test]
 async fn requests_endpoint_filters_by_status_class() {
     let pf = spawn(seed_store_for_filters().await).await;
