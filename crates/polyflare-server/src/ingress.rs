@@ -172,6 +172,40 @@ fn synthesize_codex_forward_headers(
     ]
 }
 
+/// A stable, conversation-scoped `prompt_cache_key` for a translated (aliased) Codex body.
+///
+/// The alias path builds a fresh Codex body with no `prompt_cache_key`, so every turn of a
+/// conversation cache-MISSED on OpenAI's prompt-prefix cache — re-prefilling the whole history each
+/// turn. This derives a key from the request's STABLE prefix — the `instructions` (system prompt)
+/// and the first `input` item — both identical across every turn of a conversation and distinct
+/// between conversations, so the same conversation reuses the cache turn to turn. (This is ccflare's
+/// conversation-mode key; we key on content rather than a session id because the translated
+/// `/v1/messages` path carries no reliable Codex session id.) A content collision between two
+/// unrelated conversations is harmless under `store:false` — the cache only helps up to the shared
+/// prefix, which is exactly what matched.
+///
+/// Setting this BEFORE `synthesize_codex_forward_headers` also stabilizes the synthesized codex
+/// identity headers, whose `conversation_key` prefers `prompt_cache_key` over the per-model fallback.
+fn derive_alias_prompt_cache_key(body: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let instructions = body
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let first_input = match body.get("input") {
+        Some(serde_json::Value::Array(items)) => {
+            items.first().map(|v| v.to_string()).unwrap_or_default()
+        }
+        Some(serde_json::Value::String(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(instructions.as_bytes());
+    hasher.update([0u8]); // domain separator so (instr, input) can't alias (instr∥input, "")
+    hasher.update(first_input.as_bytes());
+    hex::encode(&hasher.finalize()[..24]) // 48 hex chars, matching codex/ccflare key width
+}
+
 fn stream_response(stream: ResponseStream) -> Response {
     Response::builder()
         .status(StatusCode::OK)
@@ -759,6 +793,19 @@ async fn messages_handler_codex_aliased(
         translated_body["reasoning"] = serde_json::json!({ "effort": effort });
     }
 
+    // Give the fresh Codex body a stable, conversation-scoped `prompt_cache_key` so repeated turns
+    // reuse OpenAI's prompt-prefix cache instead of cold-prefilling the whole history every turn.
+    // Set only when absent (never clobber a client-supplied key) and BEFORE the header synthesis
+    // below, which derives the codex identity from this key when present.
+    if translated_body
+        .get("prompt_cache_key")
+        .and_then(|v| v.as_str())
+        .is_none()
+    {
+        let key = derive_alias_prompt_cache_key(&translated_body);
+        translated_body["prompt_cache_key"] = serde_json::Value::String(key);
+    }
+
     // Translated path: there is no real Codex client to forward, so SYNTHESIZE codex-rs's identity
     // headers (see `synthesize_codex_forward_headers`). Mirrors codex-lb's forward-native /
     // synthesize-non-native split. The User-Agent's codex version is resolved live (GitHub/npm,
@@ -829,6 +876,69 @@ async fn messages_handler_codex_aliased(
         Err(e) => {
             record_failure(&state, &health_id, &e, unix_now());
             (StatusCode::BAD_GATEWAY, "upstream error").into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_alias_prompt_cache_key;
+    use serde_json::json;
+
+    /// The same conversation across turns (same system prompt + same first message, later turns
+    /// append more input) must yield the SAME key — that is what makes the prompt cache hit.
+    #[test]
+    fn key_is_stable_across_turns_of_a_conversation() {
+        let turn1 = json!({
+            "instructions": "You are Claude Code.",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+        });
+        let turn2 = json!({
+            "instructions": "You are Claude Code.",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "hi"}]},
+                {"role": "user", "content": [{"type": "input_text", "text": "next question"}]},
+            ],
+        });
+        assert_eq!(
+            derive_alias_prompt_cache_key(&turn1),
+            derive_alias_prompt_cache_key(&turn2),
+            "same instructions + same first input item ⇒ same conversation key"
+        );
+    }
+
+    #[test]
+    fn key_differs_across_conversations() {
+        let base = json!({"instructions": "sys", "input": [{"text": "conv A"}]});
+        let diff_first = json!({"instructions": "sys", "input": [{"text": "conv B"}]});
+        let diff_instr = json!({"instructions": "other", "input": [{"text": "conv A"}]});
+        let k = derive_alias_prompt_cache_key(&base);
+        assert_ne!(
+            k,
+            derive_alias_prompt_cache_key(&diff_first),
+            "different first message"
+        );
+        assert_ne!(
+            k,
+            derive_alias_prompt_cache_key(&diff_instr),
+            "different system prompt"
+        );
+    }
+
+    #[test]
+    fn key_is_48_hex_chars_and_handles_missing_fields() {
+        for body in [
+            json!({}),
+            json!({"input": []}),
+            json!({"instructions": "x"}),
+        ] {
+            let k = derive_alias_prompt_cache_key(&body);
+            assert_eq!(k.len(), 48, "48 hex chars for {body}");
+            assert!(
+                k.bytes().all(|b| b.is_ascii_hexdigit()),
+                "hex only for {body}"
+            );
         }
     }
 }
