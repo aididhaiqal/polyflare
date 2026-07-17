@@ -188,10 +188,8 @@ pub fn classify(frame: &Value) -> FrameClass {
     match frame_type {
         "response.completed" | "response.failed" | "response.incomplete" => FrameClass::Terminal,
         "error" => {
-            let code = frame
-                .pointer("/error/code")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let error_code = frame.pointer("/error/code").and_then(Value::as_str);
+            let code = error_code.unwrap_or("");
 
             // MUST come before any status-based mapping below (see fn doc + this module's header
             // doc). This is the discrimination ground truth §5 says only `code` can make.
@@ -207,10 +205,15 @@ pub fn classify(frame: &Value) -> FrameClass {
 
             let status = frame.get("status").and_then(Value::as_u64).unwrap_or(0) as u16;
             let retry_after = frame.get("headers").and_then(envelope_retry_after);
+            // Task 3 (failure-code writeback): carry the envelope's `error.code` through — CODE
+            // ONLY, never `error.message` (content-safety, same rule as the HTTP executor's
+            // `extract_error_code` in `executor.rs`). `error_code` is already `None` when the
+            // envelope has no code at all (empty-string `code` from `unwrap_or("")` above is never
+            // mistaken for a real code since we read `error_code` here, not `code`).
             FrameClass::Error(ExecError::UpstreamStatus(FailureSignal {
                 status,
                 retry_after,
-                error_code: None,
+                error_code: error_code.map(str::to_string),
             }))
         }
         // Ground truth §3 (`sse/responses.rs:467-469`): unknown types are ignored, never fatal.
@@ -475,8 +478,83 @@ mod tests {
         match classify(&frame) {
             FrameClass::Error(ExecError::UpstreamStatus(sig)) => {
                 assert_eq!(sig.status, 400);
+                assert_eq!(
+                    sig.error_code.as_deref(),
+                    Some("invalid_value"),
+                    "the general error arm must carry the envelope's error.code through, \
+                     content-safely (code only, never message)"
+                );
             }
             other => panic!("expected Error(UpstreamStatus{{status:400}}), got {other:?}"),
+        }
+    }
+
+    // ---- Task 3: the general error arm carries error.code into FailureSignal.error_code ------
+
+    #[test]
+    fn classify_carries_the_envelope_error_code_into_failure_signal_for_a_general_error() {
+        // ground truth §3 general wrapped-error-envelope shape, a code that is NEITHER of the two
+        // special-cased recoverable codes (previous_response_not_found /
+        // websocket_connection_limit_reached) — the fallthrough `UpstreamStatus` arm this task
+        // populates.
+        let frame = json!({
+            "type": "error",
+            "status": 403,
+            "error": {"code": "account_deactivated", "message": "secret ws detail"},
+            "headers": {}
+        });
+
+        match classify(&frame) {
+            FrameClass::Error(ExecError::UpstreamStatus(sig)) => {
+                assert_eq!(sig.status, 403);
+                assert_eq!(sig.error_code.as_deref(), Some("account_deactivated"));
+            }
+            other => panic!("expected Error(UpstreamStatus{{status:403}}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_leaves_error_code_none_when_the_envelope_has_no_code_field() {
+        let frame = json!({
+            "type": "error",
+            "status": 500,
+            "error": {"message": "no code field at all here"}
+        });
+
+        match classify(&frame) {
+            FrameClass::Error(ExecError::UpstreamStatus(sig)) => {
+                assert_eq!(sig.status, 500);
+                assert_eq!(sig.error_code, None);
+            }
+            other => panic!("expected Error(UpstreamStatus{{status:500}}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_never_leaks_the_envelope_message_into_the_failure_signal_debug() {
+        // Content-safety: FailureSignal has no message field to leak, but this pins that
+        // invariant against the actual classify() output (not just the type definition) so a
+        // future change adding a message-carrying field here would fail this test loudly.
+        let frame = json!({
+            "type": "error",
+            "status": 403,
+            "error": {"code": "account_deactivated", "message": "secret ws detail"}
+        });
+
+        match classify(&frame) {
+            FrameClass::Error(err @ ExecError::UpstreamStatus(_)) => {
+                let debug = format!("{err:?}");
+                let display = format!("{err}");
+                assert!(
+                    !debug.contains("secret ws detail"),
+                    "Debug leaked the envelope message: {debug}"
+                );
+                assert!(
+                    !display.contains("secret ws detail"),
+                    "Display leaked the envelope message: {display}"
+                );
+            }
+            other => panic!("expected Error(UpstreamStatus), got {other:?}"),
         }
     }
 
