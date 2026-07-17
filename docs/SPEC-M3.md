@@ -23,6 +23,16 @@ Make conversation continuity an **explicit, persisted, observable state machine 
 
 ## 2. Problem recap (the wedge, three sentences)
 
+> **REVISION (2026-07-17, live-measured — see `docs/TRANSPORT-FINDINGS-2026-07-17.md`):** the
+> "silently accepts … hangs indefinitely" premise below is **not** current raw-backend behavior. A
+> dead anchor returns a fast, explicit `previous_response_not_found` (HTTP 400) in 0.5–2 s — and the
+> anchor is **WebSocket-only** (HTTP rejects `previous_response_id` outright). So on today's HTTP
+> transport the wedge cannot occur, and on WS it is a *catchable error*, not a silent hang.
+> Consequence: **primary recovery = catch `previous_response_not_found` → strip anchor → full resend**
+> (R1 no-trim makes this free); the R2 silence-watchdog is a **backstop**, not the centerpiece. R1 +
+> ownership routing are unchanged and validated. Read the original recap below as the *design intent*;
+> read the findings doc for measured behavior.
+
 `store:false` is the operative reality (the real Codex CLI sends it; PolyFlare passes it through), which makes every `previous_response_id` an **ephemeral anchor** — resolvable only while the exact upstream turn-state that produced it is still alive on the account that created it, never durably. When a request carries a dead anchor (wrong account after per-request re-selection, or an expired ephemeral window), the `store:false` upstream **silently accepts the request and never emits `response.created` or any error** — so nothing reactive fires and the client hangs indefinitely. codex-lb worsens this by *trimming a client full-resend down to that dead anchor*, converting a self-healing retry into a guaranteed hang; PolyFlare's fix is to never trim/inject (R1), route anchored turns back to their owner, and put a bounded silence-watchdog on every anchored request (R2) so the invisible stall becomes a bounded, recoverable event.
 
 ---
