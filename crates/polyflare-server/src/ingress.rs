@@ -82,6 +82,17 @@ fn no_eligible() -> Response {
 /// account. Async because the durable write (`AccountRepo::update_status`) is; every call site
 /// already awaits other work in the same `async fn`, so awaiting here is a plain, non-blocking
 /// dependency, not a new sync/async boundary.
+///
+/// A6 (deliberately NOT implemented here — a retirement, not a gap): there is no third branch
+/// dispatching to `runtime_state::record_quota_exceeded`. See that function's doc comment for the
+/// full evidence trail; in short, the real quota wire codes (`insufficient_quota`/
+/// `usage_not_included`) never reach `sig.error_code` on this codebase's actual wire path (they
+/// arrive inside a `response.failed` frame that's reframed as SSE and passed through to the client,
+/// never becoming a `WatchdogError::Upstream(_)`), so a code-keyed quota branch here would be dead
+/// code from day one. `usage_refresh.rs`'s poller is the sole, authoritative owner of the durable
+/// `quota_exceeded` status. `failure_routing.rs` carries two regression tests proving a quota-shaped
+/// code that DOES somehow reach `error_code` still falls through to the ordinary status-keyed
+/// bucketing below (never to `record_quota_exceeded`).
 async fn record_failure(state: &AppState, id: &AccountId, err: &WatchdogError, now: i64) {
     let WatchdogError::Upstream(signal) = err else {
         return;

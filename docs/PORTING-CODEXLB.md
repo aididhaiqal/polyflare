@@ -36,33 +36,40 @@ So mirror codex-lb's split:
 
 Without this the already-built waterfall and eligibility gates do nothing.
 
-> **STATUS (audited 2026-07-17 against `feat/dashboard-phase1-frontend`).** Most of Phase A already
-> shipped; this section's "large / do first" framing predates that work.
+> **STATUS (audited 2026-07-17 against `feat/dashboard-phase1-frontend`; A6/A7 CLOSED 2026-07-18 per
+> `docs/superpowers/plans/2026-07-18-failure-code-writeback.md` — Phase A is now complete).**
 > - **A1 substrate — DONE.** `RuntimeState`/`RuntimeStates` (`runtime_state.rs:49-69`), overlaid pre-selection,
->   single write funnel `record_failure` (`ingress.rs:74-88`). Caveat: the classifier is inlined (no
->   standalone `classify_upstream_failure()`) and produces only 2 of 4 buckets — `rate_limit` + `transient`.
->   No `quota`/`permanent` bucket, because `FailureSignal` (`polyflare-core/src/types.rs:55-60`) carries only
->   `{status, retry_after}` — no error-code string. Client-disconnect neutrality holds (emergent Stream-drop).
+>   single write funnel `record_failure` (`ingress.rs:85-107`). `FailureSignal` (`polyflare-core/src/types.rs`)
+>   now carries an optional upstream `error_code` string (Task 1 of the writeback plan); both executors
+>   populate it content-safely (code only, never message/body). Client-disconnect neutrality holds (emergent
+>   Stream-drop).
 > - **A2 rate-limit — DONE.** `record_rate_limit` (`runtime_state.rs:117-130`): error_count++, last_error_at,
 >   Retry-After-else-`backoff_secs`, 30s floor + 24h ceiling, never-shortens. Jitter correctly deferred to B10;
 >   `resets_at→reset_at` is N/A per this doc's own cooldown-only simplification. Tested end-to-end (`failure_routing.rs`).
 > - **A3 transient/success/decays — DONE.** `record_transient_error` + `record_success` (zeros error_count,
 >   nulls last_error_at), both decays in `select.rs::eligibility` (cooldown-elapsed clear + error_count≥3
 >   backoff admit), wired at the watchdog success/error paths (`watchdog.rs:381-430`).
-> - **A6 quota — PARTIAL (dead code).** `record_quota_exceeded` (`runtime_state.rs:135-140`, correct: +120s
->   cooldown, no error_count bump) exists + unit-tested but has **zero call sites** — nothing on the request
->   path can distinguish quota from rate-limit. The quota *outcome* is separately covered by the
->   `usage_refresh.rs` poller writing durable `status`, so practical impact is soft.
-> - **A7 permanent/auth — ABSENT on the request path.** `classify_failure`'s code table (`oauth.rs:105-123`)
->   is wired ONLY for OAuth-refresh failures; an upstream 401 `invalid_grant` on `/responses` falls through to
->   generic transient and self-heals instead of parking `reauth_required`.
->
-> **Genuine remaining A-work = one coherent task, gated behind M5a** (it extends `ExecError::UpstreamStatus`,
-> which the in-flight WS executor also produces — do NOT build concurrently with M5a): extend the failure
-> signal to carry a parsed upstream **error-code string**, then route it through the existing `classify_failure`
-> table so A7 parks permanent/auth accounts durably, and either call the already-built `record_quota_exceeded`
-> from a real quota-vs-rate-limit distinction (A6) or retire it in favor of the `usage_refresh` poller. A1/A2/A3
-> need no further build; only the classifier's bucket count grows once the code string exists.
+> - **A6 quota — RESOLVED as an intentional retirement, not wired.** `record_quota_exceeded`
+>   (`runtime_state.rs:135-...`, correct: +120s cooldown, no error_count bump) stays unit-tested,
+>   unreachable-from-the-request-path infrastructure — see its doc comment for the full evidence trail.
+>   Ground truth (`codex-rs`: `codex-api/src/sse/responses.rs:630,634`, `api_bridge.rs:21-22,112-113`,
+>   `core/tests/suite/quota_exceeded.rs`): the real quota wire codes are `insufficient_quota` and
+>   `usage_not_included`. Neither can reach `FailureSignal.error_code` on this codebase's actual wire path:
+>   `insufficient_quota` arrives only inside a `response.failed` frame that `ws::codec::classify` and the
+>   HTTP-SSE relay deliberately reframe as SSE and pass through to the client (never an `ExecError`);
+>   `usage_not_included` can arrive as a raw pre-stream 429 but only under the JSON key `error.type`, which
+>   `extract_error_code` (which reads only `error.code`) never sees. So a code-keyed quota branch in
+>   `record_failure` would be dead code from day one — worse than the status quo. `usage_refresh.rs`'s
+>   ≤600s poller (usage-percent-derived, strictly more reliable than scraping an error code) remains the
+>   sole, authoritative owner of the durable `quota_exceeded` status. `failure_routing.rs` carries two
+>   regression tests proving a quota-shaped code that DOES somehow reach `error_code` still falls through
+>   to the ordinary status-keyed bucketing, never to `record_quota_exceeded`.
+> - **A7 permanent/auth — DONE.** `record_failure` now has a branch (BEFORE the status-keyed bucketing)
+>   that routes any `error_code` through the reused `classify_failure` table (`oauth.rs:105-123`) to a
+>   durable terminal status (`reauth_required`/`deactivated`) via `AccountRepo::update_status`, leaving
+>   `cooldown_until` null and NOT bumping `error_count` (a terminal status supersedes health backoff).
+>   Tested end-to-end in `failure_routing.rs` (401 `invalid_grant`, 403 `account_deactivated`, plus the
+>   pre-existing plain-500 regression guard).
 
 ### A1. Runtime-state substrate + failure classifier → dispatch funnel  · HIGH · large
 The keystone. Build `RuntimeState` (above) + a single write funnel:

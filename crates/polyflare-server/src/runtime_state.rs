@@ -132,6 +132,33 @@ impl RuntimeStates {
     /// Record a quota-exceeded hit: bench for [`QUOTA_EXCEEDED_COOLDOWN_SECS`] WITHOUT bumping
     /// `error_count` (quota is a capacity signal, not a health error — bumping it would double-
     /// penalize a merely-full account into the drain tier). The later cooldown wins.
+    ///
+    /// **A6 (failure-code writeback plan, Task 5): deliberately NOT called from the request-failure
+    /// path** (`ingress::record_failure`) — this is a considered retirement, not an oversight. The
+    /// real upstream wire codes for quota exhaustion are `insufficient_quota` and
+    /// `usage_not_included` (verified against `codex-rs`: `codex-api/src/sse/responses.rs:630,634`,
+    /// `api_bridge.rs:21-22,112-113`, and the `quota_exceeded_emits_single_error_event` test in
+    /// `codex-rs/core/tests/suite/quota_exceeded.rs`). On this codebase's actual wire path neither
+    /// code can ever reach `FailureSignal.error_code`:
+    /// - `insufficient_quota` arrives ONLY inside a `response.failed` terminal SSE/WS frame — both
+    ///   `polyflare_codex::ws::codec::classify` (`FrameClass::Terminal`) and the HTTP-SSE relay
+    ///   deliberately reframe that frame as SSE and pass it through to the CLIENT instead of turning
+    ///   it into an `ExecError` (see `ws/codec.rs`'s `FrameClass::Terminal` doc and the
+    ///   `terminal_response_failed_is_reframed_as_sse_and_passed_through` test) — it never becomes a
+    ///   `WatchdogError::Upstream(_)` at all.
+    /// - `usage_not_included` CAN arrive as a raw pre-stream HTTP 429, but only under the JSON key
+    ///   `error.type` (`codex-rs`'s `UsageErrorBody` has no `code` field — `api_bridge.rs:208-218`);
+    ///   `polyflare_codex::executor::extract_error_code` reads ONLY `error.code` (plus a `detail`-
+    ///   token fallback), so this shape yields `error_code: None`, by design.
+    ///
+    /// So there is no reliable (or even any) request-path quota signal to route through today — a
+    /// code-keyed branch here would be dead code from day one, worse than this function's current
+    /// standing as untriggered-but-reachable infrastructure. The durable `quota_exceeded` status is
+    /// instead owned entirely by the `usage_refresh.rs` poller, which derives it from actual
+    /// used-percent windows (a strictly more reliable signal than scraping an error code) every
+    /// ≤600s. This function is kept (not deleted) as tested, correct building-block infrastructure
+    /// that a future architecture change (e.g. the TA6(b) cyber-move, if it ever parses
+    /// `response.failed` content) could legitimately wire up.
     pub fn record_quota_exceeded(&self, id: &AccountId, now: i64) {
         self.mutate(id, |rt| {
             let until = now.saturating_add(QUOTA_EXCEEDED_COOLDOWN_SECS);
