@@ -154,39 +154,61 @@ pub async fn execute_with_watchdog(
                 .map_err(|e| WatchdogError::Upstream(e.failure_signal()))?;
             match tokio::time::timeout(timeout, stream.next()).await {
                 Ok(Some(Ok(first))) => {
-                    // TA6(b) Task 1: a cyber-policy rejection fails the turn BEFORE producing
-                    // output, so in the common case it IS this first frame — the same
-                    // peek-before-relay point the wedge fix's "ALIVE" check already uses. Detect it
-                    // HERE, before ever rebuilding/relaying, and surface a distinct, content-safe
-                    // signal instead of treating it as alive. No reroute in this task (TA6b Task 2
-                    // consumes the signal); a NON-cyber `response.failed` (or anything else) falls
-                    // through to the unchanged "ALIVE" path below exactly as before.
-                    if is_cyber_policy_rejection(&first) {
-                        let _ = continuity
-                            .observe(
-                                TurnOutcome::Failed {
-                                    session_key: session_key.clone(),
-                                },
-                                &ctx,
-                            )
-                            .await;
-                        return Err(WatchdogError::CapabilityRejection {
-                            capability: "security_work",
-                        });
+                    // TA6(b) Task 1 (fixed): real Codex wire ordering emits `response.created`
+                    // FIRST and the cyber-policy `response.failed` on a LATER chunk — inspecting
+                    // only this first peeked chunk (the original bug) let `response.created` alone
+                    // be judged "ALIVE" and relayed, so the later cyber frame streamed straight to
+                    // the client without ever being inspected. `scan_past_lifecycle` buffers
+                    // (bounded, mirroring `ResponseIdSniffer`) past pure lifecycle frames
+                    // (`response.created`/`response.in_progress`) until it reaches the first
+                    // decisive frame — model content, any terminal frame, or an unrecognized type —
+                    // and only THEN decides ALIVE. A `cyber_policy` `response.failed` seen before
+                    // that point rejects with nothing relayed (peek-before-relay preserved: still no
+                    // client byte written for a rejected turn). No reroute in this task (TA6b Task 2
+                    // consumes the signal).
+                    match scan_past_lifecycle(first, stream).await {
+                        ScanOutcome::CyberPolicy => {
+                            let _ = continuity
+                                .observe(
+                                    TurnOutcome::Failed {
+                                        session_key: session_key.clone(),
+                                    },
+                                    &ctx,
+                                )
+                                .await;
+                            Err(WatchdogError::CapabilityRejection {
+                                capability: "security_work",
+                            })
+                        }
+                        ScanOutcome::HardError(e) => {
+                            // A hard error surfaced while scanning (before any client byte was
+                            // relayed) is exactly the "hard upstream error before any client byte"
+                            // case below — same handling.
+                            let signal = e.failure_signal();
+                            let _ = continuity
+                                .observe(
+                                    TurnOutcome::Failed {
+                                        session_key: session_key.clone(),
+                                    },
+                                    &ctx,
+                                )
+                                .await;
+                            Err(WatchdogError::Upstream(signal))
+                        }
+                        ScanOutcome::Alive(rebuilt) => {
+                            // ALIVE: sniff + observe(Completed), relaying every buffered frame (in
+                            // order) chained with whatever the inner stream has left.
+                            Ok(wrap_stream(
+                                rebuilt,
+                                continuity,
+                                ctx,
+                                account_id,
+                                session_key,
+                                OutcomeKind::Completed { fp, count },
+                                runtime,
+                            ))
+                        }
                     }
-                    // ALIVE: rebuild the full stream (peek-before-relay) + sniff + observe(Completed).
-                    let rebuilt: ResponseStream = Box::pin(
-                        stream::once(async move { Ok::<Bytes, ExecError>(first) }).chain(stream),
-                    );
-                    Ok(wrap_stream(
-                        rebuilt,
-                        continuity,
-                        ctx,
-                        account_id,
-                        session_key,
-                        OutcomeKind::Completed { fp, count },
-                        runtime,
-                    ))
                 }
                 Ok(Some(Err(e))) => {
                     // Hard upstream error before any client byte ⇒ observe(Failed) + 502. Carry any
@@ -379,38 +401,123 @@ fn extract_response_id(buf: &[u8]) -> Option<String> {
     None
 }
 
-/// Returns `true` iff `buf` (raw SSE bytes from a single peeked chunk) contains a terminal
-/// `response.failed` frame whose `response.error.code == "cyber_policy"` — the wire truth
-/// (`codex-rs`'s `codex-api/src/sse/responses.rs` `is_cyber_policy_error`: `error.code.as_deref()
-/// == Some("cyber_policy")`). Content-safety: reads ONLY `type` and the nested `response.error.code`
+/// Outcome of [`scan_past_lifecycle`].
+enum ScanOutcome {
+    /// Nothing decisive said "cyber" — relay everything buffered while scanning, chained with
+    /// whatever the inner stream has left. This is the (renamed, otherwise unchanged) "ALIVE" path.
+    Alive(ResponseStream),
+    /// A `cyber_policy` `response.failed` frame appeared before any decisive frame. Peek-before-
+    /// relay is preserved: nothing buffered during the scan is relayed.
+    CyberPolicy,
+    /// The inner stream produced a hard error while scanning, i.e. before anything was relayed —
+    /// identical in every observable way to a hard error on the very first frame.
+    HardError(ExecError),
+}
+
+/// A single buffered frame's classification, once its `type` can be read.
+enum ScanVerdict {
+    /// A `response.failed` whose `error.code == "cyber_policy"` — the wire truth (`codex-rs`'s
+    /// `codex-api/src/sse/responses.rs` `is_cyber_policy_error`: `error.code.as_deref() ==
+    /// Some("cyber_policy")`).
+    CyberPolicy,
+    /// Anything else recognized as NOT a pure lifecycle frame: actual model content
+    /// (`response.output_text.delta`, `response.output_item.added`, ...), any terminal frame that
+    /// isn't the cyber rejection (`response.completed`, a non-cyber `response.failed`), or an
+    /// unrecognized type. All of these get identical treatment — stop scanning, go ALIVE — so they
+    /// don't need to be told apart any further than "not lifecycle, not cyber".
+    Decisive,
+}
+
+/// Classifies one already-parsed SSE event `type` + payload. `response.created`/
+/// `response.in_progress` are the ONLY types that keep the scan going — every real Codex turn
+/// starts with these before anything else, and they never carry content or a terminal outcome.
+/// Content-safety: reads ONLY `type` and, for `response.failed`, the nested `response.error.code`
 /// — the frame's `message` is never read into any local, returned, or logged value (mirrors
 /// `polyflare_codex::executor::extract_error_code`'s code-only extraction for the non-2xx path).
-/// Unparsable/absent/non-matching input is always `false` — never treated as an error here.
-fn is_cyber_policy_rejection(buf: &[u8]) -> bool {
+fn classify_frame(v: &serde_json::Value) -> Option<ScanVerdict> {
+    let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+    match ty {
+        "response.created" | "response.in_progress" => None, // keep scanning
+        "response.failed" => {
+            let code = v
+                .get("response")
+                .and_then(|r| r.get("error"))
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_str());
+            Some(if code == Some("cyber_policy") {
+                ScanVerdict::CyberPolicy
+            } else {
+                ScanVerdict::Decisive
+            })
+        }
+        _ => Some(ScanVerdict::Decisive),
+    }
+}
+
+/// Scans `buf` (the accumulated raw SSE bytes buffered so far, across possibly several chunks) for
+/// the first frame that decides anything. Returns `None` if every complete frame parsed so far is
+/// pure lifecycle (or nothing parses yet, e.g. a chunk boundary split a line) — the caller should
+/// buffer more and rescan. Mirrors `extract_response_id`'s tolerant, re-parse-the-whole-buffer-each-
+/// time style: malformed/partial trailing JSON is silently skipped, never treated as decisive.
+fn scan_buffered_frames(buf: &[u8]) -> Option<ScanVerdict> {
     let text = String::from_utf8_lossy(buf);
     for line in text.lines() {
         let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
             continue;
         };
-        if payload == "[DONE]" {
+        if payload.is_empty() || payload == "[DONE]" {
             continue;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
             continue;
         };
-        if v.get("type").and_then(|t| t.as_str()) != Some("response.failed") {
-            continue;
-        }
-        let code = v
-            .get("response")
-            .and_then(|r| r.get("error"))
-            .and_then(|e| e.get("code"))
-            .and_then(|c| c.as_str());
-        if code == Some("cyber_policy") {
-            return true;
+        if let Some(verdict) = classify_frame(&v) {
+            return Some(verdict);
         }
     }
-    false
+    None
+}
+
+/// Bounded buffer cap for [`scan_past_lifecycle`] — mirrors `ResponseIdSniffer`'s give-up
+/// threshold. A real turn always produces a decisive frame (content or terminal) within a handful
+/// of small lifecycle frames; if a pathological upstream never does, give up scanning rather than
+/// buffer unboundedly and fall back to the ALIVE path with whatever was collected.
+const MAX_SCAN_BYTES: usize = 64 * 1024;
+
+/// Buffers upstream chunks (bounded; see [`MAX_SCAN_BYTES`]) past pure lifecycle frames
+/// (`response.created`/`response.in_progress`), scanning for the first DECISIVE frame — mirrors
+/// `ResponseIdSniffer`'s accumulate-and-reparse buffering approach rather than reinventing SSE
+/// reassembly. `first` is the chunk the caller already peeked (under the silence-watchdog timeout,
+/// unchanged); `stream` is polled further WITHOUT an additional timeout — only the very first byte
+/// races the wedge timer, exactly as before this fix.
+async fn scan_past_lifecycle(first: Bytes, mut stream: ResponseStream) -> ScanOutcome {
+    let mut relay_chunks: Vec<Bytes> = vec![first.clone()];
+    let mut scan_buf: Vec<u8> = first.to_vec();
+
+    loop {
+        match scan_buffered_frames(&scan_buf) {
+            Some(ScanVerdict::CyberPolicy) => return ScanOutcome::CyberPolicy,
+            Some(ScanVerdict::Decisive) => break,
+            None => {
+                if scan_buf.len() > MAX_SCAN_BYTES {
+                    break; // bounded: give up scanning, treat as alive with what we have
+                }
+                match stream.next().await {
+                    Some(Ok(next)) => {
+                        scan_buf.extend_from_slice(&next);
+                        relay_chunks.push(next);
+                    }
+                    Some(Err(e)) => return ScanOutcome::HardError(e),
+                    None => break, // stream ended before a decisive frame; relay what we have
+                }
+            }
+        }
+    }
+
+    let rebuilt: ResponseStream = Box::pin(
+        stream::iter(relay_chunks.into_iter().map(Ok::<Bytes, ExecError>)).chain(stream),
+    );
+    ScanOutcome::Alive(rebuilt)
 }
 
 enum ObserveState {
@@ -543,33 +650,78 @@ mod tests {
     }
 
     #[test]
-    fn detects_cyber_policy_response_failed() {
+    fn scan_detects_cyber_policy_response_failed() {
         let sse = concat!(
             "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_x\",",
             "\"error\":{\"code\":\"cyber_policy\",\"message\":\"do not leak this\"}}}\n\n",
         )
         .as_bytes();
-        assert!(is_cyber_policy_rejection(sse));
+        assert!(matches!(
+            scan_buffered_frames(sse),
+            Some(ScanVerdict::CyberPolicy)
+        ));
     }
 
     #[test]
-    fn ignores_non_cyber_response_failed() {
+    fn scan_treats_non_cyber_response_failed_as_decisive() {
         let sse = concat!(
             "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_x\",",
             "\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"slow down\"}}}\n\n",
         )
         .as_bytes();
-        assert!(!is_cyber_policy_rejection(sse));
+        assert!(matches!(
+            scan_buffered_frames(sse),
+            Some(ScanVerdict::Decisive)
+        ));
     }
 
     #[test]
-    fn ignores_non_failed_frames_and_garbage() {
-        assert!(!is_cyber_policy_rejection(
-            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+    fn scan_treats_content_frame_as_decisive() {
+        let sse = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n";
+        assert!(matches!(
+            scan_buffered_frames(sse),
+            Some(ScanVerdict::Decisive)
         ));
-        assert!(!is_cyber_policy_rejection(b"data: [DONE]\n\n"));
-        assert!(!is_cyber_policy_rejection(b"not sse at all"));
-        assert!(!is_cyber_policy_rejection(b""));
+    }
+
+    #[test]
+    fn scan_keeps_scanning_past_lifecycle_frames_and_garbage() {
+        // response.created / response.in_progress: pure lifecycle, never decisive on their own.
+        assert!(scan_buffered_frames(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+        )
+        .is_none());
+        assert!(scan_buffered_frames(
+            b"data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+        )
+        .is_none());
+        // Both together: still nothing decisive.
+        assert!(scan_buffered_frames(
+            concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+                "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+            )
+            .as_bytes()
+        )
+        .is_none());
+        assert!(scan_buffered_frames(b"data: [DONE]\n\n").is_none());
+        assert!(scan_buffered_frames(b"not sse at all").is_none());
+        assert!(scan_buffered_frames(b"").is_none());
+    }
+
+    #[test]
+    fn scan_finds_the_decisive_frame_after_buffered_lifecycle_frames() {
+        // created (keep scanning) followed by a cyber_policy failure in the SAME buffer (as if two
+        // chunks had already been concatenated) — proves the loop looks PAST the first frame.
+        let sse = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"cyber_policy\"}}}\n\n",
+        )
+        .as_bytes();
+        assert!(matches!(
+            scan_buffered_frames(sse),
+            Some(ScanVerdict::CyberPolicy)
+        ));
     }
 
     #[test]
