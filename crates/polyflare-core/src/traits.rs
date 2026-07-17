@@ -11,12 +11,18 @@ use crate::types::{
 };
 
 /// Executes a prepared request against an upstream using an account, returning a byte stream.
+///
+/// `ctx` is the same [`RequestCtx`] ingress already computed for `Continuity::prepare` — threaded
+/// down rather than re-derived so a future WS transport can key its per-conversation connection
+/// cache off `ctx.session_key` without re-parsing the body (see `session_key.rs::parse_inbound`,
+/// whose whole point is to derive this once). Today's HTTP-SSE impls don't need it and ignore it.
 #[async_trait]
 pub trait Executor: Send + Sync {
     async fn execute(
         &self,
         req: PreparedRequest,
         account: &Account,
+        ctx: &RequestCtx,
     ) -> Result<ResponseStream, ExecError>;
 }
 

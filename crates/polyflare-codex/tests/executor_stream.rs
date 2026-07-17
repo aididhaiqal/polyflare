@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use polyflare_codex::executor::CodexExecutor;
-use polyflare_core::{Account, Executor, PreparedRequest};
+use polyflare_core::{Account, Executor, PreparedRequest, RequestCtx};
 use polyflare_testkit::MockUpstream;
 
 #[tokio::test]
@@ -26,7 +26,10 @@ async fn executor_streams_upstream_events_and_forwards_body() {
         raw_body: None,
     };
 
-    let mut stream = executor.execute(req, &account).await.unwrap();
+    let mut stream = executor
+        .execute(req, &account, &RequestCtx::default())
+        .await
+        .unwrap();
     let mut collected = String::new();
     while let Some(chunk) = stream.next().await {
         collected.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
@@ -65,7 +68,10 @@ async fn raw_body_is_forwarded_verbatim_with_exactly_one_content_type() {
         raw_body: Some(bytes::Bytes::from(raw.clone())),
     };
 
-    let mut stream = executor.execute(req, &account).await.unwrap();
+    let mut stream = executor
+        .execute(req, &account, &RequestCtx::default())
+        .await
+        .unwrap();
     while stream.next().await.is_some() {}
 
     // Body reached upstream (content preserved).
@@ -107,7 +113,10 @@ async fn executor_sends_selected_account_chatgpt_account_id_overriding_forwarded
         raw_body: None,
     };
 
-    let mut stream = executor.execute(req, &account).await.unwrap();
+    let mut stream = executor
+        .execute(req, &account, &RequestCtx::default())
+        .await
+        .unwrap();
     while stream.next().await.is_some() {}
 
     let headers = handle.last_headers().unwrap();
@@ -137,7 +146,11 @@ async fn executor_surfaces_upstream_error_status() {
         forward_headers: vec![],
         raw_body: None,
     };
-    let err = executor.execute(req, &account).await.err().unwrap();
+    let err = executor
+        .execute(req, &account, &RequestCtx::default())
+        .await
+        .err()
+        .unwrap();
     // A non-2xx (404 here) now surfaces the structured status for routing-health classification.
     assert!(
         matches!(err, polyflare_core::ExecError::UpstreamStatus(s) if s.status == 404),
