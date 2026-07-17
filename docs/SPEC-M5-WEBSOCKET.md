@@ -31,6 +31,43 @@ PolyFlare to hold conversation state (§5). So they ship in that order.
 Transport lives below `Executor` (E4), in `polyflare-codex`. Continuity (M3) and translation stay above it
 and stay transport-agnostic.
 
+### 1a. What the seam actually is (surveyed, not assumed)
+
+The `Executor` trait is one method (`polyflare-core/src/traits.rs:14-21`):
+
+```rust
+#[async_trait]
+pub trait Executor: Send + Sync {
+    async fn execute(&self, req: PreparedRequest, account: &Account) -> Result<ResponseStream, ExecError>;
+}
+```
+
+`ResponseStream = Pin<Box<dyn Stream<Item = Result<Bytes, ExecError>> + Send>>` (`types.rs:87`). A WS executor
+is a second `Executor` impl in `polyflare-codex` alongside `CodexExecutor`, wired via `AppState`
+(`app.rs:31,85-90`, `state.executor_for(provider)`). Three consequences fall out, and each is load-bearing:
+
+**(a) The stream must be SSE bytes, not WS frames.** Everything downstream parses `data:`-prefixed lines out
+of the raw `Bytes` — `ResponseIdSniffer::extract_response_id` (`watchdog.rs:329-353`) and
+`TranslatingStream::feed_line` (`translate_stream.rs:58-79`). So the WS executor must **re-serialize each
+received JSON frame back into SSE framing** (`format!("data: {json}\n\n")`) inside its own `execute`. Handing
+raw WS payloads through would silently break the watchdog's id-sniffing and the Anthropic translator.
+
+**(b) The per-turn stream must END while the socket stays OPEN.** `Continuity::observe` — which writes the
+`response_id → owner` anchor map — fires from `ObservingStream` at true stream end (`watchdog.rs:400-417`), and
+`record_success`/`record_transient_error` writeback keys off the same terminal (`watchdog.rs:393-403`). A WS
+connection deliberately outlives the turn (ground truth §2). So the executor must terminate its
+`ResponseStream` at the terminal frame (`response.completed` / `response.failed` / `response.incomplete`) with
+`Poll::Ready(None)` **without closing the socket**, and park the live connection back in its cache. Get this
+wrong and continuity's turn-boundary model breaks — ownership stops being recorded, and every turn re-anchors.
+
+**(c) The trait carries no session key.** `execute` receives only `PreparedRequest`
+(`body: Option<Value>`, `model`, `forward_headers`, `raw_body: Option<Bytes>`) and `Account` — no `RequestCtx`,
+no session key. But WS needs one to key its connection cache. Do **not** re-parse the body in the executor to
+recover it: the native path is `raw_body: Some(_) / body: None` precisely so the big `input` tree is never
+materialized (the 26–51% parse win, `session_key.rs::parse_inbound`). **Extend the seam** — the session key is
+already computed in ingress; thread it down rather than recomputing. This is a trait change, so it lands as its
+own task, first.
+
 ## 2. The delta decision (M5a)
 
 Over HTTP the client hands PolyFlare the **full history every turn**. That is what makes M5a free of state:
@@ -77,16 +114,30 @@ PolyFlare owns recovery entirely. Ground truth §5 is unambiguous: `previous_res
 occurrences in codex-rs — the client has no handling, so a forwarded anchor error burns its retry budget and
 can silently disable WS for the whole conversation.
 
-| Upstream event | PolyFlare does | Client sees |
+**Scope correction (surveyed).** PolyFlare has **no generic N-account retry loop** today. Ingress does:
+ownership pre-filter → one-shot recovery (`RecoveryPlan::{ResendFull, SignalClient, None}`, `watchdog.rs:63-86`)
+→ on `Err`, `record_failure` (`ingress.rs:74-88`) writes account health and returns **502; the client retries**.
+So "429 → transparently failover to the next account" is **not** M5a — that is `PORTING-CODEXLB.md` **B4
+(cross-account failover retry loop, HIGH, large)**, a separate item. M5a keeps today's behavior exactly and
+changes only the transport underneath it.
+
+Within the executor (M5a):
+
+| Upstream event | WS executor does | Above the seam |
 |---|---|---|
-| `previous_response_not_found` | strip anchor → **full resend on the same socket** | nothing |
-| 429 | record rate-limit cooldown (existing `runtime_state`) → **failover**: next account, full resend | nothing |
-| `websocket_connection_limit_reached` (60-min cap) | reconnect → full resend | nothing |
-| idle timeout (300 s, per-event) | reconnect → full resend | nothing |
-| `Close` before `response.completed` | reconnect → full resend | nothing |
-| handshake 426 | HTTP-SSE for this session | nothing |
-| handshake/transport failure | HTTP-SSE for this turn | nothing |
-| `response.failed` with a terminal code (quota, context-window, cyber-policy, invalid-request) | pass through | the error |
+| `previous_response_not_found` | strip anchor → **full resend on the same socket**, bounded attempts | never surfaces |
+| `websocket_connection_limit_reached` (60-min cap) | reconnect → full resend | never surfaces |
+| idle timeout (300 s, per-event) | reconnect → full resend | never surfaces |
+| `Close` before a terminal frame | reconnect → full resend | never surfaces |
+| handshake 426 | HTTP-SSE for this session | never surfaces |
+| handshake / transport failure | HTTP-SSE for this turn | never surfaces |
+| 429 (wrapped error envelope) | `ExecError::UpstreamStatus(FailureSignal{status, retry_after})` | **unchanged**: `record_rate_limit` → 502 → client retries |
+| `response.failed`, terminal code (quota, context-window, cyber-policy, invalid-request) | re-frame as SSE, pass through | the error, as today |
+| mid-stream failure after first byte | `Poll::Ready(Some(Err(ExecError::Stream(..))))` | **unchanged**: `record_transient_error` (`watchdog.rs:393-399`) |
+
+The two `ExecError` rows matter: they are how a WS transport keeps the existing health/routing writeback
+working. `retry_after` must be parsed off the WS error envelope's `headers` map the way
+`retry_secs` reads the HTTP `Retry-After` (`executor.rs:34-40`) — same semantics, different carrier.
 
 Two invariants:
 
@@ -143,6 +194,25 @@ fence. Flag-gated separately.
 
 Sequenced this way because M5a banks the value with no new state; if M5b's accumulation proves uglier than it
 looks here, the win is already in hand.
+
+## 6a. Test harness — net-new, and on the critical path
+
+`polyflare-testkit::MockUpstream` is **axum/HTTP-only** and does not speak WebSocket
+(`polyflare-testkit/src/lib.rs:36-230`). Every existing ingress test builds `AppState` with
+`codex_executor: Arc::new(CodexExecutor::new().unwrap())` against it (e.g. `tests/no_anchor_failover.rs:63-102`).
+
+So a WS `MockUpstream` equivalent is a **prerequisite task, not an afterthought**: same
+"scriptable mock + `spawn() -> base URL`" idiom, plus WS-specific scripting the existing modes can't express —
+kill the socket mid-stream, return the `websocket_connection_limit_reached` envelope, answer an anchor with
+`previous_response_not_found`, stall past the idle timeout, and record whether a frame carried an anchor and
+what its `input` length was (that last one is what proves the delta path actually sent a delta).
+
+The live probes (`examples/ws_vs_sse_probe.rs`, `ws_wedge_demo.rs`) are the only in-repo evidence of the real
+wire shape and are the reference for framing — but they hit the live backend with real credentials from
+`~/.polyflare/store.db`, so **CI can never depend on them**.
+
+`tests/websocket_fallback.rs` asserts the current 426-on-GET shim. When M5b lands, that test changes rather
+than disappears — the shim's own doc comment (`ingress.rs:429-431`) says replace, not delete.
 
 ## 7. Non-goals
 
