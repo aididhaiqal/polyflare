@@ -8,6 +8,14 @@ a `file:line` into `codex-rs/`. This is the authoritative input to `SPEC-M5-WEBS
 the Codex CLI and a WS *client* to upstream — so most of this binds our upstream side, and §5 binds our
 server side (it is what makes a client fall back).
 
+**Two kinds of evidence — do not conflate them.** Almost everything here is a *source fact*: what the codex
+client's code does, cited to `codex-rs` file:line. A source fact tells you nothing about what the **server**
+sends: the client having no handling for something does not mean the server never emits it (see §5's
+`previous_response_not_found` — the exact trap, which this document previously fell into). Where a claim is
+instead a *live-measured fact* about real backend behavior, it is labelled as such and cites
+`TRANSPORT-FINDINGS-2026-07-17.md` / the probes in `crates/polyflare-server/examples/`. **Live measurement
+outranks source inference about server behavior.**
+
 **Stability caveat.** Read at codex 0.144.x. The wire constants below are version-coupled by design
 (see `DESIGN-DECISIONS.md` E4(a)); re-verify on a version bump rather than assuming.
 
@@ -129,16 +137,38 @@ protocol** — correlation is implicit: the single in-flight request owns the wh
 - **401** is handled inside the stream loop by `handle_unauthorized` (`client.rs:1601-1614,2164-2279`),
   bounded by the recovery state machine rather than the retry budget; does not itself cause fallback.
 
-### `previous_response_not_found`: **not handled by the client at all**
+### `previous_response_not_found`: emitted by the SERVER, unhandled by the CLIENT
 
-Grepped the whole tree (source + tests): **zero occurrences** of `previous_response_not_found` /
-`response_not_found`. The client has no special case. A dead anchor arrives as a generic `response.failed`
-→ the `Retryable{message, delay}` catch-all (`sse/responses.rs:410-414`) → burns retry budget → may
-eventually flip the session permanently to HTTP.
+Two separate facts, from two different kinds of evidence. Keep them apart — conflating them produces wrong code.
 
-**Consequence for us:** anchor recovery has to be entirely PolyFlare's. There is no client-side partner
-logic to cooperate with, and letting the error reach the client wastes its retry budget and can silently
-disable WS for the rest of that conversation.
+**Source fact (this document's kind of evidence):** grepped the whole `codex-rs` tree, source + tests —
+**zero occurrences** of `previous_response_not_found` / `response_not_found`. The client has no special case.
+Absence from the client is NOT absence from the wire; it means only that codex never learned to handle it.
+
+**Live-measured fact (`TRANSPORT-FINDINGS-2026-07-17.md` §3, `examples/ws_wedge_demo.rs` against the real
+backend):** the server absolutely does emit it, in 0.5–2 s, and it arrives as the **wrapped error envelope with
+`status: 400`** — NOT as a `response.failed`:
+
+```json
+{"type":"error","error":{"type":"invalid_request_error","code":"previous_response_not_found",
+ "message":"Previous response with id 'resp_...' not found.","param":"previous_response_id"},"status":400}
+```
+
+Confirmed for both the cross-account case and the same-account fresh-reattach case. So it takes the §3
+wrapped-envelope path (`responses_websocket.rs:597-640`), which is checked BEFORE generic frame parsing —
+and since its `code` isn't `websocket_connection_limit_reached`, codex maps it to
+`ApiError::Transport(Http{status:400})`, i.e. an ordinary hard error.
+
+**Consequences for us:**
+1. Anchor recovery is entirely PolyFlare's. There is no client-side partner logic, and letting the error reach
+   the client wastes its retry budget and can silently disable WS for the rest of that conversation.
+2. **A classifier must inspect the envelope's `error.code` BEFORE mapping `status` to an outcome.** An anchor
+   miss and a genuine bad-request are both `status: 400` on the same envelope shape; only `code`
+   distinguishes "strip the anchor and resend" from "surface the error". Keying purely on status would either
+   swallow real 400s or fail to recover the wedge.
+
+*(An earlier revision of this section asserted a dead anchor arrives as a generic `response.failed` — that was
+an inference about client handling, contradicted by our own live probe. Corrected 2026-07-17.)*
 
 ## 6. `generate: false`
 
