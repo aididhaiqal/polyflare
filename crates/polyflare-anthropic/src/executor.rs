@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 
-use polyflare_core::{Account, ExecError, Executor, PreparedRequest, ResponseStream};
+use polyflare_core::{Account, ExecError, Executor, PreparedRequest, RequestCtx, ResponseStream};
 
 /// The Anthropic Messages API version this executor speaks. Every request must carry this header
 /// (doc-verified against the Anthropic TypeScript SDK: `'anthropic-version': '2023-06-01'` is sent
@@ -34,6 +34,7 @@ impl Executor for AnthropicExecutor {
         &self,
         req: PreparedRequest,
         account: &Account,
+        _ctx: &RequestCtx,
     ) -> Result<ResponseStream, ExecError> {
         let url = format!("{}/v1/messages", account.base_url.trim_end_matches('/'));
         // No Anthropic ingress path forwards raw bytes today (the native + aliased `/v1/messages`

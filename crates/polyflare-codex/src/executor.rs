@@ -26,7 +26,7 @@ use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER,
 };
 
-use polyflare_core::{Account, ExecError, Executor, PreparedRequest, ResponseStream};
+use polyflare_core::{Account, ExecError, Executor, PreparedRequest, RequestCtx, ResponseStream};
 
 /// Parse the numeric-seconds form of `Retry-After` (the form the Codex/OpenAI backend sends on a
 /// 429). The HTTP-date form is ignored (returns `None` ⇒ the caller falls back to exponential
@@ -83,6 +83,7 @@ impl Executor for CodexExecutor {
         &self,
         req: PreparedRequest,
         account: &Account,
+        _ctx: &RequestCtx,
     ) -> Result<ResponseStream, ExecError> {
         let url = format!("{}/responses", account.base_url.trim_end_matches('/'));
 

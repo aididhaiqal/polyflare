@@ -40,7 +40,7 @@ use std::collections::BTreeSet;
 
 use futures_util::StreamExt;
 use polyflare_codex::CodexExecutor;
-use polyflare_core::{Account, Executor, PreparedRequest};
+use polyflare_core::{Account, Executor, PreparedRequest, RequestCtx};
 use polyflare_server::fingerprint_capture::capture_request_fingerprint;
 use polyflare_testkit::MockUpstream;
 
@@ -137,7 +137,10 @@ async fn codex_egress_header_structure_matches_the_from_source_codex_rs_golden()
         raw_body: None,
     };
 
-    let mut stream = executor.execute(req, &account).await.unwrap();
+    let mut stream = executor
+        .execute(req, &account, &RequestCtx::default())
+        .await
+        .unwrap();
     while stream.next().await.is_some() {}
 
     let headers = handle

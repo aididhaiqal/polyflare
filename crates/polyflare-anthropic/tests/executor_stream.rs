@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use polyflare_anthropic::AnthropicExecutor;
-use polyflare_core::{Account, Executor, PreparedRequest};
+use polyflare_core::{Account, Executor, PreparedRequest, RequestCtx};
 use polyflare_testkit::MockUpstream;
 
 #[tokio::test]
@@ -29,7 +29,10 @@ async fn executor_streams_upstream_events_and_forwards_body() {
         raw_body: None,
     };
 
-    let mut stream = executor.execute(req, &account).await.unwrap();
+    let mut stream = executor
+        .execute(req, &account, &RequestCtx::default())
+        .await
+        .unwrap();
     let mut collected = String::new();
     while let Some(chunk) = stream.next().await {
         collected.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
@@ -58,7 +61,11 @@ async fn executor_surfaces_upstream_error_status() {
         forward_headers: vec![],
         raw_body: None,
     };
-    let err = executor.execute(req, &account).await.err().unwrap();
+    let err = executor
+        .execute(req, &account, &RequestCtx::default())
+        .await
+        .err()
+        .unwrap();
     // A non-2xx upstream response now surfaces the structured status (404 here from the missing
     // base), not a stringly `Upstream` — so the ingress can classify it for routing-health.
     assert!(

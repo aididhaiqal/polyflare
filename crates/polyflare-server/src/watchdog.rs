@@ -127,7 +127,7 @@ pub async fn execute_with_watchdog(
         WatchdogArm::Disarmed => {
             // No anchor ⇒ cannot be silent. Relay + sniff + observe(Completed).
             let stream = executor
-                .execute(req, account)
+                .execute(req, account, &ctx)
                 .await
                 .map_err(|e| WatchdogError::Upstream(e.failure_signal()))?;
             Ok(wrap_stream(
@@ -142,7 +142,7 @@ pub async fn execute_with_watchdog(
         }
         WatchdogArm::Armed { timeout } => {
             let mut stream = executor
-                .execute(req, account)
+                .execute(req, account, &ctx)
                 .await
                 .map_err(|e| WatchdogError::Upstream(e.failure_signal()))?;
             match tokio::time::timeout(timeout, stream.next()).await {
@@ -221,7 +221,7 @@ pub async fn execute_recovery(
     runtime: Arc<RuntimeStates>,
 ) -> Result<ResponseStream, WatchdogError> {
     let stream = executor
-        .execute(anchorless_req, account)
+        .execute(anchorless_req, account, &ctx)
         .await
         .map_err(|e| WatchdogError::Upstream(e.failure_signal()))?;
     Ok(wrap_stream(

@@ -31,6 +31,7 @@ impl Executor for ErrorFirstExecutor {
         &self,
         _req: PreparedRequest,
         _account: &Account,
+        _ctx: &RequestCtx,
     ) -> Result<ResponseStream, ExecError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(Box::pin(stream::once(async {
