@@ -1,13 +1,13 @@
 // QueryClientProvider → BrowserRouter → AuthProvider → Routes. This wires the app shell for good
-// (provider stack + route tree); ShellPlaceholder and the per-page placeholders below are the only
-// TEMPORARY pieces — Task 4 replaces ShellPlaceholder with the real Shell (nav + header), and each
-// later page task replaces its own placeholder route element.
+// (provider stack + route tree); the per-page placeholders below are the only remaining TEMPORARY
+// pieces — each later page task replaces its own placeholder route element.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Navigate, Outlet, Route, Routes } from "react-router-dom";
+import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 
 import { AuthProvider, RequireAuth } from "./auth/AuthProvider";
 import { CapabilitiesProvider } from "./capabilities/CapabilitiesProvider";
 import { Login } from "./pages/Login";
+import { Shell } from "./shell/Shell";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -17,15 +17,6 @@ const queryClient = new QueryClient({
     },
   },
 });
-
-// TEMPORARY — Task 4 replaces this with the real Shell (sidebar nav + header) around <Outlet/>.
-function ShellPlaceholder() {
-  return (
-    <div className="min-h-screen p-6">
-      <Outlet />
-    </div>
-  );
-}
 
 // TEMPORARY — each later page task supplies the real route element.
 function RoutePlaceholder({ label }: { label: string }) {
@@ -44,7 +35,7 @@ export function App() {
               element={
                 <RequireAuth>
                   <CapabilitiesProvider>
-                    <ShellPlaceholder />
+                    <Shell />
                   </CapabilitiesProvider>
                 </RequireAuth>
               }
