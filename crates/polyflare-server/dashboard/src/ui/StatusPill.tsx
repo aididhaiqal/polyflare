@@ -38,7 +38,7 @@ export function StatusPill({ status, className }: { status: string; className?: 
   return (
     <span
       className={clsx(
-        "inline-block whitespace-nowrap rounded px-2 py-0.5 text-[10px] font-semibold capitalize leading-none",
+        "inline-block whitespace-nowrap rounded px-2 py-0.5 text-[10px] font-semibold leading-none",
         TONE_CLASSES[tone],
         className,
       )}
