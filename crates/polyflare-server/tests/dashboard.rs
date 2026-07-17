@@ -40,6 +40,7 @@ async fn spawn() -> String {
         token_cache: Default::default(),
         admin_token: None,
         live_logs: false,
+        log_bus: polyflare_server::log_bus::LogBus::new(1000),
 
         runtime: Default::default(),
     });

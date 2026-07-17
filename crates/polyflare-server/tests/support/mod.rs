@@ -87,6 +87,7 @@ pub async fn spawn(upstream_url: String) -> (String, Arc<AppState>) {
         runtime: Default::default(),
         admin_token: Some("secret".to_string()),
         live_logs: true,
+        log_bus: polyflare_server::log_bus::LogBus::new(1000),
     });
     let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -141,6 +142,7 @@ pub async fn spawn_without_admin_token(upstream_url: String) -> (String, Arc<App
         runtime: Default::default(),
         admin_token: None,
         live_logs: false,
+        log_bus: polyflare_server::log_bus::LogBus::new(1000),
     });
     let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

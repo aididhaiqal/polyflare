@@ -117,6 +117,7 @@ async fn no_anchor_request_on_ineligible_owner_fails_over_not_500() {
         token_cache: Default::default(),
         admin_token: None,
         live_logs: false,
+        log_bus: polyflare_server::log_bus::LogBus::new(1000),
 
         runtime: Default::default(),
     });

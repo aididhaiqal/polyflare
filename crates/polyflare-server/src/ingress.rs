@@ -408,6 +408,8 @@ async fn responses_route(
     maybe_capture_fingerprint(&state, "POST", "/responses", &headers);
     // Build the log repo BEFORE `state` moves into the impl (it owns a cheap pool clone).
     let log_repo = state.store.request_log();
+    // Same reason: `state` moves into the impl below, so grab the log-bus handle first.
+    let log_bus = state.log_bus.clone();
     let response = responses_handler_impl(state, pool.as_deref(), headers, body).await;
     let log = RequestLog {
         method: "POST",
@@ -422,6 +424,7 @@ async fn responses_route(
         duration_ms: start.elapsed().as_millis() as u64,
     };
     log.emit();
+    log_bus.publish(log.to_log_event());
     spawn_persist_request_log(log_repo, log.record(unix_now()));
     response
 }
@@ -651,6 +654,8 @@ async fn messages_route(
     maybe_capture_fingerprint(&state, "POST", "/v1/messages", &headers);
     // Build the log repo BEFORE `state` moves into a sub-handler (it owns a cheap pool clone).
     let log_repo = state.store.request_log();
+    // Same reason: `state` moves into a sub-handler below, so grab the log-bus handle first.
+    let log_bus = state.log_bus.clone();
     let model = body
         .get("model")
         .and_then(|m| m.as_str())
@@ -684,6 +689,7 @@ async fn messages_route(
         duration_ms: start.elapsed().as_millis() as u64,
     };
     log.emit();
+    log_bus.publish(log.to_log_event());
     spawn_persist_request_log(log_repo, log.record(unix_now()));
 
     response

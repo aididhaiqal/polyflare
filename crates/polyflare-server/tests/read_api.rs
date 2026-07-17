@@ -132,6 +132,7 @@ async fn spawn(store: Store) -> String {
         token_cache: Default::default(),
         admin_token: Some("secret".to_string()),
         live_logs: true,
+        log_bus: polyflare_server::log_bus::LogBus::new(1000),
 
         runtime: Default::default(),
     });
