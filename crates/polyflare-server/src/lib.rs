@@ -17,6 +17,7 @@ pub mod refresh_locks;
 pub mod runtime_state;
 pub mod session_key;
 pub mod snapshot;
+pub mod sse;
 pub mod token_cache;
 pub mod translate_stream;
 pub mod usage_refresh;

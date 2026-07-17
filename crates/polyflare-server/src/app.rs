@@ -119,6 +119,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         )
         .route("/api/requests", get(crate::read_api::requests_handler))
         .route("/api/overview", get(crate::read_api::overview_handler))
+        .route("/api/logs/stream", get(crate::sse::logs_stream_handler))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::require_admin,

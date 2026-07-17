@@ -24,6 +24,8 @@ serde_json = { workspace = true }
 clap = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
+# /api/logs/stream: adapts the log bus's broadcast::Receiver into a Stream for the SSE body.
+tokio-stream = { version = "0.1", features = ["sync"] }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 sha2 = { workspace = true }

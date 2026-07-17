@@ -43,10 +43,11 @@ pub fn account(id: &str) -> Account {
 }
 
 /// Spawns a real PolyFlare server against `upstream_url`, seeded with one active account
-/// (`acct-1`), with the dashboard enabled (`admin_token: Some("secret")`). Returns the server's
-/// base URL and its `AppState` (for asserting on runtime/store side effects).
+/// (`acct-1`), with the dashboard enabled (`admin_token: Some("secret")`) and `live_logs` set to
+/// `enabled`. Returns the server's base URL and its `AppState` (for asserting on runtime/store
+/// side effects).
 #[allow(dead_code)]
-pub async fn spawn(upstream_url: String) -> (String, Arc<AppState>) {
+pub async fn spawn_live_logs(upstream_url: String, enabled: bool) -> (String, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
     let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
@@ -86,7 +87,7 @@ pub async fn spawn(upstream_url: String) -> (String, Arc<AppState>) {
         token_cache: Default::default(),
         runtime: Default::default(),
         admin_token: Some("secret".to_string()),
-        live_logs: true,
+        live_logs: enabled,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
     });
     let app = build_app(state.clone());
@@ -96,6 +97,15 @@ pub async fn spawn(upstream_url: String) -> (String, Arc<AppState>) {
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), state)
+}
+
+/// Spawns a real PolyFlare server against `upstream_url`, seeded with one active account
+/// (`acct-1`), with the dashboard enabled (`admin_token: Some("secret")`) and `live_logs: true`.
+/// Returns the server's base URL and its `AppState` (for asserting on runtime/store side
+/// effects).
+#[allow(dead_code)]
+pub async fn spawn(upstream_url: String) -> (String, Arc<AppState>) {
+    spawn_live_logs(upstream_url, true).await
 }
 
 /// Like `spawn`, but with the dashboard disabled (`admin_token: None`) — for asserting the
