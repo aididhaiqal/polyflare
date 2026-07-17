@@ -66,6 +66,47 @@ async fn spawn_429_upstream() -> String {
     format!("http://{addr}")
 }
 
+/// An inline upstream that always answers `POST /responses` with a fixed `status` and an OpenAI-
+/// shaped error body carrying `code` (`{"error":{"code":"...","message":"..."}}`) — the exact shape
+/// `polyflare_codex::executor::extract_error_code` parses (code only, never the message).
+async fn spawn_error_code_upstream(status: u16, code: &'static str) -> String {
+    use axum::response::IntoResponse;
+    async fn respond(status: u16, code: &'static str) -> axum::response::Response {
+        (
+            StatusCode::from_u16(status).unwrap(),
+            axum::Json(serde_json::json!({"error": {"code": code, "message": "do not persist this"}})),
+        )
+            .into_response()
+    }
+    let app = axum::Router::new().route(
+        "/responses",
+        axum::routing::post(move || respond(status, code)),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// An inline upstream that always answers `POST /responses` with a bare `500` and NO parseable
+/// error code (plain text body) — the A7 regression guard: a non-permanent failure must still route
+/// through the pre-existing transient-error path, unchanged.
+async fn spawn_plain_500_upstream() -> String {
+    async fn boom() -> axum::response::Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+    }
+    use axum::response::IntoResponse;
+    let app = axum::Router::new().route("/responses", axum::routing::post(boom));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
 async fn spawn(upstream_url: String) -> (String, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
@@ -197,5 +238,114 @@ async fn a_429_cools_the_account_down_and_benches_it_next_request() {
         r2.status(),
         503,
         "the cooled-down account is benched, so there is no eligible account"
+    );
+}
+
+/// A7: an upstream `401` carrying the reauth-required code `invalid_grant` must park the account
+/// with a DURABLE `reauth_required` status (not just a runtime cooldown) — asserted via a direct
+/// store read, not merely next-request exclusion — and must NOT also bump the transient
+/// `error_count` / set a runtime `cooldown_until` (a terminal status supersedes health backoff; only
+/// re-auth clears `reauth_required`, so a cooldown would wrongly auto-readmit a deauthed account).
+#[tokio::test]
+async fn a_401_invalid_grant_parks_a_durable_reauth_required_status() {
+    let upstream = spawn_error_code_upstream(401, "invalid_grant").await;
+    let (pf, state) = spawn(upstream).await;
+    let body = serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"});
+
+    let resp = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502, "surfaces as the generic 502 like any other upstream failure");
+
+    // Durable status write: read straight from the store, not the runtime overlay.
+    let stored = state
+        .store
+        .accounts()
+        .get("acct-1")
+        .await
+        .unwrap()
+        .expect("account still exists");
+    assert_eq!(
+        stored.status, "reauth_required",
+        "invalid_grant is a REAUTH_REQUIRED_FAILURE_CODES entry in classify_failure"
+    );
+
+    // The transient health-backoff fields must be untouched: no error_count bump, no cooldown.
+    let mut snaps = vec![AccountSnapshot::new("acct-1")];
+    state.runtime.overlay(&mut snaps, now());
+    assert_eq!(
+        snaps[0].error_count, 0,
+        "a permanent/auth code must NOT also bump the transient error_count"
+    );
+    assert_eq!(
+        snaps[0].cooldown_until, None,
+        "cooldown_until stays null — only re-auth clears reauth_required"
+    );
+}
+
+/// A7: `account_deactivated` maps to the OTHER permanent bucket — durable `deactivated`, not
+/// `reauth_required` — proving the branch reads the FULL `classify_failure` table, not just the
+/// reauth arm.
+#[tokio::test]
+async fn an_account_deactivated_code_parks_a_durable_deactivated_status() {
+    let upstream = spawn_error_code_upstream(403, "account_deactivated").await;
+    let (pf, state) = spawn(upstream).await;
+    let body = serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"});
+
+    let resp = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+
+    let stored = state
+        .store
+        .accounts()
+        .get("acct-1")
+        .await
+        .unwrap()
+        .expect("account still exists");
+    assert_eq!(stored.status, "deactivated");
+}
+
+/// A7 regression guard: a NON-permanent failure (a plain 500 with no parseable error code) must
+/// route through the pre-existing transient-error path exactly as before A7 — durable `status`
+/// stays `active`, and the runtime `error_count` (not a durable write) is what bumps.
+#[tokio::test]
+async fn a_plain_500_with_no_code_still_routes_transient_not_durable() {
+    let upstream = spawn_plain_500_upstream().await;
+    let (pf, state) = spawn(upstream).await;
+    let body = serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"});
+
+    let resp = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+
+    let stored = state
+        .store
+        .accounts()
+        .get("acct-1")
+        .await
+        .unwrap()
+        .expect("account still exists");
+    assert_eq!(
+        stored.status, "active",
+        "a non-permanent failure must NOT durably park the account"
+    );
+
+    let mut snaps = vec![AccountSnapshot::new("acct-1")];
+    state.runtime.overlay(&mut snaps, now());
+    assert_eq!(
+        snaps[0].error_count, 1,
+        "unchanged existing behavior: a plain 500 still bumps the transient error_count"
     );
 }

@@ -71,10 +71,29 @@ fn no_eligible() -> Response {
 /// drop ⇒ a transient error (the selector's error-backoff gate handles repeat offenders). Other 4xx
 /// (a bad request, a 404) are a client/request problem, NOT an account-health signal, so they don't
 /// bench the account. A `Continuity` error is not an account-health signal either.
-fn record_failure(state: &AppState, id: &AccountId, err: &WatchdogError, now: i64) {
+///
+/// A7: BEFORE any of the above, if the signal carries an upstream `error_code` that
+/// `classify_failure` (the SAME code table the OAuth-refresh path at `resolve_core_account` uses —
+/// reused, never copied, so the two paths can't drift) maps to a permanent class
+/// (`ReauthRequired`/`Deactivated`, i.e. `.status()` is `Some`), this parks the account with that
+/// durable terminal status instead: a terminal status supersedes health backoff, so `error_count` is
+/// NOT also bumped, and `cooldown_until` is left untouched (null, absent a prior transient hit) —
+/// only re-auth clears `reauth_required`, so a cooldown would wrongly auto-readmit a deauthed
+/// account. Async because the durable write (`AccountRepo::update_status`) is; every call site
+/// already awaits other work in the same `async fn`, so awaiting here is a plain, non-blocking
+/// dependency, not a new sync/async boundary.
+async fn record_failure(state: &AppState, id: &AccountId, err: &WatchdogError, now: i64) {
     let WatchdogError::Upstream(signal) = err else {
         return;
     };
+    if let Some(sig) = signal {
+        if let Some(code) = &sig.error_code {
+            if let Some(status) = classify_failure(code).status() {
+                let _ = state.store.accounts().update_status(id.as_str(), status).await;
+                return;
+            }
+        }
+    }
     match signal {
         Some(sig) if sig.status == 429 => state.runtime.record_rate_limit(id, sig.retry_after, now),
         // 5xx (server error), 401/403 (bad credential / account-scoped auth), 408 (request timeout):
@@ -590,7 +609,7 @@ async fn responses_handler_impl(
                 {
                     Ok(stream) => stream_response(stream),
                     Err(e) => {
-                        record_failure(&state, &health_id, &e, unix_now());
+                        record_failure(&state, &health_id, &e, unix_now()).await;
                         (StatusCode::BAD_GATEWAY, "upstream error").into_response()
                     }
                 }
@@ -626,7 +645,7 @@ async fn responses_handler_impl(
                         {
                             Ok(stream) => stream_response(stream),
                             Err(e) => {
-                                record_failure(&state, &health_id, &e, unix_now());
+                                record_failure(&state, &health_id, &e, unix_now()).await;
                                 (StatusCode::BAD_GATEWAY, "upstream error").into_response()
                             }
                         }
@@ -685,7 +704,7 @@ async fn responses_handler_impl(
                                 {
                                     Ok(stream) => stream_response(stream),
                                     Err(e) => {
-                                        record_failure(&state, &health_id, &e, unix_now());
+                                        record_failure(&state, &health_id, &e, unix_now()).await;
                                         (StatusCode::BAD_GATEWAY, "upstream error").into_response()
                                     }
                                 }
@@ -864,7 +883,7 @@ async fn messages_handler_native(
     {
         Ok(stream) => stream_response(stream),
         Err(e) => {
-            record_failure(&state, &health_id, &e, unix_now());
+            record_failure(&state, &health_id, &e, unix_now()).await;
             (StatusCode::BAD_GATEWAY, "upstream error").into_response()
         }
     };
@@ -989,7 +1008,7 @@ async fn messages_handler_codex_aliased(
             stream_response(translated_stream)
         }
         Err(e) => {
-            record_failure(&state, &health_id, &e, unix_now());
+            record_failure(&state, &health_id, &e, unix_now()).await;
             (StatusCode::BAD_GATEWAY, "upstream error").into_response()
         }
     };
