@@ -14,6 +14,8 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use polyflare_store::RequestsFilter;
+
 use crate::app::AppState;
 use crate::usage_windows::{resolve, ResolvedWindow};
 
@@ -144,7 +146,10 @@ pub async fn pools_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
 }
 
 /// One request-log row for the dashboard: content-free by construction (the same audited field set
-/// the tracing event carries — method/path/provider/status/latency, never a body or identity).
+/// the tracing event carries — method/path/provider/status/latency plus the content-free per-request
+/// metrics — never a body or identity). `tps` is derived, not stored: `total_tokens` over the
+/// generation window (`duration_ms - ttft_ms`, seconds), present only when both source fields are
+/// present and the window is positive.
 #[derive(Serialize)]
 struct RequestRowView {
     id: i64,
@@ -155,13 +160,43 @@ struct RequestRowView {
     aliased: bool,
     status: i64,
     duration_ms: i64,
+    account_id: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
+    transport: Option<String>,
+    ttft_ms: Option<i64>,
+    total_tokens: Option<i64>,
+    cached_tokens: Option<i64>,
+    tps: Option<f64>,
 }
 
-/// `GET /api/requests` pagination. `limit` is clamped to [1, MAX_LIMIT]; `offset` defaults to 0.
+/// Tokens/sec over the post-first-token generation window, when derivable: needs both
+/// `total_tokens` and `ttft_ms`, and a positive `duration_ms - ttft_ms` window (else the divisor
+/// would be zero or negative and the ratio is meaningless).
+fn derive_tps(duration_ms: i64, ttft_ms: Option<i64>, total_tokens: Option<i64>) -> Option<f64> {
+    let ttft_ms = ttft_ms?;
+    let total_tokens = total_tokens?;
+    if duration_ms <= ttft_ms {
+        return None;
+    }
+    Some(total_tokens as f64 / ((duration_ms - ttft_ms) as f64 / 1000.0))
+}
+
+/// `GET /api/requests` filters + pagination. `limit` is clamped to [1, MAX_LIMIT]; `offset`
+/// defaults to 0. `status_class` is `"success"` (status < 300), `"error"` (status >= 400), or
+/// anything else / unset (no status filter). All filters are content-free identifiers, never
+/// request/response text.
 #[derive(Deserialize)]
 pub struct RequestsQuery {
     limit: Option<i64>,
     offset: Option<i64>,
+    account: Option<String>,
+    provider: Option<String>,
+    status_class: Option<String>,
+    model: Option<String>,
+    transport: Option<String>,
+    since_ts: Option<i64>,
 }
 
 const DEFAULT_LIMIT: i64 = 100;
@@ -174,20 +209,28 @@ struct RequestsView {
     rows: Vec<RequestRowView>,
 }
 
-/// `GET /api/requests?limit=&offset=` — recent request-log rows (newest first, per the repo's
-/// ordering) plus the total count.
+/// `GET /api/requests?limit=&offset=&account=&provider=&status_class=&model=&transport=&since_ts=`
+/// — filtered, paginated request-log rows (newest first, per the repo's ordering) plus the total
+/// count MATCHING the filters (not the whole table).
 pub async fn requests_handler(
     State(state): State<Arc<AppState>>,
     Query(q): Query<RequestsQuery>,
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = q.offset.unwrap_or(0).max(0);
+    let filter = RequestsFilter {
+        account: q.account,
+        provider: q.provider,
+        status_class: q.status_class,
+        model: q.model,
+        transport: q.transport,
+        since_ts: q.since_ts,
+    };
     let repo = state.store.request_log();
-    let rows = match repo.list(limit, offset).await {
+    let (rows, total) = match repo.page(&filter, limit, offset).await {
         Ok(r) => r,
         Err(_) => return Response::error(),
     };
-    let total = repo.count().await.unwrap_or(0);
     let rows = rows
         .into_iter()
         .map(|r| RequestRowView {
@@ -199,9 +242,21 @@ pub async fn requests_handler(
             aliased: r.aliased,
             status: r.status,
             duration_ms: r.duration_ms,
+            tps: derive_tps(r.duration_ms, r.ttft_ms, r.total_tokens),
+            account_id: r.account_id,
+            model: r.model,
+            reasoning_effort: r.reasoning_effort,
+            service_tier: r.service_tier,
+            transport: r.transport,
+            ttft_ms: r.ttft_ms,
+            total_tokens: r.total_tokens,
+            cached_tokens: r.cached_tokens,
         })
         .collect();
-    Response::ok(RequestsView { total, rows })
+    Response::ok(RequestsView {
+        total: total as i64,
+        rows,
+    })
 }
 
 /// A tiny JSON responder: `Ok(200, body)` or a content-safe `500` (the store error's own text is

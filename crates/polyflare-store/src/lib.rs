@@ -13,7 +13,7 @@ pub use account::{Account, AccountRepo, EncryptedTokens, PlainTokens, UsageSnaps
 pub use continuity_repo::{ContinuityRepo, SessionRow};
 pub use crypto::TokenCipher;
 pub use import::{import_from_codex_lb, ImportSummary};
-pub use request_log_repo::{RequestLogRecord, RequestLogRepo, RequestLogRow};
+pub use request_log_repo::{RequestLogRecord, RequestLogRepo, RequestLogRow, RequestsFilter};
 pub use store::Store;
 
 /// Errors surfaced by the store, crypto, and importer.

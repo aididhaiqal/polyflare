@@ -339,3 +339,130 @@ async fn requests_endpoint_pages_the_log() {
     assert_eq!(rows[0]["status"], 200);
     assert_eq!(rows[0]["duration_ms"], 12);
 }
+
+/// Seeds 3 rows (2 codex/200 with metrics, 1 anthropic/500) so filters + the content-free metric
+/// columns + the derived `tps` can be exercised end to end, unauthenticated (auth lands later).
+async fn seed_store_for_filters() -> Store {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let repo = store.request_log();
+    repo.insert(&RequestLogRecord {
+        requested_at: now(),
+        provider: "codex".to_string(),
+        method: "POST".to_string(),
+        path: "/responses".to_string(),
+        aliased: false,
+        status: 200,
+        duration_ms: 2000,
+        account_id: Some("acct-1".to_string()),
+        model: Some("gpt-5.6-sol".to_string()),
+        reasoning_effort: Some("high".to_string()),
+        service_tier: Some("priority".to_string()),
+        transport: Some("http".to_string()),
+        ttft_ms: Some(500),
+        total_tokens: Some(3000),
+        cached_tokens: Some(1000),
+    })
+    .await
+    .unwrap();
+    repo.insert(&RequestLogRecord {
+        requested_at: now(),
+        provider: "codex".to_string(),
+        method: "POST".to_string(),
+        path: "/responses".to_string(),
+        aliased: false,
+        status: 200,
+        duration_ms: 1500,
+        account_id: Some("acct-2".to_string()),
+        model: Some("gpt-5.6-sol".to_string()),
+        reasoning_effort: None,
+        service_tier: None,
+        transport: Some("http".to_string()),
+        ttft_ms: None,
+        total_tokens: None,
+        cached_tokens: None,
+    })
+    .await
+    .unwrap();
+    repo.insert(&RequestLogRecord {
+        requested_at: now(),
+        provider: "anthropic".to_string(),
+        method: "POST".to_string(),
+        path: "/v1/messages".to_string(),
+        aliased: false,
+        status: 500,
+        duration_ms: 300,
+        account_id: Some("acct-3".to_string()),
+        model: Some("claude-x".to_string()),
+        reasoning_effort: None,
+        service_tier: None,
+        transport: Some("sse".to_string()),
+        ttft_ms: None,
+        total_tokens: None,
+        cached_tokens: None,
+    })
+    .await
+    .unwrap();
+    std::mem::forget(dir);
+    store
+}
+
+#[tokio::test]
+async fn requests_endpoint_filters_by_provider_and_carries_content_free_metrics() {
+    let pf = spawn(seed_store_for_filters().await).await;
+    let client = reqwest::Client::new();
+    let body: serde_json::Value = client
+        .get(format!("{pf}/api/requests?provider=codex&limit=10"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["total"], 2, "only the 2 codex rows count");
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r["provider"] == "codex"));
+
+    // The row with both ttft_ms and total_tokens gets a derived tps; duration_ms=2000,
+    // ttft_ms=500 → elapsed generation window = 1500ms = 1.5s; total_tokens=3000 → tps = 2000.0.
+    let full = rows
+        .iter()
+        .find(|r| r["account_id"] == "acct-1")
+        .expect("acct-1 row present");
+    assert_eq!(full["model"], "gpt-5.6-sol");
+    assert_eq!(full["reasoning_effort"], "high");
+    assert_eq!(full["service_tier"], "priority");
+    assert_eq!(full["transport"], "http");
+    assert_eq!(full["ttft_ms"], 500);
+    assert_eq!(full["total_tokens"], 3000);
+    assert_eq!(full["cached_tokens"], 1000);
+    assert_eq!(full["tps"], 2000.0);
+
+    // The row missing ttft_ms/total_tokens gets no derived tps.
+    let partial = rows
+        .iter()
+        .find(|r| r["account_id"] == "acct-2")
+        .expect("acct-2 row present");
+    assert!(partial["tps"].is_null());
+    assert!(partial["ttft_ms"].is_null());
+}
+
+#[tokio::test]
+async fn requests_endpoint_filters_by_status_class() {
+    let pf = spawn(seed_store_for_filters().await).await;
+    let client = reqwest::Client::new();
+    let body: serde_json::Value = client
+        .get(format!("{pf}/api/requests?status_class=error&limit=10"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["total"], 1);
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["status"], 500);
+    assert_eq!(rows[0]["provider"], "anthropic");
+}
