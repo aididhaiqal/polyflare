@@ -3,6 +3,7 @@
 pub mod account_cache;
 pub mod alias;
 pub mod app;
+pub mod auth;
 pub mod catalog;
 pub mod config;
 pub mod continuity;

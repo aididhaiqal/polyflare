@@ -86,6 +86,9 @@ async fn bare_tail_dead_anchor_signals_previous_response_not_found() {
         codex_version: std::sync::Arc::new(polyflare_codex::CodexVersionCache::new().unwrap()),
         account_cache: std::sync::Arc::new(polyflare_server::account_cache::AccountCache::new()),
         token_cache: Default::default(),
+        admin_token: None,
+        live_logs: false,
+
         runtime: Default::default(),
     });
     let app = build_app(state);

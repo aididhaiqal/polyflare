@@ -75,6 +75,9 @@ async fn spawn_with(store: Store) -> String {
         codex_version: Arc::new(polyflare_codex::CodexVersionCache::new().unwrap()),
         account_cache: Arc::new(polyflare_server::account_cache::AccountCache::new()),
         token_cache: Default::default(),
+        admin_token: Some("secret".to_string()),
+        live_logs: true,
+
         runtime: Default::default(),
     });
     let app = build_app(state);
@@ -102,6 +105,7 @@ async fn store_with_one() -> Store {
 async fn fetch_account(pf: &str, id: &str) -> serde_json::Value {
     let body: serde_json::Value = reqwest::Client::new()
         .get(format!("{pf}/api/accounts"))
+        .header("authorization", "Bearer secret")
         .send()
         .await
         .unwrap()
@@ -126,6 +130,7 @@ async fn patch_assigns_pool_and_pauses_then_clears() {
     // Assign a pool + pause + set routing policy in one patch.
     let resp = client
         .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
         .json(&serde_json::json!({ "pool": "team-a", "status": "paused", "routing_policy": "burn_first" }))
         .send()
         .await
@@ -144,6 +149,7 @@ async fn patch_assigns_pool_and_pauses_then_clears() {
     // A partial patch (status only) must leave pool + routing_policy untouched.
     let resp = client
         .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
         .json(&serde_json::json!({ "status": "active" }))
         .send()
         .await
@@ -156,6 +162,7 @@ async fn patch_assigns_pool_and_pauses_then_clears() {
     // Explicit null clears the pool (unpool).
     let resp = client
         .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
         .json(&serde_json::json!({ "pool": null }))
         .send()
         .await
@@ -172,6 +179,7 @@ async fn patch_validation_fails_closed() {
     // Unknown account → 404.
     let resp = client
         .patch(format!("{pf}/api/accounts/nope"))
+        .header("authorization", "Bearer secret")
         .json(&serde_json::json!({ "status": "paused" }))
         .send()
         .await
@@ -181,6 +189,7 @@ async fn patch_validation_fails_closed() {
     // Invalid routing policy → 400, and nothing applied.
     let resp = client
         .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
         .json(&serde_json::json!({ "routing_policy": "aggressive", "pool": "x" }))
         .send()
         .await
@@ -194,6 +203,7 @@ async fn patch_validation_fails_closed() {
     // A status the UI may not set (e.g. deactivated) → 400.
     let resp = client
         .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
         .json(&serde_json::json!({ "status": "deactivated" }))
         .send()
         .await
