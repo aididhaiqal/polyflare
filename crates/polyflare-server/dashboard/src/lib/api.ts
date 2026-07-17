@@ -263,6 +263,24 @@ export interface OverviewView {
   recent_errors: RecentErrorView[];
 }
 
+/** `read_api.rs::SeriesBucketView` — one entry of `OverviewSeriesView.buckets`. `ts` is the bucket
+ * start (unix-epoch seconds); every bucket in `[since_ts, now]` is present, zero-filled where the
+ * backend had no rows for that hour — never a gap in the array. */
+export interface SeriesBucketView {
+  ts: number;
+  requests: number;
+  errors: number;
+  avg_latency_ms: number;
+  total_tokens: number;
+}
+
+/** `read_api.rs::OverviewSeriesView` — `GET /api/overview/series` response: the rolling-24h
+ * request-volume chart, bucketed hourly (`bucket_secs` is fixed today, not client-configurable). */
+export interface OverviewSeriesView {
+  bucket_secs: number;
+  buckets: SeriesBucketView[];
+}
+
 /** `auth.rs::whoami_handler` — `GET /api/whoami` response. No identity beyond `ok` today (a single
  * shared operator token has no per-user identity to report). */
 export interface WhoamiView {
@@ -300,6 +318,7 @@ export interface LogEvent {
 
 export const api = {
   overview: () => fetchJson<OverviewView>("/api/overview"),
+  overviewSeries: () => fetchJson<OverviewSeriesView>("/api/overview/series"),
   accounts: () => fetchJson<AccountView[]>("/api/accounts"),
   account: (id: string) => fetchJson<AccountDetailView>(`/api/accounts/${encodeURIComponent(id)}`),
   accountTrends: (id: string) =>

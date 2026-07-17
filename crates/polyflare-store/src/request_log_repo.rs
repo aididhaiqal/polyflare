@@ -99,6 +99,20 @@ pub struct RequestAggregate {
     pub total_tokens: i64,
 }
 
+/// One time bucket of [`RequestLogRepo::series_since`]: a content-free request-volume rollup for a
+/// single `bucket_secs`-wide window — the dashboard overview's request-volume chart. Same metric
+/// set as [`RequestAggregate`] minus `success` (the chart only plots total/error volume + latency +
+/// tokens per bucket; `success` is derivable as `requests - errors` if a future consumer needs it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestBucket {
+    /// Bucket start, unix-epoch seconds (i.e. `(requested_at / bucket_secs) * bucket_secs`).
+    pub ts: i64,
+    pub requests: i64,
+    pub errors: i64,
+    pub avg_latency_ms: f64,
+    pub total_tokens: i64,
+}
+
 /// One row of [`RequestLogRepo::recent_errors`]: content-free error identification, never a body or
 /// upstream error message.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -231,6 +245,58 @@ impl RequestLogRepo {
             avg_latency_ms: row.3,
             total_tokens: row.4,
         })
+    }
+
+    /// Content-free request-volume time series for the dashboard overview's chart
+    /// (`GET /api/overview/series`): one row per `bucket_secs`-wide bucket at/after `since_ts`,
+    /// ascending by bucket start (`ts`). Bucketing is done in SQL via integer-division grouping
+    /// (`(requested_at / bucket_secs) * bucket_secs`), not by fetching rows into Rust. `errors`
+    /// classifies by the SAME rule [`Self::aggregate_since`] uses (`status >= 400`); `avg_latency_ms`
+    /// / `total_tokens` are per-bucket `AVG`/`SUM`, never null (a bucket only exists here because it
+    /// has >= 1 row).
+    ///
+    /// # `bucket_secs` guard
+    /// Clamped to a minimum of 1 so the SQL integer division can never divide by zero. There is no
+    /// legitimate caller today (a hardcoded hourly bucket — see `read_api.rs`'s
+    /// `OVERVIEW_SERIES_BUCKET_SECS`) that would pass `<= 0`; clamping (rather than returning a new
+    /// `StoreError` variant) keeps this infallible-by-construction like `aggregate_since`.
+    ///
+    /// # Gaps are NOT filled in here
+    /// SQL only emits buckets that have at least one row — a window with no traffic for an hour
+    /// produces NO row for that hour, not a zeroed one. Zero-filling the full `[since_ts, now]` grid
+    /// is the caller's job (`read_api.rs::overview_series_handler`), done exactly once there, so a
+    /// chart consumer never has to distinguish "no data" from "gap in the array" itself.
+    pub async fn series_since(
+        &self,
+        since_ts: i64,
+        bucket_secs: i64,
+    ) -> Result<Vec<RequestBucket>, StoreError> {
+        let bucket_secs = bucket_secs.max(1);
+        let rows: Vec<(i64, i64, i64, f64, i64)> = sqlx::query_as(
+            "SELECT (requested_at / ?) * ? AS bucket_ts, \
+                    COUNT(*), \
+                    COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END), 0), \
+                    COALESCE(AVG(duration_ms), 0.0), \
+                    COALESCE(SUM(total_tokens), 0) \
+             FROM request_log WHERE requested_at >= ? \
+             GROUP BY bucket_ts ORDER BY bucket_ts ASC",
+        )
+        .bind(bucket_secs)
+        .bind(bucket_secs)
+        .bind(since_ts)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(ts, requests, errors, avg_latency_ms, total_tokens)| RequestBucket {
+                ts,
+                requests,
+                errors,
+                avg_latency_ms,
+                total_tokens,
+            })
+            .collect())
     }
 
     /// The newest `limit` content-free error rows (`status >= 400`), newest first — the dashboard
@@ -481,6 +547,137 @@ mod tests {
             "an empty window rolls up to zero, not null"
         );
         assert_eq!(empty.total_tokens, 0);
+    }
+
+    /// `series_since` groups rows into `bucket_secs`-wide buckets (via SQL integer-division), each
+    /// bucket carrying its own `requests`/`errors`/`avg_latency_ms`/`total_tokens` rollup — mirroring
+    /// `aggregate_since`'s per-window math, just repeated per bucket instead of over the whole
+    /// window.
+    #[tokio::test]
+    async fn series_since_buckets_rows_and_rolls_up_metrics_per_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        // bucket_secs = 100 → buckets start at multiples of 100.
+        // Bucket [0, 100): one row at ts=50.
+        repo.insert(&row_at(50, 200, Some(500), 100))
+            .await
+            .unwrap();
+        // Bucket [100, 200): two rows, one success one error, at ts=120 and ts=150.
+        repo.insert(&row_at(120, 200, Some(1000), 100))
+            .await
+            .unwrap();
+        repo.insert(&row_at(150, 500, Some(2000), 300))
+            .await
+            .unwrap();
+
+        let buckets = repo.series_since(0, 100).await.unwrap();
+        assert_eq!(buckets.len(), 2, "two distinct buckets have rows");
+
+        assert_eq!(buckets[0].ts, 0);
+        assert_eq!(buckets[0].requests, 1);
+        assert_eq!(buckets[0].errors, 0);
+        assert_eq!(buckets[0].total_tokens, 500);
+        assert_eq!(buckets[0].avg_latency_ms, 100.0);
+
+        assert_eq!(buckets[1].ts, 100);
+        assert_eq!(buckets[1].requests, 2);
+        assert_eq!(buckets[1].errors, 1);
+        assert_eq!(buckets[1].total_tokens, 3000);
+        assert_eq!(buckets[1].avg_latency_ms, 200.0, "(100 + 300) / 2");
+    }
+
+    /// Buckets come back ascending by `ts` regardless of insertion order.
+    #[tokio::test]
+    async fn series_since_orders_buckets_ascending_by_ts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        // Insert the LATER bucket's row first, to prove ordering isn't just insertion order.
+        repo.insert(&row_at(950, 200, Some(1), 50)).await.unwrap();
+        repo.insert(&row_at(50, 200, Some(1), 50)).await.unwrap();
+        repo.insert(&row_at(450, 200, Some(1), 50)).await.unwrap();
+
+        let buckets = repo.series_since(0, 100).await.unwrap();
+        let tss: Vec<i64> = buckets.iter().map(|b| b.ts).collect();
+        assert_eq!(tss, vec![0, 400, 900]);
+    }
+
+    /// Rows strictly before `since_ts` are excluded from every bucket, same as `aggregate_since`'s
+    /// window boundary.
+    #[tokio::test]
+    async fn series_since_excludes_rows_before_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        repo.insert(&row_at(50, 200, Some(1), 50)).await.unwrap(); // before the window
+        repo.insert(&row_at(200, 200, Some(7), 50)).await.unwrap(); // in the window
+
+        let buckets = repo.series_since(200, 100).await.unwrap();
+        assert_eq!(buckets.len(), 1, "the ts=50 row's bucket must not appear");
+        assert_eq!(buckets[0].ts, 200);
+        assert_eq!(buckets[0].total_tokens, 7);
+    }
+
+    /// An empty range (no rows at/after `since_ts`) returns an empty `Vec`, not a panic or an error.
+    #[tokio::test]
+    async fn series_since_returns_empty_vec_for_a_window_with_no_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        repo.insert(&row_at(50, 200, Some(1), 50)).await.unwrap();
+
+        let buckets = repo.series_since(1_000_000, 100).await.unwrap();
+        assert!(buckets.is_empty());
+    }
+
+    /// Gaps between buckets that DO have rows are not filled in by the store — only buckets with at
+    /// least one row are emitted. This is the documented split of responsibility: `series_since`
+    /// stays a pure SQL rollup, and zero-filling the full grid is the handler's job
+    /// (`read_api.rs::overview_series_handler`).
+    #[tokio::test]
+    async fn series_since_does_not_zero_fill_gaps_between_populated_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        repo.insert(&row_at(0, 200, Some(1), 50)).await.unwrap(); // bucket 0
+        // Buckets 100 and 200 have no rows at all.
+        repo.insert(&row_at(300, 200, Some(1), 50)).await.unwrap(); // bucket 300
+
+        let buckets = repo.series_since(0, 100).await.unwrap();
+        assert_eq!(
+            buckets.len(),
+            2,
+            "only the two populated buckets are returned, not the empty ones in between"
+        );
+        assert_eq!(buckets[0].ts, 0);
+        assert_eq!(buckets[1].ts, 300);
+    }
+
+    /// `bucket_secs <= 0` is clamped to `1` rather than panicking on a divide-by-zero in SQL — every
+    /// row lands in its own one-second bucket instead.
+    #[tokio::test]
+    async fn series_since_clamps_non_positive_bucket_secs_to_avoid_divide_by_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        repo.insert(&row_at(10, 200, Some(1), 50)).await.unwrap();
+        repo.insert(&row_at(20, 200, Some(1), 50)).await.unwrap();
+
+        let buckets = repo.series_since(0, 0).await.unwrap();
+        assert_eq!(
+            buckets.len(),
+            2,
+            "clamped to bucket_secs=1 → each row gets its own bucket"
+        );
+        assert_eq!(buckets[0].ts, 10);
+        assert_eq!(buckets[1].ts, 20);
     }
 
     /// `recent_errors` returns only `status >= 400` rows, newest first, and honors `limit`.
