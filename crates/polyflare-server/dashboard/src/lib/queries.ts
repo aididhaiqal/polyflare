@@ -1,0 +1,121 @@
+// TanStack Query hooks over the typed API client (./api.ts). Every hook here is a thin wrapper:
+// query key + fetchJson call + a refetch policy. Pages consume these instead of calling fetchJson
+// directly, so the caching/refetch behavior lives in one place.
+
+import { useQuery } from "@tanstack/react-query";
+
+import {
+  api,
+  type AccountDetailView,
+  type AccountView,
+  type CapabilitiesView,
+  type OverviewView,
+  type PoolView,
+  type RequestsQueryParams,
+  type RequestsView,
+  type TrendsView,
+} from "./api";
+
+/** How often the landing-page/list views poll for fresh data while mounted. Per the task brief:
+ * overview + the account/pool lists refetch every 30s; per-item detail views (account detail,
+ * trends) don't — the fetch already happens whenever the user navigates in. */
+const LIST_REFETCH_MS = 30_000;
+
+export const queryKeys = {
+  overview: ["overview"] as const,
+  accounts: ["accounts"] as const,
+  account: (id: string) => ["accounts", id] as const,
+  accountTrends: (id: string) => ["accounts", id, "trends"] as const,
+  pools: ["pools"] as const,
+  requests: (params: RequestsQueryParams) => ["requests", params] as const,
+  capabilities: ["capabilities"] as const,
+};
+
+export function useOverview() {
+  return useQuery<OverviewView>({
+    queryKey: queryKeys.overview,
+    queryFn: api.overview,
+    refetchInterval: LIST_REFETCH_MS,
+    staleTime: LIST_REFETCH_MS,
+  });
+}
+
+export function useAccounts() {
+  return useQuery<AccountView[]>({
+    queryKey: queryKeys.accounts,
+    queryFn: api.accounts,
+    refetchInterval: LIST_REFETCH_MS,
+    staleTime: LIST_REFETCH_MS,
+  });
+}
+
+export function useAccount(id: string) {
+  return useQuery<AccountDetailView>({
+    queryKey: queryKeys.account(id),
+    queryFn: () => api.account(id),
+    enabled: id.length > 0,
+  });
+}
+
+export function useAccountTrends(id: string) {
+  return useQuery<TrendsView>({
+    queryKey: queryKeys.accountTrends(id),
+    queryFn: () => api.accountTrends(id),
+    enabled: id.length > 0,
+    // 7-day history (see read_api.rs::TRENDS_LOOKBACK_SECS) — cheap to treat as fairly static
+    // within a session; a hard refresh (or navigating away and back) is enough to pick up changes.
+    staleTime: 60_000,
+  });
+}
+
+export function usePools() {
+  return useQuery<PoolView[]>({
+    queryKey: queryKeys.pools,
+    queryFn: api.pools,
+    refetchInterval: LIST_REFETCH_MS,
+    staleTime: LIST_REFETCH_MS,
+  });
+}
+
+/** Serializes `RequestsQuery`'s filter/pagination fields into a `?`-prefixed query string,
+ * omitting any field left `undefined`. Field names/order match `read_api.rs::RequestsQuery`
+ * exactly (`limit,offset,account,provider,status_class,model,transport,since_ts`). */
+function buildRequestsQueryString(params: RequestsQueryParams): string {
+  const sp = new URLSearchParams();
+  const order: Array<keyof RequestsQueryParams> = [
+    "limit",
+    "offset",
+    "account",
+    "provider",
+    "status_class",
+    "model",
+    "transport",
+    "since_ts",
+  ];
+  for (const key of order) {
+    const value = params[key];
+    if (value === undefined) continue;
+    sp.set(key, String(value));
+  }
+  const qs = sp.toString();
+  return qs ? `?${qs}` : "";
+}
+
+export function useRequests(params: RequestsQueryParams = {}) {
+  return useQuery<RequestsView>({
+    queryKey: queryKeys.requests(params),
+    queryFn: () => api.requests(buildRequestsQueryString(params)),
+    refetchInterval: LIST_REFETCH_MS,
+    staleTime: LIST_REFETCH_MS,
+  });
+}
+
+export function useCapabilities() {
+  return useQuery<CapabilitiesView>({
+    queryKey: queryKeys.capabilities,
+    queryFn: api.capabilities,
+    // Feature flags sourced from process env at server startup — effectively static for the life
+    // of a running server, so never proactively refetch.
+    staleTime: Infinity,
+  });
+}
