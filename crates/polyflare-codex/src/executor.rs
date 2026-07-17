@@ -39,6 +39,65 @@ fn retry_after_secs(headers: &HeaderMap) -> Option<i64> {
         .filter(|&s| s >= 0)
 }
 
+/// Content-safety cap on how much of a non-2xx error body we will ever read into memory. A
+/// hostile or merely huge upstream error body must never be read unbounded (hang/OOM risk); this
+/// is a hard ceiling, not a hint — bytes past it are never even copied into `buf`.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Read a non-2xx response body up to [`MAX_ERROR_BODY_BYTES`], then drop the response. Never
+/// buffers more than the cap regardless of how large the upstream body is or how it's chunked —
+/// each incoming chunk is truncated to whatever room remains before being copied in, and reading
+/// stops (the stream is dropped) the moment the cap is reached.
+async fn read_bounded_error_body(resp: reqwest::Response) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while buf.len() < MAX_ERROR_BODY_BYTES {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        let Ok(chunk) = chunk else { break };
+        let room = MAX_ERROR_BODY_BYTES - buf.len();
+        let take = room.min(chunk.len());
+        buf.extend_from_slice(&chunk[..take]);
+    }
+    buf
+}
+
+/// A code token is a short, enum-like ASCII identifier (`invalid_grant`, `account_deactivated`,
+/// …) — never prose. Used to gate the `detail` shape below: a `detail` string is only ever
+/// treated as a code if it already looks like one, so free-text messages (which can echo request
+/// framing) are never scraped for a "code".
+fn looks_like_code_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Extract ONLY the error `code` from a non-2xx response body — never the `message`/`detail`
+/// prose text, which can echo request framing (content-safety). Handles the OpenAI shape
+/// (`{"error":{"code":"...","type":"...","message":"..."}}`, preferred) and the codex-lb-observed
+/// `{"detail":"..."}` shape, but only when `detail` itself is already a clean code token — a
+/// prose `detail` yields `None` rather than a guessed/scraped code. Any parse failure (malformed
+/// JSON, absent/non-string code, truncated body) also yields `None`; this must never be treated
+/// as an error in the caller — a missing code is always a valid, silent outcome.
+fn extract_error_code(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if let Some(code) = value
+        .get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str())
+    {
+        return Some(code.to_string());
+    }
+    if let Some(detail) = value.get("detail").and_then(|d| d.as_str()) {
+        if looks_like_code_token(detail) {
+            return Some(detail.to_string());
+        }
+    }
+    None
+}
+
 // Pins the exact aws-lc-rs version (see workspace Cargo.toml) that rustls's `aws_lc_rs` feature
 // resolves to transitively; never called directly ourselves — `rustls::crypto::aws_lc_rs` is the
 // entry point we use below.
@@ -148,10 +207,17 @@ impl Executor for CodexExecutor {
             .map_err(|e| ExecError::Upstream(e.to_string()))?;
 
         if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let retry_after = retry_after_secs(resp.headers());
+            // Bounded read of the error body to extract the code ONLY (content-safety: the
+            // message/detail prose is read into `buf` transiently here and then never touched
+            // again — not stored, not logged, not placed anywhere on `ExecError`).
+            let buf = read_bounded_error_body(resp).await;
+            let error_code = extract_error_code(&buf);
             return Err(ExecError::UpstreamStatus(polyflare_core::FailureSignal {
-                status: resp.status().as_u16(),
-                retry_after: retry_after_secs(resp.headers()),
-                error_code: None,
+                status,
+                retry_after,
+                error_code,
             }));
         }
 

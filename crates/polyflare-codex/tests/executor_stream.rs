@@ -157,3 +157,104 @@ async fn executor_surfaces_upstream_error_status() {
         "expected UpstreamStatus(404), got {err:?}"
     );
 }
+
+async fn run_error_status(status: u16, body: &str) -> polyflare_core::ExecError {
+    let base = MockUpstream::error_status(status, body).spawn().await;
+    let executor = CodexExecutor::new().unwrap();
+    let account = Account {
+        id: "test".into(),
+        base_url: base,
+        bearer_token: "t".into(),
+        chatgpt_account_id: None,
+    };
+    let req = PreparedRequest {
+        body: Some(serde_json::json!({"model": "m"})),
+        model: "m".into(),
+        forward_headers: vec![],
+        raw_body: None,
+    };
+    executor
+        .execute(req, &account, &RequestCtx::default())
+        .await
+        .err()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn executor_extracts_error_code_from_openai_shape_without_leaking_message() {
+    let err = run_error_status(
+        403,
+        r#"{"error":{"code":"account_deactivated","message":"secret detail"}}"#,
+    )
+    .await;
+
+    match &err {
+        polyflare_core::ExecError::UpstreamStatus(s) => {
+            assert_eq!(s.status, 403);
+            assert_eq!(s.error_code.as_deref(), Some("account_deactivated"));
+        }
+        other => panic!("expected UpstreamStatus, got {other:?}"),
+    }
+
+    // Content-safety: the message text must never surface via Display or Debug.
+    let display = format!("{err}");
+    let debug = format!("{err:?}");
+    assert!(
+        !display.contains("secret detail"),
+        "Display leaked the error message: {display}"
+    );
+    assert!(
+        !debug.contains("secret detail"),
+        "Debug leaked the error message: {debug}"
+    );
+}
+
+#[tokio::test]
+async fn executor_does_not_scrape_a_code_out_of_prose_detail() {
+    let err = run_error_status(
+        429,
+        r#"{"detail":"you have been rate limited, try later"}"#,
+    )
+    .await;
+    match &err {
+        polyflare_core::ExecError::UpstreamStatus(s) => {
+            assert_eq!(s.status, 429);
+            assert_eq!(s.error_code, None);
+        }
+        other => panic!("expected UpstreamStatus, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn executor_tolerates_malformed_json_error_body() {
+    let err = run_error_status(500, "not json at all {{{").await;
+    match &err {
+        polyflare_core::ExecError::UpstreamStatus(s) => {
+            assert_eq!(s.status, 500);
+            assert_eq!(s.error_code, None);
+        }
+        other => panic!("expected UpstreamStatus, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn executor_bounds_the_error_body_read_on_an_oversized_body() {
+    // 256 KiB of filler, far past the 64 KiB cap — must not hang or OOM; a best-effort result
+    // (status still correct) is all that's required.
+    let huge_body = format!(r#"{{"padding":"{}"}}"#, "x".repeat(256 * 1024));
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run_error_status(502, &huge_body),
+    )
+    .await
+    .expect("bounded read must not hang on an oversized error body");
+
+    match &err {
+        polyflare_core::ExecError::UpstreamStatus(s) => {
+            assert_eq!(s.status, 502);
+            // Truncated JSON has no parseable code — best-effort None, not a panic.
+            assert_eq!(s.error_code, None);
+        }
+        other => panic!("expected UpstreamStatus, got {other:?}"),
+    }
+}

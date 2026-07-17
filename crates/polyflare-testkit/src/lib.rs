@@ -31,6 +31,10 @@ enum MockMode {
     /// `previous_response_id`, instead return 200 headers then a never-yielding body (no
     /// keep-alive) — the wedge (silence-after-accept).
     WithIds { silent_on_anchor: bool },
+    /// Always respond with the given non-2xx HTTP status and raw body verbatim (no SSE, no id
+    /// injection) — used to drive the HTTP executor's error-body code-extraction path
+    /// (failure-code writeback Task 2).
+    Error { status: u16, body: String },
 }
 
 /// A scriptable mock upstream: serves `POST /responses`, records every request body + the last
@@ -105,6 +109,19 @@ impl MockUpstream {
             events,
             MockMode::WithIds {
                 silent_on_anchor: true,
+            },
+        )
+    }
+
+    /// Always respond with `status` and `body` verbatim (`content-type: application/json`) — no
+    /// scripting, no id injection. Used to test error-body parsing (e.g. the structured
+    /// `{"error":{"code":...}}` shape, or an oversized body exercising a bounded read).
+    pub fn error_status(status: u16, body: impl Into<String>) -> Self {
+        Self::build(
+            vec![],
+            MockMode::Error {
+                status,
+                body: body.into(),
             },
         )
     }
@@ -229,6 +246,11 @@ async fn handler(
                 .body(Body::from_stream(s))
                 .unwrap()
         }
+        MockMode::Error { status, body } => Response::builder()
+            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap(),
     }
 }
 
