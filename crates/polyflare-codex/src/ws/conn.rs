@@ -89,9 +89,21 @@ pub struct WsConn {
     /// this. Never raw conversation content. Must be set at the same time and by the same sender
     /// as `last_item_hashes` (see that field's doc for the failure mode if it's forgotten).
     pub last_non_input_fingerprint: Option<String>,
+    /// Set once this socket is known dead: a `Close` frame / clean stream end observed by
+    /// `recv_frame`, or a send/recv error. Ground truth §2: real codex reuse is "gated only on
+    /// liveness (`conn.is_closed()`)" — Task 7's connection cache reads this via [`Self::is_closed`]
+    /// to decide "reuse the cached handle" vs "this needs a fresh `connect`" BEFORE attempting to
+    /// reuse it, rather than reactively discovering the failure on the next attempted send.
+    closed: bool,
 }
 
 impl WsConn {
+    /// Whether this socket is known dead (see [`Self::closed`]'s doc). `pub(crate)`: read by
+    /// Task 7's connection cache (`ws::executor`), not exposed outside this crate.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
+    }
+
     /// Dial `{account.base_url}/responses` (scheme swapped `http`→`ws` / `https`→`wss`, ground
     /// truth §1) with the codex-parity handshake headers, then hand back the open socket.
     ///
@@ -108,66 +120,129 @@ impl WsConn {
         account: &Account,
         forward_headers: &[(String, String)],
     ) -> Result<WsConn, ExecError> {
-        // Must run before the first WS TLS handshake so tokio-tungstenite's rustls backend picks
-        // up aws-lc-rs instead of falling back to ring — same reason `CodexExecutor::new` calls
-        // this before its first HTTP TLS use.
-        ensure_rustls_crypto_provider();
-
-        let url = ws_url_for(&account.base_url)?;
-        let mut request = url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| ExecError::Upstream(e.to_string()))?;
-        let headers = request.headers_mut();
-
-        for (name, value) in forward_headers {
-            if name.eq_ignore_ascii_case(TURN_STATE_HEADER) {
-                continue;
-            }
-            let header_name = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|e| ExecError::Upstream(e.to_string()))?;
-            let header_value =
-                HeaderValue::from_str(value).map_err(|e| ExecError::Upstream(e.to_string()))?;
-            headers.insert(header_name, header_value);
+        match connect_detailed(account, forward_headers).await {
+            ConnectOutcome::Connected(conn) => Ok(*conn),
+            // Collapses the one distinguished outcome back to a generic error for callers that
+            // don't need to act on it differently (this fn's existing callers/tests) — Task 7's
+            // `ws::executor::CodexWsExecutor` calls `connect_detailed` directly instead, precisely
+            // so it CAN tell this case apart (ground truth §5: the ONE `FallbackToHttp` trigger).
+            ConnectOutcome::UpgradeRequired => Err(ExecError::Upstream(
+                "WS handshake rejected: HTTP 426 Upgrade Required".to_string(),
+            )),
+            ConnectOutcome::Failed(e) => Err(e),
         }
+    }
+}
 
-        let bearer = HeaderValue::from_str(&format!("Bearer {}", account.bearer_token))
-            .map_err(|e| ExecError::Upstream(e.to_string()))?;
-        headers.insert(HeaderName::from_static("authorization"), bearer);
-        // Pair the SELECTED account's ChatGPT id with its Bearer — same reasoning as
-        // `executor.rs:109-119`: `insert` (replace), never leave a forwarded value for a
-        // DIFFERENT account sitting next to our overridden Bearer.
-        if let Some(account_id) = &account.chatgpt_account_id {
-            headers.insert(
-                HeaderName::from_static("chatgpt-account-id"),
-                HeaderValue::from_str(account_id)
-                    .map_err(|e| ExecError::Upstream(e.to_string()))?,
-            );
+/// The distinguished outcomes of one handshake attempt (M5a Task 7). Ground truth §5 is explicit
+/// that HTTP 426 Upgrade Required is the ONLY `FallbackToHttp` trigger codex itself recognizes —
+/// "No other status falls back". `ws::executor::CodexWsExecutor` needs to tell that ONE case apart
+/// from every other connect/handshake failure (which stays a plain `ExecError::Upstream`, surfaced
+/// unchanged, per `SPEC-M5-WEBSOCKET.md` §4 / the M5a plan's Task 7 table) — hence this three-way
+/// split instead of collapsing straight to `Result<WsConn, ExecError>` the way [`WsConn::connect`]
+/// (this function's thin public wrapper, kept for existing callers/tests) still does.
+pub(crate) enum ConnectOutcome {
+    /// Boxed purely to keep this enum small (clippy's `large_enum_variant`): `WsConn` embeds the
+    /// full `WebSocketStream`/TLS-stream buffers, dwarfing the other two variants.
+    Connected(Box<WsConn>),
+    /// The handshake was rejected with HTTP 426 — the ONE `FallbackToHttp` trigger (ground truth
+    /// §5). No socket was ever established.
+    UpgradeRequired,
+    /// Any other handshake/transport failure (DNS, refused, timeout, malformed header value, ...).
+    Failed(ExecError),
+}
+
+/// Build the WS handshake request (header construction only — no I/O). Split out from
+/// `connect_detailed` purely so that function's dial step can `match` on outcomes without
+/// threading `?` through header-building AND the dial in the same expression.
+fn build_handshake_request(
+    account: &Account,
+    forward_headers: &[(String, String)],
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, ExecError> {
+    let url = ws_url_for(&account.base_url)?;
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| ExecError::Upstream(e.to_string()))?;
+    let headers = request.headers_mut();
+
+    for (name, value) in forward_headers {
+        if name.eq_ignore_ascii_case(TURN_STATE_HEADER) {
+            continue;
         }
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| ExecError::Upstream(e.to_string()))?;
+        let header_value =
+            HeaderValue::from_str(value).map_err(|e| ExecError::Upstream(e.to_string()))?;
+        headers.insert(header_name, header_value);
+    }
 
+    let bearer = HeaderValue::from_str(&format!("Bearer {}", account.bearer_token))
+        .map_err(|e| ExecError::Upstream(e.to_string()))?;
+    headers.insert(HeaderName::from_static("authorization"), bearer);
+    // Pair the SELECTED account's ChatGPT id with its Bearer — same reasoning as
+    // `executor.rs:109-119`: `insert` (replace), never leave a forwarded value for a
+    // DIFFERENT account sitting next to our overridden Bearer.
+    if let Some(account_id) = &account.chatgpt_account_id {
         headers.insert(
-            HeaderName::from_static("openai-beta"),
-            HeaderValue::from_static(OPENAI_BETA_WS),
+            HeaderName::from_static("chatgpt-account-id"),
+            HeaderValue::from_str(account_id).map_err(|e| ExecError::Upstream(e.to_string()))?,
         );
-        // permessage-deflate is offered via `ws_config()` below, not a hand-written header —
-        // `tokio_tungstenite::connect_async_with_config` negotiates the `Sec-WebSocket-Extensions`
-        // header itself from `WebSocketConfig::extensions`, the same mechanism codex's own
-        // `websocket_config()` uses (see module doc).
+    }
 
-        let (socket, _response) =
-            tokio_tungstenite::connect_async_with_config(request, Some(ws_config()), false)
-                .await
-                .map_err(|e| ExecError::Upstream(e.to_string()))?;
+    headers.insert(
+        HeaderName::from_static("openai-beta"),
+        HeaderValue::from_static(OPENAI_BETA_WS),
+    );
+    // permessage-deflate is offered via `ws_config()`, not a hand-written header —
+    // `tokio_tungstenite::connect_async_with_config` negotiates the `Sec-WebSocket-Extensions`
+    // header itself from `WebSocketConfig::extensions`, the same mechanism codex's own
+    // `websocket_config()` uses (see module doc).
 
-        Ok(WsConn {
+    Ok(request)
+}
+
+/// Dial the handshake and distinguish the ONE fallback-worthy outcome (HTTP 426) from every other
+/// failure. `pub(crate)`: `ws::executor::CodexWsExecutor` (Task 7) is the one caller that needs
+/// this distinction; [`WsConn::connect`] stays the public, collapsed-to-`Result` entry point for
+/// everyone else (this module's own tests included).
+pub(crate) async fn connect_detailed(
+    account: &Account,
+    forward_headers: &[(String, String)],
+) -> ConnectOutcome {
+    // Must run before the first WS TLS handshake so tokio-tungstenite's rustls backend picks up
+    // aws-lc-rs instead of falling back to ring — same reason `CodexExecutor::new` calls this
+    // before its first HTTP TLS use.
+    ensure_rustls_crypto_provider();
+
+    let request = match build_handshake_request(account, forward_headers) {
+        Ok(r) => r,
+        Err(e) => return ConnectOutcome::Failed(e),
+    };
+
+    match tokio_tungstenite::connect_async_with_config(request, Some(ws_config()), false).await {
+        Ok((socket, _response)) => ConnectOutcome::Connected(Box::new(WsConn {
             socket,
+            closed: false,
             last_response_id: None,
             last_input_count: None,
             last_item_hashes: None,
             last_non_input_fingerprint: None,
-        })
+        })),
+        // Ground truth §5: HTTP 426 Upgrade Required, checked at handshake time, is the ONLY
+        // `FallbackToHttp` trigger — "No other status falls back". Everything else (refused,
+        // timeout, DNS, any other HTTP status, a protocol-level handshake error, ...) collapses to
+        // the generic `Failed` arm below, surfaced as `ExecError::Upstream` unchanged.
+        Err(tokio_tungstenite::tungstenite::Error::Http(response))
+            if response.status() == tokio_tungstenite::tungstenite::http::StatusCode::UPGRADE_REQUIRED =>
+        {
+            ConnectOutcome::UpgradeRequired
+        }
+        Err(e) => ConnectOutcome::Failed(ExecError::Upstream(e.to_string())),
     }
+}
 
+impl WsConn {
     /// Send one outbound frame (a `response.create` envelope Task 4's `codec::build_response_create`
     /// already built, and Task 6's `delta::plan_request` already decided anchor/suffix for) as a
     /// `Text` WS message. First consumer: Task 5's turn stream (`ws::turn`), hence `pub(crate)` —
@@ -175,10 +250,15 @@ impl WsConn {
     pub(crate) async fn send_frame(&mut self, envelope: &Value) -> Result<(), ExecError> {
         let text = serde_json::to_string(envelope)
             .map_err(|e| ExecError::Upstream(format!("failed to serialize response.create: {e}")))?;
-        self.socket
-            .send(Message::Text(text.into()))
-            .await
-            .map_err(|e| ExecError::Upstream(e.to_string()))
+        match self.socket.send(Message::Text(text.into())).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // A send failure means this socket can no longer be trusted for reuse — see
+                // `closed`'s doc. Task 7's cache checks this before ever attempting reuse.
+                self.closed = true;
+                Err(ExecError::Upstream(e.to_string()))
+            }
+        }
     }
 
     /// Read the next frame's raw text off the socket, for the turn stream (Task 5, `ws::turn`) to
@@ -205,8 +285,15 @@ impl WsConn {
                     ));
                 }
                 Some(Ok(Message::Frame(_))) => continue,
-                Some(Ok(Message::Close(_))) | None => return Ok(None),
-                Some(Err(e)) => return Err(ExecError::Stream(e.to_string())),
+                Some(Ok(Message::Close(_))) | None => {
+                    // Proven dead: no further reuse — see `closed`'s doc.
+                    self.closed = true;
+                    return Ok(None);
+                }
+                Some(Err(e)) => {
+                    self.closed = true;
+                    return Err(ExecError::Stream(e.to_string()));
+                }
             }
         }
     }
