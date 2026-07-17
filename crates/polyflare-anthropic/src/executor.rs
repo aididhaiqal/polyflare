@@ -66,6 +66,7 @@ impl Executor for AnthropicExecutor {
             return Err(ExecError::UpstreamStatus(polyflare_core::FailureSignal {
                 status: resp.status().as_u16(),
                 retry_after,
+                error_code: None,
             }));
         }
 
