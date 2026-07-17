@@ -13,16 +13,22 @@
 // (success rate / avg latency / tokens) and the recent-errors strip — same reasoning: the mockup's
 // glyphs (✓ ◷ ◆ ⚠) aren't real icons, and "no emoji" means every one of them needs a genuine lucide
 // replacement rather than a Unicode symbol. See task-5-report.md.
+//
+// Key/ChevronDown are Task 6 additions for the Accounts page: `Key` replaces the mockup's 🔑
+// token-health glyph (`accounts-page.html`'s `.afoot`), `ChevronDown` is the Radix Select trigger's
+// caret (the pool filter). Same no-emoji rationale as above. See task-6-report.md.
 export {
   Activity,
   AlertTriangle,
   ArrowDown,
   BarChart3,
   CheckCircle2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Clock,
   Coins,
+  Key,
   Layers,
   List,
   LayoutGrid,
