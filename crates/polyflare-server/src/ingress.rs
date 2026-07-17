@@ -206,6 +206,21 @@ fn derive_alias_prompt_cache_key(body: &serde_json::Value) -> String {
     hex::encode(&hasher.finalize()[..24]) // 48 hex chars, matching codex/ccflare key width
 }
 
+/// Content-free identifiers about a request's routing outcome, threaded back out of the deep
+/// account-selection logic (`responses_handler_impl` / `messages_handler_native` /
+/// `messages_handler_codex_aliased`) to the thin logging wrapper (`responses_route` /
+/// `messages_route`) that builds the persisted/emitted `RequestLog` (see `crate::observability`).
+/// Every field here is a routing-level scalar or a stable row id — never request/response content.
+#[derive(Default)]
+struct RouteOutcome {
+    /// The account selected to serve (or attempted for) this request, when selection got that far.
+    account_id: Option<String>,
+    /// The requested (native path) or resolved target (translated/aliased path) model string.
+    model: Option<String>,
+    /// `reasoning.effort` for this request, when known.
+    reasoning_effort: Option<String>,
+}
+
 fn stream_response(stream: ResponseStream) -> Response {
     Response::builder()
         .status(StatusCode::OK)
@@ -410,7 +425,7 @@ async fn responses_route(
     let log_repo = state.store.request_log();
     // Same reason: `state` moves into the impl below, so grab the log-bus handle first.
     let log_bus = state.log_bus.clone();
-    let response = responses_handler_impl(state, pool.as_deref(), headers, body).await;
+    let (response, outcome) = responses_handler_impl(state, pool.as_deref(), headers, body).await;
     let log = RequestLog {
         method: "POST",
         path: "/responses",
@@ -422,6 +437,17 @@ async fn responses_route(
         aliased: false,
         status: response.status(),
         duration_ms: start.elapsed().as_millis() as u64,
+        account_id: outcome.account_id,
+        model: outcome.model,
+        reasoning_effort: outcome.reasoning_effort,
+        // Not yet known at this chokepoint (SPEC-M4a has no per-account subscription-tier read
+        // wired here today).
+        service_tier: None,
+        transport: Some("http".to_string()),
+        // TODO(follow-up): populate ttft/tokens from the stream observer.
+        ttft_ms: None,
+        total_tokens: None,
+        cached_tokens: None,
     };
     log.emit();
     log_bus.publish(log.to_log_event());
@@ -434,7 +460,7 @@ async fn responses_handler_impl(
     pool: Option<&str>,
     headers: HeaderMap,
     raw: Bytes,
-) -> Response {
+) -> (Response, RouteOutcome) {
     // Parse ONCE — but only the scalars + the `input` SHAPE, NOT the deep conversation tree. The
     // wire bytes are forwarded verbatim (see `PreparedRequest::raw_body`), so `body` stays `None`
     // here; everything the request path needs (model, tier, continuity ctx, input count) comes off
@@ -443,11 +469,23 @@ async fn responses_handler_impl(
     // the schema authority — a genuine pass-through, matching the old full-`Value` parse's tolerance.
     let facts = match parse_inbound(&headers, &raw) {
         Some(f) => f,
-        None => return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response(),
+        None => {
+            return (
+                (StatusCode::BAD_REQUEST, "invalid JSON body").into_response(),
+                RouteOutcome::default(),
+            )
+        }
     };
     let model = facts.model;
     let now = unix_now();
     let tier = tier_from_effort(facts.effort.as_deref());
+    // Model + effort are known from the parse itself, regardless of what happens next; account_id
+    // is filled in once (if ever) a `RouteDecision` actually selects one below.
+    let mut outcome = RouteOutcome {
+        account_id: None,
+        model: Some(model.clone()),
+        reasoning_effort: facts.effort.clone(),
+    };
 
     // C3: continuity ctx derived from headers + body at parse time.
     let ctx: RequestCtx = facts.ctx;
@@ -467,12 +505,12 @@ async fn responses_handler_impl(
     // C4: prepare (resolve owner + arm + recovery plan).
     let prepared = match state.continuity.prepare(req, &ctx).await {
         Ok(p) => p,
-        Err(_) => return internal_error(),
+        Err(_) => return (internal_error(), outcome),
     };
 
     let snapshots = match state.account_cache.snapshots(&state.store).await {
         Ok(s) => s,
-        Err(_) => return internal_error(),
+        Err(_) => return (internal_error(), outcome),
     };
     // M4a has no cross-format translator (that's M4b): `/responses` may only ever pick a
     // Codex-provider account. One pass also narrows to the requested pool (`None` = all accounts).
@@ -492,130 +530,139 @@ async fn responses_handler_impl(
     let session_key = prepared.directive.session_key.clone();
 
     // C5: ownership pre-filter.
-    match apply_ownership(&prepared.directive, &snapshots, selector.as_ref(), &sel_ctx) {
-        RouteDecision::Route(id) => {
-            // Stamp last_selected_at NOW (not at completion) so concurrent picks in a burst see this
-            // one — the round_robin + capacity_weighted tiebreaks read it.
-            state.runtime.record_selected(&id, now);
-            let (account, provider) = match resolve_core_account(&state, &id, now).await {
-                Ok(a) => a,
-                Err(r) => return r,
-            };
-            let health_id = id.clone(); // `id` is moved into the executor below.
-            match execute_with_watchdog(
-                state.executor_for(provider).as_ref(),
-                state.continuity.clone(),
-                prepared,
-                &account,
-                id,
-                ctx,
-                state.runtime.clone(),
-            )
-            .await
-            {
-                Ok(stream) => stream_response(stream),
-                Err(e) => {
-                    record_failure(&state, &health_id, &e, unix_now());
-                    (StatusCode::BAD_GATEWAY, "upstream error").into_response()
-                }
-            }
-        }
-        RouteDecision::Recover => {
-            // Owner pinned but ineligible: recover on a freshly-selected account (full pool), or
-            // signal the client if the input is a bare tail.
-            match prepared.directive.recovery {
-                RecoveryPlan::ResendFull { anchorless_req } => {
-                    let fresh = match selector.pick(&snapshots, &sel_ctx) {
-                        Some(id) => id,
-                        None => return no_eligible(),
-                    };
-                    state.runtime.record_selected(&fresh, now);
-                    let (account, provider) = match resolve_core_account(&state, &fresh, now).await
-                    {
-                        Ok(a) => a,
-                        Err(r) => return r,
-                    };
-                    let health_id = fresh.clone(); // `fresh` is moved into the executor below.
-                    match execute_recovery(
-                        state.executor_for(provider).as_ref(),
-                        state.continuity.clone(),
-                        anchorless_req,
-                        &account,
-                        fresh,
-                        ctx,
-                        session_key,
-                        state.runtime.clone(),
-                    )
-                    .await
-                    {
-                        Ok(stream) => stream_response(stream),
-                        Err(e) => {
-                            record_failure(&state, &health_id, &e, unix_now());
-                            (StatusCode::BAD_GATEWAY, "upstream error").into_response()
-                        }
+    let response =
+        match apply_ownership(&prepared.directive, &snapshots, selector.as_ref(), &sel_ctx) {
+            RouteDecision::Route(id) => {
+                // Stamp last_selected_at NOW (not at completion) so concurrent picks in a burst see this
+                // one — the round_robin + capacity_weighted tiebreaks read it.
+                state.runtime.record_selected(&id, now);
+                outcome.account_id = Some(id.as_str().to_string());
+                let (account, provider) = match resolve_core_account(&state, &id, now).await {
+                    Ok(a) => a,
+                    Err(r) => return (r, outcome),
+                };
+                let health_id = id.clone(); // `id` is moved into the executor below.
+                match execute_with_watchdog(
+                    state.executor_for(provider).as_ref(),
+                    state.continuity.clone(),
+                    prepared,
+                    &account,
+                    id,
+                    ctx,
+                    state.runtime.clone(),
+                )
+                .await
+                {
+                    Ok(stream) => stream_response(stream),
+                    Err(e) => {
+                        record_failure(&state, &health_id, &e, unix_now());
+                        (StatusCode::BAD_GATEWAY, "upstream error").into_response()
                     }
                 }
-                RecoveryPlan::SignalClient => {
-                    let owner = prepared
-                        .directive
-                        .pin_account
-                        .clone()
-                        .unwrap_or_else(|| AccountId::from("unknown"));
-                    let stream =
-                        signal_client_stream(state.continuity.clone(), ctx, owner, session_key)
-                            .await;
-                    stream_response(stream)
-                }
-                RecoveryPlan::None => {
-                    // No anchor ⇒ this request is self-sufficient (nothing to resume), so a
-                    // pinned-but-ineligible owner (cooldown / rate-limited / reauth_required /
-                    // a stale Soft session-row pin) is NOT fatal: fail over to any eligible
-                    // account from the FULL candidate pool, ignoring the pin, and relay as a
-                    // normal (Disarmed) request. `prepared.req` is still owned here — only
-                    // `directive.recovery` was moved by the outer match.
-                    match selector.pick(&snapshots, &sel_ctx) {
-                        Some(fresh) => {
-                            state.runtime.record_selected(&fresh, now);
-                            let (account, provider) =
-                                match resolve_core_account(&state, &fresh, now).await {
-                                    Ok(a) => a,
-                                    Err(r) => return r,
-                                };
-                            let fallback = Prepared {
-                                req: prepared.req,
-                                directive: ContinuityDirective {
-                                    pin_account: None,
-                                    watchdog: prepared.directive.watchdog,
-                                    recovery: RecoveryPlan::None,
-                                    session_key: prepared.directive.session_key.clone(),
-                                },
+            }
+            RouteDecision::Recover => {
+                // Owner pinned but ineligible: recover on a freshly-selected account (full pool), or
+                // signal the client if the input is a bare tail.
+                match prepared.directive.recovery {
+                    RecoveryPlan::ResendFull { anchorless_req } => {
+                        let fresh = match selector.pick(&snapshots, &sel_ctx) {
+                            Some(id) => id,
+                            None => return (no_eligible(), outcome),
+                        };
+                        state.runtime.record_selected(&fresh, now);
+                        outcome.account_id = Some(fresh.as_str().to_string());
+                        let (account, provider) =
+                            match resolve_core_account(&state, &fresh, now).await {
+                                Ok(a) => a,
+                                Err(r) => return (r, outcome),
                             };
-                            let health_id = fresh.clone(); // moved into the executor below.
-                            match execute_with_watchdog(
-                                state.executor_for(provider).as_ref(),
-                                state.continuity.clone(),
-                                fallback,
-                                &account,
-                                fresh,
-                                ctx,
-                                state.runtime.clone(),
-                            )
-                            .await
-                            {
-                                Ok(stream) => stream_response(stream),
-                                Err(e) => {
-                                    record_failure(&state, &health_id, &e, unix_now());
-                                    (StatusCode::BAD_GATEWAY, "upstream error").into_response()
-                                }
+                        let health_id = fresh.clone(); // `fresh` is moved into the executor below.
+                        match execute_recovery(
+                            state.executor_for(provider).as_ref(),
+                            state.continuity.clone(),
+                            anchorless_req,
+                            &account,
+                            fresh,
+                            ctx,
+                            session_key,
+                            state.runtime.clone(),
+                        )
+                        .await
+                        {
+                            Ok(stream) => stream_response(stream),
+                            Err(e) => {
+                                record_failure(&state, &health_id, &e, unix_now());
+                                (StatusCode::BAD_GATEWAY, "upstream error").into_response()
                             }
                         }
-                        None => no_eligible(),
+                    }
+                    RecoveryPlan::SignalClient => {
+                        let owner = prepared
+                            .directive
+                            .pin_account
+                            .clone()
+                            .unwrap_or_else(|| AccountId::from("unknown"));
+                        // No account is actually served here (the client is signaled, not relayed) —
+                        // but `owner` is the pinned account this request was scoped to, so it's still
+                        // a meaningful (and content-free) identifier to surface.
+                        outcome.account_id = Some(owner.as_str().to_string());
+                        let stream =
+                            signal_client_stream(state.continuity.clone(), ctx, owner, session_key)
+                                .await;
+                        stream_response(stream)
+                    }
+                    RecoveryPlan::None => {
+                        // No anchor ⇒ this request is self-sufficient (nothing to resume), so a
+                        // pinned-but-ineligible owner (cooldown / rate-limited / reauth_required /
+                        // a stale Soft session-row pin) is NOT fatal: fail over to any eligible
+                        // account from the FULL candidate pool, ignoring the pin, and relay as a
+                        // normal (Disarmed) request. `prepared.req` is still owned here — only
+                        // `directive.recovery` was moved by the outer match.
+                        match selector.pick(&snapshots, &sel_ctx) {
+                            Some(fresh) => {
+                                state.runtime.record_selected(&fresh, now);
+                                outcome.account_id = Some(fresh.as_str().to_string());
+                                let (account, provider) =
+                                    match resolve_core_account(&state, &fresh, now).await {
+                                        Ok(a) => a,
+                                        Err(r) => return (r, outcome),
+                                    };
+                                let fallback = Prepared {
+                                    req: prepared.req,
+                                    directive: ContinuityDirective {
+                                        pin_account: None,
+                                        watchdog: prepared.directive.watchdog,
+                                        recovery: RecoveryPlan::None,
+                                        session_key: prepared.directive.session_key.clone(),
+                                    },
+                                };
+                                let health_id = fresh.clone(); // moved into the executor below.
+                                match execute_with_watchdog(
+                                    state.executor_for(provider).as_ref(),
+                                    state.continuity.clone(),
+                                    fallback,
+                                    &account,
+                                    fresh,
+                                    ctx,
+                                    state.runtime.clone(),
+                                )
+                                .await
+                                {
+                                    Ok(stream) => stream_response(stream),
+                                    Err(e) => {
+                                        record_failure(&state, &health_id, &e, unix_now());
+                                        (StatusCode::BAD_GATEWAY, "upstream error").into_response()
+                                    }
+                                }
+                            }
+                            None => no_eligible(),
+                        }
                     }
                 }
             }
-        }
-        RouteDecision::NoEligibleAccount => no_eligible(),
-    }
+            RouteDecision::NoEligibleAccount => no_eligible(),
+        };
+    (response, outcome)
 }
 
 /// The `/v1/messages` ingress entrypoint. A client `model` string that `alias::lookup_alias` maps
@@ -673,7 +720,7 @@ async fn messages_route(
         Provider::Anthropic
     };
 
-    let response = match alias {
+    let (response, outcome) = match alias {
         Some(model_alias) if model_alias.target_provider == Provider::Codex => {
             messages_handler_codex_aliased(state, pool.as_deref(), body, model_alias).await
         }
@@ -687,6 +734,16 @@ async fn messages_route(
         aliased: aliased_to_codex,
         status: response.status(),
         duration_ms: start.elapsed().as_millis() as u64,
+        account_id: outcome.account_id,
+        model: outcome.model,
+        reasoning_effort: outcome.reasoning_effort,
+        // Not yet known at this chokepoint.
+        service_tier: None,
+        transport: Some("http".to_string()),
+        // TODO(follow-up): populate ttft/tokens from the stream observer.
+        ttft_ms: None,
+        total_tokens: None,
+        cached_tokens: None,
     };
     log.emit();
     log_bus.publish(log.to_log_event());
@@ -704,8 +761,15 @@ async fn messages_handler_native(
     pool: Option<&str>,
     body: serde_json::Value,
     model: String,
-) -> Response {
+) -> (Response, RouteOutcome) {
     let now = unix_now();
+    // The client-requested model is known up front, regardless of what happens next; the native
+    // Anthropic path carries no Codex-style reasoning-effort concept, so that field stays `None`.
+    let mut outcome = RouteOutcome {
+        account_id: None,
+        model: Some(model.clone()),
+        reasoning_effort: None,
+    };
     // Native Anthropic path: the AnthropicExecutor does not use `forward_headers` (that field is
     // the Codex egress identity set), so there is nothing to forward here.
     let req = PreparedRequest {
@@ -719,12 +783,12 @@ async fn messages_handler_native(
 
     let prepared = match NoopContinuity.prepare(req, &ctx).await {
         Ok(p) => p,
-        Err(_) => return internal_error(),
+        Err(_) => return (internal_error(), outcome),
     };
 
     let snapshots = match state.account_cache.snapshots(&state.store).await {
         Ok(s) => s,
-        Err(_) => return internal_error(),
+        Err(_) => return (internal_error(), outcome),
     };
     // M4a has no cross-format translator (that's M4b): `/v1/messages` may only ever pick an
     // Anthropic-provider account — the exact mirror of `/responses`'s Codex-only filter above.
@@ -742,16 +806,17 @@ async fn messages_handler_native(
     };
     let picked = match selector.pick(&snapshots, &sel_ctx) {
         Some(id) => id,
-        None => return no_eligible(),
+        None => return (no_eligible(), outcome),
     };
     state.runtime.record_selected(&picked, now);
+    outcome.account_id = Some(picked.as_str().to_string());
     let (account, provider) = match resolve_core_account(&state, &picked, now).await {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => return (r, outcome),
     };
 
     let health_id = picked.clone(); // moved into the executor below.
-    match execute_with_watchdog(
+    let response = match execute_with_watchdog(
         state.executor_for(provider).as_ref(),
         Arc::new(NoopContinuity) as Arc<dyn Continuity>,
         prepared,
@@ -767,7 +832,8 @@ async fn messages_handler_native(
             record_failure(&state, &health_id, &e, unix_now());
             (StatusCode::BAD_GATEWAY, "upstream error").into_response()
         }
-    }
+    };
+    (response, outcome)
 }
 
 /// M4b-wiring: a client model string aliased to a Codex target (SPEC-M4 §3.6). Translates the
@@ -787,8 +853,15 @@ async fn messages_handler_codex_aliased(
     pool: Option<&str>,
     body: serde_json::Value,
     model_alias: ModelAlias,
-) -> Response {
+) -> (Response, RouteOutcome) {
     let now = unix_now();
+    // The resolved target model + effort are known up front from the alias itself, regardless of
+    // what happens next.
+    let mut outcome = RouteOutcome {
+        account_id: None,
+        model: Some(model_alias.target_model.clone()),
+        reasoning_effort: model_alias.reasoning_effort.clone(),
+    };
     let mut translator = AnthropicToResponses::new();
     let mut translated_body = translator.translate_request(body);
     translated_body["model"] = serde_json::Value::String(model_alias.target_model.clone());
@@ -832,12 +905,12 @@ async fn messages_handler_codex_aliased(
 
     let prepared = match NoopContinuity.prepare(req, &ctx).await {
         Ok(p) => p,
-        Err(_) => return internal_error(),
+        Err(_) => return (internal_error(), outcome),
     };
 
     let snapshots = match state.account_cache.snapshots(&state.store).await {
         Ok(s) => s,
-        Err(_) => return internal_error(),
+        Err(_) => return (internal_error(), outcome),
     };
     // The mirror of `/responses`'s Codex-only filter: an aliased-to-Codex turn may only ever pick
     // a Codex-provider account, regardless of what `/v1/messages` itself would otherwise select.
@@ -854,16 +927,17 @@ async fn messages_handler_codex_aliased(
     };
     let picked = match selector.pick(&snapshots, &sel_ctx) {
         Some(id) => id,
-        None => return no_eligible(),
+        None => return (no_eligible(), outcome),
     };
     state.runtime.record_selected(&picked, now);
+    outcome.account_id = Some(picked.as_str().to_string());
     let (account, provider) = match resolve_core_account(&state, &picked, now).await {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => return (r, outcome),
     };
 
     let health_id = picked.clone(); // moved into the executor below.
-    match execute_with_watchdog(
+    let response = match execute_with_watchdog(
         state.executor_for(provider).as_ref(),
         Arc::new(NoopContinuity) as Arc<dyn Continuity>,
         prepared,
@@ -883,7 +957,8 @@ async fn messages_handler_codex_aliased(
             record_failure(&state, &health_id, &e, unix_now());
             (StatusCode::BAD_GATEWAY, "upstream error").into_response()
         }
-    }
+    };
+    (response, outcome)
 }
 
 #[cfg(test)]
