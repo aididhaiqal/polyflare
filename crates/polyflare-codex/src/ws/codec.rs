@@ -51,6 +51,17 @@ pub enum FrameClass {
     /// only `code` tells them apart, and this variant IS that discrimination, made once, here,
     /// rather than left for every future caller to re-derive from the raw frame.
     AnchorMiss,
+    /// The wrapped WS-only error envelope with `error.code ==
+    /// "websocket_connection_limit_reached"` (ground truth §2's server 60-minute connection cap).
+    /// **Recoverable, same reasoning as [`FrameClass::AnchorMiss`]**: Task 7 reconnects and
+    /// full-resends, bounded; this must never reach the client. Given its own variant rather than
+    /// left inside the generic [`FrameClass::Error`] bucket for the identical reason `AnchorMiss`
+    /// is: `ExecError::UpstreamStatus` carries only a numeric `status` (ground truth doesn't pin
+    /// one for this envelope — a real backend could reuse any status alongside this `code`), so a
+    /// caller reading only the resulting `ExecError` could never distinguish "reconnect and retry"
+    /// from "surface this 429/400 to the client" without this classification happening HERE, once,
+    /// while `code` is still in hand.
+    ConnectionLimitReached,
     /// Any other hard error: a genuine wrapped error envelope (any `code` other than
     /// `previous_response_not_found`), keyed into the same [`ExecError::UpstreamStatus`] shape the
     /// HTTP-SSE executor already produces (`executor.rs:150-155`) so the existing health-writeback
@@ -186,6 +197,12 @@ pub fn classify(frame: &Value) -> FrameClass {
             // doc). This is the discrimination ground truth §5 says only `code` can make.
             if code == "previous_response_not_found" {
                 return FrameClass::AnchorMiss;
+            }
+            // Same precedence tier as the anchor-miss check above — see `ConnectionLimitReached`'s
+            // doc for why this also needs a dedicated variant rather than falling into the generic
+            // status-keyed `Error` bucket below.
+            if code == "websocket_connection_limit_reached" {
+                return FrameClass::ConnectionLimitReached;
             }
 
             let status = frame.get("status").and_then(Value::as_u64).unwrap_or(0) as u16;
@@ -420,6 +437,23 @@ mod tests {
         assert!(
             matches!(classify(&frame), FrameClass::AnchorMiss),
             "a dead anchor must classify as the dedicated recoverable case, not a generic Error"
+        );
+    }
+
+    #[test]
+    fn classify_maps_connection_limit_reached_to_its_own_variant_not_generic_error() {
+        // Ground truth §2/§5: the server 60-minute connection cap. No specific numeric status is
+        // pinned by ground truth, so this test deliberately uses one (409) that would otherwise be
+        // indistinguishable from an arbitrary generic error if `code` weren't checked first.
+        let frame = json!({
+            "type": "error",
+            "error": {"code": "websocket_connection_limit_reached", "message": "cap reached"},
+            "status": 409
+        });
+
+        assert!(
+            matches!(classify(&frame), FrameClass::ConnectionLimitReached),
+            "must classify as the dedicated recoverable case, not a generic Error"
         );
     }
 

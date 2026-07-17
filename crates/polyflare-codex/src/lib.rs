@@ -15,4 +15,4 @@ pub use oauth::{
     classify_failure, decode_claims, should_refresh, token_exp, Claims, FailureClass, OAuthClient,
     OAuthError, Refreshed, RefreshedTokens,
 };
-pub use ws::WsConn;
+pub use ws::{CodexWsExecutor, WsConn};

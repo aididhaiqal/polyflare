@@ -70,6 +70,18 @@ use polyflare_core::{ExecError, ResponseStream};
 
 use super::codec::{classify, frame_to_sse, FrameClass};
 use super::conn::WsConn;
+use super::delta::{item_hashes, non_input_fingerprint};
+
+/// Substring markers embedded in the `ExecError::Stream` messages this module produces for the
+/// turn-stream-level conditions Task 7's `ws::executor::CodexWsExecutor` recovers from
+/// (`AnchorMiss`, `ConnectionLimitReached`, and a close/end before any terminal frame). Shared
+/// between the PRODUCER (this module) and the ONLY consumer (`ws::executor`'s
+/// `classify_recovery`) so the two can never drift out of sync — a deliberate, documented choice
+/// over adding a `code` field to `ExecError`/`FailureSignal` (which would ripple into every other
+/// `Executor` impl and caller in the workspace for a need that is WS-only).
+pub(crate) const ANCHOR_MISS_MARKER: &str = "previous_response_not_found";
+pub(crate) const CONNECTION_LIMIT_MARKER: &str = "websocket_connection_limit_reached";
+pub(crate) const SOCKET_CLOSED_MARKER: &str = "closed by server before response.completed";
 
 /// A [`WsConn`] shared across turns: `Arc` so a caller (eventually Task 7's connection cache) can
 /// hold one handle across many sequential [`turn_stream`] calls, `tokio::sync::Mutex` so exactly
@@ -169,12 +181,21 @@ impl Stream for TurnStream {
                             FrameClass::AnchorMiss => {
                                 // Classified, not recovered — see module doc. `guard` drops here.
                                 this.state = TurnState::Done;
-                                return Poll::Ready(Some(Err(ExecError::Stream(
-                                    "previous_response_not_found: anchor miss on this turn \
-                                     (recovery is Task 7's concern, not resolved by the turn \
-                                     stream itself)"
-                                        .to_string(),
-                                ))));
+                                return Poll::Ready(Some(Err(ExecError::Stream(format!(
+                                    "{ANCHOR_MISS_MARKER}: anchor miss on this turn (recovery is \
+                                     ws::executor's CodexWsExecutor's concern, not resolved by \
+                                     the turn stream itself)"
+                                )))));
+                            }
+                            FrameClass::ConnectionLimitReached => {
+                                // Same treatment as AnchorMiss above: classified here, recovered by
+                                // `ws::executor::CodexWsExecutor` (reconnect + full resend,
+                                // bounded), never by this stream itself.
+                                this.state = TurnState::Done;
+                                return Poll::Ready(Some(Err(ExecError::Stream(format!(
+                                    "{CONNECTION_LIMIT_MARKER}: server's WS connection cap hit \
+                                     (recovery is ws::executor's CodexWsExecutor's concern)"
+                                )))));
                             }
                             FrameClass::Error(e) => {
                                 this.state = TurnState::Done; // `guard` drops here.
@@ -192,9 +213,9 @@ impl Stream for TurnStream {
                         // left to "park"; that distinction is Task 7's reconnect concern, not
                         // this stream's.
                         this.state = TurnState::Done;
-                        return Poll::Ready(Some(Err(ExecError::Stream(
-                            "websocket closed by server before response.completed".to_string(),
-                        ))));
+                        return Poll::Ready(Some(Err(ExecError::Stream(format!(
+                            "websocket {SOCKET_CLOSED_MARKER}"
+                        )))));
                     }
                     Poll::Ready((_guard, Err(e))) => {
                         this.state = TurnState::Done;
@@ -229,6 +250,24 @@ pub fn turn_stream(conn: SharedWsConn, envelope: Value) -> ResponseStream {
         state: TurnState::Sending(Box::pin(async move {
             let mut guard = conn.lock_owned().await;
             guard.send_frame(&envelope).await?;
+            // **THE FAILURE THAT MUST NOT HAPPEN** (M5a Task 7): record exactly what was just sent
+            // so `delta::plan_request` can compute a real strict-extension next turn. This MUST
+            // happen right here, immediately after `send_frame` succeeds and nowhere else —
+            // forgetting it makes every future turn on this connection silently plan `Full`
+            // forever: no error, no test failure, just the milestone's entire benefit evaporating
+            // while everything appears to work (see `delta.rs`'s module doc's "Who must set the
+            // hashes" section and `WsConn::last_item_hashes`'s own doc for the exact mechanism).
+            // Placing it here — the one place a frame is ever sent — rather than leaving it to
+            // each caller is what makes it impossible to forget.
+            guard.last_item_hashes = Some(item_hashes(&envelope));
+            guard.last_non_input_fingerprint = Some(non_input_fingerprint(&envelope));
+            guard.last_input_count = Some(
+                envelope
+                    .get("input")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .unwrap_or(0) as u32,
+            );
             Ok(guard)
         })),
     })

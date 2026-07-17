@@ -1,0 +1,1143 @@
+//! `CodexWsExecutor` — the WS `Executor` impl (M5a Task 7): the per-conversation connection
+//! cache, the bounded recovery paths, and the error mapping that make M5a's transport swap real.
+//!
+//! **This module wires together, but does not re-derive, the semantics of every earlier M5a
+//! task**: `ws::conn::{WsConn, connect_detailed}` (Task 3) for the handshake, `ws::codec` (Task 4)
+//! for frame classification (consumed indirectly, through `ws::turn`'s already-classified `Err`
+//! shapes — see the "Recovery: how classification reaches this module" section below),
+//! `ws::delta::plan_request_for_conn` (Task 6) for the incremental-vs-full decision, and
+//! `ws::turn::turn_stream` (Task 5, extended by this task — see that module's `turn_stream` doc
+//! for the exact point the delta-tracking hashes are now set) for driving one turn.
+//!
+//! # "Dumb executor, smart ingress" — same division of labor as `executor.rs` and `ws::conn`
+//! This executor does not synthesize codex-identity headers itself; it relays whatever
+//! `req.forward_headers` ingress already decided (see `executor.rs`'s module doc and
+//! `ws::conn::WsConn::connect`'s own doc for the one WS-specific exception,
+//! `x-codex-turn-state`). Nothing here changes that.
+//!
+//! # The connection cache
+//! Keyed by `ctx.session_key`'s hashed `value` (already content-free — `SessionKey::value` is a
+//! sha256 hex digest computed by `polyflare-server::session_key`, never raw conversation
+//! identifiers) — never the raw request body, and never recomputed here (the whole point of
+//! threading `RequestCtx` through the `Executor` seam in Task 1). A request with no session key
+//! (`ctx.session_key: None`) gets a fresh, uncached connection every call: no reuse is possible
+//! without something to key on, but the request still completes correctly (as a full send with no
+//! anchor) — WS just delivers no benefit for it, which is a degraded-but-correct default, not a
+//! failure.
+//!
+//! Eviction: ground truth §2 gates reuse "only on liveness (`conn.is_closed()`)" — never on a
+//! generic staleness timer. [`WsConn::is_closed`] (Task 7's own small addition to `conn.rs`, set
+//! at the two points a socket is proven dead: a `Close`/end-of-stream observed by `recv_frame`, or
+//! a `send_frame` error) is checked BEFORE reuse; a dead cached entry is evicted and replaced by a
+//! fresh `connect`, never reactively discovered by attempting to reuse it and handling the failure
+//! after the fact. A connection is also evicted (and replaced) as part of the bounded reconnect
+//! recovery path below.
+//!
+//! # Recovery: how classification reaches this module
+//! `ws::turn::turn_stream` (Task 5) already classifies every received frame via `ws::codec`, but
+//! its `ResponseStream` interface can only report a WS-specific condition as a plain
+//! `ExecError::Stream(String)` (the same `Result<Bytes, ExecError>` shape every other executor's
+//! stream produces — `ResponseStream` cannot carry a richer type without breaking that contract).
+//! So the two turn-stream conditions this module recovers from — `AnchorMiss` and
+//! `ConnectionLimitReached` (plus the generic "closed before any terminal frame" condition) — are
+//! carried as documented, constant marker substrings inside that message
+//! (`ws::turn::{ANCHOR_MISS_MARKER, CONNECTION_LIMIT_MARKER, SOCKET_CLOSED_MARKER}`), produced in
+//! exactly one place (`ws::turn`) and consumed in exactly one place ([`classify_recovery`] below) —
+//! a deliberate, narrowly-scoped choice over widening `ExecError`/`FailureSignal` with a `code`
+//! field for a need that is WS-only and would otherwise ripple into every other `Executor` impl
+//! and caller in the workspace.
+//!
+//! **Recovery only ever inspects the FIRST item of a turn's stream.** Once a turn has yielded one
+//! successful byte to the caller, every later item — including a LATER anchor-miss/connection-limit/
+//! close condition on the SAME turn — is passed through completely unchanged (`ExecError::Stream`,
+//! as `ws::turn` already produces it): SPEC-M5-WEBSOCKET.md §4's last row, "mid-stream failure
+//! after first byte", is unconditional and un-retried. This is also why `execute` itself resolves
+//! the FIRST item before returning: exactly like `CodexExecutor::execute` awaiting the HTTP
+//! response's status line before returning its stream (`executor.rs`), this module awaits the
+//! first WS frame back before returning ITS stream — both are "resolve the pre-flight outcome
+//! synchronously; stream only the body" the same way.
+//!
+//! # Fallback scope — a DELIBERATE divergence from codex (document here, not just in the plan)
+//! Ground truth §5: real codex-rs flips a single `disable_websockets: AtomicBool` for the whole
+//! process, one-way, no reset path. That is wrong for PolyFlare: a long-lived, multi-tenant server
+//! serving many accounts and sessions from one process must not let one account's rejected
+//! handshake silently and permanently disable WS for every OTHER account/session too. So fallback
+//! here is scoped in two independent dimensions instead of codex's one process-wide switch:
+//!
+//! - **Per session**, triggered ONLY by a 426 (ground truth §5's one `FallbackToHttp` trigger):
+//!   [`CodexWsExecutor::disable_session`] marks THIS session's `SessionKey` so every future
+//!   `execute` call for it skips WS entirely and goes straight to the injected HTTP-SSE fallback —
+//!   permanently for that session's in-memory lifetime (a 426 means the account/session
+//!   combination doesn't get WS at all; there is no reason to keep re-trying it).
+//! - **Per account, bounded by a cooldown**, triggered by the SAME 426 event:
+//!   [`CodexWsExecutor::start_account_cooldown`] additionally blocks WS for every OTHER session on
+//!   that same account for a bounded window (`account_cooldown`), so a single bad account doesn't
+//!   get hammered with repeated doomed handshake attempts from many concurrent sessions before its
+//!   first 426 has even been recorded against it. Unlike the session-level mark, this expires.
+//!
+//! **A future reader must not "fix" this back to codex's one-way global switch** — that would
+//! reintroduce exactly the blast radius (one account's rejection taking down WS for every tenant)
+//! this scoping exists to avoid. If codex's upstream behavior ever changes, re-verify against
+//! ground truth before touching this.
+//!
+//! **Generic (non-426) transport/handshake failures do NOT fall back at all** — ground truth §5 is
+//! explicit that 426 is the ONLY trigger ("No other status falls back"); a DNS failure, a refused
+//! connection, or any other handshake error surfaces as `ExecError::Upstream`, exactly as
+//! `CodexExecutor` would surface an equivalent HTTP failure today. This keeps M5a's promise of
+//! "changes nothing above the seam" — no new retry/failover machinery, per the plan's Global
+//! Constraints.
+//!
+//! # Content-safety
+//! `body` (the materialized request) and `envelope` (the built `response.create`) carry
+//! conversation content, same as everywhere else in this crate — never logged, never included in
+//! `Debug`. The wedge-visibility logging this module does emit ([`log_wedge_recovery`],
+//! [`log_fallback`]) is deliberately reason-code-and-counts only: a session key (already a
+//! content-free hash) and an account id, never a body, envelope, or frame. This is precisely the
+//! visibility codex-lb lacked — it wedged on ~31% of reattaches with no way to measure it; every
+//! bounded-recovery attempt here is a `tracing::warn!` a dashboard can count.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use futures_util::StreamExt;
+use serde_json::Value;
+
+use polyflare_core::{Account, ExecError, Executor, PreparedRequest, RequestCtx, ResponseStream};
+
+use super::codec::build_response_create;
+use super::conn::{connect_detailed, ConnectOutcome};
+use super::delta::{plan_request_for_conn, RequestPlan};
+use super::turn::{
+    shared_conn, turn_stream, SharedWsConn, ANCHOR_MISS_MARKER, CONNECTION_LIMIT_MARKER,
+    SOCKET_CLOSED_MARKER,
+};
+
+/// Bounded attempts for the same-socket anchor-miss recovery (strip anchor, full resend). Chosen
+/// small and fixed rather than configurable in production: a SECOND consecutive anchor-miss on the
+/// very same socket, moments after stripping the anchor and resending fresh, indicates something
+/// more persistently wrong than a one-off dead anchor — better to surface than to keep re-billing
+/// full history silently.
+const DEFAULT_MAX_ANCHOR_MISS_RETRIES: u32 = 2;
+/// Bounded attempts for the reconnect-and-resend recovery (connection-limit / closed-before-first-byte).
+const DEFAULT_MAX_RECONNECT_RETRIES: u32 = 2;
+/// How long a 426 keeps WS disabled for OTHER sessions on the SAME account (the per-account
+/// dimension of the fallback-scope divergence documented in the module doc above).
+const DEFAULT_ACCOUNT_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// The WS `Executor` impl. See the module doc for the cache key, eviction rule, recovery bounds,
+/// and the fallback-scope divergence from codex.
+pub struct CodexWsExecutor {
+    /// The per-session connection cache. `std::sync::Mutex` (not `tokio::sync::Mutex`): only ever
+    /// held for a plain map operation (get/insert/remove), never across an `.await` point.
+    conns: StdMutex<HashMap<String, SharedWsConn>>,
+    /// Sessions permanently (for this process's lifetime) routed to `fallback` after a 426 —
+    /// see the module doc's "Fallback scope" section.
+    session_ws_disabled: StdMutex<HashSet<String>>,
+    /// Accounts temporarily routed to `fallback` after a 426, until the paired `Instant` — the
+    /// per-account dimension of the same fallback-scope decision.
+    account_cooldown_until: StdMutex<HashMap<String, Instant>>,
+    account_cooldown: Duration,
+    max_anchor_miss_retries: u32,
+    max_reconnect_retries: u32,
+    /// HTTP-SSE fallback, used ONLY for the 426 case (and its per-session/per-account cooldown
+    /// echoes) — never for a generic transport failure, which surfaces unchanged (module doc).
+    fallback: Arc<dyn Executor>,
+    /// How many times this executor has actually attempted a NEW WS handshake (cache hits don't
+    /// count). `pub(crate)`-visible only for this module's own tests, to prove the session/account
+    /// fallback scoping actually skips the WS attempt rather than merely failing it again.
+    ws_connect_attempts: AtomicUsize,
+}
+
+impl CodexWsExecutor {
+    /// Construct with production defaults (`DEFAULT_MAX_ANCHOR_MISS_RETRIES`,
+    /// `DEFAULT_MAX_RECONNECT_RETRIES`, `DEFAULT_ACCOUNT_COOLDOWN`). `fallback` is the HTTP-SSE
+    /// executor to use on a 426 (Task 8 wires in `Arc::new(CodexExecutor::new()?)`; this module
+    /// takes any `Arc<dyn Executor>` so its own tests can inject a lightweight stand-in instead of
+    /// standing up a real HTTP mock for a scenario this module never actually sends bytes over
+    /// HTTP for — only delegates to).
+    pub fn new(fallback: Arc<dyn Executor>) -> Self {
+        Self::with_config(
+            fallback,
+            DEFAULT_MAX_ANCHOR_MISS_RETRIES,
+            DEFAULT_MAX_RECONNECT_RETRIES,
+            DEFAULT_ACCOUNT_COOLDOWN,
+        )
+    }
+
+    /// Construct with explicit bounds — used directly by this module's own tests (a 30s production
+    /// cooldown and a real network round-trip make poor test material) and available to a future
+    /// caller that wants non-default bounds.
+    pub fn with_config(
+        fallback: Arc<dyn Executor>,
+        max_anchor_miss_retries: u32,
+        max_reconnect_retries: u32,
+        account_cooldown: Duration,
+    ) -> Self {
+        Self {
+            conns: StdMutex::new(HashMap::new()),
+            session_ws_disabled: StdMutex::new(HashSet::new()),
+            account_cooldown_until: StdMutex::new(HashMap::new()),
+            account_cooldown,
+            max_anchor_miss_retries,
+            max_reconnect_retries,
+            fallback,
+            ws_connect_attempts: AtomicUsize::new(0),
+        }
+    }
+
+    /// Test-only introspection: how many NEW WS handshakes this executor has attempted (cache hits
+    /// excluded). See the field's own doc.
+    #[cfg(test)]
+    pub(crate) fn ws_connect_attempts(&self) -> usize {
+        self.ws_connect_attempts.load(Ordering::SeqCst)
+    }
+
+    fn is_session_ws_disabled(&self, session_key: &str) -> bool {
+        self.session_ws_disabled
+            .lock()
+            .unwrap()
+            .contains(session_key)
+    }
+
+    fn disable_session(&self, session_key: &str) {
+        self.session_ws_disabled
+            .lock()
+            .unwrap()
+            .insert(session_key.to_string());
+    }
+
+    fn is_account_in_cooldown(&self, account_id: &str) -> bool {
+        match self.account_cooldown_until.lock().unwrap().get(account_id) {
+            Some(until) => Instant::now() < *until,
+            None => false,
+        }
+    }
+
+    fn start_account_cooldown(&self, account_id: &str) {
+        let until = Instant::now() + self.account_cooldown;
+        self.account_cooldown_until
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), until);
+    }
+
+    fn evict(&self, session_key: Option<&str>) {
+        if let Some(key) = session_key {
+            self.conns.lock().unwrap().remove(key);
+        }
+    }
+
+    /// Get a live cached connection for `session_key`, or dial a fresh one — never reusing a
+    /// connection [`WsConn::is_closed`] reports dead (module doc's eviction rule).
+    async fn connect_and_cache(
+        &self,
+        account: &Account,
+        forward_headers: &[(String, String)],
+        session_key: Option<&str>,
+    ) -> ConnAttempt {
+        if let Some(key) = session_key {
+            let cached = self.conns.lock().unwrap().get(key).cloned();
+            if let Some(shared) = cached {
+                let dead = shared.lock().await.is_closed();
+                if !dead {
+                    return ConnAttempt::Ready(shared);
+                }
+                self.conns.lock().unwrap().remove(key);
+            }
+        }
+
+        self.ws_connect_attempts.fetch_add(1, Ordering::SeqCst);
+        match connect_detailed(account, forward_headers).await {
+            ConnectOutcome::Connected(fresh) => {
+                let shared = shared_conn(*fresh);
+                if let Some(key) = session_key {
+                    self.conns
+                        .lock()
+                        .unwrap()
+                        .insert(key.to_string(), shared.clone());
+                }
+                ConnAttempt::Ready(shared)
+            }
+            ConnectOutcome::UpgradeRequired => ConnAttempt::UpgradeRequired,
+            ConnectOutcome::Failed(e) => ConnAttempt::Failed(e),
+        }
+    }
+
+    /// Plan (Task 6) and build (Task 4) the envelope for the next attempt on `shared`, reading
+    /// ALL prior-turn state off the connection itself (content-free — see `delta.rs`'s module doc).
+    async fn plan_and_build(shared: &SharedWsConn, body: &Value) -> Value {
+        let plan = {
+            let conn = shared.lock().await;
+            plan_request_for_conn(&conn, body)
+        };
+        match plan {
+            RequestPlan::Incremental { anchor, suffix } => {
+                build_response_create(body, Some(&anchor), &suffix, None)
+            }
+            RequestPlan::Full => build_response_create(body, None, &full_input(body), None),
+        }
+    }
+
+    /// Drive one turn to completion, applying the two bounded recovery paths (module doc) to the
+    /// FIRST item only. Returns a `ResponseStream` whose first item is already known-good (or the
+    /// turn has already exhausted its recovery budget and this returns `Err` instead) — mirrors
+    /// `CodexExecutor::execute` resolving the HTTP status line before returning its stream.
+    async fn drive_turn(
+        &self,
+        account: &Account,
+        forward_headers: &[(String, String)],
+        session_key: Option<&str>,
+        body: &Value,
+        mut shared: SharedWsConn,
+    ) -> Result<ResponseStream, ExecError> {
+        let mut anchor_attempts: u32 = 0;
+        let mut reconnect_attempts: u32 = 0;
+
+        loop {
+            let envelope = Self::plan_and_build(&shared, body).await;
+            let mut stream = turn_stream(shared.clone(), envelope);
+
+            match stream.next().await {
+                None => {
+                    // Unreachable in practice: `ws::turn::turn_stream`'s state machine always
+                    // yields at least one item (a frame, or the send/first-read error) before ever
+                    // reaching `Done` — see that module's `poll_next`. Treated as an error rather
+                    // than silently returning an empty stream, so a future change to that
+                    // invariant fails loudly here instead of masking a real bug.
+                    return Err(ExecError::Stream(
+                        "WS turn produced no frames at all (unexpected end of stream before the \
+                         first item)"
+                            .to_string(),
+                    ));
+                }
+                Some(Ok(first)) => {
+                    let rest = stream;
+                    let combined =
+                        futures_util::stream::once(async move { Ok::<_, ExecError>(first) })
+                            .chain(rest);
+                    return Ok(Box::pin(combined));
+                }
+                Some(Err(e)) => match classify_recovery(&e) {
+                    RecoveryAction::StripAnchorAndResend
+                        if anchor_attempts < self.max_anchor_miss_retries =>
+                    {
+                        anchor_attempts += 1;
+                        log_wedge_recovery(
+                            "anchor_miss_full_resend",
+                            &account.id,
+                            session_key,
+                            anchor_attempts,
+                        );
+                        // Strip the (now-dead) anchor state so `plan_request_for_conn` computes
+                        // `Full` on the next loop iteration — never re-derive/guess, just clear
+                        // exactly what a fresh connection would also have unset.
+                        let mut guard = shared.lock().await;
+                        guard.last_response_id = None;
+                        guard.last_item_hashes = None;
+                        guard.last_non_input_fingerprint = None;
+                        drop(guard);
+                        continue;
+                    }
+                    RecoveryAction::Reconnect if reconnect_attempts < self.max_reconnect_retries => {
+                        reconnect_attempts += 1;
+                        log_wedge_recovery(
+                            "reconnect_full_resend",
+                            &account.id,
+                            session_key,
+                            reconnect_attempts,
+                        );
+                        self.evict(session_key);
+                        match self
+                            .connect_and_cache(account, forward_headers, session_key)
+                            .await
+                        {
+                            ConnAttempt::Ready(fresh) => {
+                                shared = fresh;
+                                continue;
+                            }
+                            // A 426 discovered mid-recovery (not the common initial-connect case,
+                            // which `execute` handles with the real fallback dispatch): update the
+                            // session/account state for FUTURE calls, but this in-flight turn has
+                            // no `PreparedRequest`/`RequestCtx` to hand to `fallback` from this
+                            // deep in the loop — surface the error that triggered the reconnect
+                            // instead of the 426 itself, matching "handshake/transport failure
+                            // surfaces unchanged" for everything that isn't the top-level 426 path.
+                            ConnAttempt::UpgradeRequired => {
+                                if let Some(key) = session_key {
+                                    self.disable_session(key);
+                                }
+                                self.start_account_cooldown(&account.id);
+                                log_fallback(
+                                    "handshake_426_during_reconnect",
+                                    &account.id,
+                                    session_key,
+                                );
+                                return Err(e);
+                            }
+                            ConnAttempt::Failed(conn_err) => return Err(conn_err),
+                        }
+                    }
+                    _ => return Err(e),
+                },
+            }
+        }
+    }
+}
+
+/// Outcome of one connect attempt from [`CodexWsExecutor::connect_and_cache`].
+enum ConnAttempt {
+    Ready(SharedWsConn),
+    UpgradeRequired,
+    Failed(ExecError),
+}
+
+/// What to do about the FIRST item of a turn's stream being an `Err`. See the module doc's
+/// "Recovery: how classification reaches this module" section for why this string-matches
+/// `ExecError::Stream` messages rather than reading a richer type.
+enum RecoveryAction {
+    StripAnchorAndResend,
+    Reconnect,
+    /// Not recoverable here: surface as-is. Covers `ExecError::UpstreamStatus` (429, a genuine 400,
+    /// ...) unconditionally — SPEC-M5 §4's "key off STATUS, not the code string" — and any
+    /// `ExecError::Stream`/`Upstream` that doesn't carry one of the known recoverable markers.
+    Surface,
+}
+
+fn classify_recovery(e: &ExecError) -> RecoveryAction {
+    if let ExecError::Stream(msg) = e {
+        if msg.contains(ANCHOR_MISS_MARKER) {
+            return RecoveryAction::StripAnchorAndResend;
+        }
+        if msg.contains(CONNECTION_LIMIT_MARKER) || msg.contains(SOCKET_CLOSED_MARKER) {
+            return RecoveryAction::Reconnect;
+        }
+    }
+    RecoveryAction::Surface
+}
+
+/// `body["input"]` as an owned `Vec`, or empty if absent/not an array — the FULL history to send
+/// on a `RequestPlan::Full` decision. Mirrors `delta.rs`'s private `input_items` (not exposed from
+/// that module, so reimplemented here rather than widening its visibility for one caller).
+fn full_input(body: &Value) -> Vec<Value> {
+    body.get("input")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Materialize `req`'s body as a `Value` for WS planning/sending. **This is NOT the session-key
+/// re-parse the plan's Global Constraints forbid** — that constraint is specifically about never
+/// re-deriving the session key by re-parsing the body (Task 1 threads `ctx.session_key` down
+/// exactly to avoid that). This parse is different and unavoidable: the WS path must inspect and
+/// partially rebuild `input` (the delta decision, Task 6) and cannot do that from raw bytes. A
+/// native pass-through's `raw_body` is parsed here once; a translated/already-materialized request
+/// (`req.body: Some(_)`) is simply cloned.
+fn materialize_body(req: &PreparedRequest) -> Result<Value, ExecError> {
+    if let Some(body) = &req.body {
+        return Ok(body.clone());
+    }
+    match &req.raw_body {
+        Some(raw) => serde_json::from_slice(raw).map_err(|e| {
+            ExecError::Upstream(format!(
+                "WS executor requires a JSON request body to plan/send a delta: {e}"
+            ))
+        }),
+        None => Err(ExecError::Upstream(
+            "WS executor: PreparedRequest has neither body nor raw_body".to_string(),
+        )),
+    }
+}
+
+/// Content-free wedge-visibility logging for a bounded recovery attempt: reason code + counts
+/// only, per the module doc's content-safety section. Never a body, envelope, or frame.
+fn log_wedge_recovery(reason: &str, account_id: &str, session_key: Option<&str>, attempt: u32) {
+    tracing::warn!(
+        reason,
+        account_id,
+        session_key = session_key.unwrap_or("<none>"),
+        attempt,
+        "ws executor recovering a turn (content-free: reason code + counts only — this is the \
+         wedge-rate visibility codex-lb lacked, which wedged ~31% of reattaches with no way to \
+         measure it)"
+    );
+}
+
+/// Content-free fallback-dispatch logging (the 426 / session-disabled / account-cooldown paths).
+fn log_fallback(reason: &str, account_id: &str, session_key: Option<&str>) {
+    tracing::warn!(
+        reason,
+        account_id,
+        session_key = session_key.unwrap_or("<none>"),
+        "ws executor falling back to HTTP-SSE (content-free)"
+    );
+}
+
+#[async_trait]
+impl Executor for CodexWsExecutor {
+    async fn execute(
+        &self,
+        req: PreparedRequest,
+        account: &Account,
+        ctx: &RequestCtx,
+    ) -> Result<ResponseStream, ExecError> {
+        let session_key = ctx.session_key.as_ref().map(|k| k.value.clone());
+
+        if let Some(key) = &session_key {
+            if self.is_session_ws_disabled(key) {
+                log_fallback("session_ws_disabled", &account.id, Some(key));
+                return self.fallback.execute(req, account, ctx).await;
+            }
+        }
+        if self.is_account_in_cooldown(&account.id) {
+            log_fallback("account_cooldown", &account.id, session_key.as_deref());
+            return self.fallback.execute(req, account, ctx).await;
+        }
+
+        let shared = match self
+            .connect_and_cache(account, &req.forward_headers, session_key.as_deref())
+            .await
+        {
+            ConnAttempt::Ready(shared) => shared,
+            ConnAttempt::UpgradeRequired => {
+                // Ground truth §5: the ONE `FallbackToHttp` trigger. Scoped per-session
+                // (permanent for this session) + per-account (bounded cooldown) — module doc's
+                // "Fallback scope" section.
+                if let Some(key) = &session_key {
+                    self.disable_session(key);
+                }
+                self.start_account_cooldown(&account.id);
+                log_fallback("handshake_426", &account.id, session_key.as_deref());
+                return self.fallback.execute(req, account, ctx).await;
+            }
+            // Generic handshake/transport failure: surfaces unchanged, exactly like today's HTTP
+            // path — no fallback, no cooldown (module doc: 426 is the only trigger).
+            ConnAttempt::Failed(e) => return Err(e),
+        };
+
+        let body = materialize_body(&req)?;
+        self.drive_turn(
+            account,
+            &req.forward_headers,
+            session_key.as_deref(),
+            &body,
+            shared,
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use polyflare_core::{Account, KeyStrength, SessionKey};
+    use polyflare_testkit::{MockWsUpstream, ScriptedTurn};
+    use serde_json::json;
+    use std::sync::atomic::AtomicUsize as StdAtomicUsize;
+
+    fn test_account(base_url: String) -> Account {
+        Account {
+            id: "acct-1".into(),
+            base_url,
+            bearer_token: "secret-bearer".into(),
+            chatgpt_account_id: None,
+        }
+    }
+
+    fn ctx_with_session(session: &str) -> RequestCtx {
+        RequestCtx {
+            session_key: Some(SessionKey {
+                value: format!("session-hash-{session}"),
+                strength: KeyStrength::Hard,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn item(n: u32) -> Value {
+        json!({"role": "user", "content": format!("item-{n}")})
+    }
+
+    fn prepared(body: Value) -> PreparedRequest {
+        PreparedRequest {
+            body: Some(body),
+            model: "gpt-5.6-sol".to_string(),
+            forward_headers: vec![],
+            raw_body: None,
+        }
+    }
+
+    /// A fallback stand-in that must NEVER be called — used by every test whose whole point is
+    /// that WS handles the turn without ever reaching the fallback path. Panicking (rather than
+    /// silently returning something) turns an unnoticed fallback-dispatch bug into a loud test
+    /// failure instead of a green test that quietly proves nothing.
+    struct NeverCalledExecutor;
+
+    #[async_trait]
+    impl Executor for NeverCalledExecutor {
+        async fn execute(
+            &self,
+            _req: PreparedRequest,
+            _account: &Account,
+            _ctx: &RequestCtx,
+        ) -> Result<ResponseStream, ExecError> {
+            panic!("fallback executor must not be called for this test");
+        }
+    }
+
+    fn never_called_fallback() -> Arc<dyn Executor> {
+        Arc::new(NeverCalledExecutor)
+    }
+
+    /// A fallback stand-in that records how many times it was called and returns a trivially
+    /// empty (but successful) stream — for tests whose point IS that fallback gets used.
+    #[derive(Clone)]
+    struct RecordingExecutor {
+        calls: Arc<StdAtomicUsize>,
+    }
+
+    impl RecordingExecutor {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(StdAtomicUsize::new(0)),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Executor for RecordingExecutor {
+        async fn execute(
+            &self,
+            _req: PreparedRequest,
+            _account: &Account,
+            _ctx: &RequestCtx,
+        ) -> Result<ResponseStream, ExecError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures_util::stream::empty()))
+        }
+    }
+
+    async fn drain(mut stream: ResponseStream) -> Vec<Result<bytes::Bytes, String>> {
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(item.map_err(|e| e.to_string()));
+        }
+        out
+    }
+
+    // ---- THE central delta proof: two executor.execute() calls, one connection, a real delta --
+
+    #[tokio::test]
+    async fn second_execute_call_same_session_reuses_the_connection_and_sends_a_real_delta() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::normal(vec![]),
+        ]);
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::new(never_called_fallback());
+        let account = test_account(base);
+        let ctx = ctx_with_session("alpha");
+
+        // Turn 1: two items, no anchor possible yet.
+        let body1 = json!({"model": "gpt-5.6-sol", "input": [item(0), item(1)]});
+        let stream1 = executor
+            .execute(prepared(body1), &account, &ctx)
+            .await
+            .expect("turn 1 must succeed");
+        drain(stream1).await;
+
+        // Turn 2: the SAME two items plus exactly one new one — a strict extension.
+        let body2 = json!({"model": "gpt-5.6-sol", "input": [item(0), item(1), item(2)]});
+        let stream2 = executor
+            .execute(prepared(body2), &account, &ctx)
+            .await
+            .expect("turn 2 must succeed");
+        drain(stream2).await;
+
+        assert_eq!(
+            mock.handshake_count(),
+            1,
+            "two executor.execute() calls for the same session must reuse ONE connection"
+        );
+        assert_eq!(
+            mock.last_frame_anchor(),
+            Some("resp_1".to_string()),
+            "turn 2 must anchor on turn 1's response id, not resend full history"
+        );
+        assert_eq!(
+            mock.last_frame_input_len(),
+            Some(1),
+            "turn 2 must send ONLY the one new item — this is the delta actually being a delta, \
+             not merely 'nothing failed'"
+        );
+    }
+
+    // ---- Row: previous_response_not_found -> strip anchor, full resend, SAME socket, bounded ---
+
+    #[tokio::test]
+    async fn anchor_miss_recovers_transparently_and_the_client_sees_only_a_clean_stream() {
+        // 3-entry script: turn1 completes normally (seeds a real anchor); turn2's first attempt
+        // (anchored, per plan_request) gets told the anchor is dead; turn2's retry (now full,
+        // anchorless — the recovery) gets a clean completion. Proves recovery AND that the retry
+        // actually stripped the anchor (frame 2 anchored, frame 2's retry i.e. frame 3 is not).
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::previous_response_not_found("resp_1"),
+            ScriptedTurn::normal(vec![]),
+        ]);
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::new(never_called_fallback());
+        let account = test_account(base);
+        let ctx = ctx_with_session("beta");
+
+        let stream1 = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0), item(1)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .expect("turn 1 must succeed");
+        drain(stream1).await;
+
+        let stream2 = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0), item(1), item(2)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .expect("turn 2 must recover from the anchor miss and still succeed");
+        let items = drain(stream2).await;
+
+        assert!(
+            items.iter().all(|i| i.is_ok()),
+            "the client must see a CLEAN stream — the anchor-miss must never surface: {items:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, Ok(b) if String::from_utf8_lossy(b).contains("response.completed"))),
+            "must still see a real completion after recovery: {items:?}"
+        );
+
+        let frames = mock.frames();
+        assert_eq!(
+            frames.len(),
+            3,
+            "turn1(1) + turn2's anchored attempt(1) + turn2's stripped-anchor retry(1) = 3 frames"
+        );
+        assert_eq!(frames[1].previous_response_id, Some("resp_1".to_string()));
+        assert_eq!(
+            frames[2].previous_response_id, None,
+            "the retry must have stripped the anchor"
+        );
+        assert_eq!(
+            frames[2].input_len, 3,
+            "the retry must be a FULL resend (all 3 items), not another delta"
+        );
+        assert_eq!(
+            mock.handshake_count(),
+            1,
+            "anchor-miss recovery resends on the SAME socket — no reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn anchor_miss_recovery_gives_up_after_bounded_retries() {
+        // Every attempt gets told the anchor is dead — proves the retry loop actually terminates
+        // rather than looping forever, and surfaces the error once the bound is hit.
+        let mock = MockWsUpstream::new(ScriptedTurn::previous_response_not_found("resp_dead"));
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::with_config(
+            never_called_fallback(),
+            2, // max_anchor_miss_retries
+            2,
+            Duration::from_secs(30),
+        );
+        let account = test_account(base);
+        let ctx = ctx_with_session("gamma");
+
+        let err = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .err()
+            .expect("must give up rather than loop forever");
+
+        match err {
+            ExecError::Stream(msg) => {
+                assert!(msg.contains("previous_response_not_found"), "{msg}");
+            }
+            other => panic!("expected ExecError::Stream, got {other:?}"),
+        }
+        // The attempt count, as a real assertable value: 1 initial + 2 bounded retries = 3 frames.
+        assert_eq!(
+            mock.frames().len(),
+            3,
+            "must attempt exactly 1 + max_anchor_miss_retries times, then give up"
+        );
+    }
+
+    // ---- Row: websocket_connection_limit_reached -> reconnect, full resend, bounded -----------
+
+    #[tokio::test]
+    async fn connection_limit_reached_triggers_a_reconnect_and_resend() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::connection_limit_reached(409),
+            ScriptedTurn::normal(vec![]),
+        ]);
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::new(never_called_fallback());
+        let account = test_account(base);
+        let ctx = ctx_with_session("delta-session");
+
+        let stream = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .expect("must recover via reconnect and still succeed");
+        let items = drain(stream).await;
+
+        assert!(items.iter().all(|i| i.is_ok()), "{items:?}");
+        assert_eq!(
+            mock.handshake_count(),
+            2,
+            "connection-limit recovery must RECONNECT (a brand new handshake), unlike anchor-miss"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_recovery_gives_up_after_bounded_retries() {
+        let mock = MockWsUpstream::new(ScriptedTurn::connection_limit_reached(409));
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::with_config(
+            never_called_fallback(),
+            2,
+            2, // max_reconnect_retries
+            Duration::from_secs(30),
+        );
+        let account = test_account(base);
+        let ctx = ctx_with_session("epsilon");
+
+        let err = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .err()
+            .expect("must give up rather than reconnect forever");
+
+        match err {
+            ExecError::Stream(msg) => assert!(msg.contains("websocket_connection_limit_reached"), "{msg}"),
+            other => panic!("expected ExecError::Stream, got {other:?}"),
+        }
+        assert_eq!(
+            mock.handshake_count(),
+            3,
+            "1 initial handshake + max_reconnect_retries(2) more = 3, then give up"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_before_any_terminal_frame_as_the_first_item_triggers_reconnect() {
+        // Distinguishes THIS case (close arrives before ANY byte reached the caller — recoverable,
+        // grouped with connection-limit per SPEC-M5 §4) from the "after the first byte" case
+        // below (never retried).
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::close_mid_stream(vec![]), // closes with NO events at all first
+            ScriptedTurn::normal(vec![]),
+        ]);
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::new(never_called_fallback());
+        let account = test_account(base);
+        let ctx = ctx_with_session("zeta");
+
+        let stream = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .expect("must recover via reconnect");
+        let items = drain(stream).await;
+
+        assert!(items.iter().all(|i| i.is_ok()), "{items:?}");
+        assert_eq!(mock.handshake_count(), 2);
+    }
+
+    // ---- Row: mid-stream failure after the first byte -> surfaces immediately, never retried --
+
+    #[tokio::test]
+    async fn close_mid_stream_after_the_first_byte_surfaces_immediately_without_retry() {
+        let mock = MockWsUpstream::new(ScriptedTurn::close_mid_stream(vec![json!({
+            "type": "response.output_text.delta",
+            "delta": "partial",
+        })
+        .to_string()]));
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::new(never_called_fallback());
+        let account = test_account(base);
+        let ctx = ctx_with_session("eta");
+
+        let stream = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .expect("the first byte succeeded, so execute() itself returns Ok");
+        let items = drain(stream).await;
+
+        assert_eq!(items.len(), 2, "one good delta byte, then the surfaced error: {items:?}");
+        assert!(items[0].is_ok());
+        match &items[1] {
+            Err(msg) => assert!(msg.contains("closed"), "{msg}"),
+            Ok(_) => panic!("expected the close to surface as an error after the first byte"),
+        }
+        assert_eq!(
+            mock.handshake_count(),
+            1,
+            "no reconnect — a post-first-byte failure is never retried"
+        );
+    }
+
+    // ---- Row: 429 envelope -> ExecError::UpstreamStatus, unchanged, never retried -------------
+
+    #[tokio::test]
+    async fn rate_limit_429_surfaces_as_upstream_status_unchanged() {
+        let mock = MockWsUpstream::new(ScriptedTurn::rate_limited_429(37));
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::new(never_called_fallback());
+        let account = test_account(base);
+        let ctx = ctx_with_session("theta");
+
+        let err = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .err()
+            .expect("429 must surface, not be retried");
+
+        match err {
+            ExecError::UpstreamStatus(sig) => {
+                assert_eq!(sig.status, 429);
+                assert_eq!(sig.retry_after, Some(37));
+            }
+            other => panic!("expected ExecError::UpstreamStatus, got {other:?}"),
+        }
+        assert_eq!(mock.frames().len(), 1, "a 429 must never be retried");
+    }
+
+    // ---- Row: terminal response.failed -> reframe as SSE, pass through, the error as today ----
+
+    #[tokio::test]
+    async fn terminal_response_failed_is_reframed_as_sse_and_passed_through() {
+        let mock = MockWsUpstream::new(ScriptedTurn::Failed {
+            code: "context_window_exceeded".to_string(),
+            message: "too long".to_string(),
+        });
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::new(never_called_fallback());
+        let account = test_account(base);
+        let ctx = ctx_with_session("iota");
+
+        let stream = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .expect("execute() itself succeeds; the failure travels IN the SSE stream");
+        let items = drain(stream).await;
+
+        assert_eq!(items.len(), 1);
+        let text = match &items[0] {
+            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+            Err(e) => panic!("expected an Ok SSE frame carrying the failure, got Err({e})"),
+        };
+        assert!(text.starts_with("data: "), "{text}");
+        assert!(text.contains("context_window_exceeded"), "{text}");
+    }
+
+    // ---- Row: handshake 426 -> HTTP-SSE for this session, never surfaces ----------------------
+
+    #[tokio::test]
+    async fn handshake_426_falls_back_and_disables_ws_for_this_session_only() {
+        let mock = MockWsUpstream::rejecting_handshake();
+        let base = mock.clone().spawn().await;
+        let fallback = RecordingExecutor::new();
+        let executor = CodexWsExecutor::new(Arc::new(fallback.clone()));
+        let account = test_account(base);
+        let ctx = ctx_with_session("kappa");
+
+        let stream = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .expect("must fall back to HTTP-SSE, never surface the 426 itself");
+        drain(stream).await;
+
+        assert_eq!(fallback.call_count(), 1);
+        assert_eq!(executor.ws_connect_attempts(), 1);
+        assert_eq!(mock.handshake_count(), 0, "426 never establishes a socket");
+
+        // A SECOND call, same session: must skip the WS attempt entirely (session disabled), not
+        // merely fail it again.
+        let stream2 = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .expect("must fall back again");
+        drain(stream2).await;
+
+        assert_eq!(fallback.call_count(), 2);
+        assert_eq!(
+            executor.ws_connect_attempts(),
+            1,
+            "the session-disabled bypass must skip the WS connect attempt entirely on the 2nd call"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_cooldown_after_426_bypasses_ws_for_a_different_session_same_account() {
+        let mock = MockWsUpstream::rejecting_handshake();
+        let base = mock.clone().spawn().await;
+        let fallback = RecordingExecutor::new();
+        let executor = CodexWsExecutor::new(Arc::new(fallback.clone()));
+        let account = test_account(base);
+
+        let ctx_a = ctx_with_session("session-A");
+        let stream = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0)]})),
+                &account,
+                &ctx_a,
+            )
+            .await
+            .unwrap();
+        drain(stream).await;
+        assert_eq!(executor.ws_connect_attempts(), 1);
+
+        // A DIFFERENT session on the SAME account: session-level disablement doesn't apply (new
+        // key), but the account-level cooldown must still bypass WS.
+        let ctx_b = ctx_with_session("session-B");
+        let stream2 = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0)]})),
+                &account,
+                &ctx_b,
+            )
+            .await
+            .unwrap();
+        drain(stream2).await;
+
+        assert_eq!(fallback.call_count(), 2);
+        assert_eq!(
+            executor.ws_connect_attempts(),
+            1,
+            "account cooldown must bypass WS for a DIFFERENT session on the same account too"
+        );
+    }
+
+    // ---- Row: handshake/transport failure (not 426) -> ExecError::Upstream, unchanged ---------
+
+    #[tokio::test]
+    async fn generic_connect_failure_surfaces_as_upstream_error_unchanged() {
+        let fallback = RecordingExecutor::new();
+        let executor = CodexWsExecutor::new(Arc::new(fallback.clone()));
+        // Port 1 is a privileged/unassigned port: connection should be refused promptly.
+        let account = test_account("ws://127.0.0.1:1".to_string());
+        let ctx = ctx_with_session("lambda");
+
+        let err = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .err()
+            .expect("a refused connection must surface as an error");
+
+        assert!(
+            matches!(err, ExecError::Upstream(_)),
+            "generic transport failure must surface as ExecError::Upstream, unchanged, got {err:?}"
+        );
+        assert_eq!(
+            fallback.call_count(),
+            0,
+            "a non-426 transport failure must NOT fall back — ground truth §5: 426 is the ONLY trigger"
+        );
+    }
+
+    // ---- No session key: still correct, just no reuse -----------------------------------------
+
+    #[tokio::test]
+    async fn no_session_key_still_completes_a_turn_with_no_connection_reuse() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::normal(vec![]),
+        ]);
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::new(never_called_fallback());
+        let account = test_account(base);
+        let ctx = RequestCtx::default(); // no session_key
+
+        let s1 = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .unwrap();
+        drain(s1).await;
+        let s2 = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0), item(1)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .unwrap();
+        drain(s2).await;
+
+        assert_eq!(
+            mock.handshake_count(),
+            2,
+            "with no session key there is nothing to cache on — each call gets a fresh connection"
+        );
+        assert_eq!(
+            mock.last_frame_anchor(),
+            None,
+            "no reuse ⇒ no anchor ⇒ always a full send"
+        );
+    }
+}
