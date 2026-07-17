@@ -734,6 +734,96 @@ async fn overview_reports_pools_and_quota_from_seeded_accounts() {
     assert_eq!(quota[0]["weekly"], 26.5);
 }
 
+/// Same content-free shape as [`req_row`], but with an explicit `requested_at` so the series test
+/// can control which hourly bucket a row lands in.
+fn req_row_at(requested_at: i64, status: u16, total_tokens: i64) -> RequestLogRecord {
+    RequestLogRecord {
+        requested_at,
+        provider: "codex".to_string(),
+        method: "POST".to_string(),
+        path: "/responses".to_string(),
+        aliased: false,
+        status,
+        duration_ms: 100,
+        account_id: None,
+        model: None,
+        reasoning_effort: None,
+        service_tier: None,
+        transport: None,
+        ttft_ms: None,
+        total_tokens: Some(total_tokens),
+        cached_tokens: None,
+    }
+}
+
+/// `GET /api/overview/series`: hourly buckets over the rolling 24h window, ascending by `ts`, with
+/// EVERY bucket in the grid present — including the ones with no rows, zero-filled rather than
+/// missing (see `read_api.rs::overview_series_handler`'s doc comment for where that zero-fill lives).
+#[tokio::test]
+async fn overview_series_reports_hourly_buckets_zero_filled_over_the_24h_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let repo = store.request_log();
+
+    let insert_ts = now();
+    for (status, tokens) in [(200, 1000), (200, 2000), (500, 500)] {
+        repo.insert(&req_row_at(insert_ts, status, tokens))
+            .await
+            .unwrap();
+    }
+    std::mem::forget(dir);
+
+    let pf = spawn(store).await;
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/overview/series"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(v["bucket_secs"], 3600);
+    let buckets = v["buckets"].as_array().unwrap();
+    assert!(
+        buckets.len() >= 24,
+        "hourly buckets across (at least) a 24h window, got {}",
+        buckets.len()
+    );
+
+    // Ascending order by ts.
+    let tss: Vec<i64> = buckets.iter().map(|b| b["ts"].as_i64().unwrap()).collect();
+    let mut sorted = tss.clone();
+    sorted.sort();
+    assert_eq!(tss, sorted, "buckets must be ascending by ts");
+
+    // The bucket our 3 rows landed in carries the real rollup.
+    let expected_bucket_ts = (insert_ts / 3600) * 3600;
+    let populated = buckets
+        .iter()
+        .find(|b| b["ts"] == expected_bucket_ts)
+        .expect("the bucket our rows landed in must be present");
+    assert_eq!(populated["requests"], 3);
+    assert_eq!(populated["errors"], 1);
+    assert_eq!(populated["total_tokens"], 3500);
+    let avg = populated["avg_latency_ms"].as_f64().unwrap();
+    assert!((avg - 100.0).abs() < 0.001, "all 3 rows use duration_ms=100");
+
+    // Every other bucket in the grid is zero-filled, not absent.
+    let others: Vec<_> = buckets
+        .iter()
+        .filter(|b| b["ts"] != expected_bucket_ts)
+        .collect();
+    assert!(!others.is_empty());
+    for b in others {
+        assert_eq!(b["requests"], 0);
+        assert_eq!(b["errors"], 0);
+        assert_eq!(b["total_tokens"], 0);
+        assert_eq!(b["avg_latency_ms"], 0.0);
+    }
+}
+
 #[tokio::test]
 async fn account_detail_returns_identity_status_quota_and_token_status_and_404s_for_unknown() {
     // Task 8: GET /api/accounts/{id} — the per-account detail view. Seed an account with a non-default

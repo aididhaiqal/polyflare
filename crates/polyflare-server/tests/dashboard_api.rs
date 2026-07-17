@@ -69,6 +69,28 @@ async fn whoami_is_503_when_dashboard_disabled() {
 }
 
 #[tokio::test]
+async fn overview_series_requires_admin_token() {
+    let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
+    let (pf, _state) = spawn(up).await; // admin_token = Some("secret")
+    let c = reqwest::Client::new();
+
+    let no_tok = c
+        .get(format!("{pf}/api/overview/series"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_tok.status(), 401);
+
+    let ok = c
+        .get(format!("{pf}/api/overview/series"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+}
+
+#[tokio::test]
 async fn logs_stream_200_and_streams_backfill_when_flag_on() {
     let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
     let (pf, state) = spawn(up).await; // spawn sets live_logs = true for tests

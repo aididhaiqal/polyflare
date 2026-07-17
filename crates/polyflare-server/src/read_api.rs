@@ -806,6 +806,91 @@ pub async fn overview_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
     })
 }
 
+/// Bucket width for `GET /api/overview/series`: hourly, matching the 24h landing-page convention
+/// [`OVERVIEW_KPI_WINDOW_SECS`] already sets. Not client-configurable today — same YAGNI rationale
+/// as `OVERVIEW_KPI_WINDOW_SECS`: the brief calls for a fixed 24h/1h default, not a query-param
+/// surface with no real consumer yet.
+const OVERVIEW_SERIES_BUCKET_SECS: i64 = 3600;
+
+/// One bucket of `OverviewSeriesView.buckets`. Mirrors `polyflare_store::RequestBucket`
+/// field-for-field — every value is a count, a timestamp, or an averaged metric, never content.
+#[derive(Serialize)]
+struct SeriesBucketView {
+    ts: i64,
+    requests: i64,
+    errors: i64,
+    avg_latency_ms: f64,
+    total_tokens: i64,
+}
+
+impl From<polyflare_store::RequestBucket> for SeriesBucketView {
+    fn from(b: polyflare_store::RequestBucket) -> Self {
+        SeriesBucketView {
+            ts: b.ts,
+            requests: b.requests,
+            errors: b.errors,
+            avg_latency_ms: b.avg_latency_ms,
+            total_tokens: b.total_tokens,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct OverviewSeriesView {
+    bucket_secs: i64,
+    /// Ascending by `ts`, one entry per bucket across the WHOLE `[since_ts, now]` grid — zero-filled
+    /// (see [`overview_series_handler`]), so this never has a hole for the chart to special-case.
+    buckets: Vec<SeriesBucketView>,
+}
+
+/// `GET /api/overview/series` — the dashboard overview's request-volume chart: a rolling
+/// [`OVERVIEW_KPI_WINDOW_SECS`] window bucketed into [`OVERVIEW_SERIES_BUCKET_SECS`]-wide buckets,
+/// oldest first. `polyflare_store::RequestLogRepo::series_since` only emits buckets that have rows;
+/// this handler zero-fills every other bucket in the aligned `[since_ts, now]` grid so the response
+/// is always a complete, gap-free series — the ONLY place that zero-fill happens.
+pub async fn overview_series_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let now = unix_now();
+    let bucket_secs = OVERVIEW_SERIES_BUCKET_SECS;
+    let since_ts = now - OVERVIEW_KPI_WINDOW_SECS;
+
+    let rows = match state
+        .store
+        .request_log()
+        .series_since(since_ts, bucket_secs)
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return Response::error(),
+    };
+    let mut by_ts: std::collections::BTreeMap<i64, polyflare_store::RequestBucket> =
+        rows.into_iter().map(|b| (b.ts, b)).collect();
+
+    // Zero-fill the full grid from the aligned window start through the aligned "now" bucket, so a
+    // window with sparse (or zero) traffic still renders as a continuous series.
+    let aligned_start = (since_ts / bucket_secs) * bucket_secs;
+    let aligned_now = (now / bucket_secs) * bucket_secs;
+    let mut buckets = Vec::new();
+    let mut ts = aligned_start;
+    while ts <= aligned_now {
+        let bucket = by_ts
+            .remove(&ts)
+            .unwrap_or(polyflare_store::RequestBucket {
+                ts,
+                requests: 0,
+                errors: 0,
+                avg_latency_ms: 0.0,
+                total_tokens: 0,
+            });
+        buckets.push(SeriesBucketView::from(bucket));
+        ts += bucket_secs;
+    }
+
+    Response::ok(OverviewSeriesView {
+        bucket_secs,
+        buckets,
+    })
+}
+
 /// A tiny JSON responder: `Ok(200, body)` or a content-safe `500` (the store error's own text is
 /// never surfaced — a read failure returns a generic body, like the ingress error paths).
 enum Response<T: Serialize> {

@@ -9,6 +9,7 @@ import {
   type AccountDetailView,
   type AccountView,
   type CapabilitiesView,
+  type OverviewSeriesView,
   type OverviewView,
   type PoolView,
   type RequestsQueryParams,
@@ -23,6 +24,7 @@ const LIST_REFETCH_MS = 30_000;
 
 export const queryKeys = {
   overview: ["overview"] as const,
+  overviewSeries: ["overview", "series"] as const,
   accounts: ["accounts"] as const,
   account: (id: string) => ["accounts", id] as const,
   accountTrends: (id: string) => ["accounts", id, "trends"] as const,
@@ -35,6 +37,17 @@ export function useOverview() {
   return useQuery<OverviewView>({
     queryKey: queryKeys.overview,
     queryFn: api.overview,
+    refetchInterval: LIST_REFETCH_MS,
+    staleTime: LIST_REFETCH_MS,
+  });
+}
+
+/** `GET /api/overview/series` — the overview's request-volume chart data. Same refetch/staleness
+ * policy as `useOverview` (30s), since it's a landing-page-tile-adjacent series, not a detail view. */
+export function useOverviewSeries() {
+  return useQuery<OverviewSeriesView>({
+    queryKey: queryKeys.overviewSeries,
+    queryFn: api.overviewSeries,
     refetchInterval: LIST_REFETCH_MS,
     staleTime: LIST_REFETCH_MS,
   });
