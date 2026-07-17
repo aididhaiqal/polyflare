@@ -18,6 +18,14 @@ fn rec(
         aliased: false,
         status,
         duration_ms,
+        account_id: None,
+        model: None,
+        reasoning_effort: None,
+        service_tier: None,
+        transport: None,
+        ttft_ms: None,
+        total_tokens: None,
+        cached_tokens: None,
     }
 }
 

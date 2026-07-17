@@ -61,6 +61,15 @@ impl RequestLog {
             aliased: self.aliased,
             status: self.status.as_u16(),
             duration_ms: self.duration_ms as i64,
+            // Populated by a later task; this task only adds the plumbing.
+            account_id: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            transport: None,
+            ttft_ms: None,
+            total_tokens: None,
+            cached_tokens: None,
         }
     }
 }

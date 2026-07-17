@@ -92,6 +92,14 @@ async fn seed_store() -> Store {
             aliased: false,
             status: 200,
             duration_ms: 12,
+            account_id: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            transport: None,
+            ttft_ms: None,
+            total_tokens: None,
+            cached_tokens: None,
         })
         .await
         .unwrap();
