@@ -664,6 +664,82 @@ async fn overview_reports_pools_and_quota_from_seeded_accounts() {
 }
 
 #[tokio::test]
+async fn account_detail_returns_identity_status_quota_and_token_status_and_404s_for_unknown() {
+    // Task 8: GET /api/accounts/{id} — the per-account detail view. Seed an account with a non-default
+    // routing_policy + security_work_authorized=true + a usage window, and assert all three surface
+    // (plus a non-empty quota_windows + a secret-safe token_status), then assert an unknown id 404s.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
+    let repo = store.accounts();
+    let mut acct = account("acct-1", "acct1@example.test", Some("team-a"));
+    acct.routing_policy = "burn_first".to_string();
+    acct.security_work_authorized = true;
+    repo.insert(&acct, &tokens(), &cipher).await.unwrap();
+    repo.insert_usage_window(
+        "acct-1",
+        "secondary",
+        40.0,
+        Some(1_900_000_000),
+        Some(10080),
+        now(),
+    )
+    .await
+    .unwrap();
+    std::mem::forget(dir);
+
+    let pf = spawn(store).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert_eq!(body["identity"]["id"], "acct-1");
+    assert_eq!(body["identity"]["email"], "acct1@example.test");
+    assert_eq!(body["identity"]["pool"], "team-a");
+    assert_eq!(body["identity"]["provider"], "codex");
+    assert_eq!(body["status"], "active");
+    assert_eq!(body["routing_policy"], "burn_first");
+    assert_eq!(body["security_work_authorized"], true);
+
+    let quota = body["quota_windows"].as_array().unwrap();
+    assert!(!quota.is_empty(), "quota_windows: {quota:?}");
+    assert!(
+        quota
+            .iter()
+            .any(|w| w["window"] == "weekly" && w["used_percent"] == 40.0),
+        "quota_windows: {quota:?}"
+    );
+
+    let token_status = &body["token_status"];
+    assert!(
+        token_status["access_state"].is_string(),
+        "token_status: {token_status:?}"
+    );
+    // "SECRET-ACCESS-TOKEN" isn't a JWT → exp can't be decoded → "missing", and the raw token must
+    // never appear anywhere in the body.
+    assert_eq!(token_status["access_state"], "missing");
+    assert!(!body.to_string().contains("SECRET"));
+
+    assert_eq!(body["request_totals"]["request_count"], 0);
+    assert_eq!(body["request_totals"]["total_tokens"], 0);
+
+    let missing = client
+        .get(format!("{pf}/api/accounts/does-not-exist"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+}
+
+#[tokio::test]
 async fn requests_endpoint_filters_by_status_class() {
     let pf = spawn(seed_store_for_filters().await).await;
     let client = reqwest::Client::new();
