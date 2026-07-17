@@ -11,6 +11,7 @@ import { Accounts } from "./pages/Accounts";
 import { Login } from "./pages/Login";
 import { Overview } from "./pages/Overview";
 import { Pools } from "./pages/Pools";
+import { Requests } from "./pages/Requests";
 import { Shell } from "./shell/Shell";
 
 const queryClient = new QueryClient({
@@ -48,7 +49,7 @@ export function App() {
               <Route path="accounts" element={<Accounts />} />
               <Route path="accounts/:id" element={<AccountDetail />} />
               <Route path="pools" element={<Pools />} />
-              <Route path="requests" element={<RoutePlaceholder label="Requests" />} />
+              <Route path="requests" element={<Requests />} />
               <Route path="logs" element={<RoutePlaceholder label="Logs" />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Route>
