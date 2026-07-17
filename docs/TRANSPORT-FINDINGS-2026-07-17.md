@@ -7,6 +7,9 @@ decisions they force. Supersedes assumptions baked into `SPEC-M3.md §2` (the si
 - `handover_probe.rs` — HTTP-SSE: store/anchor support matrix + cross-account prefill cost.
 - `ws_vs_sse_probe.rs` — WebSocket incremental vs HTTP-SSE full resend.
 - `ws_wedge_demo.rs` — dead-anchor behavior (cross-account + same-account reattach) + recovery.
+- `ws_ratelimit_probe.rs` — **measured-by** for the open question below: does WS incremental
+  continuation reduce `/wham/usage` `used_percent` movement (rate-limit consumption), not just
+  upload bytes? Built, not yet run — see "Rate-limit consumption (UNRUN)" below.
 
 ## What was measured (facts)
 
@@ -41,6 +44,30 @@ decisions they force. Supersedes assumptions baked into `SPEC-M3.md §2` (the si
    (`is_previous_response_not_found_error`, `previous_response_id_from_not_found_message`,
    `should_rewrite`, WS + HTTP-bridge variants) — and still wedges ~31% of reattaches. The silent
    hang is therefore **self-inflicted** by codex-lb's rewrite/trim/bridge machinery, not the backend.
+
+## Rate-limit consumption (UNRUN / result pending)
+
+The `used_percent` movement question — the milestone's actual premise (SPEC-M5-WEBSOCKET.md §8)
+— is **measured-by:** `crates/polyflare-server/examples/ws_ratelimit_probe.rs`.
+
+**Status: UNRUN.** The probe is built, compiles clean (`cargo build --examples -p
+polyflare-server`, `cargo clippy --workspace --all-targets -- -D warnings`), and is ready to run,
+but it has **not been executed against live accounts** — running it spends the exact resource it
+measures (rate-limit quota), and one account is already exhausted. This section intentionally
+carries **no measured result** — do not treat the absence of a number here as "WS doesn't help" or
+as "WS helps"; it means nobody has run the probe yet.
+
+Everything above this section (the 86× upload figure, the anchor/handover facts) was measured and
+holds regardless of this open question. What is NOT yet established: whether prefilled/cached
+tokens that make the 86× upload win possible are billed fully against `/wham/usage` windows
+anyway, in which case the upload win would not translate into a quota win.
+
+**When someone runs it** (`cargo run -p polyflare-server --example ws_ratelimit_probe --release
+-- --live`, only with real headroom on two accounts), replace this paragraph with the measured
+`used_percent`-per-turn delta for WS vs HTTP and the probe's printed verdict line, and update
+`SPEC-M5-WEBSOCKET.md` §8 from "measure this" to the actual measured statement — including if the
+answer is negative (prefill still billed fully against rate limits). Do not fabricate a number in
+either document before that run happens.
 
 ## Decisions forced
 
