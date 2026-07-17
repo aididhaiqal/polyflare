@@ -1,6 +1,6 @@
 import clsx from "clsx";
 
-type StatusTone = "ok" | "warn" | "error";
+export type StatusTone = "ok" | "warn" | "error";
 
 /** Buckets every status string the backend can report (`read_api.rs`'s `AccountView.status` /
  * `AccountDetailView.status` — a plain `String`, not a closed Rust enum) into the three tones the
@@ -16,6 +16,13 @@ const TONE_BY_STATUS: Record<string, StatusTone> = {
   reauth: "error",
   deactivated: "error",
 };
+
+/** Exported so other surfaces that need the tone WITHOUT the full pill (e.g. Overview's
+ * account-health table status dot) share this single status→tone mapping instead of
+ * re-deriving it. */
+export function statusTone(status: string): StatusTone {
+  return TONE_BY_STATUS[status] ?? "warn";
+}
 
 /** Shortens a few verbose backend status strings to the mockups' labels (e.g. `reauth_required` ->
  * `reauth`); anything else falls back to the raw status with underscores turned to spaces. */
@@ -33,7 +40,7 @@ const TONE_CLASSES: Record<StatusTone, string> = {
 
 /** Small rounded status badge (mockups' `.st`). */
 export function StatusPill({ status, className }: { status: string; className?: string }) {
-  const tone = TONE_BY_STATUS[status] ?? "warn";
+  const tone = statusTone(status);
   const label = LABEL_BY_STATUS[status] ?? status.replace(/_/g, " ");
   return (
     <span
