@@ -51,12 +51,17 @@ impl std::fmt::Debug for PreparedRequest {
 
 /// A classified upstream-failure signal extracted from a non-2xx response — the routing-health
 /// inputs the ingress uses to bench / cool-down the account that produced the failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailureSignal {
     /// The upstream HTTP status code.
     pub status: u16,
     /// The upstream `Retry-After`, in seconds, if it sent a parseable one.
     pub retry_after: Option<i64>,
+    /// The upstream error code ONLY (e.g. "invalid_grant", "account_deactivated") — NEVER the
+    /// error message or response body (content-safety: the message can echo request framing).
+    /// `None` when the executor couldn't parse a code. Populated by Tasks 2/3; unread until
+    /// Tasks 4/5.
+    pub error_code: Option<String>,
 }
 
 /// Errors an executor can surface.
@@ -77,7 +82,7 @@ impl ExecError {
     /// The failure signal for routing-health writeback, when this error carries an upstream status.
     pub fn failure_signal(&self) -> Option<FailureSignal> {
         match self {
-            ExecError::UpstreamStatus(s) => Some(*s),
+            ExecError::UpstreamStatus(s) => Some(s.clone()),
             _ => None,
         }
     }

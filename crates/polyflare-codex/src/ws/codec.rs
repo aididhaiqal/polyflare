@@ -210,6 +210,7 @@ pub fn classify(frame: &Value) -> FrameClass {
             FrameClass::Error(ExecError::UpstreamStatus(FailureSignal {
                 status,
                 retry_after,
+                error_code: None,
             }))
         }
         // Ground truth §3 (`sse/responses.rs:467-469`): unknown types are ignored, never fatal.

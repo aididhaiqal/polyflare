@@ -151,6 +151,7 @@ impl Executor for CodexExecutor {
             return Err(ExecError::UpstreamStatus(polyflare_core::FailureSignal {
                 status: resp.status().as_u16(),
                 retry_after: retry_after_secs(resp.headers()),
+                error_code: None,
             }));
         }
 

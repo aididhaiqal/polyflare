@@ -69,7 +69,7 @@ async fn executor_surfaces_upstream_error_status() {
     // A non-2xx upstream response now surfaces the structured status (404 here from the missing
     // base), not a stringly `Upstream` — so the ingress can classify it for routing-health.
     assert!(
-        matches!(err, polyflare_core::ExecError::UpstreamStatus(s) if s.status == 404),
+        matches!(&err, polyflare_core::ExecError::UpstreamStatus(s) if s.status == 404),
         "expected UpstreamStatus(404), got {err:?}"
     );
 }
