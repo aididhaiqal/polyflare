@@ -123,9 +123,15 @@ changes only the transport underneath it.
 
 Within the executor (M5a):
 
+**Classify on `error.code`, not `status`.** A dead anchor and a genuine bad-request both arrive as the same
+wrapped envelope with `status: 400` (ground truth §5, live-measured). Only `code` separates "strip the anchor
+and resend" from "surface the error" — key on status alone and you either swallow real 400s or never recover
+the wedge.
+
 | Upstream event | WS executor does | Above the seam |
 |---|---|---|
-| `previous_response_not_found` | strip anchor → **full resend on the same socket**, bounded attempts | never surfaces |
+| error envelope, `status:400`, `code:"previous_response_not_found"` | strip anchor → **full resend on the same socket**, bounded attempts | never surfaces |
+| error envelope, `status:400`, any other `code` | re-frame as SSE, pass through | the error, as today |
 | `websocket_connection_limit_reached` (60-min cap) | reconnect → full resend | never surfaces |
 | idle timeout (300 s, per-event) | reconnect → full resend | never surfaces |
 | `Close` before a terminal frame | reconnect → full resend | never surfaces |
