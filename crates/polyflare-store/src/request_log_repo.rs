@@ -88,6 +88,27 @@ pub struct RequestsFilter {
     pub since_ts: Option<i64>,
 }
 
+/// The `GET /api/overview` KPI rollup produced by [`RequestLogRepo::aggregate_since`]: content-free
+/// counts/metrics over a time window, never rows.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RequestAggregate {
+    pub total: i64,
+    pub success: i64,
+    pub error: i64,
+    pub avg_latency_ms: f64,
+    pub total_tokens: i64,
+}
+
+/// One row of [`RequestLogRepo::recent_errors`]: content-free error identification, never a body or
+/// upstream error message.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RecentErrorRow {
+    pub status: i64,
+    pub account_id: Option<String>,
+    pub error_code: Option<String>,
+    pub requested_at: i64,
+}
+
 /// Repository over the `request_log` table.
 pub struct RequestLogRepo {
     pool: SqlitePool,
@@ -183,6 +204,50 @@ impl RequestLogRepo {
         let total: i64 = count.build_query_scalar().fetch_one(&self.pool).await?;
 
         Ok((rows, total.max(0) as u64))
+    }
+
+    /// One-query content-free rollup over `request_log` rows at/after `since_ts` — the dashboard
+    /// overview's KPI tile (`GET /api/overview`). `total`/`success`/`error` classify by the same
+    /// status-class rule as [`RequestsFilter::status_class`] (`success` = `status < 300`, `error` =
+    /// `status >= 400`; the gap between them, e.g. 3xx redirects, counts toward `total` only).
+    /// `avg_latency_ms`/`total_tokens` default to `0.0`/`0` (via `COALESCE`) when no row matches,
+    /// so an empty window renders as zeroed KPIs rather than nulls.
+    pub async fn aggregate_since(&self, since_ts: i64) -> Result<RequestAggregate, StoreError> {
+        let row: (i64, i64, i64, f64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), \
+                    COALESCE(SUM(CASE WHEN status < 300 THEN 1 ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END), 0), \
+                    COALESCE(AVG(duration_ms), 0.0), \
+                    COALESCE(SUM(total_tokens), 0) \
+             FROM request_log WHERE requested_at >= ?",
+        )
+        .bind(since_ts)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(RequestAggregate {
+            total: row.0,
+            success: row.1,
+            error: row.2,
+            avg_latency_ms: row.3,
+            total_tokens: row.4,
+        })
+    }
+
+    /// The newest `limit` content-free error rows (`status >= 400`), newest first — the dashboard
+    /// overview's `recent_errors` tile. Deliberately a narrow, dedicated projection (not `page`):
+    /// the overview only ever wants these four fields, and `error_code` (migration 0005) isn't on
+    /// [`RequestLogRow`] — wiring it there is a separate, larger change (every other
+    /// `RequestLogRecord`/`RequestLogRow` call site would need updating) that this dashboard-read
+    /// feature doesn't need.
+    pub async fn recent_errors(&self, limit: i64) -> Result<Vec<RecentErrorRow>, StoreError> {
+        let rows = sqlx::query_as::<_, RecentErrorRow>(
+            "SELECT status, account_id, error_code, requested_at FROM request_log \
+             WHERE status >= 400 ORDER BY requested_at DESC, id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Append a `WHERE ...` clause (or nothing, if `filter` is empty) binding only the filters that
@@ -358,5 +423,98 @@ mod tests {
         let (rows, total) = repo.page(&RequestsFilter::default(), 1, 1).await.unwrap();
         assert_eq!(total, 3);
         assert_eq!(rows.len(), 1);
+    }
+
+    fn row_at(
+        requested_at: i64,
+        status: u16,
+        total_tokens: Option<i64>,
+        duration_ms: i64,
+    ) -> RequestLogRecord {
+        RequestLogRecord {
+            requested_at,
+            provider: "codex".into(),
+            method: "POST".into(),
+            path: "/responses".into(),
+            aliased: false,
+            status,
+            duration_ms,
+            account_id: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            transport: None,
+            ttft_ms: None,
+            total_tokens,
+            cached_tokens: None,
+        }
+    }
+
+    /// `aggregate_since` rolls up ONLY rows at/after `since_ts`, classifying by the same
+    /// status-class rule `page`'s `status_class` filter uses, and defaults an empty window's
+    /// latency/tokens to zero (not null).
+    #[tokio::test]
+    async fn aggregate_since_rolls_up_counts_latency_and_tokens_within_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        repo.insert(&row_at(50, 200, Some(999), 999)).await.unwrap(); // before the window — must not count
+        repo.insert(&row_at(200, 200, Some(1000), 100))
+            .await
+            .unwrap();
+        repo.insert(&row_at(210, 500, Some(2000), 300))
+            .await
+            .unwrap();
+
+        let agg = repo.aggregate_since(200).await.unwrap();
+        assert_eq!(agg.total, 2, "the ts=50 row is outside the window");
+        assert_eq!(agg.success, 1);
+        assert_eq!(agg.error, 1);
+        assert_eq!(agg.total_tokens, 3000);
+        assert_eq!(agg.avg_latency_ms, 200.0, "(100 + 300) / 2");
+
+        let empty = repo.aggregate_since(1_000_000).await.unwrap();
+        assert_eq!(empty.total, 0);
+        assert_eq!(
+            empty.avg_latency_ms, 0.0,
+            "an empty window rolls up to zero, not null"
+        );
+        assert_eq!(empty.total_tokens, 0);
+    }
+
+    /// `recent_errors` returns only `status >= 400` rows, newest first, and honors `limit`.
+    /// `error_code` isn't yet written by `insert()` (only the codex-lb importer populates it via
+    /// raw SQL today — see `import.rs`), so it round-trips as `NULL` until a later task wires a
+    /// native write path for it; `account_id` already round-trips since `insert()` binds it today.
+    #[tokio::test]
+    async fn recent_errors_returns_newest_error_rows_first_and_omits_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        repo.insert(&rec("codex", "/responses", 200, None))
+            .await
+            .unwrap(); // success — excluded
+        repo.insert(&rec("codex", "/responses", 500, None))
+            .await
+            .unwrap();
+        repo.insert(&rec("codex", "/responses", 429, None))
+            .await
+            .unwrap();
+
+        let errors = repo.recent_errors(10).await.unwrap();
+        assert_eq!(errors.len(), 2, "the 200 row is excluded");
+        assert_eq!(
+            errors[0].status, 429,
+            "id DESC tiebreak => most recently inserted first"
+        );
+        assert_eq!(errors[0].account_id.as_deref(), Some("acct-1"));
+        assert!(errors[0].error_code.is_none());
+        assert_eq!(errors[1].status, 500);
+
+        let limited = repo.recent_errors(1).await.unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].status, 429);
     }
 }

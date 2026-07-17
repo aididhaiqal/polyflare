@@ -259,6 +259,217 @@ pub async fn requests_handler(
     })
 }
 
+/// Default lookback window for the overview KPI tile: rolling 24h. Not yet client-configurable
+/// (no query param) — the brief's `Consumes` list is just the store/cache/runtime, and a
+/// dashboard-side "last 24h" default is the common landing-page convention. A `since_ts` override
+/// can be added later the same way `/api/requests` added its own filter set.
+const OVERVIEW_KPI_WINDOW_SECS: i64 = 24 * 3600;
+
+/// How many `recent_errors` rows the overview surfaces.
+const RECENT_ERRORS_LIMIT: i64 = 10;
+
+/// The overview KPI tile: request volume/outcome/latency/token rollup over the last
+/// [`OVERVIEW_KPI_WINDOW_SECS`], straight off [`polyflare_store::RequestAggregate`].
+#[derive(Serialize)]
+struct KpisView {
+    requests: i64,
+    success: i64,
+    errors: i64,
+    /// `success / requests`, or `0.0` when `requests == 0` (avoids a NaN from a 0/0 divide).
+    success_rate: f64,
+    avg_latency_ms: f64,
+    total_tokens: i64,
+}
+
+impl From<polyflare_store::RequestAggregate> for KpisView {
+    fn from(a: polyflare_store::RequestAggregate) -> Self {
+        let success_rate = if a.total > 0 {
+            a.success as f64 / a.total as f64
+        } else {
+            0.0
+        };
+        KpisView {
+            requests: a.total,
+            success: a.success,
+            errors: a.error,
+            success_rate,
+            avg_latency_ms: a.avg_latency_ms,
+            total_tokens: a.total_tokens,
+        }
+    }
+}
+
+/// One provider's quota tile. `five_hour`/`weekly` are remaining-percent (`100 - used_percent`),
+/// the WORST CASE (minimum remaining) across that provider's accounts — the number that matters
+/// for "are we about to run out of capacity", not an average that would hide one exhausted account
+/// behind many fresh ones.
+///
+/// # Known simplification
+/// These come from `AccountCache::snapshots()`'s `used_percent`/`secondary_used_percent`, which
+/// `assemble_snapshots` defaults to `0.0` when upstream isn't reporting a window at all (see
+/// `crate::snapshot`) — i.e. this layer cannot distinguish "genuinely 0% used" from "no window
+/// reported". `/api/accounts` gets that distinction from a richer per-account query
+/// (`usage_windows::resolve` over `repo.latest_usage`); re-deriving that here per provider is
+/// deferred until a real need for it shows up. Both windows are therefore always present for any
+/// provider with at least one account.
+#[derive(Serialize)]
+struct ProviderQuotaView {
+    provider: String,
+    five_hour: f64,
+    weekly: f64,
+}
+
+/// One pool's account/availability counts for the overview (computed inline from
+/// `account_cache.snapshots()` — NOT sourced from `/api/pools`, which is extended separately).
+/// `available` uses the same eligibility rule as the top-level `accounts_available` (see
+/// [`is_available`]), scoped to this pool.
+#[derive(Serialize)]
+struct PoolOverviewView {
+    pool: Option<String>,
+    accounts: usize,
+    available: usize,
+}
+
+/// One `recent_errors` row: content-free error identification, never a body or upstream message.
+#[derive(Serialize)]
+struct RecentErrorView {
+    status: i64,
+    account_id: Option<String>,
+    error_code: Option<String>,
+    requested_at: i64,
+}
+
+impl From<polyflare_store::RecentErrorRow> for RecentErrorView {
+    fn from(r: polyflare_store::RecentErrorRow) -> Self {
+        RecentErrorView {
+            status: r.status,
+            account_id: r.account_id,
+            error_code: r.error_code,
+            requested_at: r.requested_at,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct OverviewView {
+    kpis: KpisView,
+    /// One entry per provider PRESENT in the account pool (a provider with zero accounts is
+    /// omitted entirely — never a zeroed placeholder entry).
+    quota: Vec<ProviderQuotaView>,
+    pools: Vec<PoolOverviewView>,
+    /// Count of accounts eligible for routing right now (see [`is_available`]), across ALL pools.
+    accounts_available: usize,
+    recent_errors: Vec<RecentErrorView>,
+}
+
+/// An account counts as "available" for the dashboard's headline number when its durable status is
+/// `active` AND it isn't currently benched by the live runtime overlay (`cooldown_until` absent or
+/// already elapsed). This mirrors (a coarse approximation of) the selector's own eligibility gate
+/// without re-deriving its full state-machine (rate_limited/quota_exceeded reset logic, error
+/// backoff) here — good enough for a dashboard headline, not a routing decision.
+fn is_available(snap: &polyflare_core::AccountSnapshot, now: i64) -> bool {
+    snap.status == "active" && snap.cooldown_until.is_none_or(|cd| cd < now)
+}
+
+/// `GET /api/overview` — the dashboard landing-page aggregates: request KPIs (rolling 24h),
+/// per-provider quota headroom, per-pool account/availability counts, the global available-account
+/// count, and the most recent errors. Every field is a content-free aggregate/metric/identifier —
+/// never a request body, token, or conversation content.
+pub async fn overview_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let now = unix_now();
+
+    let kpis = match state
+        .store
+        .request_log()
+        .aggregate_since(now - OVERVIEW_KPI_WINDOW_SECS)
+        .await
+    {
+        Ok(a) => KpisView::from(a),
+        Err(_) => return Response::error(),
+    };
+
+    let recent_errors = match state
+        .store
+        .request_log()
+        .recent_errors(RECENT_ERRORS_LIMIT)
+        .await
+    {
+        Ok(rows) => rows.into_iter().map(RecentErrorView::from).collect(),
+        Err(_) => return Response::error(),
+    };
+
+    let snapshots = match state.account_cache.snapshots(&state.store).await {
+        Ok(s) => s,
+        Err(_) => return Response::error(),
+    };
+    // The cache's `Arc<Vec<..>>` is shared; the runtime overlay mutates in place, so clone the
+    // slice into an owned `Vec` first (same pattern the ingress path uses before `Selector::pick`).
+    let mut snapshots = (*snapshots).clone();
+    state.runtime.overlay(&mut snapshots, now);
+
+    let accounts_available = snapshots.iter().filter(|s| is_available(s, now)).count();
+
+    // Pools: group by `pool` (None = unpooled), counting total + available per group. Named pools
+    // alphabetically first, unpooled group last — same convention as `/api/pools`.
+    let mut by_pool: std::collections::BTreeMap<Option<String>, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    for snap in &snapshots {
+        let entry = by_pool.entry(snap.pool.clone()).or_insert((0, 0));
+        entry.0 += 1;
+        if is_available(snap, now) {
+            entry.1 += 1;
+        }
+    }
+    let unpooled = by_pool.remove(&None);
+    let mut pools: Vec<PoolOverviewView> = by_pool
+        .into_iter()
+        .map(|(pool, (accounts, available))| PoolOverviewView {
+            pool,
+            accounts,
+            available,
+        })
+        .collect();
+    if let Some((accounts, available)) = unpooled {
+        pools.push(PoolOverviewView {
+            pool: None,
+            accounts,
+            available,
+        });
+    }
+
+    // Quota: group by provider, taking the MINIMUM remaining-percent (i.e. the account closest to
+    // exhausted) across each provider's accounts per window.
+    let mut by_provider: std::collections::BTreeMap<String, (f64, f64)> =
+        std::collections::BTreeMap::new();
+    for snap in &snapshots {
+        let remaining_5h = 100.0 - snap.used_percent;
+        let remaining_weekly = 100.0 - snap.secondary_used_percent;
+        by_provider
+            .entry(snap.provider.to_string())
+            .and_modify(|(five, weekly)| {
+                *five = five.min(remaining_5h);
+                *weekly = weekly.min(remaining_weekly);
+            })
+            .or_insert((remaining_5h, remaining_weekly));
+    }
+    let quota = by_provider
+        .into_iter()
+        .map(|(provider, (five_hour, weekly))| ProviderQuotaView {
+            provider,
+            five_hour,
+            weekly,
+        })
+        .collect();
+
+    Response::ok(OverviewView {
+        kpis,
+        quota,
+        pools,
+        accounts_available,
+        recent_errors,
+    })
+}
+
 /// A tiny JSON responder: `Ok(200, body)` or a content-safe `500` (the store error's own text is
 /// never surfaced — a read failure returns a generic body, like the ingress error paths).
 enum Response<T: Serialize> {
