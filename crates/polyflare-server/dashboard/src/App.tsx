@@ -1,6 +1,6 @@
-// QueryClientProvider → BrowserRouter → AuthProvider → Routes. This wires the app shell for good
-// (provider stack + route tree); the per-page placeholders below are the only remaining TEMPORARY
-// pieces — each later page task replaces its own placeholder route element.
+// QueryClientProvider → BrowserRouter → AuthProvider → Routes. This wires the app shell (provider
+// stack + route tree); every route now points at a real page (Task 10 — Live Logs — was the last
+// placeholder route, see progress.md).
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 
@@ -8,6 +8,7 @@ import { AuthProvider, RequireAuth } from "./auth/AuthProvider";
 import { CapabilitiesProvider } from "./capabilities/CapabilitiesProvider";
 import { AccountDetail } from "./pages/AccountDetail";
 import { Accounts } from "./pages/Accounts";
+import { LiveLogs } from "./pages/LiveLogs";
 import { Login } from "./pages/Login";
 import { Overview } from "./pages/Overview";
 import { Pools } from "./pages/Pools";
@@ -22,11 +23,6 @@ const queryClient = new QueryClient({
     },
   },
 });
-
-// TEMPORARY — each later page task supplies the real route element.
-function RoutePlaceholder({ label }: { label: string }) {
-  return <div className="text-fg">{label} (todo)</div>;
-}
 
 export function App() {
   return (
@@ -50,7 +46,7 @@ export function App() {
               <Route path="accounts/:id" element={<AccountDetail />} />
               <Route path="pools" element={<Pools />} />
               <Route path="requests" element={<Requests />} />
-              <Route path="logs" element={<RoutePlaceholder label="Logs" />} />
+              <Route path="logs" element={<LiveLogs />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Route>
           </Routes>

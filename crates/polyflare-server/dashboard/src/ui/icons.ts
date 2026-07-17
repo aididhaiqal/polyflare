@@ -23,10 +23,16 @@
 // replaces the mockup's plain "Re-authenticate" label glyph, `Download` is "Export auth", `Zap` is
 // "Force probe", `Flame` is "Limit warm-up" (thematically apt for a PolyFlare warm-up affordance).
 // All four are rendered only inside disabled/non-functional controls — see task-7-report.md.
+//
+// Play/ArrowDownToLine/EyeOff are Task 10 additions for the Live Logs console
+// (`live-logs.html`): `Play` is the Resume affordance (paired with the existing `Pause`), the
+// mockup's own "auto-scroll" glyph isn't a real icon so `ArrowDownToLine` (scroll-to-bottom) is
+// its lucide replacement, and `EyeOff` fronts the flag-off disabled notice. See task-10-report.md.
 export {
   Activity,
   AlertTriangle,
   ArrowDown,
+  ArrowDownToLine,
   BarChart3,
   CheckCircle2,
   ChevronDown,
@@ -35,6 +41,7 @@ export {
   Clock,
   Coins,
   Download,
+  EyeOff,
   Flame,
   Key,
   Layers,
@@ -45,6 +52,7 @@ export {
   Moon,
   Pause,
   Pencil,
+  Play,
   RotateCcw,
   Route,
   Search,
