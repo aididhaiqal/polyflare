@@ -56,6 +56,13 @@ pub enum WatchdogError {
     Upstream(Option<polyflare_core::FailureSignal>),
     #[error("continuity recovery unavailable")]
     Continuity,
+    /// A streamed `response.failed` carrying `error.code == "cyber_policy"` (codex-rs wire truth:
+    /// `codex-api/src/sse/responses.rs` `is_cyber_policy_error`), detected via peek-before-relay —
+    /// no client byte was written before this was returned. Content-safe: `capability` is a fixed
+    /// label, never the frame's `message`. TA6(b) Task 2 consumes this to trigger a reselect onto a
+    /// `security_work_authorized` account; THIS type only detects + surfaces — no reroute here.
+    #[error("capability rejection: {capability}")]
+    CapabilityRejection { capability: &'static str },
 }
 
 /// HARD ownership pre-filter: narrow candidates to the pinned owner BEFORE `Selector::pick` (no
@@ -147,6 +154,26 @@ pub async fn execute_with_watchdog(
                 .map_err(|e| WatchdogError::Upstream(e.failure_signal()))?;
             match tokio::time::timeout(timeout, stream.next()).await {
                 Ok(Some(Ok(first))) => {
+                    // TA6(b) Task 1: a cyber-policy rejection fails the turn BEFORE producing
+                    // output, so in the common case it IS this first frame — the same
+                    // peek-before-relay point the wedge fix's "ALIVE" check already uses. Detect it
+                    // HERE, before ever rebuilding/relaying, and surface a distinct, content-safe
+                    // signal instead of treating it as alive. No reroute in this task (TA6b Task 2
+                    // consumes the signal); a NON-cyber `response.failed` (or anything else) falls
+                    // through to the unchanged "ALIVE" path below exactly as before.
+                    if is_cyber_policy_rejection(&first) {
+                        let _ = continuity
+                            .observe(
+                                TurnOutcome::Failed {
+                                    session_key: session_key.clone(),
+                                },
+                                &ctx,
+                            )
+                            .await;
+                        return Err(WatchdogError::CapabilityRejection {
+                            capability: "security_work",
+                        });
+                    }
                     // ALIVE: rebuild the full stream (peek-before-relay) + sniff + observe(Completed).
                     let rebuilt: ResponseStream = Box::pin(
                         stream::once(async move { Ok::<Bytes, ExecError>(first) }).chain(stream),
@@ -352,6 +379,40 @@ fn extract_response_id(buf: &[u8]) -> Option<String> {
     None
 }
 
+/// Returns `true` iff `buf` (raw SSE bytes from a single peeked chunk) contains a terminal
+/// `response.failed` frame whose `response.error.code == "cyber_policy"` — the wire truth
+/// (`codex-rs`'s `codex-api/src/sse/responses.rs` `is_cyber_policy_error`: `error.code.as_deref()
+/// == Some("cyber_policy")`). Content-safety: reads ONLY `type` and the nested `response.error.code`
+/// — the frame's `message` is never read into any local, returned, or logged value (mirrors
+/// `polyflare_codex::executor::extract_error_code`'s code-only extraction for the non-2xx path).
+/// Unparsable/absent/non-matching input is always `false` — never treated as an error here.
+fn is_cyber_policy_rejection(buf: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(buf);
+    for line in text.lines() {
+        let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if payload == "[DONE]" {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("response.failed") {
+            continue;
+        }
+        let code = v
+            .get("response")
+            .and_then(|r| r.get("error"))
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str());
+        if code == Some("cyber_policy") {
+            return true;
+        }
+    }
+    false
+}
+
 enum ObserveState {
     Streaming,
     Observing(Pin<Box<dyn Future<Output = ()> + Send>>),
@@ -479,5 +540,44 @@ mod tests {
             WatchdogError::Continuity.to_string(),
             "continuity recovery unavailable"
         );
+    }
+
+    #[test]
+    fn detects_cyber_policy_response_failed() {
+        let sse = concat!(
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_x\",",
+            "\"error\":{\"code\":\"cyber_policy\",\"message\":\"do not leak this\"}}}\n\n",
+        )
+        .as_bytes();
+        assert!(is_cyber_policy_rejection(sse));
+    }
+
+    #[test]
+    fn ignores_non_cyber_response_failed() {
+        let sse = concat!(
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_x\",",
+            "\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"slow down\"}}}\n\n",
+        )
+        .as_bytes();
+        assert!(!is_cyber_policy_rejection(sse));
+    }
+
+    #[test]
+    fn ignores_non_failed_frames_and_garbage() {
+        assert!(!is_cyber_policy_rejection(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+        ));
+        assert!(!is_cyber_policy_rejection(b"data: [DONE]\n\n"));
+        assert!(!is_cyber_policy_rejection(b"not sse at all"));
+        assert!(!is_cyber_policy_rejection(b""));
+    }
+
+    #[test]
+    fn capability_rejection_display_never_carries_a_message() {
+        let err = WatchdogError::CapabilityRejection {
+            capability: "security_work",
+        };
+        assert_eq!(err.to_string(), "capability rejection: security_work");
+        assert!(!format!("{err:?}").contains("message"));
     }
 }
