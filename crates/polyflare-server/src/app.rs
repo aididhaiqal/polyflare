@@ -16,6 +16,7 @@ use polyflare_store::{Store, TokenCipher};
 
 use crate::ingress::{
     messages_handler, pooled_messages_handler, pooled_responses_handler, responses_handler,
+    websocket_fallback_handler,
 };
 use crate::refresh_locks::RefreshLocks;
 
@@ -135,13 +136,26 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         ));
 
     Router::new()
-        .route("/responses", post(responses_handler))
+        // `GET` on these two Codex-native proxy paths is a WebSocket-handshake attempt from a
+        // WS-capable Codex client, never a real request — Codex only ever POSTs `/responses`.
+        // Answering it with `426 Upgrade Required` (rather than falling through to axum's default
+        // 405) is a temporary correctness shim so such a client degrades to HTTP-SSE instead of
+        // hard-failing; see `crate::ingress::websocket_fallback_handler`'s doc for the full
+        // rationale. `/v1/messages` is the Anthropic-format path — Codex never opens a WS there,
+        // so it's deliberately left without this GET handler.
+        .route(
+            "/responses",
+            post(responses_handler).get(websocket_fallback_handler),
+        )
         .route("/v1/messages", post(messages_handler))
         // Pooled variants: `/{pool}/…` narrows selection to accounts tagged with that pool slug
         // (see `filter_by_pool`). The bare paths above keep selecting over ALL accounts. The
         // `{pool}` segment is a param, so it never shadows the literal single-segment `/responses`
         // or the `/v1/*` / `/models` routes — matchit prefers a static segment over a param one.
-        .route("/{pool}/responses", post(pooled_responses_handler))
+        .route(
+            "/{pool}/responses",
+            post(pooled_responses_handler).get(websocket_fallback_handler),
+        )
         .route("/{pool}/v1/messages", post(pooled_messages_handler))
         // Model catalog (read-only GETs): real Codex models (bootstrap floor for now) merged with
         // PolyFlare's synthetic aliases. Routing is by method+path, so these never conflict with

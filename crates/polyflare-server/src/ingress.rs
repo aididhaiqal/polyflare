@@ -410,6 +410,41 @@ pub async fn pooled_responses_handler(
     responses_route(state, Some(pool), headers, body).await
 }
 
+/// Answers a `GET` on the Codex-native `/responses` (and `/{pool}/responses`) path with
+/// `426 Upgrade Required`, so a WebSocket-capable Codex client cleanly and permanently falls back
+/// to HTTP-SSE for the rest of that session, instead of hard-failing.
+///
+/// WHY 426 specifically — do not "helpfully" change this to a 404 or 501: the real Codex CLI's
+/// WS→HTTP fallback logic (`codex-rs/core/src/client.rs`, ~line 1596) checks for exactly
+/// `StatusCode::UPGRADE_REQUIRED` at WS-handshake time. That is the SOLE trigger for
+/// `WebsocketStreamOutcome::FallbackToHttp`, which flips `force_http_fallback` — a
+/// session-lifetime, one-way switch, so the client never re-attempts WS again this session. Any
+/// other status (404, 405, 500, …) is NOT recognized as a fallback signal by Codex; it surfaces as
+/// a hard client error instead of a degrade.
+///
+/// PolyFlare has no WebSocket support at all today. Without this route, a client configured with
+/// `supports_websockets = true` sends a `GET` upgrade request here, axum's default routing 405s
+/// it (Method Not Allowed on a POST-only route), and the client hard-fails instead of degrading.
+///
+/// This is a deliberate, TEMPORARY correctness shim, not a permanent refusal: real WebSocket
+/// support is a planned future milestone. When it lands, this handler should be replaced by an
+/// actual upgrade handshake on these paths, not simply deleted — until then, 426 is the correct
+/// steady-state answer to a WS attempt here.
+///
+/// Answers unconditionally on `GET` — it does not inspect `Upgrade`/`Connection` request headers
+/// to distinguish a genuine WS handshake from a plain browser GET. That's the simpler option, and
+/// it cannot mislead either way: `/responses` and `/{pool}/responses` are POST-only Codex-proxy
+/// endpoints with no legitimate GET use, so a 426 with an explanatory body is an accurate answer
+/// to any GET here, not just an upgrade attempt. Gating on headers would add parsing complexity
+/// (and a header-shape assumption) for no correctness benefit.
+pub async fn websocket_fallback_handler() -> Response {
+    (
+        StatusCode::UPGRADE_REQUIRED,
+        "PolyFlare serves HTTP-SSE only on this endpoint; WebSocket upgrades are not supported.",
+    )
+        .into_response()
+}
+
 /// Shared `/responses` route: thin timing + content-safe logging wrapper around
 /// [`responses_handler_impl`], parameterized by the optional account-pool slug. See
 /// `crate::observability` for the content-safety constraint on what may be logged.
