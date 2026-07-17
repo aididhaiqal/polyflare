@@ -36,6 +36,34 @@ So mirror codex-lb's split:
 
 Without this the already-built waterfall and eligibility gates do nothing.
 
+> **STATUS (audited 2026-07-17 against `feat/dashboard-phase1-frontend`).** Most of Phase A already
+> shipped; this section's "large / do first" framing predates that work.
+> - **A1 substrate — DONE.** `RuntimeState`/`RuntimeStates` (`runtime_state.rs:49-69`), overlaid pre-selection,
+>   single write funnel `record_failure` (`ingress.rs:74-88`). Caveat: the classifier is inlined (no
+>   standalone `classify_upstream_failure()`) and produces only 2 of 4 buckets — `rate_limit` + `transient`.
+>   No `quota`/`permanent` bucket, because `FailureSignal` (`polyflare-core/src/types.rs:55-60`) carries only
+>   `{status, retry_after}` — no error-code string. Client-disconnect neutrality holds (emergent Stream-drop).
+> - **A2 rate-limit — DONE.** `record_rate_limit` (`runtime_state.rs:117-130`): error_count++, last_error_at,
+>   Retry-After-else-`backoff_secs`, 30s floor + 24h ceiling, never-shortens. Jitter correctly deferred to B10;
+>   `resets_at→reset_at` is N/A per this doc's own cooldown-only simplification. Tested end-to-end (`failure_routing.rs`).
+> - **A3 transient/success/decays — DONE.** `record_transient_error` + `record_success` (zeros error_count,
+>   nulls last_error_at), both decays in `select.rs::eligibility` (cooldown-elapsed clear + error_count≥3
+>   backoff admit), wired at the watchdog success/error paths (`watchdog.rs:381-430`).
+> - **A6 quota — PARTIAL (dead code).** `record_quota_exceeded` (`runtime_state.rs:135-140`, correct: +120s
+>   cooldown, no error_count bump) exists + unit-tested but has **zero call sites** — nothing on the request
+>   path can distinguish quota from rate-limit. The quota *outcome* is separately covered by the
+>   `usage_refresh.rs` poller writing durable `status`, so practical impact is soft.
+> - **A7 permanent/auth — ABSENT on the request path.** `classify_failure`'s code table (`oauth.rs:105-123`)
+>   is wired ONLY for OAuth-refresh failures; an upstream 401 `invalid_grant` on `/responses` falls through to
+>   generic transient and self-heals instead of parking `reauth_required`.
+>
+> **Genuine remaining A-work = one coherent task, gated behind M5a** (it extends `ExecError::UpstreamStatus`,
+> which the in-flight WS executor also produces — do NOT build concurrently with M5a): extend the failure
+> signal to carry a parsed upstream **error-code string**, then route it through the existing `classify_failure`
+> table so A7 parks permanent/auth accounts durably, and either call the already-built `record_quota_exceeded`
+> from a real quota-vs-rate-limit distinction (A6) or retire it in favor of the `usage_refresh` poller. A1/A2/A3
+> need no further build; only the classifier's bucket count grows once the code string exists.
+
 ### A1. Runtime-state substrate + failure classifier → dispatch funnel  · HIGH · large
 The keystone. Build `RuntimeState` (above) + a single write funnel:
 `classify_upstream_failure()` bucketing every upstream failure into `{rate_limit, quota, permanent,
