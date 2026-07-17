@@ -635,7 +635,15 @@ mod tests {
 
     #[tokio::test]
     async fn second_execute_call_same_session_reuses_the_connection_and_sends_a_real_delta() {
+        // 4 scripted turns: this test now drives FOUR sequential executor.execute() calls, not
+        // two. The original 2-turn version of this test is exactly why the "delta reverts to
+        // full-resend every OTHER turn" regression shipped silently — it stopped looking right
+        // after the one turn that happened to still work. Turns 3 and 4 are the regression guard:
+        // per SPEC-M5-WEBSOCKET.md §2, the HTTP client resends the FULL accumulated history every
+        // turn, so turn 3's body already has 4 items (2 from turn 1, 1 new in turn 2, 1 new here).
         let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::normal(vec![]),
             ScriptedTurn::normal(vec![]),
             ScriptedTurn::normal(vec![]),
         ]);
@@ -676,6 +684,69 @@ mod tests {
             "turn 2 must send ONLY the one new item — this is the delta actually being a delta, \
              not merely 'nothing failed'"
         );
+
+        // Turn 3 — THE REGRESSION GUARD: the client resends the full accumulated history (4
+        // items: item0, item1 from turn 1, item2 from turn 2, item3 new here). The socket's
+        // `last_item_hashes` must reflect the FULL 3-item history it holds after turn 2 (item0,
+        // item1, item2), not merely the 1-item wire suffix turn 2 actually sent — otherwise
+        // this 4-item body has no valid recorded prefix to extend and silently falls back to a
+        // full resend (the bug this test exists to catch).
+        let body3 = json!({
+            "model": "gpt-5.6-sol",
+            "input": [item(0), item(1), item(2), item(3)],
+        });
+        let stream3 = executor
+            .execute(prepared(body3), &account, &ctx)
+            .await
+            .expect("turn 3 must succeed");
+        drain(stream3).await;
+
+        assert_eq!(
+            mock.last_frame_anchor(),
+            Some("resp_2".to_string()),
+            "turn 3 must anchor on turn 2's completion id (resp_2) — the bug forgets the \
+             accumulated history and forces an unanchored Full resend here instead"
+        );
+        assert_eq!(
+            mock.last_frame_input_len(),
+            Some(1),
+            "turn 3 must send ONLY the single newest item (item3), not the full 4-item history"
+        );
+
+        // Turn 4 — proves the chain holds indefinitely, not just for one extra turn past the
+        // point the bug used to bite.
+        let body4 = json!({
+            "model": "gpt-5.6-sol",
+            "input": [item(0), item(1), item(2), item(3), item(4)],
+        });
+        let stream4 = executor
+            .execute(prepared(body4), &account, &ctx)
+            .await
+            .expect("turn 4 must succeed");
+        drain(stream4).await;
+
+        assert_eq!(
+            mock.last_frame_anchor(),
+            Some("resp_3".to_string()),
+            "turn 4 must still be a delta, anchored on turn 3's completion id (resp_3)"
+        );
+        assert_eq!(
+            mock.last_frame_input_len(),
+            Some(1),
+            "turn 4 must still send only the single newest item (item4)"
+        );
+
+        assert_eq!(
+            mock.handshake_count(),
+            1,
+            "all four turns must stay on the SAME connection throughout"
+        );
+        let frames = mock.frames();
+        assert_eq!(frames.len(), 4);
+        assert_eq!(frames[0].input_len, 2, "turn 1: full 2-item send");
+        assert_eq!(frames[1].input_len, 1, "turn 2: 1-item delta");
+        assert_eq!(frames[2].input_len, 1, "turn 3: 1-item delta (the regression guard)");
+        assert_eq!(frames[3].input_len, 1, "turn 4: 1-item delta (the chain holds)");
     }
 
     // ---- Row: previous_response_not_found -> strip anchor, full resend, SAME socket, bounded ---
