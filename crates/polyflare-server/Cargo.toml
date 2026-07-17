@@ -46,6 +46,18 @@ sqlx = { workspace = true }
 tempfile = { workspace = true }
 zeroize = { workspace = true }
 base64 = { workspace = true }
-# ws_vs_sse_probe example only: a WebSocket client for the Codex backend POC. Pinned to the same
+# ws_vs_sse_probe example: a WebSocket client for the Codex backend POC. Pinned to the same
 # rustls 0.23 the workspace uses so it reuses the installed aws-lc-rs crypto provider.
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+#
+# M5a deflate adoption: bumped from 0.26 to 0.28.0 (the same `[patch.crates-io]`-redirected
+# OpenAI fork `polyflare-codex` now pins — see workspace root `Cargo.toml`) SPECIFICALLY so
+# `ws_deflate_probe.rs` can build a real `WebSocketConfig` with `permessage_deflate` enabled and
+# thereby actually exercise decode support live, mirroring `ws::conn::WsConn::connect` instead of
+# hand-writing the `Sec-WebSocket-Extensions` header (which the fork's client handshake now
+# rejects with `InvalidHeader` unless the response's confirmed extension matches a real client
+# config — see `.superpowers/sdd/m5a-deflate-forks-report.md`).
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
+# `tungstenite::extensions::{ExtensionsConfig, compression::deflate::DeflateConfig}` /
+# `tungstenite::protocol::WebSocketConfig` for `ws_deflate_probe.rs` — same versions/forks as
+# `polyflare-codex`'s direct dependency.
+tungstenite = { version = "0.27.0", features = ["deflate"] }

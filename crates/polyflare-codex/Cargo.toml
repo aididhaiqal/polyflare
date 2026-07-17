@@ -35,13 +35,21 @@ rand = { workspace = true }
 # (`login/src/auth/default_client.rs` in `openai/codex`) — see `codex_headers.rs`.
 os_info = "3"
 # M5a: the WS upstream transport (`ws::conn::WsConn`) lives here beside `CodexExecutor` — this
-# crate is where WS is in-scope per the module doc above. Promoted from `polyflare-server`'s
-# `[dev-dependencies]` (where it still remains, for the `ws_vs_sse_probe` example) to a real
-# dependency here, now that a non-POC caller exists. Same major.minor + the same
-# `rustls-tls-webpki-roots` feature as that dev-dependency, so it resolves to the identical
-# `rustls = "=0.23.36"` / `aws-lc-rs = "=1.16.2"` this crate already pins (see above) rather than
-# pulling a second TLS stack.
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+# crate is where WS is in-scope per the module doc above.
+#
+# M5a deflate adoption: pinned to the exact same version + `[patch]`-redirected git forks as
+# codex-rs's own `codex-rs/Cargo.toml` (`tokio-tungstenite` 0.28.0, `tungstenite` 0.27.0 — see the
+# workspace root `Cargo.toml` for the `[patch.crates-io]` entries and the supply-chain note).
+# `rustls-tls-native-roots` (not `-webpki-roots`) now matches codex's own pin exactly, and the
+# native root store this crate's `reqwest` client already uses (see above). The forks pin the
+# same `rustls = 0.23.36` / `aws-lc-rs = 1.16.2` this crate already pins, verified via
+# `cargo tree -d` — no second TLS stack is introduced.
+tokio-tungstenite = { version = "0.28.0", features = ["proxy", "rustls-tls-native-roots"] }
+# Depended on directly (not just via `tokio_tungstenite::tungstenite::*`) to mirror codex-rs's own
+# import style for `tungstenite::extensions::{ExtensionsConfig, compression::deflate::DeflateConfig}`
+# and `tungstenite::protocol::WebSocketConfig` (see `codex-api/src/endpoint/responses_websocket.rs`
+# `websocket_config()`), which `ws::conn::WsConn::connect` now mirrors to enable permessage-deflate.
+tungstenite = { version = "0.27.0", features = ["deflate", "proxy"] }
 
 [dev-dependencies]
 polyflare-testkit = { path = "../polyflare-testkit" }

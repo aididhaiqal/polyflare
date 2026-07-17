@@ -1,20 +1,26 @@
-//! ws_deflate_probe — empirical check: does the LIVE Codex backend ACCEPT the
-//! `permessage-deflate` WebSocket extension when PolyFlare offers it?
+//! ws_deflate_probe — empirical check: with the M5a OpenAI-fork adoption
+//! (`.superpowers/sdd/m5a-deflate-forks-report.md`), can PolyFlare actually decode the
+//! `permessage-deflate` frames the LIVE Codex backend sends once it confirms the offer?
 //!
-//! Why this matters: `crates/polyflare-codex/src/ws/conn.rs` (`WsConn::connect`, commit `5c661a6`)
-//! sends `Sec-WebSocket-Extensions: permessage-deflate` on every WS handshake for codex-parity
-//! fingerprinting, but `tokio-tungstenite` 0.26 has NO deflate feature at all — it can offer the
-//! extension but cannot negotiate or decompress it. If the backend actually CONFIRMS the offer
-//! (echoes `Sec-WebSocket-Extensions` in its 101 response), every subsequent frame arrives
-//! deflate-compressed and any future frame codec built on top of this transport will choke on
-//! garbage bytes. If the backend ignores the offer, the header is free fingerprint parity and
-//! frames stay plain UTF-8 JSON. This example measures which is true against the real backend —
-//! it does not guess from documentation.
+//! History: `crates/polyflare-codex/src/ws/conn.rs` (`WsConn::connect`) originally sent
+//! `Sec-WebSocket-Extensions: permessage-deflate` on every WS handshake for codex-parity
+//! fingerprinting, but stock `tokio-tungstenite` 0.26 has NO deflate feature at all — it could
+//! offer the extension but not negotiate or decompress it
+//! (`.superpowers/sdd/m5a-deflate-probe-report.md` measured this: the backend confirmed the
+//! offer, then the first frame killed the connection, "Reserved bits are non-zero"). The offer
+//! was withheld (commit `c497a39`) until real decode support existed. It now does: this crate is
+//! pinned to the same `openai-oss-forks/tokio-tungstenite` + `openai-oss-forks/tungstenite-rs`
+//! revs codex-rs itself uses (workspace root `Cargo.toml`'s `[patch.crates-io]`). This probe
+//! re-measures with that support in place.
 //!
-//! Connects TWICE, same live account:
-//!   1. WITH the offer — header construction mirrors `WsConn::connect` exactly (same
-//!      `OpenAI-Beta` value, same `Sec-WebSocket-Extensions: permessage-deflate` literal).
-//!   2. WITHOUT the offer — control, isolates the effect of the header alone.
+//! Connects TWICE, same live account, each via `connect_async_with_config` with a real
+//! `WebSocketConfig` (the library's own negotiation/decode mechanism — never a hand-written
+//! `Sec-WebSocket-Extensions` header; the fork's client handshake rejects a server-confirmed
+//! extension the client's own config didn't declare):
+//!   1. WITH the offer — `extensions.permessage_deflate = Some(DeflateConfig::default())`,
+//!      exactly mirroring `ws::conn::WsConn::connect`'s config (same `OpenAI-Beta` value too).
+//!   2. WITHOUT the offer — control, `WebSocketConfig::default()` (no extensions configured),
+//!      isolates the effect of the offer alone.
 //!
 //! For each connect: prints the full 101 response header list (names + values — these are
 //! SERVER-originated response headers, never our credentials, but `set-cookie`/`cookie` are
@@ -44,14 +50,14 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
+use tungstenite::extensions::compression::deflate::DeflateConfig;
+use tungstenite::extensions::ExtensionsConfig;
+use tungstenite::protocol::WebSocketConfig;
 
 const WS_URL: &str = "wss://chatgpt.com/backend-api/codex/responses";
 const AUTH_BASE: &str = "https://auth.openai.com";
 /// Ground truth §7.2 / `WsConn::connect` (`conn.rs:34`) — inserted exactly once, exact value.
 const OPENAI_BETA_WS: &str = "responses_websockets=2026-02-06";
-/// The literal offer `WsConn::connect` sends (`conn.rs:118`).
-const PERMESSAGE_DEFLATE: &str = "permessage-deflate";
-
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -128,11 +134,10 @@ fn is_sensitive_header(name: &str) -> bool {
 }
 
 /// Build the WS upgrade request: `codex_headers` first, then `OpenAI-Beta` (always — mirrors
-/// `WsConn::connect`), then `Sec-WebSocket-Extensions: permessage-deflate` ONLY if `offer_deflate`.
-fn build_request(
-    hdrs: &[(String, String)],
-    offer_deflate: bool,
-) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+/// `WsConn::connect`). No `Sec-WebSocket-Extensions` header here — that's negotiated by the
+/// library itself from the `WebSocketConfig` passed to `connect_async_with_config` (see
+/// `ws_config_for`), the same mechanism `WsConn::connect` uses.
+fn build_request(hdrs: &[(String, String)]) -> tokio_tungstenite::tungstenite::handshake::client::Request {
     let mut req = WS_URL.into_client_request().expect("ws request");
     let headers = req.headers_mut();
     for (name, value) in hdrs {
@@ -145,13 +150,22 @@ fn build_request(
         HeaderName::from_static("openai-beta"),
         HeaderValue::from_static(OPENAI_BETA_WS),
     );
-    if offer_deflate {
-        headers.insert(
-            HeaderName::from_static("sec-websocket-extensions"),
-            HeaderValue::from_static(PERMESSAGE_DEFLATE),
-        );
-    }
     req
+}
+
+/// Mirrors `ws::conn::WsConn`'s (private) `ws_config()` exactly: `permessage_deflate =
+/// Some(DeflateConfig::default())` when offering, `WebSocketConfig::default()` (no extensions)
+/// otherwise. Duplicated here (rather than imported) because this probe lives in a different
+/// crate (`polyflare-server`) than `WsConn` (`polyflare-codex`), and `ws_config()` is private —
+/// kept private there because production code has no other caller for it.
+fn ws_config_for(offer_deflate: bool) -> WebSocketConfig {
+    let mut config = WebSocketConfig::default();
+    if offer_deflate {
+        let mut extensions = ExtensionsConfig::default();
+        extensions.permessage_deflate = Some(DeflateConfig::default());
+        config.extensions = extensions;
+    }
+    config
 }
 
 /// One frame's readability classification.
@@ -165,10 +179,11 @@ enum FrameReadability {
 /// and classify every frame that comes back as readable plain JSON or not.
 async fn run_variant(label: &str, hdrs: &[(String, String)], model: &str, offer_deflate: bool) {
     println!("\n■ {label}  (offer permessage-deflate = {offer_deflate})");
-    let req = build_request(hdrs, offer_deflate);
+    let req = build_request(hdrs);
+    let config = ws_config_for(offer_deflate);
     let connect = tokio::time::timeout(
         Duration::from_secs(20),
-        tokio_tungstenite::connect_async(req),
+        tokio_tungstenite::connect_async_with_config(req, Some(config), false),
     )
     .await;
     let (mut ws, resp) = match connect {

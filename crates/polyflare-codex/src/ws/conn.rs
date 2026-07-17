@@ -9,33 +9,38 @@
 //! server has supplied a value (never invented client-side). That's the opposite of the HTTP
 //! path, which sends it as a real header (`client.rs:1146`).
 //!
-//! **`permessage-deflate`: deliberately NOT offered — a known fingerprint divergence, not an
-//! oversight.** Real codex DOES offer it (ground truth §1; `codex-rs/codex-api/src/endpoint/
-//! responses_websocket.rs:546-553`'s `websocket_config()` sets `extensions.permessage_deflate =
-//! Some(DeflateConfig::default())`). This crate omits the offer because it cannot decode the
-//! extension if the backend accepts it: `deflate` is not a real Cargo feature of stock
-//! `tungstenite`/`tokio-tungstenite` (verified: `cargo add tungstenite@0.27 --features deflate` →
-//! `error: unrecognized feature for crate tungstenite: deflate`). Codex gets deflate support from
-//! **OpenAI's own forks**, pinned by git rev in `codex-rs/Cargo.toml:557-564`
-//! (`openai-oss-forks/tokio-tungstenite` rev `0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186`,
-//! `openai-oss-forks/tungstenite-rs` rev `4fffad30fe373adbdcffab9545e9e9bf4f2fc19f`, with
-//! `tungstenite = { version = "0.27.0", features = ["deflate", "proxy"] }`) — this workspace does
-//! not depend on those forks (adopting them is a pending decision, out of scope here).
+//! **`permessage-deflate`: now offered, matching real codex exactly (M5a fork adoption).** Real
+//! codex offers it (ground truth §1; `codex-rs/codex-api/src/endpoint/responses_websocket.rs:
+//! 546-553`'s `websocket_config()` sets `extensions.permessage_deflate =
+//! Some(DeflateConfig::default())`), and this crate now matches: stock crates.io
+//! `tungstenite`/`tokio-tungstenite` have no `deflate` Cargo feature at all (verified: `cargo add
+//! tungstenite@0.27 --features deflate` → `error: unrecognized feature for crate tungstenite:
+//! deflate`), so codex gets deflate support from **OpenAI's own forks**, pinned by git rev in the
+//! workspace root `Cargo.toml`'s `[patch.crates-io]` (mirroring `codex-rs/Cargo.toml:557-564`
+//! exactly: `openai-oss-forks/tokio-tungstenite` rev `0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186`,
+//! `openai-oss-forks/tungstenite-rs` rev `4fffad30fe373adbdcffab9545e9e9bf4f2fc19f`). This crate
+//! now pins the same versions (`tokio-tungstenite` 0.28.0, `tungstenite` 0.27.0 with the
+//! `deflate` feature) via those forks, so it CAN decode `permessage-deflate` frames, and
+//! `WsConn::connect` builds the handshake's `WebSocketConfig` the same way
+//! `websocket_config()` does (`extensions.permessage_deflate = Some(DeflateConfig::default())`,
+//! via `connect_async_with_config`) rather than by hand-writing a
+//! `Sec-WebSocket-Extensions` header.
 //!
 //! This was live-measured, not theoretical: `crates/polyflare-server/examples/ws_deflate_probe.rs`
-//! (`.superpowers/sdd/m5a-deflate-probe-report.md`) connected to the real Codex backend twice.
-//! WITH the offer, the 101 response echoed `sec-websocket-extensions: permessage-deflate` (the
-//! backend confirmed it), and the very first inbound frame then killed the connection —
-//! `WebSocket protocol error: Reserved bits are non-zero` — zero readable frames, connection
-//! unusable. WITHOUT the offer (same account, same turn), all 13 frames arrived as plain
-//! `Text`/valid-JSON. **Do not re-add this offer for fingerprint parity without first adding real
-//! deflate support** (i.e. adopting the forks above) — restoring it as-is breaks every live WS
-//! connection this crate makes.
+//! (`.superpowers/sdd/m5a-deflate-probe-report.md`) first proved the backend confirms the offer
+//! but that stock `tokio-tungstenite` 0.26 cannot decode the resulting frames (`WebSocket protocol
+//! error: Reserved bits are non-zero`, zero readable frames) — which is exactly why the offer was
+//! withheld until the forks above were adopted (see `.superpowers/sdd/m5a-deflate-forks-report.md`
+//! for the re-run confirming frames now arrive readable WITH the offer, now backed by real decode
+//! support).
 
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tungstenite::extensions::ExtensionsConfig;
+use tungstenite::extensions::compression::deflate::DeflateConfig;
+use tungstenite::protocol::WebSocketConfig;
 
 use polyflare_core::{Account, ExecError};
 
@@ -76,10 +81,12 @@ impl WsConn {
     /// Header construction mirrors `executor.rs:96-126`'s insert-not-append rules: every entry in
     /// `forward_headers` is set first (minus `x-codex-turn-state`, stripped per the module doc),
     /// then `Authorization`/`chatgpt-account-id` are overridden from `account`, then `OpenAI-Beta`
-    /// is inserted. `permessage-deflate` is NOT offered — see the module doc's caveat: real codex
-    /// does offer it, this crate can't decode it, and offering it anyway kills every live
-    /// connection (live-measured). No subprotocol, no `Origin` — never set anywhere in this
-    /// function, and `into_client_request()` does not add them itself (ground truth §1).
+    /// is inserted. `permessage-deflate` IS now offered — via `connect_async_with_config`'s
+    /// `WebSocketConfig` (the library's own negotiation mechanism, matching codex's
+    /// `websocket_config()`), not a hand-written header; see the module doc for why this is now
+    /// safe (the OpenAI-fork adoption backing real decode support). No subprotocol, no `Origin` —
+    /// never set anywhere in this function, and `into_client_request()` does not add them itself
+    /// (ground truth §1).
     pub async fn connect(
         account: &Account,
         forward_headers: &[(String, String)],
@@ -125,13 +132,15 @@ impl WsConn {
             HeaderName::from_static("openai-beta"),
             HeaderValue::from_static(OPENAI_BETA_WS),
         );
-        // No `sec-websocket-extensions: permessage-deflate` offer here — see the module doc's
-        // caveat. Live-measured: offering it makes the backend confirm deflate and then kill the
-        // connection on the first inbound frame, since this crate can't decode it.
+        // permessage-deflate is offered via `ws_config()` below, not a hand-written header —
+        // `tokio_tungstenite::connect_async_with_config` negotiates the `Sec-WebSocket-Extensions`
+        // header itself from `WebSocketConfig::extensions`, the same mechanism codex's own
+        // `websocket_config()` uses (see module doc).
 
-        let (socket, _response) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| ExecError::Upstream(e.to_string()))?;
+        let (socket, _response) =
+            tokio_tungstenite::connect_async_with_config(request, Some(ws_config()), false)
+                .await
+                .map_err(|e| ExecError::Upstream(e.to_string()))?;
 
         Ok(WsConn {
             socket,
@@ -140,6 +149,20 @@ impl WsConn {
             last_input_fingerprint: None,
         })
     }
+}
+
+/// Mirrors codex's own `websocket_config()` (`codex-api/src/endpoint/responses_websocket.rs:
+/// 546-553`) exactly: enable the `permessage-deflate` extension via the library's own
+/// `WebSocketConfig`/`ExtensionsConfig` mechanism (never a hand-written
+/// `Sec-WebSocket-Extensions` header), with default deflate parameters — same as codex, which
+/// also uses `DeflateConfig::default()`.
+fn ws_config() -> WebSocketConfig {
+    let mut extensions = ExtensionsConfig::default();
+    extensions.permessage_deflate = Some(DeflateConfig::default());
+
+    let mut config = WebSocketConfig::default();
+    config.extensions = extensions;
+    config
 }
 
 /// `{base_url}/responses` with the scheme swapped `http→ws` / `https→wss` (ground truth §1).
@@ -214,10 +237,21 @@ mod tests {
         assert_eq!(conn.last_input_fingerprint, None);
     }
 
-    /// Spins up a raw TCP + `accept_hdr_async` server (NOT `MockWsUpstream`, which has no header
-    /// introspection in its public API) purely to capture the client's handshake request headers
-    /// for exact assertion. Returns the base URL to connect to and a handle that yields the
-    /// captured headers once the handshake completes.
+    /// Spins up a raw TCP + `accept_hdr_async_with_config` server (NOT `MockWsUpstream`, which has
+    /// no header introspection in its public API) purely to capture the client's handshake
+    /// request headers for exact assertion. Returns the base URL to connect to and a handle that
+    /// yields the captured headers once the handshake completes.
+    ///
+    /// Must pass `Some(WebSocketConfig::default())`, not `accept_hdr_async`'s implicit `None`:
+    /// the forked `tungstenite`'s server handshake (`handshake/server.rs`) treats ANY
+    /// `Sec-WebSocket-Extensions` header on the request as a hard `InvalidHeader` protocol error
+    /// when `self.config` is `None` (`self.config.ok_or_else(...)?` before it can even decline
+    /// the offer) — since `WsConn::connect` now always offers `permessage-deflate`, a bare `None`
+    /// config here would fail every handshake this test drives, not just this one property. A
+    /// real server (the live codex backend, or `accept_hdr_async_with_config` with a `Some`
+    /// config) always supplies a config, so this is a test-double-only wrinkle, not a production
+    /// concern; `MockWsUpstream` (axum-based, used by the other test in this module) is a
+    /// different WS stack entirely and is unaffected.
     async fn spawn_header_capture_server() -> (String, Arc<Mutex<Option<HeaderMap>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -232,7 +266,12 @@ mod tests {
                     *captured_cb.lock().unwrap() = Some(req.headers().clone());
                     Ok(resp)
                 };
-                let _ = tokio_tungstenite::accept_hdr_async(stream, callback).await;
+                let _ = tokio_tungstenite::accept_hdr_async_with_config(
+                    stream,
+                    callback,
+                    Some(WebSocketConfig::default()),
+                )
+                .await;
             }
         });
         (format!("http://{addr}"), captured)
@@ -286,16 +325,19 @@ mod tests {
         // Dumb-relay: other forwarded headers pass through untouched.
         assert_eq!(headers.get("x-client-request-id").unwrap(), "thread-123");
 
-        // Deliberate fingerprint divergence, pinned so it doesn't drift back: real codex offers
-        // permessage-deflate (ground truth §1), but this crate must NOT, because it can't decode
-        // it — live-measured in `.superpowers/sdd/m5a-deflate-probe-report.md`: offering it made
-        // the real backend confirm the extension and then kill the connection on the first
-        // inbound frame (`WebSocket protocol error: Reserved bits are non-zero`, zero readable
-        // frames). Without the offer, the same live account/turn produced 13 valid JSON frames.
+        // Fingerprint parity restored (M5a fork adoption): real codex offers permessage-deflate
+        // (ground truth §1), and this crate now matches, because it can actually decode it —
+        // `tokio-tungstenite`/`tungstenite` are now pinned to OpenAI's own forks (workspace root
+        // `Cargo.toml`'s `[patch.crates-io]`) which add the `deflate` feature stock crates.io
+        // lacks. `.superpowers/sdd/m5a-deflate-probe-report.md` first measured that the backend
+        // confirms the offer but stock tokio-tungstenite 0.26 can't decode the result
+        // (`WebSocket protocol error: Reserved bits are non-zero`, zero readable frames);
+        // `.superpowers/sdd/m5a-deflate-forks-report.md` re-ran the same live probe after this
+        // fork adoption and confirmed frames now arrive readable WITH the offer.
         assert!(
-            headers.get("sec-websocket-extensions").is_none(),
-            "must NOT offer permessage-deflate — see m5a-deflate-probe-report.md; restoring this \
-             without real deflate support breaks every live WS connection"
+            headers.get("sec-websocket-extensions").is_some(),
+            "must offer permessage-deflate — matches codex-parity ground truth §1, now backed by \
+             real decode support (see m5a-deflate-forks-report.md)"
         );
 
         // §1: no subprotocol, no Origin.
