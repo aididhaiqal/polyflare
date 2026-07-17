@@ -24,6 +24,30 @@ async fn whoami_requires_admin_token() {
 }
 
 #[tokio::test]
+async fn capabilities_reports_live_logs_flag() {
+    let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
+    let (pf, _s) = spawn(up).await; // spawn sets live_logs = true for tests
+    let c = reqwest::Client::new();
+
+    let no_tok = c
+        .get(format!("{pf}/api/capabilities"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_tok.status(), 401, "must be behind admin auth");
+
+    let r = c
+        .get(format!("{pf}/api/capabilities"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["live_logs"], true);
+}
+
+#[tokio::test]
 async fn whoami_is_503_when_dashboard_disabled() {
     let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
     let (pf, _state) = spawn_without_admin_token(up).await; // admin_token = None

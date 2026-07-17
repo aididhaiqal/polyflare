@@ -105,6 +105,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     // today — later tasks add their own route lines to this same auth-gated router.
     let api = Router::new()
         .route("/api/whoami", get(crate::auth::whoami_handler))
+        .route("/api/capabilities", get(crate::auth::capabilities_handler))
         .route("/api/pools", get(crate::read_api::pools_handler))
         .route("/api/accounts", get(crate::read_api::accounts_handler))
         .route(
