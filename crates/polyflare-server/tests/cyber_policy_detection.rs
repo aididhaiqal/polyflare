@@ -33,6 +33,18 @@ fn non_cyber_failed_frame() -> String {
     r#"{"type":"response.failed","response":{"id":"resp_fatal_x","status":"failed","error":{"code":"server_is_overloaded","message":"try later"}}}"#.to_string()
 }
 
+fn created_frame(id: &str) -> String {
+    format!(r#"{{"type":"response.created","response":{{"id":"{id}","status":"in_progress"}}}}"#)
+}
+
+fn completed_frame(id: &str) -> String {
+    format!(r#"{{"type":"response.completed","response":{{"id":"{id}"}}}}"#)
+}
+
+fn content_delta_frame(delta: &str) -> String {
+    format!(r#"{{"type":"response.output_text.delta","delta":"{delta}"}}"#)
+}
+
 fn core_account(base_url: String) -> polyflare_core::Account {
     polyflare_core::Account {
         id: "acct".into(),
@@ -254,6 +266,108 @@ async fn cyber_policy_after_content_already_relayed_falls_back_to_pass_through()
         body.contains("cyber_policy"),
         "the later cyber_policy frame is passed through untouched (fallback), not swallowed: {body}"
     );
+}
+
+/// THE REGRESSION (empirically proven bug): real Codex wire ordering emits `response.created`
+/// FIRST, then `response.failed(cyber_policy)` on a LATER chunk. The old code only inspected the
+/// very FIRST peeked chunk, so `response.created` alone judged the stream "ALIVE", relayed it, and
+/// never looked at the later cyber frame. `chunked_with_gap` guarantees the two frames arrive as
+/// SEPARATE reads (the gap is a real `tokio::time::sleep` between them) so this isn't a coalescing
+/// fluke like the single-frame `MockUpstream::new` fixture that hid the bug.
+#[tokio::test]
+async fn armed_created_then_later_cyber_policy_is_detected_before_relay() {
+    let gap = Duration::from_millis(150);
+    let mock = MockUpstream::chunked_with_gap(
+        created_frame("resp_fatal_cyber"),
+        vec![cyber_policy_frame(SENTINEL_MESSAGE)],
+        gap,
+    );
+    let handle = mock.clone();
+    let base = mock.spawn().await;
+    let exec = CodexExecutor::new().unwrap();
+    let cont: Arc<dyn Continuity> = Arc::new(NoopContinuity);
+
+    let prepared = armed_full_resend(
+        serde_json::json!({"previous_response_id": "resp_a", "input": [{"a":1}]}),
+    );
+    let res = tokio::time::timeout(
+        Duration::from_secs(3),
+        execute_with_watchdog(
+            &exec,
+            cont,
+            prepared,
+            &core_account(base),
+            polyflare_core::AccountId::from("acct"),
+            RequestCtx::default(),
+            Default::default(),
+        ),
+    )
+    .await
+    .expect("bounded");
+
+    match res {
+        Err(WatchdogError::CapabilityRejection { capability }) => {
+            assert_eq!(capability, "security_work");
+        }
+        Err(other) => panic!("expected CapabilityRejection, got {other:?}"),
+        Ok(stream) => {
+            let body = drain(stream).await;
+            panic!(
+                "created-then-cyber (across chunks) must NOT relay a stream, got body: {body}"
+            );
+        }
+    }
+    assert_eq!(handle.request_count(), 1, "detect-only: no reselect/retry");
+}
+
+/// Normal-turn regression: `created -> content delta -> completed` must relay EVERY frame, in
+/// order, with nothing dropped or delayed-to-loss — proving the buffering added to scan past
+/// lifecycle frames does not swallow them, hold the stream open past the first content frame, or
+/// reorder anything. `Continuity::observe(Completed)` still fires exactly as before (asserted via
+/// `NoopContinuity` not panicking / the stream completing cleanly).
+#[tokio::test]
+async fn armed_normal_stream_relays_every_frame_in_order() {
+    let gap = Duration::from_millis(150);
+    let mock = MockUpstream::chunked_with_gap(
+        created_frame("resp_ok"),
+        vec![content_delta_frame("hello"), completed_frame("resp_ok")],
+        gap,
+    );
+    let base = mock.spawn().await;
+    let exec = CodexExecutor::new().unwrap();
+    let cont: Arc<dyn Continuity> = Arc::new(NoopContinuity);
+
+    let prepared = armed_full_resend(
+        serde_json::json!({"previous_response_id": "resp_a", "input": [{"a":1}]}),
+    );
+    let stream = execute_with_watchdog(
+        &exec,
+        cont,
+        prepared,
+        &core_account(base),
+        polyflare_core::AccountId::from("acct"),
+        RequestCtx::default(),
+        Default::default(),
+    )
+    .await
+    .expect("a normal created->content->completed turn must relay, not reject");
+
+    let body = tokio::time::timeout(Duration::from_secs(3), drain(stream))
+        .await
+        .expect("bounded");
+
+    let created_pos = body.find("response.created").expect("created frame relayed");
+    let delta_pos = body
+        .find("response.output_text.delta")
+        .expect("content delta relayed");
+    let completed_pos = body
+        .find("response.completed")
+        .expect("completed frame relayed");
+    assert!(
+        created_pos < delta_pos && delta_pos < completed_pos,
+        "frames must relay in order: {body}"
+    );
+    assert!(body.contains("\"hello\""), "delta payload relayed: {body}");
 }
 
 /// Documents the Disarmed-path boundary explicitly: no anchor => `execute_with_watchdog` does not
