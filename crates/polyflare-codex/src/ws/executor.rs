@@ -1182,6 +1182,57 @@ mod tests {
         assert_eq!(mock.frames().len(), 1, "a 429 must never be retried");
     }
 
+    // ---- Task 3: general error envelope carries error.code into ExecError::UpstreamStatus -----
+
+    #[tokio::test]
+    async fn general_error_envelope_carries_the_error_code_content_safely() {
+        // A general code — NEITHER previous_response_not_found nor
+        // websocket_connection_limit_reached — must surface via the ordinary UpstreamStatus arm,
+        // now carrying `error_code`.
+        let mock = MockWsUpstream::new(ScriptedTurn::ErrorEnvelope {
+            status: 403,
+            code: "account_deactivated".to_string(),
+            message: "secret ws detail".to_string(),
+            error_extra: vec![],
+            headers: vec![],
+        });
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::new(never_called_fallback());
+        let account = test_account(base);
+        let ctx = ctx_with_session("mu");
+
+        let err = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .err()
+            .expect("a general error envelope must surface, not be retried");
+
+        match &err {
+            ExecError::UpstreamStatus(sig) => {
+                assert_eq!(sig.status, 403);
+                assert_eq!(sig.error_code.as_deref(), Some("account_deactivated"));
+            }
+            other => panic!("expected ExecError::UpstreamStatus, got {other:?}"),
+        }
+        assert_eq!(mock.frames().len(), 1, "a general error must never be retried");
+
+        // Content-safety: the envelope's `error.message` must never surface via Display or Debug.
+        let display = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(
+            !display.contains("secret ws detail"),
+            "Display leaked the envelope message: {display}"
+        );
+        assert!(
+            !debug.contains("secret ws detail"),
+            "Debug leaked the envelope message: {debug}"
+        );
+    }
+
     // ---- Row: terminal response.failed -> reframe as SSE, pass through, the error as today ----
 
     #[tokio::test]
