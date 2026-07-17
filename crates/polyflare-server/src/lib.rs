@@ -10,6 +10,7 @@ pub mod continuity;
 pub mod dashboard;
 pub mod fingerprint_capture;
 pub mod ingress;
+pub mod log_bus;
 pub mod observability;
 pub mod read_api;
 pub mod refresh_locks;

@@ -17,6 +17,8 @@
 use axum::http::StatusCode;
 use polyflare_core::Provider;
 
+use crate::log_bus::{self, LogEvent, LogLevel};
+
 /// A request's content-safe completion facts. Emitted as ONE `tracing::info!` event via
 /// [`RequestLog::emit`] — everything on this type is structurally safe to log (no free-form
 /// strings sourced from the request itself).
@@ -70,6 +72,35 @@ impl RequestLog {
             ttft_ms: None,
             total_tokens: None,
             cached_tokens: None,
+        }
+    }
+
+    /// The content-free live-log-bus form of this request outcome (see `crate::log_bus`). Draws
+    /// from EXACTLY the same field set as [`Self::record`] — this is the same content-safety
+    /// chokepoint feeding a second sink (an ephemeral broadcast + ring buffer instead of the
+    /// durable `request_log` table). `RequestLog` doesn't hold an account id or client `model`
+    /// today (see the module doc's constraint), so those `LogEvent` fields are `None` here; a
+    /// later task may thread them through once `RequestLog` itself carries them.
+    pub fn to_log_event(&self) -> LogEvent {
+        let status = self.status.as_u16();
+        let level = if status == 429 || status >= 500 {
+            LogLevel::Warn
+        } else if status >= 400 {
+            LogLevel::Error
+        } else {
+            LogLevel::Info
+        };
+        let provider = self.provider.to_string();
+        LogEvent {
+            ts_ms: log_bus::now_ms(),
+            level,
+            provider: Some(provider.clone()),
+            account: None,
+            model: None,
+            status: Some(status),
+            latency_ms: Some(self.duration_ms as i64),
+            kind: "request".to_string(),
+            message: format!("req {status} · {provider} · {}ms", self.duration_ms),
         }
     }
 }

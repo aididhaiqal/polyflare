@@ -72,6 +72,11 @@ pub struct AppState {
     /// Enables the live log stream (`POLYFLARE_LIVE_LOGS`). Consumed by a later task
     /// (`/api/logs/stream`); present now so `AppState` construction doesn't churn again then.
     pub live_logs: bool,
+    /// Content-free live-log bus (see `crate::log_bus`): a broadcast channel + ring buffer fed
+    /// from the `RequestLog` content-safety chokepoint (`crate::ingress`'s route wrappers). A
+    /// later task exposes this over `/api/logs/stream`; present now so publishing starts
+    /// immediately at the chokepoint instead of only once the SSE endpoint lands.
+    pub log_bus: std::sync::Arc<crate::log_bus::LogBus>,
 }
 
 impl AppState {

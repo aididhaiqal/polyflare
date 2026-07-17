@@ -89,6 +89,7 @@ async fn large_request_body_is_not_rejected_with_413() {
         token_cache: Default::default(),
         admin_token: None,
         live_logs: false,
+        log_bus: polyflare_server::log_bus::LogBus::new(1000),
 
         runtime: Default::default(),
     });
