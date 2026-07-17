@@ -17,6 +17,10 @@ rustls = { workspace = true }
 # called directly — `rustls::crypto::aws_lc_rs` (gated by rustls's `aws_lc_rs` feature) wraps it.
 aws-lc-rs = { workspace = true }
 futures-util = { workspace = true }
+# `ResponseStream`'s trait bound (`polyflare-core/src/types.rs:87`) is `futures_core::Stream` — the
+# WS turn stream (`ws::turn::TurnStream`, M5a Task 5) implements it directly, the same crate
+# `polyflare-server`'s `ObservingStream` (`watchdog.rs`) already implements it against.
+futures-core = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
