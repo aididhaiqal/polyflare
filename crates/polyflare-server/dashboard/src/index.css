@@ -1,0 +1,38 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ccflare-parity design tokens. Values are bare HSL components (no `hsl()` wrapper) so Tailwind's
+   `hsl(var(--x))` color indirection in tailwind.config.ts works. Dark is the default; the
+   `data-theme` attribute is stamped onto <html> before first paint (see index.html) to avoid a
+   flash of the wrong theme. */
+:root {
+  --bg: 220 13% 8%;
+  --card: 220 13% 12%;
+  --muted: 220 13% 18%;
+  --border: 220 13% 20%;
+  --fg: 0 0% 95%;
+  --accent: 24 89% 56%;
+  --codex: 24 89% 56%;
+  --claude: 267 100% 74%;
+  --success: 130 53% 46%;
+  --warn: 36 79% 58%;
+  --error: 3 85% 60%;
+}
+
+:root[data-theme="light"] {
+  --bg: 0 0% 100%;
+  --card: 0 0% 100%;
+  --muted: 220 14% 96%;
+  --border: 240 6% 90%;
+  --fg: 240 10% 4%;
+}
+
+body {
+  @apply bg-bg text-fg;
+  font-variant-numeric: tabular-nums;
+}
+
+.font-mono {
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+}
