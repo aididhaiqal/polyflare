@@ -434,11 +434,100 @@ impl AccountRepo {
         .await?;
         Ok(row)
     }
+
+    /// Every `usage_history` row for `account_id` recorded at/after `since_ts` (unix seconds),
+    /// oldest first — the raw material for a per-account usage trend series (dashboard
+    /// `GET /api/accounts/{id}/trends`). Only rows in either known window (`"primary"` /
+    /// `"secondary"`) are returned.
+    pub async fn usage_history_since(
+        &self,
+        account_id: &str,
+        since_ts: i64,
+    ) -> Result<Vec<(i64, String, f64)>, StoreError> {
+        let rows: Vec<(i64, String, f64)> = sqlx::query_as(
+            "SELECT recorded_at, \"window\", used_percent FROM usage_history \
+             WHERE account_id = ? AND recorded_at >= ? AND \"window\" IN ('primary', 'secondary') \
+             ORDER BY recorded_at ASC",
+        )
+        .bind(account_id)
+        .bind(since_ts)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn usage_history_since_returns_bounded_rows_ordered_ascending() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
+        let repo = store.accounts();
+        let account = Account {
+            id: "acct-1".to_string(),
+            chatgpt_account_id: None,
+            chatgpt_user_id: None,
+            email: "a@example.test".to_string(),
+            alias: None,
+            workspace_id: None,
+            workspace_label: None,
+            seat_type: None,
+            plan_type: "pro".to_string(),
+            routing_policy: "normal".to_string(),
+            last_refresh: 0,
+            created_at: 0,
+            status: "active".to_string(),
+            deactivation_reason: None,
+            reset_at: None,
+            blocked_at: None,
+            security_work_authorized: false,
+            provider: "codex".to_string(),
+            pool: None,
+        };
+        let tokens = PlainTokens {
+            access_token: "a".to_string(),
+            refresh_token: "b".to_string(),
+            id_token: "c".to_string(),
+        };
+        repo.insert(&account, &tokens, &cipher).await.unwrap();
+
+        let now = 1_800_000_000_i64;
+        // Two rows within the last 7 days (one per window) and one row 8 days old (out of range).
+        repo.insert_usage_window("acct-1", "primary", 20.0, None, None, now - 60)
+            .await
+            .unwrap();
+        repo.insert_usage_window("acct-1", "secondary", 30.0, None, None, now - 30)
+            .await
+            .unwrap();
+        repo.insert_usage_window("acct-1", "primary", 10.0, None, None, now - 8 * 86400)
+            .await
+            .unwrap();
+
+        let rows = repo
+            .usage_history_since("acct-1", now - 7 * 86400)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "the 8-day-old row must be excluded: {rows:?}"
+        );
+        assert_eq!(rows[0], (now - 60, "primary".to_string(), 20.0));
+        assert_eq!(rows[1], (now - 30, "secondary".to_string(), 30.0));
+
+        // A different account (or one with no history at all) gets an empty vec, not an error.
+        let empty = repo
+            .usage_history_since("no-such-account", 0)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+    }
 
     #[test]
     fn plain_tokens_debug_redacts_secret_values() {

@@ -118,6 +118,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             get(crate::read_api::account_detail_handler)
                 .patch(crate::write_api::patch_account_handler),
         )
+        .route(
+            "/api/accounts/{id}/trends",
+            get(crate::read_api::account_trends_handler),
+        )
         .route("/api/requests", get(crate::read_api::requests_handler))
         .route("/api/overview", get(crate::read_api::overview_handler))
         .route("/api/logs/stream", get(crate::sse::logs_stream_handler))

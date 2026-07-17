@@ -340,6 +340,69 @@ pub async fn account_detail_handler(
     .into_response()
 }
 
+/// One point of an [`TrendsView`] series: when (`recorded_at`, unix seconds) and how full the
+/// window was (`used_percent`) at that moment. Content-free by construction — no request/response
+/// data, only a timestamp + percentage.
+#[derive(Serialize)]
+struct Point {
+    t: i64,
+    v: f64,
+}
+
+/// `GET /api/accounts/{id}/trends` response: the account's 7-day usage history split by window,
+/// ordered oldest-first. An account with no `usage_history` rows in range gets empty arrays (still
+/// `200`, not `404` — the account may simply be quiet, not missing). The `secondaryScheduled` plan
+/// line is out of scope here (a later phase).
+#[derive(Serialize)]
+struct TrendsView {
+    account_id: String,
+    primary: Vec<Point>,
+    secondary: Vec<Point>,
+}
+
+/// Lookback for `/api/accounts/{id}/trends`: 7 days.
+const TRENDS_LOOKBACK_SECS: i64 = 7 * 24 * 3600;
+
+/// `GET /api/accounts/{id}/trends` — the dashboard's per-account 7-day usage trend: `primary`/
+/// `secondary` point series (`{t, v}`) straight off `usage_history`, ordered oldest-first. Always
+/// `200`, even for an account with no history (empty series) — this endpoint doesn't validate that
+/// `id` names an existing account, since an empty trend is a valid answer either way.
+pub async fn account_trends_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let now = unix_now();
+    let rows = match state
+        .store
+        .accounts()
+        .usage_history_since(&id, now - TRENDS_LOOKBACK_SECS)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return Response::error(),
+    };
+
+    let mut primary = Vec::new();
+    let mut secondary = Vec::new();
+    for (recorded_at, window, used_percent) in rows {
+        let point = Point {
+            t: recorded_at,
+            v: used_percent,
+        };
+        match window.as_str() {
+            "primary" => primary.push(point),
+            "secondary" => secondary.push(point),
+            _ => {}
+        }
+    }
+
+    Response::ok(TrendsView {
+        account_id: id,
+        primary,
+        secondary,
+    })
+}
+
 /// One pool as the dashboard lists it. `pool = null` is the unpooled group (accounts reachable only
 /// via the bare ingress paths). `active` counts accounts whose status is `active`.
 #[derive(Serialize)]

@@ -740,6 +740,93 @@ async fn account_detail_returns_identity_status_quota_and_token_status_and_404s_
 }
 
 #[tokio::test]
+async fn account_trends_returns_seeded_history_split_by_window() {
+    // Task 9: GET /api/accounts/{id}/trends — a 7-day per-window usage series derived from
+    // `usage_history`. Seed 3 rows for acct-1 (2 primary, 1 secondary) across distinct
+    // timestamps and assert the response splits them into `primary`/`secondary` point arrays.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
+    let repo = store.accounts();
+    repo.insert(
+        &account("acct-1", "acct1@example.test", None),
+        &tokens(),
+        &cipher,
+    )
+    .await
+    .unwrap();
+    let t0 = now() - 3 * 3600;
+    let t1 = now() - 2 * 3600;
+    let t2 = now() - 3600;
+    repo.insert_usage_window("acct-1", "primary", 12.0, None, None, t0)
+        .await
+        .unwrap();
+    repo.insert_usage_window("acct-1", "secondary", 40.0, None, None, t1)
+        .await
+        .unwrap();
+    repo.insert_usage_window("acct-1", "primary", 15.5, None, None, t2)
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+
+    let pf = spawn(store).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{pf}/api/accounts/acct-1/trends"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert_eq!(body["account_id"], "acct-1");
+    let primary = body["primary"].as_array().expect("primary is an array");
+    assert_eq!(primary.len(), 2, "primary: {primary:?}");
+    assert_eq!(primary[0]["t"], t0);
+    assert_eq!(primary[0]["v"], 12.0);
+    assert_eq!(primary[1]["t"], t2);
+    assert_eq!(primary[1]["v"], 15.5);
+    for p in primary {
+        let v = p["v"].as_f64().unwrap();
+        assert!((0.0..=100.0).contains(&v), "v out of range: {v}");
+    }
+
+    let secondary = body["secondary"].as_array().expect("secondary is an array");
+    assert_eq!(secondary.len(), 1, "secondary: {secondary:?}");
+    assert_eq!(secondary[0]["t"], t1);
+    assert_eq!(secondary[0]["v"], 40.0);
+}
+
+#[tokio::test]
+async fn account_trends_returns_empty_series_for_account_with_no_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
+    store
+        .accounts()
+        .insert(
+            &account("acct-quiet", "quiet@example.test", None),
+            &tokens(),
+            &cipher,
+        )
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+
+    let pf = spawn(store).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{pf}/api/accounts/acct-quiet/trends"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "no history is still a 200, not 404");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["primary"].as_array().unwrap().is_empty());
+    assert!(body["secondary"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn requests_endpoint_filters_by_status_class() {
     let pf = spawn(seed_store_for_filters().await).await;
     let client = reqwest::Client::new();
