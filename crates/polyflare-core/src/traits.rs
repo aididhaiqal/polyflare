@@ -25,6 +25,11 @@ pub trait Executor: Send + Sync {
 /// Returns an owned `AccountId` (M2-GATE1).
 pub trait Selector: Send + Sync {
     fn pick(&self, candidates: &[AccountSnapshot], ctx: &SelectionCtx) -> Option<AccountId>;
+
+    /// The selector's canonical snake_case strategy name (dashboard-facing, e.g. via
+    /// `/api/pools`'s `strategy` field). Config-selectable strategies match
+    /// `RoutingStrategy::name()`'s strings; ad hoc/test selectors just need a stable identifier.
+    fn name(&self) -> &'static str;
 }
 
 /// The continuity state machine seam (M3). `prepare` resolves session + ownership and decides
@@ -56,6 +61,10 @@ mod tests {
     impl Selector for FirstCandidate {
         fn pick(&self, candidates: &[AccountSnapshot], _ctx: &SelectionCtx) -> Option<AccountId> {
             candidates.first().map(|s| s.id.clone())
+        }
+
+        fn name(&self) -> &'static str {
+            "first_candidate"
         }
     }
 

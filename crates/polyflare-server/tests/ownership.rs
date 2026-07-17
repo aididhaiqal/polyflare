@@ -30,6 +30,10 @@ impl Selector for PreferB {
         }
         candidates.first().map(|s| s.id.clone())
     }
+
+    fn name(&self) -> &'static str {
+        "prefer_b"
+    }
 }
 
 fn account(id: &str) -> Account {

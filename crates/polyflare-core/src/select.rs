@@ -324,6 +324,10 @@ impl Selector for CapacityWeighted {
     fn pick(&self, candidates: &[AccountSnapshot], ctx: &SelectionCtx) -> Option<AccountId> {
         weighted_pick(&standard_pool(candidates, ctx), ctx)
     }
+
+    fn name(&self) -> &'static str {
+        RoutingStrategy::CapacityWeighted.name()
+    }
 }
 
 /// Deterministic: the least weekly-used eligible account (even utilization; testable). Tiebreak id.
@@ -333,6 +337,10 @@ pub struct UsageWeighted;
 impl Selector for UsageWeighted {
     fn pick(&self, candidates: &[AccountSnapshot], ctx: &SelectionCtx) -> Option<AccountId> {
         deterministic_by(&standard_pool(candidates, ctx), |c| c.eff_secondary_used)
+    }
+
+    fn name(&self) -> &'static str {
+        RoutingStrategy::UsageWeighted.name()
     }
 }
 
@@ -349,6 +357,10 @@ impl Selector for RoundRobin {
             c.snap.last_selected_at.unwrap_or(0) as f64
         })
     }
+
+    fn name(&self) -> &'static str {
+        RoutingStrategy::RoundRobin.name()
+    }
 }
 
 /// Deterministic: saturate the WARMEST eligible account (highest current usage) for prompt-cache
@@ -361,6 +373,10 @@ impl Selector for FillFirst {
         // max warmth == min(-warmth); the shared helper does the id tiebreak.
         deterministic_by(&standard_pool(candidates, ctx), |c| -c.warmth())
     }
+
+    fn name(&self) -> &'static str {
+        RoutingStrategy::FillFirst.name()
+    }
 }
 
 /// Deterministic: the SMALLEST-capacity eligible account first — burn cheap/throwaway accounts
@@ -371,6 +387,10 @@ pub struct SequentialDrain;
 impl Selector for SequentialDrain {
     fn pick(&self, candidates: &[AccountSnapshot], ctx: &SelectionCtx) -> Option<AccountId> {
         deterministic_by(&standard_pool(candidates, ctx), Candidate::capacity)
+    }
+
+    fn name(&self) -> &'static str {
+        RoutingStrategy::SequentialDrain.name()
     }
 }
 
@@ -444,6 +464,10 @@ impl Selector for CacheAffinityTier {
             .map(|c| Self::tier_weight(c, tier, ctx.now))
             .collect();
         sample_weighted(&pool, &weights, ctx)
+    }
+
+    fn name(&self) -> &'static str {
+        RoutingStrategy::CacheAffinityTier.name()
     }
 }
 

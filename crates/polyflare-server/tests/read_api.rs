@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use polyflare_codex::oauth::OAuthClient;
 use polyflare_codex::CodexExecutor;
-use polyflare_core::{CapacityWeighted, Continuity, Executor};
+use polyflare_core::{AccountId, CapacityWeighted, Continuity, Executor};
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::continuity::CodexContinuity;
 use polyflare_store::{Account, PlainTokens, RequestLogRecord, Store, TokenCipher};
@@ -108,6 +108,12 @@ async fn seed_store() -> Store {
 }
 
 async fn spawn(store: Store) -> String {
+    spawn_with_state(store).await.0
+}
+
+/// Same as `spawn`, but also hands back the `AppState` so a test can reach into live-only state
+/// (e.g. `state.runtime.record_rate_limit`) that isn't reachable through the HTTP surface.
+async fn spawn_with_state(store: Store) -> (String, Arc<AppState>) {
     let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
     let continuity: Arc<dyn Continuity> = Arc::new(CodexContinuity::new(
         store.continuity(),
@@ -136,13 +142,13 @@ async fn spawn(store: Store) -> String {
 
         runtime: Default::default(),
     });
-    let app = build_app(state);
+    let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), state)
 }
 
 #[tokio::test]
@@ -421,6 +427,71 @@ async fn pools_endpoint_aggregates_named_and_unpooled_groups() {
     assert_eq!(arr[0]["active"], 1);
     assert!(arr[1]["pool"].is_null(), "unpooled group last");
     assert_eq!(arr[1]["accounts"], 1);
+}
+
+#[tokio::test]
+async fn pools_endpoint_carries_available_usage_percent_and_strategy() {
+    // Task 10: /api/pools must additionally surface, per pool, `available` (eligible-right-now
+    // count, i.e. active AND not currently cooled down by the live runtime overlay),
+    // `usage_percent` (mean `used_percent` across the pool's accounts), and `strategy` (the
+    // pool's configured routing-selector name).
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
+    let repo = store.accounts();
+    repo.insert(
+        &account("codex-d1", "d1@example.test", Some("default")),
+        &tokens(),
+        &cipher,
+    )
+    .await
+    .unwrap();
+    repo.insert(
+        &account("codex-d2", "d2@example.test", Some("default")),
+        &tokens(),
+        &cipher,
+    )
+    .await
+    .unwrap();
+    std::mem::forget(dir);
+
+    let (pf, state) = spawn_with_state(store).await;
+
+    // Cool codex-d2 down via the live runtime overlay (same mechanism `/api/overview` reads through
+    // `RuntimeStates::overlay`) — it stays durably `active` but is not selectable right now.
+    state
+        .runtime
+        .record_rate_limit(&AccountId::from("codex-d2"), None, now());
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/pools"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = body.as_array().unwrap();
+    let default_pool = arr
+        .iter()
+        .find(|p| p["pool"] == "default")
+        .expect("default pool present");
+
+    assert_eq!(default_pool["accounts"], 2);
+    assert_eq!(
+        default_pool["available"], 1,
+        "only codex-d1 is eligible right now: {default_pool:?}"
+    );
+    assert!(
+        default_pool["usage_percent"].is_number(),
+        "usage_percent must be numeric: {default_pool:?}"
+    );
+    assert!(
+        default_pool["strategy"].is_string()
+            && !default_pool["strategy"].as_str().unwrap().is_empty(),
+        "strategy must be a non-empty string: {default_pool:?}"
+    );
 }
 
 #[tokio::test]

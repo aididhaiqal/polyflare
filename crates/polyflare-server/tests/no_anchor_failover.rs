@@ -33,6 +33,10 @@ impl Selector for ExcludeReauth {
             .find(|s| s.status != "reauth_required")
             .map(|s| s.id.clone())
     }
+
+    fn name(&self) -> &'static str {
+        "exclude_reauth"
+    }
 }
 
 fn account(id: &str) -> Account {
