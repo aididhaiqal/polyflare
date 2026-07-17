@@ -43,3 +43,9 @@ pub async fn require_admin(
 pub async fn whoami_handler() -> impl IntoResponse {
     Json(serde_json::json!({ "ok": true }))
 }
+
+/// `GET /api/capabilities` — feature flags the dashboard SPA gates UI on. Currently just
+/// `live_logs` (from `POLYFLARE_LIVE_LOGS`); grows as later tasks add capabilities.
+pub async fn capabilities_handler(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(serde_json::json!({ "live_logs": s.live_logs }))
+}
