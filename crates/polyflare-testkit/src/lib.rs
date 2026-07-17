@@ -1,5 +1,8 @@
 //! Test support: scriptable mock upstreams for e2e tests.
 
+pub mod ws_mock;
+pub use ws_mock::{MockWsUpstream, RecordedFrame, ScriptedTurn};
+
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};

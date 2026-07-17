@@ -5,7 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-axum = { workspace = true }
+# "ws" enables axum::extract::ws (WebSocketUpgrade) for MockWsUpstream — the WS mock upstream
+# (M5a Task 2). Server-side only: axum's own internal tokio-tungstenite dependency (pulled in by
+# this feature) is unrelated to the workspace's TLS-pinned tokio-tungstenite dev-dep below and
+# needs no TLS feature, since this mock only ever serves plain ws:// on localhost.
+axum = { workspace = true, features = ["ws"] }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 futures-util = { workspace = true }
@@ -13,3 +17,9 @@ bytes = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }
+# MockWsUpstream's own tests need a WS client. Pinned to the same version as
+# polyflare-server's `ws_vs_sse_probe` example dev-dep for workspace-wide dependency-resolution
+# consistency. No TLS feature: this client only ever dials plain ws:// against the local mock, so
+# it never needs the workspace's pinned rustls/aws-lc-rs (see that dev-dep's comment for when a WS
+# dep DOES need the pin).
+tokio-tungstenite = "0.26"
