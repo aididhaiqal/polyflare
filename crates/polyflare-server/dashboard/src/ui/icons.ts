@@ -8,12 +8,21 @@
 // Sun/Moon are additions beyond the brief's enumerated list — the ThemeToggle atom (Task 4) needs
 // *some* rendered icon for its dark/light affordance, and lucide is the only allowed icon source,
 // so these two were the obvious, minimal choice. See task-4-report.md.
+//
+// AlertTriangle/CheckCircle2/Clock/Coins are Task 5 additions for the Overview page's KPI cards
+// (success rate / avg latency / tokens) and the recent-errors strip — same reasoning: the mockup's
+// glyphs (✓ ◷ ◆ ⚠) aren't real icons, and "no emoji" means every one of them needs a genuine lucide
+// replacement rather than a Unicode symbol. See task-5-report.md.
 export {
   Activity,
+  AlertTriangle,
   ArrowDown,
   BarChart3,
+  CheckCircle2,
   ChevronLeft,
   ChevronRight,
+  Clock,
+  Coins,
   Layers,
   List,
   LayoutGrid,
