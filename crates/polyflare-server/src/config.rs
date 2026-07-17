@@ -37,6 +37,12 @@ pub struct ServeConfig {
     /// Enables the live log stream (`POLYFLARE_LIVE_LOGS=1|true`). Consumed by a later task
     /// (`/api/logs/stream`); wired through now so `AppState` construction doesn't churn again.
     pub live_logs: bool,
+    /// M5a: selects the upstream WebSocket transport (`POLYFLARE_WS_UPSTREAM=1|true`) for the
+    /// Codex executor instead of today's HTTP-SSE. **Default OFF** — off means `CodexExecutor`
+    /// exactly as before this flag existed, zero behavior change (see `SPEC-M5-WEBSOCKET.md` §6:
+    /// "HTTP-SSE remains the fallback on every path"). Consumed by
+    /// `crate::app::build_codex_executor`.
+    pub ws_upstream: bool,
 }
 
 /// Parse `POLYFLARE_POOL_STRATEGY` — a comma-separated list of `slug=strategy` pairs. Whitespace
@@ -106,6 +112,13 @@ impl ServeConfig {
             std::env::var("POLYFLARE_LIVE_LOGS").as_deref(),
             Ok("1") | Ok("true")
         );
+        // M5a: same fail-safe-default convention as `live_logs` above — any unset/empty/unrecognized
+        // value is treated as OFF (never a startup error), so a malformed env var degrades to
+        // today's HTTP-SSE behavior rather than failing to boot.
+        let ws_upstream = matches!(
+            std::env::var("POLYFLARE_WS_UPSTREAM").as_deref(),
+            Ok("1") | Ok("true")
+        );
         Ok(ServeConfig {
             bind_addr,
             upstream_base_url,
@@ -119,6 +132,7 @@ impl ServeConfig {
             pool_strategies,
             admin_token,
             live_logs,
+            ws_upstream,
         })
     }
 }

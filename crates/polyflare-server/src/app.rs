@@ -8,8 +8,8 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use polyflare_codex::oauth::OAuthClient;
-use polyflare_codex::CodexVersionCache;
-use polyflare_core::{Continuity, Executor, Provider, Selector};
+use polyflare_codex::{CodexExecutor, CodexVersionCache, CodexWsExecutor};
+use polyflare_core::{Continuity, ExecError, Executor, Provider, Selector};
 
 use crate::account_cache::AccountCache;
 use polyflare_store::{Store, TokenCipher};
@@ -102,6 +102,30 @@ impl AppState {
     pub fn selector_for(&self, pool: Option<&str>) -> &Arc<dyn Selector> {
         pool.and_then(|p| self.pool_selectors.get(p))
             .unwrap_or(&self.selector)
+    }
+}
+
+/// Construct the Codex-provider executor for `AppState.codex_executor`, selected by
+/// `POLYFLARE_WS_UPSTREAM` (`ws_upstream`, see `crate::config::ServeConfig`).
+///
+/// **`ws_upstream == false` (the default): `CodexExecutor` exactly as before this flag existed —
+/// zero behavior change.** This is the ONLY path every deployment and every existing test used
+/// prior to M5a; nothing about it is touched by this function's `true` branch.
+///
+/// `ws_upstream == true`: wraps a `CodexWsExecutor` around a FRESH `CodexExecutor` as its
+/// HTTP-SSE fallback. Per `SPEC-M5-WEBSOCKET.md` §6, HTTP-SSE "remains the fallback on every
+/// path" — but that fallback is entirely internal to `CodexWsExecutor` (a 426 at handshake time,
+/// scoped per-session/per-account-cooldown; see `polyflare_codex::ws::executor`'s module doc's
+/// "Fallback scope" section). This function performs SELECTION only — which concrete `Executor`
+/// impl backs the field — never new retry/failover machinery of its own (M5a plan's Global
+/// Constraints: "No new retry/failover machinery. M5a swaps the transport under today's
+/// behavior.").
+pub fn build_codex_executor(ws_upstream: bool) -> Result<Arc<dyn Executor>, ExecError> {
+    let http = CodexExecutor::new()?;
+    if ws_upstream {
+        Ok(Arc::new(CodexWsExecutor::new(Arc::new(http))))
+    } else {
+        Ok(Arc::new(http))
     }
 }
 
