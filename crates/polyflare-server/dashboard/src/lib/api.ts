@@ -47,6 +47,14 @@ export function setUnauthorizedHandler(fn: UnauthorizedHandler): void {
   unauthorizedHandler = fn;
 }
 
+/** Invokes the registered unauthorized handler, if any, without throwing. For callers that hit
+ * `/api/*` via a raw `fetch` instead of `fetchJson` (e.g. `useLogStream.ts`'s manual SSE reader,
+ * which can't use `fetchJson` because it needs the raw `Response` body stream) so a 401 there
+ * still clears the token / redirects to login the same way a `fetchJson` 401 would. */
+export function notifyUnauthorized(): void {
+  unauthorizedHandler?.();
+}
+
 async function readBody(res: Response): Promise<unknown> {
   const text = await res.text().catch(() => "");
   if (!text) return null;
