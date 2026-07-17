@@ -5,9 +5,12 @@
 //! HTTP method, ingress path, the resolved backend provider, whether the request was
 //! model-aliased, the client-facing outcome status, and duration in milliseconds.
 //!
-//! It must NEVER carry a token/bearer, an account id, a session/thread/turn id, the request or
-//! response body, or the client's `model` string. When in doubt, leave it out — do not add fields
-//! to `RequestLog` without re-reading SPEC-M5 §3.4's content-safety constraint.
+//! It must NEVER carry a bearer token, a session/thread/turn id, or the request/response body.
+//! `account_id` and `model` ARE carried (added by Task 12, SPEC-M5 §5/§6.7): both are content-free
+//! identifiers — a stable account row id and the requested/served model string, never conversation
+//! content — needed to populate the dashboard's per-account and per-model breakdowns. When in
+//! doubt about any OTHER field, leave it out — do not add fields to `RequestLog` without
+//! re-reading SPEC-M5 §3.4's content-safety constraint.
 //!
 //! The SAME `RequestLog` also produces the content-free row persisted to the `request_log` table
 //! (the dashboard's history backend) via [`RequestLog::record`] — deliberately routed through this
@@ -29,6 +32,24 @@ pub struct RequestLog {
     pub aliased: bool,
     pub status: StatusCode,
     pub duration_ms: u64,
+    /// The account that served (or was selected/attempted to serve) this request — a stable row
+    /// id, never a token or session identifier.
+    pub account_id: Option<String>,
+    /// The requested (native path) or resolved target (translated/aliased path) model string.
+    pub model: Option<String>,
+    /// `reasoning.effort` for this request, when known (native facts or the alias's override).
+    pub reasoning_effort: Option<String>,
+    /// The account's subscription/service tier, when known. Not populated by this task.
+    pub service_tier: Option<String>,
+    /// The wire transport this request rode in on (`"http"` today; `"ws"` lands with the WS
+    /// milestone).
+    pub transport: Option<String>,
+    /// Time to first token, in milliseconds, when observed from the response stream.
+    pub ttft_ms: Option<i64>,
+    /// Total tokens for this request, when observed from the response stream.
+    pub total_tokens: Option<i64>,
+    /// Cached tokens for this request, when observed from the response stream.
+    pub cached_tokens: Option<i64>,
 }
 
 impl RequestLog {
@@ -63,24 +84,22 @@ impl RequestLog {
             aliased: self.aliased,
             status: self.status.as_u16(),
             duration_ms: self.duration_ms as i64,
-            // Populated by a later task; this task only adds the plumbing.
-            account_id: None,
-            model: None,
-            reasoning_effort: None,
-            service_tier: None,
-            transport: None,
-            ttft_ms: None,
-            total_tokens: None,
-            cached_tokens: None,
+            account_id: self.account_id.clone(),
+            model: self.model.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            service_tier: self.service_tier.clone(),
+            transport: self.transport.clone(),
+            ttft_ms: self.ttft_ms,
+            total_tokens: self.total_tokens,
+            cached_tokens: self.cached_tokens,
         }
     }
 
     /// The content-free live-log-bus form of this request outcome (see `crate::log_bus`). Draws
     /// from EXACTLY the same field set as [`Self::record`] — this is the same content-safety
     /// chokepoint feeding a second sink (an ephemeral broadcast + ring buffer instead of the
-    /// durable `request_log` table). `RequestLog` doesn't hold an account id or client `model`
-    /// today (see the module doc's constraint), so those `LogEvent` fields are `None` here; a
-    /// later task may thread them through once `RequestLog` itself carries them.
+    /// durable `request_log` table). `account`/`model` are populated from `self.account_id`/
+    /// `self.model` now that `RequestLog` carries them.
     pub fn to_log_event(&self) -> LogEvent {
         let status = self.status.as_u16();
         let level = if status == 429 || status >= 500 {
@@ -95,8 +114,8 @@ impl RequestLog {
             ts_ms: log_bus::now_ms(),
             level,
             provider: Some(provider.clone()),
-            account: None,
-            model: None,
+            account: self.account_id.clone(),
+            model: self.model.clone(),
             status: Some(status),
             latency_ms: Some(self.duration_ms as i64),
             kind: "request".to_string(),
@@ -173,6 +192,14 @@ mod tests {
                 aliased: false,
                 status: StatusCode::OK,
                 duration_ms: 42,
+                account_id: None,
+                model: None,
+                reasoning_effort: None,
+                service_tier: None,
+                transport: None,
+                ttft_ms: None,
+                total_tokens: None,
+                cached_tokens: None,
             }
             .emit();
         });
