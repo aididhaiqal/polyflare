@@ -34,7 +34,10 @@
 //! for the re-run confirming frames now arrive readable WITH the offer, now backed by real decode
 //! support).
 
+use futures_util::{SinkExt, StreamExt};
+use serde_json::Value;
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -56,22 +59,36 @@ const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 
 /// An established WS connection to a codex backend account, plus the incremental-continuation
 /// state later tasks read/write: `last_response_id` (Task 5, from the most recent
-/// `response.completed` on THIS socket), `last_input_count` / `last_input_fingerprint` (Task 6's
-/// strict-extension check). This task only connects and stores the fields at their initial
-/// (unset) values — nothing here sends or classifies a frame yet.
+/// `response.completed` on THIS socket), `last_item_hashes` / `last_non_input_fingerprint` /
+/// `last_input_count` (Task 6's `delta::plan_request` strict-extension check). This task only
+/// connects and stores the fields at their initial (unset) values — nothing here sends or
+/// classifies a frame yet.
 pub struct WsConn {
-    #[allow(dead_code)] // held for Tasks 4-7 (frame send/receive); unused until then.
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     /// `response.id` of the most recent `response.completed` seen on this socket. `None` until a
     /// turn has completed (Task 5).
     pub last_response_id: Option<String>,
-    /// `input` item count of the most recently sent turn on this socket (Task 6's strict-extension
-    /// check reads this).
+    /// `input` item count of the most recently sent turn on this socket. Not read directly by
+    /// `delta::plan_request` (which derives the count from `last_item_hashes.len()` instead); kept
+    /// as a cheap pre-check hint (e.g. "new input can't possibly be a strict extension if it's not
+    /// even longer than this" without computing any hashes) available to Task 5/7's send path.
     pub last_input_count: Option<u32>,
-    /// A fingerprint of the most recently sent turn's non-input fields (model, instructions,
-    /// tools, tool_choice, parallel_tool_calls, reasoning, service_tier, text) — Task 6's "do the
-    /// non-input fields match" check reads this. Never raw conversation content.
-    pub last_input_fingerprint: Option<String>,
+    /// Content-free per-item hashes (`delta::ItemHash`, via `delta::item_hashes`) of the `input`
+    /// array most recently SENT on this socket, in order — `delta::plan_request`'s rule 2
+    /// (strict-extension) check reads this. **Whoever sends a turn on this connection (Task 5/7's
+    /// turn-send code) MUST set this immediately after sending**, to `Some(delta::item_hashes(&body))`
+    /// for the envelope `body` just sent. `None` until the first turn is sent. If a sender forgets
+    /// to set this after sending, every subsequent `plan_request` call on this connection silently
+    /// and permanently sees `None` here and returns `Full` — no error, just a milestone that
+    /// quietly never produces an incremental turn again.
+    pub last_item_hashes: Option<Vec<super::delta::ItemHash>>,
+    /// A content-free fingerprint (`delta::non_input_fingerprint`) of the most recently SENT
+    /// turn's non-input fields (model, instructions, tools, tool_choice, parallel_tool_calls,
+    /// reasoning, service_tier, text — despite the field's name, this covers everything EXCEPT
+    /// `input`) — `delta::plan_request`'s rule 3 ("do the non-input fields match") check reads
+    /// this. Never raw conversation content. Must be set at the same time and by the same sender
+    /// as `last_item_hashes` (see that field's doc for the failure mode if it's forgotten).
+    pub last_non_input_fingerprint: Option<String>,
 }
 
 impl WsConn {
@@ -146,8 +163,52 @@ impl WsConn {
             socket,
             last_response_id: None,
             last_input_count: None,
-            last_input_fingerprint: None,
+            last_item_hashes: None,
+            last_non_input_fingerprint: None,
         })
+    }
+
+    /// Send one outbound frame (a `response.create` envelope Task 4's `codec::build_response_create`
+    /// already built, and Task 6's `delta::plan_request` already decided anchor/suffix for) as a
+    /// `Text` WS message. First consumer: Task 5's turn stream (`ws::turn`), hence `pub(crate)` —
+    /// the socket itself stays private to this module.
+    pub(crate) async fn send_frame(&mut self, envelope: &Value) -> Result<(), ExecError> {
+        let text = serde_json::to_string(envelope)
+            .map_err(|e| ExecError::Upstream(format!("failed to serialize response.create: {e}")))?;
+        self.socket
+            .send(Message::Text(text.into()))
+            .await
+            .map_err(|e| ExecError::Upstream(e.to_string()))
+    }
+
+    /// Read the next frame's raw text off the socket, for the turn stream (Task 5, `ws::turn`) to
+    /// parse and `classify`.
+    ///
+    /// - Ground truth §2/§7.3: the client never initiates a `Ping`; `tungstenite` answers an
+    ///   inbound `Ping` with an automatic `Pong` internally (queued on the next write), so `Ping`/
+    ///   `Pong` frames observed here are simply skipped — never surfaced as a turn event.
+    /// - Ground truth §3 (`responses_websocket.rs:797-799`): an unexpected `Binary` frame is a
+    ///   hard error.
+    /// - Ground truth §3 (`:800-804`): a `Close` frame (no close-code inspection, per that same
+    ///   citation) and a clean stream end (`None`) both mean "the socket closed before any
+    ///   terminal frame" — both collapse to `Ok(None)` here; the caller (Task 5's turn stream)
+    ///   turns that into the required `ExecError::Stream("websocket closed by server before
+    ///   response.completed")`.
+    pub(crate) async fn recv_frame(&mut self) -> Result<Option<String>, ExecError> {
+        loop {
+            match self.socket.next().await {
+                Some(Ok(Message::Text(text))) => return Ok(Some(text.as_str().to_string())),
+                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+                Some(Ok(Message::Binary(_))) => {
+                    return Err(ExecError::Stream(
+                        "unexpected binary WS frame from codex backend".to_string(),
+                    ));
+                }
+                Some(Ok(Message::Frame(_))) => continue,
+                Some(Ok(Message::Close(_))) | None => return Ok(None),
+                Some(Err(e)) => return Err(ExecError::Stream(e.to_string())),
+            }
+        }
     }
 }
 
@@ -234,7 +295,8 @@ mod tests {
         assert_eq!(mock.handshake_count(), 1);
         assert_eq!(conn.last_response_id, None);
         assert_eq!(conn.last_input_count, None);
-        assert_eq!(conn.last_input_fingerprint, None);
+        assert!(conn.last_item_hashes.is_none());
+        assert_eq!(conn.last_non_input_fingerprint, None);
     }
 
     /// Spins up a raw TCP + `accept_hdr_async_with_config` server (NOT `MockWsUpstream`, which has

@@ -30,35 +30,62 @@
 //!
 //! Any mismatch anywhere in 1-3 => [`RequestPlan::Full`]. When in doubt => `Full`.
 //!
-//! ## Signature deviation from the plan's sketch, and why
+//! ## Revision: content-free delta state (supersedes the original `last_body` design)
 //!
-//! The plan sketches `plan_request(conn: &WsConn, body: &Value)`. `WsConn` (`ws/conn.rs`) does
-//! carry `last_response_id: Option<String>`, but its other two fields —
-//! `last_input_count: Option<u32>` and `last_input_fingerprint: Option<String>` — are documented
-//! there as covering ONLY the count of the last-sent `input` array and a fingerprint of the
-//! **non-input** fields; explicitly "Never raw conversation content." Neither field can support
-//! rule 2 above: verifying that the new `input`'s prefix is *identical* to what was actually sent
-//! last time (the "changed earlier item" dangerous case) requires comparing actual item values,
-//! not a length or a non-input-only summary. A count alone cannot distinguish "the earlier items
-//! are unchanged, N new ones were appended" from "an earlier item was silently edited and N new
-//! ones were appended" — exactly the corruption this module exists to prevent.
+//! The first cut of this module took the prior turn's full envelope as an explicit
+//! `last_body: Option<&Value>` parameter, reasoning that `WsConn` shouldn't be widened with a
+//! field pinning raw conversation content to a long-lived, connection-scoped struct. That
+//! reasoning about `WsConn` was correct — but it only moved the content-retention problem to
+//! whichever caller held `last_body` per connection, which is retention in RAM all the same.
+//! `docs/SPEC-M5-WEBSOCKET.md` §6 requires M5a to retain **zero** conversation content (unlike
+//! M5b's deliberate, fenced RAM accumulation) — a `last_body` sitting anywhere, even off `WsConn`,
+//! violates that.
 //!
-//! Rather than widening `WsConn` with a field that would pin raw conversation content to a
-//! long-lived, connection-scoped struct (a content-retention footprint of its own, and an edit to
-//! `conn.rs`, which is off-limits while another task adopts the deflate forks there concurrently),
-//! [`plan_request`] takes the previous turn's full envelope explicitly as `last_body: Option<&Value>`
-//! — supplied by whichever short-lived caller already holds it (the turn/executor state, Task 7's
-//! concern, not this connection's). [`plan_request_for_conn`] is a thin convenience wrapper that
-//! reads `conn.last_response_id` for the anchor-presence gate (rule 1) without reading or
-//! restructuring anything else on `WsConn`.
+//! The fix: rule 2's "is the new input a strict extension of what we last sent" check does not
+//! need the prior items themselves — it only needs to know whether they're *unchanged*, which a
+//! content-free per-item hash answers exactly as well (modulo hash collision). [`plan_request`]
+//! now takes `last_item_hashes: Option<&[ItemHash]>` (the prior turn's per-item hashes, in order)
+//! instead of `last_body`, plus `last_non_input_fingerprint: Option<&str>` (a hash of rule 3's
+//! fields, replacing direct `Value` comparison against a retained `last_body`). Both are exactly
+//! what [`WsConn`] now stores (`last_item_hashes`, `last_non_input_fingerprint`), so
+//! [`plan_request_for_conn`] no longer needs a `last_body` argument at all — ALL prior-turn state
+//! the planner needs now lives on the connection, content-free, which was the whole point of
+//! declining to widen `WsConn` with raw content in the first place.
 //!
-//! **Content-safety:** `last_body`, `body`, and a produced [`RequestPlan::Incremental`]'s `suffix`
-//! all carry conversation content. Nothing here implements or derives `Debug` that would print an
-//! item; [`RequestPlan`]'s hand-written `Debug` redacts `suffix` the same way `PreparedRequest`
-//! redacts `body` (`polyflare-core/src/types.rs:42-50`). This module also never logs a frame or a
-//! body — it is pure comparison logic with no I/O.
+//! **Why hash-prefix comparison is exactly equivalent to item-by-item comparison:** a strict
+//! extension means "the first `last_item_hashes.len()` items of the new input are identical to
+//! what was sent last time, and there is at least one more item after that." Two items are
+//! identical iff their canonical JSON encodings are identical (this crate enables no
+//! `preserve_order` feature anywhere in the workspace, so `Value::Object`'s `BTreeMap` backing
+//! serializes any two semantically-equal objects to byte-identical strings regardless of
+//! insertion order — array order, which is what actually matters for conversation history, is
+//! preserved either way). Hashing that canonical encoding and comparing hashes therefore agrees
+//! with comparing the items themselves for every input except an actual sha256 collision — the
+//! same standard the durable `input_fingerprint` (`polyflare-core/src/types.rs:217`,
+//! `polyflare-server/src/session_key.rs`'s `sha256_hex`) already relies on elsewhere in this
+//! codebase. This module follows that same hashing convention (`sha2`, lowercase hex) rather than
+//! introducing a new one.
+//!
+//! **Who must set the hashes, and when:** [`WsConn::last_item_hashes`] /
+//! [`WsConn::last_non_input_fingerprint`] start `None` and stay `None` until whoever SENDS a turn
+//! on this connection (Task 5/7's turn-send code) sets them, immediately after sending, via
+//! [`item_hashes`] / [`non_input_fingerprint`] applied to the envelope that was just sent. This
+//! module only computes and compares; it never sends a frame and therefore never sets these
+//! fields itself. If the sender forgets, `plan_request` silently and permanently sees
+//! `last_item_hashes: None`, which gate 1 alone turns into `Full` forever — no error, just a
+//! milestone that quietly never produces an incremental turn.
+//!
+//! **Content-safety:** `body` and a produced [`RequestPlan::Incremental`]'s `suffix` still carry
+//! conversation content (as before — `body` is a short-lived, per-call argument, never retained).
+//! [`ItemHash`] and the fingerprint `String`s are sha256 digests: not reversible to content, safe
+//! to hold indefinitely (that's precisely why [`WsConn`] can now carry them). Nothing here
+//! implements or derives `Debug` that would print an item; [`RequestPlan`]'s hand-written `Debug`
+//! redacts `suffix` the same way `PreparedRequest` redacts `body`
+//! (`polyflare-core/src/types.rs:42-50`). This module also never logs a frame or a body — it is
+//! pure comparison logic with no I/O.
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::WsConn;
 
@@ -75,6 +102,58 @@ const NON_INPUT_FIELDS: &[&str] = &[
     "service_tier",
     "text",
 ];
+
+/// Lowercase-hex sha256 of `bytes` — the same hashing convention `polyflare-server`'s
+/// `session_key::sha256_hex` already uses for content-free session keys / input fingerprints.
+/// Reimplemented locally (rather than depending on `polyflare-server`, which depends on this
+/// crate, not the other way around) using `sha2` alone — no `hex` crate dependency needed.
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A content-free sha256 hash of a single `input` item's canonical JSON encoding. Never
+/// reversible to the item it was derived from — safe to hold indefinitely on the long-lived
+/// [`WsConn`], unlike the item itself. Deriving `Debug` is safe here: the wrapped string IS the
+/// hash, not conversation content (same reasoning [`RequestPlan`]'s hand-written `Debug` uses to
+/// print `anchor` as-is — an opaque id is not content either).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ItemHash(String);
+
+impl ItemHash {
+    /// Hash one `input` item. See the module doc's "Why hash-prefix comparison is exactly
+    /// equivalent" section for why equal items always hash equal and unequal items essentially
+    /// never collide.
+    fn of(item: &Value) -> Self {
+        ItemHash(sha256_hex(item.to_string().as_bytes()))
+    }
+}
+
+/// Per-item content-free hashes of `body`'s `"input"` array, in order. **This is what a turn's
+/// SENDER must call** (on the exact envelope just sent) to populate
+/// [`WsConn::last_item_hashes`] — see the module doc's "Who must set the hashes" section.
+pub fn item_hashes(body: &Value) -> Vec<ItemHash> {
+    input_items(body).iter().map(ItemHash::of).collect()
+}
+
+/// A content-free fingerprint of `body`'s [`NON_INPUT_FIELDS`] — hashes only the presence/value of
+/// those 8 fields (never `input`). Two envelopes fingerprint equal iff every one of those 8 fields
+/// is `==` between them (via `Value`'s own equality, same as the original direct comparison this
+/// replaces) — a field's absence is encoded as a MISSING map key, never as `null`, so "field
+/// present as `null`" and "field absent" still fingerprint differently (codex omits fields it
+/// doesn't set rather than nulling them, ground truth §3). **This is what a turn's SENDER must
+/// call** to populate [`WsConn::last_non_input_fingerprint`] — see the module doc.
+pub fn non_input_fingerprint(body: &Value) -> String {
+    let mut present = serde_json::Map::new();
+    for field in NON_INPUT_FIELDS {
+        if let Some(v) = body.get(*field) {
+            present.insert((*field).to_string(), v.clone());
+        }
+    }
+    sha256_hex(Value::Object(present).to_string().as_bytes())
+}
 
 /// The outcome of [`plan_request`]: send only the new suffix anchored on a prior `response.id`,
 /// or full-resend the entire history with no anchor.
@@ -108,72 +187,79 @@ impl std::fmt::Debug for RequestPlan {
 }
 
 /// Decide whether the new turn (`body`, a full `response.create`-shaped envelope: non-input
-/// fields plus an `"input"` array) can go out as an incremental continuation of `last_body` (the
-/// full envelope this socket most recently sent), anchored on `last_response_id` (that prior
-/// turn's `response.id`, from a `response.completed` on **this same connection** — never a value
+/// fields plus an `"input"` array) can go out as an incremental continuation of the turn most
+/// recently sent on this connection, anchored on `last_response_id` (that prior turn's
+/// `response.id`, from a `response.completed` on **this same connection** — never a value
 /// borrowed from a different socket or a different account).
 ///
 /// Returns `Full` unless ALL of:
-/// 1. `last_response_id` is `Some` (a turn has actually completed on this connection);
-/// 2. `last_body` is `Some`, and `body`'s `"input"` array is a strict extension of `last_body`'s —
-///    strictly longer, with an identical prefix (missing `"input"` on either side is treated as
-///    an empty array, same as codex would see no items);
-/// 3. every field in [`NON_INPUT_FIELDS`] is `==` (via `Value`'s own equality; a field's absence
-///    counts as `None`, so "present as `null`" and "absent" are NOT treated as equal — codex omits
-///    fields it doesn't set rather than nulling them, ground truth §3).
+/// 1. `last_response_id` is `Some` AND `last_item_hashes` is `Some` (a turn has both completed and
+///    been sent on this connection — see the module doc for who populates `last_item_hashes` and
+///    when);
+/// 2. `body`'s `"input"` array is a strict extension of `last_item_hashes` — strictly longer, with
+///    the new input's per-item hashes matching `last_item_hashes` exactly over that prefix
+///    (missing `"input"` is treated as an empty array, same as codex would see no items);
+/// 3. `last_non_input_fingerprint` equals `non_input_fingerprint(body)` — i.e. every one of
+///    [`NON_INPUT_FIELDS`] matches (a field's absence counts as `None`, so "present as `null`" and
+///    "absent" are NOT treated as equal — codex omits fields it doesn't set rather than nulling
+///    them, ground truth §3).
 ///
-/// When 2 holds, the produced `suffix` is exactly `body`'s `"input"` items past `last_body`'s
-/// count — never the whole array, never a re-derived guess.
+/// When 2 holds, the produced `suffix` is exactly `body`'s `"input"` items past
+/// `last_item_hashes`'s length — never the whole array, never a re-derived guess.
 pub fn plan_request(
     last_response_id: Option<&str>,
-    last_body: Option<&Value>,
+    last_item_hashes: Option<&[ItemHash]>,
+    last_non_input_fingerprint: Option<&str>,
     body: &Value,
 ) -> RequestPlan {
-    let (Some(last_response_id), Some(last_body)) = (last_response_id, last_body) else {
+    let (Some(last_response_id), Some(last_item_hashes)) = (last_response_id, last_item_hashes)
+    else {
         return RequestPlan::Full;
     };
 
-    let last_input = input_items(last_body);
     let new_input = input_items(body);
+    let new_item_hashes = item_hashes(body);
 
-    // Rule 2: strict extension only. `<=` (not just "shorter") also correctly rejects the
-    // dangerous same-length case: if nothing grew, there is no suffix to send, so it can never be
-    // a valid extension regardless of what the content comparison below would say.
-    if new_input.len() <= last_input.len() {
+    // Rule 2: strict extension, checked ENTIRELY through hashes — never through the items
+    // themselves (this function never sees the prior items, only their hashes). `<=` (not just
+    // "shorter") also correctly rejects the dangerous same-length case: if nothing grew, there is
+    // no suffix to send, so it can never be a valid extension regardless of what the hash
+    // comparison below would say.
+    if new_item_hashes.len() <= last_item_hashes.len() {
         return RequestPlan::Full;
     }
-    if new_input[..last_input.len()] != *last_input {
+    if new_item_hashes[..last_item_hashes.len()] != *last_item_hashes {
         return RequestPlan::Full;
     }
 
-    // Rule 3.
-    for field in NON_INPUT_FIELDS {
-        if last_body.get(*field) != body.get(*field) {
-            return RequestPlan::Full;
-        }
+    // Rule 3: compare fingerprints (content-free), not fields directly — equivalent to the
+    // original field-by-field comparison per `non_input_fingerprint`'s doc.
+    if last_non_input_fingerprint != Some(non_input_fingerprint(body).as_str()) {
+        return RequestPlan::Full;
     }
 
     RequestPlan::Incremental {
         anchor: last_response_id.to_string(),
-        suffix: new_input[last_input.len()..].to_vec(),
+        suffix: new_input[last_item_hashes.len()..].to_vec(),
     }
 }
 
-/// Convenience wrapper reading `conn.last_response_id` for rule 1 (the anchor-presence gate),
-/// without reading or restructuring any other `WsConn` field — see the module doc's "Signature
-/// deviation" section for why `last_body` still comes in as an explicit parameter rather than
-/// from `conn`.
-pub fn plan_request_for_conn(
-    conn: &WsConn,
-    last_body: Option<&Value>,
-    body: &Value,
-) -> RequestPlan {
-    plan_request(conn.last_response_id.as_deref(), last_body, body)
+/// Convenience wrapper reading ALL prior-turn state straight off `conn` — now possible because
+/// `WsConn` carries only content-free state (`last_response_id`, `last_item_hashes`,
+/// `last_non_input_fingerprint`), unlike the original design this superseded (see the module
+/// doc's "Revision" section), which still needed a `last_body` argument from the caller.
+pub fn plan_request_for_conn(conn: &WsConn, body: &Value) -> RequestPlan {
+    plan_request(
+        conn.last_response_id.as_deref(),
+        conn.last_item_hashes.as_deref(),
+        conn.last_non_input_fingerprint.as_deref(),
+        body,
+    )
 }
 
 /// `body["input"]` as a slice, or an empty slice if absent/not an array. Never re-parses a raw
-/// wire body — `body`/`last_body` are already-materialized `Value`s the caller (Task 7) holds for
-/// other reasons; this just borrows the one field it needs.
+/// wire body — `body` is an already-materialized `Value` the caller (Task 7) holds for other
+/// reasons; this just borrows the one field it needs.
 fn input_items(body: &Value) -> &[Value] {
     body.get("input")
         .and_then(Value::as_array)
@@ -207,17 +293,25 @@ mod tests {
         })
     }
 
+    /// The content-free prior-turn state (`last_item_hashes`, `last_non_input_fingerprint`) that
+    /// `plan_request` now takes in place of a retained `last_body`. Mirrors exactly what a real
+    /// sender (Task 5/7) would compute and store on `WsConn` right after sending `baseline(input)`.
+    fn last_state(input: Vec<Value>) -> (Vec<ItemHash>, String) {
+        let envelope = baseline(input);
+        (item_hashes(&envelope), non_input_fingerprint(&envelope))
+    }
+
     const ANCHOR: &str = "resp_prior_turn_123";
 
     // ---- strict extension --------------------------------------------------------------
 
     #[test]
     fn strict_extension_is_incremental_with_only_the_new_items() {
-        let last = baseline(vec![item(0), item(1)]);
+        let (last_hashes, last_fp) = last_state(vec![item(0), item(1)]);
         let new_items = [item(0), item(1), item(2), item(3)];
         let body = baseline(new_items.to_vec());
 
-        let plan = plan_request(Some(ANCHOR), Some(&last), &body);
+        let plan = plan_request(Some(ANCHOR), Some(&last_hashes), Some(&last_fp), &body);
 
         assert_eq!(
             plan,
@@ -234,7 +328,7 @@ mod tests {
 
     #[test]
     fn each_non_input_field_changed_alone_forces_full() {
-        let last = baseline(vec![item(0), item(1)]);
+        let (last_hashes, last_fp) = last_state(vec![item(0), item(1)]);
         let new_items = vec![item(0), item(1), item(2)];
 
         let mutations: &[(&str, Value)] = &[
@@ -255,7 +349,7 @@ mod tests {
             let mut body = baseline(new_items.clone());
             body[field] = new_value.clone();
 
-            let plan = plan_request(Some(ANCHOR), Some(&last), &body);
+            let plan = plan_request(Some(ANCHOR), Some(&last_hashes), Some(&last_fp), &body);
 
             assert_eq!(
                 plan,
@@ -269,12 +363,12 @@ mod tests {
     #[test]
     fn changed_model_is_full() {
         // Single explicit case per the plan's Step 1 list, in addition to the table above.
-        let last = baseline(vec![item(0), item(1)]);
+        let (last_hashes, last_fp) = last_state(vec![item(0), item(1)]);
         let mut body = baseline(vec![item(0), item(1), item(2)]);
         body["model"] = json!("a-completely-different-model");
 
         assert_eq!(
-            plan_request(Some(ANCHOR), Some(&last), &body),
+            plan_request(Some(ANCHOR), Some(&last_hashes), Some(&last_fp), &body),
             RequestPlan::Full
         );
     }
@@ -285,11 +379,11 @@ mod tests {
     fn changed_earlier_item_same_length_is_full() {
         // Same length as last time (no new items at all) but item 0 was edited. Not an
         // extension by definition — must never be reported Incremental with an empty suffix.
-        let last = baseline(vec![item(0), item(1)]);
+        let (last_hashes, last_fp) = last_state(vec![item(0), item(1)]);
         let body = baseline(vec![item(99), item(1)]);
 
         assert_eq!(
-            plan_request(Some(ANCHOR), Some(&last), &body),
+            plan_request(Some(ANCHOR), Some(&last_hashes), Some(&last_fp), &body),
             RequestPlan::Full
         );
     }
@@ -300,7 +394,7 @@ mod tests {
         // pass), but an earlier (non-appended) item silently differs from what this socket
         // actually sent last time. Anchoring on `last_response_id` here would resume a history
         // that has diverged from what the server actually has — must be Full, not Incremental.
-        let last = baseline(vec![item(0), item(1)]);
+        let (last_hashes, last_fp) = last_state(vec![item(0), item(1)]);
         let body = baseline(vec![
             item(0),
             item(99), /* changed */
@@ -308,38 +402,119 @@ mod tests {
         ]);
 
         assert_eq!(
-            plan_request(Some(ANCHOR), Some(&last), &body),
+            plan_request(Some(ANCHOR), Some(&last_hashes), Some(&last_fp), &body),
             RequestPlan::Full
         );
     }
 
-    // ---- no last_response_id -------------------------------------------------------------
-
     #[test]
-    fn no_last_response_id_is_full() {
-        let last = baseline(vec![item(0), item(1)]);
-        let body = baseline(vec![item(0), item(1), item(2)]);
+    fn changed_earlier_item_is_caught_through_a_hash_mismatch_not_value_comparison() {
+        // Same dangerous shape as `changed_earlier_item_despite_growth_is_full`, but this test
+        // proves the MECHANISM: `plan_request` never sees the prior turn's actual items again —
+        // only their hashes were ever retained — so the divergence must be caught purely because
+        // a hash at the same position differs, not because anything compared the original values.
+        let last_hashes = item_hashes(&baseline(vec![item(0), item(1)]));
+        let last_fp = non_input_fingerprint(&baseline(vec![item(0), item(1)]));
 
-        assert_eq!(plan_request(None, Some(&last), &body), RequestPlan::Full);
+        let body = baseline(vec![
+            item(99), /* changed */
+            item(1),
+            item(2), /* new */
+        ]);
+        let new_hashes = item_hashes(&body);
+
+        assert_ne!(
+            new_hashes[0], last_hashes[0],
+            "item(99) must hash differently from item(0) for the prefix check to catch this"
+        );
+        assert_eq!(
+            new_hashes[1], last_hashes[1],
+            "the untouched item(1) must hash identically, isolating the change to position 0"
+        );
+
+        assert_eq!(
+            plan_request(Some(ANCHOR), Some(&last_hashes), Some(&last_fp), &body),
+            RequestPlan::Full,
+            "a changed earlier item, caught via the hash prefix mismatch, must force Full"
+        );
     }
 
     #[test]
-    fn no_last_body_is_full() {
+    fn item_hashes_are_deterministic_and_content_sensitive() {
+        let a = item_hashes(&baseline(vec![item(0), item(1)]));
+        let b = item_hashes(&baseline(vec![item(0), item(1)]));
+        assert_eq!(
+            a, b,
+            "hashing the same items twice must produce identical hashes"
+        );
+
+        let c = item_hashes(&baseline(vec![item(0), item(2)]));
+        assert_ne!(
+            a, c,
+            "a different item at the same position must hash differently"
+        );
+    }
+
+    #[test]
+    fn non_input_fingerprint_distinguishes_absent_from_null() {
+        let mut with_null = baseline(vec![item(0)]);
+        with_null["service_tier"] = Value::Null;
+
+        let mut absent = baseline(vec![item(0)]);
+        absent.as_object_mut().unwrap().remove("service_tier");
+
+        assert_ne!(
+            non_input_fingerprint(&with_null),
+            non_input_fingerprint(&absent),
+            "a field present as `null` must fingerprint differently from the field being absent \
+             entirely — codex omits unset fields rather than nulling them"
+        );
+    }
+
+    #[test]
+    fn item_hash_debug_never_contains_raw_item_content() {
+        let sensitive = json!({"role": "user", "content": "SENSITIVE_MARKER_qwer9876"});
+        let hashes = item_hashes(&baseline(vec![sensitive]));
+        let rendered = format!("{hashes:?}");
+        assert!(
+            !rendered.contains("SENSITIVE_MARKER_qwer9876"),
+            "ItemHash Debug must never leak the item it was derived from: {rendered}"
+        );
+    }
+
+    // ---- no last_response_id / no last_item_hashes -----------------------------------------
+
+    #[test]
+    fn no_last_response_id_is_full() {
+        let (last_hashes, last_fp) = last_state(vec![item(0), item(1)]);
+        let body = baseline(vec![item(0), item(1), item(2)]);
+
+        assert_eq!(
+            plan_request(None, Some(&last_hashes), Some(&last_fp), &body),
+            RequestPlan::Full
+        );
+    }
+
+    #[test]
+    fn no_last_item_hashes_is_full() {
         // First turn on a fresh connection: nothing sent yet to extend.
         let body = baseline(vec![item(0)]);
 
-        assert_eq!(plan_request(Some(ANCHOR), None, &body), RequestPlan::Full);
+        assert_eq!(
+            plan_request(Some(ANCHOR), None, None, &body),
+            RequestPlan::Full
+        );
     }
 
     // ---- shorter input ----------------------------------------------------------------
 
     #[test]
     fn shorter_input_is_full() {
-        let last = baseline(vec![item(0), item(1), item(2)]);
+        let (last_hashes, last_fp) = last_state(vec![item(0), item(1), item(2)]);
         let body = baseline(vec![item(0), item(1)]);
 
         assert_eq!(
-            plan_request(Some(ANCHOR), Some(&last), &body),
+            plan_request(Some(ANCHOR), Some(&last_hashes), Some(&last_fp), &body),
             RequestPlan::Full
         );
     }
@@ -365,7 +540,7 @@ mod tests {
         );
     }
 
-    // ---- plan_request_for_conn reads only conn.last_response_id --------------------------
+    // ---- plan_request_for_conn reads only conn's content-free state ------------------------
 
     #[tokio::test]
     async fn plan_request_for_conn_uses_conn_last_response_id() {
@@ -382,14 +557,11 @@ mod tests {
         };
         let conn = WsConn::connect(&account, &[]).await.expect("connect");
         assert!(conn.last_response_id.is_none());
+        assert!(conn.last_item_hashes.is_none());
 
-        let last = baseline(vec![item(0)]);
         let body = baseline(vec![item(0), item(1)]);
 
-        // No last_response_id yet on a fresh connection => Full, regardless of last_body/body.
-        assert_eq!(
-            plan_request_for_conn(&conn, Some(&last), &body),
-            RequestPlan::Full
-        );
+        // No last_response_id yet on a fresh connection => Full, regardless of body.
+        assert_eq!(plan_request_for_conn(&conn, &body), RequestPlan::Full);
     }
 }
