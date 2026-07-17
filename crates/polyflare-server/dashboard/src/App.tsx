@@ -1,12 +1,65 @@
-// TEMPORARY placeholder — proves the parity stack (Tailwind + ccflare token theme) compiles and
-// renders. Later tasks replace this with the routed dashboard (react-router-dom + react-query
-// pages/hooks); api.ts and styles.css are superseded incrementally by those tasks, not this one.
-export function App() {
+// QueryClientProvider → BrowserRouter → AuthProvider → Routes. This wires the app shell for good
+// (provider stack + route tree); ShellPlaceholder and the per-page placeholders below are the only
+// TEMPORARY pieces — Task 4 replaces ShellPlaceholder with the real Shell (nav + header), and each
+// later page task replaces its own placeholder route element.
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { BrowserRouter, Navigate, Outlet, Route, Routes } from "react-router-dom";
+
+import { AuthProvider, RequireAuth } from "./auth/AuthProvider";
+import { CapabilitiesProvider } from "./capabilities/CapabilitiesProvider";
+import { Login } from "./pages/Login";
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: false,
+      refetchOnWindowFocus: true,
+    },
+  },
+});
+
+// TEMPORARY — Task 4 replaces this with the real Shell (sidebar nav + header) around <Outlet/>.
+function ShellPlaceholder() {
   return (
     <div className="min-h-screen p-6">
-      <div className="bg-card border border-border rounded p-6 text-fg">
-        PolyFlare dashboard — scaffolding
-      </div>
+      <Outlet />
     </div>
+  );
+}
+
+// TEMPORARY — each later page task supplies the real route element.
+function RoutePlaceholder({ label }: { label: string }) {
+  return <div className="text-fg">{label} (todo)</div>;
+}
+
+export function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter basename="/dashboard">
+        <AuthProvider>
+          <Routes>
+            <Route path="/login" element={<Login />} />
+            <Route
+              path="/"
+              element={
+                <RequireAuth>
+                  <CapabilitiesProvider>
+                    <ShellPlaceholder />
+                  </CapabilitiesProvider>
+                </RequireAuth>
+              }
+            >
+              <Route index element={<RoutePlaceholder label="Overview" />} />
+              <Route path="accounts" element={<RoutePlaceholder label="Accounts" />} />
+              <Route path="accounts/:id" element={<RoutePlaceholder label="Account detail" />} />
+              <Route path="pools" element={<RoutePlaceholder label="Pools" />} />
+              <Route path="requests" element={<RoutePlaceholder label="Requests" />} />
+              <Route path="logs" element={<RoutePlaceholder label="Logs" />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Route>
+          </Routes>
+        </AuthProvider>
+      </BrowserRouter>
+    </QueryClientProvider>
   );
 }
