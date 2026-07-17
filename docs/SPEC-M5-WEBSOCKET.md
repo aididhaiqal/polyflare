@@ -84,9 +84,24 @@ This mirrors codex's own rule — `get_incremental_items` + `responses_request_p
 (`client.rs:306-359,1222-1253`). Non-input fields (model, instructions, tools, tool_choice, reasoning,
 service_tier, text, …) differing ⇒ full request; do not try to be cleverer than codex here.
 
+**Compare per-item HASHES, never items — this is what keeps M5a content-free.** "Strict extension" needs the
+prior turn's items, and holding them would mean retaining conversation content in RAM on a long-lived
+connection — precisely the fenced M5b exception that M5a is sequenced to avoid (§6). Instead `WsConn` carries
+the per-item hash vector of what it last sent: extension ⇔ the stored hashes are a **prefix** of the new
+input's hashes AND the new input is strictly longer; the suffix is the items past that prefix. Equivalent to
+codex's item-by-item comparison modulo collision, at ~32 bytes/item and zero content. PolyFlare already
+fingerprints input content-free — M3 persists `input_fingerprint` durably
+(`polyflare-core/src/types.rs:217`) — so this is the established convention, not a new one.
+
+**The silent failure mode:** whoever sends a turn MUST set those hashes. If they stay `None`, every turn plans
+`Full`, the milestone's entire benefit evaporates, and *nothing errors* — it just quietly behaves like HTTP at
+HTTP's cost. Test for the delta actually being a delta (assert the sent `input` length + the anchor), never
+merely for the absence of failure.
+
 **The anchor is a property of the live socket, never of the database.** Ground truth §7.5: a reconnect zeroes
 incremental state and the next request carries no anchor. `WsConn` owns `{last_response_id, last_input_count,
-last_input_fingerprint}`; dropping the connection drops them. M3's durable `continuity_sessions` row keeps its
+last_item_hashes, last_input_fingerprint}` — note the last of those covers the **non-input** fields despite its
+name (it has already misled one reader). Dropping the connection drops them all. M3's durable `continuity_sessions` row keeps its
 existing job (ownership routing — D3) and must **not** be read back as a live WS anchor.
 
 ## 3. Handshake and fingerprint
