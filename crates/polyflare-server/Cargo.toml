@@ -44,3 +44,6 @@ sqlx = { workspace = true }
 tempfile = { workspace = true }
 zeroize = { workspace = true }
 base64 = { workspace = true }
+# ws_vs_sse_probe example only: a WebSocket client for the Codex backend POC. Pinned to the same
+# rustls 0.23 the workspace uses so it reuses the installed aws-lc-rs crypto provider.
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
