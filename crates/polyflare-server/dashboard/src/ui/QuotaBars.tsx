@@ -1,6 +1,6 @@
 import clsx from "clsx";
 
-import { ProviderTag } from "./ProviderTag";
+import { ProviderTag, providerBrandKey } from "./ProviderTag";
 
 export interface QuotaWindowRow {
   /** Raw window key, e.g. `"five_hour" | "weekly" | "session"` (see `UsageWindowView.window` /
@@ -60,7 +60,10 @@ export function QuotaBars({
                   <span className="w-11 shrink-0 text-fg opacity-60">{labelForWindow(w.window)}</span>
                   <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
                     <div
-                      className={clsx("h-full rounded-full", PROVIDER_BAR_CLASS[group.provider] ?? "bg-accent")}
+                      className={clsx(
+                        "h-full rounded-full",
+                        PROVIDER_BAR_CLASS[providerBrandKey(group.provider)] ?? "bg-accent",
+                      )}
                       style={{ width: `${Math.max(0, Math.min(100, w.usedPercent as number))}%` }}
                     />
                   </div>
