@@ -8,9 +8,9 @@ use clap::{Parser, Subcommand};
 
 use polyflare_anthropic::AnthropicExecutor;
 use polyflare_codex::oauth::OAuthClient;
-use polyflare_codex::{run_login, CodexExecutor, CodexVersionCache};
+use polyflare_codex::{run_login, CodexVersionCache};
 use polyflare_core::{Continuity, Executor, Selector};
-use polyflare_server::app::{build_app, AppState};
+use polyflare_server::app::{build_app, build_codex_executor, AppState};
 use polyflare_server::config::{self, ServeConfig};
 use polyflare_server::continuity::CodexContinuity;
 use polyflare_store::{import_from_codex_lb, Account, PlainTokens, Store, TokenCipher};
@@ -109,7 +109,9 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServeConfig::from_env()?;
     let store = Store::open(&config.db_path).await?;
     let cipher = TokenCipher::load_or_create(&config.key_path)?;
-    let codex_executor: Arc<dyn Executor> = Arc::new(CodexExecutor::new()?);
+    // M5a: `POLYFLARE_WS_UPSTREAM` (default OFF) selects `CodexWsExecutor` over the WS transport
+    // instead of today's HTTP-SSE `CodexExecutor` — see `build_codex_executor`'s doc.
+    let codex_executor: Arc<dyn Executor> = build_codex_executor(config.ws_upstream)?;
     let anthropic_executor: Arc<dyn Executor> = Arc::new(AnthropicExecutor::new()?);
     // Routing: the global default strategy + any per-pool overrides, both from config.
     let selector: Arc<dyn Selector> = config.routing_strategy.selector();

@@ -234,6 +234,54 @@ async fn read_next(mut guard: OwnedMutexGuard<WsConn>) -> ReadOutcome {
     (guard, result)
 }
 
+/// Send `envelope` on an ALREADY-HELD `guard` and update the connection's delta-tracking state —
+/// the shared body behind both [`turn_stream`] (which acquires the guard itself, lazily, at first
+/// poll) and [`turn_stream_with_guard`] (which takes a guard the caller acquired earlier, to widen
+/// the critical section to also cover planning — see that function's doc for why).
+async fn send_and_track(
+    mut guard: OwnedMutexGuard<WsConn>,
+    envelope: &Value,
+) -> Result<OwnedMutexGuard<WsConn>, ExecError> {
+    guard.send_frame(envelope).await?;
+    // **THE FAILURE THAT MUST NOT HAPPEN** (M5a Task 7): record what the socket now HOLDS
+    // — the full accumulated history, not merely the wire suffix — so `delta::plan_request`
+    // can compute a real strict-extension next turn. This MUST happen right here,
+    // immediately after `send_frame` succeeds and nowhere else — forgetting it makes every
+    // future turn on this connection silently plan `Full` forever: no error, no test
+    // failure, just the milestone's entire benefit evaporating while everything appears to
+    // work (see `delta.rs`'s module doc's "Who must set the hashes" section and
+    // `WsConn::last_item_hashes`'s own doc for the exact mechanism).
+    //
+    // `envelope`'s `input` is only the WIRE payload just sent: the full history on a
+    // `Full` plan, but only the new suffix on an `Incremental` one
+    // (`executor.rs::plan_and_build` / `codec::build_response_create`). Recording just
+    // `item_hashes(envelope)` unconditionally — the original, buggy version of this line
+    // — is therefore correct after a `Full` send but WRONG after an `Incremental` one: it
+    // would overwrite the full history with only the suffix's hashes, so the very next
+    // turn's real full-history body (SPEC-M5-WEBSOCKET.md §2: the HTTP client always
+    // resends full history) has no valid prefix to extend and silently falls back to
+    // `Full` — the exact "delta works for one turn, then reverts every OTHER turn" defect
+    // this fix closes. So: on an incremental send, APPEND the suffix's hashes onto the
+    // prior-full vector already sitting in `guard.last_item_hashes` (untouched since the
+    // last time this closure ran); on a full send (or the first turn, when there is no
+    // prior state), the sent hashes ARE the full history, so they simply replace it.
+    let sent = item_hashes(envelope);
+    let full = match (
+        envelope.get("previous_response_id").is_some(),
+        guard.last_item_hashes.take(),
+    ) {
+        (true, Some(mut prev)) => {
+            prev.extend(sent);
+            prev
+        }
+        _ => sent,
+    };
+    guard.last_non_input_fingerprint = Some(non_input_fingerprint(envelope));
+    guard.last_input_count = Some(full.len() as u32);
+    guard.last_item_hashes = Some(full);
+    Ok(guard)
+}
+
 /// Drive ONE turn over `conn`: send `envelope` (an already-built `response.create` request — Task
 /// 4's `codec::build_response_create` output, already anchored/deltad by Task 6's
 /// `delta::plan_request` if applicable), then yield every received frame re-framed as SSE bytes
@@ -244,50 +292,46 @@ async fn read_next(mut guard: OwnedMutexGuard<WsConn>) -> ReadOutcome {
 ///
 /// The send itself is lazy: nothing happens on the wire until the returned stream is first polled
 /// (matching every other `ResponseStream`-returning path in this codebase — no work happens before
-/// the caller starts consuming).
+/// the caller starts consuming). This entry point acquires `conn`'s lock itself, at first poll —
+/// used directly by this module's own tests and any caller with no separate planning step to widen
+/// the critical section over. `ws::executor::CodexWsExecutor::drive_turn` (M5a Task 8) uses
+/// [`turn_stream_with_guard`] instead — see that function's doc.
 pub fn turn_stream(conn: SharedWsConn, envelope: Value) -> ResponseStream {
     Box::pin(TurnStream {
         state: TurnState::Sending(Box::pin(async move {
-            let mut guard = conn.lock_owned().await;
-            guard.send_frame(&envelope).await?;
-            // **THE FAILURE THAT MUST NOT HAPPEN** (M5a Task 7): record what the socket now HOLDS
-            // — the full accumulated history, not merely the wire suffix — so `delta::plan_request`
-            // can compute a real strict-extension next turn. This MUST happen right here,
-            // immediately after `send_frame` succeeds and nowhere else — forgetting it makes every
-            // future turn on this connection silently plan `Full` forever: no error, no test
-            // failure, just the milestone's entire benefit evaporating while everything appears to
-            // work (see `delta.rs`'s module doc's "Who must set the hashes" section and
-            // `WsConn::last_item_hashes`'s own doc for the exact mechanism).
-            //
-            // `envelope`'s `input` is only the WIRE payload just sent: the full history on a
-            // `Full` plan, but only the new suffix on an `Incremental` one
-            // (`executor.rs::plan_and_build` / `codec::build_response_create`). Recording just
-            // `item_hashes(&envelope)` unconditionally — the original, buggy version of this line
-            // — is therefore correct after a `Full` send but WRONG after an `Incremental` one: it
-            // would overwrite the full history with only the suffix's hashes, so the very next
-            // turn's real full-history body (SPEC-M5-WEBSOCKET.md §2: the HTTP client always
-            // resends full history) has no valid prefix to extend and silently falls back to
-            // `Full` — the exact "delta works for one turn, then reverts every OTHER turn" defect
-            // this fix closes. So: on an incremental send, APPEND the suffix's hashes onto the
-            // prior-full vector already sitting in `guard.last_item_hashes` (untouched since the
-            // last time this closure ran); on a full send (or the first turn, when there is no
-            // prior state), the sent hashes ARE the full history, so they simply replace it.
-            let sent = item_hashes(&envelope);
-            let full = match (
-                envelope.get("previous_response_id").is_some(),
-                guard.last_item_hashes.take(),
-            ) {
-                (true, Some(mut prev)) => {
-                    prev.extend(sent);
-                    prev
-                }
-                _ => sent,
-            };
-            guard.last_non_input_fingerprint = Some(non_input_fingerprint(&envelope));
-            guard.last_input_count = Some(full.len() as u32);
-            guard.last_item_hashes = Some(full);
-            Ok(guard)
+            let guard = conn.lock_owned().await;
+            send_and_track(guard, &envelope).await
         })),
+    })
+}
+
+/// Like [`turn_stream`], but the caller has ALREADY acquired `conn`'s lock (an
+/// [`OwnedMutexGuard`]) and hands it straight in, instead of this function acquiring it itself.
+///
+/// # Why this exists: closing the plan-vs-send race (M5a Task 8)
+/// `ws::executor::CodexWsExecutor::drive_turn` must PLAN the next envelope (`delta::
+/// plan_request_for_conn`, reading `conn`'s `last_response_id`/`last_item_hashes`/
+/// `last_non_input_fingerprint`) before it can build the `response.create` body this function
+/// sends. If planning locks-and-releases separately from this function's own (former) internal
+/// `lock_owned()`, there is a real gap between the two: a second concurrent turn on the SAME
+/// session key (same cached [`SharedWsConn`]) can plan against the identical pre-send state,
+/// build its own envelope, and only THEN queue behind the first turn's send — meaning by the time
+/// the second turn's envelope actually reaches the wire, the connection's real state has already
+/// moved past what that envelope was planned against (a stale anchor, a suffix that no longer
+/// starts where the connection's history now ends). Ground truth §4 ("strictly one in-flight turn
+/// per socket") already prevented two turns from being IN FLIGHT on the wire at once — the gap was
+/// specifically between planning and sending, not between two sends.
+///
+/// The fix: the caller acquires `conn`'s lock ONCE, holds it across BOTH the plan (a synchronous
+/// read of the guard) and the send (this function), and only [`turn_stream`]/[`send_and_track`]
+/// (via reaching `TurnState::Done`) ever drops it. A second concurrent `drive_turn` call on the
+/// same session key blocks at its own lock acquisition until the first turn is fully done —
+/// exactly mirroring ground truth §4's per-socket exclusivity, just widened to cover planning too.
+/// Turns on a DIFFERENT session key use a DIFFERENT `SharedWsConn` (a different `Mutex`), so this
+/// never serializes unrelated sessions against each other.
+pub(crate) fn turn_stream_with_guard(guard: OwnedMutexGuard<WsConn>, envelope: Value) -> ResponseStream {
+    Box::pin(TurnStream {
+        state: TurnState::Sending(Box::pin(async move { send_and_track(guard, &envelope).await })),
     })
 }
 
