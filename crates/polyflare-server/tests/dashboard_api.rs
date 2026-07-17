@@ -3,7 +3,9 @@
 //! not silently open.
 
 mod support;
-use support::{spawn, spawn_without_admin_token};
+use futures_util::StreamExt;
+use polyflare_server::log_bus::LogEvent;
+use support::{spawn, spawn_live_logs, spawn_without_admin_token};
 
 #[tokio::test]
 async fn whoami_requires_admin_token() {
@@ -64,4 +66,40 @@ async fn whoami_is_503_when_dashboard_disabled() {
         503,
         "no POLYFLARE_ADMIN_TOKEN configured ⇒ dashboard disabled"
     );
+}
+
+#[tokio::test]
+async fn logs_stream_200_and_streams_backfill_when_flag_on() {
+    let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
+    let (pf, state) = spawn(up).await; // spawn sets live_logs = true for tests
+
+    // Publish before connecting so this event lands in the backfill snapshot.
+    state.log_bus.publish(LogEvent::info("test", "hello"));
+
+    let r = reqwest::Client::new()
+        .get(format!("{pf}/api/logs/stream"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-type"], "text/event-stream");
+
+    let mut stream = r.bytes_stream();
+    let chunk = stream.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&chunk).contains("hello"));
+}
+
+#[tokio::test]
+async fn logs_stream_is_404_when_flag_off() {
+    let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
+    let (pf, _state) = spawn_live_logs(up, false).await;
+
+    let r = reqwest::Client::new()
+        .get(format!("{pf}/api/logs/stream"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404, "POLYFLARE_LIVE_LOGS off ⇒ 404");
 }

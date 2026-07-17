@@ -1853,6 +1853,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
@@ -2922,6 +2923,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
