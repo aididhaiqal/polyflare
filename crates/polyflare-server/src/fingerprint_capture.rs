@@ -65,6 +65,11 @@ const AUTH_HEADER_NAMES: &[&str] = &["authorization"];
 /// `session_id` / `x-session-id`; `docs/reference/codex-lb-continuity-reference.md` / SPEC-M3 §3
 /// note `x-codex-turn-state`, session, thread/turn/window/installation ids as the real Codex CLI's
 /// identity headers).
+///
+/// `chatgpt-account-id` (M5a, `docs/WS-GROUND-TRUTH-CODEX.md` §1): the real ChatGPT account id
+/// sent alongside the Bearer on both the HTTP and WS egress paths (`polyflare_core::Account::
+/// chatgpt_account_id`) — every bit as account-identifying as `x-codex-account-id` above, so it
+/// gets the same FORMAT-only treatment here rather than falling through to generic classification.
 const ID_HEADER_NAMES: &[&str] = &[
     "session-id",
     "session_id",
@@ -79,6 +84,7 @@ const ID_HEADER_NAMES: &[&str] = &[
     "x-codex-installation-id",
     "account-id",
     "x-codex-account-id",
+    "chatgpt-account-id",
     "x-client-request-id",
     "x-request-id",
     "request-id",
@@ -86,12 +92,20 @@ const ID_HEADER_NAMES: &[&str] = &[
 
 /// `(header name, exact value)` pairs that are fixed wire-protocol constants — never
 /// user/account-identifying — and so may be recorded verbatim (rule 5) instead of redacted.
+///
+/// M5a additions (`docs/WS-GROUND-TRUTH-CODEX.md` §1/§7.2): the WS handshake's own fixed
+/// upgrade-negotiation values, plus the `OpenAI-Beta` version string this gate's "exactly once,
+/// exact value" assertion cares about — none of these carry any account/session identity.
 const STATIC_CONSTANTS: &[(&str, &str)] = &[
     ("accept", "text/event-stream"),
     ("accept", "application/json"),
     ("content-type", "application/json"),
     ("content-type", "text/event-stream"),
     ("connection", "keep-alive"),
+    ("connection", "Upgrade"),
+    ("upgrade", "websocket"),
+    ("sec-websocket-version", "13"),
+    ("openai-beta", "responses_websockets=2026-02-06"),
     ("accept-encoding", "gzip"),
     ("te", "trailers"),
 ];
@@ -480,6 +494,41 @@ mod tests {
         let fp = capture_request_fingerprint("POST", "/responses", &headers);
         assert_eq!(find(&fp, "session_id")["value"]["format"], "uuid");
         assert_eq!(find(&fp, "x-codex-thread-id")["value"]["format"], "uuid");
+    }
+
+    #[test]
+    fn chatgpt_account_id_becomes_a_format_descriptor_not_a_raw_value() {
+        // M5a: the WS (and HTTP) egress's account-identifying companion header to the Bearer —
+        // must never be echoed raw (see `ID_HEADER_NAMES`'s doc for why it was added here).
+        let headers = hdr(&[("chatgpt-account-id", "acct-should-never-leak-raw-12345")]);
+        let fp = capture_request_fingerprint("GET", "/responses", &headers);
+        let value = &find(&fp, "chatgpt-account-id")["value"];
+        assert!(
+            value["format"].is_string(),
+            "expected a format descriptor: {value}"
+        );
+        let serialized = serde_json::to_string(&fp).unwrap();
+        assert!(!serialized.contains("acct-should-never-leak-raw-12345"));
+    }
+
+    #[test]
+    fn ws_handshake_protocol_constants_are_recorded_verbatim() {
+        // M5a additions to `STATIC_CONSTANTS`: none of these carry account/session identity, so
+        // they're recorded verbatim rather than generically classified.
+        let headers = hdr(&[
+            ("connection", "Upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-version", "13"),
+            ("openai-beta", "responses_websockets=2026-02-06"),
+        ]);
+        let fp = capture_request_fingerprint("GET", "/responses", &headers);
+        assert_eq!(find(&fp, "connection")["value"], "Upgrade");
+        assert_eq!(find(&fp, "upgrade")["value"], "websocket");
+        assert_eq!(find(&fp, "sec-websocket-version")["value"], "13");
+        assert_eq!(
+            find(&fp, "openai-beta")["value"],
+            "responses_websockets=2026-02-06"
+        );
     }
 
     #[test]
