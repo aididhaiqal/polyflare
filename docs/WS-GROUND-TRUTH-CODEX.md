@@ -209,3 +209,46 @@ box — treat that as the observed contract, not a guarantee.
 `x-codex-turn-metadata`, `ws_request_header_x_openai_internal_codex_responses_lite`,
 `x-codex-turn-state`, `ws_request_header_traceparent` / `ws_request_header_tracestate`, plus
 `x-codex-ws-stream-request-start-ms` stamped immediately before every send (`client.rs:1627`).
+
+## 8. "WebSocket v2" and `responses_lite` (studied 2026-07-18)
+
+**"v2" is NOT a live protocol version — it is *the* WS transport.** The `responses_websockets` and
+`responses_websockets_v2` Feature flags are both `Stage::Removed` no-ops (`features/src/lib.rs:296-298,1353-1364`;
+`Stage::Removed` = "useless but kept for backward compat", `:49-50`). There is no v1 code path in the tree to
+diff against. What actually gates WS is `responses_websocket_enabled()` = provider `supports_websockets` AND not
+`disable_websockets` (`client.rs:929-937`) — not the flags.
+
+**The beta date is a single hardcoded constant, not negotiated.** `RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE =
+"responses_websockets=2026-02-06"` (`client.rs:154`, `from_static` at `:1094`; mirrored `doctor.rs:94`). One
+value tree-wide. The server never echoes a WS version; the client never compares one. The ONLY negotiation is
+the 426→HTTP fallback (`client.rs:1596-1600`). ⇒ Hardcoding it (as PolyFlare does) is faithful. **Risk = version
+DRIFT only:** it's a compile-time literal a future codex release bumps with no runtime signal — so track it like
+`CODEX_CLI_VERSION` (the fingerprint-drift guard should watch this constant too).
+
+**`responses_lite` — model-gated body TRANSFORMATION, orthogonal to WS, NOT ignorable for 5.6-class models.**
+Gated by `ModelInfo.use_responses_lite` (`openai_models.rs:435`), true ONLY for `gpt-5.6-sol`/`terra`/`luna`
+(`models.json:22,135,246`), false for all pre-5.6. When true it REWRITES the request body (`client.rs:842-863,896,817-819`;
+`client_common.rs:52-90`): instructions + tools relocated OUT of top-level and INTO the input list as a leading
+`AdditionalTools` (`role:"developer"`) item (top-level `instructions=""`, `tools=None`); `parallel_tool_calls`
+forced false; `reasoning.context = AllTurns`; input-image `detail` stripped. Transport encoding differs by path:
+HTTP sends header `x-openai-internal-codex-responses-lite: true` (`client.rs:1903-1910`); WS carries it as the
+`client_metadata` key `ws_request_header_x_openai_internal_codex_responses_lite = "true"` inside `response.create`
+(`client.rs:757-770`), NOT as a header.
+
+### PolyFlare fidelity gaps this surfaces (CONFIRMED against the tree)
+
+1. **`responses_lite` body-shaping is ABSENT on the aliased/translated path — a real M4 gap.** PolyFlare only
+   *mentions* the header in a doc comment (`polyflare-codex/src/codex_headers.rs:16-17`); no code applies the
+   body transformation or synthesizes the metadata key. The NATIVE `/responses` path forwards raw client bytes
+   verbatim, so a real Codex CLI already shaped the body — native is faithful for free. But the **alias/translate
+   path** (M4 headline: Claude `opus → gpt-5.6-sol`) SYNTHESIZES a standard Codex body with top-level
+   tools/instructions, `parallel_tool_calls` unset, no AllTurns context — i.e. the NON-lite shape sent to a lite
+   model. **Unverified whether the server REJECTS this or merely runs it suboptimally** (server-side, not in
+   source) — needs a live test (send a translated request to gpt-5.6-sol, observe accept/reject). Fix if it
+   matters: apply the lite transformation in the translator when the resolved target model is lite, encoding the
+   flag as a header (HTTP) or `client_metadata` key (WS) per path.
+2. **WS `response.create` `client_metadata` completeness (fingerprint fidelity, WS path only).** The real client
+   injects WS-only keys — `x-codex-ws-stream-request-start-ms`, turn-state, traceparent/tracestate, and the lite
+   key — that don't exist on an HTTP body (§7 list). PolyFlare's M5a frame builder should be audited for which of
+   these it populates; missing keys are a WS-handshake/frame fingerprint divergence (the T9 golden is currently
+   spec-derived, so this rides on the deferred live capture-verify).
