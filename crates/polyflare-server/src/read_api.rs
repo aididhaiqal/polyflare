@@ -14,10 +14,15 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use polyflare_codex::oauth::token_exp;
 use polyflare_store::RequestsFilter;
 
 use crate::app::AppState;
 use crate::usage_windows::{resolve, ResolvedWindow};
+
+/// Rolling lookback for `AccountView::request_count_24h`: how many requests this account served in
+/// the last 24h.
+const ACCOUNT_REQUEST_COUNT_WINDOW_SECS: i64 = 24 * 3600;
 
 fn unix_now() -> i64 {
     SystemTime::now()
@@ -47,6 +52,28 @@ impl From<ResolvedWindow> for WindowView {
     }
 }
 
+/// One entry of `AccountView::usage`: a named rate-limit window (`"five_hour"` | `"weekly"`), how
+/// full it is, and when it resets. The array is ADAPTIVE — a window the provider/account doesn't
+/// report at all (e.g. `five_hour` during the current no-5h-limit promo) is omitted entirely, never
+/// emitted as a zeroed placeholder.
+#[derive(Serialize)]
+struct UsageWindowView {
+    window: &'static str,
+    used_percent: f64,
+    reset_at: Option<i64>,
+}
+
+/// The account's stored access-token health, derived from the token's OWN unverified JWT `exp`
+/// claim — never the token itself (see module docs: this surface never returns a token).
+/// `access_state` is `"missing"` (no token / undecryptable / `exp` unreadable), `"expired"`
+/// (`exp < now`), or `"valid"`. `access_expires_at` is the raw expiry unix-epoch-seconds (content-
+/// safe on its own — it identifies a moment in time, not a credential) or `null` when unknown.
+#[derive(Serialize)]
+struct TokenHealthView {
+    access_state: &'static str,
+    access_expires_at: Option<i64>,
+}
+
 /// One account row for the dashboard. Windows are resolved by DURATION, not storage slot (see
 /// `crate::usage_windows`): `five_hour` is the 5h limit (null when upstream isn't reporting one —
 /// e.g. the current no-5h-limit promo — which means "not reported", NOT blocked); `weekly` is the
@@ -65,6 +92,14 @@ struct AccountView {
     five_hour: Option<WindowView>,
     /// Weekly window (may be null).
     weekly: Option<WindowView>,
+    /// Adaptive per-window usage, `{window, used_percent, reset_at}[]` — the same resolved windows
+    /// as `five_hour`/`weekly` above, restated as a list for dashboard consumers that want to
+    /// iterate rather than address two fixed fields.
+    usage: Vec<UsageWindowView>,
+    /// Access-token health derived from the stored token's JWT `exp` — never the token.
+    token_health: TokenHealthView,
+    /// Requests this account served in the last 24h (from `request_log`).
+    request_count_24h: i64,
 }
 
 /// `GET /api/accounts` — every account with its latest usage windows + reset times. This is where
@@ -82,6 +117,62 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         // duration + freshness so the right window shows under the right heading.
         let usage = repo.latest_usage(&account.id).await.unwrap_or_default();
         let resolved = resolve(&usage, now);
+        let mut usage_windows = Vec::with_capacity(2);
+        if let Some(w) = &resolved.five_hour {
+            usage_windows.push(UsageWindowView {
+                window: "five_hour",
+                used_percent: w.used_percent,
+                reset_at: w.reset_at,
+            });
+        }
+        if let Some(w) = &resolved.weekly {
+            usage_windows.push(UsageWindowView {
+                window: "weekly",
+                used_percent: w.used_percent,
+                reset_at: w.reset_at,
+            });
+        }
+
+        // Token health: derived ONLY from the access token's own unverified JWT `exp` — the token
+        // itself never leaves `get_with_tokens`'s scope here. A decrypt failure or missing account
+        // (shouldn't happen — we just listed it) collapses to "missing", same as no token at all.
+        let token_health = match repo.get_with_tokens(&account.id, &state.cipher).await {
+            Ok(Some((_, tokens))) => match token_exp(&tokens.access_token) {
+                Some(exp) if exp < now => TokenHealthView {
+                    access_state: "expired",
+                    access_expires_at: Some(exp),
+                },
+                Some(exp) => TokenHealthView {
+                    access_state: "valid",
+                    access_expires_at: Some(exp),
+                },
+                None => TokenHealthView {
+                    access_state: "missing",
+                    access_expires_at: None,
+                },
+            },
+            _ => TokenHealthView {
+                access_state: "missing",
+                access_expires_at: None,
+            },
+        };
+
+        let request_count_24h = state
+            .store
+            .request_log()
+            .page(
+                &RequestsFilter {
+                    account: Some(account.id.clone()),
+                    since_ts: Some(now - ACCOUNT_REQUEST_COUNT_WINDOW_SECS),
+                    ..Default::default()
+                },
+                1,
+                0,
+            )
+            .await
+            .map(|(_, total)| total as i64)
+            .unwrap_or(0);
+
         views.push(AccountView {
             id: account.id,
             email: account.email,
@@ -93,6 +184,9 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
             reset_at: account.reset_at,
             five_hour: resolved.five_hour.map(Into::into),
             weekly: resolved.weekly.map(Into::into),
+            usage: usage_windows,
+            token_health,
+            request_count_24h,
         });
     }
     Response::ok(views)

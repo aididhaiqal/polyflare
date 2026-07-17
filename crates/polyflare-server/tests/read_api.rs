@@ -187,6 +187,101 @@ async fn accounts_endpoint_surfaces_usage_windows_and_reset_times() {
 }
 
 #[tokio::test]
+async fn accounts_endpoint_carries_provider_pool_usage_token_health_and_request_count() {
+    // Task 7: /api/accounts must additionally surface provider/pool (already present, re-asserted
+    // here for the new shape), an adaptive per-window `usage` array (`{window, used_percent,
+    // reset_at}`), a `token_health` object derived from the stored access token's JWT `exp` (NEVER
+    // the token itself), and a rolling-24h `request_count_24h`.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
+    let repo = store.accounts();
+    repo.insert(
+        &account("codex-c", "c@example.test", Some("team-c")),
+        &tokens(),
+        &cipher,
+    )
+    .await
+    .unwrap();
+    repo.insert_usage_window(
+        "codex-c",
+        "secondary",
+        12.5,
+        Some(1_900_000_000),
+        Some(10080),
+        now(),
+    )
+    .await
+    .unwrap();
+    store
+        .request_log()
+        .insert(&RequestLogRecord {
+            requested_at: now(),
+            provider: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/responses".to_string(),
+            aliased: false,
+            status: 200,
+            duration_ms: 10,
+            account_id: Some("codex-c".to_string()),
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            transport: None,
+            ttft_ms: None,
+            total_tokens: None,
+            cached_tokens: None,
+        })
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+
+    let pf = spawn(store).await;
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/accounts"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = body.as_array().unwrap();
+    let a = arr
+        .iter()
+        .find(|a| a["id"] == "codex-c")
+        .expect("codex-c present");
+
+    assert_eq!(a["provider"], "codex");
+    assert_eq!(a["pool"], "team-c");
+
+    let usage = a["usage"].as_array().expect("usage is an array");
+    assert!(
+        !usage.is_empty(),
+        "usage must carry at least the seeded weekly window"
+    );
+    assert!(
+        usage
+            .iter()
+            .any(|w| w["window"] == "weekly" && w["used_percent"] == 12.5),
+        "usage: {usage:?}"
+    );
+
+    let token_health = &a["token_health"];
+    assert!(token_health.is_object(), "token_health: {token_health:?}");
+    assert!(
+        token_health["access_state"].is_string(),
+        "token_health.access_state must be a string: {token_health:?}"
+    );
+    // "SECRET-ACCESS-TOKEN" isn't a JWT → exp can't be decoded → access_state is "missing", and
+    // access_expires_at is null. Also the whole point of this test: the raw token never appears.
+    assert_eq!(token_health["access_state"], "missing");
+    assert!(token_health["access_expires_at"].is_null());
+
+    assert_eq!(a["request_count_24h"], 1);
+}
+
+#[tokio::test]
 async fn promo_shape_resolves_weekly_from_primary_slot_and_flags_stale() {
     // The real-world shape the live API surfaced: during the no-5h-limit promo, upstream writes the
     // weekly window into the PRIMARY slot (fresh) and leaves an OLD weekly in the secondary slot.
