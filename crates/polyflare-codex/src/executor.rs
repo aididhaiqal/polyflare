@@ -50,7 +50,10 @@ use aws_lc_rs as _;
 /// `CryptoProvider::install_default()` raises when called twice: a second real attempt returns
 /// `Err` (a provider is already installed), which we discard via `.ok()` since a pre-installed
 /// provider — ours or, in an embedding host, someone else's — is not an error for us.
-fn ensure_rustls_crypto_provider() {
+///
+/// `pub(crate)`: the WS transport (`crate::ws::conn::WsConn::connect`) must call this before its
+/// first TLS handshake too, same reason as here.
+pub(crate) fn ensure_rustls_crypto_provider() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();

@@ -34,6 +34,14 @@ rand = { workspace = true }
 # `get_codex_user_agent()` calls for the OS/arch segment of its User-Agent string
 # (`login/src/auth/default_client.rs` in `openai/codex`) — see `codex_headers.rs`.
 os_info = "3"
+# M5a: the WS upstream transport (`ws::conn::WsConn`) lives here beside `CodexExecutor` — this
+# crate is where WS is in-scope per the module doc above. Promoted from `polyflare-server`'s
+# `[dev-dependencies]` (where it still remains, for the `ws_vs_sse_probe` example) to a real
+# dependency here, now that a non-POC caller exists. Same major.minor + the same
+# `rustls-tls-webpki-roots` feature as that dev-dependency, so it resolves to the identical
+# `rustls = "=0.23.36"` / `aws-lc-rs = "=1.16.2"` this crate already pins (see above) rather than
+# pulling a second TLS stack.
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 polyflare-testkit = { path = "../polyflare-testkit" }

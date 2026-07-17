@@ -6,6 +6,7 @@ pub mod codex_version;
 pub mod executor;
 pub mod login;
 pub mod oauth;
+pub mod ws;
 
 pub use codex_version::CodexVersionCache;
 pub use executor::CodexExecutor;
@@ -14,3 +15,4 @@ pub use oauth::{
     classify_failure, decode_claims, should_refresh, token_exp, Claims, FailureClass, OAuthClient,
     OAuthError, Refreshed, RefreshedTokens,
 };
+pub use ws::WsConn;
