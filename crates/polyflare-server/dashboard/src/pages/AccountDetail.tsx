@@ -550,6 +550,7 @@ function DetailContent({
               type="button"
               onClick={onPrev}
               disabled={!canCycle}
+              aria-label="Previous account"
               className="flex h-[22px] w-[22px] items-center justify-center rounded border border-border bg-card text-fg opacity-70 hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30"
             >
               <ChevronLeft className="h-3.5 w-3.5" strokeWidth={2} />
@@ -558,6 +559,7 @@ function DetailContent({
               type="button"
               onClick={onNext}
               disabled={!canCycle}
+              aria-label="Next account"
               className="flex h-[22px] w-[22px] items-center justify-center rounded border border-border bg-card text-fg opacity-70 hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30"
             >
               <ChevronRight className="h-3.5 w-3.5" strokeWidth={2} />

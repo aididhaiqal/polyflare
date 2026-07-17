@@ -1,17 +1,19 @@
 // The only unauthenticated route. A single centered ccflare-styled card: no signup, no other
 // credential fields — the dashboard has exactly one shared operator token (POLYFLARE_ADMIN_TOKEN).
 import { useState, type FormEvent } from "react";
-import { useNavigate } from "react-router-dom";
+import { Navigate, useNavigate } from "react-router-dom";
 
 import { useAuth } from "../auth/AuthProvider";
 import { ApiError, fetchJson, type WhoamiView } from "../lib/api";
 
 export function Login() {
-  const { signIn, signOut } = useAuth();
+  const { token, signIn, signOut } = useAuth();
   const navigate = useNavigate();
   const [value, setValue] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [verifying, setVerifying] = useState(false);
+
+  if (token) return <Navigate to="/" replace />;
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();

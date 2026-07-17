@@ -425,7 +425,7 @@ function AccountHealthCard(
       ) : filtered.length === 0 ? (
         <p className="mt-2 text-[11px] text-fg opacity-50">No accounts for this provider.</p>
       ) : (
-        <div className="mt-1.5 max-h-64 overflow-y-auto">
+        <div className="mt-1.5 max-h-64 overflow-x-auto overflow-y-auto">
           <table className="w-full min-w-[520px] border-collapse text-[10.5px]">
             <thead>
               <tr>
