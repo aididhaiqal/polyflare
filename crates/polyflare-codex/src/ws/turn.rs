@@ -250,24 +250,42 @@ pub fn turn_stream(conn: SharedWsConn, envelope: Value) -> ResponseStream {
         state: TurnState::Sending(Box::pin(async move {
             let mut guard = conn.lock_owned().await;
             guard.send_frame(&envelope).await?;
-            // **THE FAILURE THAT MUST NOT HAPPEN** (M5a Task 7): record exactly what was just sent
-            // so `delta::plan_request` can compute a real strict-extension next turn. This MUST
-            // happen right here, immediately after `send_frame` succeeds and nowhere else —
-            // forgetting it makes every future turn on this connection silently plan `Full`
-            // forever: no error, no test failure, just the milestone's entire benefit evaporating
-            // while everything appears to work (see `delta.rs`'s module doc's "Who must set the
-            // hashes" section and `WsConn::last_item_hashes`'s own doc for the exact mechanism).
-            // Placing it here — the one place a frame is ever sent — rather than leaving it to
-            // each caller is what makes it impossible to forget.
-            guard.last_item_hashes = Some(item_hashes(&envelope));
+            // **THE FAILURE THAT MUST NOT HAPPEN** (M5a Task 7): record what the socket now HOLDS
+            // — the full accumulated history, not merely the wire suffix — so `delta::plan_request`
+            // can compute a real strict-extension next turn. This MUST happen right here,
+            // immediately after `send_frame` succeeds and nowhere else — forgetting it makes every
+            // future turn on this connection silently plan `Full` forever: no error, no test
+            // failure, just the milestone's entire benefit evaporating while everything appears to
+            // work (see `delta.rs`'s module doc's "Who must set the hashes" section and
+            // `WsConn::last_item_hashes`'s own doc for the exact mechanism).
+            //
+            // `envelope`'s `input` is only the WIRE payload just sent: the full history on a
+            // `Full` plan, but only the new suffix on an `Incremental` one
+            // (`executor.rs::plan_and_build` / `codec::build_response_create`). Recording just
+            // `item_hashes(&envelope)` unconditionally — the original, buggy version of this line
+            // — is therefore correct after a `Full` send but WRONG after an `Incremental` one: it
+            // would overwrite the full history with only the suffix's hashes, so the very next
+            // turn's real full-history body (SPEC-M5-WEBSOCKET.md §2: the HTTP client always
+            // resends full history) has no valid prefix to extend and silently falls back to
+            // `Full` — the exact "delta works for one turn, then reverts every OTHER turn" defect
+            // this fix closes. So: on an incremental send, APPEND the suffix's hashes onto the
+            // prior-full vector already sitting in `guard.last_item_hashes` (untouched since the
+            // last time this closure ran); on a full send (or the first turn, when there is no
+            // prior state), the sent hashes ARE the full history, so they simply replace it.
+            let sent = item_hashes(&envelope);
+            let full = match (
+                envelope.get("previous_response_id").is_some(),
+                guard.last_item_hashes.take(),
+            ) {
+                (true, Some(mut prev)) => {
+                    prev.extend(sent);
+                    prev
+                }
+                _ => sent,
+            };
             guard.last_non_input_fingerprint = Some(non_input_fingerprint(&envelope));
-            guard.last_input_count = Some(
-                envelope
-                    .get("input")
-                    .and_then(Value::as_array)
-                    .map(|a| a.len())
-                    .unwrap_or(0) as u32,
-            );
+            guard.last_input_count = Some(full.len() as u32);
+            guard.last_item_hashes = Some(full);
             Ok(guard)
         })),
     })
