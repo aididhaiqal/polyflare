@@ -10,6 +10,7 @@
 //! client IP, User-Agent, upstream error text) is gated on an explicit content-safety decision.
 
 use sqlx::sqlite::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite};
 
 use crate::StoreError;
 
@@ -71,6 +72,20 @@ pub struct RequestLogRow {
     pub ttft_ms: Option<i64>,
     pub total_tokens: Option<i64>,
     pub cached_tokens: Option<i64>,
+}
+
+/// Dashboard filter set for [`RequestLogRepo::page`]. Every field is optional; an unset field
+/// applies no filter. `status_class` is not a raw column value — `"success"` maps to `status < 300`,
+/// `"error"` maps to `status >= 400`, and any other value (including `"all"` or unset) applies no
+/// status filter.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestsFilter {
+    pub account: Option<String>,
+    pub provider: Option<String>,
+    pub status_class: Option<String>,
+    pub model: Option<String>,
+    pub transport: Option<String>,
+    pub since_ts: Option<i64>,
 }
 
 /// Repository over the `request_log` table.
@@ -137,6 +152,91 @@ impl RequestLogRepo {
             .await?;
         Ok(n)
     }
+
+    /// The dashboard's filtered, paginated request-log query: a `limit`-sized page (newest first)
+    /// matching `filter`, plus the FILTERED total (not the whole table's row count) so the client's
+    /// page count matches what's actually being shown. The `WHERE` is built dynamically — only the
+    /// filters actually present in `filter` are bound.
+    pub async fn page(
+        &self,
+        filter: &RequestsFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<RequestLogRow>, u64), StoreError> {
+        let mut select = QueryBuilder::<Sqlite>::new(
+            "SELECT id, requested_at, provider, method, path, aliased, status, duration_ms, \
+             account_id, model, reasoning_effort, service_tier, transport, ttft_ms, \
+             total_tokens, cached_tokens FROM request_log",
+        );
+        Self::push_where(&mut select, filter);
+        select.push(" ORDER BY requested_at DESC, id DESC LIMIT ");
+        select.push_bind(limit);
+        select.push(" OFFSET ");
+        select.push_bind(offset);
+        let rows = select
+            .build_query_as::<RequestLogRow>()
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM request_log");
+        Self::push_where(&mut count, filter);
+        let total: i64 = count.build_query_scalar().fetch_one(&self.pool).await?;
+
+        Ok((rows, total.max(0) as u64))
+    }
+
+    /// Append a `WHERE ...` clause (or nothing, if `filter` is empty) binding only the filters that
+    /// are present. Shared between the row query and the matching count query in [`Self::page`] so
+    /// the total always reflects the same filter as the page.
+    fn push_where(qb: &mut QueryBuilder<'_, Sqlite>, filter: &RequestsFilter) {
+        let mut first = true;
+
+        fn sep(qb: &mut QueryBuilder<'_, Sqlite>, first: &mut bool) {
+            if *first {
+                qb.push(" WHERE ");
+                *first = false;
+            } else {
+                qb.push(" AND ");
+            }
+        }
+
+        if let Some(v) = &filter.account {
+            sep(qb, &mut first);
+            qb.push("account_id = ");
+            qb.push_bind(v.clone());
+        }
+        if let Some(v) = &filter.provider {
+            sep(qb, &mut first);
+            qb.push("provider = ");
+            qb.push_bind(v.clone());
+        }
+        match filter.status_class.as_deref() {
+            Some("success") => {
+                sep(qb, &mut first);
+                qb.push("status < 300");
+            }
+            Some("error") => {
+                sep(qb, &mut first);
+                qb.push("status >= 400");
+            }
+            _ => {}
+        }
+        if let Some(v) = &filter.model {
+            sep(qb, &mut first);
+            qb.push("model = ");
+            qb.push_bind(v.clone());
+        }
+        if let Some(v) = &filter.transport {
+            sep(qb, &mut first);
+            qb.push("transport = ");
+            qb.push_bind(v.clone());
+        }
+        if let Some(v) = filter.since_ts {
+            sep(qb, &mut first);
+            qb.push("requested_at >= ");
+            qb.push_bind(v);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -184,5 +284,79 @@ mod tests {
         assert_eq!(rows[0].ttft_ms, Some(700));
         assert_eq!(rows[0].total_tokens, Some(3204));
         assert_eq!(rows[0].cached_tokens, Some(1100));
+    }
+
+    fn rec(provider: &str, path: &str, status: u16, model: Option<&str>) -> RequestLogRecord {
+        RequestLogRecord {
+            requested_at: 100,
+            provider: provider.into(),
+            method: "POST".into(),
+            path: path.into(),
+            aliased: false,
+            status,
+            duration_ms: 1000,
+            account_id: Some("acct-1".into()),
+            model: model.map(String::from),
+            reasoning_effort: None,
+            service_tier: None,
+            transport: Some("http".into()),
+            ttft_ms: Some(200),
+            total_tokens: Some(500),
+            cached_tokens: None,
+        }
+    }
+
+    /// `page` applies the filters (provider, status_class) and returns a `(rows, total)` pair where
+    /// `total` reflects the FILTERED count, not the whole table — the dashboard's "how many pages"
+    /// number must match what's actually being shown.
+    #[tokio::test]
+    async fn page_filters_by_provider_and_status_class_with_matching_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        repo.insert(&rec("codex", "/responses", 200, Some("gpt-5.6-sol")))
+            .await
+            .unwrap();
+        repo.insert(&rec("codex", "/responses", 500, Some("gpt-5.6-sol")))
+            .await
+            .unwrap();
+        repo.insert(&rec("anthropic", "/v1/messages", 200, Some("claude")))
+            .await
+            .unwrap();
+
+        // provider=codex → 2 rows (one success, one error), total==2.
+        let filter = RequestsFilter {
+            provider: Some("codex".into()),
+            ..Default::default()
+        };
+        let (rows, total) = repo.page(&filter, 10, 0).await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.provider == "codex"));
+
+        // status_class=error → only the 500.
+        let filter = RequestsFilter {
+            status_class: Some("error".into()),
+            ..Default::default()
+        };
+        let (rows, total) = repo.page(&filter, 10, 0).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, 500);
+
+        // status_class=success → the two 200s.
+        let filter = RequestsFilter {
+            status_class: Some("success".into()),
+            ..Default::default()
+        };
+        let (rows, total) = repo.page(&filter, 10, 0).await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 2);
+
+        // No filter → all 3, and limit/offset still page within the filtered set.
+        let (rows, total) = repo.page(&RequestsFilter::default(), 1, 1).await.unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(rows.len(), 1);
     }
 }
