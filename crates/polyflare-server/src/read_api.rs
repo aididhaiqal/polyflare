@@ -9,7 +9,8 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -190,6 +191,153 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         });
     }
     Response::ok(views)
+}
+
+/// `AccountDetailView::identity`: the account's non-secret identity/workspace metadata. A subset of
+/// `Account`'s own fields — never a token, never `chatgpt_account_id`/`chatgpt_user_id` (those are
+/// upstream-facing identifiers, not dashboard-facing).
+#[derive(Serialize)]
+struct AccountIdentityView {
+    id: String,
+    email: String,
+    alias: Option<String>,
+    workspace_id: Option<String>,
+    workspace_label: Option<String>,
+    seat_type: Option<String>,
+    plan_type: String,
+    provider: String,
+    pool: Option<String>,
+}
+
+/// `AccountDetailView::request_totals`: how many requests this account has served (all-time) and
+/// their summed token count. Derived from `RequestLogRepo::page` filtered to this account: `total`
+/// is the filtered row count (accurate regardless of page size); `total_tokens` sums the returned
+/// rows' `total_tokens`, so the query fetches with an effectively unbounded limit rather than the
+/// dashboard's page-sized default (see `account_detail_handler`) — this is a per-account detail read,
+/// not the hot path, same tradeoff `accounts_handler` already makes for `request_count_24h`.
+#[derive(Serialize)]
+struct RequestTotalsView {
+    request_count: i64,
+    total_tokens: i64,
+}
+
+/// `GET /api/accounts/{id}` response: the dashboard's per-account detail page. Every field is
+/// content-free/secret-free (see module docs) — `token_status` in particular carries only the
+/// derived JWT-`exp` state, never the token (identical derivation to `AccountView::token_health`).
+#[derive(Serialize)]
+struct AccountDetailView {
+    identity: AccountIdentityView,
+    status: String,
+    /// Adaptive per-window usage, same shape/derivation as `AccountView::usage`.
+    quota_windows: Vec<UsageWindowView>,
+    token_status: TokenHealthView,
+    routing_policy: String,
+    security_work_authorized: bool,
+    request_totals: RequestTotalsView,
+}
+
+/// Upper bound on rows fetched from `request_log` when summing an account's lifetime
+/// `total_tokens` (see `RequestTotalsView`). Large enough that no real account's history is
+/// truncated at MVP scale; revisit with a dedicated per-account aggregate query if that changes.
+const ACCOUNT_REQUEST_TOTALS_LIMIT: i64 = i64::MAX;
+
+/// `GET /api/accounts/{id}` — the dashboard's per-account detail view: identity, status, adaptive
+/// quota-window usage, secret-safe token status, routing policy, `security_work_authorized`, and
+/// lifetime request totals. `404` when `id` doesn't name an existing account.
+pub async fn account_detail_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    let repo = state.store.accounts();
+    let account = match repo.get(&id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
+    };
+
+    let now = unix_now();
+
+    // Quota windows: identical derivation to `accounts_handler`'s `usage` field.
+    let usage = repo.latest_usage(&id).await.unwrap_or_default();
+    let resolved = resolve(&usage, now);
+    let mut quota_windows = Vec::with_capacity(2);
+    if let Some(w) = &resolved.five_hour {
+        quota_windows.push(UsageWindowView {
+            window: "five_hour",
+            used_percent: w.used_percent,
+            reset_at: w.reset_at,
+        });
+    }
+    if let Some(w) = &resolved.weekly {
+        quota_windows.push(UsageWindowView {
+            window: "weekly",
+            used_percent: w.used_percent,
+            reset_at: w.reset_at,
+        });
+    }
+
+    // Token status: derived ONLY from the access token's own unverified JWT `exp` — the token
+    // itself never leaves `get_with_tokens`'s scope here (identical pattern to `accounts_handler`).
+    let token_status = match repo.get_with_tokens(&id, &state.cipher).await {
+        Ok(Some((_, tokens))) => match token_exp(&tokens.access_token) {
+            Some(exp) if exp < now => TokenHealthView {
+                access_state: "expired",
+                access_expires_at: Some(exp),
+            },
+            Some(exp) => TokenHealthView {
+                access_state: "valid",
+                access_expires_at: Some(exp),
+            },
+            None => TokenHealthView {
+                access_state: "missing",
+                access_expires_at: None,
+            },
+        },
+        _ => TokenHealthView {
+            access_state: "missing",
+            access_expires_at: None,
+        },
+    };
+
+    // Lifetime request totals for this account (see `RequestTotalsView`'s docs on the tradeoff).
+    let (rows, total) = state
+        .store
+        .request_log()
+        .page(
+            &RequestsFilter {
+                account: Some(id.clone()),
+                ..Default::default()
+            },
+            ACCOUNT_REQUEST_TOTALS_LIMIT,
+            0,
+        )
+        .await
+        .unwrap_or_default();
+    let request_totals = RequestTotalsView {
+        request_count: total as i64,
+        total_tokens: rows.iter().filter_map(|r| r.total_tokens).sum(),
+    };
+
+    Json(AccountDetailView {
+        identity: AccountIdentityView {
+            id: account.id,
+            email: account.email,
+            alias: account.alias,
+            workspace_id: account.workspace_id,
+            workspace_label: account.workspace_label,
+            seat_type: account.seat_type,
+            plan_type: account.plan_type,
+            provider: account.provider,
+            pool: account.pool,
+        },
+        status: account.status,
+        quota_windows,
+        token_status,
+        routing_policy: account.routing_policy,
+        security_work_authorized: account.security_work_authorized,
+        request_totals,
+    })
+    .into_response()
 }
 
 /// One pool as the dashboard lists it. `pool = null` is the unpooled group (accounts reachable only
