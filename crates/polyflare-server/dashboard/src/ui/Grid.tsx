@@ -15,6 +15,7 @@ const SPAN_CLASS = {
   4: "col-span-4",
   5: "col-span-5",
   6: "col-span-6",
+  7: "col-span-7",
   8: "col-span-8",
   12: "col-span-12",
 } as const;
@@ -23,7 +24,10 @@ export type ColSpan = keyof typeof SPAN_CLASS;
 
 /** One cell of a `<Grid>` row. `span=5` is not in the brief's literal `{3|4|6|8|12}` list but IS
  * required to reproduce the authoritative mockup's 5+3+4 KPI/quota/pace row
- * (overview-ccflare-v2.html's `.c5`) — see task-4-report.md for the fidelity note. */
+ * (overview-ccflare-v2.html's `.c5`) — see task-4-report.md for the fidelity note. `span=7` is the
+ * same kind of addition for Task 7's account-detail page, whose master-detail mockup
+ * (`accounts-master-detail-v2.html`) pairs a `.c5` quota/token card with a `.c7` trend chart —
+ * see task-7-report.md. */
 export function Col({
   span,
   children,

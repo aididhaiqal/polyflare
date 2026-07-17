@@ -6,9 +6,11 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 
 import { AuthProvider, RequireAuth } from "./auth/AuthProvider";
 import { CapabilitiesProvider } from "./capabilities/CapabilitiesProvider";
+import { AccountDetail } from "./pages/AccountDetail";
 import { Accounts } from "./pages/Accounts";
 import { Login } from "./pages/Login";
 import { Overview } from "./pages/Overview";
+import { Pools } from "./pages/Pools";
 import { Shell } from "./shell/Shell";
 
 const queryClient = new QueryClient({
@@ -44,8 +46,8 @@ export function App() {
             >
               <Route index element={<Overview />} />
               <Route path="accounts" element={<Accounts />} />
-              <Route path="accounts/:id" element={<RoutePlaceholder label="Account detail" />} />
-              <Route path="pools" element={<RoutePlaceholder label="Pools" />} />
+              <Route path="accounts/:id" element={<AccountDetail />} />
+              <Route path="pools" element={<Pools />} />
               <Route path="requests" element={<RoutePlaceholder label="Requests" />} />
               <Route path="logs" element={<RoutePlaceholder label="Logs" />} />
               <Route path="*" element={<Navigate to="/" replace />} />

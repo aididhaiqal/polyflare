@@ -17,6 +17,12 @@
 // Key/ChevronDown are Task 6 additions for the Accounts page: `Key` replaces the mockup's 🔑
 // token-health glyph (`accounts-page.html`'s `.afoot`), `ChevronDown` is the Radix Select trigger's
 // caret (the pool filter). Same no-emoji rationale as above. See task-6-report.md.
+//
+// LogIn/Download/Zap/Flame are Task 7 additions for the Account detail page's disabled Phase-3
+// Actions panel (`accounts-detail-v2.html`'s reworked Operations/Configuration columns): `LogIn`
+// replaces the mockup's plain "Re-authenticate" label glyph, `Download` is "Export auth", `Zap` is
+// "Force probe", `Flame` is "Limit warm-up" (thematically apt for a PolyFlare warm-up affordance).
+// All four are rendered only inside disabled/non-functional controls — see task-7-report.md.
 export {
   Activity,
   AlertTriangle,
@@ -28,11 +34,14 @@ export {
   ChevronRight,
   Clock,
   Coins,
+  Download,
+  Flame,
   Key,
   Layers,
   List,
   LayoutGrid,
   Lock,
+  LogIn,
   Moon,
   Pause,
   Pencil,
@@ -44,5 +53,6 @@ export {
   Sun,
   Trash2,
   Users,
+  Zap,
   type LucideIcon,
 } from "lucide-react";
