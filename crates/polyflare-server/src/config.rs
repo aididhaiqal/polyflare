@@ -31,6 +31,12 @@ pub struct ServeConfig {
     pub routing_strategy: RoutingStrategy,
     /// Per-pool routing-strategy overrides (`POLYFLARE_POOL_STRATEGY="slug=strategy,slug2=..."`).
     pub pool_strategies: HashMap<String, RoutingStrategy>,
+    /// Admin token gating every `/api/*` dashboard route (`POLYFLARE_ADMIN_TOKEN`, via
+    /// `Authorization: Bearer <token>`). Unset ⇒ the dashboard API is disabled (503), not open.
+    pub admin_token: Option<String>,
+    /// Enables the live log stream (`POLYFLARE_LIVE_LOGS=1|true`). Consumed by a later task
+    /// (`/api/logs/stream`); wired through now so `AppState` construction doesn't churn again.
+    pub live_logs: bool,
 }
 
 /// Parse `POLYFLARE_POOL_STRATEGY` — a comma-separated list of `slug=strategy` pairs. Whitespace
@@ -95,6 +101,11 @@ impl ServeConfig {
             Ok(raw) => parse_pool_strategies(&raw)?,
             Err(_) => HashMap::new(),
         };
+        let admin_token = std::env::var("POLYFLARE_ADMIN_TOKEN").ok();
+        let live_logs = matches!(
+            std::env::var("POLYFLARE_LIVE_LOGS").as_deref(),
+            Ok("1") | Ok("true")
+        );
         Ok(ServeConfig {
             bind_addr,
             upstream_base_url,
@@ -106,6 +117,8 @@ impl ServeConfig {
             capture_fingerprint_path,
             routing_strategy,
             pool_strategies,
+            admin_token,
+            live_logs,
         })
     }
 }

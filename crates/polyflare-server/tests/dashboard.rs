@@ -38,6 +38,9 @@ async fn spawn() -> String {
         codex_version: Arc::new(polyflare_codex::CodexVersionCache::new().unwrap()),
         account_cache: Arc::new(polyflare_server::account_cache::AccountCache::new()),
         token_cache: Default::default(),
+        admin_token: None,
+        live_logs: false,
+
         runtime: Default::default(),
     });
     let app = build_app(state);

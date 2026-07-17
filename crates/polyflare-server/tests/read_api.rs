@@ -130,6 +130,9 @@ async fn spawn(store: Store) -> String {
         codex_version: Arc::new(polyflare_codex::CodexVersionCache::new().unwrap()),
         account_cache: Arc::new(polyflare_server::account_cache::AccountCache::new()),
         token_cache: Default::default(),
+        admin_token: Some("secret".to_string()),
+        live_logs: true,
+
         runtime: Default::default(),
     });
     let app = build_app(state);
@@ -147,6 +150,7 @@ async fn accounts_endpoint_surfaces_usage_windows_and_reset_times() {
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("{pf}/api/accounts"))
+        .header("authorization", "Bearer secret")
         .send()
         .await
         .unwrap();
@@ -245,6 +249,7 @@ async fn promo_shape_resolves_weekly_from_primary_slot_and_flags_stale() {
     let pf = spawn(store).await;
     let body: serde_json::Value = reqwest::Client::new()
         .get(format!("{pf}/api/accounts"))
+        .header("authorization", "Bearer secret")
         .send()
         .await
         .unwrap()
@@ -286,6 +291,7 @@ async fn no_secret_token_is_ever_present_in_a_read_response() {
     for path in ["/api/accounts", "/api/pools", "/api/requests"] {
         let text = client
             .get(format!("{pf}{path}"))
+            .header("authorization", "Bearer secret")
             .send()
             .await
             .unwrap()
@@ -305,6 +311,7 @@ async fn pools_endpoint_aggregates_named_and_unpooled_groups() {
     let client = reqwest::Client::new();
     let body: serde_json::Value = client
         .get(format!("{pf}/api/pools"))
+        .header("authorization", "Bearer secret")
         .send()
         .await
         .unwrap()
@@ -326,6 +333,7 @@ async fn requests_endpoint_pages_the_log() {
     let client = reqwest::Client::new();
     let body: serde_json::Value = client
         .get(format!("{pf}/api/requests?limit=10"))
+        .header("authorization", "Bearer secret")
         .send()
         .await
         .unwrap()
@@ -413,6 +421,7 @@ async fn requests_endpoint_filters_by_provider_and_carries_content_free_metrics(
     let client = reqwest::Client::new();
     let body: serde_json::Value = client
         .get(format!("{pf}/api/requests?provider=codex&limit=10"))
+        .header("authorization", "Bearer secret")
         .send()
         .await
         .unwrap()
@@ -485,6 +494,7 @@ async fn overview_reports_kpis_and_recent_errors_from_request_log() {
     let pf = spawn(store).await;
     let v: serde_json::Value = reqwest::Client::new()
         .get(format!("{pf}/api/overview"))
+        .header("authorization", "Bearer secret")
         .send()
         .await
         .unwrap()
@@ -522,6 +532,7 @@ async fn overview_reports_pools_and_quota_from_seeded_accounts() {
     let pf = spawn(seed_store().await).await;
     let v: serde_json::Value = reqwest::Client::new()
         .get(format!("{pf}/api/overview"))
+        .header("authorization", "Bearer secret")
         .send()
         .await
         .unwrap()
@@ -562,6 +573,7 @@ async fn requests_endpoint_filters_by_status_class() {
     let client = reqwest::Client::new();
     let body: serde_json::Value = client
         .get(format!("{pf}/api/requests?status_class=error&limit=10"))
+        .header("authorization", "Bearer secret")
         .send()
         .await
         .unwrap()

@@ -66,6 +66,12 @@ pub struct AppState {
     /// `error_count`/`cooldown_until`/`last_error_at`/`last_selected_at` overlaid onto snapshots at
     /// selection time. In-memory only (churns per request); resets on restart.
     pub runtime: Arc<crate::runtime_state::RuntimeStates>,
+    /// Admin token gating every `/api/*` dashboard route (see `crate::auth::require_admin`), from
+    /// `POLYFLARE_ADMIN_TOKEN`. `None` ⇒ the dashboard API is disabled (503), not silently open.
+    pub admin_token: Option<String>,
+    /// Enables the live log stream (`POLYFLARE_LIVE_LOGS`). Consumed by a later task
+    /// (`/api/logs/stream`); present now so `AppState` construction doesn't churn again then.
+    pub live_logs: bool,
 }
 
 impl AppState {
@@ -94,6 +100,24 @@ impl AppState {
 }
 
 pub fn build_app(state: Arc<AppState>) -> Router {
+    // The dashboard API: every route here sits behind `require_admin` (POLYFLARE_ADMIN_TOKEN via
+    // `Authorization: Bearer <token>`; unset ⇒ 503). Register only routes whose handlers exist
+    // today — later tasks add their own route lines to this same auth-gated router.
+    let api = Router::new()
+        .route("/api/whoami", get(crate::auth::whoami_handler))
+        .route("/api/pools", get(crate::read_api::pools_handler))
+        .route("/api/accounts", get(crate::read_api::accounts_handler))
+        .route(
+            "/api/accounts/{id}",
+            patch(crate::write_api::patch_account_handler),
+        )
+        .route("/api/requests", get(crate::read_api::requests_handler))
+        .route("/api/overview", get(crate::read_api::overview_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::require_admin,
+        ));
+
     Router::new()
         .route("/responses", post(responses_handler))
         .route("/v1/messages", post(messages_handler))
@@ -112,23 +136,12 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             get(crate::catalog::codex_models_handler),
         )
         .route("/v1/models", get(crate::catalog::v1_models_handler))
-        // Read-only dashboard API (GET JSON): pools, accounts (+ live usage windows / reset
-        // times), and recent request-log rows. Non-secret metadata only (see `crate::read_api`).
-        .route("/api/pools", get(crate::read_api::pools_handler))
-        .route("/api/accounts", get(crate::read_api::accounts_handler))
-        // Dashboard landing-page aggregates: KPIs, per-provider quota, per-pool availability,
-        // recent errors (see `crate::read_api::overview_handler`). Like the reads above,
-        // unauthenticated for now — a later task moves all `/api/*` behind auth.
-        .route("/api/overview", get(crate::read_api::overview_handler))
-        // Dashboard-driven account settings (pool / routing policy / pause-resume). Unauthenticated
-        // like the reads (see `crate::write_api`); mutates non-secret settings only.
-        .route(
-            "/api/accounts/{id}",
-            patch(crate::write_api::patch_account_handler),
-        )
-        .route("/api/requests", get(crate::read_api::requests_handler))
+        // Auth-gated dashboard API (see `api` above): pools/accounts/requests/overview reads,
+        // the account-settings patch, and `/api/whoami`.
+        .merge(api)
         // Embedded dashboard UI (see `crate::dashboard`). `/dashboard` serves the SPA entrypoint;
         // `/dashboard/{*path}` serves its bundle assets (with SPA fallback to index.html).
+        // Unauthenticated: it's a static asset bundle — the API calls it makes are what's gated.
         .route("/dashboard", get(crate::dashboard::dashboard_index))
         .route("/dashboard/", get(crate::dashboard::dashboard_index))
         .route("/dashboard/{*path}", get(crate::dashboard::dashboard_asset))

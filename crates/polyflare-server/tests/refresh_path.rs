@@ -122,6 +122,9 @@ async fn spawn_with_access_token(
         codex_version: std::sync::Arc::new(polyflare_codex::CodexVersionCache::new().unwrap()),
         account_cache: std::sync::Arc::new(polyflare_server::account_cache::AccountCache::new()),
         token_cache: Default::default(),
+        admin_token: None,
+        live_logs: false,
+
         runtime: Default::default(),
     });
     let app = build_app(state.clone());
