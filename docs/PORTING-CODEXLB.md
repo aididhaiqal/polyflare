@@ -192,6 +192,43 @@ discrete-event sim. Needs per-account weekly usage rows (capacity/remaining/rese
 grow the usage schema feature-by-feature.
 *codex-lb:* `core/usage/depletion.py`, `modules/dashboard/weekly_pace.py`.
 
+### D17. Codex control-endpoint surface  · MEDIUM · medium
+PolyFlare serves `/responses` (+ `/v1/messages`, `/models`) and nothing else, so every other endpoint
+the Codex CLI can call 404s. codex-lb proxies eleven, each a thin pass-through funnelling into one
+helper — `_codex_control_proxy` → `service.codex_control_request(path, …, codex_session_affinity=True)`:
+`thread/goal/{set,clear,get}`, `analytics-events/events`, `memories/trace_summarize`, `realtime/calls`,
+`safety/arc`, `alpha/search`, `agent-identities/jwks` (GET), `opportunistic/admission` (GET),
+`images/{generations,edits}`. (`/responses/compact` is separate and larger — see D14.)
+
+The work is small per endpoint but has two real design points:
+- **`codex_session_affinity=True`** — a control call must land on the SAME account as the conversation
+  it belongs to, not a freshly-selected one. This is M3 ownership resolution applied to a non-`/responses`
+  path, where PolyFlare's owner resolution does not currently reach.
+- **Header handling both ways** — requests need the same fingerprint synthesis `/responses` gets;
+  responses are filtered downstream through `_codex_control_downstream_headers`.
+
+Which endpoints the CLI actually fires depends on config: the endpoint constants live in
+`codex-rs/core/src/client.rs:157-163`, and the user's codex-lb config comments that `name = "openai"`
+is what enables remote `/responses/compact` — **the gate for that was not located in the source; verify
+before assuming any endpoint is dormant.** PolyFlare's dev harness names the provider
+`"PolyFlare (local dev)"`, which is why the gap is currently unhit rather than handled.
+*codex-lb:* `modules/proxy/api.py:491-597,1744,1931`.
+
+### D18. Client API-key auth on the proxy surface  · MEDIUM · medium
+`POST /responses` / `/v1/messages` (and their `/{pool}/…` variants) are **unauthenticated** — a
+deliberate stance (network-boundary trust; see FEATURE-MAP's api-keys rows), safe only while bound to
+`127.0.0.1`. Note the `/api/*` surface is NOT in this gap: `require_admin` already covers it, reads and
+the account PATCH alike (`app.rs:112-134`). This item is about the proxy surface only.
+Anything that can reach the port spends the pool's quota anonymously, so this gates any non-loopback
+bind. codex-lb's equivalent is `api_key: ApiKeyData | None = Security(validate_proxy_api_key)` on every
+proxy route — note the `| None`: it permits unauthenticated calls when no keys are configured, so the
+*default posture* matches PolyFlare's; what differs is that codex-lb has the mechanism at all.
+The shape already exists here: `crate::auth::require_admin` is exactly this middleware, pointed at one
+env var. v1 = the same gate against a keys table. The full codex-lb feature set (per-key account/source
+scoping, enforced model/effort/tier, per-key usage rollup) is separately tracked in FEATURE-MAP and is
+NOT part of v1.
+*codex-lb:* `modules/api_keys/{service,repository,api}.py`; `modules/proxy/api.py:495`.
+
 ---
 
 ## Suggested order

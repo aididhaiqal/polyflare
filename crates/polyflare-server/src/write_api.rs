@@ -1,7 +1,8 @@
 //! Write API: dashboard-driven account configuration. Mutates only non-secret account SETTINGS —
-//! pool, routing policy, and pause/resume (status) — never a token or any secret. UNAUTHENTICATED
-//! like the rest of the MVP (network-boundary trust); a `POLYFLARE_ADMIN_TOKEN` gate is the planned
-//! follow-up before this is exposed beyond localhost. Every write bumps the store generation, so
+//! pool, routing policy, and pause/resume (status) — never a token or any secret. Gated on
+//! `POLYFLARE_ADMIN_TOKEN` (`crate::auth::require_admin`) like every other `/api/*` route — the
+//! proxy surface (`/responses`, `/v1/messages`) remains unauthenticated network-boundary trust; see
+//! PORTING-CODEXLB.md D18. Every write bumps the store generation, so
 //! the running server's account cache picks the change up on the next selection without a restart.
 
 use std::sync::Arc;
