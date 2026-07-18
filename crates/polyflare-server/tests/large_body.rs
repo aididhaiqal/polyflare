@@ -72,6 +72,7 @@ async fn large_request_body_is_not_rejected_with_413() {
     std::mem::forget(dir);
 
     let state = Arc::new(AppState {
+        enforce_client_keys: false,
         codex_executor: Arc::new(CodexExecutor::new().unwrap()),
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),

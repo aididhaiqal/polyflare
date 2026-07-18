@@ -30,6 +30,7 @@ async fn build_state() -> Arc<AppState> {
         Duration::from_secs(30),
     ));
     Arc::new(AppState {
+        enforce_client_keys: false,
         codex_executor: Arc::new(CodexExecutor::new().unwrap()) as Arc<dyn Executor>,
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap())
             as Arc<dyn Executor>,

@@ -91,6 +91,7 @@ async fn spawn_state(
         Duration::from_secs(30),
     ));
     let state = Arc::new(AppState {
+        enforce_client_keys: false,
         codex_executor,
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),

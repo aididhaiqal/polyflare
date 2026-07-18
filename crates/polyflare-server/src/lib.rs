@@ -14,6 +14,7 @@ pub mod ingress;
 pub mod keys;
 pub mod log_bus;
 pub mod observability;
+pub mod posture;
 pub mod read_api;
 pub mod refresh_locks;
 pub mod runtime_state;

@@ -136,6 +136,7 @@ async fn spawn_app(store: Store, cipher: TokenCipher, upstream_url: String) -> (
         Duration::from_secs(30),
     ));
     let state = Arc::new(AppState {
+        enforce_client_keys: false,
         codex_executor: Arc::new(CodexExecutor::new().unwrap()),
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),

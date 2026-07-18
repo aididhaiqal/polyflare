@@ -70,6 +70,7 @@ pub async fn spawn_live_logs(upstream_url: String, enabled: bool) -> (String, Ar
         Duration::from_secs(30),
     ));
     let state = Arc::new(AppState {
+        enforce_client_keys: false,
         codex_executor: Arc::new(CodexExecutor::new().unwrap()),
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),
@@ -139,6 +140,7 @@ pub async fn spawn_without_admin_token(upstream_url: String) -> (String, Arc<App
         Duration::from_secs(30),
     ));
     let state = Arc::new(AppState {
+        enforce_client_keys: false,
         codex_executor: Arc::new(CodexExecutor::new().unwrap()),
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),

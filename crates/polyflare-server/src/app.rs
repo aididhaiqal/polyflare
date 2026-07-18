@@ -108,6 +108,14 @@ pub struct AppState {
     /// `crate::ingress::layer2_wait_stream` at the same site that emits the
     /// `crate::observability::StarvationSignal` log/event.
     pub starvation_metrics: std::sync::Arc<crate::observability::StarvationMetrics>,
+    /// D18 Task 4: whether the proxy surface (`POST /responses`, `/v1/messages`,
+    /// `/{pool}/responses`, `/{pool}/v1/messages`) requires a valid client API key
+    /// (`crate::auth::require_client_key`, `route_layer`'d onto the extracted `proxy` sub-router
+    /// in `build_app` below). Resolved ONCE at startup by the bind-address-aware posture
+    /// (`crate::posture::resolve_proxy_enforcement`) — NEVER re-evaluated per request. `false` is
+    /// the correct default for every existing test/dev harness that builds `AppState` directly
+    /// without going through `resolve_proxy_enforcement` (a loopback-bind, no-keys posture).
+    pub enforce_client_keys: bool,
 }
 
 impl AppState {
@@ -189,6 +197,28 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             crate::auth::require_admin,
         ));
 
+    // D18 Task 4: the caller-auth gate on the proxy surface. POST handlers ONLY — the GET-426
+    // WS-fallback shim below is deliberately kept OUTSIDE this sub-router (see the comment on the
+    // top-level `.route("/responses", get(...))` further down for why: a keyless WS-handshake
+    // probe must always get 426, never 401, even when enforcement is on). `route_layer` is applied
+    // only when `state.enforce_client_keys` is true, mirroring `api`'s `require_admin` composition
+    // above exactly — this is the SAME `route_layer`-before-`.merge()` pattern, just conditional.
+    // `/{pool}/…` narrows selection to accounts tagged with that pool slug (see `filter_by_pool`);
+    // the bare paths keep selecting over ALL accounts. The `{pool}` segment is a param, so it never
+    // shadows the literal single-segment `/responses` or the `/v1/*` / `/models` routes — matchit
+    // prefers a static segment over a param one.
+    let mut proxy = Router::new()
+        .route("/responses", post(responses_handler))
+        .route("/v1/messages", post(messages_handler))
+        .route("/{pool}/responses", post(pooled_responses_handler))
+        .route("/{pool}/v1/messages", post(pooled_messages_handler));
+    if state.enforce_client_keys {
+        proxy = proxy.route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::require_client_key,
+        ));
+    }
+
     Router::new()
         // `GET` on these two Codex-native proxy paths is a WebSocket-handshake attempt from a
         // WS-capable Codex client, never a real request — Codex only ever POSTs `/responses`.
@@ -197,20 +227,19 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         // hard-failing; see `crate::ingress::websocket_fallback_handler`'s doc for the full
         // rationale. `/v1/messages` is the Anthropic-format path — Codex never opens a WS there,
         // so it's deliberately left without this GET handler.
-        .route(
-            "/responses",
-            post(responses_handler).get(websocket_fallback_handler),
-        )
-        .route("/v1/messages", post(messages_handler))
-        // Pooled variants: `/{pool}/…` narrows selection to accounts tagged with that pool slug
-        // (see `filter_by_pool`). The bare paths above keep selecting over ALL accounts. The
-        // `{pool}` segment is a param, so it never shadows the literal single-segment `/responses`
-        // or the `/v1/*` / `/models` routes — matchit prefers a static segment over a param one.
-        .route(
-            "/{pool}/responses",
-            post(pooled_responses_handler).get(websocket_fallback_handler),
-        )
-        .route("/{pool}/v1/messages", post(pooled_messages_handler))
+        //
+        // D18 Task 4: this GET route is registered here, on the TOP-LEVEL (unlayered) router, NOT
+        // inside `proxy` above — a keyless WS-handshake probe must always degrade to 426, never be
+        // rejected with 401, regardless of whether client-key enforcement is on. `Router::merge`
+        // combines a GET-only `MethodRouter` for a path with a POST-only one for the same path
+        // (axum's `MethodRouter::merge_for_path` only panics on an actual method OVERLAP, e.g. two
+        // GETs for the same path — disjoint methods merge cleanly), so splitting GET and POST
+        // across the unlayered top-level router and the conditionally-layered `proxy` sub-router
+        // below is safe and is exactly axum's supported pattern for "some methods on this path are
+        // gated, others aren't."
+        .route("/responses", get(websocket_fallback_handler))
+        .route("/{pool}/responses", get(websocket_fallback_handler))
+        .merge(proxy)
         // Model catalog (read-only GETs): real Codex models (bootstrap floor for now) merged with
         // PolyFlare's synthetic aliases. Routing is by method+path, so these never conflict with
         // the `/v1/*` POSTs above.

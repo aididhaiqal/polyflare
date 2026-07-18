@@ -71,6 +71,7 @@ async fn bare_tail_dead_anchor_signals_previous_response_not_found() {
     let mock = MockUpstream::silent_on_anchor(vec![]);
     let upstream = mock.spawn().await;
     let state = Arc::new(AppState {
+        enforce_client_keys: false,
         codex_executor: Arc::new(CodexExecutor::new().unwrap()),
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),
