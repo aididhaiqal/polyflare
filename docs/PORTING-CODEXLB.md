@@ -221,13 +221,25 @@ Emit codex-lb's metric **names + label sets** as the portable contract (dashboar
 disabled.
 *codex-lb:* `core/metrics/prometheus.py`, `core/metrics/middleware.py`.
 
-### C12. Data-retention pruning  · LOW · medium
+### C12. Data-retention pruning  · LOW · medium · **DONE**
 Hourly pruner over `request_log` + `usage_history`, preserving two guards: never delete above the
 rollup watermark (would shrink lifetime totals), and always protect the latest row per
 `(account_id, window)` via `max(recorded_at) GROUP BY`. Batch-delete (10k) below a floor. Single-node
 PolyFlare drops the leader gate. *(Note: codex-lb prunes only these two tables — never a continuity
 table.)*
 *codex-lb:* `core/retention/job.py`, `core/retention/scheduler.py`, `core/config/settings.py:236`.
+
+**DONE 2026-07-18 (plan `docs/superpowers/plans/2026-07-18-c12-retention-pruning.md`).** Hourly
+`spawn_retention_prune` background loop (`retention.rs`, mirrors `spawn_usage_refresh`) age-pruning
+`request_log` (strict `requested_at < cutoff`) + `usage_history` (with the protect-latest-row-per-
+`(account_id,"window")` guard — null-safe `IS` for the nullable window; adversarially reviewed).
+Batched 10k `rowid IN (SELECT ... LIMIT)` deletes (portable, terminating). `POLYFLARE_REQUEST_LOG_RETENTION_DAYS`
++ `POLYFLARE_USAGE_HISTORY_RETENTION_DAYS`, **default 0 = disabled** (malformed ⇒ 0 fail-safe, clamp
+`[0,3650]`). A failed prune warns content-free + continues (never crashes the loop). **NEVER-PRUNE
+boundary structural:** the whole store crate has exactly 2 DELETE statements (the 2 log tables);
+`continuity_repo`/`api_key_repo`/`accounts` have NO delete capability. No rollup-watermark guard
+(PolyFlare has no rollup); no leader gate (single-node); no VACUUM (non-goal — SQLite reuses pages).
+**Deferred:** continuity-session staleness prune (weeks-scale, own review); dashboard per-table override.
 
 ---
 
