@@ -89,6 +89,15 @@ pub struct ServeConfig {
     /// it). Since the B8-review Finding 1 fix, the poller resets ALL providers (codex and
     /// non-codex), not just codex.
     pub soft_drain_enabled: bool,
+    /// B10 Task 1 (THE CRUX): the per-waiter wake-jitter window
+    /// (`POLYFLARE_STARVATION_WAKE_JITTER_MS`; see [`wake_jitter_ms_from_env`] for the
+    /// default/clamp handling). Resolved ONCE here at startup and threaded through `AppState` —
+    /// never a per-request `env::var` read (mirrors `starvation_wait_budget`/`starvation_heartbeat`
+    /// above). `0` (the default) ⇒ zero offset ⇒ byte-for-byte today's pre-B10
+    /// `crate::ingress::layer2_wait_stream` behavior; a positive value spreads concurrent waiters on
+    /// the same recovering account across `[0, wake_jitter_ms]` of extra delay, never past the wait
+    /// budget.
+    pub wake_jitter_ms: u64,
 }
 
 /// TA6(b) Task 5: the one capability name resolved today. A pool tagged with this capability (via
@@ -350,6 +359,31 @@ pub fn stream_idle_timeout_secs_from_env() -> u64 {
     }
 }
 
+/// B10 Task 1 (THE CRUX): `POLYFLARE_STARVATION_WAKE_JITTER_MS` — the per-waiter wake-jitter
+/// window (`crate::ingress::wake_jitter_offset_ms`), which desynchronizes concurrent Layer 2
+/// waiters on the same recovering account (see that function's doc + the B10 plan's Global
+/// Constraints). Unset ⇒ `0` — **the default IS the disable lever** (unlike
+/// [`starvation_wait_budget_secs_from_env`], where `0` is a distinct branch from a non-zero
+/// default; here they're literally the same value, since `0` naturally means "no jitter", i.e.
+/// today's exact pre-B10 behavior — there is no separate "sane default > 0" the plan calls for).
+/// A well-formed, in-range value resolves to itself. A well-formed value ABOVE `MAX` (`30_000`ms —
+/// an absolute ceiling so a hostile/huge value can't blow the B5 wait budget) clamps DOWN to
+/// `MAX`, never silently accepted as-is. A MALFORMED value (non-numeric, negative, or out of `u64`
+/// range) resolves to the SAME default as unset (`0`) — never a boot crash; identical rationale to
+/// every other malformed-input decision in this module.
+pub fn wake_jitter_ms_from_env() -> u64 {
+    const DEFAULT: u64 = 0;
+    const MAX: u64 = 30_000;
+    match std::env::var("POLYFLARE_STARVATION_WAKE_JITTER_MS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(n) if n > MAX => MAX,
+            Ok(n) => n,
+            Err(_) => DEFAULT,
+        },
+        Err(_) => DEFAULT,
+    }
+}
+
 /// B8 Task 3: `POLYFLARE_SOFT_DRAIN_ENABLED` — the codex-lb `soft_drain_enabled` disable lever for
 /// the usage-driven health-tier evaluation (`crate::runtime_state::RuntimeStates::evaluate_with_usage`,
 /// called from `crate::usage_refresh::refresh_account`). Unlike every other bool flag in this
@@ -444,6 +478,7 @@ impl ServeConfig {
         let starvation_heartbeat = Duration::from_secs(starvation_heartbeat_secs as u64);
         let stream_idle_timeout = Duration::from_secs(stream_idle_timeout_secs_from_env());
         let soft_drain_enabled = soft_drain_enabled_from_env();
+        let wake_jitter_ms = wake_jitter_ms_from_env();
         Ok(ServeConfig {
             bind_addr,
             upstream_base_url,
@@ -464,6 +499,7 @@ impl ServeConfig {
             allow_unauthenticated_remote,
             stream_idle_timeout,
             soft_drain_enabled,
+            wake_jitter_ms,
         })
     }
 }
@@ -984,6 +1020,67 @@ mod tests {
         assert!(soft_drain_enabled_from_env());
         unsafe {
             std::env::remove_var("POLYFLARE_SOFT_DRAIN_ENABLED");
+        }
+    }
+
+    /// Serializes tests in this module that mutate `POLYFLARE_STARVATION_WAKE_JITTER_MS` — same
+    /// rationale as the other env-lock helpers above (env vars are process-global, tests run
+    /// concurrently on separate threads by default).
+    fn wake_jitter_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// B10 Task 1: unset ⇒ `0` — the documented disable lever AND the default (unlike
+    /// `starvation_wait_budget_secs_from_env`, `0` here isn't a separate branch from the default;
+    /// they're the same value, so "unset" and "explicit 0" resolve identically).
+    #[test]
+    fn wake_jitter_ms_unset_defaults_to_zero() {
+        let _guard = wake_jitter_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("POLYFLARE_STARVATION_WAKE_JITTER_MS");
+        }
+        assert_eq!(wake_jitter_ms_from_env(), 0);
+    }
+
+    /// A well-formed, in-range value resolves to exactly itself.
+    #[test]
+    fn wake_jitter_ms_reads_a_well_formed_value() {
+        let _guard = wake_jitter_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_STARVATION_WAKE_JITTER_MS", "250");
+        }
+        assert_eq!(wake_jitter_ms_from_env(), 250);
+        unsafe {
+            std::env::remove_var("POLYFLARE_STARVATION_WAKE_JITTER_MS");
+        }
+    }
+
+    /// An absurdly large value clamps DOWN to the `30_000`ms ceiling — never silently accepted
+    /// as-is (a hostile/huge value must not be able to blow the B5 wait budget).
+    #[test]
+    fn wake_jitter_ms_absurd_value_clamps_to_thirty_seconds() {
+        let _guard = wake_jitter_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_STARVATION_WAKE_JITTER_MS", "999999");
+        }
+        assert_eq!(wake_jitter_ms_from_env(), 30_000);
+        unsafe {
+            std::env::remove_var("POLYFLARE_STARVATION_WAKE_JITTER_MS");
+        }
+    }
+
+    /// A malformed value (non-numeric) ⇒ the SAME safe default as unset (`0`) — never a boot
+    /// crash.
+    #[test]
+    fn wake_jitter_ms_malformed_defaults_to_zero() {
+        let _guard = wake_jitter_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_STARVATION_WAKE_JITTER_MS", "not-a-number");
+        }
+        assert_eq!(wake_jitter_ms_from_env(), 0);
+        unsafe {
+            std::env::remove_var("POLYFLARE_STARVATION_WAKE_JITTER_MS");
         }
     }
 }

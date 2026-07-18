@@ -735,6 +735,79 @@ fn try_layer2_recovery_wait(
 /// served the request, fixing the disclosed gap where `RouteOutcome`/`RequestLog` can only ever
 /// record the wait target (see `crate::observability::StarvationSignal`'s doc for the full
 /// rationale).
+///
+/// # Global Constraint — HERD DAMPING (B10 Task 1, THE CRUX)
+/// Every waiter on the SAME account used to compute an IDENTICAL `target_ms` (below), so N
+/// concurrent waiters woke within one heartbeat tick and re-selected in lockstep the instant the
+/// account recovered — a self-inflicted thundering herd that can immediately re-429 it. This
+/// generator now adds a small, bounded, PER-REQUEST jitter (`wake_jitter_offset_ms`) to its own
+/// wake target ONLY — computed once, at wait entry, from this request's own session key
+/// (`layer2_wait_request_key`) and the startup-resolved `AppState.wake_jitter_ms`
+/// (`POLYFLARE_STARVATION_WAKE_JITTER_MS`, default `0`). It does NOT touch `select.rs` (`pick`
+/// stays pure), does NOT touch the account's stored `recover_at`/`cooldown_until`/`backoff_secs`
+/// (`soonest_recover`'s cross-account fairness ordering is unchanged — `wait_target`/`recover_at`
+/// above are read-only inputs, never written here), and does NOT change WHICH account this waiter
+/// is waiting on. `jittered_wake_target_ms` guarantees the jitter only ever DELAYS the wake beyond
+/// `target_ms` (never before it) and never past `budget_deadline_ms` (never past the B5 budget
+/// ceiling) — see that function's doc.
+///
+/// B10 Task 1 (THE CRUX): the per-waiter wake-jitter offset — a deterministic, bounded value in
+/// `[0, wake_jitter_ms]`. PURE (no clock, no process-global `rand`): the SAME `request_key` always
+/// yields the SAME offset (the plan's Global Constraints require a testable, "deterministic-per-
+/// request" seam, not process-global `rand`), while DIFFERENT keys generally yield DIFFERENT
+/// offsets — this is exactly what desynchronizes concurrent waiters on the same recovering account
+/// (see `layer2_wait_stream`'s "Global Constraint — HERD DAMPING" doc). `wake_jitter_ms == 0` ⇒
+/// ALWAYS `0` — the documented disable lever (`POLYFLARE_STARVATION_WAKE_JITTER_MS=0`,
+/// `crate::config::wake_jitter_ms_from_env`'s default), byte-for-byte today's pre-B10 behavior.
+///
+/// Deliberately lives here, NOT in `polyflare-core::select` — `pick`/`eligibility`/
+/// `soonest_recover` are pure over ACCOUNT snapshots only, with no clock/rand (B10's Global
+/// Constraints, mirroring the M2-GATE1 purity contract). This helper is pure too, but over a
+/// per-REQUEST key, and is never called from `select.rs`.
+///
+/// `DefaultHasher` (SipHash, fixed keys) is used rather than `RandomState`'s per-process-randomized
+/// hasher — this is precisely why it's deterministic ACROSS PROCESS RUNS too, not merely within
+/// one, which is what makes `same_key_is_deterministic` (below) a meaningful test rather than an
+/// accident of one run.
+pub fn wake_jitter_offset_ms(request_key: &str, wake_jitter_ms: u64) -> u64 {
+    if wake_jitter_ms == 0 {
+        return 0;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    request_key.hash(&mut hasher);
+    hasher.finish() % wake_jitter_ms.saturating_add(1)
+}
+
+/// B10 Task 1: caps `target_ms + jitter_ms` at `budget_deadline_ms` — the "Bounded + never past
+/// budget" / "Only spreads LATER, never earlier" Global Constraints, isolated as its own pure
+/// function so both are testable without spinning up the generator. Never returns less than
+/// `target_ms` (jitter only ever ADDS delay) and never more than `budget_deadline_ms` (jitter can
+/// only spend room already inside the existing B5 budget ceiling — it can never extend the wait
+/// past it).
+pub(crate) fn jittered_wake_target_ms(target_ms: i64, jitter_ms: u64, budget_deadline_ms: i64) -> i64 {
+    target_ms.saturating_add(jitter_ms as i64).min(budget_deadline_ms)
+}
+
+/// B10 Task 1: the per-request identifier [`wake_jitter_offset_ms`] is seeded with. The native
+/// `/responses` ingress path always derives a `SessionKey` (Hard, from
+/// `x-codex-turn-state`/`session_id`; else Soft, from `x-request-id`/`prompt_cache_key`/a content
+/// hash of `input` — see `crate::session_key::parse_inbound`), so `session_key` is `Some` in
+/// practice: different concurrent waiters (different conversations / different clients) hash to
+/// different keys, which is exactly the desync this task needs — and the SAME conversation retried
+/// across turns hashes to the SAME key (deterministic), matching the plan's testability
+/// requirement. The `None` branch is a defensive fallback for a hypothetical caller that carries no
+/// session identity at all: a fresh CSPRNG nonce drawn ONCE here (never inside the sleep loop,
+/// still flowing through the same deterministic hash helper above) — the plan's Global Constraints
+/// explicitly allow this ("a single bounded rand draw at wait-entry is acceptable" when no stable
+/// id is in scope).
+fn layer2_wait_request_key(session_key: &Option<SessionKey>) -> String {
+    match session_key {
+        Some(sk) => sk.value.clone(),
+        None => format!("{:x}", rand::random::<u64>()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn layer2_wait_stream(
     state: Arc<AppState>,
@@ -763,17 +836,28 @@ fn layer2_wait_stream(
         // Never sleep past whichever comes first: the account's own recovery time, or the budget.
         let target_ms = recover_at_ms.min(budget_deadline_ms);
 
+        // B10 Task 1 (THE CRUX): the per-waiter wake-jitter offset, computed ONCE here (never
+        // re-drawn per heartbeat — see `wake_jitter_offset_ms`'s doc) from this request's own
+        // session key + the startup-resolved `AppState.wake_jitter_ms`. `jittered_target_ms` only
+        // ever DELAYS the wake beyond `target_ms` (never before it) and is capped at
+        // `budget_deadline_ms` (never past the B5 budget) — see `jittered_wake_target_ms`'s doc and
+        // this function's "Global Constraint — HERD DAMPING" doc above. `wake_jitter_ms == 0` (the
+        // default) makes this byte-for-byte today's pre-B10 `target_ms`.
+        let request_key = layer2_wait_request_key(&session_key);
+        let jitter_ms = wake_jitter_offset_ms(&request_key, state.wake_jitter_ms);
+        let jittered_target_ms = jittered_wake_target_ms(target_ms, jitter_ms, budget_deadline_ms);
+
         loop {
             let t_ms = unix_now_ms();
-            if t_ms >= target_ms {
+            if t_ms >= jittered_target_ms {
                 break;
             }
-            let remaining_ms = (target_ms - t_ms).max(1) as u64;
+            let remaining_ms = (jittered_target_ms - t_ms).max(1) as u64;
             let tick = heartbeat.min(Duration::from_millis(remaining_ms));
             tokio::time::sleep(tick).await;
             // Only emit a keepalive if we're still genuinely waiting (avoids one trailing,
             // pointless keepalive emitted in the same instant selection is about to be retried).
-            if unix_now_ms() < target_ms {
+            if unix_now_ms() < jittered_target_ms {
                 yield starvation::keepalive_item();
             }
         }
@@ -2149,6 +2233,90 @@ mod tests {
             assert!(
                 k.bytes().all(|b| b.is_ascii_hexdigit()),
                 "hex only for {body}"
+            );
+        }
+    }
+
+    // B10 Task 1 (THE CRUX) — the per-waiter wake-jitter pure helpers. `select.rs`/
+    // `runtime_state.rs`'s backoff are UNTOUCHED by this task; these helpers live entirely here,
+    // over a per-REQUEST key, never over account snapshots.
+    mod wake_jitter {
+        use super::super::{jittered_wake_target_ms, wake_jitter_offset_ms};
+
+        /// (a) Two DIFFERENT keys produce offsets bounded in `[0, wake_jitter_ms]`, and — the
+        /// whole point — generally DIFFERENT values (desync). Not a proof for every possible pair,
+        /// but at least one representative pair must differ, or every waiter would still wake in
+        /// lockstep (today's B5 herd, byte-for-byte).
+        #[test]
+        fn offset_is_bounded_and_desyncs_different_keys() {
+            let a = wake_jitter_offset_ms("waiter-a", 1000);
+            let b = wake_jitter_offset_ms("waiter-b", 1000);
+            assert!(a <= 1000, "offset must be in [0, wake_jitter_ms]: {a}");
+            assert!(b <= 1000, "offset must be in [0, wake_jitter_ms]: {b}");
+            assert_ne!(
+                a, b,
+                "different request keys must desync (else this is a no-op re-implementation of \
+                 today's lockstep herd)"
+            );
+        }
+
+        /// `wake_jitter_ms == 0` (the disable lever's resolved value) ⇒ ALWAYS `0`, for any key —
+        /// byte-for-byte today's pre-B10 behavior.
+        #[test]
+        fn zero_jitter_window_is_always_zero() {
+            assert_eq!(wake_jitter_offset_ms("any-key", 0), 0);
+            assert_eq!(wake_jitter_offset_ms("another-key", 0), 0);
+            assert_eq!(wake_jitter_offset_ms("", 0), 0);
+        }
+
+        /// Deterministic-per-request: the SAME key always yields the SAME offset — the testable
+        /// seam the plan's Global Constraints require (not a process-global `rand` draw).
+        #[test]
+        fn same_key_is_deterministic() {
+            assert_eq!(
+                wake_jitter_offset_ms("stable-key", 5000),
+                wake_jitter_offset_ms("stable-key", 5000),
+                "same request key must always produce the same offset"
+            );
+            assert_eq!(
+                wake_jitter_offset_ms("stable-key", 5000),
+                wake_jitter_offset_ms("stable-key", 5000),
+                "reproducible across repeated calls, not just adjacent ones"
+            );
+        }
+
+        /// (b) The target math: `target_ms + jitter` capped at `budget_deadline_ms` — a jitter
+        /// that would exceed the budget clamps DOWN to the budget, never past it.
+        #[test]
+        fn target_math_caps_at_the_budget_deadline() {
+            let target_ms = 1_000_000_i64;
+            let budget_deadline_ms = 1_000_500_i64; // only 500ms of budget room left
+            assert_eq!(
+                jittered_wake_target_ms(target_ms, 10_000, budget_deadline_ms),
+                budget_deadline_ms,
+                "a jitter that would exceed the budget clamps to the budget, never past it"
+            );
+        }
+
+        /// Jitter only ever ADDS delay — the jittered target is never before `target_ms`, and
+        /// zero jitter is a byte-for-byte no-op.
+        #[test]
+        fn target_math_never_wakes_before_target_ms() {
+            let target_ms = 1_000_000_i64;
+            let budget_deadline_ms = 1_100_000_i64; // plenty of budget room
+            assert_eq!(
+                jittered_wake_target_ms(target_ms, 0, budget_deadline_ms),
+                target_ms,
+                "zero jitter is a no-op — identical to today's target_ms"
+            );
+            let jittered = jittered_wake_target_ms(target_ms, 5_000, budget_deadline_ms);
+            assert!(
+                jittered >= target_ms,
+                "jitter only ever adds delay, never wakes earlier than target_ms (got {jittered})"
+            );
+            assert_eq!(
+                jittered, 1_005_000,
+                "within budget room, the full jitter is applied"
             );
         }
     }

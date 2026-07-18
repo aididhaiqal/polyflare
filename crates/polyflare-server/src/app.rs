@@ -123,6 +123,15 @@ pub struct AppState {
     /// against `starvation_wait_budget` above). The production entrypoint reads this field instead
     /// of `crate::starvation::DEFAULT_HEARTBEAT`.
     pub starvation_heartbeat: std::time::Duration,
+    /// B10 Task 1 (THE CRUX): the per-waiter wake-jitter window
+    /// (`POLYFLARE_STARVATION_WAKE_JITTER_MS`, resolved ONCE at startup by
+    /// `crate::config::wake_jitter_ms_from_env` — never read per-request). Read directly by
+    /// `crate::ingress::layer2_wait_stream` at wait entry to compute this waiter's own
+    /// `jittered_wake_target_ms`, desynchronizing concurrent waiters on the same recovering
+    /// account. `0` (the default) ⇒ zero offset ⇒ byte-for-byte today's pre-B10 behavior; it never
+    /// touches `select.rs`, the account's stored `recover_at`/`cooldown_until`/`backoff_secs`, or
+    /// which account is waited on.
+    pub wake_jitter_ms: u64,
     /// B5 Task 5: content-free counter of Layer 2 keepalive-wait terminal outcomes (see
     /// `crate::observability::StarvationMetrics`) — incremented from
     /// `crate::ingress::layer2_wait_stream` at the same site that emits the
