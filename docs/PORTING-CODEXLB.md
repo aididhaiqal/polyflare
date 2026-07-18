@@ -213,7 +213,7 @@ spreads load. Keep in-memory; surface only to metrics.
 - **Follow-ups:** the hard concurrency cap (needs the pigeonhole/fallback decision); an optional TTL-reclaim sweep
   (belt-and-suspenders); C11 Prometheus `account_lease_*` surface.
 
-### C11. Prometheus `/metrics` surface  · LOW · medium
+### C11. Prometheus `/metrics` surface  · LOW · medium · **DONE (first cut)**
 Emit codex-lb's metric **names + label sets** as the portable contract (dashboards key off them):
 `upstream_requests_total{account_id,status}`, `rate_limit_hits_total{type}`,
 `accounts_total{status}`, the `account_lease_*` family (pairs with C9), and the `bridge_*`/
