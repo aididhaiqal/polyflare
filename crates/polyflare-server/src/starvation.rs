@@ -84,6 +84,27 @@ pub fn in_band_error_frame(outcome: StarvationOutcome) -> Bytes {
     ))
 }
 
+/// The Anthropic `/v1/messages` streaming equivalent of [`in_band_error_frame`]: a single
+/// `event: error` SSE frame in Anthropic's shape (`{"type":"error","error":{"type":..,"message":..}}`,
+/// see `polyflare_anthropic::translate::AnthropicToResponses`'s `build_error_event`), for the
+/// Anthropic empty-pool Layer-2 paths (native + aliased). **Content-free by construction**: a FIXED
+/// Anthropic error `type` (`overloaded_error` — the closest match for "no capacity available") plus a
+/// FIXED sentence carrying ONLY the compile-time [`StarvationOutcome::code`] label — never upstream
+/// error text, unlike the translator's `build_error_event`.
+pub fn anthropic_in_band_error_frame(outcome: StarvationOutcome) -> Bytes {
+    Bytes::from(format!(
+        "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"overloaded_error\",\
+         \"message\":\"starvation recovery wait ended without a servable account ({})\"}}}}\n\n",
+        outcome.code()
+    ))
+}
+
+/// The Anthropic keepalive: a typed `ping` event (what the real Anthropic streaming API emits),
+/// used in place of the Codex `: keepalive` SSE comment on the Anthropic Layer-2 wait paths.
+pub fn anthropic_ping_frame() -> Bytes {
+    Bytes::from_static(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
+}
+
 /// A single keepalive item, pre-wrapped as the `ResponseStream` item type — mirrors
 /// `watchdog::signal_client_stream`'s established idiom: a synthetic frame is always yielded as
 /// `Ok`, never `Err` (see [`in_band_error_frame`]'s doc for why).
@@ -147,5 +168,37 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(codes.len(), 3);
+    }
+
+    #[test]
+    fn anthropic_error_frame_is_the_anthropic_error_event_shape_and_content_free() {
+        let frame = anthropic_in_band_error_frame(StarvationOutcome::BudgetExceeded);
+        let s = std::str::from_utf8(&frame).unwrap();
+        // Anthropic SSE error event shape: `event: error\ndata: {"type":"error","error":{...}}\n\n`
+        assert!(s.starts_with("event: error\n"));
+        assert!(s.contains("\"type\":\"error\""));
+        assert!(s.contains("\"error\":{"));
+        // A valid, fixed Anthropic error type — never upstream text.
+        assert!(s.contains("\"type\":\"overloaded_error\""));
+        // The message is a FIXED sentence carrying only our own fixed outcome code label.
+        assert!(s.contains(StarvationOutcome::BudgetExceeded.code()));
+        assert!(s.ends_with("\n\n"));
+        // The three fixed outcome codes are the ONLY variable content.
+        for oc in [
+            StarvationOutcome::BudgetExceeded,
+            StarvationOutcome::StillNothing,
+            StarvationOutcome::ExecutorError,
+        ] {
+            let f = anthropic_in_band_error_frame(oc);
+            let t = std::str::from_utf8(&f).unwrap();
+            assert!(t.contains(oc.code()));
+        }
+    }
+
+    #[test]
+    fn anthropic_ping_frame_is_a_typed_ping_event() {
+        let frame = anthropic_ping_frame();
+        let s = std::str::from_utf8(&frame).unwrap();
+        assert_eq!(s, "event: ping\ndata: {\"type\":\"ping\"}\n\n");
     }
 }
