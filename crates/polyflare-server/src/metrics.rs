@@ -33,6 +33,19 @@ pub struct MetricsSnapshot {
     pub lease_acquired_total: u64,
     pub lease_released_total: u64,
     pub accounts: Vec<AccountMetric>,
+    /// C11b: one `(account_id, status, count)` triple per distinct pair recorded by
+    /// `AppState::upstream_request_metrics` (`crate::observability::UpstreamRequestMetrics`) — a
+    /// content-free, monotonic, in-process counter bumped once per completed client request at
+    /// each of the 3 request-completion wrapper sites. `account_id == ""` is the documented
+    /// `None` (no-eligible-account) render convention, mirroring `AccountMetric::pool`'s
+    /// `None -> ""` treatment.
+    pub upstream_requests: Vec<(String, u16, u64)>,
+    /// C11b: one `(type, count)` pair per distinct rate-limit kind recorded by
+    /// `AppState::rate_limit_metrics` (`crate::observability::RateLimitMetrics`) — bumped once per
+    /// 429 writeback inside `RuntimeStates::record_rate_limit`, the single chokepoint. `type` is
+    /// always one of the fixed strings `"upstream"` (upstream supplied `Retry-After`) or
+    /// `"backoff"` (computed backoff) — never free-form upstream text.
+    pub rate_limit_hits: Vec<(String, u64)>,
 }
 
 /// One account's content-free gauge inputs. `account_id` is the OPAQUE store-row id (the same class
@@ -158,6 +171,9 @@ pub fn render_prometheus_text(snapshot: &MetricsSnapshot) -> String {
 
     write_accounts_total(&mut out, &snapshot.accounts);
 
+    write_upstream_requests_total(&mut out, &snapshot.upstream_requests);
+    write_rate_limit_hits_total(&mut out, &snapshot.rate_limit_hits);
+
     out
 }
 
@@ -216,6 +232,46 @@ fn write_accounts_total(out: &mut String, accounts: &[AccountMetric]) {
     }
 }
 
+/// Writes `polyflare_upstream_requests_total{account_id="...",status="..."}` — one sample per
+/// `(account_id, status, count)` triple in `entries` (C11b). A single `# HELP`/`# TYPE ... counter`
+/// pair precedes all samples, emitted once for the whole family (never once per sample). `status`
+/// is rendered as its decimal `u16` value (a numeric HTTP status code, not free text); `account_id`
+/// goes through [`escape_label_value`] like every other label this module emits — the empty-string
+/// `None` convention renders as the valid, empty label `account_id=""`.
+fn write_upstream_requests_total(out: &mut String, entries: &[(String, u16, u64)]) {
+    let name = "polyflare_upstream_requests_total";
+    let _ = writeln!(
+        out,
+        "# HELP {name} Total completed client requests per (account_id, status)."
+    );
+    let _ = writeln!(out, "# TYPE {name} counter");
+    for (account_id, status, count) in entries {
+        let _ = writeln!(
+            out,
+            "{name}{{account_id=\"{}\",status=\"{status}\"}} {count}",
+            escape_label_value(account_id),
+        );
+    }
+}
+
+/// Writes `polyflare_rate_limit_hits_total{type="..."}` — one sample per `(type, count)` pair in
+/// `entries` (C11b). A single `# HELP`/`# TYPE ... counter` pair precedes all samples, emitted once
+/// for the whole family. `type` is always one of the fixed `&'static str` values `RateLimitMetrics`
+/// records (`"upstream"`/`"backoff"`) but is still escaped via [`escape_label_value`] for
+/// consistency with every other label this module emits.
+fn write_rate_limit_hits_total(out: &mut String, entries: &[(String, u64)]) {
+    let name = "polyflare_rate_limit_hits_total";
+    let _ = writeln!(out, "# HELP {name} Total 429 writebacks per type.");
+    let _ = writeln!(out, "# TYPE {name} counter");
+    for (kind, count) in entries {
+        let _ = writeln!(
+            out,
+            "{name}{{type=\"{}\"}} {count}",
+            escape_label_value(kind),
+        );
+    }
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -270,6 +326,8 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
         lease_acquired_total: state.lease_metrics.acquired(),
         lease_released_total: state.lease_metrics.released(),
         accounts,
+        upstream_requests: state.upstream_request_metrics.snapshot(),
+        rate_limit_hits: state.rate_limit_metrics.snapshot(),
     };
 
     let body = render_prometheus_text(&snapshot);
@@ -331,6 +389,8 @@ mod tests {
                     cooldown_active: true,
                 },
             ],
+            upstream_requests: vec![],
+            rate_limit_hits: vec![],
         };
 
         let body = render_prometheus_text(&snapshot);
@@ -397,6 +457,8 @@ mod tests {
             lease_acquired_total: 10,
             lease_released_total: 4,
             accounts: vec![],
+            upstream_requests: vec![],
+            rate_limit_hits: vec![],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(body.contains("# TYPE polyflare_lease_inflight gauge"));
@@ -412,6 +474,8 @@ mod tests {
             lease_acquired_total: 2,
             lease_released_total: 9,
             accounts: vec![],
+            upstream_requests: vec![],
+            rate_limit_hits: vec![],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(body.contains("polyflare_lease_inflight 0"));
@@ -432,6 +496,8 @@ mod tests {
                 account("acct-b", "active"),
                 account("acct-c", "cooldown"),
             ],
+            upstream_requests: vec![],
+            rate_limit_hits: vec![],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(body.contains("# TYPE polyflare_accounts_total gauge"));
@@ -452,6 +518,8 @@ mod tests {
             lease_acquired_total: 1,
             lease_released_total: 1,
             accounts: vec![account("acct-opaque-row-id-123", "active")],
+            upstream_requests: vec![("acct-opaque-row-id-123".to_string(), 200, 1)],
+            rate_limit_hits: vec![("upstream".to_string(), 1)],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(!body.contains('@'), "body must never contain an @: {body}");
@@ -475,6 +543,8 @@ mod tests {
             lease_acquired_total: 0,
             lease_released_total: 0,
             accounts: vec![account("acct-\"quote\"-\\backslash\\", "active")],
+            upstream_requests: vec![],
+            rate_limit_hits: vec![],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(
@@ -502,6 +572,8 @@ mod tests {
             lease_acquired_total: 4,
             lease_released_total: 1,
             accounts: vec![],
+            upstream_requests: vec![],
+            rate_limit_hits: vec![],
         };
         let body = render_prometheus_text(&snapshot);
 
@@ -519,5 +591,103 @@ mod tests {
         // accounts_total has no per-status samples when there are no accounts.
         assert!(body.contains("# TYPE polyflare_accounts_total gauge"));
         assert!(!body.contains("polyflare_accounts_total{status="));
+
+        // The two C11b counter families still emit their HELP/TYPE header even when empty (a
+        // valid, zero-sample metric family is legal Prometheus text), but no sample lines.
+        assert!(body.contains("# TYPE polyflare_upstream_requests_total counter"));
+        assert!(!body.contains("polyflare_upstream_requests_total{"));
+        assert!(body.contains("# TYPE polyflare_rate_limit_hits_total counter"));
+        assert!(!body.contains("polyflare_rate_limit_hits_total{"));
+    }
+
+    /// (a) C11b: `render_prometheus_text` with seeded `upstream_requests`/`rate_limit_hits` vecs
+    /// emits the exact `# TYPE polyflare_upstream_requests_total counter` line ONCE, one labeled
+    /// sample line per `(account_id, status, count)` entry, and the mirrored
+    /// `polyflare_rate_limit_hits_total{type="..."}` family — HELP/TYPE appear once per family, not
+    /// once per sample, exactly like every other family this renderer emits.
+    #[test]
+    fn renders_upstream_requests_and_rate_limit_hits_counter_families() {
+        let snapshot = MetricsSnapshot {
+            failover_total: 0,
+            starvation_total: 0,
+            health_tier_transitions_total: 0,
+            lease_acquired_total: 0,
+            lease_released_total: 0,
+            accounts: vec![],
+            upstream_requests: vec![
+                ("acct-a".to_string(), 200, 5),
+                ("acct-b".to_string(), 429, 2),
+                // The `None` (no-eligible-account) render convention: empty account_id.
+                (String::new(), 503, 1),
+            ],
+            rate_limit_hits: vec![("upstream".to_string(), 3), ("backoff".to_string(), 1)],
+        };
+
+        let body = render_prometheus_text(&snapshot);
+
+        assert_eq!(
+            body.matches("# TYPE polyflare_upstream_requests_total counter")
+                .count(),
+            1,
+            "HELP/TYPE must be emitted once per family, not once per sample: {body}"
+        );
+        assert_eq!(
+            body.matches("# HELP polyflare_upstream_requests_total")
+                .count(),
+            1,
+            "HELP must be emitted once per family: {body}"
+        );
+        assert!(body
+            .contains("polyflare_upstream_requests_total{account_id=\"acct-a\",status=\"200\"} 5"));
+        assert!(body
+            .contains("polyflare_upstream_requests_total{account_id=\"acct-b\",status=\"429\"} 2"));
+        assert!(
+            body.contains("polyflare_upstream_requests_total{account_id=\"\",status=\"503\"} 1"),
+            "the None account_id convention must render as the valid empty label: {body}"
+        );
+
+        assert_eq!(
+            body.matches("# TYPE polyflare_rate_limit_hits_total counter")
+                .count(),
+            1,
+            "HELP/TYPE must be emitted once per family, not once per sample: {body}"
+        );
+        assert_eq!(
+            body.matches("# HELP polyflare_rate_limit_hits_total")
+                .count(),
+            1,
+            "HELP must be emitted once per family: {body}"
+        );
+        assert!(body.contains("polyflare_rate_limit_hits_total{type=\"upstream\"} 3"));
+        assert!(body.contains("polyflare_rate_limit_hits_total{type=\"backoff\"} 1"));
+    }
+
+    /// (b) Content-safety: a snapshot whose `upstream_requests`/`rate_limit_hits` entries carry only
+    /// plain, opaque values renders no `@`/email/SECRET substring — same structural guarantee as
+    /// `rendered_body_never_contains_email_or_secret_substrings` (`(d)` above), which was itself
+    /// extended to seed a populated `upstream_requests`/`rate_limit_hits` and assert nothing new
+    /// leaks through them.
+    #[test]
+    fn upstream_and_rate_limit_families_never_contain_email_or_secret_substrings() {
+        let snapshot = MetricsSnapshot {
+            failover_total: 0,
+            starvation_total: 0,
+            health_tier_transitions_total: 0,
+            lease_acquired_total: 0,
+            lease_released_total: 0,
+            accounts: vec![],
+            upstream_requests: vec![("acct-opaque-row-id-123".to_string(), 200, 1)],
+            rate_limit_hits: vec![("upstream".to_string(), 1)],
+        };
+        let body = render_prometheus_text(&snapshot);
+        assert!(!body.contains('@'), "body must never contain an @: {body}");
+        assert!(
+            !body.to_uppercase().contains("SECRET"),
+            "body must never contain SECRET: {body}"
+        );
+        assert!(
+            !body.to_lowercase().contains("email"),
+            "body must never contain 'email': {body}"
+        );
     }
 }
