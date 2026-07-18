@@ -14,11 +14,14 @@
 //! `StubSource`). The production `HttpModelSource` (account-bearer upstream fetch) and the wiring
 //! into `catalog.rs`/`AppState`/config are later tasks in the same plan.
 
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tracing::warn;
+
+use polyflare_codex::CodexVersionCache;
+use polyflare_store::{Store, TokenCipher};
 
 /// Default TTL for tests exercising the fallback ladder; production wiring (a later task) will
 /// pass an explicit config-derived TTL into [`ModelCatalogCache::new`].
@@ -178,6 +181,194 @@ pub fn merge_onto_floor(upstream: &[UpstreamModel], floor: &[UpstreamModel]) -> 
     }
 
     merged
+}
+
+/// Build the upstream `/models` URL: `{base}/models?client_version={version}`. `base` already
+/// includes `/codex` (`config.rs`'s `upstream_base_url`, default `https://chatgpt.com/backend-api/
+/// codex`), so only `/models?...` is appended — mirrors `usage_refresh.rs`'s pure `usage_url`
+/// helper (testable without any HTTP).
+pub fn models_url(base: &str, version: &str) -> String {
+    format!(
+        "{}/models?client_version={}",
+        base.trim_end_matches('/'),
+        percent_encode_query_value(version)
+    )
+}
+
+/// Minimal percent-encoding for a single query VALUE (not a whole URL): unreserved characters
+/// (letters, digits, `-`, `_`, `.`, `~`) pass through unchanged; everything else becomes `%XX`.
+/// Codex version strings are validated `X.Y.Z` triples before ever reaching here (see
+/// `CodexVersionCache::cached_or_fallback` / `is_semver_triple`), so in practice this never changes
+/// the input — it exists purely as a defensive guard against a malformed/unvalidated version ever
+/// injecting a stray `&`/`#`/space into the query string.
+fn percent_encode_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Parse the upstream `/models` response body into `UpstreamModel`s. The upstream shape is
+/// `{"models": [...]}` (confirmed against codex-lb's `model_fetcher.py`'s `data["models"]`
+/// parsing); each entry needs at least a non-empty string `slug` — everything else is optional
+/// enrichment. A malformed entry (not a JSON object, or missing/empty/non-string `slug`) is
+/// SKIPPED, never causes a panic. Missing/non-array `models`, or non-object top-level JSON, yields
+/// an empty `Vec` — the caller (`HttpModelSource::fetch`) treats an empty result as "no usable
+/// upstream data" and returns `None`, so the cache keeps serving the stale value or static floor
+/// rather than collapsing to an empty catalog.
+pub fn parse_models(json: &serde_json::Value) -> Vec<UpstreamModel> {
+    json.get("models")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| entries.iter().filter_map(parse_one_model).collect())
+        .unwrap_or_default()
+}
+
+/// Parse a single upstream model entry. `display_name` falls back to the slug when upstream omits
+/// it; `context_window`/`prefer_websockets` are optional enrichment and are simply `None` when
+/// upstream doesn't supply them (never an error).
+fn parse_one_model(entry: &serde_json::Value) -> Option<UpstreamModel> {
+    let obj = entry.as_object()?;
+    let slug = obj.get("slug").and_then(serde_json::Value::as_str)?;
+    if slug.is_empty() {
+        return None;
+    }
+    let display_name = obj
+        .get("display_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(slug)
+        .to_string();
+    Some(UpstreamModel {
+        slug: slug.to_string(),
+        display_name,
+        context_window: obj
+            .get("context_window")
+            .and_then(serde_json::Value::as_u64),
+        prefer_websockets: obj
+            .get("prefer_websockets")
+            .and_then(serde_json::Value::as_bool),
+    })
+}
+
+/// The production [`ModelSource`]: fetches the live upstream catalog using ONE active codex
+/// account's bearer token (no per-plan fan-out for v1 — mirrors `usage_refresh.rs`'s account-bearer
+/// fetch pattern exactly: pick an account, `decrypt_tokens`, `Authorization: Bearer` +
+/// `chatgpt-account-id` headers; see that module's `refresh_account` for the precedent).
+///
+/// Content-safety: the decrypted access token is used ONLY as the `Authorization` header value —
+/// it is never passed to `tracing::warn!`/`info!`/etc anywhere in this struct (see the
+/// `fetch_never_logs_the_access_token` structural test below).
+pub struct HttpModelSource {
+    client: reqwest::Client,
+    store: Store,
+    cipher: TokenCipher,
+    /// Upstream base URL, e.g. `https://chatgpt.com/backend-api/codex` — already includes
+    /// `/codex` (`config.rs`'s `upstream_base_url`), so [`models_url`] appends only `/models?...`.
+    base_url: String,
+    version_cache: Arc<CodexVersionCache>,
+}
+
+impl HttpModelSource {
+    /// Builds its own dedicated `reqwest::Client` with a 15s timeout (mirrors
+    /// `usage_refresh::spawn_usage_refresh`'s client, not shared with the executor's pinned-TLS
+    /// client — this is a control-plane call, not provider egress).
+    pub fn new(
+        store: Store,
+        cipher: TokenCipher,
+        base_url: String,
+        version_cache: Arc<CodexVersionCache>,
+    ) -> Result<Self, reqwest::Error> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()?;
+        Ok(Self {
+            client,
+            store,
+            cipher,
+            base_url,
+            version_cache,
+        })
+    }
+}
+
+#[async_trait]
+impl ModelSource for HttpModelSource {
+    /// Fetch the live catalog via one active codex account. Returns `None` — never panics, never
+    /// logs the token — on: no active codex account, undecryptable/missing tokens, transport
+    /// error, non-2xx, an invalid JSON body, or a parsed-but-empty model list (an empty parse is
+    /// treated as "no usable data", not "here is an empty catalog", so [`ModelCatalogCache`] keeps
+    /// serving its stale value or the static floor instead of collapsing to nothing).
+    async fn fetch(&self) -> Option<Vec<UpstreamModel>> {
+        let accounts = match self.store.accounts().list().await {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(error = %e, "model catalog fetch: could not list accounts");
+                return None;
+            }
+        };
+        let account = accounts
+            .iter()
+            .find(|a| a.status == "active" && a.provider == "codex")?;
+
+        let tokens = match self
+            .store
+            .accounts()
+            .decrypt_tokens(&account.id, &self.cipher)
+            .await
+        {
+            Ok(Some(t)) => t,
+            Ok(None) => return None,
+            Err(e) => {
+                warn!(error = %e, "model catalog fetch: could not decrypt account tokens");
+                return None;
+            }
+        };
+
+        let version = self.version_cache.cached_or_fallback();
+        let url = models_url(&self.base_url, &version);
+        let mut req = self
+            .client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", tokens.access_token))
+            .header("Accept", "application/json");
+        if let Some(cid) = &account.chatgpt_account_id {
+            req = req.header("chatgpt-account-id", cid);
+        }
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "model catalog fetch: upstream transport error");
+                return None;
+            }
+        };
+        if !resp.status().is_success() {
+            warn!(
+                status = %resp.status(),
+                "model catalog fetch: upstream non-2xx"
+            );
+            return None;
+        }
+        let body: serde_json::Value = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "model catalog fetch: invalid JSON body from upstream");
+                return None;
+            }
+        };
+
+        let models = parse_models(&body);
+        if models.is_empty() {
+            warn!("model catalog fetch: parsed zero models from upstream; treating as unavailable");
+            return None;
+        }
+        Some(models)
+    }
 }
 
 #[cfg(test)]
@@ -440,5 +631,147 @@ mod tests {
         let stub = StubSource::new(None);
         let cache = cache_with(&stub, Duration::from_secs(42), default_floor());
         assert_eq!(cache.refresh_interval(), Duration::from_secs(42));
+    }
+
+    // --- Task 2: models_url (pure) ---
+
+    #[test]
+    fn models_url_builds_correct_query() {
+        assert_eq!(
+            models_url("https://chatgpt.com/backend-api/codex", "0.144.4"),
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.144.4"
+        );
+    }
+
+    #[test]
+    fn models_url_trims_trailing_slash_on_base() {
+        assert_eq!(
+            models_url("https://chatgpt.com/backend-api/codex/", "0.144.4"),
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.144.4"
+        );
+    }
+
+    #[test]
+    fn models_url_percent_encodes_a_non_triple_version_defensively() {
+        // Versions are validated `X.Y.Z` before reaching here, but the URL builder itself must not
+        // inject a raw space/`&` into the query string if it ever received something unvalidated.
+        assert_eq!(
+            models_url("https://example.test/codex", "weird version&x=1"),
+            "https://example.test/codex/models?client_version=weird%20version%26x%3D1"
+        );
+    }
+
+    // --- Task 2: parse_models (pure) ---
+
+    /// A realistic upstream fixture mirroring codex-lb's `data["models"]` shape
+    /// (`model_fetcher.py`): one fully-populated entry, one with only the required `slug`, and
+    /// three malformed entries (missing slug, non-object, empty slug) that must all be skipped
+    /// without panicking.
+    fn sample_models_json() -> serde_json::Value {
+        serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6 Sol",
+                    "context_window": 400_000,
+                    "prefer_websockets": true
+                },
+                {
+                    "slug": "gpt-5.7-nova"
+                },
+                {
+                    "display_name": "No Slug Here"
+                },
+                "not-an-object",
+                {
+                    "slug": "",
+                    "display_name": "Empty Slug"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn parse_models_parses_realistic_fixture_and_skips_malformed_entries() {
+        let models = parse_models(&sample_models_json());
+        assert_eq!(
+            models.len(),
+            2,
+            "the 3 malformed entries (no slug, non-object, empty slug) are skipped without panic"
+        );
+
+        let sol = models
+            .iter()
+            .find(|m| m.slug == "gpt-5.6-sol")
+            .expect("fully-populated entry parses");
+        assert_eq!(sol.display_name, "GPT-5.6 Sol");
+        assert_eq!(sol.context_window, Some(400_000));
+        assert_eq!(sol.prefer_websockets, Some(true));
+
+        let nova = models
+            .iter()
+            .find(|m| m.slug == "gpt-5.7-nova")
+            .expect("slug-only entry tolerates missing optional fields");
+        assert_eq!(
+            nova.display_name, "gpt-5.7-nova",
+            "missing display_name falls back to the slug"
+        );
+        assert_eq!(nova.context_window, None);
+        assert_eq!(nova.prefer_websockets, None);
+    }
+
+    #[test]
+    fn parse_models_missing_models_key_returns_empty() {
+        assert_eq!(
+            parse_models(&serde_json::json!({"other": []})),
+            Vec::<UpstreamModel>::new()
+        );
+    }
+
+    #[test]
+    fn parse_models_garbage_or_wrong_shaped_json_returns_empty() {
+        assert_eq!(
+            parse_models(&serde_json::json!("just a string")),
+            Vec::<UpstreamModel>::new()
+        );
+        assert_eq!(
+            parse_models(&serde_json::json!(null)),
+            Vec::<UpstreamModel>::new()
+        );
+        assert_eq!(
+            parse_models(&serde_json::json!({"models": "not-an-array"})),
+            Vec::<UpstreamModel>::new()
+        );
+        assert_eq!(
+            parse_models(&serde_json::json!({"models": []})),
+            Vec::<UpstreamModel>::new()
+        );
+    }
+
+    // --- Task 2: content-safety — fetch() must never log the token ---
+
+    /// Structural guard (no real HTTP / no real Store needed): scans this file's own source for
+    /// every tracing log-macro call site and asserts none of them interpolate the decrypted access
+    /// token. `HttpModelSource::fetch`'s only use of `tokens.access_token` must remain the
+    /// `Authorization` header value built two lines above its one `warn!`-adjacent branch — this
+    /// test fails loudly if a future edit ever logs the token instead.
+    #[test]
+    fn fetch_never_logs_the_access_token() {
+        let src = include_str!("model_catalog.rs");
+        for (i, line) in src.lines().enumerate() {
+            let is_log_line = ["warn!(", "info!(", "error!(", "debug!(", "trace!("]
+                .iter()
+                .any(|m| line.contains(m));
+            if !is_log_line {
+                continue;
+            }
+            let lower = line.to_lowercase();
+            assert!(
+                !lower.contains("access_token") && !lower.contains("bearer"),
+                "line {} logs sensitive token material: {}",
+                i + 1,
+                line
+            );
+        }
     }
 }
