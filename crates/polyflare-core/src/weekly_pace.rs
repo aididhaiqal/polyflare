@@ -4,14 +4,11 @@
 //! helpers are deliberately omitted; the operator-configurable working-days + smoothing settings
 //! are a deferred follow-up (they'd need new settings columns). Dashboard-read-only; feeds no routing.
 //!
-//! `#[allow(dead_code)]` throughout: this module lands ahead of the assembler that will call it
-//! (added to this same file in a follow-up task), so today these `pub(crate)` primitives are only
-//! reachable from this module's own `#[cfg(test)]` block — which doesn't count for the plain
-//! (non-test) build's dead-code analysis. Remove the allows once the assembler wires them in.
-
-#![allow(dead_code)]
+//! The pure sim primitives above are consumed by [`build_weekly_credit_pace`] below, the pool-wide
+//! aggregation entry point.
 
 use crate::depletion::{ewma_update, EwmaState, UsageSample, DEFAULT_ALPHA};
+use serde::Serialize;
 
 pub(crate) const RECENT_BURN_WINDOW_SECS: i64 = 6 * 3600;
 pub(crate) const MIN_FRESHNESS_SECS: f64 = 300.0;
@@ -212,6 +209,245 @@ pub(crate) fn project_weekly_pool(
     }
 }
 
+/// One account's inputs to the pool pace calc. `full_credits` is the plan-derived (or per-account
+/// override) secondary-window capacity; `used_percent` is the latest secondary used%; the remaining
+/// credits are derived as `full · (1 - clamp(used%,0,100)/100)`. All fields content-free.
+#[derive(Debug, Clone)]
+pub struct PaceAccountInput {
+    pub account_id: String,
+    pub status_eligible: bool,
+    pub full_credits: f64,
+    pub used_percent: f64,
+    pub reset_at: Option<i64>,
+    pub window_minutes: Option<i64>,
+    pub secondary_history: Vec<UsageSample>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaceStatus {
+    OnTrack,
+    Ahead,
+    Behind,
+    Danger,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Confidence {
+    High,
+    Medium,
+    Low,
+}
+
+/// Pool-wide weekly credit pace. All fields content-free (credits/percentages/hours/counts).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct WeeklyCreditPaceReport {
+    pub total_full_credits: f64,
+    pub total_actual_remaining_credits: f64,
+    pub total_expected_remaining_credits: f64,
+    pub actual_used_percent: f64,
+    pub scheduled_used_percent: f64,
+    pub delta_percent: f64,
+    pub schedule_gap_credits: f64,
+    pub smoothed_delta_percent: f64,
+    pub smoothed_schedule_gap_credits: f64,
+    pub projected_shortfall_credits: f64,
+    pub pause_for_break_even_hours: Option<f64>,
+    pub pace_multiplier: Option<f64>,
+    pub throttle_to_percent: Option<f64>,
+    pub reduce_by_percent: Option<f64>,
+    pub pro_account_equivalent_to_cover_over_plan: Option<f64>,
+    pub pro_accounts_to_cover_over_plan: Option<i64>,
+    pub projected_depletion_hours: Option<f64>,
+    pub projected_minimum_remaining_credits: f64,
+    pub forecast_burn_rate_credits_per_hour: Option<f64>,
+    pub scheduled_burn_rate_credits_per_hour: f64,
+    pub status: PaceStatus,
+    pub account_count: i64,
+    pub stale_account_count: i64,
+    pub inactive_account_count: i64,
+    pub confidence: Confidence,
+}
+
+/// `now`/`reset_at` are unix seconds; the sim works in ms internally. `working_days` is fixed to the
+/// linear schedule (v1). Returns `None` when no eligible, fresh, positive-capacity account remains.
+pub fn build_weekly_credit_pace(
+    accounts: &[PaceAccountInput],
+    now: i64,
+    refresh_interval_secs: i64,
+    smoothing_window_minutes: i64,
+) -> Option<WeeklyCreditPaceReport> {
+    let now_ms = now as f64 * 1000.0;
+    let freshness_cutoff = now - freshness_seconds(refresh_interval_secs) as i64;
+
+    let mut sim_inputs: Vec<SimAccount> = Vec::new();
+    let mut stale = 0i64;
+    let mut inactive = 0i64;
+    let mut rate_samples = 0i64;
+    let mut total_full = 0.0;
+    let mut total_actual_remaining = 0.0;
+    let mut total_smoothed_remaining = 0.0;
+    let mut total_expected_remaining = 0.0;
+    let mut scheduled_burn = 0.0;
+    let mut forecast_burn = 0.0;
+
+    for a in accounts {
+        // _weekly_timing: require positive capacity, a reset, positive window.
+        let (Some(reset_at), Some(window_minutes)) = (a.reset_at, a.window_minutes) else {
+            continue;
+        };
+        if a.full_credits <= 0.0 || window_minutes <= 0 {
+            continue;
+        }
+        if !a.status_eligible {
+            inactive += 1;
+            continue;
+        }
+        // freshness: latest secondary row must be newer than the cutoff.
+        let latest = a.secondary_history.last();
+        match latest {
+            Some(r) if r.recorded_at >= freshness_cutoff => {}
+            _ => {
+                stale += 1;
+                continue;
+            }
+        }
+
+        let full = a.full_credits;
+        let actual_remaining =
+            (full * (1.0 - a.used_percent.clamp(0.0, 100.0) / 100.0)).clamp(0.0, full);
+        let window_ms = window_minutes as f64 * 60_000.0;
+        let reset_at_ms = advance_reset_at(reset_at as f64 * 1000.0, window_ms, now_ms);
+
+        // linear schedule (working_days = None): used fraction = clamp(elapsed/window, 0, 1).
+        let window_start_ms = reset_at_ms - window_ms;
+        let elapsed_ms = (now_ms - window_start_ms).clamp(0.0, window_ms);
+        let used_schedule_fraction = if elapsed_ms <= 0.0 {
+            0.0
+        } else {
+            elapsed_ms / window_ms
+        };
+        let expected_remaining = full * (1.0 - used_schedule_fraction);
+
+        let account_rate = recent_burn_rate_credits_per_hour(&a.secondary_history, full, now);
+        let smoothed_remaining = smoothed_remaining_credits(
+            &a.secondary_history,
+            full,
+            actual_remaining,
+            now,
+            smoothing_window_minutes,
+        );
+
+        total_full += full;
+        total_actual_remaining += actual_remaining;
+        total_smoothed_remaining += smoothed_remaining;
+        total_expected_remaining += expected_remaining;
+        // working_days = None => working_schedule_share_per_hour = 3_600_000/window_ms.
+        scheduled_burn += full * (3_600_000.0 / window_ms);
+        if let Some(rate) = account_rate {
+            rate_samples += 1;
+            forecast_burn += rate;
+        }
+
+        sim_inputs.push(SimAccount {
+            full_credits: full,
+            balance_credits: actual_remaining,
+            reset_at_ms,
+            window_ms,
+        });
+    }
+
+    if sim_inputs.is_empty() || total_full <= 0.0 {
+        return None;
+    }
+
+    let actual_used_percent = 100.0 * (total_full - total_actual_remaining) / total_full;
+    let scheduled_used_percent = 100.0 * (total_full - total_expected_remaining) / total_full;
+    let delta_percent = actual_used_percent - scheduled_used_percent;
+    let schedule_gap_credits = (total_expected_remaining - total_actual_remaining).max(0.0);
+    let smoothed_used_percent = 100.0 * (total_full - total_smoothed_remaining) / total_full;
+    let smoothed_delta_percent = smoothed_used_percent - scheduled_used_percent;
+    let smoothed_schedule_gap_credits =
+        (total_expected_remaining - total_smoothed_remaining).max(0.0);
+
+    let forecast_rate = if rate_samples > 0 {
+        Some(forecast_burn)
+    } else {
+        None
+    };
+    let projection = project_weekly_pool(&sim_inputs, now_ms, forecast_rate);
+    let shortfall = projection.projected_shortfall_credits;
+
+    let pace_multiplier = match forecast_rate {
+        Some(r) if scheduled_burn > 0.0 => Some(r / scheduled_burn),
+        _ => None,
+    };
+    let pause_for_break_even_hours = match forecast_rate {
+        Some(r) if r > 0.0 && shortfall > 0.0 => Some(shortfall / r),
+        _ => None,
+    };
+    let throttle_to_percent = match forecast_rate {
+        Some(r) if r > 0.0 && scheduled_burn > 0.0 && shortfall > 0.0 => {
+            Some(((scheduled_burn / r) * 100.0).clamp(0.0, 100.0))
+        }
+        _ => None,
+    };
+    let reduce_by_percent = throttle_to_percent.map(|t| 100.0 - t);
+    let pro_equivalent = if shortfall > 0.0 {
+        Some(shortfall / PRO_WEEKLY_CAPACITY_CREDITS)
+    } else {
+        None
+    };
+    let pro_accounts = pro_equivalent.map(|e| e.ceil() as i64);
+
+    let status = if shortfall > 0.0 {
+        PaceStatus::Danger
+    } else if smoothed_delta_percent < -5.0 {
+        PaceStatus::Behind
+    } else if smoothed_delta_percent > 5.0 {
+        PaceStatus::Ahead
+    } else {
+        PaceStatus::OnTrack
+    };
+    let account_count = sim_inputs.len() as i64;
+    let confidence = if rate_samples >= account_count && stale == 0 {
+        Confidence::High
+    } else if rate_samples > 0 {
+        Confidence::Medium
+    } else {
+        Confidence::Low
+    };
+
+    Some(WeeklyCreditPaceReport {
+        total_full_credits: total_full,
+        total_actual_remaining_credits: total_actual_remaining,
+        total_expected_remaining_credits: total_expected_remaining,
+        actual_used_percent,
+        scheduled_used_percent,
+        delta_percent,
+        schedule_gap_credits,
+        smoothed_delta_percent,
+        smoothed_schedule_gap_credits,
+        projected_shortfall_credits: shortfall,
+        pause_for_break_even_hours,
+        pace_multiplier,
+        throttle_to_percent,
+        reduce_by_percent,
+        pro_account_equivalent_to_cover_over_plan: pro_equivalent,
+        pro_accounts_to_cover_over_plan: pro_accounts,
+        projected_depletion_hours: projection.projected_depletion_hours,
+        projected_minimum_remaining_credits: projection.projected_minimum_remaining_credits,
+        forecast_burn_rate_credits_per_hour: forecast_rate,
+        scheduled_burn_rate_credits_per_hour: scheduled_burn,
+        status,
+        account_count,
+        stale_account_count: stale,
+        inactive_account_count: inactive,
+        confidence,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,5 +638,108 @@ mod tests {
         assert_eq!(p.projected_shortfall_credits, 0.0);
         assert_eq!(p.projected_depletion_hours, None);
         assert_eq!(p.projected_minimum_remaining_credits, 2700.0);
+    }
+}
+
+#[cfg(test)]
+mod agg_tests {
+    use super::*;
+    use crate::depletion::UsageSample;
+
+    fn acct(
+        id: &str,
+        full: f64,
+        used: f64,
+        reset_at: i64,
+        rows: Vec<UsageSample>,
+    ) -> PaceAccountInput {
+        PaceAccountInput {
+            account_id: id.to_string(),
+            status_eligible: true,
+            full_credits: full,
+            used_percent: used,
+            reset_at: Some(reset_at),
+            window_minutes: Some(10_080),
+            secondary_history: rows,
+        }
+    }
+
+    fn row(used: f64, reset_at: i64, recorded_at: i64) -> UsageSample {
+        UsageSample {
+            used_percent: used,
+            reset_at: Some(reset_at),
+            window_minutes: Some(10_080),
+            recorded_at,
+        }
+    }
+
+    #[test]
+    fn none_when_no_eligible_fresh_accounts() {
+        let now = 1_000_000;
+        // stale: latest row far older than freshness cutoff
+        let a = acct(
+            "a",
+            7560.0,
+            50.0,
+            now + 3600,
+            vec![row(50.0, now + 3600, now - 100_000)],
+        );
+        assert!(build_weekly_credit_pace(&[a], now, 600, 30).is_none());
+    }
+
+    #[test]
+    fn ineligible_status_is_counted_inactive_not_paced() {
+        let now = 1_000_000;
+        let mut a = acct(
+            "a",
+            7560.0,
+            50.0,
+            now + 3600,
+            vec![row(40.0, now + 3600, now - 600), row(50.0, now + 3600, now)],
+        );
+        a.status_eligible = false;
+        assert!(build_weekly_credit_pace(&[a], now, 600, 30).is_none());
+    }
+
+    #[test]
+    fn happy_path_reports_used_percent_and_status() {
+        let now = 1_000_000;
+        let reset = now + 6 * 24 * 3600; // ~6 days out (near week start)
+        let a = acct(
+            "a",
+            10_000.0,
+            50.0,
+            reset,
+            vec![row(40.0, reset, now - 600), row(50.0, reset, now)],
+        );
+        let r = build_weekly_credit_pace(&[a], now, 600, 30).expect("report");
+        assert_eq!(r.account_count, 1);
+        assert_eq!(r.total_full_credits, 10_000.0);
+        // actual_used ~ 50% (remaining derived from used_percent)
+        assert!((r.actual_used_percent - 50.0).abs() < 1e-6);
+        // early in the window (reset ~6d out of 7d window) => scheduled_used_percent is low => actual > scheduled => "ahead" or "danger"
+        assert!(r.forecast_burn_rate_credits_per_hour.is_some());
+        assert!(matches!(
+            r.confidence,
+            Confidence::High | Confidence::Medium
+        ));
+    }
+
+    #[test]
+    fn pool_shortfall_sets_danger_status() {
+        let now = 1_000_000;
+        let reset = now + 7 * 24 * 3600; // full window ahead => low scheduled use
+                                         // steep burn: +40% over 600s on a small pool => huge credits/hr => shortfall
+        let a = acct(
+            "a",
+            1000.0,
+            90.0,
+            reset,
+            vec![row(50.0, reset, now - 600), row(90.0, reset, now)],
+        );
+        let r = build_weekly_credit_pace(&[a], now, 600, 30).expect("report");
+        assert!(r.projected_shortfall_credits > 0.0);
+        assert_eq!(r.status, PaceStatus::Danger);
+        assert!(r.pro_accounts_to_cover_over_plan.unwrap() >= 1);
     }
 }
