@@ -154,6 +154,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServeConfig::from_env()?;
     let store = Store::open(&config.db_path).await?;
+    // D18 Task 4: the bind-address-aware posture — resolved ONCE here, BEFORE `AppState`/`build_app`,
+    // using only already-available inputs (does any key exist yet; the configured bind; the
+    // explicit override env var). See `polyflare_server::posture` for the full decision table and
+    // rationale. A `StartupError` here (non-loopback bind, no keys, no override) propagates via `?`
+    // and the process exits without ever opening a listener — never a silent/anonymous non-local
+    // proxy.
+    let has_keys = store.api_keys().count().await? > 0;
+    let enforce_client_keys = polyflare_server::posture::resolve_proxy_enforcement(
+        has_keys,
+        &config.bind_addr,
+        config.allow_unauthenticated_remote,
+    )?;
     let cipher = TokenCipher::load_or_create(&config.key_path)?;
     // M5a: `POLYFLARE_WS_UPSTREAM` (default OFF) selects `CodexWsExecutor` over the WS transport
     // instead of today's HTTP-SSE `CodexExecutor` — see `build_codex_executor`'s doc.
@@ -211,6 +223,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         starvation_wait_budget: config.starvation_wait_budget,
         starvation_heartbeat: config.starvation_heartbeat,
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
+        enforce_client_keys,
     });
     // Runtime usage-refresh loop: keeps each Codex account's rate-limit windows (5h + weekly) and
     // routing gate live, instead of the frozen numbers the importer left.

@@ -82,6 +82,17 @@ impl ApiKeyRepo {
         Ok(row)
     }
 
+    /// D18 Task 4: cheap existence check for the startup bind-address-aware posture decision
+    /// (`crate posture::resolve_proxy_enforcement` in `polyflare-server`) — "does at least one
+    /// `api_keys` row exist, regardless of `enabled`?" A `SELECT COUNT(*)`, not [`Self::list`]:
+    /// the posture check needs only the count, never row bodies.
+    pub async fn count(&self) -> Result<i64, StoreError> {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM api_keys")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
     /// All keys, newest first. Never carries a raw key or the hash — display-safe by construction
     /// (see [`ApiKeyRow`]).
     pub async fn list(&self) -> Result<Vec<ApiKeyRow>, StoreError> {
@@ -128,6 +139,35 @@ mod tests {
         let s = Store::open(&dir.path().join("s.db")).await.unwrap();
         std::mem::forget(dir);
         s
+    }
+
+    /// D18 Task 4: `count()` backs the startup bind-address-aware posture decision ("does any
+    /// client API key exist at all, regardless of `enabled`?") — a `COUNT(*)`, not `list()`, since
+    /// the posture check needs only the existence fact, not any row body.
+    #[tokio::test]
+    async fn count_is_zero_then_reflects_inserts_regardless_of_enabled() {
+        let s = store().await;
+        let repo = s.api_keys();
+        assert_eq!(repo.count().await.unwrap(), 0, "empty table ⇒ 0");
+
+        repo.create("id1", "hash1", "sk-pf-abc123456", None, 100)
+            .await
+            .unwrap();
+        assert_eq!(repo.count().await.unwrap(), 1);
+
+        repo.create("id2", "hash2", "sk-pf-def987654", None, 200)
+            .await
+            .unwrap();
+        assert_eq!(repo.count().await.unwrap(), 2);
+
+        // A revoked key still counts — "any key exists" is about the posture decision (has the
+        // operator ever opted into key-based auth?), not about how many are currently usable.
+        repo.set_enabled("id1", false).await.unwrap();
+        assert_eq!(
+            repo.count().await.unwrap(),
+            2,
+            "count is existence, not enabled-count"
+        );
     }
 
     #[tokio::test]

@@ -130,6 +130,7 @@ async fn spawn(upstream_url: String) -> (String, Arc<AppState>) {
         Duration::from_secs(30),
     ));
     let state = Arc::new(AppState {
+        enforce_client_keys: false,
         codex_executor: Arc::new(CodexExecutor::new().unwrap()),
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),

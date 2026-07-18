@@ -102,6 +102,7 @@ async fn spawn(store: Store, upstream: String) -> String {
     pool_selectors.insert("p1".to_string(), Arc::new(UsageWeighted));
 
     let state = Arc::new(AppState {
+        enforce_client_keys: false,
         codex_executor: Arc::new(CodexExecutor::new().unwrap()) as Arc<dyn Executor>,
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap())
             as Arc<dyn Executor>,

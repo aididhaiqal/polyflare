@@ -62,6 +62,12 @@ pub struct ServeConfig {
     /// [`starvation_heartbeat_secs_from_env`]). Resolved ONCE here, clamped against the ALREADY-
     /// resolved `starvation_wait_budget` above.
     pub starvation_heartbeat: Duration,
+    /// D18 Task 4: `POLYFLARE_ALLOW_UNAUTHENTICATED_REMOTE=1` — the ONLY way to boot the proxy
+    /// surface unauthenticated on a non-loopback bind with no client API key configured (see
+    /// `crate::posture::resolve_proxy_enforcement`). Fail-safe-default: any value other than
+    /// exactly `"1"` is treated as unset (mirrors `live_logs`/`ws_upstream` above) — a typo here
+    /// must never accidentally grant the dangerous path.
+    pub allow_unauthenticated_remote: bool,
 }
 
 /// TA6(b) Task 5: the one capability name resolved today. A pool tagged with this capability (via
@@ -329,6 +335,14 @@ impl ServeConfig {
             std::env::var("POLYFLARE_WS_UPSTREAM").as_deref(),
             Ok("1") | Ok("true")
         );
+        // D18 Task 4: same fail-safe-default convention as `live_logs`/`ws_upstream` above — any
+        // unset/empty/unrecognized value is treated as OFF (never a startup error on its own; the
+        // consequence of leaving it off on a non-loopback bind with no keys is a REFUSE-TO-START
+        // from `crate::posture::resolve_proxy_enforcement`, resolved further down in `serve()`).
+        let allow_unauthenticated_remote = matches!(
+            std::env::var("POLYFLARE_ALLOW_UNAUTHENTICATED_REMOTE").as_deref(),
+            Ok("1")
+        );
         let max_account_attempts = max_account_attempts_from_env();
         let starvation_wait_budget_secs = starvation_wait_budget_secs_from_env();
         let starvation_heartbeat_secs =
@@ -352,6 +366,7 @@ impl ServeConfig {
             max_account_attempts,
             starvation_wait_budget,
             starvation_heartbeat,
+            allow_unauthenticated_remote,
         })
     }
 }

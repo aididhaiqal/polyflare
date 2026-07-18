@@ -88,6 +88,7 @@ fn build_state(
         Duration::from_secs(30),
     ));
     Arc::new(AppState {
+        enforce_client_keys: false,
         codex_executor: Arc::new(polyflare_codex::CodexExecutor::new().unwrap()),
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),

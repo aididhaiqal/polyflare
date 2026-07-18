@@ -71,6 +71,7 @@ async fn spawn_polyflare(store: Store, upstream: String) -> String {
         Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap());
 
     let state = Arc::new(AppState {
+        enforce_client_keys: false,
         codex_executor,
         anthropic_executor,
         selector: Arc::new(CapacityWeighted),
