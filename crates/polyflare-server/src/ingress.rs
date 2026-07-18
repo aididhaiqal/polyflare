@@ -1,6 +1,7 @@
 //! Ingress: derive continuity ctx → prepare → ownership pre-filter → execute under the watchdog →
 //! relay. Client-facing errors carry generic bodies (never a token, URL, or internal Display).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,20 +15,22 @@ use polyflare_codex::oauth::{classify_failure, should_refresh, token_exp, OAuthE
 use polyflare_core::{
     Account, AccountId, AccountSnapshot, Continuity, ContinuityDirective, NoopContinuity, Prepared,
     PreparedRequest, Provider, RecoveryPlan, RequestCtx, ResponseStream, SelectionCtx, Selector,
-    SessionKey, Tier, Translator,
+    SessionKey, Tier, Translator, WatchdogArm,
 };
 use polyflare_store::{PlainTokens, RequestLogRecord, RequestLogRepo};
 
 use crate::alias::{self, ModelAlias};
 use crate::app::AppState;
 use crate::config;
+use crate::failover::{exclude_tried, failover_verdict, FailoverVerdict};
 use crate::fingerprint_capture::{append_fingerprint_capture, capture_request_fingerprint};
 use crate::observability::RequestLog;
 use crate::session_key::parse_inbound;
 use crate::snapshot::filter_by_provider_and_pool;
 use crate::translate_stream::wrap_translating_stream;
 use crate::watchdog::{
-    apply_ownership, execute_recovery, execute_with_watchdog, signal_client_stream, RouteDecision,
+    apply_ownership, execute_recovery, execute_recovery_tracked, execute_with_watchdog,
+    execute_with_watchdog_tracked, signal_client_stream, CommitWitness, RouteDecision,
     WatchdogError,
 };
 
@@ -43,6 +46,14 @@ fn unix_now() -> i64 {
 const PERSIST_MAX_ATTEMPTS: u32 = 3;
 /// Fixed backoff between persist retries (small — the write is on the hot lock).
 const PERSIST_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+
+/// B4 Task 4: total upstream attempts allowed for one client request (the first pick + bounded
+/// failover) — INCLUSIVE, i.e. `1` reproduces today's one-shot behavior exactly (the plan's
+/// clean-rollback lever; see `responses_handler_impl_for_test`'s doc + `tests/failover_loop.rs`'s
+/// `(g)` regression). Task 5 will make this configurable via `POLYFLARE_MAX_ACCOUNT_ATTEMPTS` and
+/// pass the resolved value through instead of this const; for now this constant IS the default it
+/// will read (`docs/superpowers/plans/2026-07-18-phase-b-failover.md`, Global Constraints).
+const DEFAULT_MAX_ACCOUNT_ATTEMPTS: u32 = 3;
 
 /// Map a reasoning-effort string to a routing `Tier` (the subagent-tier signal the
 /// `cache_affinity_tier` strategy reads). `minimal`/`low` → Low, `medium` → Medium, `high` → High.
@@ -525,6 +536,134 @@ async fn reroute_cyber_rejection(
     }
 }
 
+/// B4 Task 4 (THE CRUX): the bounded cross-account failover loop. Generalizes
+/// `reroute_cyber_rejection`'s single reselect→`execute_recovery`→relay step into a bounded loop,
+/// composed from Tasks 1-3: [`failover_verdict`] (T1, the retryable-vs-terminal classifier),
+/// [`exclude_tried`] (T2, the order-preserving tried-account pool filter), and [`CommitWitness`]
+/// (T3, the commit-barrier signal).
+///
+/// Called ONLY for a request whose FIRST attempt (made by the caller, `responses_handler_impl_with_max_attempts`'s
+/// `RouteDecision::Route` arm, via `execute_with_watchdog_tracked`) already failed with
+/// `first_err`/`committed` AND was anchorless (`WatchdogArm::Disarmed` — see that call site's
+/// CONTINUITY OWNERSHIP gate; a live-anchor turn never reaches this function at all). `resend_req`
+/// is the ORIGINAL (already anchorless, hence self-sufficient) request body, reused unchanged on
+/// every reselected account — mirroring `reroute_cyber_rejection`'s `anchorless_req` role, and the
+/// established "reselect-after-failure ⇒ `execute_recovery`" idiom this codebase already uses for
+/// both `reroute_cyber_rejection` and `RouteDecision::Recover`'s `ResendFull` arm (never
+/// `execute_with_watchdog`, which is for a FIRST attempt only).
+///
+/// # Bookkeeping order (load-bearing — mirrors the plan's literal sequencing)
+/// `tried` starts EMPTY. Each loop iteration evaluates `failover_verdict` for the account that
+/// JUST failed using the `tried` set as it stood BEFORE that failure (i.e. `attempts_left` counts
+/// "attempts already spent (`tried.len()`) + this one" against `max_attempts`); only on a
+/// `FailoverNext` verdict is the failed account inserted into `tried` and excluded from the next
+/// pick. This is what makes `max_attempts == 1` collapse to zero loop iterations (`0 + 1 < 1` is
+/// false) — the one-shot regression proof — and what makes `max_attempts == 3` surface after
+/// EXACTLY 3 total upstream attempts, not fewer or more.
+///
+/// # Security floor (inviolable — see the plan's Global Constraints)
+/// `sel_ctx` is the SAME `SelectionCtx` the first attempt used, passed by shared reference and
+/// never mutated: `require_security_work_authorized` is never reset to `false` here. Every reselect
+/// (`exclude_tried` + `selector.pick`) re-applies that same flag via the selector's existing TA6
+/// hard pre-filter (`select.rs`). If the filtered reselect ever returns `None` while the flag is
+/// set, this returns [`no_authorized_account_for_security_work`] — the distinct security 503 —
+/// NEVER an unfiltered retry (codex-lb's `retry.py:698-717` degrade is explicitly NOT ported here).
+/// If the flag is unset, ordinary pool exhaustion returns [`no_eligible`] (today's 503), matching
+/// `RouteDecision::Recover`'s existing exhaustion response for the same "selector picked nothing"
+/// situation.
+///
+/// # Commit barrier (inviolable — see the plan's Global Constraints)
+/// Every `Err` this function's own `execute_recovery_tracked` calls can produce is, BY
+/// CONSTRUCTION, always pre-relay (see [`CommitWitness`]'s doc: these functions only ever return
+/// `Err` before `wrap_stream` runs) — so `commit.is_committed()` reads `false` on every iteration of
+/// THIS loop, same as the caller's own first-attempt `committed` this function is seeded with. This
+/// is not a coincidence to special-case away: it is the structural reason a double-relay is
+/// impossible here at all — once ANY attempt (the caller's first, or one of this loop's) returns
+/// `Ok(stream)`, the function returns immediately and no further attempt is ever made. `committed`
+/// is still threaded and checked explicitly (never hard-coded `false`) so `failover_verdict`'s
+/// contract stays honest and any FUTURE change to the watchdog's `Err` shape can't silently
+/// reintroduce a double-relay risk without this loop's own logic changing to match.
+#[allow(clippy::too_many_arguments)]
+async fn run_failover_loop(
+    state: &AppState,
+    first_failed_id: AccountId,
+    first_err: WatchdogError,
+    first_committed: bool,
+    resend_req: PreparedRequest,
+    snapshots: &[AccountSnapshot],
+    selector: &dyn Selector,
+    sel_ctx: &SelectionCtx,
+    ctx: RequestCtx,
+    session_key: Option<SessionKey>,
+    now: i64,
+    max_attempts: u32,
+    outcome: &mut RouteOutcome,
+) -> Response {
+    let mut tried: HashSet<AccountId> = HashSet::new();
+    let mut failed_id = first_failed_id;
+    let mut err = first_err;
+    let mut committed = first_committed;
+
+    loop {
+        // `tried.len()` does NOT yet include `failed_id` — see the doc's "Bookkeeping order".
+        let attempts_left = (tried.len() as u32) + 1 < max_attempts;
+        if failover_verdict(&err, attempts_left, committed) == FailoverVerdict::Surface {
+            return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
+        }
+        // FailoverNext: this account is excluded from every future pick this request (T2).
+        tried.insert(failed_id);
+
+        let candidates = exclude_tried(snapshots, &tried);
+        let fresh = match selector.pick(&candidates, sel_ctx) {
+            Some(id) => id,
+            None => {
+                // SECURITY FLOOR: the flag is never reset — a filtered exhaustion is the distinct
+                // security 503, never an unfiltered fallback. Otherwise, ordinary exhaustion
+                // (e.g. a single-account pool whose only account just failed) surfaces exactly
+                // like the immediate-Surface case: today's generic 502 — NOT `no_eligible()`'s
+                // 503, which is reserved for "the selector found nothing BEFORE any attempt was
+                // ever made" (`RouteDecision::NoEligibleAccount` / `RouteDecision::Recover`'s own
+                // exhaustion). Regression-locked by the wedge suite `failure_routing.rs` (a
+                // single-account pool's retryable failure has always surfaced as 502).
+                return if sel_ctx.require_security_work_authorized {
+                    no_authorized_account_for_security_work()
+                } else {
+                    (StatusCode::BAD_GATEWAY, "upstream error").into_response()
+                };
+            }
+        };
+        state.runtime.record_selected(&fresh, now);
+        outcome.account_id = Some(fresh.as_str().to_string());
+        let (account, provider) = match resolve_core_account(state, &fresh, now).await {
+            Ok(a) => a,
+            Err(r) => return r,
+        };
+        let health_id = fresh.clone(); // `fresh` is moved into the executor below.
+        let commit = CommitWitness::new();
+        match execute_recovery_tracked(
+            state.executor_for(provider).as_ref(),
+            state.continuity.clone(),
+            resend_req.clone(),
+            &account,
+            fresh,
+            ctx.clone(),
+            session_key.clone(),
+            state.runtime.clone(),
+            commit.clone(),
+        )
+        .await
+        {
+            Ok(stream) => return stream_response(stream),
+            Err(e2) => {
+                record_failure(state, &health_id, &e2, unix_now()).await;
+                failed_id = health_id;
+                err = e2;
+                committed = commit.is_committed();
+            }
+        }
+    }
+}
+
 /// The bare `/responses` ingress entrypoint: selects over ALL Codex accounts (no pool filter).
 /// Takes the RAW request bytes (not the `Json` extractor) so the native path can forward them
 /// upstream verbatim — no parse→re-serialize round-trip (see `PreparedRequest::raw_body`).
@@ -633,6 +772,42 @@ async fn responses_handler_impl(
     headers: HeaderMap,
     raw: Bytes,
 ) -> (Response, RouteOutcome) {
+    responses_handler_impl_with_max_attempts(
+        state,
+        pool,
+        headers,
+        raw,
+        DEFAULT_MAX_ACCOUNT_ATTEMPTS,
+    )
+    .await
+}
+
+/// B4 Task 4 test seam: drives the SAME real ingress logic `responses_handler_impl` does, but with
+/// an explicit `max_attempts` for the bounded failover loop — the production HTTP entrypoints
+/// (via `responses_handler_impl` above) always use [`DEFAULT_MAX_ACCOUNT_ATTEMPTS`]. Exists so
+/// integration tests can exercise a non-default bound (most importantly `max_attempts == 1`, the
+/// "reproduces today's one-shot behavior EXACTLY" regression proof) without needing Task 5's
+/// `POLYFLARE_MAX_ACCOUNT_ATTEMPTS` config to exist yet. Returns only the `Response` — `RouteOutcome`
+/// is a private, logging-only type and can't cross the crate boundary in a `pub` signature.
+pub async fn responses_handler_impl_for_test(
+    state: Arc<AppState>,
+    pool: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+    max_attempts: u32,
+) -> Response {
+    responses_handler_impl_with_max_attempts(state, pool.as_deref(), headers, body, max_attempts)
+        .await
+        .0
+}
+
+async fn responses_handler_impl_with_max_attempts(
+    state: Arc<AppState>,
+    pool: Option<&str>,
+    headers: HeaderMap,
+    raw: Bytes,
+    max_attempts: u32,
+) -> (Response, RouteOutcome) {
     // Parse ONCE — but only the scalars + the `input` SHAPE, NOT the deep conversation tree. The
     // wire bytes are forwarded verbatim (see `PreparedRequest::raw_body`), so `body` stays `None`
     // here; everything the request path needs (model, tier, continuity ctx, input count) comes off
@@ -735,14 +910,32 @@ async fn responses_handler_impl(
                 // reselect+resend (`reroute_cyber_rejection`) without re-preparing the request.
                 let recovery_for_cyber = prepared.directive.recovery.clone();
                 let ctx_for_cyber = ctx.clone();
-                match execute_with_watchdog(
+                // B4 Task 4 — CONTINUITY OWNERSHIP gate (see the plan's Global Constraints): the
+                // bounded cross-account failover loop (`run_failover_loop`) may only fan out an
+                // ANCHORLESS attempt onto a NEW account. A live anchor (this turn is
+                // `WatchdogArm::Armed`, i.e. it carries `previous_response_id`) must NEVER be
+                // resent to a different account on a general (non-cyber) failure — that would
+                // re-home the conversation's ownership off the back of an ordinary retryable
+                // failure instead of the reviewed, capability-scoped `reroute_cyber_rejection`
+                // path, and risks re-opening the wedge. So an Armed turn's failure here surfaces
+                // exactly as before this task (today's 502) — see `tests/failover_loop.rs`'s `(e)`.
+                // A Disarmed turn's own request body carries no anchor at all, so it is already a
+                // self-sufficient resend for any account: clone it now, before `prepared` moves
+                // into the executor below, in case a failure needs to fail over.
+                let resend_req_for_loop = match prepared.directive.watchdog {
+                    WatchdogArm::Disarmed => Some(prepared.req.clone()),
+                    WatchdogArm::Armed { .. } => None,
+                };
+                let commit = CommitWitness::new();
+                match execute_with_watchdog_tracked(
                     state.executor_for(provider).as_ref(),
                     state.continuity.clone(),
                     prepared,
                     &account,
                     id,
-                    ctx,
+                    ctx.clone(),
                     state.runtime.clone(),
+                    commit.clone(),
                 )
                 .await
                 {
@@ -750,6 +943,9 @@ async fn responses_handler_impl(
                     Err(WatchdogError::CapabilityRejection { .. }) => {
                         // NOT an account-health signal (see `record_failure`'s doc): a capability
                         // rejection says nothing about the owner's health, so no writeback here.
+                        // Composes with (does NOT conflict with) B4's general failover loop: a
+                        // `CapabilityRejection` always routes here, never into
+                        // `run_failover_loop`, regardless of `resend_req_for_loop`.
                         reroute_cyber_rejection(
                             &state,
                             recovery_for_cyber,
@@ -765,7 +961,29 @@ async fn responses_handler_impl(
                     }
                     Err(e) => {
                         record_failure(&state, &health_id, &e, unix_now()).await;
-                        (StatusCode::BAD_GATEWAY, "upstream error").into_response()
+                        match resend_req_for_loop {
+                            // Anchorless: eligible for the bounded cross-account failover loop.
+                            Some(resend_req) => {
+                                run_failover_loop(
+                                    &state,
+                                    health_id,
+                                    e,
+                                    commit.is_committed(),
+                                    resend_req,
+                                    &snapshots,
+                                    selector.as_ref(),
+                                    &sel_ctx,
+                                    ctx,
+                                    session_key.clone(),
+                                    now,
+                                    max_attempts,
+                                    &mut outcome,
+                                )
+                                .await
+                            }
+                            // A live-anchor pinned turn: surfaces exactly as before this task.
+                            None => (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
+                        }
                     }
                 }
             }
