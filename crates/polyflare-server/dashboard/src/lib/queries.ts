@@ -14,6 +14,8 @@ import {
   type PoolView,
   type RequestsQueryParams,
   type RequestsView,
+  type SessionsQueryParams,
+  type SessionsView,
   type TrendsView,
 } from "./api";
 
@@ -30,6 +32,7 @@ export const queryKeys = {
   accountTrends: (id: string) => ["accounts", id, "trends"] as const,
   pools: ["pools"] as const,
   requests: (params: RequestsQueryParams) => ["requests", params] as const,
+  sessions: (params: SessionsQueryParams) => ["sessions", params] as const,
   capabilities: ["capabilities"] as const,
 };
 
@@ -118,6 +121,31 @@ export function useRequests(params: RequestsQueryParams = {}) {
   return useQuery<RequestsView>({
     queryKey: queryKeys.requests(params),
     queryFn: () => api.requests(buildRequestsQueryString(params)),
+    refetchInterval: LIST_REFETCH_MS,
+    staleTime: LIST_REFETCH_MS,
+  });
+}
+
+/** Serializes `SessionsQuery`'s pagination fields into a `?`-prefixed query string, omitting any
+ * field left `undefined`. Field names/order match `read_api.rs::SessionsQuery` (`limit,offset`). */
+function buildSessionsQueryString(params: SessionsQueryParams): string {
+  const sp = new URLSearchParams();
+  const order: Array<keyof SessionsQueryParams> = ["limit", "offset"];
+  for (const key of order) {
+    const value = params[key];
+    if (value === undefined) continue;
+    sp.set(key, String(value));
+  }
+  const qs = sp.toString();
+  return qs ? `?${qs}` : "";
+}
+
+/** `GET /api/sessions` — the session→account affinity list. A list view, so it polls on the same
+ * 30s cadence as the accounts/pools/requests lists (detail views don't poll). */
+export function useSessions(params: SessionsQueryParams = {}) {
+  return useQuery<SessionsView>({
+    queryKey: queryKeys.sessions(params),
+    queryFn: () => api.sessions(buildSessionsQueryString(params)),
     refetchInterval: LIST_REFETCH_MS,
     staleTime: LIST_REFETCH_MS,
   });

@@ -24,6 +24,10 @@
 // "Force probe", `Flame` is "Limit warm-up" (thematically apt for a PolyFlare warm-up affordance).
 // All four are rendered only inside disabled/non-functional controls — see task-7-report.md.
 //
+// Link2 is the TA6(c) addition for the Sessions page's sidebar nav entry — the page shows which
+// account each conversation session is stuck/linked to (session→account affinity), so a link glyph
+// is the apt lucide choice; same no-emoji rationale as every other icon here. See ta6c report.
+//
 // Play/ArrowDownToLine/EyeOff are Task 10 additions for the Live Logs console
 // (`live-logs.html`): `Play` is the Resume affordance (paired with the existing `Pause`), the
 // mockup's own "auto-scroll" glyph isn't a real icon so `ArrowDownToLine` (scroll-to-bottom) is
@@ -45,6 +49,7 @@ export {
   Flame,
   Key,
   Layers,
+  Link2,
   List,
   LayoutGrid,
   Lock,
