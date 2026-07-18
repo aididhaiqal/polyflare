@@ -231,7 +231,38 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/responses", post(responses_handler))
         .route("/v1/messages", post(messages_handler))
         .route("/{pool}/responses", post(pooled_responses_handler))
-        .route("/{pool}/v1/messages", post(pooled_messages_handler));
+        .route("/{pool}/v1/messages", post(pooled_messages_handler))
+        // D17: the minimal codex CONTROL-endpoint surface (thin generic forwards — see
+        // `crate::control`). UNPOOLED (no `/{pool}/…` variant exists today, matching the plan's
+        // scope) and, like the routes above, gated by `require_client_key` when
+        // `enforce_client_keys` — including the GETs (`jwks`, `thread/goal/get`), which is a
+        // deliberate parity choice with codex-lb (not left open like `/models`). None of these
+        // literal first-segments (`thread`, `agent-identities`, `wham`, `memories`) can ever be
+        // captured by the `{pool}` param above: matchit prefers a static segment over a param one
+        // at the SAME position, and none of these paths' second segment is `responses` or
+        // `v1/messages` anyway, so there is no possible collision with `/{pool}/responses` /
+        // `/{pool}/v1/messages` either.
+        .route(
+            "/thread/goal/set",
+            post(crate::control::thread_goal_set_handler),
+        )
+        .route(
+            "/thread/goal/clear",
+            post(crate::control::thread_goal_clear_handler),
+        )
+        .route(
+            "/thread/goal/get",
+            get(crate::control::thread_goal_get_handler),
+        )
+        .route("/agent-identities/jwks", get(crate::control::jwks_handler))
+        .route(
+            "/wham/agent-identities/jwks",
+            get(crate::control::wham_jwks_handler),
+        )
+        .route(
+            "/memories/trace_summarize",
+            post(crate::control::trace_summarize_handler),
+        );
     if state.enforce_client_keys {
         proxy = proxy.route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

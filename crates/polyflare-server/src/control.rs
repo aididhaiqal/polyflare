@@ -11,12 +11,24 @@
 //! this into a hard pin-or-fail is the primary risk the D17 scoping study flagged (Global
 //! Constraints: "SOFT affinity — do NOT over-bind (inviolable for correctness)").
 
-use axum::http::HeaderMap;
-use axum::response::Response;
+use std::sync::Arc;
+use std::time::Instant;
+
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use reqwest::Method;
+
 use polyflare_core::{Account, AccountId, Provider, SelectionCtx};
 
 use crate::app::AppState;
-use crate::ingress::{internal_error, no_eligible, resolve_core_account};
+use crate::ingress::{
+    forward_headers_from_inbound, internal_error, no_eligible, resolve_core_account,
+    spawn_persist_request_log,
+};
+use crate::observability::RequestLog;
 use crate::session_key::header_session_key;
 use crate::snapshot::filter_by_provider_and_pool;
 
@@ -118,6 +130,227 @@ pub async fn resolve_control_account(
 
     let (account, _provider) = resolve_core_account(state, &picked, now).await?;
     Ok((account, picked))
+}
+
+// -------------------------------------------------------------------------------------------
+// D17 Task 3: the route handlers. Each is a thin `pub async fn` extractor wrapper (mirroring
+// `crate::ingress::responses_handler`/`pooled_responses_handler`'s two-tier shape) that forwards
+// straight into [`control_route`] — the shared glue: `resolve_control_account` (Task 2) →
+// `polyflare_codex::control_forward` (Task 1) → build the client-facing `Response` from the
+// filtered `ControlResponse` → write ONE content-free `request_log` row.
+//
+// The body is threaded through OPAQUE — `Option<Bytes>`, never parsed/re-serialized (the plan's
+// "treat as generic forwards... do NOT parse the goal payload" instruction). It flows: axum's
+// `Bytes` extractor → `control_route`'s `body` parameter → `polyflare_codex::control_forward`'s
+// `body` parameter → the outbound `reqwest::RequestBuilder::body()` call — never touched, matched,
+// or logged anywhere in between (see `control_forward.rs`'s own content-safety doc for the
+// upstream half of this chain; `control_route` below is the downstream half: the ONLY thing it
+// derives from the body is its byte length is never even read — `Bytes` is passed by value).
+// -------------------------------------------------------------------------------------------
+
+/// The response-header allow-set filtering is Task 1's job (`control_forward`'s
+/// `ALLOWED_RESPONSE_HEADERS`) — this fn just re-materializes an axum `Response` from the already
+/// -filtered `(status, headers, body)` triple, skipping any header whose name/value fails to
+/// parse (defensive; Task 1's filtered set is expected to already be well-formed ASCII).
+fn control_response_from(cr: polyflare_codex::ControlResponse) -> Response {
+    let status = StatusCode::from_u16(cr.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(status);
+    for (name, value) in &cr.headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+        .body(Body::from(cr.body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Shared control-route glue: resolve the account (Task 2's soft affinity) → forward (Task 1's
+/// unary primitive) → relay the response → persist ONE content-free `request_log` row, mirroring
+/// `crate::ingress::responses_route`'s wrapper shape exactly (grab the log repo/bus, run the
+/// logic, build+emit+persist the row, return the response).
+///
+/// `log_label` is the content-free `request_log` "kind" discriminator (`"codex_control_<path>"`,
+/// per the plan's Global Constraints) written into the row's `path` field — the existing schema
+/// has no separate `request_kind` column (see `polyflare_store::RequestLogRecord`), so `path` is
+/// the field that already plays that role for `/responses`/`/v1/messages`'s own rows.
+/// `forward_path` is the SEPARATE literal handed to `control_forward`/`control_url` (e.g.
+/// `"thread/goal/set"`, no `"codex_control_"` prefix) — the actual upstream path segment.
+///
+/// A `resolve_control_account` failure (503, no eligible account) or a `control_forward` transport
+/// failure (mapped to 502 here) both still write a content-free log row — mirroring
+/// `responses_route`, which logs every outcome (including its own early-exit 503s) via
+/// `responses_handler_impl`'s `RouteOutcome`, never only the success path.
+async fn control_route(
+    state: Arc<AppState>,
+    log_label: &'static str,
+    forward_path: &'static str,
+    forward_method: Method,
+    method_label: &'static str,
+    headers: HeaderMap,
+    body: Option<Bytes>,
+) -> Response {
+    let start = Instant::now();
+    // Grab the log repo/bus BEFORE `&state` is borrowed further below — cheap `Arc`/pool clones,
+    // matching `responses_route`'s "grab before the state borrow" ordering.
+    let log_repo = state.store.request_log();
+    let log_bus = state.log_bus.clone();
+
+    // "Dumb executor, smart ingress": the SAME hop-by-hop drop-list `/responses` uses for its own
+    // native forward-headers path (`crate::ingress::forward_headers_from_inbound`) — control
+    // requests get identical treatment, not a second, independently-maintained filter.
+    let forward_headers = forward_headers_from_inbound(&headers);
+
+    let (response, account_id) = match resolve_control_account(&state, &headers).await {
+        Err(resp) => (resp, None),
+        Ok((account, account_id)) => {
+            let outcome = polyflare_codex::control_forward(
+                &state.control_client,
+                &account,
+                forward_path,
+                forward_method,
+                &forward_headers,
+                body,
+            )
+            .await;
+            let resp = match outcome {
+                Ok(cr) => control_response_from(cr),
+                Err(_e) => {
+                    (StatusCode::BAD_GATEWAY, "control upstream forward failed").into_response()
+                }
+            };
+            (resp, Some(account_id))
+        }
+    };
+
+    let log = RequestLog {
+        method: method_label,
+        path: log_label,
+        provider: Provider::Codex,
+        aliased: false,
+        status: response.status(),
+        duration_ms: start.elapsed().as_millis() as u64,
+        account_id: account_id.map(|id| id.to_string()),
+        model: None,
+        reasoning_effort: None,
+        service_tier: None,
+        transport: Some("http".to_string()),
+        ttft_ms: None,
+        total_tokens: None,
+        cached_tokens: None,
+    };
+    log.emit();
+    log_bus.publish(log.to_log_event());
+    spawn_persist_request_log(log_repo, log.record(unix_now()));
+
+    response
+}
+
+/// `POST /thread/goal/set` — forwards the body verbatim; PolyFlare does not parse the goal
+/// payload (unlike codex-lb's payload rebuild).
+pub async fn thread_goal_set_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    control_route(
+        state,
+        "codex_control_thread/goal/set",
+        "thread/goal/set",
+        Method::POST,
+        "POST",
+        headers,
+        Some(body),
+    )
+    .await
+}
+
+/// `POST /thread/goal/clear`.
+pub async fn thread_goal_clear_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    control_route(
+        state,
+        "codex_control_thread/goal/clear",
+        "thread/goal/clear",
+        Method::POST,
+        "POST",
+        headers,
+        Some(body),
+    )
+    .await
+}
+
+/// `GET /thread/goal/get` — no body.
+pub async fn thread_goal_get_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    control_route(
+        state,
+        "codex_control_thread/goal/get",
+        "thread/goal/get",
+        Method::GET,
+        "GET",
+        headers,
+        None,
+    )
+    .await
+}
+
+/// `GET /agent-identities/jwks`.
+pub async fn jwks_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    control_route(
+        state,
+        "codex_control_agent-identities/jwks",
+        "agent-identities/jwks",
+        Method::GET,
+        "GET",
+        headers,
+        None,
+    )
+    .await
+}
+
+/// `GET /wham/agent-identities/jwks` — the `wham/`-prefixed variant, joined WITHOUT a `/codex/`
+/// segment (see `polyflare_codex::control_url`).
+pub async fn wham_jwks_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    control_route(
+        state,
+        "codex_control_wham/agent-identities/jwks",
+        "wham/agent-identities/jwks",
+        Method::GET,
+        "GET",
+        headers,
+        None,
+    )
+    .await
+}
+
+/// `POST /memories/trace_summarize` — forwards the body verbatim.
+pub async fn trace_summarize_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    control_route(
+        state,
+        "codex_control_memories/trace_summarize",
+        "memories/trace_summarize",
+        Method::POST,
+        "POST",
+        headers,
+        Some(body),
+    )
+    .await
 }
 
 #[cfg(test)]
