@@ -10,11 +10,14 @@
 //! - a mid-stream failure AFTER >= 1 relayed byte reports `committed == true`;
 //! - a clean completion is unaffected (still observes/succeeds; the flag doesn't interfere).
 //!
-//! `execute_with_watchdog`/`execute_recovery` (the functions every existing caller — ingress.rs's
-//! three call sites, and the 5 wedge suites `wedge_regression`/`watchdog_race`/
-//! `no_anchor_failover`/`signal_client`/`failure_routing` — use) are UNTOUCHED in shape and
-//! behavior; this suite exclusively drives the new `_tracked` siblings, so those 5 suites needed
-//! zero edits and stay green by construction (their call sites never changed).
+//! `execute_with_watchdog`/`execute_recovery` (the convenience delegators the 5 wedge suites
+//! `wedge_regression`/`watchdog_race`/`no_anchor_failover`/`signal_client`/`failure_routing`, plus
+//! `cyber_policy_detection.rs`, call directly) are UNTOUCHED in shape and behavior — they still
+//! delegate to the `_tracked` siblings internally (now always passing `None` for C9 Task 2's
+//! `InFlightGuard` too) — so those suites needed zero edits and stay green by construction (their
+//! call sites never changed). ingress.rs itself, as of C9 Task 2, calls the `_tracked` siblings
+//! directly at every streaming selection site (to thread an acquired lease into the returned
+//! stream) — see `watchdog.rs`'s and `ingress.rs`'s own docs for that threading.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -172,6 +175,7 @@ async fn executor_err_before_any_stream_is_not_committed() {
         Default::default(),
         Duration::ZERO, // idle_timeout: disabled, not under test here
         commit.clone(),
+        None, // C9 Task 2: no in-flight lease under test here — commit-barrier only.
     )
     .await;
 
@@ -212,6 +216,7 @@ async fn first_frame_reject_before_relay_is_not_committed() {
             Default::default(),
             Duration::ZERO, // idle_timeout: disabled, not under test here
             commit.clone(),
+            None, // C9 Task 2: no in-flight lease under test here — commit-barrier only.
         ),
     )
     .await
@@ -254,6 +259,7 @@ async fn mid_stream_failure_after_a_relayed_byte_is_committed() {
         Default::default(),
         Duration::ZERO, // idle_timeout: disabled, not under test here
         commit.clone(),
+        None, // C9 Task 2: no in-flight lease under test here — commit-barrier only.
     )
     .await
     .expect("Disarmed relays immediately: Ok(stream), not a WatchdogError");
@@ -312,6 +318,7 @@ async fn clean_completion_still_observes_and_the_flag_does_not_interfere() {
         Default::default(),
         Duration::ZERO, // idle_timeout: disabled, not under test here
         commit.clone(),
+        None, // C9 Task 2: no in-flight lease under test here — commit-barrier only.
     )
     .await
     .unwrap();

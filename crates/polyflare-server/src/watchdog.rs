@@ -19,7 +19,7 @@ use polyflare_core::{
     SessionKey, TurnOutcome, WatchdogArm,
 };
 
-use crate::runtime_state::RuntimeStates;
+use crate::runtime_state::{InFlightGuard, RuntimeStates};
 use crate::session_key::sha256_hex;
 
 fn unix_now() -> i64 {
@@ -196,6 +196,11 @@ pub async fn execute_with_watchdog(
         runtime,
         idle_timeout,
         CommitWitness::new(),
+        // C9 Task 2: this convenience delegator's callers (the wedge/cyber suites, and every
+        // ingress.rs site that has not been given a lease) never carry an `InFlightGuard` — its
+        // signature is UNCHANGED by this task (see the module-level precedent set by B4 Task 3's
+        // `CommitWitness` addition: new capabilities land on the `_tracked` sibling only).
+        None,
     )
     .await
 }
@@ -216,6 +221,12 @@ pub async fn execute_with_watchdog_tracked(
     runtime: Arc<RuntimeStates>,
     idle_timeout: Duration,
     commit: CommitWitness,
+    // C9 Task 2: the in-flight lease the CALLER already acquired for `account_id` at selection
+    // (`None` for a caller that never acquired one). Moves into whichever `wrap_stream`/
+    // `recover_from_silence` branch below actually fires for THIS attempt — every other branch
+    // (a pre-relay `Err` return) simply drops it when this function's scope ends, which is exactly
+    // the release-on-failed-attempt behavior the crux requires.
+    in_flight: Option<InFlightGuard>,
 ) -> Result<ResponseStream, WatchdogError> {
     let Prepared { req, directive } = prepared;
     let session_key = directive.session_key.clone();
@@ -238,6 +249,7 @@ pub async fn execute_with_watchdog_tracked(
                 runtime,
                 idle_timeout,
                 commit,
+                in_flight,
             ))
         }
         WatchdogArm::Armed { timeout } => {
@@ -301,6 +313,7 @@ pub async fn execute_with_watchdog_tracked(
                                 runtime,
                                 idle_timeout,
                                 commit,
+                                in_flight,
                             ))
                         }
                         ScanOutcome::Silence => {
@@ -321,6 +334,7 @@ pub async fn execute_with_watchdog_tracked(
                                 runtime,
                                 idle_timeout,
                                 commit,
+                                in_flight,
                             )
                             .await
                         }
@@ -355,6 +369,7 @@ pub async fn execute_with_watchdog_tracked(
                         runtime,
                         idle_timeout,
                         commit,
+                        in_flight,
                     )
                     .await
                 }
@@ -374,6 +389,14 @@ pub async fn execute_with_watchdog_tracked(
 /// other two branches never touch it: `SignalClient` emits a synthetic, always-succeeding one-shot
 /// frame (no failure path to track), and `None` returns `Err` before any stream exists at all (the
 /// witness is correctly left unmarked, i.e. still `false`, in both).
+///
+/// `in_flight` (C9 Task 2): same account, same attempt's lease — it continues straight through
+/// into `ResendFull`'s `execute_recovery_tracked` call (still same-account, so no
+/// release/reacquire needed here; that only happens on a genuine cross-account failover, which
+/// lives in `ingress.rs::run_failover_loop`, one layer up). `SignalClient` doesn't relay any real
+/// upstream bytes on this account for this turn, and `None` never reaches a stream at all — both
+/// simply let the owned `in_flight` parameter drop when this function's scope ends, which is
+/// exactly the correct release for "this account attempt is over, no stream was produced".
 #[allow(clippy::too_many_arguments)] // internal fn; each param is a distinct, clearly-named handle.
 async fn recover_from_silence(
     executor: &dyn Executor,
@@ -386,6 +409,7 @@ async fn recover_from_silence(
     runtime: Arc<RuntimeStates>,
     idle_timeout: Duration,
     commit: CommitWitness,
+    in_flight: Option<InFlightGuard>,
 ) -> Result<ResponseStream, WatchdogError> {
     match recovery {
         RecoveryPlan::ResendFull { anchorless_req } => {
@@ -400,6 +424,7 @@ async fn recover_from_silence(
                 runtime,
                 idle_timeout,
                 commit,
+                in_flight,
             )
             .await
         }
@@ -438,6 +463,9 @@ pub async fn execute_recovery(
         runtime,
         idle_timeout,
         CommitWitness::new(),
+        // C9 Task 2: this delegator's signature is unchanged — see `execute_with_watchdog`'s
+        // matching comment.
+        None,
     )
     .await
 }
@@ -457,6 +485,10 @@ pub async fn execute_recovery_tracked(
     runtime: Arc<RuntimeStates>,
     idle_timeout: Duration,
     commit: CommitWitness,
+    // C9 Task 2: see `execute_with_watchdog_tracked`'s matching param doc — moves into the single
+    // `wrap_stream` call below on success; drops here (this function's scope) on the `?`-propagated
+    // pre-relay `Err` above.
+    in_flight: Option<InFlightGuard>,
 ) -> Result<ResponseStream, WatchdogError> {
     let stream = executor
         .execute(anchorless_req, account, &ctx)
@@ -472,6 +504,7 @@ pub async fn execute_recovery_tracked(
         runtime,
         idle_timeout,
         commit,
+        in_flight,
     ))
 }
 
@@ -809,6 +842,16 @@ struct ObservingStream {
     /// (every chunk is still forwarded unconditionally, in order) or the `record_transient_error`/
     /// `record_success`/`observe` calls, which fire exactly as before Task 3.
     commit: CommitWitness,
+    /// C9 Task 2 (THE CRUX): the in-flight lease acquired at selection for this stream's account,
+    /// held here PURELY so its own `Drop` (see [`InFlightGuard`]) fires whenever THIS
+    /// `ObservingStream` is dropped — clean drain, client disconnect, mid-stream error, idle-
+    /// timeout, or a panic unwind, uniformly, with ZERO change to `poll_next` below. NEVER READ
+    /// (the leading underscore signals that — `#[allow(dead_code)]` is unnecessary because a
+    /// struct field's `Drop` still runs even though nothing ever loads its value). Deliberately NOT
+    /// an `impl Drop for ObservingStream`: a field's own `Drop` already does the release, so adding
+    /// one here would be redundant machinery risking an accidental future touch to this struct's
+    /// (wedge-sacred) poll logic.
+    _in_flight: Option<InFlightGuard>,
 }
 
 impl Stream for ObservingStream {
@@ -920,6 +963,10 @@ fn wrap_stream(
     runtime: Arc<RuntimeStates>,
     idle_timeout: Duration,
     commit: CommitWitness,
+    // C9 Task 2: the caller's in-flight lease (if any — `None` for callers that never acquired
+    // one, e.g. every existing `execute_with_watchdog`/`execute_recovery` caller before this task)
+    // moves into the returned stream's `_in_flight` field here, and ONLY here.
+    in_flight: Option<InFlightGuard>,
 ) -> ResponseStream {
     Box::pin(ObservingStream {
         inner,
@@ -933,6 +980,7 @@ fn wrap_stream(
         runtime,
         idle_deadline: IdleDeadline::new(idle_timeout),
         commit,
+        _in_flight: in_flight,
     })
 }
 
@@ -1014,6 +1062,7 @@ mod tests {
             runtime: Arc::new(RuntimeStates::new()),
             idle_deadline: IdleDeadline::new(Duration::ZERO), // disabled: not under test here
             commit: commit.clone(),
+            _in_flight: None, // not under test here (C9 Task 2 has its own dedicated tests below)
         };
 
         assert!(
@@ -1044,6 +1093,178 @@ mod tests {
         assert_eq!(
             tracked[0].error_count, 1,
             "record_transient_error still bumped the count exactly once"
+        );
+    }
+
+    /// C9 Task 2 (THE CRUX — leak-proof-release proof, client disconnect): dropping an
+    /// `ObservingStream` BEFORE it is ever polled to completion (simulating a client disconnect
+    /// mid-flight — axum drops the response body's stream the instant the client goes away, with
+    /// no further poll) must still release the embedded `InFlightGuard`. Proves the field-Drop
+    /// mechanism works for the ONE exit path `poll_next`'s own success/error/idle arms can never
+    /// see (a drop that never reaches another poll at all) — the exact gap `record_success`/
+    /// `record_transient_error` structurally cannot cover (see this module's top-level doc and the
+    /// plan's "opposite disconnect-correctness" note).
+    #[tokio::test]
+    async fn dropping_the_stream_before_polling_to_completion_releases_the_in_flight_lease() {
+        let rs = Arc::new(RuntimeStates::new());
+        let id = AccountId::from("acct");
+        let guard = rs.acquire_in_flight(&id, 0);
+        let mut snaps = vec![polyflare_core::AccountSnapshot::new("acct")];
+        rs.overlay(&mut snaps, 0);
+        assert_eq!(snaps[0].in_flight, 1, "the lease is held before the stream ever exists");
+
+        // A stream with plenty left to yield — never polled at all here, mirroring a client that
+        // disconnects before the server even gets to relay the first byte.
+        let inner: ResponseStream = Box::pin(stream::iter(vec![
+            Ok::<Bytes, ExecError>(Bytes::from_static(b"data: first\n\n")),
+            Ok(Bytes::from_static(b"data: second\n\n")),
+        ]));
+        let observing = ObservingStream {
+            inner,
+            sniffer: ResponseIdSniffer::new(),
+            continuity: Arc::new(polyflare_core::NoopContinuity),
+            ctx: RequestCtx::default(),
+            account: id.clone(),
+            session_key: None,
+            kind: OutcomeKind::Completed {
+                fp: String::new(),
+                count: 0,
+            },
+            state: ObserveState::Streaming,
+            runtime: rs.clone(),
+            idle_deadline: IdleDeadline::new(Duration::ZERO),
+            commit: CommitWitness::new(),
+            _in_flight: Some(guard),
+        };
+
+        // The disconnect: drop the whole stream WITHOUT ever calling `.next()`/`poll_next`.
+        drop(observing);
+
+        let mut snaps = vec![polyflare_core::AccountSnapshot::new("acct")];
+        rs.overlay(&mut snaps, 0);
+        assert_eq!(
+            snaps[0].in_flight, 0,
+            "the lease releases on an unpolled drop — a client disconnect must never leak it"
+        );
+    }
+
+    /// C9 Task 2: a clean drain (poll to `Poll::Ready(None)`, then drop) releases the lease AND
+    /// still fires `record_success` — the field-Drop addition must not interfere with, precede, or
+    /// replace the existing wedge bookkeeping in `poll_next`'s `Poll::Ready(None)` arm (that arm is
+    /// UNCHANGED by this task; both properties are asserted together as the regression proof).
+    #[tokio::test]
+    async fn clean_drain_releases_the_lease_and_record_success_still_fires() {
+        let rs = Arc::new(RuntimeStates::new());
+        let id = AccountId::from("acct");
+        // Pre-seed an error so `record_success` actually clearing it (error_count -> 0) is
+        // observable, not merely "never touched" — mirrors the existing idle-timeout test's idiom.
+        rs.record_transient_error(&id, 0);
+        let guard = rs.acquire_in_flight(&id, 0);
+
+        let inner: ResponseStream = Box::pin(stream::iter(vec![Ok::<Bytes, ExecError>(
+            Bytes::from_static(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\"}}\n\n"),
+        )]));
+        let mut observing = ObservingStream {
+            inner,
+            sniffer: ResponseIdSniffer::new(),
+            continuity: Arc::new(polyflare_core::NoopContinuity),
+            ctx: RequestCtx::default(),
+            account: id.clone(),
+            session_key: None,
+            kind: OutcomeKind::Completed {
+                fp: String::new(),
+                count: 0,
+            },
+            state: ObserveState::Streaming,
+            runtime: rs.clone(),
+            idle_deadline: IdleDeadline::new(Duration::ZERO),
+            commit: CommitWitness::new(),
+            _in_flight: Some(guard),
+        };
+
+        let first = Pin::new(&mut observing).next().await;
+        assert!(matches!(first, Some(Ok(_))), "the one real chunk relays cleanly");
+        let end = Pin::new(&mut observing).next().await;
+        assert!(end.is_none(), "clean EOF: Poll::Ready(None) after observe completes");
+
+        // Still holding `observing` here (not yet dropped) — the lease must still be alive; the
+        // field's own `Drop` is what releases it, not `poll_next` reaching `Done`.
+        let mut snaps = vec![polyflare_core::AccountSnapshot::new("acct")];
+        rs.overlay(&mut snaps, 0);
+        assert_eq!(
+            snaps[0].in_flight, 1,
+            "polling to completion alone does not release the lease — only dropping the stream does"
+        );
+        assert_eq!(
+            snaps[0].error_count, 0,
+            "record_success fired on clean EOF and cleared the pre-seeded error — unaffected by \
+             the new lease field"
+        );
+
+        drop(observing);
+        let mut snaps = vec![polyflare_core::AccountSnapshot::new("acct")];
+        rs.overlay(&mut snaps, 0);
+        assert_eq!(snaps[0].in_flight, 0, "dropping the fully-drained stream releases the lease");
+    }
+
+    /// C9 Task 2: a mid-stream error (the `Poll::Ready(Some(Err(_)))` arm) forwards the error
+    /// unchanged (as before this task) and, once the stream is dropped, releases the lease.
+    /// `record_transient_error` still fires — same "unchanged bookkeeping" proof as the clean-drain
+    /// test above, for the error arm instead of the success arm.
+    #[tokio::test]
+    async fn mid_stream_error_releases_the_lease_and_record_transient_error_still_fires() {
+        let rs = Arc::new(RuntimeStates::new());
+        let id = AccountId::from("acct");
+        let guard = rs.acquire_in_flight(&id, 0);
+
+        let inner: ResponseStream = Box::pin(stream::iter(vec![
+            Ok::<Bytes, ExecError>(Bytes::from_static(b"data: first\n\n")),
+            Err(ExecError::Stream("mid-stream drop".into())),
+        ]));
+        let mut observing = ObservingStream {
+            inner,
+            sniffer: ResponseIdSniffer::new(),
+            continuity: Arc::new(polyflare_core::NoopContinuity),
+            ctx: RequestCtx::default(),
+            account: id.clone(),
+            session_key: None,
+            kind: OutcomeKind::Completed {
+                fp: String::new(),
+                count: 0,
+            },
+            state: ObserveState::Streaming,
+            runtime: rs.clone(),
+            idle_deadline: IdleDeadline::new(Duration::ZERO),
+            commit: CommitWitness::new(),
+            _in_flight: Some(guard),
+        };
+
+        let first = Pin::new(&mut observing).next().await;
+        assert!(matches!(first, Some(Ok(_))), "the first chunk relays cleanly");
+        let second = Pin::new(&mut observing).next().await;
+        assert!(
+            matches!(second, Some(Err(_))),
+            "the mid-stream error is forwarded unchanged"
+        );
+
+        let mut snaps = vec![polyflare_core::AccountSnapshot::new("acct")];
+        rs.overlay(&mut snaps, 0);
+        assert_eq!(
+            snaps[0].in_flight, 1,
+            "the lease is still held right after the error item — releasing is the DROP's job"
+        );
+        assert_eq!(
+            snaps[0].error_count, 1,
+            "record_transient_error fired for the mid-stream drop, unaffected by the new lease field"
+        );
+
+        drop(observing);
+        let mut snaps = vec![polyflare_core::AccountSnapshot::new("acct")];
+        rs.overlay(&mut snaps, 0);
+        assert_eq!(
+            snaps[0].in_flight, 0,
+            "dropping the stream after a mid-stream error still releases the lease — no leak on \
+             the failure path either"
         );
     }
 
@@ -1264,6 +1485,7 @@ mod tests {
             runtime.clone(),
             idle,
             CommitWitness::new(),
+            None,
         );
 
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -1332,6 +1554,7 @@ mod tests {
             runtime,
             Duration::from_millis(250),
             commit.clone(),
+            None,
         )
         .await
         .expect("Disarmed relays immediately: Ok(stream)");
@@ -1408,6 +1631,7 @@ mod tests {
             runtime.clone(),
             idle,
             CommitWitness::new(),
+            None,
         );
 
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -1461,6 +1685,7 @@ mod tests {
             runtime.clone(),
             Duration::ZERO, // disabled
             CommitWitness::new(),
+            None,
         );
 
         let first = wrapped.next().await;
@@ -1539,6 +1764,7 @@ mod tests {
             runtime,
             idle,
             CommitWitness::new(),
+            None,
         );
 
         tokio::time::timeout(Duration::from_secs(3), async {
