@@ -262,12 +262,24 @@ and the replayed-input path so a reconnect never forwards a duplicate destructiv
 the `/responses/compact` passthrough.
 *codex-lb:* `tool_call_dedupe.py`, `_service/compact.py`.
 
-### D15. Live upstream model-catalog fetch/merge  · LOW · medium
+### D15. Live upstream model-catalog fetch/merge  · LOW · medium · **DONE (single-node)**
 PolyFlare serves static golden metadata pinned to one codex version. Port the fetcher
 (`GET {base}/codex/models?client_version=`, Bearer + chatgpt-account-id) + a periodic refresh loop
 that groups active accounts by plan, fetches with cross-account failover, merges same-plan slugs, and
 updates an in-memory registry with the golden set as bootstrap floor. Single-node refresh loop first.
 *codex-lb:* `core/clients/model_fetcher.py`, `core/openai/model_refresh_scheduler.py`.
+
+**DONE 2026-07-18 (single-node; plan `docs/superpowers/plans/2026-07-18-d15-model-catalog.md`).**
+`ModelCatalogCache` (`model_catalog.rs`) mirrors `CodexVersionCache`: TTL + single-flight + fallback
+ladder (fresh → live fetch → stale → static floor, **never empty**). `HttpModelSource` fetches
+`GET {upstream}/models?client_version=` with an active account's bearer + chatgpt-account-id, parses
+`data["models"]`, merges onto the `codex_bootstrap_floor()` (floor never removed, upstream wins on
+slug), and `/models`+`/v1/models` serve the merged set (+ synthetic aliases). `POLYFLARE_MODEL_CATALOG_ENABLED`
+(default on; off ⇒ static-only via `floor_only_cache`) + `_TTL_SECS` (3600). Airtight: disabled /
+no-accounts / fetch-fail / empty ⇒ exactly today's static list. Token never logged (structural test).
+`Store`/`TokenCipher` gained cheap `#[derive(Clone)]` (pool is Arc, cipher clone = 32-byte key; no
+Debug on TokenCipher so no key leak). No routing-path impact. **Single-node only — deferred:** codex-lb's
+per-plan catalogs + cross-account merge + leader-election + DB-persisted snapshot (multi-node/dashboard).
 
 ### D16. WeeklyCreditPace + EWMA depletion forecasting  · LOW · medium
 Port the EWMA core first (pure math: alpha-0.4 d(used%)/dt with reset-on-drop, burn-rate, projected
