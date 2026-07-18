@@ -170,6 +170,7 @@ async fn executor_err_before_any_stream_is_not_committed() {
         AccountId::from("acct"),
         RequestCtx::default(),
         Default::default(),
+        Duration::ZERO, // idle_timeout: disabled, not under test here
         commit.clone(),
     )
     .await;
@@ -209,6 +210,7 @@ async fn first_frame_reject_before_relay_is_not_committed() {
             AccountId::from("acct"),
             RequestCtx::default(),
             Default::default(),
+            Duration::ZERO, // idle_timeout: disabled, not under test here
             commit.clone(),
         ),
     )
@@ -250,6 +252,7 @@ async fn mid_stream_failure_after_a_relayed_byte_is_committed() {
         AccountId::from("acct"),
         RequestCtx::default(),
         Default::default(),
+        Duration::ZERO, // idle_timeout: disabled, not under test here
         commit.clone(),
     )
     .await
@@ -307,6 +310,7 @@ async fn clean_completion_still_observes_and_the_flag_does_not_interfere() {
         AccountId::from("acct"),
         RequestCtx::default(),
         Default::default(),
+        Duration::ZERO, // idle_timeout: disabled, not under test here
         commit.clone(),
     )
     .await

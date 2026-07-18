@@ -113,6 +113,7 @@ async fn relays_when_first_byte_arrives_before_timeout() {
         AccountId::from("acct"),
         RequestCtx::default(),
         Default::default(),
+        Duration::ZERO, // idle_timeout: disabled, not under test here
     )
     .await
     .unwrap();
@@ -141,6 +142,7 @@ async fn recovers_on_silence_via_resend_full() {
         AccountId::from("acct"),
         RequestCtx::default(),
         Default::default(),
+        Duration::ZERO, // idle_timeout: disabled, not under test here
     )
     .await
     .unwrap();
@@ -182,6 +184,7 @@ async fn hard_upstream_error_is_watchdog_upstream() {
         AccountId::from("acct"),
         RequestCtx::default(),
         Default::default(),
+        Duration::ZERO, // idle_timeout: disabled, not under test here
     )
     .await;
     assert!(matches!(res, Err(WatchdogError::Upstream(_))));
@@ -217,6 +220,7 @@ async fn mid_race_first_item_error_is_watchdog_upstream_and_does_not_recover() {
             AccountId::from("acct"),
             RequestCtx::default(),
             Default::default(),
+            Duration::ZERO, // idle_timeout: disabled, not under test here
         ),
     )
     .await
