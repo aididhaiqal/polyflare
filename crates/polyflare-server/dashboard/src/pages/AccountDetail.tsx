@@ -58,7 +58,9 @@ import {
   ApiError,
   type AccountDetailView,
   type AccountView,
+  type DepletionForecast,
   type Point,
+  type RiskLevel,
   type TokenHealthView,
   type UsageWindowView,
 } from "../lib/api";
@@ -235,6 +237,7 @@ export function AccountDetail() {
             onTrendsRetry={() => trendsQuery.refetch()}
             primary={trendsQuery.data?.primary ?? []}
             secondary={trendsQuery.data?.secondary ?? []}
+            forecast={trendsQuery.data?.forecast ?? null}
           />
         ) : (
           // Defensive fallback (e.g. a route somehow reached with no :id) — never a blank page.
@@ -504,6 +507,7 @@ interface DetailContentProps {
   onTrendsRetry: () => void;
   primary: Point[];
   secondary: Point[];
+  forecast: DepletionForecast | null;
 }
 
 function DetailContent({
@@ -518,6 +522,7 @@ function DetailContent({
   onTrendsRetry,
   primary,
   secondary,
+  forecast,
 }: DetailContentProps) {
   const { identity } = detail;
   const displayName = identity.alias ?? identity.id;
@@ -625,6 +630,7 @@ function DetailContent({
             onRetry={onTrendsRetry}
             primary={primary}
             secondary={secondary}
+            forecast={forecast}
           />
         </Col>
 
@@ -703,18 +709,58 @@ function mergeTrend(primary: Point[], secondary: Point[]): TrendRow[] {
   return rows;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Depletion-risk badge — `trends.forecast?.risk_level` (D16 T6). The secondary/weekly-window EWMA
+// depletion forecast rebuilt server-side from the same `usage_history` this trend chart already
+// plots (see `read_api.rs::account_trends_handler` / `polyflare_core::depletion`). `null` (fewer
+// than 2 secondary samples, the rate never establishing, or the window having already reset) hides
+// the badge entirely rather than rendering a misleading "safe" default.
+// ---------------------------------------------------------------------------------------------
+
+const RISK_LABEL: Record<RiskLevel, string> = {
+  safe: "safe",
+  warning: "warning",
+  danger: "danger",
+  critical: "critical",
+};
+
+/** safe = muted, warning = warn/gold, danger = flare-amber accent, critical = red — an escalating
+ * ramp one step past `PACE_STATUS_CLASS` (Overview.tsx), consistent with this file's `RiskLevel`. */
+const RISK_CLASS: Record<RiskLevel, string> = {
+  safe: "bg-muted text-fg opacity-70",
+  warning: "bg-warn/15 text-warn",
+  danger: "bg-accent/15 text-accent",
+  critical: "bg-error/15 text-error",
+};
+
+function DepletionRiskBadge({ forecast }: { forecast: DepletionForecast }) {
+  return (
+    <span
+      className={clsx(
+        "inline-block whitespace-nowrap rounded px-1.5 py-0.5 text-[9px] font-bold normal-case tracking-normal",
+        RISK_CLASS[forecast.risk_level],
+      )}
+      title={`Projected to reach ${pct(Math.min(100, forecast.risk * 100))} of the weekly window by reset`}
+    >
+      depletion · {RISK_LABEL[forecast.risk_level]}
+    </span>
+  );
+}
+
 function TrendCard({
   isLoading,
   isError,
   onRetry,
   primary,
   secondary,
+  forecast,
 }: {
   isLoading: boolean;
   isError: boolean;
   onRetry: () => void;
   primary: Point[];
   secondary: Point[];
+  forecast: DepletionForecast | null;
 }) {
   if (isLoading) {
     return (
@@ -756,9 +802,12 @@ function TrendCard({
     <Card>
       <div className="flex items-center justify-between text-[10px] uppercase tracking-wide text-fg opacity-60">
         <span>7-day usage trend</span>
-        <span className="flex items-center gap-3 normal-case tracking-normal text-[9px] opacity-80">
-          <LegendSwatch colorClass="bg-codex" label="5h" />
-          <LegendSwatch colorClass="bg-claude" label="Weekly" />
+        <span className="flex items-center gap-2">
+          {forecast && <DepletionRiskBadge forecast={forecast} />}
+          <span className="flex items-center gap-3 normal-case tracking-normal text-[9px] opacity-80">
+            <LegendSwatch colorClass="bg-codex" label="5h" />
+            <LegendSwatch colorClass="bg-claude" label="Weekly" />
+          </span>
         </span>
       </div>
       {!hasData ? (

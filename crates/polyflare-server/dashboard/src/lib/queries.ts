@@ -11,6 +11,7 @@ import {
   type CapabilitiesView,
   type OverviewSeriesView,
   type OverviewView,
+  type PaceResponse,
   type PoolView,
   type RequestsQueryParams,
   type RequestsView,
@@ -31,6 +32,7 @@ export const queryKeys = {
   account: (id: string) => ["accounts", id] as const,
   accountTrends: (id: string) => ["accounts", id, "trends"] as const,
   pools: ["pools"] as const,
+  pace: ["pace"] as const,
   requests: (params: RequestsQueryParams) => ["requests", params] as const,
   sessions: (params: SessionsQueryParams) => ["sessions", params] as const,
   capabilities: ["capabilities"] as const,
@@ -88,6 +90,19 @@ export function usePools() {
   return useQuery<PoolView[]>({
     queryKey: queryKeys.pools,
     queryFn: api.pools,
+    refetchInterval: LIST_REFETCH_MS,
+    staleTime: LIST_REFETCH_MS,
+  });
+}
+
+/** `GET /api/pace` — the pool-wide weekly credit pace forecast (admin-gated; `pace: null` when no
+ * eligible/fresh/positive-capacity account exists). A landing-page summary, so it polls on the same
+ * 30s cadence as `useOverview`/`usePools`, not the "fetch once, refresh on navigation" detail-view
+ * policy `useAccountTrends` uses. */
+export function usePace() {
+  return useQuery<PaceResponse>({
+    queryKey: queryKeys.pace,
+    queryFn: api.pace,
     refetchInterval: LIST_REFETCH_MS,
     staleTime: LIST_REFETCH_MS,
   });
