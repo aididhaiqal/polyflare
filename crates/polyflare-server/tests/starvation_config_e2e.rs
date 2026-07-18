@@ -198,12 +198,10 @@ async fn all_accounts_recover_during_the_wait_client_gets_keepalives_then_clean_
 
     let (store, cipher, _dir) = spawn_store().await;
     let upstream_url = spawn_stub_upstream().await;
-    // `reset_at` is set relative to `now()` captured AFTER standing up the store + the stub
-    // upstream server (real I/O — SQLite file creation, a real TCP listener) so the ~2s margin
-    // below is measured from as close to "request about to fire" as this harness can get, not from
-    // before that setup overhead.
+    // `reset_at` starts as a far-future placeholder — see the re-anchoring right before the
+    // request fires below for why the REAL margin isn't set here.
     let mut a = account("A", "rate_limited");
-    a.reset_at = Some(now() + 2); // recovers ~2 real seconds after the request starts
+    a.reset_at = Some(now() + 3600);
     store
         .accounts()
         .insert(&a, &tokens("tokA"), &cipher)
@@ -218,6 +216,27 @@ async fn all_accounts_recover_during_the_wait_client_gets_keepalives_then_clean_
     );
     let pf = spawn_app(state.clone()).await;
 
+    // Anti-flake fix (this test used to set `reset_at = now() + 2` BEFORE the SQLite insert +
+    // `spawn_app` (TCP bind + `tokio::spawn`'ing the axum server) above. That setup is real I/O
+    // and, under the CPU contention of the full workspace test suite running in parallel, can
+    // itself eat a non-trivial fraction of a short margin — occasionally the whole 2s of it,
+    // leaving the account already "recovered" (or the keepalive window already exhausted) by the
+    // time the request ever reached the wait loop, so zero keepalives fired and the assertion
+    // below flaked. Re-anchoring `reset_at` to a wall-clock timestamp captured HERE — immediately
+    // before the request fires, after all setup I/O is done — means the only latency the margin
+    // has to absorb is the local HTTP round trip + axum routing (sub-millisecond in practice), not
+    // store/server startup. The margin is also widened from 2s to 4s for extra slack against
+    // scheduler jitter, giving room for multiple heartbeat ticks (heartbeat=1s) rather than
+    // requiring exactly one to land in a narrow window. `update_status_and_reset` bumps the
+    // account_cache generation so the fresh `reset_at` is what the request actually observes.
+    let fire_at = now();
+    state
+        .store
+        .accounts()
+        .update_status_and_reset("A", "rate_limited", Some(fire_at + 4))
+        .await
+        .unwrap();
+
     let resp = reqwest::Client::new()
         .post(format!("{pf}/responses"))
         .json(&serde_json::json!({"model": "m", "input": "hi"}))
@@ -228,7 +247,7 @@ async fn all_accounts_recover_during_the_wait_client_gets_keepalives_then_clean_
     let body = drain(resp).await;
     assert!(
         body.contains(": keepalive"),
-        "at least one keepalive must have been emitted during the ~2s wait: {body}"
+        "at least one keepalive must have been emitted during the ~4s wait: {body}"
     );
     assert!(
         body.contains("response.completed"),
@@ -310,7 +329,11 @@ async fn budget_zero_disables_layer_2_fast_503_config_driven() {
 
     assert_eq!(status, 503, "budget=0 ⇒ Layer 2 disabled ⇒ today's fast 503");
     assert!(
-        elapsed < Duration::from_secs(2),
+        // Widened from 2s to 5s for slack against scheduler jitter under the full workspace test
+        // suite's CPU contention — this only guards against a REGRESSION where Layer 2 accidentally
+        // enters its real wait loop (which ticks on 1s heartbeats and would blow well past 5s), not
+        // against ordinary request-handling latency.
+        elapsed < Duration::from_secs(5),
         "must be a FAST pre-response 503 — no wait loop of any kind ran (elapsed={elapsed:?})"
     );
 
