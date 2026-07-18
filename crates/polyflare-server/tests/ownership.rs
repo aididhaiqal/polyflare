@@ -118,6 +118,8 @@ async fn second_turn_pins_back_to_owning_account() {
         admin_token: None,
         live_logs: false,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
+        max_account_attempts: 3,
+        failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
 
         runtime: Default::default(),
     });

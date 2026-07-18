@@ -17,6 +17,9 @@
 //! one struct so there is a single content-safety chokepoint for both the ephemeral event and the
 //! durable row. The constraint above binds the persisted record identically.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use axum::http::StatusCode;
 use polyflare_core::Provider;
 
@@ -124,16 +127,97 @@ impl RequestLog {
     }
 }
 
+/// B4/B5 Task 5: a process-global, content-free counter of cross-account failover events. In
+/// memory only (like `RuntimeStates`/`LogBus`) — resets on restart. Incremented exactly ONCE per
+/// `FailoverVerdict::FailoverNext` transition actually taken by `crate::ingress::run_failover_loop`
+/// (i.e. once per real cross-account retry, never per mere classification or per request), so its
+/// total is the failover RATE an operator can watch — the visibility the porting doc calls for
+/// (codex-lb wedged invisibly; this is the fix's whole point).
+#[derive(Default)]
+pub struct FailoverMetrics {
+    total: AtomicU64,
+}
+
+impl FailoverMetrics {
+    /// A fresh, zeroed counter, `Arc`-wrapped to match `LogBus::new`'s and `RuntimeStates`'s
+    /// `AppState`-field shape.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Records one failover event, returning the new total.
+    pub fn record(&self) -> u64 {
+        self.total.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The current total (test/dashboard read path).
+    pub fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+}
+
+/// B4/B5 Task 5: the content-free signal for one actual cross-account failover (a
+/// `FailoverVerdict::FailoverNext` transition). Carries ONLY a fixed reason-code label (see
+/// `crate::failover::failover_reason_code` — never a raw upstream message/body), the two account
+/// row ids involved (content-free identifiers, same class as `RequestLog::account_id`), and the
+/// 1-indexed attempt number the request is now making. NEVER a body/message/frame — a leak here is
+/// Critical (see the plan's Global Constraints content-safety rule). Emitted from exactly one call
+/// site: `crate::ingress::run_failover_loop`, right after a fresh account is picked to retry on.
+pub struct FailoverSignal<'a> {
+    pub reason: &'static str,
+    pub from_account: &'a str,
+    pub to_account: &'a str,
+    pub attempt: u32,
+}
+
+impl FailoverSignal<'_> {
+    /// Emits the structured `tracing` event (target `polyflare_server::failover`, isolable from
+    /// other crates' traffic exactly like `RequestLog::emit`'s `polyflare_server::request` target).
+    pub fn emit(&self) {
+        tracing::warn!(
+            target: "polyflare_server::failover",
+            reason = self.reason,
+            from_account = self.from_account,
+            to_account = self.to_account,
+            attempt = self.attempt,
+            "cross-account failover"
+        );
+    }
+
+    /// The content-free live-log-bus form (see `crate::log_bus`) — same sink `RequestLog` feeds,
+    /// so the dashboard's live log stream shows failover events inline with request completions.
+    /// `message` is built ENTIRELY from the fixed reason code + the two account ids + the attempt
+    /// number — never from request/response content, exactly like `RequestLog::to_log_event`'s
+    /// `message`.
+    pub fn to_log_event(&self) -> LogEvent {
+        LogEvent {
+            ts_ms: log_bus::now_ms(),
+            level: LogLevel::Warn,
+            provider: None,
+            account: Some(self.to_account.to_string()),
+            model: None,
+            status: None,
+            latency_ms: None,
+            kind: "failover".to_string(),
+            message: format!(
+                "failover reason={} from={} to={} attempt={}",
+                self.reason, self.from_account, self.to_account, self.attempt
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
-    /// A minimal `tracing::Subscriber` that records every event on the
-    /// `"polyflare_server::request"` target as a flat `field=value` string and ignores
-    /// everything else. Enough to assert our one content-safe event fired with exactly the
-    /// expected fields and nothing more.
-    struct Capture(Arc<Mutex<Vec<String>>>);
+    /// A minimal `tracing::Subscriber` that records every event on `.1`'s target as a flat
+    /// `field=value` string and ignores everything else. Enough to assert our one content-safe
+    /// event fired with exactly the expected fields and nothing more. Parameterized by target
+    /// (rather than hardcoded to `"polyflare_server::request"`) so it also covers the
+    /// `"polyflare_server::failover"` signal below.
+    struct Capture(Arc<Mutex<Vec<String>>>, &'static str);
 
     struct FieldVisitor(String);
 
@@ -157,7 +241,7 @@ mod tests {
 
     impl tracing::Subscriber for Capture {
         fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            metadata.target() == "polyflare_server::request"
+            metadata.target() == self.1
         }
 
         fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -182,7 +266,8 @@ mod tests {
     #[test]
     fn request_completion_event_carries_only_safe_fields() {
         let captured = Arc::new(Mutex::new(Vec::new()));
-        let dispatch = tracing::Dispatch::new(Capture(captured.clone()));
+        let dispatch =
+            tracing::Dispatch::new(Capture(captured.clone(), "polyflare_server::request"));
 
         tracing::dispatcher::with_default(&dispatch, || {
             RequestLog {
@@ -245,7 +330,8 @@ mod tests {
     #[test]
     fn events_outside_the_request_target_are_ignored() {
         let captured = Arc::new(Mutex::new(Vec::new()));
-        let dispatch = tracing::Dispatch::new(Capture(captured.clone()));
+        let dispatch =
+            tracing::Dispatch::new(Capture(captured.clone(), "polyflare_server::request"));
 
         tracing::dispatcher::with_default(&dispatch, || {
             tracing::info!(target: "some_other_crate", "unrelated noise");
@@ -255,5 +341,77 @@ mod tests {
             captured.lock().unwrap().is_empty(),
             "Capture must ignore events outside its target"
         );
+    }
+
+    #[test]
+    fn failover_metrics_counts_exactly_the_recorded_events() {
+        let m = FailoverMetrics::new();
+        assert_eq!(m.total(), 0, "starts at zero");
+        assert_eq!(m.record(), 1);
+        assert_eq!(m.record(), 2);
+        assert_eq!(m.total(), 2);
+    }
+
+    /// The failover signal's `tracing` event carries reason + both account ids + the attempt
+    /// number ONLY — this is the content-safety-critical assertion: a leak here is Critical per
+    /// the plan's Global Constraints.
+    #[test]
+    fn failover_signal_event_carries_only_reason_ids_and_attempt() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let dispatch =
+            tracing::Dispatch::new(Capture(captured.clone(), "polyflare_server::failover"));
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            FailoverSignal {
+                reason: "rate_limited",
+                from_account: "acct-a",
+                to_account: "acct-b",
+                attempt: 2,
+            }
+            .emit();
+        });
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1, "expected exactly one failover event");
+        let line = &events[0];
+        for expected in [
+            "reason=rate_limited",
+            "from_account=acct-a",
+            "to_account=acct-b",
+            "attempt=2",
+        ] {
+            assert!(line.contains(expected), "missing `{expected}` in: {line}");
+        }
+    }
+
+    /// The failover signal's `LogEvent` (dashboard live-log form) must never carry a body,
+    /// message, or frame — only the reason code, account ids, and attempt number, exactly like
+    /// the `tracing` event.
+    #[test]
+    fn failover_signal_log_event_is_content_free() {
+        let ev = FailoverSignal {
+            reason: "transient",
+            from_account: "acct-a",
+            to_account: "acct-b",
+            attempt: 3,
+        }
+        .to_log_event();
+
+        assert_eq!(ev.kind, "failover");
+        assert_eq!(ev.account.as_deref(), Some("acct-b"));
+        assert!(ev.message.contains("reason=transient"));
+        assert!(ev.message.contains("from=acct-a"));
+        assert!(ev.message.contains("to=acct-b"));
+        assert!(ev.message.contains("attempt=3"));
+
+        for forbidden in [
+            "bearer", "body", "content", "delta", "text", "input", "message\":",
+        ] {
+            assert!(
+                !ev.message.to_lowercase().contains(forbidden),
+                "forbidden content `{forbidden}` leaked into failover log event: {}",
+                ev.message
+            );
+        }
     }
 }
