@@ -532,7 +532,16 @@ impl AccountRepo {
         account_id: &str,
         since_ts: i64,
     ) -> Result<Vec<(String, WindowUsage)>, StoreError> {
-        let rows: Vec<(String, f64, Option<i64>, Option<i64>, i64)> = sqlx::query_as(
+        #[derive(sqlx::FromRow)]
+        struct FullUsageRow {
+            window: String,
+            used_percent: f64,
+            reset_at: Option<i64>,
+            window_minutes: Option<i64>,
+            recorded_at: i64,
+        }
+
+        let rows: Vec<FullUsageRow> = sqlx::query_as(
             "SELECT \"window\", used_percent, reset_at, window_minutes, recorded_at \
              FROM usage_history \
              WHERE account_id = ? AND recorded_at >= ? AND \"window\" IN ('primary', 'secondary') \
@@ -544,19 +553,17 @@ impl AccountRepo {
         .await?;
         Ok(rows
             .into_iter()
-            .map(
-                |(window, used_percent, reset_at, window_minutes, recorded_at)| {
-                    (
-                        window,
-                        WindowUsage {
-                            used_percent,
-                            reset_at,
-                            window_minutes,
-                            recorded_at,
-                        },
-                    )
-                },
-            )
+            .map(|row| {
+                (
+                    row.window,
+                    WindowUsage {
+                        used_percent: row.used_percent,
+                        reset_at: row.reset_at,
+                        window_minutes: row.window_minutes,
+                        recorded_at: row.recorded_at,
+                    },
+                )
+            })
             .collect())
     }
 }
