@@ -496,6 +496,58 @@ pub(crate) async fn resolve_core_account(
     ))
 }
 
+/// B5-anthropic Task 3: which SSE dialect the *client* of a Layer-1/Layer-2 recovery-wait speaks —
+/// orthogonal to `pool_provider` (which accounts we wait ON: a Codex request always waits on Codex
+/// accounts, an Anthropic request always waits on Anthropic accounts, regardless of which dialect
+/// the ORIGINAL client speaks). Owns every dialect-specific frame the wait emits (keepalive, in-band
+/// error) plus how the recovered upstream stream reaches the client (verbatim, or — T4 — Codex→
+/// Anthropic translated). `Clone` is cheap: today's two variants are unit variants; T4's added
+/// variant holds an `Arc`.
+#[derive(Clone)]
+enum WaitClient {
+    /// Codex `/responses` client: `response.failed` error frames, `: keepalive` comments, recovered
+    /// Codex stream forwarded verbatim. Byte-identical to pre-B5-anthropic behavior — every existing
+    /// Codex call site passes this variant, and nothing about its output has changed.
+    Codex,
+    /// Native Anthropic `/v1/messages` client: `event: error` frames, `event: ping` keepalives,
+    /// recovered Anthropic stream forwarded verbatim.
+    Anthropic,
+    // T4 adds: AnthropicTranslated(Arc<dyn Fn() -> Box<dyn Translator> + Send + Sync>) — the
+    // Codex-aliased `/v1/messages` path's Layer-2 wait, which speaks Anthropic to the client but
+    // waits on Codex accounts and must translate the recovered Codex stream before splicing it.
+}
+
+impl WaitClient {
+    /// The in-band SSE terminal-error frame for this dialect (Global Constraint: POST-200 COMMIT —
+    /// see `in_band_error_frame`'s doc for why this is never a dropped/`Err` stream item).
+    fn error_frame(&self, outcome: starvation::StarvationOutcome) -> Bytes {
+        match self {
+            WaitClient::Codex => starvation::in_band_error_frame(outcome),
+            WaitClient::Anthropic => starvation::anthropic_in_band_error_frame(outcome),
+        }
+    }
+
+    /// The keepalive frame bytes for this dialect. Returns `Bytes` (not the stream's `Item` type
+    /// directly — see `starvation::keepalive_item`'s doc on why the two happen to coincide for
+    /// `Codex` today) so callers wrap it as `Ok(..)` at the yield site themselves.
+    fn keepalive_bytes(&self) -> Bytes {
+        match self {
+            // Byte-identical to `starvation::KEEPALIVE_FRAME` / `keepalive_item()`'s existing Ok
+            // value — this is NOT a new frame, just the same constant reached through the new seam.
+            WaitClient::Codex => Bytes::from_static(starvation::KEEPALIVE_FRAME),
+            WaitClient::Anthropic => starvation::anthropic_ping_frame(),
+        }
+    }
+
+    /// How the recovered upstream stream reaches the client. Verbatim for Codex + native Anthropic
+    /// (T4's `AnthropicTranslated` wraps it in a fresh `Translator` instance instead).
+    fn wrap_recovered(&self, stream: ResponseStream) -> ResponseStream {
+        match self {
+            WaitClient::Codex | WaitClient::Anthropic => stream,
+        }
+    }
+}
+
 /// B5 Task 3 — Layer 1: serve the soonest `ErrorBackoff` account IMMEDIATELY (no wait) when the
 /// caller's own selection just found the eligible pool empty. An error-backoff account is a
 /// *probably-fine* soft signal (a short transient-upstream-error window) — better to try it than a
@@ -535,6 +587,10 @@ async fn try_layer1_serve_now(
     session_key: Option<SessionKey>,
     now: i64,
     outcome: &mut RouteOutcome,
+    // B5-anthropic Task 3: which SSE dialect the client speaks — see `WaitClient`'s doc. Threaded
+    // through so this function's own served-stream site below can dialect-correctly wrap the
+    // stream (identity for both variants today; T4 adds a translating one).
+    client: &WaitClient,
 ) -> Option<Response> {
     let recovery = selector.soonest_recover(snapshots, sel_ctx)?;
     if recovery.kind != BackoffKind::ErrorBackoff {
@@ -578,7 +634,7 @@ async fn try_layer1_serve_now(
     )
     .await
     {
-        Ok(stream) => stream_response(stream),
+        Ok(stream) => stream_response(client.wrap_recovered(stream)),
         Err(e) => {
             record_failure(state, &health_id, &e, unix_now()).await;
             (StatusCode::BAD_GATEWAY, "upstream error").into_response()
@@ -663,6 +719,9 @@ fn try_layer2_recovery_wait(
     budget: Duration,
     heartbeat: Duration,
     outcome: &mut RouteOutcome,
+    // B5-anthropic Task 3: which SSE dialect the client speaks — see `WaitClient`'s doc. Forwarded
+    // into `layer2_wait_stream`, which owns it for the generator's whole lifetime.
+    client: WaitClient,
 ) -> Option<Response> {
     // B5 Task 5: the config-driven DISABLE LEVER — `POLYFLARE_STARVATION_WAIT_BUDGET_SECS=0`
     // resolves to `Duration::ZERO` (see `crate::config::starvation_wait_budget_secs_from_env`'s
@@ -705,6 +764,7 @@ fn try_layer2_recovery_wait(
         now,
         heartbeat,
         budget,
+        client,
     );
     Some(stream_response(stream))
 }
@@ -852,6 +912,9 @@ fn layer2_wait_stream(
     wait_start: i64,
     heartbeat: Duration,
     budget: Duration,
+    // B5-anthropic Task 3: which SSE dialect the client speaks — see `WaitClient`'s doc. Owned by
+    // the generator for its whole lifetime (every yield site below reads it).
+    client: WaitClient,
 ) -> ResponseStream {
     Box::pin(async_stream::stream! {
         // B5 Task 5: wall-clock start of the wait, purely for the content-free
@@ -888,7 +951,7 @@ fn layer2_wait_stream(
             // Only emit a keepalive if we're still genuinely waiting (avoids one trailing,
             // pointless keepalive emitted in the same instant selection is about to be retried).
             if unix_now_ms() < jittered_target_ms {
-                yield starvation::keepalive_item();
+                yield Ok(client.keepalive_bytes());
             }
         }
 
@@ -904,7 +967,7 @@ fn layer2_wait_stream(
                 None,
                 jitter_ms,
             );
-            yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::BudgetExceeded));
+            yield Ok(client.error_frame(starvation::StarvationOutcome::BudgetExceeded));
             return;
         }
 
@@ -925,7 +988,7 @@ fn layer2_wait_stream(
                     None,
                     jitter_ms,
                 );
-                yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::StillNothing));
+                yield Ok(client.error_frame(starvation::StarvationOutcome::StillNothing));
                 return;
             }
         };
@@ -944,7 +1007,7 @@ fn layer2_wait_stream(
                     None,
                     jitter_ms,
                 );
-                yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::StillNothing));
+                yield Ok(client.error_frame(starvation::StarvationOutcome::StillNothing));
                 return;
             }
         };
@@ -961,7 +1024,7 @@ fn layer2_wait_stream(
                     None,
                     jitter_ms,
                 );
-                yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::ExecutorError));
+                yield Ok(client.error_frame(starvation::StarvationOutcome::ExecutorError));
                 return;
             }
         };
@@ -984,7 +1047,7 @@ fn layer2_wait_stream(
         )
         .await
         {
-            Ok(mut real_stream) => {
+            Ok(real_stream) => {
                 // SPLICE: the account actually serving this request is known NOW — this is the fix
                 // for the disclosed `outcome.account_id` gap (see `try_layer2_recovery_wait`'s doc):
                 // emit the AUTHORITATIVE served-account signal HERE, before forwarding the real
@@ -997,6 +1060,10 @@ fn layer2_wait_stream(
                     Some(health_id.as_str()),
                     jitter_ms,
                 );
+                // B5-anthropic Task 3: dialect-wrap BEFORE forwarding — identity for `Codex`/
+                // `Anthropic` today (T4's translating variant re-shapes the recovered Codex stream
+                // into Anthropic SSE here).
+                let mut real_stream = client.wrap_recovered(real_stream);
                 while let Some(item) = real_stream.next().await {
                     yield item;
                 }
@@ -1011,7 +1078,7 @@ fn layer2_wait_stream(
                     None,
                     jitter_ms,
                 );
-                yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::ExecutorError));
+                yield Ok(client.error_frame(starvation::StarvationOutcome::ExecutorError));
             }
         }
     })
@@ -1233,6 +1300,7 @@ async fn run_failover_loop(
                     session_key.clone(),
                     now,
                     outcome,
+                    &WaitClient::Codex,
                 )
                 .await;
                 if let Some(resp) = layer1 {
@@ -1255,6 +1323,7 @@ async fn run_failover_loop(
                     starvation_budget,
                     starvation_heartbeat,
                     outcome,
+                    WaitClient::Codex,
                 ) {
                     return resp;
                 }
@@ -1769,6 +1838,7 @@ async fn responses_handler_impl_with_max_attempts(
                                     session_key.clone(),
                                     now,
                                     &mut outcome,
+                                    &WaitClient::Codex,
                                 )
                                 .await;
                                 let resp = layer1.or_else(|| {
@@ -1786,6 +1856,7 @@ async fn responses_handler_impl_with_max_attempts(
                                         starvation_budget,
                                         starvation_heartbeat,
                                         &mut outcome,
+                                        WaitClient::Codex,
                                     )
                                 });
                                 return (resp.unwrap_or_else(no_eligible), outcome);
@@ -1916,6 +1987,7 @@ async fn responses_handler_impl_with_max_attempts(
                                     session_key.clone(),
                                     now,
                                     &mut outcome,
+                                    &WaitClient::Codex,
                                 )
                                 .await;
                                 layer1
@@ -1934,6 +2006,7 @@ async fn responses_handler_impl_with_max_attempts(
                                             starvation_budget,
                                             starvation_heartbeat,
                                             &mut outcome,
+                                            WaitClient::Codex,
                                         )
                                     })
                                     .unwrap_or_else(no_eligible)
@@ -1956,6 +2029,7 @@ async fn responses_handler_impl_with_max_attempts(
                     session_key.clone(),
                     now,
                     &mut outcome,
+                    &WaitClient::Codex,
                 )
                 .await;
                 layer1
@@ -1974,6 +2048,7 @@ async fn responses_handler_impl_with_max_attempts(
                             starvation_budget,
                             starvation_heartbeat,
                             &mut outcome,
+                            WaitClient::Codex,
                         )
                     })
                     .unwrap_or_else(no_eligible)
@@ -2133,7 +2208,53 @@ async fn messages_handler_native(
     };
     let picked = match selector.pick(&snapshots, &sel_ctx) {
         Some(id) => id,
-        None => return (no_eligible(), outcome),
+        None => {
+            // B5-anthropic Task 3: the native `/v1/messages` mirror of `/responses`'s Layer 1 →
+            // Layer 2 → `no_eligible` empty-pool fallthrough (see the `RouteDecision::
+            // NoEligibleAccount` arm above) — same guarded serve-soonest-error-backoff (Layer 1),
+            // then the keepalive recovery-wait (Layer 2), over the SAME Anthropic-only `snapshots`/
+            // `sel_ctx` this handler already built above, but speaking the ANTHROPIC dialect
+            // (`WaitClient::Anthropic`: `event: ping` keepalives, `event: error` terminal frames —
+            // never Codex's `: keepalive`/`response.failed`). `session_key` is `None` throughout:
+            // `NoopContinuity` never derives one on this path (SPEC-M4 §3.7 — no anchor concept for
+            // the Anthropic backend), so there is nothing to key a waiter's wake-jitter beyond the
+            // `layer2_wait_request_key` fallback's own per-wait random draw. Budget/heartbeat are
+            // read straight off `state` (this handler has no test-seam override parameter, unlike
+            // `responses_handler_impl`'s `_for_test_with_starvation_timing` — the REAL e2e harness
+            // drives this through env-resolved `AppState` fields instead, mirroring production).
+            let layer1 = try_layer1_serve_now(
+                &state,
+                &snapshots,
+                selector.as_ref(),
+                &sel_ctx,
+                prepared.req.clone(),
+                ctx.clone(),
+                None,
+                now,
+                &mut outcome,
+                &WaitClient::Anthropic,
+            )
+            .await;
+            let resp = layer1.or_else(|| {
+                try_layer2_recovery_wait(
+                    state.clone(),
+                    &snapshots,
+                    pool.map(|p| p.to_string()),
+                    Provider::Anthropic,
+                    selector.clone(),
+                    &sel_ctx,
+                    prepared.req,
+                    ctx,
+                    None,
+                    now,
+                    state.starvation_wait_budget,
+                    state.starvation_heartbeat,
+                    &mut outcome,
+                    WaitClient::Anthropic,
+                )
+            });
+            return (resp.unwrap_or_else(no_eligible), outcome);
+        }
     };
     state.runtime.record_selected(&picked, now);
     outcome.account_id = Some(picked.as_str().to_string());
