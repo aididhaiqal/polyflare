@@ -14,6 +14,7 @@ pub mod fingerprint_capture;
 pub mod ingress;
 pub mod keys;
 pub mod log_bus;
+pub mod metrics;
 pub mod observability;
 pub mod posture;
 pub mod read_api;
