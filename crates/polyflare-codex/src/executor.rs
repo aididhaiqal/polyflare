@@ -119,23 +119,41 @@ pub(crate) fn ensure_rustls_crypto_provider() {
     });
 }
 
+/// Builds the exact rustls/aws-lc-rs-pinned `reqwest::Client` [`CodexExecutor`] uses, as a free
+/// function so other Codex-egress call sites (the D17 control-forward primitive,
+/// `control_forward::control_forward`) can obtain a byte-for-byte identical TLS fingerprint
+/// without duplicating the builder — see that module's doc for why sharing THIS function (rather
+/// than a second independent builder) matters for fingerprint parity.
+pub fn build_client() -> Result<reqwest::Client, ExecError> {
+    // Must run before the first TLS use so reqwest's rustls backend picks up aws-lc-rs instead
+    // of falling back to ring (see reqwest's `TlsBackend::Rustls` build path).
+    ensure_rustls_crypto_provider();
+    reqwest::Client::builder()
+        // Force rustls: `default-tls` (native-tls) is also compiled in workspace-wide, so
+        // without this the client would silently use native-tls instead.
+        .use_rustls_tls()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| ExecError::Upstream(e.to_string()))
+}
+
 pub struct CodexExecutor {
     client: reqwest::Client,
 }
 
 impl CodexExecutor {
     pub fn new() -> Result<Self, ExecError> {
-        // Must run before the first TLS use so reqwest's rustls backend picks up aws-lc-rs
-        // instead of falling back to ring (see reqwest's `TlsBackend::Rustls` build path).
-        ensure_rustls_crypto_provider();
-        let client = reqwest::Client::builder()
-            // Force rustls: `default-tls` (native-tls) is also compiled in workspace-wide, so
-            // without this the client would silently use native-tls instead.
-            .use_rustls_tls()
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| ExecError::Upstream(e.to_string()))?;
-        Ok(Self { client })
+        Ok(Self {
+            client: build_client()?,
+        })
+    }
+
+    /// The executor's own `reqwest::Client` — a cheap clone (reqwest clients are `Arc`-backed
+    /// internally). Lets a caller that already holds a live `CodexExecutor` (e.g. a future
+    /// control-forward wiring in `polyflare-server`) reuse the SAME pooled client/connections
+    /// instead of building a second one via [`build_client`].
+    pub fn client(&self) -> reqwest::Client {
+        self.client.clone()
     }
 }
 

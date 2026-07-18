@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Json, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{any, post};
 use axum::Router;
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
@@ -191,6 +191,110 @@ impl MockUpstream {
         });
         format!("http://{addr}")
     }
+}
+
+/// One recorded request against a [`MockControlUpstream`]: everything the D17 control-forward
+/// primitive is expected to have sent, so tests can assert on the real values it produced (final
+/// path, method, the `Authorization`/`chatgpt-account-id` headers, the body) rather than just
+/// "did it not panic".
+#[derive(Clone, Debug)]
+pub struct RecordedControlRequest {
+    /// e.g. `"POST"`, `"GET"`.
+    pub method: String,
+    /// The request path as received by the mock, e.g. `"/codex/memories/trace_summarize"` or
+    /// `"/wham/agent-identities/jwks"` — NOT including the mock's own host/port, so a test can
+    /// assert the control-forward primitive built the right join (`/codex/...` vs `/wham/...`).
+    pub path: String,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+}
+
+/// A scriptable mock CONTROL endpoint — the codex "control" surface (`thread/goal/*`,
+/// `agent-identities/jwks`, `memories/trace_summarize`, ...), distinct from the streaming
+/// `/responses` transport [`MockUpstream`] mocks. Serves both the `/codex/*path` and `/wham/*path`
+/// shapes the D17 forward primitive's URL join (`polyflare_codex::control_url`) is required to
+/// produce, records the most recent request's method/path/headers/body, and returns one scripted
+/// status+body+headers response. Mirrors `MockUpstream`'s spawn/record idiom.
+#[derive(Clone)]
+pub struct MockControlUpstream {
+    status: u16,
+    body: Bytes,
+    /// Extra response headers to send verbatim — tests use this to script BOTH an allow-listed
+    /// header (e.g. `etag`) and a non-allow-listed one (e.g. `x-internal-secret`) in the same
+    /// response, to prove the forward primitive's header filter drops the latter.
+    extra_headers: Vec<(String, String)>,
+    last_request: Arc<Mutex<Option<RecordedControlRequest>>>,
+    request_count: Arc<AtomicUsize>,
+}
+
+impl MockControlUpstream {
+    /// A mock that always returns `status` with `body` verbatim, no extra headers.
+    pub fn new(status: u16, body: impl Into<Bytes>) -> Self {
+        Self {
+            status,
+            body: body.into(),
+            extra_headers: Vec::new(),
+            last_request: Arc::new(Mutex::new(None)),
+            request_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Adds one response header the mock will send back, in addition to `status`/`body`. Chainable
+    /// — call repeatedly to script multiple headers (e.g. one allow-listed, one not).
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// The most recently received request, if any.
+    pub fn last_request(&self) -> Option<RecordedControlRequest> {
+        self.last_request.lock().unwrap().clone()
+    }
+
+    /// How many requests the mock has received.
+    pub fn request_count(&self) -> usize {
+        self.request_count.load(Ordering::SeqCst)
+    }
+
+    /// Bind an ephemeral port, serve in a background task, and return the base URL. The returned
+    /// base URL is a bare `http://host:port` — a test's `Account::base_url` should be built as
+    /// `format!("{base}/backend-api/codex")` (or `{base}/backend-api`) to exercise
+    /// `control_url`'s normalization exactly as production `base_url` values do.
+    pub async fn spawn(self) -> String {
+        let app = Router::new()
+            .route("/codex/{*path}", any(control_handler))
+            .route("/wham/{*path}", any(control_handler))
+            .with_state(self);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+}
+
+async fn control_handler(
+    State(mock): State<MockControlUpstream>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    *mock.last_request.lock().unwrap() = Some(RecordedControlRequest {
+        method: method.to_string(),
+        path: uri.path().to_string(),
+        headers,
+        body,
+    });
+    mock.request_count.fetch_add(1, Ordering::SeqCst);
+
+    let mut builder =
+        Response::builder().status(StatusCode::from_u16(mock.status).unwrap_or(StatusCode::OK));
+    for (name, value) in &mock.extra_headers {
+        builder = builder.header(name, value);
+    }
+    builder.body(Body::from(mock.body.clone())).unwrap()
 }
 
 fn sse_frame(payload: &str) -> Bytes {
