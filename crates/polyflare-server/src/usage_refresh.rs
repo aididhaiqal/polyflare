@@ -149,6 +149,7 @@ fn unix_now() -> i64 {
 /// FULL usage-driven health-tier evaluation (`RuntimeStates::evaluate_with_usage`; see that
 /// method's doc for why this is the only site that may promote DRAINING→PROBING). A stale-token
 /// 401 (or any non-2xx) is skipped silently — the next real request refreshes the token.
+#[allow(clippy::too_many_arguments)] // internal fn; B8 Task 4 added the log-bus + metrics emit handles.
 async fn refresh_account(
     repo: &AccountRepo,
     cipher: &TokenCipher,
@@ -157,6 +158,8 @@ async fn refresh_account(
     account: &Account,
     runtime: &RuntimeStates,
     soft_drain_enabled: bool,
+    log_bus: &crate::log_bus::LogBus,
+    health_tier_metrics: &crate::observability::HealthTierMetrics,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tokens = match repo.decrypt_tokens(&account.id, cipher).await? {
         Some(t) => t,
@@ -212,7 +215,7 @@ async fn refresh_account(
     let status_frozen = HEALTH_TIER_FROZEN_STATUSES.contains(&effective_status);
     let (five_hour_used, weekly_used) =
         split_usage_by_duration(rl.primary_window.as_ref(), rl.secondary_window.as_ref());
-    runtime.evaluate_with_usage(
+    let transition = runtime.evaluate_with_usage(
         &AccountId::from(account.id.as_str()),
         five_hour_used,
         weekly_used,
@@ -220,6 +223,19 @@ async fn refresh_account(
         soft_drain_enabled,
         now,
     );
+    // B8 Task 4: the usage-driven edge — the ONLY site that can emit a `usage_drain`, a
+    // `quiet_promote`, or a `disabled_reset`. Emit the content-free health-tier signal only on a
+    // real tier change (`evaluate_with_usage` returns `Some` only then).
+    if let Some(t) = transition {
+        crate::observability::emit_health_tier_signal(
+            log_bus,
+            health_tier_metrics,
+            &account.id,
+            t.from,
+            t.to,
+            t.reason,
+        );
+    }
 
     Ok(())
 }
@@ -249,6 +265,8 @@ pub fn spawn_usage_refresh(state: Arc<AppState>) {
                     account,
                     &state.runtime,
                     state.soft_drain_enabled,
+                    &state.log_bus,
+                    &state.health_tier_metrics,
                 )
                 .await
                 {

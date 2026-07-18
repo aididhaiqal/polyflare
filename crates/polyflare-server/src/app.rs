@@ -101,6 +101,12 @@ pub struct AppState {
     /// `crate::ingress::run_failover_loop` at the same site that emits the
     /// `crate::observability::FailoverSignal` log/event.
     pub failover_metrics: std::sync::Arc<crate::observability::FailoverMetrics>,
+    /// B8 Task 4: content-free counter of health-tier soft-drain TRANSITIONS (see
+    /// `crate::observability::HealthTierMetrics`) — incremented at the same two sites that emit the
+    /// `crate::observability::HealthTierSignal`: `crate::ingress::record_failure` (the error-driven
+    /// funnel edge) and `crate::usage_refresh::refresh_account` (the usage-driven poller edge).
+    /// In-memory only; resets on restart.
+    pub health_tier_metrics: std::sync::Arc<crate::observability::HealthTierMetrics>,
     /// B5 Task 5: the Layer 2 keepalive recovery-wait's bounded wait budget
     /// (`POLYFLARE_STARVATION_WAIT_BUDGET_SECS`, resolved ONCE at startup by
     /// `crate::config::starvation_wait_budget_secs_from_env` — never read per-request). The

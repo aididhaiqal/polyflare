@@ -55,6 +55,36 @@ pub const PROBE_QUIET_SECS: i64 = 60;
 /// Consecutive successes required while PROBING before promotion back to HEALTHY.
 pub const PROBE_SUCCESS_STREAK_REQUIRED: u32 = 3;
 
+/// B8 Task 4: the five FIXED, content-free reason labels a health-tier transition can carry — a
+/// leaf reason code the caller hands to `crate::observability::HealthTierSignal`. Authored HERE (at
+/// the transition edge, where the "why" is unambiguous) rather than reconstructed at the emit site,
+/// but kept as plain `&'static str` data so `runtime_state` takes NO dependency on `observability`.
+/// The poller drove a HEALTHY/PROBING account into DRAINING because usage% crossed a threshold.
+pub const REASON_USAGE_DRAIN: &str = "usage_drain";
+/// An account entered DRAINING because of the error-flapping signal (the funnel always; the poller
+/// when the error condition — not usage — was the sole drain cause).
+pub const REASON_ERROR_DRAIN: &str = "error_drain";
+/// The poller promoted a DRAINING account to PROBING after the quiet timer elapsed below threshold.
+pub const REASON_QUIET_PROMOTE: &str = "quiet_promote";
+/// A PROBING account was promoted back to HEALTHY after its success streak completed.
+pub const REASON_PROBE_PROMOTE: &str = "probe_promote";
+/// The `POLYFLARE_SOFT_DRAIN_ENABLED=0` disable lever forced a non-HEALTHY account back to HEALTHY.
+pub const REASON_DISABLED_RESET: &str = "disabled_reset";
+
+/// B8 Task 4: one actual health-tier change (`from != to`), returned UPWARD by the funnel /
+/// poller methods so the CALLER — which owns the `log_bus` + `HealthTierMetrics` handles — emits the
+/// content-free `crate::observability::HealthTierSignal`. Returned as `Some` ONLY when a real tier
+/// transition was applied; a no-op evaluation (tier unchanged, or a refused funnel promotion)
+/// returns `None`, so a caller emits exactly once per genuine transition, never per mere evaluation.
+/// Carries no usage/error content — just the two tier numbers and a fixed [`REASON_USAGE_DRAIN`]-
+/// class label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthTierTransition {
+    pub from: u8,
+    pub to: u8,
+    pub reason: &'static str,
+}
+
 /// Wall-clock seconds since the Unix epoch. `record_success`'s signature is fixed (callers, e.g.
 /// `watchdog.rs`, invoke it with no `now` param — out of this task's file scope to change), but the
 /// PROBING-streak / error-driven health-tier evaluation it now performs needs a clock reading. Mirrors
@@ -142,20 +172,42 @@ impl RuntimeState {
     /// edge (HEALTHY→DRAINING, PROBING→DRAINING, PROBING→HEALTHY via streak, and any no-op) is
     /// safe to apply from the error-only view because it only ever moves the tier toward MORE
     /// drained, or completes an already-independently-tracked probe streak.
-    fn apply_funnel_transition(&mut self, should_drain: bool, now: i64) {
+    ///
+    /// B8 Task 4: returns the applied [`HealthTierTransition`] (with a funnel-appropriate reason)
+    /// when the tier actually changed, so the CALLER can emit the content-free observability signal;
+    /// `None` on a no-op or on the refused DRAINING→PROBING promotion. The funnel only ever produces
+    /// an ENTERING-DRAINING edge (`to == 1` ⇒ [`REASON_ERROR_DRAIN`], since it can only see the error
+    /// signal) or a PROBING→HEALTHY streak completion (`to == 0` ⇒ [`REASON_PROBE_PROMOTE`]); it can
+    /// never produce a usage-drain or a quiet-promote (that's the poller's exclusive province).
+    fn apply_funnel_transition(&mut self, should_drain: bool, now: i64) -> Option<HealthTierTransition> {
+        let from = self.health_tier;
         let new_tier = evaluate_health_tier(
-            self.health_tier,
+            from,
             should_drain,
             self.drain_entered_at,
             self.probe_success_streak,
             false, // frozen: the funnel only fires on completed/failed requests, i.e. not blocked.
             now,
         );
-        if self.health_tier == 1 && new_tier == 2 {
+        if from == 1 && new_tier == 2 {
             // THE CARE POINT: never let an error-only view promote DRAINING -> PROBING.
-            return;
+            return None;
         }
         self.transition(new_tier, now);
+        if from == new_tier {
+            return None;
+        }
+        let reason = match new_tier {
+            1 => REASON_ERROR_DRAIN,
+            0 => REASON_PROBE_PROMOTE,
+            // Unreachable from the funnel (it refuses ->PROBING and never usage-drains); defensive.
+            _ => return None,
+        };
+        Some(HealthTierTransition {
+            from,
+            to: new_tier,
+            reason,
+        })
     }
 }
 
@@ -289,21 +341,29 @@ impl RuntimeStates {
     }
 
     /// Apply `f` to `id`'s entry (creating it from default), then drop it if it decayed back to
-    /// neutral so the map stays bounded.
-    fn mutate(&self, id: &AccountId, f: impl FnOnce(&mut RuntimeState)) {
+    /// neutral so the map stays bounded. Returns whatever `f` produced (B8 Task 4: the funnel/poller
+    /// methods return the applied [`HealthTierTransition`] through this seam so the caller can emit
+    /// the observability signal — the return is captured BEFORE the neutral-GC check).
+    fn mutate<R>(&self, id: &AccountId, f: impl FnOnce(&mut RuntimeState) -> R) -> R {
         let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let entry = map.entry(id.clone()).or_default();
-        f(entry);
+        let out = f(entry);
         if entry.is_neutral() {
             map.remove(id);
         }
+        out
     }
 
     /// Record a rate-limit (429) hit: bump the error count, stamp the error time, and bench the
     /// account until `now + delay` (floored at [`RATE_LIMITED_MIN_COOLDOWN_SECS`]). `retry_after` is
     /// the upstream `Retry-After`, if any; absent ⇒ exponential backoff on the new error count. The
     /// LATER of an existing cooldown and the new one wins (never shorten a bench).
-    pub fn record_rate_limit(&self, id: &AccountId, retry_after: Option<i64>, now: i64) {
+    pub fn record_rate_limit(
+        &self,
+        id: &AccountId,
+        retry_after: Option<i64>,
+        now: i64,
+    ) -> Option<HealthTierTransition> {
         self.mutate(id, |rt| {
             rt.error_count = rt.error_count.saturating_add(1);
             rt.last_error_at = Some(now);
@@ -323,8 +383,8 @@ impl RuntimeStates {
             }
             let should_drain =
                 compute_should_drain(None, None, rt.error_count, rt.last_error_at, now);
-            rt.apply_funnel_transition(should_drain, now);
-        });
+            rt.apply_funnel_transition(should_drain, now)
+        })
     }
 
     /// Record a quota-exceeded hit: bench for [`QUOTA_EXCEEDED_COOLDOWN_SECS`] WITHOUT bumping
@@ -366,7 +426,7 @@ impl RuntimeStates {
 
     /// Record a transient error (5xx / connection): bump the error count + stamp the time. No
     /// cooldown — the selector's error-backoff gate (`error_count ≥ 3`) handles exclusion.
-    pub fn record_transient_error(&self, id: &AccountId, now: i64) {
+    pub fn record_transient_error(&self, id: &AccountId, now: i64) -> Option<HealthTierTransition> {
         self.mutate(id, |rt| {
             rt.error_count = rt.error_count.saturating_add(1);
             rt.last_error_at = Some(now);
@@ -377,8 +437,8 @@ impl RuntimeStates {
             }
             let should_drain =
                 compute_should_drain(None, None, rt.error_count, rt.last_error_at, now);
-            rt.apply_funnel_transition(should_drain, now);
-        });
+            rt.apply_funnel_transition(should_drain, now)
+        })
     }
 
     /// Record a successful completion: clear the error state (error_count → 0, last_error_at → None)
@@ -396,7 +456,7 @@ impl RuntimeStates {
     /// point still applies here too: it refuses to let this call promote an unrelated DRAINING
     /// account to PROBING (see its doc) — only the PROBING->HEALTHY streak edge, or a no-op, can
     /// result from a success.
-    pub fn record_success(&self, id: &AccountId) {
+    pub fn record_success(&self, id: &AccountId) -> Option<HealthTierTransition> {
         self.mutate(id, |rt| {
             rt.error_count = 0;
             rt.last_error_at = None;
@@ -406,8 +466,8 @@ impl RuntimeStates {
             let now = unix_now();
             let should_drain =
                 compute_should_drain(None, None, rt.error_count, rt.last_error_at, now);
-            rt.apply_funnel_transition(should_drain, now);
-        });
+            rt.apply_funnel_transition(should_drain, now)
+        })
     }
 
     /// B8 Task 3: the FULL (usage + error) health-tier evaluation, run by the usage-refresh
@@ -445,13 +505,18 @@ impl RuntimeStates {
         status_frozen: bool,
         enabled: bool,
         now: i64,
-    ) {
+    ) -> Option<HealthTierTransition> {
         self.mutate(id, |rt| {
             if !enabled {
                 // Disable lever: force HEALTHY + clear aux, unconditionally. Deliberately leaves
                 // error_count/last_error_at alone — the funnel owns those.
+                let from = rt.health_tier;
                 rt.transition(0, now);
-                return;
+                return (from != 0).then_some(HealthTierTransition {
+                    from,
+                    to: 0,
+                    reason: REASON_DISABLED_RESET,
+                });
             }
             let should_drain = compute_should_drain(
                 used_percent,
@@ -460,8 +525,9 @@ impl RuntimeStates {
                 rt.last_error_at,
                 now,
             );
+            let from = rt.health_tier;
             let new_tier = evaluate_health_tier(
-                rt.health_tier,
+                from,
                 should_drain,
                 rt.drain_entered_at,
                 rt.probe_success_streak,
@@ -469,7 +535,33 @@ impl RuntimeStates {
                 now,
             );
             rt.transition(new_tier, now);
-        });
+            if from == new_tier {
+                return None;
+            }
+            // B8 Task 4 reason mapping at the poller edge. An ENTERING-DRAINING edge is labelled by
+            // WHICH signal caused it: recompute the usage-only `should_drain` (error_count=0) — if
+            // usage alone would drain, it's a `usage_drain`, else the lingering error state is the
+            // cause (`error_drain`). The two promotions are unambiguous.
+            let reason = match new_tier {
+                1 => {
+                    let usage_only =
+                        compute_should_drain(used_percent, secondary_percent, 0, None, now);
+                    if usage_only {
+                        REASON_USAGE_DRAIN
+                    } else {
+                        REASON_ERROR_DRAIN
+                    }
+                }
+                2 => REASON_QUIET_PROMOTE,
+                0 => REASON_PROBE_PROMOTE,
+                _ => return None,
+            };
+            Some(HealthTierTransition {
+                from,
+                to: new_tier,
+                reason,
+            })
+        })
     }
 
     /// Stamp the last-selected time (the `round_robin` tiebreak + a liveness marker). Cheap; called

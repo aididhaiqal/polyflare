@@ -319,6 +319,128 @@ impl StarvationSignal<'_> {
     }
 }
 
+/// B8 Task 4: a process-global, content-free counter of health-tier soft-drain TRANSITIONS (an
+/// account actually changing tier — HEALTHY↔DRAINING↔PROBING). In memory only (like
+/// `FailoverMetrics`/`StarvationMetrics`/`RuntimeStates`/`LogBus`) — resets on restart. Incremented
+/// exactly ONCE per real tier change (`from != to`) actually applied by the runtime funnel or the
+/// usage poller — never per mere evaluation that leaves the tier where it was — so its total is the
+/// soft-drain churn RATE an operator can watch (codex-lb drained invisibly; this is the visibility
+/// the porting doc calls for).
+#[derive(Default)]
+pub struct HealthTierMetrics {
+    total: AtomicU64,
+}
+
+impl HealthTierMetrics {
+    /// A fresh, zeroed counter, `Arc`-wrapped to match `FailoverMetrics::new`'s / `StarvationMetrics::new`'s
+    /// `AppState`-field shape.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Records one health-tier transition, returning the new total.
+    pub fn record(&self) -> u64 {
+        self.total.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The current total (test/dashboard read path).
+    pub fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+}
+
+/// B8 Task 4: the content-free signal for one actual health-tier soft-drain transition (a real
+/// `from != to` tier change — an account entering/leaving DRAINING or PROBING). Carries ONLY a
+/// fixed reason-code label (see below — never a raw upstream message/body/usage number), the single
+/// account row id involved (a content-free identifier, same class as `RequestLog::account_id` /
+/// `FailoverSignal`'s ids), and the two tier NUMBERS (`0` HEALTHY / `1` DRAINING / `2` PROBING).
+/// NEVER a body/message/frame/token, and never a raw usage percentage — a leak here is Critical (see
+/// the plan's Global Constraints content-safety rule).
+///
+/// `reason` is one of five FIXED `&'static str` labels chosen at the transition edge:
+/// - `"usage_drain"`  — the poller drove a HEALTHY/PROBING account into DRAINING because usage% hit
+///   a threshold.
+/// - `"error_drain"`  — an account entered DRAINING because of the error-flapping signal (the
+///   runtime funnel, or the poller when only the error condition — not usage — was true).
+/// - `"quiet_promote"`— the poller promoted a DRAINING account to PROBING after the quiet timer
+///   elapsed with usage back below threshold.
+/// - `"probe_promote"`— a PROBING account was promoted back to HEALTHY after its success streak
+///   completed.
+/// - `"disabled_reset"`— the `POLYFLARE_SOFT_DRAIN_ENABLED=0` disable lever forced a non-HEALTHY
+///   account back to HEALTHY.
+///
+/// Emitted (via [`emit_health_tier_signal`]) from exactly two call sites that own the log
+/// bus/metrics handles: `crate::ingress::record_failure` (the error-driven funnel edge) and
+/// `crate::usage_refresh::refresh_account` (the usage-driven poller edge).
+pub struct HealthTierSignal<'a> {
+    pub account_id: &'a str,
+    pub from_tier: u8,
+    pub to_tier: u8,
+    pub reason: &'static str,
+}
+
+impl HealthTierSignal<'_> {
+    /// Emits the structured `tracing` event (target `polyflare_server::health_tier`, isolable from
+    /// other crates' traffic exactly like `RequestLog::emit`/`FailoverSignal::emit`'s own targets).
+    pub fn emit(&self) {
+        tracing::warn!(
+            target: "polyflare_server::health_tier",
+            reason = self.reason,
+            account_id = self.account_id,
+            from_tier = self.from_tier,
+            to_tier = self.to_tier,
+            "health-tier transition"
+        );
+    }
+
+    /// The content-free live-log-bus form (see `crate::log_bus`) — same sink `RequestLog`/
+    /// `FailoverSignal`/`StarvationSignal` feed, so the dashboard's live log stream shows soft-drain
+    /// transitions inline. `message` is built ENTIRELY from the fixed reason code + the account id +
+    /// the two tier numbers — never from request/response content or a raw usage percentage.
+    pub fn to_log_event(&self) -> LogEvent {
+        LogEvent {
+            ts_ms: log_bus::now_ms(),
+            level: LogLevel::Warn,
+            provider: None,
+            account: Some(self.account_id.to_string()),
+            model: None,
+            status: None,
+            latency_ms: None,
+            kind: "health_tier".to_string(),
+            message: format!(
+                "health_tier reason={} account={} from={} to={}",
+                self.reason, self.account_id, self.from_tier, self.to_tier
+            ),
+        }
+    }
+}
+
+/// B8 Task 4: emit one [`HealthTierSignal`] — the `tracing` event, the `log_bus` event, and the
+/// [`HealthTierMetrics`] bump — at a single call site, mirroring the exact triple
+/// `crate::ingress::emit_starvation_signal` / `run_failover_loop` already perform for their signals
+/// (`emit()` + `log_bus.publish(..)` + `metrics.record()`, together, at the real transition). Takes
+/// primitives (never the `runtime_state` transition struct) so `observability` stays free of a
+/// `runtime_state` dependency. Called ONLY on an actual tier change (`from != to`); the callers pass
+/// a transition they already confirmed non-empty.
+pub fn emit_health_tier_signal(
+    log_bus: &crate::log_bus::LogBus,
+    metrics: &HealthTierMetrics,
+    account_id: &str,
+    from_tier: u8,
+    to_tier: u8,
+    reason: &'static str,
+) {
+    let signal = HealthTierSignal {
+        account_id,
+        from_tier,
+        to_tier,
+        reason,
+    };
+    signal.emit();
+    log_bus.publish(signal.to_log_event());
+    metrics.record();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,6 +744,89 @@ mod tests {
             assert!(
                 !ev.message.to_lowercase().contains(forbidden),
                 "forbidden content `{forbidden}` leaked into starvation log event: {}",
+                ev.message
+            );
+        }
+    }
+
+    #[test]
+    fn health_tier_metrics_counts_exactly_the_recorded_events() {
+        let m = HealthTierMetrics::new();
+        assert_eq!(m.total(), 0, "starts at zero");
+        assert_eq!(m.record(), 1);
+        assert_eq!(m.record(), 2);
+        assert_eq!(m.total(), 2);
+    }
+
+    /// The health-tier signal's `tracing` event carries reason + the account id + the two tier
+    /// numbers ONLY — this is the content-safety-critical assertion: a leak here (a body, a token,
+    /// or a raw usage percentage) is Critical per the plan's Global Constraints.
+    #[test]
+    fn health_tier_signal_event_carries_only_reason_id_and_tiers() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let dispatch =
+            tracing::Dispatch::new(Capture(captured.clone(), "polyflare_server::health_tier"));
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            HealthTierSignal {
+                account_id: "acct-a",
+                from_tier: 0,
+                to_tier: 1,
+                reason: "usage_drain",
+            }
+            .emit();
+        });
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1, "expected exactly one health-tier event");
+        let line = &events[0];
+        for expected in [
+            "reason=usage_drain",
+            "account_id=acct-a",
+            "from_tier=0",
+            "to_tier=1",
+        ] {
+            assert!(line.contains(expected), "missing `{expected}` in: {line}");
+        }
+        // Never a body/token/session/usage percentage.
+        for forbidden in [
+            "bearer", "token", "sess_", "session", "percent", "used", "body", "content",
+        ] {
+            assert!(
+                !line.to_lowercase().contains(forbidden),
+                "forbidden content `{forbidden}` leaked into health-tier event: {line}"
+            );
+        }
+    }
+
+    /// The health-tier signal's `LogEvent` (dashboard live-log form) must never carry a body,
+    /// message, frame, or usage number — only the reason code, account id, and tier numbers,
+    /// exactly like the `tracing` event.
+    #[test]
+    fn health_tier_signal_log_event_is_content_free() {
+        let ev = HealthTierSignal {
+            account_id: "acct-a",
+            from_tier: 1,
+            to_tier: 2,
+            reason: "quiet_promote",
+        }
+        .to_log_event();
+
+        assert_eq!(ev.kind, "health_tier");
+        assert_eq!(ev.account.as_deref(), Some("acct-a"));
+        assert_eq!(ev.model, None);
+        assert_eq!(ev.status, None);
+        assert!(ev.message.contains("reason=quiet_promote"));
+        assert!(ev.message.contains("account=acct-a"));
+        assert!(ev.message.contains("from=1"));
+        assert!(ev.message.contains("to=2"));
+
+        for forbidden in [
+            "bearer", "body", "content", "delta", "text", "input", "percent", "used", "message\":",
+        ] {
+            assert!(
+                !ev.message.to_lowercase().contains(forbidden),
+                "forbidden content `{forbidden}` leaked into health-tier log event: {}",
                 ev.message
             );
         }
