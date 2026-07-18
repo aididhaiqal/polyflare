@@ -28,7 +28,7 @@ fn plan_alias(normalized: &str) -> Option<&'static str> {
 /// (usage/__init__.py:31-40): normalize (`trim().to_lowercase()`), apply the alias map, then map to
 /// capacity. An empty or unrecognized plan falls back to the `free` tier (1134.0) —
 /// `UNKNOWN_PLAN_FALLBACK = "free"` in codex-lb, NOT the plus tier.
-fn plan_capacity_secondary(plan: &str) -> f64 {
+pub fn plan_capacity_secondary(plan: &str) -> f64 {
     let normalized = plan.trim().to_lowercase();
     // resolved = alias(normalized) OR (normalized if non-empty else "free") — logic.py:352.
     let resolved = match plan_alias(&normalized) {

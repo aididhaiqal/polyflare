@@ -355,12 +355,16 @@ struct Point {
 /// `GET /api/accounts/{id}/trends` response: the account's 7-day usage history split by window,
 /// ordered oldest-first. An account with no `usage_history` rows in range gets empty arrays (still
 /// `200`, not `404` — the account may simply be quiet, not missing). The `secondaryScheduled` plan
-/// line is out of scope here (a later phase).
+/// line is out of scope here (a later phase). `forecast` (D16 T5) is the secondary-window EWMA
+/// depletion forecast rebuilt from the full history — `None` when there are fewer than 2 samples,
+/// the rate never establishes, or the window has already reset. Content-free: numeric fields + a
+/// `RiskLevel` enum only (see `polyflare_core::depletion::DepletionForecast`).
 #[derive(Serialize)]
 struct TrendsView {
     account_id: String,
     primary: Vec<Point>,
     secondary: Vec<Point>,
+    forecast: Option<polyflare_core::depletion::DepletionForecast>,
 }
 
 /// Lookback for `/api/accounts/{id}/trends`: 7 days.
@@ -399,10 +403,32 @@ pub async fn account_trends_handler(
         }
     }
 
+    // Build the per-account secondary-window depletion forecast (content-free) from the FULL
+    // history — `usage_history_since` above drops `reset_at`/`window_minutes`, which the EWMA
+    // assembler needs, so this re-queries via `usage_history_full_since` (same lookback).
+    let full_rows = state
+        .store
+        .accounts()
+        .usage_history_full_since(&id, now - TRENDS_LOOKBACK_SECS)
+        .await
+        .unwrap_or_default();
+    let samples: Vec<polyflare_core::depletion::UsageSample> = full_rows
+        .iter()
+        .filter(|(w, _)| w == "secondary")
+        .map(|(_, u)| polyflare_core::depletion::UsageSample {
+            used_percent: u.used_percent,
+            reset_at: u.reset_at,
+            window_minutes: u.window_minutes,
+            recorded_at: u.recorded_at,
+        })
+        .collect();
+    let forecast = polyflare_core::depletion::compute_depletion_for_account(&samples, now);
+
     Response::ok(TrendsView {
         account_id: id,
         primary,
         secondary,
+        forecast,
     })
 }
 
@@ -482,6 +508,81 @@ pub async fn pools_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
         views.push(to_view(None, counts));
     }
     Response::ok(views)
+}
+
+/// `GET /api/pace` — pool-wide WeeklyCreditPace forecast (admin-gated). `{ "pace": null }` when
+/// there is no eligible, fresh, positive-capacity account. Content-free: credits/percentages/hours/
+/// counts + status/confidence enums only — NEVER any email or conversation content.
+pub async fn pace_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let now = unix_now();
+    let snapshots = match state.account_cache.snapshots(&state.store).await {
+        Ok(s) => s,
+        Err(_) => return Response::error(),
+    };
+    let mut snapshots = (*snapshots).clone();
+    state.runtime.overlay(&mut snapshots, now);
+
+    let mut inputs: Vec<polyflare_core::weekly_pace::PaceAccountInput> = Vec::new();
+    for snap in &snapshots {
+        // secondary-window capacity: per-account override else plan-derived (same rule select.rs uses).
+        let full_credits = snap
+            .capacity_credits
+            .unwrap_or_else(|| polyflare_core::select::plan_capacity_secondary(&snap.plan_type));
+        // latest secondary usage for reset_at + window_minutes; full history for burn/smoothing.
+        // One extra SELECT per account — acceptable on this admin-gated, human-triggered read (not
+        // the hot proxy path); do NOT add caching here (see task notes).
+        let full_rows = state
+            .store
+            .accounts()
+            .usage_history_full_since(
+                snap.id.as_str(),
+                now - polyflare_core::weekly_pace::RECENT_BURN_WINDOW_SECS,
+            )
+            .await
+            .unwrap_or_default();
+        let secondary_history: Vec<polyflare_core::depletion::UsageSample> = full_rows
+            .iter()
+            .filter(|(w, _)| w == "secondary")
+            .map(|(_, u)| polyflare_core::depletion::UsageSample {
+                used_percent: u.used_percent,
+                reset_at: u.reset_at,
+                window_minutes: u.window_minutes,
+                recorded_at: u.recorded_at,
+            })
+            .collect();
+        let latest = state
+            .store
+            .accounts()
+            .latest_usage(snap.id.as_str())
+            .await
+            .ok()
+            .and_then(|u| u.secondary);
+        let (reset_at, window_minutes) = match latest {
+            Some(w) => (w.reset_at, w.window_minutes),
+            None => (None, None),
+        };
+        inputs.push(polyflare_core::weekly_pace::PaceAccountInput {
+            account_id: snap.id.as_str().to_string(),
+            status_eligible: matches!(
+                snap.status.as_str(),
+                "active" | "rate_limited" | "quota_exceeded"
+            ),
+            full_credits,
+            used_percent: snap.secondary_used_percent,
+            reset_at,
+            window_minutes,
+            secondary_history,
+        });
+    }
+
+    // 600s = the usage poller's REFRESH_INTERVAL; 30 = codex-lb's default smoothing window.
+    let report = polyflare_core::weekly_pace::build_weekly_credit_pace(&inputs, now, 600, 30);
+    Response::ok(PaceView { pace: report })
+}
+
+#[derive(Serialize)]
+struct PaceView {
+    pace: Option<polyflare_core::weekly_pace::WeeklyCreditPaceReport>,
 }
 
 /// One request-log row for the dashboard: content-free by construction (the same audited field set

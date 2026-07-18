@@ -10,7 +10,7 @@
 use crate::depletion::{ewma_update, EwmaState, UsageSample, DEFAULT_ALPHA};
 use serde::Serialize;
 
-pub(crate) const RECENT_BURN_WINDOW_SECS: i64 = 6 * 3600;
+pub const RECENT_BURN_WINDOW_SECS: i64 = 6 * 3600;
 pub(crate) const MIN_FRESHNESS_SECS: f64 = 300.0;
 pub(crate) const FRESHNESS_MISSED_REFRESH_CYCLES: f64 = 3.0;
 pub(crate) const PRO_WEEKLY_CAPACITY_CREDITS: f64 = 50_400.0;
