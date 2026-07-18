@@ -45,6 +45,74 @@ pub struct ServeConfig {
     pub ws_upstream: bool,
 }
 
+/// TA6(b) Task 5: the one capability name resolved today. A pool tagged with this capability (via
+/// `POLYFLARE_POOL_CAPABILITIES`) or a request carrying the matching `CAPABILITY_HEADER` value
+/// requires `security_work_authorized` accounts — the selector's existing hard filter
+/// (`select.rs:294,454`) already enforces it; this module only RESOLVES whether a given turn needs
+/// it, proactively, without waiting for a `cyber_policy` rejection.
+pub const SECURITY_WORK_CAPABILITY: &str = "security_work";
+
+/// TA6(a)'s proactive-precedence-1 header: a request carrying
+/// `X-PolyFlare-Capability: security_work` pre-filters to capability-holding accounts from turn 1.
+/// `HeaderMap::get` is case-insensitive, so the exact casing here doesn't matter at the call site.
+pub const CAPABILITY_HEADER: &str = "x-polyflare-capability";
+
+/// Parse `POLYFLARE_POOL_CAPABILITIES` — a comma-separated list of `slug:capability` pairs (e.g.
+/// `cyber:security_work`). Whitespace around each token is tolerated; empty segments are skipped.
+/// A malformed pair, an empty slug, or an empty capability is a hard error — mirrors
+/// `parse_pool_strategies`'s fail-fast tolerance. This is the pool-tagging mechanism TA6(b) calls
+/// for (DESIGN-DECISIONS.md): the pool declares the requirement, the per-account
+/// `security_work_authorized` flag declares who satisfies it — self-enforcing, since the selector
+/// filters out any non-authorized account even if it's misplaced into a tagged pool.
+fn parse_pool_capabilities(raw: &str) -> Result<HashMap<String, String>, String> {
+    let mut map = HashMap::new();
+    for pair in raw.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (slug, cap) = pair.split_once(':').ok_or_else(|| {
+            format!("POLYFLARE_POOL_CAPABILITIES: expected 'slug:capability', got '{pair}'")
+        })?;
+        let slug = slug.trim();
+        let cap = cap.trim();
+        if slug.is_empty() {
+            return Err(format!(
+                "POLYFLARE_POOL_CAPABILITIES: empty pool slug in '{pair}'"
+            ));
+        }
+        if cap.is_empty() {
+            return Err(format!(
+                "POLYFLARE_POOL_CAPABILITIES: empty capability in '{pair}'"
+            ));
+        }
+        map.insert(slug.to_string(), cap.to_string());
+    }
+    Ok(map)
+}
+
+/// Resolves whether `pool` requires `capability`, per `POLYFLARE_POOL_CAPABILITIES` — read FRESH
+/// on every call (no caching, no persistence): TA6(b) Task 5 is a per-turn resolution from
+/// deployment config, not a stamp, so there is nothing to invalidate or race on. `pool: None` (the
+/// bare, unpooled routes) never requires a capability from this source — only a named pool can be
+/// tagged. A malformed env value fails OPEN on this signal only (treated as "no requirement"): it
+/// never lowers the selector's hard capability filter, and Task 2's reactive move still catches a
+/// genuine `cyber_policy` rejection regardless of this proactive signal, so a startup-time crash
+/// isn't needed for correctness here the way it is for `POLYFLARE_ROUTING_STRATEGY`.
+pub fn pool_requires_capability(pool: Option<&str>, capability: &str) -> bool {
+    let Some(pool) = pool.filter(|p| !p.is_empty()) else {
+        return false;
+    };
+    let raw = match std::env::var("POLYFLARE_POOL_CAPABILITIES") {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    match parse_pool_capabilities(&raw) {
+        Ok(map) => map.get(pool).is_some_and(|c| c == capability),
+        Err(_) => false,
+    }
+}
+
 /// Parse `POLYFLARE_POOL_STRATEGY` — a comma-separated list of `slug=strategy` pairs. Whitespace
 /// around each token is tolerated; empty segments are skipped. An unknown strategy name or a
 /// malformed pair is a hard error (fail fast at startup rather than silently misroute a pool).
@@ -179,5 +247,26 @@ mod tests {
             "empty slug → err"
         );
         assert!(parse_pool_strategies("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_pool_capabilities_reads_pairs_and_rejects_bad_input() {
+        let m = parse_pool_capabilities("cyber:security_work, other : some_cap ,").unwrap();
+        assert_eq!(m.get("cyber"), Some(&"security_work".to_string()));
+        assert_eq!(m.get("other"), Some(&"some_cap".to_string()));
+        assert_eq!(m.len(), 2, "trailing empty segment skipped");
+        assert!(
+            parse_pool_capabilities("nocolon").is_err(),
+            "malformed pair → err"
+        );
+        assert!(
+            parse_pool_capabilities(":security_work").is_err(),
+            "empty slug → err"
+        );
+        assert!(
+            parse_pool_capabilities("cyber:").is_err(),
+            "empty capability → err"
+        );
+        assert!(parse_pool_capabilities("").unwrap().is_empty());
     }
 }
