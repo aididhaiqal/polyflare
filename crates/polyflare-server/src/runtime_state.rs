@@ -192,6 +192,17 @@ impl RuntimeStates {
     pub fn record_selected(&self, id: &AccountId, now: i64) {
         self.mutate(id, |rt| rt.last_selected_at = Some(now));
     }
+
+    /// TEST-ONLY seam (B5 Task 4 adversarial review, FIX 3): stamp `cooldown_until` on an account's
+    /// runtime entry directly, bypassing [`Self::record_rate_limit`]'s [`RATE_LIMITED_MIN_COOLDOWN_SECS`]
+    /// floor. That floor makes a short, test-scale in-memory cooldown unrepresentable via the normal
+    /// recording API — exactly what's needed to exercise `overlay`'s elapsed-`cooldown_until` DROP
+    /// (this module's doc, and the `overlay` body above) on a fast test timescale, distinctly from
+    /// the durable `rate_limited`/`reset_at` gate (`select.rs::eligibility`). No production call site
+    /// uses this; it exists solely for `polyflare-server`'s integration test suite.
+    pub fn set_cooldown_until_for_test(&self, id: &AccountId, cooldown_until: i64) {
+        self.mutate(id, |rt| rt.cooldown_until = Some(cooldown_until));
+    }
 }
 
 #[cfg(test)]
