@@ -206,6 +206,8 @@ mod tests {
             runtime: Default::default(),
             inflight_penalty_pct: 2.5,
             lease_metrics: crate::observability::LeaseMetrics::new(),
+            upstream_request_metrics: crate::observability::UpstreamRequestMetrics::new(),
+            rate_limit_metrics: crate::observability::RateLimitMetrics::new(),
         })
     }
 
