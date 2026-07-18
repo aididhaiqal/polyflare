@@ -114,19 +114,26 @@ fn input_shape(input: Option<&RawValue>) -> (u32, bool) {
     }
 }
 
-/// Derive the session key: `x-codex-turn-state` ⇒ Hard; else a session header (+ `prompt_cache_key`
-/// isolating threads) ⇒ Hard; else a soft key from `x-request-id` / `prompt_cache_key` / a content
-/// hash of the raw `input`. Values are hashed so no raw header/content is stored.
-fn derive_session_key(
-    headers: &HeaderMap,
-    prompt_cache_key: Option<&str>,
-    input: Option<&RawValue>,
-) -> SessionKey {
+/// The HARD-strength half of session-key derivation: hashes `x-codex-turn-state` (with an optional
+/// `prompt_cache_key` suffix isolating threads), else a session header (`session_id` /
+/// `x-session-id`, same suffix rule). Returns `None` when NEITHER header is present — deliberately
+/// does NOT fall through to the soft (`x-request-id` / content-hash) derivation, because that
+/// fallback exists to give every native `/responses` turn *some* stable key even absent a real
+/// session header; control requests have no such requirement (D17 plan, Global Constraints: "SOFT
+/// affinity ... No session header ⇒ select ANY eligible account" — the ABSENCE of a session header
+/// is exactly the fallback trigger, so a manufactured soft key here would spuriously report
+/// "session present" for a request that carries none).
+///
+/// Byte-identical hashing to [`derive_session_key`]'s two Hard branches — [`derive_session_key`] is
+/// implemented in terms of this fn plus its own soft fallback, so a `/responses` turn and a control
+/// request presenting the SAME `x-codex-turn-state`/`session_id` header always hash to the same
+/// [`SessionKey::value`] and therefore resolve the same continuity-session row.
+pub fn header_session_key(headers: &HeaderMap, prompt_cache_key: Option<&str>) -> Option<SessionKey> {
     if let Some(ts) = header_str(headers, "x-codex-turn-state") {
-        return SessionKey {
+        return Some(SessionKey {
             value: sha256_hex(format!("turn:{ts}").as_bytes()),
             strength: KeyStrength::Hard,
-        };
+        });
     }
     if let Some(sess) =
         header_str(headers, "session_id").or_else(|| header_str(headers, "x-session-id"))
@@ -135,10 +142,24 @@ fn derive_session_key(
         if let Some(pck) = prompt_cache_key {
             raw = format!("{raw}:{pck}");
         }
-        return SessionKey {
+        return Some(SessionKey {
             value: sha256_hex(format!("session:{raw}").as_bytes()),
             strength: KeyStrength::Hard,
-        };
+        });
+    }
+    None
+}
+
+/// Derive the session key: `x-codex-turn-state` ⇒ Hard; else a session header (+ `prompt_cache_key`
+/// isolating threads) ⇒ Hard; else a soft key from `x-request-id` / `prompt_cache_key` / a content
+/// hash of the raw `input`. Values are hashed so no raw header/content is stored.
+fn derive_session_key(
+    headers: &HeaderMap,
+    prompt_cache_key: Option<&str>,
+    input: Option<&RawValue>,
+) -> SessionKey {
+    if let Some(hard) = header_session_key(headers, prompt_cache_key) {
+        return hard;
     }
     // Soft fallback: `x-request-id`, else `prompt_cache_key`, else a hash of the raw `input` text.
     // (The last-ditch content hash uses the raw JSON slice rather than a canonicalized re-serialize
@@ -415,6 +436,30 @@ mod tests {
         let ctx = ctx_of(&hdr(&[]), serde_json::json!({"model": "m", "input": null}));
         assert_eq!(ctx.input_count, 1);
         assert!(!ctx.is_full_resend);
+    }
+
+    #[test]
+    fn header_session_key_is_none_with_no_session_header() {
+        // No `x-codex-turn-state`/`session_id`/`x-session-id` ⇒ None, NOT a manufactured soft key
+        // (control's affinity resolution reads this `None` as "no session header present").
+        assert!(header_session_key(&hdr(&[]), None).is_none());
+        assert!(header_session_key(&hdr(&[("x-request-id", "req-1")]), None).is_none());
+    }
+
+    #[test]
+    fn header_session_key_matches_derive_session_key_for_hard_headers() {
+        // A control request and a `/responses` turn presenting the SAME session header must hash
+        // to the identical `SessionKey.value` so they resolve the same continuity-session row.
+        let h = hdr(&[("x-codex-turn-state", "ts-abc")]);
+        let via_header_fn = header_session_key(&h, None).unwrap();
+        let via_full_derive = derive_session_key(&h, None, None);
+        assert_eq!(via_header_fn.value, via_full_derive.value);
+        assert_eq!(via_header_fn.strength, KeyStrength::Hard);
+
+        let h2 = hdr(&[("session_id", "sess-1")]);
+        let via_header_fn2 = header_session_key(&h2, Some("thread-1")).unwrap();
+        let via_full_derive2 = derive_session_key(&h2, Some("thread-1"), None);
+        assert_eq!(via_header_fn2.value, via_full_derive2.value);
     }
 
     #[test]

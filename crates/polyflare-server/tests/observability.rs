@@ -75,6 +75,7 @@ async fn spawn_polyflare(store: Store, upstream: String) -> String {
     let state = Arc::new(AppState {
         enforce_client_keys: false,
         codex_executor,
+        control_client: polyflare_codex::build_client().expect("build control_client"),
         anthropic_executor,
         selector: Arc::new(CapacityWeighted),
         pool_selectors: Default::default(),

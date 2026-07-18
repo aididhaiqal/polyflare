@@ -24,6 +24,7 @@ async fn no_eligible_account_returns_503() {
     let state = Arc::new(AppState {
         enforce_client_keys: false,
         codex_executor: Arc::new(CodexExecutor::new().unwrap()),
+        control_client: polyflare_codex::build_client().expect("build control_client"),
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),
         pool_selectors: Default::default(),

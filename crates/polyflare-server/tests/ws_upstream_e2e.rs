@@ -93,6 +93,7 @@ async fn spawn_state(
     let state = Arc::new(AppState {
         enforce_client_keys: false,
         codex_executor,
+        control_client: polyflare_codex::build_client().expect("build control_client"),
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(CapacityWeighted),
         pool_selectors: Default::default(),

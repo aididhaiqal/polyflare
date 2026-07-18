@@ -7,6 +7,7 @@ pub mod auth;
 pub mod catalog;
 pub mod config;
 pub mod continuity;
+pub mod control;
 pub mod dashboard;
 pub mod failover;
 pub mod fingerprint_capture;
