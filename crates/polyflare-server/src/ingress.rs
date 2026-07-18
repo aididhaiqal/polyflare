@@ -1604,6 +1604,9 @@ async fn responses_handler_impl_with_max_attempts(
         rng_seed: None,
         session_id: ctx.session_id.clone(),
         tier,
+        // C9 Task 3: startup-resolved (`AppState.inflight_penalty_pct`), never a per-request env
+        // read — mirrors every other config-derived field on `sel_ctx`.
+        inflight_penalty_pct: state.inflight_penalty_pct,
     };
     let session_key = prepared.directive.session_key.clone();
 
@@ -2077,6 +2080,8 @@ async fn messages_handler_native(
         // Native Anthropic requests carry no Codex model-alias tier; tier steering is a
         // Codex-pool concern, so leave it unset here.
         tier: None,
+        // C9 Task 3: startup-resolved, never a per-request env read.
+        inflight_penalty_pct: state.inflight_penalty_pct,
     };
     let picked = match selector.pick(&snapshots, &sel_ctx) {
         Some(id) => id,
@@ -2204,6 +2209,8 @@ async fn messages_handler_codex_aliased(
         session_id: None,
         // The subagent tier IS the alias's reasoning effort (opus→high, sonnet→medium, haiku→low).
         tier: tier_from_effort(model_alias.reasoning_effort.as_deref()),
+        // C9 Task 3: startup-resolved, never a per-request env read.
+        inflight_penalty_pct: state.inflight_penalty_pct,
     };
     let picked = match selector.pick(&snapshots, &sel_ctx) {
         Some(id) => id,

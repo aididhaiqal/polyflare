@@ -154,7 +154,8 @@ fn build_state(
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: Duration::from_secs(60),
         starvation_heartbeat: Duration::from_secs(10),
-        wake_jitter_ms: 0,
+        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
         soft_drain_enabled: true,
@@ -342,6 +343,7 @@ async fn layer2_wait_target_and_spliced_account_differ_signal_records_the_splice
         rng_seed: None,
         session_id: None,
         tier: None,
+        inflight_penalty_pct: 0.0,
     };
     let wait_target = state
         .selector

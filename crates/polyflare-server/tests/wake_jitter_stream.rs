@@ -178,6 +178,7 @@ fn build_state(
         stream_idle_timeout: std::time::Duration::from_secs(300),
         soft_drain_enabled: true,
         runtime: Default::default(),
+        inflight_penalty_pct: 2.5,
     })
 }
 

@@ -98,6 +98,14 @@ pub struct ServeConfig {
     /// the same recovering account across `[0, wake_jitter_ms]` of extra delay, never past the wait
     /// budget.
     pub wake_jitter_ms: u64,
+    /// C9 Task 3: the in-flight soft-penalty pct (`POLYFLARE_INFLIGHT_PENALTY_PCT`; see
+    /// [`inflight_penalty_pct_from_env`] for the default/clamp/disable-lever decision). Resolved
+    /// ONCE here at startup and threaded through `AppState` → `SelectionCtx` — never a per-request
+    /// `env::var` read (mirrors every other knob in this struct; `crate::select` reads it purely
+    /// off `SelectionCtx`, never env, so `Selector::pick` stays pure-sync, M2-GATE1). `0.0` ⇒ the
+    /// documented disable lever: `AccountSnapshot.in_flight` is still tracked (Tasks 1-2), it is
+    /// simply folded in at zero weight, a byte-for-byte rollback to pre-C9 selection scoring.
+    pub inflight_penalty_pct: f64,
 }
 
 /// TA6(b) Task 5: the one capability name resolved today. A pool tagged with this capability (via
@@ -418,6 +426,36 @@ pub fn soft_drain_enabled_from_env() -> bool {
     }
 }
 
+/// C9 Task 3: `POLYFLARE_INFLIGHT_PENALTY_PCT` — the in-flight soft-penalty pct threaded onto
+/// `SelectionCtx` and folded by `polyflare_core::select`'s `eligibility()` into
+/// `eff_used`/`eff_secondary_used` as `in_flight * penalty_pct` (mirroring codex-lb
+/// `load_balancer.py:2251-2263`'s `inflight_pressure_pct = in_flight * 2.5`). Unset ⇒ `2.5`
+/// (codex-lb's own value — the default IS "on"). A well-formed, non-negative value is clamped to
+/// `[0, MAX]` (`50.0` — an absolute ceiling so a hostile/huge value can't single-handedly clamp
+/// every account's `eff_used` to 100 off a single in-flight request). A malformed value
+/// (non-numeric, NaN, or out-of-`f64`-range) resolves to the SAME default as unset (`2.5`) —
+/// never a boot crash, identical rationale to every other malformed-input decision in this module.
+///
+/// **`0` is the documented DISABLE LEVER, not a clamp target** (same shape as
+/// [`starvation_wait_budget_secs_from_env`]'s `0`): an explicit, well-formed `0` resolves to
+/// `0.0`, under which `in_flight * 0.0 == 0.0` for any `in_flight` — a clean, byte-for-byte
+/// rollback to pre-C9 selection scoring (in_flight is still tracked, Tasks 1-2, it's just never
+/// folded into the weight).
+pub fn inflight_penalty_pct_from_env() -> f64 {
+    const DEFAULT: f64 = 2.5;
+    const MAX: f64 = 50.0;
+    match std::env::var("POLYFLARE_INFLIGHT_PENALTY_PCT") {
+        Ok(raw) => match raw.trim().parse::<f64>() {
+            Ok(n) if n.is_nan() => DEFAULT,
+            Ok(n) if n < 0.0 => 0.0,
+            Ok(n) if n > MAX => MAX,
+            Ok(n) => n,
+            Err(_) => DEFAULT,
+        },
+        Err(_) => DEFAULT,
+    }
+}
+
 impl ServeConfig {
     pub fn from_env() -> Result<Self, String> {
         let bind_addr =
@@ -479,6 +517,7 @@ impl ServeConfig {
         let stream_idle_timeout = Duration::from_secs(stream_idle_timeout_secs_from_env());
         let soft_drain_enabled = soft_drain_enabled_from_env();
         let wake_jitter_ms = wake_jitter_ms_from_env();
+        let inflight_penalty_pct = inflight_penalty_pct_from_env();
         Ok(ServeConfig {
             bind_addr,
             upstream_base_url,
@@ -500,6 +539,7 @@ impl ServeConfig {
             stream_idle_timeout,
             soft_drain_enabled,
             wake_jitter_ms,
+            inflight_penalty_pct,
         })
     }
 }
@@ -1081,6 +1121,108 @@ mod tests {
         assert_eq!(wake_jitter_ms_from_env(), 0);
         unsafe {
             std::env::remove_var("POLYFLARE_STARVATION_WAKE_JITTER_MS");
+        }
+    }
+
+    // ---- C9 Task 3 (d): `POLYFLARE_INFLIGHT_PENALTY_PCT` ----
+
+    /// Serializes tests in this module that mutate `POLYFLARE_INFLIGHT_PENALTY_PCT` — same
+    /// rationale as the other env-lock helpers above.
+    fn inflight_penalty_pct_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// Unset ⇒ `2.5` (codex-lb's own value — the default is "on", unlike `wake_jitter_ms`'s
+    /// unset-is-the-disable-lever shape).
+    #[test]
+    fn inflight_penalty_pct_unset_defaults_to_two_point_five() {
+        let _guard = inflight_penalty_pct_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("POLYFLARE_INFLIGHT_PENALTY_PCT");
+        }
+        assert_eq!(inflight_penalty_pct_from_env(), 2.5);
+    }
+
+    /// `0` is the documented DISABLE LEVER, not a clamp target — an explicit, well-formed `0`
+    /// resolves to exactly `0.0`, distinct from the `2.5` default.
+    #[test]
+    fn inflight_penalty_pct_explicit_zero_disables() {
+        let _guard = inflight_penalty_pct_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_INFLIGHT_PENALTY_PCT", "0");
+        }
+        assert_eq!(inflight_penalty_pct_from_env(), 0.0);
+        unsafe {
+            std::env::remove_var("POLYFLARE_INFLIGHT_PENALTY_PCT");
+        }
+    }
+
+    /// A well-formed, in-range value resolves to exactly itself.
+    #[test]
+    fn inflight_penalty_pct_reads_a_well_formed_value() {
+        let _guard = inflight_penalty_pct_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_INFLIGHT_PENALTY_PCT", "5.5");
+        }
+        assert_eq!(inflight_penalty_pct_from_env(), 5.5);
+        unsafe {
+            std::env::remove_var("POLYFLARE_INFLIGHT_PENALTY_PCT");
+        }
+    }
+
+    /// An absurdly large value clamps DOWN to the `50.0` ceiling — never silently accepted as-is
+    /// (a hostile/huge value must not be able to single-handedly clamp every account's `eff_used`
+    /// to 100 off a single in-flight request).
+    #[test]
+    fn inflight_penalty_pct_absurd_value_clamps_to_fifty() {
+        let _guard = inflight_penalty_pct_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_INFLIGHT_PENALTY_PCT", "999999");
+        }
+        assert_eq!(inflight_penalty_pct_from_env(), 50.0);
+        unsafe {
+            std::env::remove_var("POLYFLARE_INFLIGHT_PENALTY_PCT");
+        }
+    }
+
+    /// A negative value clamps UP to the `0.0` floor (never a negative penalty — that would
+    /// invert the scoring direction).
+    #[test]
+    fn inflight_penalty_pct_negative_value_clamps_to_zero() {
+        let _guard = inflight_penalty_pct_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_INFLIGHT_PENALTY_PCT", "-5");
+        }
+        assert_eq!(inflight_penalty_pct_from_env(), 0.0);
+        unsafe {
+            std::env::remove_var("POLYFLARE_INFLIGHT_PENALTY_PCT");
+        }
+    }
+
+    /// A malformed value (non-numeric) ⇒ the SAME safe default as unset (`2.5`) — never a boot
+    /// crash.
+    #[test]
+    fn inflight_penalty_pct_malformed_defaults_to_two_point_five() {
+        let _guard = inflight_penalty_pct_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_INFLIGHT_PENALTY_PCT", "not-a-number");
+        }
+        assert_eq!(inflight_penalty_pct_from_env(), 2.5);
+        unsafe {
+            std::env::remove_var("POLYFLARE_INFLIGHT_PENALTY_PCT");
         }
     }
 }

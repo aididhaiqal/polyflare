@@ -369,6 +369,13 @@ pub struct SelectionCtx {
     pub rng_seed: Option<u64>,
     pub session_id: Option<String>,
     pub tier: Option<Tier>,
+    /// C9 Task 3: the startup-resolved `POLYFLARE_INFLIGHT_PENALTY_PCT` (see
+    /// `crate::select`'s `eligibility()` doc for how this folds `AccountSnapshot.in_flight` into
+    /// `eff_used`/`eff_secondary_used`). Threaded here — NEVER read from env inside a `Selector`
+    /// — so `pick` stays pure-sync (M2-GATE1). `0.0` (the `Default` value, and the config's
+    /// explicit `=0` disable lever) ⇒ in_flight has ZERO effect on scoring, byte-for-byte the
+    /// pre-C9 selection behavior.
+    pub inflight_penalty_pct: f64,
 }
 
 #[cfg(test)]
