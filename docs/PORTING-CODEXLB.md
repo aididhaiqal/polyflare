@@ -281,12 +281,50 @@ no-accounts / fetch-fail / empty ⇒ exactly today's static list. Token never lo
 Debug on TokenCipher so no key leak). No routing-path impact. **Single-node only — deferred:** codex-lb's
 per-plan catalogs + cross-account merge + leader-election + DB-persisted snapshot (multi-node/dashboard).
 
-### D16. WeeklyCreditPace + EWMA depletion forecasting  · LOW · medium
+### D16. WeeklyCreditPace + EWMA depletion forecasting  · LOW · medium · **DONE**
 Port the EWMA core first (pure math: alpha-0.4 d(used%)/dt with reset-on-drop, burn-rate, projected
 exhaustion, safe/warning/danger/critical at 0.60/0.80/0.95). Then the pool-wide WeeklyCreditPace
 discrete-event sim. Needs per-account weekly usage rows (capacity/remaining/reset/window) — additive,
 grow the usage schema feature-by-feature.
 *codex-lb:* `core/usage/depletion.py`, `modules/dashboard/weekly_pace.py`.
+
+**Built** (`docs/superpowers/plans/2026-07-19-d16-credit-pace-forecasting.md`, Tasks 1-6, merged
+`0ac8032`). Dashboard-only, additive, **no migration** — `usage_history` already had every column
+(`recorded_at`, `"window"`, `used_percent`, `reset_at`, `window_minutes`).
+- **EWMA core** — `polyflare_core::depletion` (pure, stateless): `ewma_update` (α=0.4 d(used%)/dt,
+  reset-on-drop + window-change, zero-dt ignore), `compute_burn_rate`/`compute_depletion_risk`/
+  `compute_safe_usage_percent`, `classify_risk` (`RiskLevel::{Safe,Warning,Danger,Critical}` at
+  0.60/0.80/0.95), and `compute_depletion_for_account` (rebuilds the estimator from the stored
+  time series each read — codex-lb's in-memory `_ewma_states` cache is a pure optimization, omitted).
+  Line-for-line verified vs `depletion.py` + `depletion_service.py`.
+- **Pool sim** — `polyflare_core::weekly_pace`: `project_weekly_pool` (discrete-event, events =
+  per-account weekly resets; drains soonest-reset-first, refills at each reset over a 2×max-window
+  horizon), `recent_burn_rate_credits_per_hour` (6h EWMA → credits/hr via `·36`),
+  `smoothed_remaining_credits`, `advance_reset_at`, and `build_weekly_credit_pace` → the ~24-field
+  `WeeklyCreditPaceReport` (actual-vs-scheduled used%, schedule gap, forecast/scheduled burn,
+  projected shortfall + depletion hours, pace multiplier/throttle/pro-equivalent recommendations,
+  `PaceStatus`/`Confidence`). **v1 uses the linear schedule** (`working_days=None`) — the operator-
+  configurable working-days + smoothing-minutes settings columns are the only DEFERRED piece (they'd
+  need a migration).
+- **Store** — `usage_history_full_since` (full window tuple: `reset_at`+`window_minutes`, which the
+  trend-point `usage_history_since` drops). Read-only, no schema change.
+- **Read API** (admin-gated) — `GET /api/pace` → `{pace: WeeklyCreditPaceReport | null}`; per-account
+  `forecast: DepletionForecast | null` on `GET /api/accounts/{id}/trends`. **Content-free** (numeric +
+  enums + opaque account_id; `PaceAccountInput` deliberately does NOT derive `Serialize`) — the
+  `pace_e2e.rs` content-safety test asserts a NON-NULL report before checking a seeded sentinel
+  email/token is absent (teeth, not vacuous).
+- **Dashboard** — Overview Weekly-Pace card (sources `/api/pace`, `PaceStatus` pill:
+  `ahead`=over-consuming→warn, `behind`=headroom→success, `danger`=shortfall→amber) + AccountDetail
+  per-account depletion risk badge (`trends.forecast.risk_level`).
+- **NOT routing** — codex-lb's EWMA depletion + WeeklyCreditPace are read-only (never referenced under
+  `app/core/balancer/`); the routing-facing `_weekly_pace_floor_pct` is a separate linear-schedule
+  feature, out of scope. `select.rs` change = only `pub` on `plan_capacity_secondary`.
+- **Deferred (follow-ups, none blocking):** operator working-days/smoothing settings columns
+  (+migration); **per-provider pace** — v1 pools ALL providers into one shared-credit sim
+  (`PaceAccountInput` has no provider field), so T6 replaced the old client-side per-provider heuristic
+  card with the pool-wide one (product trade — per-provider forward-risk at-a-glance lost, still
+  recoverable via the Quota card + per-account risk badge; adding provider grouping to the backend
+  pace is additive); consolidate the trends double-query.
 
 ### D17. Codex control-endpoint surface  · MEDIUM · medium · **DONE (minimal)**
 PolyFlare served `/responses` (+ `/v1/messages`, `/models`) and nothing else, so every other endpoint
