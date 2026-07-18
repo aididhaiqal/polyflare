@@ -521,6 +521,44 @@ impl AccountRepo {
         .await?;
         Ok(rows)
     }
+
+    /// Every `usage_history` row for `account_id` at/after `since_ts` (unix seconds), oldest-first,
+    /// each paired with its window name — the full tuple (`used_percent`, `reset_at`,
+    /// `window_minutes`, `recorded_at`) the depletion EWMA + weekly-pace sim need (unlike
+    /// [`usage_history_since`], which drops `reset_at`/`window_minutes` for the trend-point series).
+    /// Only rows in a known window (`"primary"`/`"secondary"`) are returned.
+    pub async fn usage_history_full_since(
+        &self,
+        account_id: &str,
+        since_ts: i64,
+    ) -> Result<Vec<(String, WindowUsage)>, StoreError> {
+        let rows: Vec<(String, f64, Option<i64>, Option<i64>, i64)> = sqlx::query_as(
+            "SELECT \"window\", used_percent, reset_at, window_minutes, recorded_at \
+             FROM usage_history \
+             WHERE account_id = ? AND recorded_at >= ? AND \"window\" IN ('primary', 'secondary') \
+             ORDER BY recorded_at ASC",
+        )
+        .bind(account_id)
+        .bind(since_ts)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(window, used_percent, reset_at, window_minutes, recorded_at)| {
+                    (
+                        window,
+                        WindowUsage {
+                            used_percent,
+                            reset_at,
+                            window_minutes,
+                            recorded_at,
+                        },
+                    )
+                },
+            )
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -593,6 +631,57 @@ mod tests {
             .await
             .unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn usage_history_full_since_carries_reset_and_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
+        let repo = store.accounts();
+        // seed an account + two secondary rows with distinct reset_at/window_minutes
+        seed_account(&repo, &cipher, "acct-1").await;
+        repo.insert_usage_window(
+            "acct-1",
+            "secondary",
+            40.0,
+            Some(9_000),
+            Some(10_080),
+            1_000,
+        )
+        .await
+        .unwrap();
+        repo.insert_usage_window(
+            "acct-1",
+            "secondary",
+            50.0,
+            Some(9_000),
+            Some(10_080),
+            1_600,
+        )
+        .await
+        .unwrap();
+        repo.insert_usage_window("acct-1", "primary", 12.0, Some(5_000), Some(300), 1_600)
+            .await
+            .unwrap();
+
+        let rows = repo.usage_history_full_since("acct-1", 0).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        // oldest first
+        assert_eq!(rows[0].0, "secondary");
+        assert_eq!(rows[0].1.used_percent, 40.0);
+        assert_eq!(rows[0].1.reset_at, Some(9_000));
+        assert_eq!(rows[0].1.window_minutes, Some(10_080));
+        assert_eq!(rows[0].1.recorded_at, 1_000);
+        // since_ts filter excludes older rows
+        let recent = repo
+            .usage_history_full_since("acct-1", 1_500)
+            .await
+            .unwrap();
+        assert_eq!(recent.len(), 2);
+        assert!(recent.iter().all(|(_, w)| w.recorded_at >= 1_500));
     }
 
     /// Minimal account row, for tests that only need an id to satisfy the `usage_history`
