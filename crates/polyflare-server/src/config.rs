@@ -82,7 +82,12 @@ pub struct ServeConfig {
     /// per-request `env::var` read (mirrors `max_account_attempts`/`starvation_wait_budget`/
     /// `stream_idle_timeout` above). `false` ⇒ `crate::usage_refresh`'s poller forces every
     /// account's health tier to HEALTHY with cleared aux state every cycle (codex-lb's disable
-    /// path) — the documented clean-rollback lever.
+    /// path) — the documented clean-rollback lever. **Caveat:** this is a STEADY-STATE guarantee,
+    /// not an instantaneous one — the flag is honored only by the poller; the per-request funnel is
+    /// not flag-gated and can still transiently drive an account into DRAINING from errors between
+    /// poller cycles (bounded to ≤ one `REFRESH_INTERVAL`, ≤600s, before the next poller tick resets
+    /// it). Since the B8-review Finding 1 fix, the poller resets ALL providers (codex and
+    /// non-codex), not just codex.
     pub soft_drain_enabled: bool,
 }
 
@@ -362,6 +367,13 @@ pub fn stream_idle_timeout_secs_from_env() -> u64 {
 /// - Anything else (including a malformed/typo'd value) ⇒ `true` — a typo must never silently
 ///   disable a preference-only, safety-neutral signal; it just falls back to the default like
 ///   every other flag in this module treats a malformed value.
+///
+/// **Caveat (B8 review, not fixed here — see [`crate::app::AppState::soft_drain_enabled`]):** this
+/// flag is honored ONLY by the usage-refresh poller (`crate::usage_refresh`). The per-request funnel
+/// (`crate::runtime_state::RuntimeStates::record_transient_error`/`record_rate_limit`) does not read
+/// it at all, so with the flag off an account can still transiently show DRAINING between poller
+/// cycles (bounded to ≤600s) before the next tick resets it. "Clean rollback" therefore means
+/// steady-state parity with pre-B8 behavior, not that soft-drain never fires while the flag is off.
 pub fn soft_drain_enabled_from_env() -> bool {
     match std::env::var("POLYFLARE_SOFT_DRAIN_ENABLED") {
         Ok(raw) => !matches!(
