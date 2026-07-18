@@ -35,6 +35,26 @@ pub const MAX_COOLDOWN_SECS: i64 = 24 * 3600;
 /// Fixed cooldown applied to a quota-exceeded account (codex-lb `QUOTA_EXCEEDED_COOLDOWN_SECONDS`).
 pub const QUOTA_EXCEEDED_COOLDOWN_SECS: i64 = 120;
 
+/// Health-tier soft-drain thresholds — a byte-faithful port of codex-lb's
+/// `app/core/balancer/logic.py:84-93`. See [`evaluate_health_tier`] for the transition table these
+/// feed. Tier values themselves are the plain `u8`s `0` (HEALTHY), `1` (DRAINING), `2` (PROBING) —
+/// codex-lb's own enum is likewise a flat int tier, not worth a Rust enum for three states that only
+/// ever move through [`evaluate_health_tier`].
+///
+/// Primary usage threshold (percent) at/above which an account should soft-drain.
+pub const DRAIN_PRIMARY_PCT: f64 = 85.0;
+/// Secondary usage threshold (percent) at/above which an account should soft-drain.
+pub const DRAIN_SECONDARY_PCT: f64 = 90.0;
+/// Window (seconds) within which recent errors count toward the error-flapping drain condition.
+pub const DRAIN_ERROR_WINDOW_SECS: i64 = 60;
+/// Error count at/above which (within the window) an account is considered flapping.
+pub const DRAIN_ERROR_COUNT: u32 = 2;
+/// Minimum time (seconds) a DRAINING account must sit quiet (`should_drain` false) before it may be
+/// promoted to PROBING.
+pub const PROBE_QUIET_SECS: i64 = 60;
+/// Consecutive successes required while PROBING before promotion back to HEALTHY.
+pub const PROBE_SUCCESS_STREAK_REQUIRED: u32 = 3;
+
 /// Deterministic exponential backoff in SECONDS for the n-th consecutive error (n ≥ 1). No jitter
 /// here — the active same-account retry jitter is a separate concern (porting item B10); this is the
 /// exclusion window the selector reads, which must be stable per (error_count, last_error_at).
@@ -51,6 +71,16 @@ pub struct RuntimeState {
     pub last_error_at: Option<i64>,
     pub cooldown_until: Option<i64>,
     pub last_selected_at: Option<i64>,
+    /// The soft-drain health tier: `0` HEALTHY, `1` DRAINING, `2` PROBING. Written by
+    /// [`Self::transition`]; read by `overlay` (a later task) onto the snapshot for
+    /// `select.rs`'s `health_tier_pool`. Defaults to `0` (HEALTHY) — neutral, like every other field.
+    pub health_tier: u8,
+    /// When the account most recently entered DRAINING (any non-DRAINING → DRAINING edge). Feeds the
+    /// DRAINING→PROBING quiet-timer promotion. Cleared on return to HEALTHY.
+    pub drain_entered_at: Option<i64>,
+    /// Consecutive successes recorded while PROBING. Reaching
+    /// [`PROBE_SUCCESS_STREAK_REQUIRED`] promotes PROBING→HEALTHY; any error while PROBING resets it.
+    pub probe_success_streak: u32,
 }
 
 impl RuntimeState {
@@ -58,6 +88,114 @@ impl RuntimeState {
     /// unbounded with accounts that recovered.
     fn is_neutral(&self) -> bool {
         *self == RuntimeState::default()
+    }
+
+    /// Apply the write-back edges for a newly computed `new_tier` (from [`evaluate_health_tier`]),
+    /// then store it. A byte-faithful port of codex-lb's writeback
+    /// (`app/modules/proxy/load_balancer.py:2220-2249`):
+    /// - entering DRAINING from any other tier (`new_tier == 1 && self.health_tier != 1`) stamps
+    ///   `drain_entered_at = now` and resets `probe_success_streak = 0`.
+    /// - reaching HEALTHY (`new_tier == 0`) clears `drain_entered_at` and `probe_success_streak`.
+    /// - the DRAINING→PROBING edge touches neither aux field — `drain_entered_at` must survive that
+    ///   transition (a PROBING account that bounces back to DRAINING needs its original quiet-timer
+    ///   semantics reset via the entering-DRAINING branch above, not a stale stamp).
+    ///
+    /// Callers (a later task) invoke this under the `mutate` lock after computing `new_tier`.
+    pub fn transition(&mut self, new_tier: u8, now: i64) {
+        if new_tier == 1 && self.health_tier != 1 {
+            self.drain_entered_at = Some(now);
+            self.probe_success_streak = 0;
+        } else if new_tier == 0 {
+            self.drain_entered_at = None;
+            self.probe_success_streak = 0;
+        }
+        self.health_tier = new_tier;
+    }
+}
+
+/// Compute `should_drain` from the three OR'd conditions — a byte-faithful port of codex-lb's
+/// `evaluate_health_tier` should-drain predicate (`app/core/balancer/logic.py:1181-1239`). Usage
+/// percentages are `Option<f64>` because the caller may not have a fresh usage reading (e.g. the
+/// per-request funnel, which only ever sees the error condition); `None` makes that condition `false`,
+/// never true.
+///
+/// - `used_percent >= `[`DRAIN_PRIMARY_PCT`] (inclusive — a boundary hit already counts as drain).
+/// - `secondary_percent >= `[`DRAIN_SECONDARY_PCT`] (inclusive).
+/// - `error_count >= `[`DRAIN_ERROR_COUNT`] AND `last_error_at` is set AND the error is still within
+///   [`DRAIN_ERROR_WINDOW_SECS`] (strict `<` — a window-aged error no longer counts).
+pub fn compute_should_drain(
+    used_percent: Option<f64>,
+    secondary_percent: Option<f64>,
+    error_count: u32,
+    last_error_at: Option<i64>,
+    now: i64,
+) -> bool {
+    let primary_drain = used_percent.is_some_and(|pct| pct >= DRAIN_PRIMARY_PCT);
+    let secondary_drain = secondary_percent.is_some_and(|pct| pct >= DRAIN_SECONDARY_PCT);
+    let error_flapping = error_count >= DRAIN_ERROR_COUNT
+        && last_error_at.is_some_and(|at| now - at < DRAIN_ERROR_WINDOW_SECS);
+    primary_drain || secondary_drain || error_flapping
+}
+
+/// Pure port of codex-lb's `evaluate_health_tier`
+/// (`app/core/balancer/logic.py:1181-1239`). Returns the NEW tier only — the caller applies the
+/// `drain_entered_at`/`probe_success_streak` writeback edges via [`RuntimeState::transition`]. No
+/// clock reads or I/O: `now` is a param, and the aux state is passed in rather than read from a lock,
+/// so this can be unit-tested and called from any evaluation site (funnel or poller) without coupling
+/// to how that site stores state.
+///
+/// `frozen` — `true` when the account's durable status is one of codex-lb's blocked statuses
+/// (rate_limited / quota_exceeded / paused / reauth_required / deactivated); the CALLER decides this
+/// (this fn has no notion of account status). While frozen, no transition happens at all — the stored
+/// tier passes through unchanged, matching codex-lb's "no transition while blocked" rule.
+///
+/// Transition table (unchanged when `frozen`):
+/// - HEALTHY (`0`): `should_drain` ⇒ DRAINING; else stays HEALTHY.
+/// - DRAINING (`1`): `should_drain` ⇒ stays DRAINING; else if `drain_entered_at` is set AND
+///   `now - drain_entered_at >= `[`PROBE_QUIET_SECS`] ⇒ PROBING; else stays DRAINING (in particular, an
+///   unset `drain_entered_at` can never promote — there is nothing to time from).
+/// - PROBING (`2`): `should_drain` ⇒ DRAINING; else if `probe_success_streak >= `
+///   [`PROBE_SUCCESS_STREAK_REQUIRED`] ⇒ HEALTHY; else stays PROBING.
+pub fn evaluate_health_tier(
+    current_tier: u8,
+    should_drain: bool,
+    drain_entered_at: Option<i64>,
+    probe_success_streak: u32,
+    frozen: bool,
+    now: i64,
+) -> u8 {
+    if frozen {
+        return current_tier;
+    }
+    match current_tier {
+        1 => {
+            // DRAINING
+            if should_drain {
+                1
+            } else if drain_entered_at.is_some_and(|at| now - at >= PROBE_QUIET_SECS) {
+                2
+            } else {
+                1
+            }
+        }
+        2 => {
+            // PROBING
+            if should_drain {
+                1
+            } else if probe_success_streak >= PROBE_SUCCESS_STREAK_REQUIRED {
+                0
+            } else {
+                2
+            }
+        }
+        _ => {
+            // HEALTHY (0, and any unrecognized value treated as healthy)
+            if should_drain {
+                1
+            } else {
+                0
+            }
+        }
     }
 }
 
@@ -368,6 +506,134 @@ mod tests {
             Some(500),
             "the selection stamp survives (round_robin needs it)"
         );
+    }
+
+    // --- B8 Task 1: evaluate_health_tier / compute_should_drain / transition / is_neutral ---
+
+    #[test]
+    fn healthy_transitions_on_should_drain() {
+        // (a) HEALTHY + should_drain ⇒ DRAINING; HEALTHY + !drain ⇒ HEALTHY.
+        assert_eq!(evaluate_health_tier(0, true, None, 0, false, 1000), 1);
+        assert_eq!(evaluate_health_tier(0, false, None, 0, false, 1000), 0);
+    }
+
+    #[test]
+    fn draining_transitions() {
+        // (b) DRAINING + should_drain ⇒ DRAINING (stays, regardless of the timer).
+        assert_eq!(evaluate_health_tier(1, true, Some(900), 0, false, 1000), 1);
+        // DRAINING + !drain + now-drain_entered_at >= 60 ⇒ PROBING.
+        assert_eq!(evaluate_health_tier(1, false, Some(940), 0, false, 1000), 2); // diff == 60
+        assert_eq!(evaluate_health_tier(1, false, Some(500), 0, false, 1000), 2); // diff > 60
+        // DRAINING + !drain + < 60 ⇒ stays DRAINING.
+        assert_eq!(evaluate_health_tier(1, false, Some(950), 0, false, 1000), 1); // diff == 50
+        // DRAINING + !drain + drain_entered_at == None ⇒ stays DRAINING (no promote without a stamp).
+        assert_eq!(evaluate_health_tier(1, false, None, 0, false, 1000), 1);
+    }
+
+    #[test]
+    fn probing_transitions() {
+        // (c) PROBING + should_drain ⇒ DRAINING.
+        assert_eq!(evaluate_health_tier(2, true, None, 5, false, 1000), 1);
+        // PROBING + streak >= 3 ⇒ HEALTHY.
+        assert_eq!(evaluate_health_tier(2, false, None, 3, false, 1000), 0);
+        assert_eq!(evaluate_health_tier(2, false, None, 9, false, 1000), 0);
+        // PROBING + streak < 3 ⇒ stays PROBING.
+        assert_eq!(evaluate_health_tier(2, false, None, 2, false, 1000), 2);
+        assert_eq!(evaluate_health_tier(2, false, None, 0, false, 1000), 2);
+    }
+
+    #[test]
+    fn frozen_status_freezes_the_tier_regardless_of_should_drain() {
+        // (d) frozen ⇒ returns current_tier unchanged, no matter what should_drain/aux state says.
+        assert_eq!(evaluate_health_tier(0, true, None, 0, true, 1000), 0);
+        assert_eq!(evaluate_health_tier(1, false, Some(900), 0, true, 1000), 1);
+        assert_eq!(evaluate_health_tier(2, true, None, 5, true, 1000), 2);
+    }
+
+    #[test]
+    fn compute_should_drain_conditions() {
+        // (e) each OR condition independently true, plus the strict boundary checks.
+        assert!(
+            compute_should_drain(Some(85.0), None, 0, None, 1000),
+            "used% == 85 exactly is >= threshold"
+        );
+        assert!(
+            compute_should_drain(None, Some(90.0), 0, None, 1000),
+            "secondary% == 90 exactly is >= threshold"
+        );
+        assert!(
+            compute_should_drain(None, None, 2, Some(941), 1000),
+            "error_count=2, now-last_error_at == 59 < 60"
+        );
+        assert!(
+            !compute_should_drain(None, None, 2, Some(940), 1000),
+            "now-last_error_at == 60 is NOT < 60 (strict)"
+        );
+        assert!(
+            !compute_should_drain(None, None, 2, Some(939), 1000),
+            "now-last_error_at == 61, well outside the window"
+        );
+        assert!(
+            !compute_should_drain(None, None, 1, Some(999), 1000),
+            "error_count=1 is below the DRAIN_ERROR_COUNT threshold even though recent"
+        );
+        assert!(
+            !compute_should_drain(None, None, 0, None, 1000),
+            "all None/0 ⇒ no condition fires"
+        );
+    }
+
+    #[test]
+    fn transition_writeback_edges() {
+        // (f) HEALTHY -> DRAINING stamps drain_entered_at + resets streak.
+        let mut rt = RuntimeState {
+            probe_success_streak: 7,
+            ..RuntimeState::default()
+        };
+        rt.transition(1, 1000);
+        assert_eq!(rt.health_tier, 1);
+        assert_eq!(rt.drain_entered_at, Some(1000));
+        assert_eq!(rt.probe_success_streak, 0);
+
+        // DRAINING -> PROBING leaves drain_entered_at intact (no stamp/clear on this edge).
+        rt.transition(2, 1100);
+        assert_eq!(rt.health_tier, 2);
+        assert_eq!(
+            rt.drain_entered_at,
+            Some(1000),
+            "drain_entered_at survives DRAINING->PROBING"
+        );
+
+        // -> HEALTHY clears both aux fields.
+        rt.probe_success_streak = 5;
+        rt.transition(0, 1200);
+        assert_eq!(rt.health_tier, 0);
+        assert_eq!(rt.drain_entered_at, None);
+        assert_eq!(rt.probe_success_streak, 0);
+
+        // PROBING -> DRAINING (re-entering DRAINING from PROBING) also stamps fresh, per the
+        // "any non-DRAINING -> DRAINING" edge definition.
+        let mut rt2 = RuntimeState {
+            health_tier: 2,
+            drain_entered_at: Some(50),
+            probe_success_streak: 2,
+            ..RuntimeState::default()
+        };
+        rt2.transition(1, 2000);
+        assert_eq!(rt2.health_tier, 1);
+        assert_eq!(rt2.drain_entered_at, Some(2000));
+        assert_eq!(rt2.probe_success_streak, 0);
+    }
+
+    #[test]
+    fn is_neutral_true_for_defaulted_state_including_new_health_fields() {
+        // (g) a freshly-defaulted state (incl. health_tier/drain_entered_at/probe_success_streak) is
+        // still neutral, so a healthy account's entry is still GC'd by `mutate`.
+        let rt = RuntimeState::default();
+        assert!(rt.is_neutral());
+        assert_eq!(rt.health_tier, 0);
+        assert_eq!(rt.drain_entered_at, None);
+        assert_eq!(rt.probe_success_streak, 0);
     }
 
     #[test]
