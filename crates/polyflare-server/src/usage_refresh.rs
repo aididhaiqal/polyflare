@@ -14,15 +14,32 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
+use polyflare_core::AccountId;
 use polyflare_store::{Account, AccountRepo, TokenCipher};
 
 use crate::app::AppState;
+use crate::runtime_state::RuntimeStates;
 
 /// How often to poll each account's usage. Windows move slowly (5h / weekly), so this is generous.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(600);
 /// Account statuses the usage refresh is allowed to move between. It must NEVER resurrect a
 /// `reauth_required` / `paused` / `deactivated` account just because its usage looks fine.
 const USAGE_CONTROLLED: &[&str] = &["active", "rate_limited", "quota_exceeded"];
+/// B8 Task 3: codex-lb's blocked-status set for the health-tier "frozen" check
+/// (`app/core/balancer/logic.py:1181-1239`'s frozen predicate) — used ONLY to gate
+/// `RuntimeStates::evaluate_with_usage`'s transition, distinct from [`USAGE_CONTROLLED`] (which
+/// gates the durable status GATE itself). Deliberately includes `rate_limited`/`quota_exceeded`
+/// even though those two ARE usage-controlled (the gate can move an account into/out of them): a
+/// hard-blocked/benched account is not a soft-drain PREFERENCE candidate at all — `select.rs`'s
+/// `eligibility()` already excludes it outright, so no health-tier transition is meaningful while
+/// one of these statuses holds (matches codex-lb's `evaluate_health_tier` frozen contract exactly).
+const HEALTH_TIER_FROZEN_STATUSES: &[&str] = &[
+    "rate_limited",
+    "quota_exceeded",
+    "paused",
+    "reauth_required",
+    "deactivated",
+];
 
 /// The `/wham/usage` response (only the fields we use; `extra` ignored).
 #[derive(Deserialize, Default)]
@@ -98,6 +115,28 @@ fn derive_gate(
     ("active", None)
 }
 
+/// B8 Task 3: split the up-to-two present windows into `(five_hour_used_percent,
+/// weekly_used_percent)`, classified by DURATION not slot — the same distinction [`derive_gate`]
+/// already makes (upstream currently emits the weekly window in the `primary` slot for plans with
+/// no 5h limit). Feeds `RuntimeStates::evaluate_with_usage`'s `used_percent`/`secondary_percent`
+/// params directly: the 85% primary threshold applies to the REAL 5h window, the 90% secondary
+/// threshold to the REAL weekly window, regardless of which JSON slot each arrived in.
+fn split_usage_by_duration(
+    primary: Option<&UsageWindow>,
+    secondary: Option<&UsageWindow>,
+) -> (Option<f64>, Option<f64>) {
+    let mut five_hour_used = None;
+    let mut weekly_used = None;
+    for w in [primary, secondary].into_iter().flatten() {
+        if is_five_hour(w) {
+            five_hour_used = w.used_percent;
+        } else {
+            weekly_used = w.used_percent;
+        }
+    }
+    (five_hour_used, weekly_used)
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -105,15 +144,19 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Refresh one account's usage: fetch `/wham/usage`, persist the present windows, and update the
-/// routing gate (only if the account is in a usage-controlled status). A stale-token 401 (or any
-/// non-2xx) is skipped silently — the next real request refreshes the token.
+/// Refresh one account's usage: fetch `/wham/usage`, persist the present windows, update the
+/// routing gate (only if the account is in a usage-controlled status), and — B8 Task 3 — run the
+/// FULL usage-driven health-tier evaluation (`RuntimeStates::evaluate_with_usage`; see that
+/// method's doc for why this is the only site that may promote DRAINING→PROBING). A stale-token
+/// 401 (or any non-2xx) is skipped silently — the next real request refreshes the token.
 async fn refresh_account(
     repo: &AccountRepo,
     cipher: &TokenCipher,
     http: &reqwest::Client,
     upstream_base: &str,
     account: &Account,
+    runtime: &RuntimeStates,
+    soft_drain_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tokens = match repo.decrypt_tokens(&account.id, cipher).await? {
         Some(t) => t,
@@ -152,12 +195,32 @@ async fn refresh_account(
     }
 
     // Only move between usage-controlled statuses; never touch reauth_required/paused/deactivated.
+    let mut effective_status: &str = &account.status;
     if USAGE_CONTROLLED.contains(&account.status.as_str()) {
         let (status, reset_at) =
             derive_gate(rl.primary_window.as_ref(), rl.secondary_window.as_ref());
         repo.update_status_and_reset(&account.id, status, reset_at)
             .await?;
+        effective_status = status;
     }
+
+    // B8 Task 3: the authoritative periodic usage-driven health-tier evaluation — the ONLY site
+    // that may promote a purely usage-drained account from DRAINING to PROBING (it has both the
+    // fresh usage% AND, via the runtime entry, the current error state). `status_frozen` uses the
+    // POST-refresh effective status (the one that was just persisted, if it changed) so a
+    // just-benched account is correctly frozen this same cycle rather than one cycle late.
+    let status_frozen = HEALTH_TIER_FROZEN_STATUSES.contains(&effective_status);
+    let (five_hour_used, weekly_used) =
+        split_usage_by_duration(rl.primary_window.as_ref(), rl.secondary_window.as_ref());
+    runtime.evaluate_with_usage(
+        &AccountId::from(account.id.as_str()),
+        five_hour_used,
+        weekly_used,
+        status_frozen,
+        soft_drain_enabled,
+        now,
+    );
+
     Ok(())
 }
 
@@ -184,6 +247,8 @@ pub fn spawn_usage_refresh(state: Arc<AppState>) {
                     &http,
                     &state.upstream_base_url,
                     account,
+                    &state.runtime,
+                    state.soft_drain_enabled,
                 )
                 .await
                 {

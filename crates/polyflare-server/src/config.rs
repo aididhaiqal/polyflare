@@ -76,6 +76,14 @@ pub struct ServeConfig {
     /// `Duration::ZERO` ⇒ Task 1's `IdleDeadline::Disabled` (no idle bound — today's pre-fix
     /// behavior, the documented `=0` rollback lever).
     pub stream_idle_timeout: Duration,
+    /// B8 Task 3: the codex-lb `soft_drain_enabled` disable lever
+    /// (`POLYFLARE_SOFT_DRAIN_ENABLED`; see [`soft_drain_enabled_from_env`] for the parse
+    /// decision). Resolved ONCE here at startup and threaded through `AppState` — never a
+    /// per-request `env::var` read (mirrors `max_account_attempts`/`starvation_wait_budget`/
+    /// `stream_idle_timeout` above). `false` ⇒ `crate::usage_refresh`'s poller forces every
+    /// account's health tier to HEALTHY with cleared aux state every cycle (codex-lb's disable
+    /// path) — the documented clean-rollback lever.
+    pub soft_drain_enabled: bool,
 }
 
 /// TA6(b) Task 5: the one capability name resolved today. A pool tagged with this capability (via
@@ -337,6 +345,33 @@ pub fn stream_idle_timeout_secs_from_env() -> u64 {
     }
 }
 
+/// B8 Task 3: `POLYFLARE_SOFT_DRAIN_ENABLED` — the codex-lb `soft_drain_enabled` disable lever for
+/// the usage-driven health-tier evaluation (`crate::runtime_state::RuntimeStates::evaluate_with_usage`,
+/// called from `crate::usage_refresh::refresh_account`). Unlike every other bool flag in this
+/// module (`live_logs`/`ws_upstream`/`allow_unauthenticated_remote`), this one defaults to **ON**
+/// — codex-lb's own `soft_drain_enabled` defaults to `true` (plan Global Constraints: "Default on
+/// (codex-lb `soft_drain_enabled`=true)"), and B8's whole point is that soft-drain preference is
+/// active out of the box; an operator opts OUT, not in.
+///
+/// - Unset ⇒ `true` (the default — matches `max_account_attempts_from_env`'s "malformed/absent
+///   converges on the safe default" convention, except here the *safe* default is ON since
+///   soft-drain is a preference-only signal that can never override eligibility/security-floor/
+///   continuity ownership; see the plan's Global Constraints).
+/// - `"0"` / `"false"` / `"no"` / `"off"` (case-insensitive, trimmed) ⇒ `false` — the explicit
+///   disable lever.
+/// - Anything else (including a malformed/typo'd value) ⇒ `true` — a typo must never silently
+///   disable a preference-only, safety-neutral signal; it just falls back to the default like
+///   every other flag in this module treats a malformed value.
+pub fn soft_drain_enabled_from_env() -> bool {
+    match std::env::var("POLYFLARE_SOFT_DRAIN_ENABLED") {
+        Ok(raw) => !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
 impl ServeConfig {
     pub fn from_env() -> Result<Self, String> {
         let bind_addr =
@@ -396,6 +431,7 @@ impl ServeConfig {
         let starvation_wait_budget = Duration::from_secs(starvation_wait_budget_secs as u64);
         let starvation_heartbeat = Duration::from_secs(starvation_heartbeat_secs as u64);
         let stream_idle_timeout = Duration::from_secs(stream_idle_timeout_secs_from_env());
+        let soft_drain_enabled = soft_drain_enabled_from_env();
         Ok(ServeConfig {
             bind_addr,
             upstream_base_url,
@@ -415,6 +451,7 @@ impl ServeConfig {
             starvation_heartbeat,
             allow_unauthenticated_remote,
             stream_idle_timeout,
+            soft_drain_enabled,
         })
     }
 }
@@ -848,6 +885,93 @@ mod tests {
         assert_eq!(stream_idle_timeout_secs_from_env(), 3600);
         unsafe {
             std::env::remove_var("POLYFLARE_STREAM_IDLE_TIMEOUT_SECS");
+        }
+    }
+
+    /// Serializes tests in this module that mutate `POLYFLARE_SOFT_DRAIN_ENABLED` — same
+    /// rationale as the other env-lock helpers above (env vars are process-global, tests run
+    /// concurrently on separate threads by default).
+    fn soft_drain_enabled_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// B8 Task 3 (e): unset ⇒ `true` — the documented default-ON behavior (soft-drain is an
+    /// opt-out, not an opt-in preference signal).
+    #[test]
+    fn soft_drain_enabled_unset_defaults_to_true() {
+        let _guard = soft_drain_enabled_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("POLYFLARE_SOFT_DRAIN_ENABLED");
+        }
+        assert!(soft_drain_enabled_from_env());
+    }
+
+    /// B8 Task 3 (e): `POLYFLARE_SOFT_DRAIN_ENABLED=0` ⇒ `false` — the explicit disable lever.
+    #[test]
+    fn soft_drain_enabled_zero_resolves_to_false() {
+        let _guard = soft_drain_enabled_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_SOFT_DRAIN_ENABLED", "0");
+        }
+        assert!(!soft_drain_enabled_from_env());
+        unsafe {
+            std::env::remove_var("POLYFLARE_SOFT_DRAIN_ENABLED");
+        }
+    }
+
+    /// B8 Task 3 (e): `POLYFLARE_SOFT_DRAIN_ENABLED=false` ⇒ `false` (mirrors the `0` case; both
+    /// are documented disable spellings).
+    #[test]
+    fn soft_drain_enabled_false_string_resolves_to_false() {
+        let _guard = soft_drain_enabled_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_SOFT_DRAIN_ENABLED", "false");
+        }
+        assert!(!soft_drain_enabled_from_env());
+        unsafe {
+            std::env::remove_var("POLYFLARE_SOFT_DRAIN_ENABLED");
+        }
+    }
+
+    /// `no`/`off` are also accepted disable spellings, and matching is case-insensitive +
+    /// whitespace-tolerant.
+    #[test]
+    fn soft_drain_enabled_no_and_off_resolve_to_false_case_insensitively() {
+        let _guard = soft_drain_enabled_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for v in ["no", "OFF", " False ", "NO"] {
+            unsafe {
+                std::env::set_var("POLYFLARE_SOFT_DRAIN_ENABLED", v);
+            }
+            assert!(!soft_drain_enabled_from_env(), "'{v}' should disable");
+        }
+        unsafe {
+            std::env::remove_var("POLYFLARE_SOFT_DRAIN_ENABLED");
+        }
+    }
+
+    /// A malformed/unrecognized value never silently disables a safety-neutral preference
+    /// signal — it falls back to the default (`true`), matching every other flag in this module's
+    /// "typo ⇒ safe default" convention.
+    #[test]
+    fn soft_drain_enabled_malformed_defaults_to_true() {
+        let _guard = soft_drain_enabled_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_SOFT_DRAIN_ENABLED", "not-a-bool");
+        }
+        assert!(soft_drain_enabled_from_env());
+        unsafe {
+            std::env::remove_var("POLYFLARE_SOFT_DRAIN_ENABLED");
         }
     }
 }

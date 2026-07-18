@@ -97,7 +97,7 @@ async fn bare_tail_dead_anchor_signals_previous_response_not_found() {
         starvation_heartbeat: std::time::Duration::from_secs(10),
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
-
+        soft_drain_enabled: true,
         runtime: Default::default(),
     });
     let app = build_app(state);

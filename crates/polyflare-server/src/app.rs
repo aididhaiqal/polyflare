@@ -136,6 +136,18 @@ pub struct AppState {
     /// `IdleDeadline` (Task 1's mechanism). `Duration::ZERO` ⇒ disabled (today's pre-fix
     /// behavior — the documented `=0` rollback lever).
     pub stream_idle_timeout: std::time::Duration,
+    /// B8 Task 3: the codex-lb `soft_drain_enabled` disable lever
+    /// (`POLYFLARE_SOFT_DRAIN_ENABLED`, resolved ONCE at startup by
+    /// `crate::config::soft_drain_enabled_from_env` — never read per-request). Read by
+    /// `crate::usage_refresh`'s poller loop (which owns the only usage-driven health-tier
+    /// evaluation site) and threaded into `RuntimeStates::evaluate_with_usage` on every refresh
+    /// cycle. `false` forces every account's health tier to HEALTHY with cleared aux state
+    /// (codex-lb's disable path, `load_balancer.py:2245-2249`) — the documented clean-rollback
+    /// lever, matching today's exact pre-B8 behavior (`select.rs`'s `health_tier_pool` becomes a
+    /// no-op single bucket). Defaults to `true` in every test/dev harness that builds `AppState`
+    /// directly, matching `POLYFLARE_SOFT_DRAIN_ENABLED`'s unset-default (mirrors
+    /// `enforce_client_keys`'s doc above for why test harnesses hardcode a value here).
+    pub soft_drain_enabled: bool,
 }
 
 impl AppState {

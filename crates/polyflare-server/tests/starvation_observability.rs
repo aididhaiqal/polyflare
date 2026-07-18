@@ -155,6 +155,7 @@ fn build_state(
         starvation_heartbeat: Duration::from_secs(10),
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
+        soft_drain_enabled: true,
         runtime: Default::default(),
     })
 }
