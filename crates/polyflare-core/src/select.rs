@@ -111,25 +111,66 @@ impl Candidate<'_> {
     }
 }
 
-/// Eligibility hard-filter (port reference step 1; faithful to codex-lb `logic.py:437-483`).
-/// `None` ⇒ skip. The gates are SEQUENTIAL: reset-recovery only mutates the account's effective
-/// state (usage/error), it does NOT admit early — a recovered account still falls through the
-/// cooldown and error-backoff gates below (exactly like `logic.py`, where recovery mutates the
-/// `state` then control continues to the remaining `if` checks).
+/// The three-way eligibility verdict for a single account (B5 Task 1). `Eligible` carries the same
+/// post-recovery candidate `eligibility` always produced; `InBackoff` surfaces WHEN (`recover_at`,
+/// a unix-seconds timestamp) and WHY (`kind`) a temporarily-blocked account becomes eligible again —
+/// the foundation `soonest_recover` (B5 Task 2) and the serve-soonest / keepalive-wait mechanism
+/// build on. `HardBlocked` is terminal: no known recovery time, so it must NEVER be treated as a
+/// wait target (an all-`HardBlocked` pool means "fail now", not "wait forever" — see the B5 plan's
+/// Global Constraints).
+enum Eligibility<'a> {
+    Eligible(Candidate<'a>),
+    // `recover_at`/`kind` are produced starting here (B5 Task 1) but only *consumed* starting with
+    // B5 Task 2's `soonest_recover` — tests already read both fields, this silences the interim
+    // dead-code lint on the non-test build until that consumer lands.
+    #[allow(dead_code)]
+    InBackoff {
+        recover_at: i64,
+        kind: BackoffKind,
+    },
+    HardBlocked,
+}
+
+impl<'a> Eligibility<'a> {
+    /// Collapse to `Some(Candidate)` iff `Eligible`, discarding `InBackoff`/`HardBlocked` — the
+    /// compatibility shim `standard_pool`/`CacheAffinityTier` use so today's
+    /// `filter_map(|s| eligibility(s, now))` behavior (and thus the eligible account *set*) is
+    /// unchanged by this refactor.
+    fn into_eligible(self) -> Option<Candidate<'a>> {
+        match self {
+            Eligibility::Eligible(c) => Some(c),
+            Eligibility::InBackoff { .. } | Eligibility::HardBlocked => None,
+        }
+    }
+}
+
+/// Which gate produced an `InBackoff` verdict. `ErrorBackoff` accounts are Layer-1 serve-now
+/// candidates (a short transient-upstream-error window); `Cooldown` accounts (rate_limited /
+/// quota_exceeded pending their reset, or an explicit `cooldown_until`) are Layer-2 wait targets.
+enum BackoffKind {
+    ErrorBackoff,
+    Cooldown,
+}
+
+/// Eligibility hard-filter (port reference step 1; faithful to codex-lb `logic.py:437-483`),
+/// returning the three-way `Eligibility` verdict. The gates are SEQUENTIAL: reset-recovery only
+/// mutates the account's effective state (usage/error), it does NOT admit early — a recovered
+/// account still falls through the cooldown and error-backoff gates below (exactly like
+/// `logic.py`, where recovery mutates the `state` then control continues to the remaining `if`
+/// checks) and the verdict is decided by the FIRST *remaining* blocking gate, not the recovery
+/// check itself.
 ///
-/// INTENTIONALLY DEFERRED: codex-lb's anti-starvation backoff-fallback (logic.py:485-548) — when
-/// the eligible pool is empty but accounts sit in error-backoff, it serves the soonest-to-recover
-/// instead of failing. M2b is fail-closed (empty pool ⇒ `pick` returns `None` ⇒ a 503 in the
-/// M2b-2 server) which is acceptable for the MVP. Porting the fallback later needs a richer
-/// eligibility result than `Option<Candidate>` (e.g. an enum `Eligible | InBackoff { recover_at }
-/// | HardBlocked`) so `pick` can pick the earliest-recovering backoff candidate — out of scope here.
-fn eligibility(s: &AccountSnapshot, now: i64) -> Option<Candidate<'_>> {
-    // Terminal / operator-held: never eligible (logic.py:444-447).
+/// INTENTIONALLY DEFERRED (was: M2b): codex-lb's anti-starvation backoff-fallback (logic.py:485-548)
+/// — when the eligible pool is empty but accounts sit in error-backoff, it serves the
+/// soonest-to-recover instead of failing. This verdict (surfacing `recover_at`) is the foundation
+/// for that; the actual serve-soonest / wait selection is B5 Task 2 onward — out of scope here.
+fn eligibility(s: &AccountSnapshot, now: i64) -> Eligibility<'_> {
+    // Terminal / operator-held: never eligible, and no known recovery time (logic.py:444-447).
     if matches!(
         s.status.as_str(),
         "reauth_required" | "deactivated" | "paused"
     ) {
-        return None;
+        return Eligibility::HardBlocked;
     }
 
     // Effective (post-recovery) state, seeded from the raw snapshot; recovery/cooldown/backoff
@@ -139,55 +180,78 @@ fn eligibility(s: &AccountSnapshot, now: i64) -> Option<Candidate<'_>> {
     let mut eff_error_count = s.error_count;
     let mut eff_last_error_at = s.last_error_at;
 
-    // rate_limited: recover iff the reset time has passed, else skip. Recovery zeros PRIMARY usage
-    // + error_count — but NOT secondary usage (logic.py:448-455).
+    // rate_limited: recover iff the reset time has passed. If it hasn't, the reset time IS the
+    // recovery target (InBackoff/Cooldown). If there's no reset time at all, there is no known
+    // recovery — HardBlocked (never a wait target). Recovery zeros PRIMARY usage + error_count —
+    // but NOT secondary usage (logic.py:448-455).
     if s.status == "rate_limited" {
         match s.reset_at {
             Some(reset) if now >= reset => {
                 eff_used = 0.0;
                 eff_error_count = 0;
             }
-            _ => return None,
+            Some(reset) => {
+                return Eligibility::InBackoff {
+                    recover_at: reset,
+                    kind: BackoffKind::Cooldown,
+                }
+            }
+            None => return Eligibility::HardBlocked,
         }
     }
 
-    // quota_exceeded: recover iff the reset time has passed, else skip. Recovery zeros PRIMARY +
-    // SECONDARY usage — but NOT error_count (logic.py:456-463).
+    // quota_exceeded: same reset-driven recovery/verdict shape as rate_limited, but recovery zeros
+    // PRIMARY + SECONDARY usage — not error_count (logic.py:456-463).
     if s.status == "quota_exceeded" {
         match s.reset_at {
             Some(reset) if now >= reset => {
                 eff_used = 0.0;
                 eff_secondary_used = 0.0;
             }
-            _ => return None,
+            Some(reset) => {
+                return Eligibility::InBackoff {
+                    recover_at: reset,
+                    kind: BackoffKind::Cooldown,
+                }
+            }
+            None => return Eligibility::HardBlocked,
         }
     }
 
     // Cooldown gate (logic.py:464-469): if the cooldown has expired, clear it AND the error state
-    // (error_count/last_error_at); if it is still active, skip. Applies to recovered accounts too.
+    // (error_count/last_error_at); if it is still active, InBackoff/Cooldown on `cooldown_until`.
+    // Applies to recovered accounts too — this is what makes recovery-does-not-admit-early hold: a
+    // rate_limited account whose reset just passed lands here next and can still be gated.
     if let Some(cd) = s.cooldown_until {
         if now >= cd {
             eff_error_count = 0;
             eff_last_error_at = None;
         } else {
-            return None;
+            return Eligibility::InBackoff {
+                recover_at: cd,
+                kind: BackoffKind::Cooldown,
+            };
         }
     }
 
     // Error-backoff gate (logic.py:470-483): only once error_count >= 3, measured from the last
-    // error time. While inside the backoff window → skip; once expired → clear the error state so
-    // recovery is not penalised by a stale count.
+    // error time. While inside the backoff window → InBackoff/ErrorBackoff on the backoff's expiry;
+    // once expired → clear the error state so recovery is not penalised by a stale count.
     if eff_error_count >= 3 {
         if let Some(last) = eff_last_error_at {
-            if now < last + error_backoff_secs(eff_error_count) {
-                return None;
+            let recover_at = last + error_backoff_secs(eff_error_count);
+            if now < recover_at {
+                return Eligibility::InBackoff {
+                    recover_at,
+                    kind: BackoffKind::ErrorBackoff,
+                };
             }
         }
         eff_error_count = 0;
         eff_last_error_at = None;
     }
 
-    Some(Candidate {
+    Eligibility::Eligible(Candidate {
         snap: s,
         eff_used,
         eff_secondary_used,
@@ -292,7 +356,7 @@ fn standard_pool<'a>(candidates: &'a [AccountSnapshot], ctx: &SelectionCtx) -> V
     let eligible: Vec<Candidate> = candidates
         .iter()
         .filter(|s| !ctx.require_security_work_authorized || s.security_work_authorized)
-        .filter_map(|s| eligibility(s, ctx.now))
+        .filter_map(|s| eligibility(s, ctx.now).into_eligible())
         .collect();
     if eligible.is_empty() {
         return Vec::new();
@@ -452,7 +516,7 @@ impl Selector for CacheAffinityTier {
         let eligible: Vec<Candidate> = candidates
             .iter()
             .filter(|s| !ctx.require_security_work_authorized || s.security_work_authorized)
-            .filter_map(|s| eligibility(s, ctx.now))
+            .filter_map(|s| eligibility(s, ctx.now).into_eligible())
             .collect();
         if eligible.is_empty() {
             return None;
@@ -984,6 +1048,105 @@ mod tests {
                 "{} must skip a paused account",
                 strat.name()
             );
+        }
+    }
+
+    // ---- B5 Task 1: the three-way `Eligibility` verdict ----
+
+    #[test]
+    fn eligibility_clean_account_is_eligible() {
+        let s = snap("a", "plus", 10.0);
+        assert!(matches!(eligibility(&s, 1000), Eligibility::Eligible(_)));
+    }
+
+    #[test]
+    fn eligibility_terminal_statuses_are_hard_blocked() {
+        for status in ["reauth_required", "deactivated", "paused"] {
+            let mut s = snap("a", "plus", 0.0);
+            s.status = status.to_string();
+            assert!(
+                matches!(eligibility(&s, 1000), Eligibility::HardBlocked),
+                "status {status} must be HardBlocked"
+            );
+        }
+    }
+
+    #[test]
+    fn eligibility_rate_limited_with_no_reset_at_is_hard_blocked() {
+        // No known recovery time ⇒ NEVER a wait target (Global Constraints: HardBlocked is never a
+        // wait target, else wait-forever).
+        let mut s = snap("a", "plus", 50.0);
+        s.status = "rate_limited".to_string();
+        s.reset_at = None;
+        assert!(matches!(eligibility(&s, 1000), Eligibility::HardBlocked));
+    }
+
+    #[test]
+    fn eligibility_quota_exceeded_with_no_reset_at_is_hard_blocked() {
+        // Same rule applies to quota_exceeded (the gate-table's other reset_at status).
+        let mut s = snap("a", "plus", 50.0);
+        s.status = "quota_exceeded".to_string();
+        s.reset_at = None;
+        assert!(matches!(eligibility(&s, 1000), Eligibility::HardBlocked));
+    }
+
+    #[test]
+    fn eligibility_rate_limited_before_reset_is_in_backoff_cooldown() {
+        let mut s = snap("a", "plus", 50.0);
+        s.status = "rate_limited".to_string();
+        s.reset_at = Some(2000);
+        match eligibility(&s, 1500) {
+            Eligibility::InBackoff { recover_at, kind } => {
+                assert_eq!(recover_at, 2000);
+                assert!(matches!(kind, BackoffKind::Cooldown));
+            }
+            _ => panic!("expected InBackoff{{Cooldown}} before reset"),
+        }
+    }
+
+    #[test]
+    fn eligibility_recovered_rate_limit_still_blocked_by_active_cooldown_reports_cooldown_recover_at()
+    {
+        // PROVES the recovery-does-not-admit-early fall-through is preserved: the reset has
+        // passed (which mutates eff_* state) but the verdict must come from the FIRST remaining
+        // blocking gate — cooldown_until — not an early Eligible from the reset alone.
+        let mut s = snap("a", "plus", 50.0);
+        s.status = "rate_limited".to_string();
+        s.reset_at = Some(1000); // reset has passed at now=1000 → recovers
+        s.cooldown_until = Some(2000); // …but cooldown is still active
+        match eligibility(&s, 1000) {
+            Eligibility::InBackoff { recover_at, kind } => {
+                assert_eq!(recover_at, 2000, "recover_at must be the cooldown, not the reset");
+                assert!(matches!(kind, BackoffKind::Cooldown));
+            }
+            _ => panic!("expected InBackoff{{Cooldown}} — recovery must not admit early"),
+        }
+    }
+
+    #[test]
+    fn eligibility_cooldown_before_expiry_is_in_backoff_cooldown() {
+        let mut s = snap("a", "plus", 0.0);
+        s.cooldown_until = Some(5000);
+        match eligibility(&s, 4999) {
+            Eligibility::InBackoff { recover_at, kind } => {
+                assert_eq!(recover_at, 5000);
+                assert!(matches!(kind, BackoffKind::Cooldown));
+            }
+            _ => panic!("expected InBackoff{{Cooldown}} before cooldown expiry"),
+        }
+    }
+
+    #[test]
+    fn eligibility_error_backoff_mid_window_is_in_backoff_error_backoff() {
+        let mut s = snap("a", "plus", 0.0);
+        s.error_count = 4; // backoff = min(300, 30*2^(4-3)) = 60s
+        s.last_error_at = Some(1000);
+        match eligibility(&s, 1030) {
+            Eligibility::InBackoff { recover_at, kind } => {
+                assert_eq!(recover_at, 1060, "last_error_at(1000) + error_backoff_secs(4)=60");
+                assert!(matches!(kind, BackoffKind::ErrorBackoff));
+            }
+            _ => panic!("expected InBackoff{{ErrorBackoff}} mid-window"),
         }
     }
 }
