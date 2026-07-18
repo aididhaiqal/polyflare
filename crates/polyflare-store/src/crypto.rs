@@ -16,6 +16,11 @@ const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
 
 /// Encrypts/decrypts short secrets (OAuth tokens) with XChaCha20-Poly1305.
+///
+/// `Clone`: cheap (the underlying `ChaChaPoly1305` clone is just its 32-byte key), added for D15's
+/// `HttpModelSource` which needs its own owned copy of the cipher alongside the account store
+/// (mirrors `Store`'s "pool is reference-counted, cloning is cheap" doc).
+#[derive(Clone)]
 pub struct TokenCipher {
     cipher: XChaCha20Poly1305,
 }

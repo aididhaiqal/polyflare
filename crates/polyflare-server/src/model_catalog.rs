@@ -35,9 +35,13 @@ const DEFAULT_TTL: Duration = Duration::from_secs(3600);
 pub struct UpstreamModel {
     pub slug: String,
     pub display_name: String,
-    /// Context window size in tokens, when the upstream entry advertises one.
+    /// Context window size in tokens, when the upstream entry advertises one. Task 3 renders this
+    /// into both `/models` response shapes (`CodexModelEntry.context_window` and the OpenAI item's
+    /// `metadata.context_window`) when present — see `catalog.rs`'s `CatalogModel`.
     pub context_window: Option<u64>,
-    /// Whether this model prefers the WebSocket transport, when upstream advertises it.
+    /// Whether this model prefers the WebSocket transport, when upstream advertises it. Task 3
+    /// renders this the same way as `context_window` above (`CodexModelEntry.prefer_websockets` /
+    /// `metadata.prefer_websockets`).
     pub prefer_websockets: Option<bool>,
 }
 
@@ -369,6 +373,39 @@ impl ModelSource for HttpModelSource {
         }
         Some(models)
     }
+}
+
+/// A [`ModelSource`] that always reports failure. Used for the
+/// `POLYFLARE_MODEL_CATALOG_ENABLED=false` production disable path (Task 3) and by test/dev
+/// harnesses that need a working `AppState.model_catalog` without ever touching the network: since
+/// `fetch` always returns `None`, [`ModelCatalogCache::get_or_refresh`]/`cached_or_fallback` always
+/// serve the static floor (never blocks, never fetches, never empty).
+struct NoneSource;
+
+#[async_trait]
+impl ModelSource for NoneSource {
+    async fn fetch(&self) -> Option<Vec<UpstreamModel>> {
+        None
+    }
+}
+
+/// Builds a floor-only `ModelCatalogCache`: a [`NoneSource`] over `floor`, so the cache always
+/// serves exactly `floor` (`cached_or_fallback`/`get_or_refresh` never fetch, never differ from
+/// today's static-catalog behavior). This is both the disabled-feature production path AND the
+/// shape every `AppState` test-construction site wants (mirrors how `CodexVersionCache::new()`'s
+/// unwarmed static-version floor is used identically in prod and tests).
+pub fn floor_only_cache(floor: Vec<UpstreamModel>) -> ModelCatalogCache {
+    ModelCatalogCache::new(Box::new(NoneSource), Duration::from_secs(3600), floor)
+}
+
+/// Convenience wrapper combining [`floor_only_cache`] with `catalog::codex_bootstrap_floor()` (the
+/// current static bootstrap slugs) — the exact `Arc<ModelCatalogCache>` value every `AppState`
+/// test/dev construction site wants for its `model_catalog` field when it doesn't care about a
+/// live upstream fetch. The floor is NEVER empty (`codex_bootstrap_floor` always yields the 5
+/// static slugs; see that function's own non-empty assertion/test), so this can never regress
+/// `/models` to an empty catalog.
+pub fn floor_only_model_catalog() -> Arc<ModelCatalogCache> {
+    Arc::new(floor_only_cache(crate::catalog::codex_bootstrap_floor()))
 }
 
 #[cfg(test)]

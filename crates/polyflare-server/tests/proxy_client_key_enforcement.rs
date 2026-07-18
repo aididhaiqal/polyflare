@@ -127,6 +127,7 @@ async fn spawn(enforce_client_keys: bool) -> (String, Arc<AppState>) {
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
         upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
+        model_catalog: polyflare_server::model_catalog::floor_only_model_catalog(),
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),

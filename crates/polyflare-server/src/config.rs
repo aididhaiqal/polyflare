@@ -120,6 +120,19 @@ pub struct ServeConfig {
     /// gate: `AccountRepo::prune_usage_history_older_than` always protects the latest row per
     /// `(account_id, window)` regardless of age.
     pub usage_history_retention_days: u32,
+    /// D15 Task 3: `POLYFLARE_MODEL_CATALOG_TTL_SECS` — the live upstream model-catalog cache's
+    /// refresh TTL (`crate::model_catalog::ModelCatalogCache`; see
+    /// [`model_catalog_ttl_secs_from_env`] for the default/clamp decision). Resolved ONCE here at
+    /// startup and threaded through `AppState`/the background-warm loop in `serve` — never a
+    /// per-request `env::var` read (mirrors every other knob in this struct).
+    pub model_catalog_ttl_secs: u64,
+    /// D15 Task 3: `POLYFLARE_MODEL_CATALOG_ENABLED` — the live upstream model-catalog fetch's
+    /// disable lever (see [`model_catalog_enabled_from_env`] for the default/parse decision).
+    /// `false` ⇒ `serve` builds `AppState.model_catalog` with a floor-only source
+    /// (`crate::model_catalog::floor_only_model_catalog`) and skips the background-warm task
+    /// entirely — a clean rollback to today's static-only `/models` behavior, never a broken or
+    /// empty catalog either way.
+    pub model_catalog_enabled: bool,
 }
 
 /// TA6(b) Task 5: the one capability name resolved today. A pool tagged with this capability (via
@@ -513,6 +526,54 @@ fn retention_days_from_env(var: &str) -> u32 {
     }
 }
 
+/// D15 Task 3: `POLYFLARE_MODEL_CATALOG_TTL_SECS` — the live upstream model-catalog cache's
+/// refresh TTL (`crate::model_catalog::ModelCatalogCache::refresh_interval`, mirrors
+/// `CodexVersionCache`'s TTL). Unset ⇒ `3600` (an hour — the model catalog changes rarely, so a
+/// generous default keeps upstream traffic low without ever going stale for long). A well-formed
+/// value is clamped to `[60, 86400]` (a floor so a hostile/typo'd tiny value can't hammer
+/// upstream every request-adjacent tick; a ceiling of 24h so the cache can never go THAT stale). A
+/// MALFORMED value (non-numeric, negative, or out of `u64` range) resolves to the SAME default as
+/// unset (`3600`) — identical fail-safe rationale to every other malformed-input decision in this
+/// module: a typo must never silently produce a surprising cadence.
+pub fn model_catalog_ttl_secs_from_env() -> u64 {
+    const DEFAULT: u64 = 3600;
+    const MIN: u64 = 60;
+    const MAX: u64 = 86400;
+    match std::env::var("POLYFLARE_MODEL_CATALOG_TTL_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(n) if n < MIN => MIN,
+            Ok(n) if n > MAX => MAX,
+            Ok(n) => n,
+            Err(_) => DEFAULT,
+        },
+        Err(_) => DEFAULT,
+    }
+}
+
+/// D15 Task 3: `POLYFLARE_MODEL_CATALOG_ENABLED` — the live upstream model-catalog fetch's disable
+/// lever. Defaults to **ON** (mirrors [`soft_drain_enabled_from_env`]'s "default on, opt OUT not
+/// IN" convention exactly, for the identical reason: the fallback ladder
+/// (`crate::model_catalog::ModelCatalogCache`) is airtight — disable/no-accounts/fetch-failure all
+/// degrade to today's static-floor `/models` behavior, so there is no safety reason to ship this
+/// off by default).
+///
+/// - Unset ⇒ `true`.
+/// - `"0"` / `"false"` / `"no"` / `"off"` (case-insensitive, trimmed) ⇒ `false` — the explicit
+///   disable lever; `serve` then builds `AppState.model_catalog` via
+///   `crate::model_catalog::floor_only_model_catalog()` and never spawns the background-warm task,
+///   a clean, total rollback to pre-D15 static-only `/models`.
+/// - Anything else (including a malformed/typo'd value) ⇒ `true` — a typo must never silently
+///   disable a fetch whose every failure mode already degrades safely.
+pub fn model_catalog_enabled_from_env() -> bool {
+    match std::env::var("POLYFLARE_MODEL_CATALOG_ENABLED") {
+        Ok(raw) => !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
 impl ServeConfig {
     pub fn from_env() -> Result<Self, String> {
         let bind_addr =
@@ -577,6 +638,8 @@ impl ServeConfig {
         let inflight_penalty_pct = inflight_penalty_pct_from_env();
         let request_log_retention_days = request_log_retention_days_from_env();
         let usage_history_retention_days = usage_history_retention_days_from_env();
+        let model_catalog_ttl_secs = model_catalog_ttl_secs_from_env();
+        let model_catalog_enabled = model_catalog_enabled_from_env();
         Ok(ServeConfig {
             bind_addr,
             upstream_base_url,
@@ -601,6 +664,8 @@ impl ServeConfig {
             inflight_penalty_pct,
             request_log_retention_days,
             usage_history_retention_days,
+            model_catalog_ttl_secs,
+            model_catalog_enabled,
         })
     }
 }
@@ -1421,6 +1486,131 @@ mod tests {
         );
         unsafe {
             std::env::remove_var("POLYFLARE_USAGE_HISTORY_RETENTION_DAYS");
+        }
+    }
+
+    /// Serializes tests in this module that mutate `POLYFLARE_MODEL_CATALOG_TTL_SECS` /
+    /// `POLYFLARE_MODEL_CATALOG_ENABLED` — same rationale as the other env-lock helpers above.
+    fn model_catalog_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// D15 Task 3 (c): unset ⇒ `3600` (an hour, the documented default).
+    #[test]
+    fn model_catalog_ttl_secs_unset_defaults_to_thirty_six_hundred() {
+        let _guard = model_catalog_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("POLYFLARE_MODEL_CATALOG_TTL_SECS");
+        }
+        assert_eq!(model_catalog_ttl_secs_from_env(), 3600);
+    }
+
+    /// D15 Task 3 (c): a well-formed value BELOW the `60`s floor (`30`) clamps UP to `60` — never
+    /// silently accepted as-is, never treated as malformed.
+    #[test]
+    fn model_catalog_ttl_secs_below_floor_clamps_to_sixty() {
+        let _guard = model_catalog_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_MODEL_CATALOG_TTL_SECS", "30");
+        }
+        assert_eq!(model_catalog_ttl_secs_from_env(), 60);
+        unsafe {
+            std::env::remove_var("POLYFLARE_MODEL_CATALOG_TTL_SECS");
+        }
+    }
+
+    /// A well-formed value ABOVE the `86400`s (24h) ceiling clamps DOWN to `86400`.
+    #[test]
+    fn model_catalog_ttl_secs_above_ceiling_clamps_to_one_day() {
+        let _guard = model_catalog_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_MODEL_CATALOG_TTL_SECS", "999999");
+        }
+        assert_eq!(model_catalog_ttl_secs_from_env(), 86400);
+        unsafe {
+            std::env::remove_var("POLYFLARE_MODEL_CATALOG_TTL_SECS");
+        }
+    }
+
+    /// A well-formed in-range value resolves to exactly itself.
+    #[test]
+    fn model_catalog_ttl_secs_reads_a_well_formed_in_range_value() {
+        let _guard = model_catalog_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_MODEL_CATALOG_TTL_SECS", "7200");
+        }
+        assert_eq!(model_catalog_ttl_secs_from_env(), 7200);
+        unsafe {
+            std::env::remove_var("POLYFLARE_MODEL_CATALOG_TTL_SECS");
+        }
+    }
+
+    /// D15 Task 3 (c): a malformed value (non-numeric) ⇒ the SAME safe default as unset (`3600`)
+    /// — never a boot crash, never silently collapsed to the clamp floor.
+    #[test]
+    fn model_catalog_ttl_secs_malformed_defaults_to_thirty_six_hundred() {
+        let _guard = model_catalog_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_MODEL_CATALOG_TTL_SECS", "not-a-number");
+        }
+        assert_eq!(model_catalog_ttl_secs_from_env(), 3600);
+        unsafe {
+            std::env::remove_var("POLYFLARE_MODEL_CATALOG_TTL_SECS");
+        }
+    }
+
+    /// D15 Task 3 (c): unset ⇒ `true` — the documented default-ON behavior (the fallback ladder
+    /// is airtight, so there's no safety reason to ship this off by default).
+    #[test]
+    fn model_catalog_enabled_unset_defaults_to_true() {
+        let _guard = model_catalog_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("POLYFLARE_MODEL_CATALOG_ENABLED");
+        }
+        assert!(model_catalog_enabled_from_env());
+    }
+
+    /// D15 Task 3 (c): `"0"` is the explicit disable lever ⇒ `false`.
+    #[test]
+    fn model_catalog_enabled_zero_disables() {
+        let _guard = model_catalog_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_MODEL_CATALOG_ENABLED", "0");
+        }
+        assert!(!model_catalog_enabled_from_env());
+        unsafe {
+            std::env::remove_var("POLYFLARE_MODEL_CATALOG_ENABLED");
+        }
+    }
+
+    /// A malformed/typo'd value ⇒ the SAME safe default as unset (`true`) — never silently
+    /// disables a fetch whose every failure mode already degrades safely.
+    #[test]
+    fn model_catalog_enabled_malformed_defaults_to_true() {
+        let _guard = model_catalog_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_MODEL_CATALOG_ENABLED", "not-a-bool");
+        }
+        assert!(model_catalog_enabled_from_env());
+        unsafe {
+            std::env::remove_var("POLYFLARE_MODEL_CATALOG_ENABLED");
         }
     }
 }
