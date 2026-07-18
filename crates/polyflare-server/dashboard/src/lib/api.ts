@@ -222,6 +222,35 @@ export interface RequestsQueryParams {
   since_ts?: number;
 }
 
+/** `read_api.rs::SessionRowView` — one row of `GET /api/sessions`. Content-free: `session_key` is a
+ * sha256 hash (one-way, never raw header/content — see read_api.rs module doc), and no field here
+ * carries a token/body/prompt. `owning_account_id`/`owner_email` are null for a session that never
+ * completed a turn or whose account was deleted (LEFT JOIN — those rows survive). */
+export interface SessionRowView {
+  session_key: string;
+  key_strength: string;
+  owning_account_id: string | null;
+  owner_email: string | null;
+  state: string;
+  required_capabilities: string | null;
+  created_at: number;
+  updated_at: number;
+  last_activity_at: number;
+}
+
+/** `read_api.rs::SessionsView` — `GET /api/sessions` response envelope. */
+export interface SessionsView {
+  total: number;
+  rows: SessionRowView[];
+}
+
+/** `read_api.rs::SessionsQuery` — pagination params for `GET /api/sessions`. Both optional;
+ * `useSessions` (queries.ts) serializes only the defined ones into the query string. */
+export interface SessionsQueryParams {
+  limit?: number;
+  offset?: number;
+}
+
 /** `read_api.rs::KpisView` — `OverviewView.kpis`. */
 export interface KpisView {
   requests: number;
@@ -325,6 +354,7 @@ export const api = {
     fetchJson<TrendsView>(`/api/accounts/${encodeURIComponent(id)}/trends`),
   pools: () => fetchJson<PoolView[]>("/api/pools"),
   requests: (qs: string) => fetchJson<RequestsView>(`/api/requests${qs}`),
+  sessions: (qs: string) => fetchJson<SessionsView>(`/api/sessions${qs}`),
   capabilities: () => fetchJson<CapabilitiesView>("/api/capabilities"),
   whoami: () => fetchJson<WhoamiView>("/api/whoami"),
 };

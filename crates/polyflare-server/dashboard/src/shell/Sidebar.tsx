@@ -3,7 +3,7 @@ import clsx from "clsx";
 
 import { useAuth } from "../auth/AuthProvider";
 import { useCapabilityFlags } from "../capabilities/CapabilitiesProvider";
-import { Activity, BarChart3, Layers, LayoutGrid, List, Settings, Users, type LucideIcon } from "../ui/icons";
+import { Activity, BarChart3, Layers, LayoutGrid, Link2, List, Settings, Users, type LucideIcon } from "../ui/icons";
 import { ThemeToggle } from "./ThemeToggle";
 
 interface NavItem {
@@ -23,6 +23,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: "/accounts", label: "Accounts", icon: Users },
   { to: "/pools", label: "Pools", icon: Layers },
   { to: "/requests", label: "Requests", icon: List },
+  { to: "/sessions", label: "Sessions", icon: Link2 },
   { to: "/logs", label: "Live Logs", icon: Activity, requiresLiveLogs: true },
 ];
 
