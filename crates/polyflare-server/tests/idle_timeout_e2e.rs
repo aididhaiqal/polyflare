@@ -110,6 +110,7 @@ async fn spawn_polyflare(upstream: String, idle: Duration) -> String {
         // The field under test: everything else here is boilerplate identical to every other
         // e2e harness in this crate (see `tests/e2e_passthrough.rs`).
         stream_idle_timeout: idle,
+        soft_drain_enabled: true,
     });
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

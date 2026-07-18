@@ -97,6 +97,7 @@ pub async fn spawn_live_logs(upstream_url: String, enabled: bool) -> (String, Ar
         starvation_heartbeat: std::time::Duration::from_secs(10),
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
+        soft_drain_enabled: true,
     });
     let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -169,6 +170,7 @@ pub async fn spawn_without_admin_token(upstream_url: String) -> (String, Arc<App
         starvation_heartbeat: std::time::Duration::from_secs(10),
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
+        soft_drain_enabled: true,
     });
     let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

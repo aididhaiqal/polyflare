@@ -226,6 +226,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         enforce_client_keys,
         stream_idle_timeout: config.stream_idle_timeout,
+        soft_drain_enabled: config.soft_drain_enabled,
     });
     // Runtime usage-refresh loop: keeps each Codex account's rate-limit windows (5h + weekly) and
     // routing gate live, instead of the frozen numbers the importer left.

@@ -410,6 +410,68 @@ impl RuntimeStates {
         });
     }
 
+    /// B8 Task 3: the FULL (usage + error) health-tier evaluation, run by the usage-refresh
+    /// poller (`crate::usage_refresh::refresh_account`) on every `used_percent`/
+    /// `secondary_used_percent` refresh cycle (≤600s). This is the ONLY evaluation site that owns
+    /// the DRAINING→PROBING quiet-timer demotion (`evaluate_health_tier`'s DRAINING branch): the
+    /// funnel (`apply_funnel_transition`, Task 2) deliberately refuses that edge because it never
+    /// sees usage%, so a purely usage-drained account could otherwise get stuck in DRAINING
+    /// forever once its errors clear. Here, `should_drain` is computed from the REAL usage
+    /// reading, so `!should_drain` genuinely means "healthy by every known signal" and the
+    /// quiet-timer promotion is safe to apply.
+    ///
+    /// - `enabled == false` (the `POLYFLARE_SOFT_DRAIN_ENABLED` disable lever, resolved once at
+    ///   startup into `ServeConfig`/`AppState` — never read per-request) forces the tier to
+    ///   HEALTHY and clears the aux fields via [`RuntimeState::transition`]`(0, now)` — codex-lb's
+    ///   disable path (`load_balancer.py:2245-2249`) — WITHOUT touching `error_count`/
+    ///   `last_error_at`: the funnel owns those, and clobbering them here would let a poller cycle
+    ///   silently erase evidence the error-backoff gate (`select.rs`) still needs. This branch
+    ///   runs BEFORE the `frozen` check — the disable lever is unconditional, matching codex-lb.
+    /// - Otherwise: compute the FULL `should_drain` (usage OR the entry's existing error state —
+    ///   `compute_should_drain` reads `rt.error_count`/`rt.last_error_at` as-is, never mutating
+    ///   them), run [`evaluate_health_tier`] with `frozen = status_frozen` (the caller's blocked-
+    ///   status set: rate_limited/quota_exceeded/paused/reauth_required/deactivated — while
+    ///   frozen, no transition happens at all, matching the pure fn's contract), then apply the
+    ///   writeback via [`RuntimeState::transition`].
+    ///
+    /// Runs under the `mutate` write lock, so it composes safely with a concurrent funnel call on
+    /// the same account. `mutate`'s GC still applies afterward: a HEALTHY, zero-error entry is
+    /// dropped, keeping the map bounded.
+    pub fn evaluate_with_usage(
+        &self,
+        id: &AccountId,
+        used_percent: Option<f64>,
+        secondary_percent: Option<f64>,
+        status_frozen: bool,
+        enabled: bool,
+        now: i64,
+    ) {
+        self.mutate(id, |rt| {
+            if !enabled {
+                // Disable lever: force HEALTHY + clear aux, unconditionally. Deliberately leaves
+                // error_count/last_error_at alone — the funnel owns those.
+                rt.transition(0, now);
+                return;
+            }
+            let should_drain = compute_should_drain(
+                used_percent,
+                secondary_percent,
+                rt.error_count,
+                rt.last_error_at,
+                now,
+            );
+            let new_tier = evaluate_health_tier(
+                rt.health_tier,
+                should_drain,
+                rt.drain_entered_at,
+                rt.probe_success_streak,
+                status_frozen,
+                now,
+            );
+            rt.transition(new_tier, now);
+        });
+    }
+
     /// Stamp the last-selected time (the `round_robin` tiebreak + a liveness marker). Cheap; called
     /// on every selection.
     pub fn record_selected(&self, id: &AccountId, now: i64) {
@@ -893,5 +955,81 @@ mod tests {
             "the funnel must never promote DRAINING->PROBING; only the poller (Task 3) does, \
              because only it has usage%"
         );
+    }
+
+    // --- B8 Task 3: usage-driven evaluation in the poller (evaluate_with_usage) ---
+
+    #[test]
+    fn evaluate_with_usage_drains_a_healthy_account_on_high_usage_and_stamps_drain_entered_at() {
+        // (a) used%=90, no errors, HEALTHY ⇒ DRAINING + drain_entered_at stamped to `now`.
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        rs.evaluate_with_usage(&id, Some(90.0), None, false, true, 1000);
+        let mut snaps = vec![snap("a")];
+        rs.overlay(&mut snaps, 1000);
+        assert_eq!(snaps[0].health_tier, 1, "used% >= 85 ⇒ DRAINING");
+        assert_eq!(
+            peek(&rs, &id).unwrap().drain_entered_at,
+            Some(1000),
+            "entering DRAINING stamps drain_entered_at"
+        );
+    }
+
+    #[test]
+    fn evaluate_with_usage_promotes_draining_to_probing_once_quiet_and_below_threshold() {
+        // (b) THE THING THE FUNNEL CAN'T DO: a DRAINING account whose drain_entered_at is >= 60s
+        // old, with usage now BELOW threshold and no errors ⇒ PROBING (the poller's quiet-timer
+        // demotion — it has usage%, so it can safely see !should_drain).
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        seed(&rs, &id, |rt| {
+            rt.health_tier = 1; // DRAINING
+            rt.drain_entered_at = Some(1000); // 61s before the `now` used below
+        });
+        rs.evaluate_with_usage(&id, Some(10.0), None, false, true, 1061);
+        let mut snaps = vec![snap("a")];
+        rs.overlay(&mut snaps, 1061);
+        assert_eq!(
+            snaps[0].health_tier, 2,
+            "quiet (>=60s) + usage below threshold + no errors ⇒ PROBING"
+        );
+    }
+
+    #[test]
+    fn evaluate_with_usage_disabled_forces_healthy_and_clears_aux_even_at_high_usage() {
+        // (c) enabled=false ⇒ forces HEALTHY + clears aux, even when used%=99 (would otherwise
+        // drain). Does NOT clobber existing error state (a separate, funnel-owned signal).
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        seed(&rs, &id, |rt| {
+            rt.health_tier = 1; // DRAINING
+            rt.drain_entered_at = Some(500);
+            rt.probe_success_streak = 2;
+            rt.error_count = 3;
+            rt.last_error_at = Some(900);
+        });
+        rs.evaluate_with_usage(&id, Some(99.0), None, false, false, 1000);
+        let entry = peek(&rs, &id).expect("non-neutral: error state survives");
+        assert_eq!(entry.health_tier, 0, "disabled ⇒ forced HEALTHY regardless of usage");
+        assert_eq!(entry.drain_entered_at, None, "aux cleared");
+        assert_eq!(entry.probe_success_streak, 0, "aux cleared");
+        assert_eq!(entry.error_count, 3, "error state is NOT clobbered by the disable path");
+        assert_eq!(entry.last_error_at, Some(900), "error state is NOT clobbered");
+    }
+
+    #[test]
+    fn evaluate_with_usage_frozen_status_leaves_tier_unchanged_at_high_usage() {
+        // (d) a frozen (blocked-status) account's tier passes through UNCHANGED regardless of
+        // should_drain — matches evaluate_health_tier's frozen contract (Task 1).
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        seed(&rs, &id, |rt| {
+            rt.health_tier = 2; // PROBING
+            rt.probe_success_streak = 1;
+        });
+        rs.evaluate_with_usage(&id, Some(99.0), None, true, true, 1000);
+        let mut snaps = vec![snap("a")];
+        rs.overlay(&mut snaps, 1000);
+        assert_eq!(snaps[0].health_tier, 2, "frozen ⇒ tier unchanged despite used%=99");
     }
 }
