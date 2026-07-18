@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use bytes::Bytes;
-use futures_util::stream;
+use futures_util::stream::{self, StreamExt};
 use tokio::net::TcpListener;
 
 /// The response behavior of a `MockUpstream`.
@@ -35,6 +35,12 @@ enum MockMode {
     /// injection) — used to drive the HTTP executor's error-body code-extraction path
     /// (failure-code writeback Task 2).
     Error { status: u16, body: String },
+    /// Emit `first_chunk` as a single SSE `data:` frame, then never yield again — no EOF, no
+    /// further frames, no keep-alive. Distinct from `silent_on_anchor` (which never sends even the
+    /// first byte): this mode DOES deliver one frame, then goes silent — simulating a real upstream
+    /// that sends `response.created` and then stalls, exercising the watchdog scan-loop's per-read
+    /// timeout rather than the initial first-chunk peek timeout.
+    Stall { first_chunk: String },
 }
 
 /// A scriptable mock upstream: serves `POST /responses`, records every request body + the last
@@ -122,6 +128,18 @@ impl MockUpstream {
             MockMode::Error {
                 status,
                 body: body.into(),
+            },
+        )
+    }
+
+    /// Emit `first_chunk` once, then never yield again (no EOF). Used to test a post-first-chunk
+    /// upstream stall (e.g. `response.created` followed by silence) — the watchdog scan-loop's
+    /// per-read timeout, not the initial first-chunk peek timeout.
+    pub fn stall_after_first(first_chunk: impl Into<String>) -> Self {
+        Self::build(
+            vec![],
+            MockMode::Stall {
+                first_chunk: first_chunk.into(),
             },
         )
     }
@@ -251,6 +269,16 @@ async fn handler(
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body))
             .unwrap(),
+        MockMode::Stall { first_chunk } => {
+            let first = sse_frame(&first_chunk);
+            let s = stream::once(async move { Ok::<Bytes, std::io::Error>(first) })
+                .chain(stream::pending::<Result<Bytes, std::io::Error>>());
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(s))
+                .unwrap()
+        }
     }
 }
 

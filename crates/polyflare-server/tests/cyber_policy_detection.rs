@@ -312,9 +312,7 @@ async fn armed_created_then_later_cyber_policy_is_detected_before_relay() {
         Err(other) => panic!("expected CapabilityRejection, got {other:?}"),
         Ok(stream) => {
             let body = drain(stream).await;
-            panic!(
-                "created-then-cyber (across chunks) must NOT relay a stream, got body: {body}"
-            );
+            panic!("created-then-cyber (across chunks) must NOT relay a stream, got body: {body}");
         }
     }
     assert_eq!(handle.request_count(), 1, "detect-only: no reselect/retry");
@@ -356,7 +354,9 @@ async fn armed_normal_stream_relays_every_frame_in_order() {
         .await
         .expect("bounded");
 
-    let created_pos = body.find("response.created").expect("created frame relayed");
+    let created_pos = body
+        .find("response.created")
+        .expect("created frame relayed");
     let delta_pos = body
         .find("response.output_text.delta")
         .expect("content delta relayed");
@@ -368,6 +368,55 @@ async fn armed_normal_stream_relays_every_frame_in_order() {
         "frames must relay in order: {body}"
     );
     assert!(body.contains("\"hello\""), "delta payload relayed: {body}");
+}
+
+/// THE RE-REVIEW FINDING: the scan loop added to buffer past lifecycle frames did naked, un-timed
+/// `stream.next().await` reads. If upstream sends `response.created` (satisfies the first-chunk
+/// peek) then goes SILENT before any decisive frame, the scan parked forever — no HTTP status ever
+/// sent to the client, holding the handler task + upstream socket with zero self-healing. Because
+/// peek-before-relay holds across the WHOLE scan window (nothing has been relayed while scanning),
+/// a scan-silence is exactly as recoverable as a first-chunk silence: drop the stream and route into
+/// the SAME `ResendFull`/`SignalClient` recovery. This test proves the fix: bounded completion (via
+/// `ResendFull` recovery — a second, anchor-stripped request), not an indefinite hang.
+#[tokio::test]
+async fn armed_created_then_silence_during_scan_recovers_via_resend() {
+    let mock = MockUpstream::stall_after_first(created_frame("resp_stall"));
+    let handle = mock.clone();
+    let base = mock.spawn().await;
+    let exec = CodexExecutor::new().unwrap();
+    let cont: Arc<dyn Continuity> = Arc::new(NoopContinuity);
+
+    let prepared = armed_full_resend(
+        serde_json::json!({"previous_response_id": "resp_a", "input": [{"a":1}]}),
+    );
+    let res = tokio::time::timeout(
+        Duration::from_secs(3),
+        execute_with_watchdog(
+            &exec,
+            cont,
+            prepared,
+            &core_account(base),
+            polyflare_core::AccountId::from("acct"),
+            RequestCtx::default(),
+            Default::default(),
+        ),
+    )
+    .await
+    .expect("scan-silence must recover within the bound (~timeout), not hang forever");
+
+    let _stream =
+        res.expect("post-created silence during the scan must recover (Ok(stream)), not error");
+    assert_eq!(
+        handle.request_count(),
+        2,
+        "post-created scan-silence must trigger ResendFull recovery: a 2nd upstream request"
+    );
+    let bodies = handle.bodies();
+    assert!(
+        bodies[1].get("previous_response_id").is_none(),
+        "the recovery request strips the anchor: {:?}",
+        bodies[1]
+    );
 }
 
 /// Documents the Disarmed-path boundary explicitly: no anchor => `execute_with_watchdog` does not

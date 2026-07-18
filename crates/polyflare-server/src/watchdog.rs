@@ -7,6 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_core::Stream;
@@ -166,7 +167,7 @@ pub async fn execute_with_watchdog(
                     // that point rejects with nothing relayed (peek-before-relay preserved: still no
                     // client byte written for a rejected turn). No reroute in this task (TA6b Task 2
                     // consumes the signal).
-                    match scan_past_lifecycle(first, stream).await {
+                    match scan_past_lifecycle(first, stream, timeout).await {
                         ScanOutcome::CyberPolicy => {
                             let _ = continuity
                                 .observe(
@@ -208,6 +209,25 @@ pub async fn execute_with_watchdog(
                                 runtime,
                             ))
                         }
+                        ScanOutcome::Silence => {
+                            // Re-review fix: a silence discovered DURING the scan (post-`created`,
+                            // before any decisive frame) is recoverable exactly like a silence on
+                            // the initial peek — nothing has been relayed yet either way. The
+                            // scanned-past `ResponseStream` was moved into `scan_past_lifecycle` and
+                            // is dropped here as it goes out of scope (cancel-safe), same as the
+                            // explicit `drop(stream)` below. Route into the SAME recovery machinery.
+                            recover_from_silence(
+                                executor,
+                                continuity,
+                                directive.recovery,
+                                account,
+                                account_id,
+                                ctx,
+                                session_key,
+                                runtime,
+                            )
+                            .await
+                        }
                     }
                 }
                 Ok(Some(Err(e))) => {
@@ -228,31 +248,57 @@ pub async fn execute_with_watchdog(
                     // Ok(None): upstream closed with zero events on an anchored req == dead anchor.
                     // Err(_): the N timeout elapsed == the wedge. Both ⇒ RECOVER. Drop = cancel.
                     drop(stream);
-                    match directive.recovery {
-                        RecoveryPlan::ResendFull { anchorless_req } => {
-                            execute_recovery(
-                                executor,
-                                continuity,
-                                anchorless_req,
-                                account,
-                                account_id,
-                                ctx,
-                                session_key,
-                                runtime,
-                            )
-                            .await
-                        }
-                        RecoveryPlan::SignalClient => {
-                            Ok(
-                                signal_client_stream(continuity, ctx, account_id, session_key)
-                                    .await,
-                            )
-                        }
-                        RecoveryPlan::None => Err(WatchdogError::Continuity),
-                    }
+                    recover_from_silence(
+                        executor,
+                        continuity,
+                        directive.recovery,
+                        account,
+                        account_id,
+                        ctx,
+                        session_key,
+                        runtime,
+                    )
+                    .await
                 }
             }
         }
+    }
+}
+
+/// Shared recovery dispatch for EVERY silence outcome — the initial peek's `Ok(None) | Err(_)` AND
+/// the scan-loop's [`ScanOutcome::Silence`] (re-review fix) both call this, so there is exactly one
+/// place that turns a `RecoveryPlan` into an outcome. Both call sites are valid here for the same
+/// reason: in each, peek-before-relay held for the whole time the dead stream was alive — nothing
+/// was ever relayed to the client — so restarting via `ResendFull`/`SignalClient` is clean.
+#[allow(clippy::too_many_arguments)] // internal fn; each param is a distinct, clearly-named handle.
+async fn recover_from_silence(
+    executor: &dyn Executor,
+    continuity: Arc<dyn Continuity>,
+    recovery: RecoveryPlan,
+    account: &Account,
+    account_id: AccountId,
+    ctx: RequestCtx,
+    session_key: Option<SessionKey>,
+    runtime: Arc<RuntimeStates>,
+) -> Result<ResponseStream, WatchdogError> {
+    match recovery {
+        RecoveryPlan::ResendFull { anchorless_req } => {
+            execute_recovery(
+                executor,
+                continuity,
+                anchorless_req,
+                account,
+                account_id,
+                ctx,
+                session_key,
+                runtime,
+            )
+            .await
+        }
+        RecoveryPlan::SignalClient => {
+            Ok(signal_client_stream(continuity, ctx, account_id, session_key).await)
+        }
+        RecoveryPlan::None => Err(WatchdogError::Continuity),
     }
 }
 
@@ -412,6 +458,12 @@ enum ScanOutcome {
     /// The inner stream produced a hard error while scanning, i.e. before anything was relayed —
     /// identical in every observable way to a hard error on the very first frame.
     HardError(ExecError),
+    /// The scan-loop's per-read `timeout` elapsed before a decisive frame arrived (re-review
+    /// finding: upstream sent `response.created` then went silent). Peek-before-relay holds across
+    /// the WHOLE scan window — nothing buffered here has been relayed — so this is recoverable
+    /// exactly like a first-chunk silence: the caller drops the stream and routes into the same
+    /// `ResendFull`/`SignalClient` recovery as `Ok(None) | Err(_)` on the initial peek.
+    Silence,
 }
 
 /// A single buffered frame's classification, once its `type` can be read.
@@ -487,10 +539,17 @@ const MAX_SCAN_BYTES: usize = 64 * 1024;
 /// Buffers upstream chunks (bounded; see [`MAX_SCAN_BYTES`]) past pure lifecycle frames
 /// (`response.created`/`response.in_progress`), scanning for the first DECISIVE frame — mirrors
 /// `ResponseIdSniffer`'s accumulate-and-reparse buffering approach rather than reinventing SSE
-/// reassembly. `first` is the chunk the caller already peeked (under the silence-watchdog timeout,
-/// unchanged); `stream` is polled further WITHOUT an additional timeout — only the very first byte
-/// races the wedge timer, exactly as before this fix.
-async fn scan_past_lifecycle(first: Bytes, mut stream: ResponseStream) -> ScanOutcome {
+/// reassembly. `first` is the chunk the caller already peeked (under the silence-watchdog timeout).
+/// Each subsequent read is ALSO raced against `timeout` (the SAME `Duration` the first-chunk peek
+/// used) — re-review finding: without this, a stream that sends `response.created` then goes
+/// silent (nothing more, ever) parked this loop's naked `stream.next().await` forever, before any
+/// HTTP status was sent to the client, with no self-healing. A genuinely-live stream that keeps
+/// producing frames within `timeout` never observes this — the timeout only fires on real silence.
+async fn scan_past_lifecycle(
+    first: Bytes,
+    mut stream: ResponseStream,
+    timeout: Duration,
+) -> ScanOutcome {
     let mut relay_chunks: Vec<Bytes> = vec![first.clone()];
     let mut scan_buf: Vec<u8> = first.to_vec();
 
@@ -502,21 +561,21 @@ async fn scan_past_lifecycle(first: Bytes, mut stream: ResponseStream) -> ScanOu
                 if scan_buf.len() > MAX_SCAN_BYTES {
                     break; // bounded: give up scanning, treat as alive with what we have
                 }
-                match stream.next().await {
-                    Some(Ok(next)) => {
+                match tokio::time::timeout(timeout, stream.next()).await {
+                    Ok(Some(Ok(next))) => {
                         scan_buf.extend_from_slice(&next);
                         relay_chunks.push(next);
                     }
-                    Some(Err(e)) => return ScanOutcome::HardError(e),
-                    None => break, // stream ended before a decisive frame; relay what we have
+                    Ok(Some(Err(e))) => return ScanOutcome::HardError(e),
+                    Ok(None) => break, // stream ended before a decisive frame; relay what we have
+                    Err(_) => return ScanOutcome::Silence, // per-read timeout elapsed: silence
                 }
             }
         }
     }
 
-    let rebuilt: ResponseStream = Box::pin(
-        stream::iter(relay_chunks.into_iter().map(Ok::<Bytes, ExecError>)).chain(stream),
-    );
+    let rebuilt: ResponseStream =
+        Box::pin(stream::iter(relay_chunks.into_iter().map(Ok::<Bytes, ExecError>)).chain(stream));
     ScanOutcome::Alive(rebuilt)
 }
 
