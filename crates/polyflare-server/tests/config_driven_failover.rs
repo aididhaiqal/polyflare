@@ -193,6 +193,7 @@ fn build_state(
         runtime: Default::default(),
         max_account_attempts,
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
+        health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: std::time::Duration::from_secs(60),
         starvation_heartbeat: std::time::Duration::from_secs(10),
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),

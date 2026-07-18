@@ -154,15 +154,28 @@ async fn record_failure(state: &AppState, id: &AccountId, err: &WatchdogError, n
             }
         }
     }
-    match signal {
+    let transition = match signal {
         Some(sig) if sig.status == 429 => state.runtime.record_rate_limit(id, sig.retry_after, now),
         // 5xx (server error), 401/403 (bad credential / account-scoped auth), 408 (request timeout):
         // an ACCOUNT-health problem — bump the error count so a repeat offender hits the backoff gate.
         Some(sig) if (500..=599).contains(&sig.status) || matches!(sig.status, 401 | 403 | 408) => {
             state.runtime.record_transient_error(id, now)
         }
-        Some(_) => {} // other 4xx (400/404/422/…): request-level, not account-health.
+        Some(_) => None, // other 4xx (400/404/422/…): request-level, not account-health.
         None => state.runtime.record_transient_error(id, now), // transport error / mid-stream drop.
+    };
+    // B8 Task 4: if that error just moved the account's soft-drain tier (an error-drain entering
+    // DRAINING, or a probe-streak promotion), emit the content-free health-tier signal here — this
+    // is one of the two edges that owns the log-bus/metrics handles (`&AppState`).
+    if let Some(t) = transition {
+        crate::observability::emit_health_tier_signal(
+            &state.log_bus,
+            &state.health_tier_metrics,
+            id.as_str(),
+            t.from,
+            t.to,
+            t.reason,
+        );
     }
 }
 
