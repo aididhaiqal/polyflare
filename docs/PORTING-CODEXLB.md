@@ -184,7 +184,7 @@ capacity-recovery wait derived from the soonest `reset_at` the snapshots already
 
 ## Phase C — Load-shaping & ops
 
-### C9. `in_flight` lease accounting  · MEDIUM · medium
+### C9. `in_flight` lease accounting  · MEDIUM · medium · **DONE (soft-penalty v1; hard cap deferred)**
 Increment `in_flight` in the runtime map at dispatch (`ingress.rs`, right after
 `resolve_core_account`), decrement at completion/error, with a stale-reclaim TTL so a crashed request
 doesn't pin the counter. Set `last_selected_at = now` on selection (`round_robin`'s tiebreak reads it
@@ -192,6 +192,26 @@ and notes it's always None today). Use `in_flight` two ways: exclude accounts at
 concurrency cap, and fold it into the capacity weight as a soft penalty (~2.5%/lease) so the waterfall
 spreads load. Keep in-memory; surface only to metrics.
 *codex-lb:* `load_balancer.py:201-318,1767-1788,2212-2225`.
+
+**DONE 2026-07-18 (soft-penalty v1; plan `docs/superpowers/plans/2026-07-18-c9-inflight-lease.md`).**
+- **Leak-proof release via a Rust RAII `InFlightGuard`** (better than codex-lb's try/finally + TTL): the guard
+  `impl Drop` decrements `RuntimeState.in_flight`; it is embedded as a held-for-Drop field of `ObservingStream`
+  (`watchdog.rs`, `poll_next` byte-UNCHANGED — Rust auto-drops the field) so it releases on EVERY exit path —
+  clean drain, client disconnect, mid-stream error, idle-timeout, panic. `run_failover_loop` releases account A's
+  guard before acquiring B's (a failed attempt drops it in the executor frame before the next pick). Acquired at
+  all 9 streaming selection sites, always AFTER the pick (a request never penalizes its own selection). No
+  stale-reclaim TTL needed (Rust Drop is deterministic) — deferred as optional defense-in-depth.
+- **Soft penalty** (`select.rs`): `eff_used = min(100, used% + in_flight * POLYFLARE_INFLIGHT_PENALTY_PCT)` folded
+  at Candidate construction (inside the Eligible arm, after hard gates) → flows into capacity weighting. Default
+  2.5, `0` = disable (true byte-rollback). Mirrors codex-lb `:2251-2263`. `pick` stays pure (overlaid + on
+  SelectionCtx).
+- **HARD CAP DEFERRED** — codex-lb's cap can EMPTY the pool with `account_cap_exhausted` (no pigeonhole fallback),
+  conflicting with PolyFlare's "never empty the eligible pool" principle; porting it needs a new fallback judgment.
+  The soft penalty alone can never empty the pool (a weight, not a filter) and delivers the "spread load" intent.
+- Content-free `LeaseMetrics` (acquired/released counters + derived gauge). Adversarial (crux) + whole-branch
+  reviewed; never overrides continuity ownership; the 5 wedge/cyber/failover/starvation suites green.
+- **Follow-ups:** the hard concurrency cap (needs the pigeonhole/fallback decision); an optional TTL-reclaim sweep
+  (belt-and-suspenders); C11 Prometheus `account_lease_*` surface.
 
 ### C11. Prometheus `/metrics` surface  · LOW · medium
 Emit codex-lb's metric **names + label sets** as the portable contract (dashboards key off them):

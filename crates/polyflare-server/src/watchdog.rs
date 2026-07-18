@@ -436,44 +436,13 @@ async fn recover_from_silence(
 }
 
 /// Re-execute an anchor-stripped request (Strategy A). Anchorless ⇒ cannot be silent, so no second
-/// watchdog. Sniffs the new id and observes `Recovered`.
+/// watchdog. Sniffs the new id and observes `Recovered`. Threads a [`CommitWitness`] through to the
+/// wrapped stream and an optional in-flight lease guard (C9) held for the stream's lifetime — see
+/// [`execute_with_watchdog_tracked`]'s doc for the general shape.
 ///
-/// Signature-identical to before B4 Task 3 (see [`execute_with_watchdog`]'s doc for why) — a thin
-/// delegator over [`execute_recovery_tracked`] with a throwaway [`CommitWitness`].
+/// (The former thin non-tracked `execute_recovery` delegator was removed in C9 once every call site
+/// threaded a real `CommitWitness` + lease guard — all callers use this `_tracked` form directly.)
 #[allow(clippy::too_many_arguments)] // internal fn; each param is a distinct, clearly-named handle.
-pub async fn execute_recovery(
-    executor: &dyn Executor,
-    continuity: Arc<dyn Continuity>,
-    anchorless_req: PreparedRequest,
-    account: &Account,
-    account_id: AccountId,
-    ctx: RequestCtx,
-    session_key: Option<SessionKey>,
-    runtime: Arc<RuntimeStates>,
-    idle_timeout: Duration,
-) -> Result<ResponseStream, WatchdogError> {
-    execute_recovery_tracked(
-        executor,
-        continuity,
-        anchorless_req,
-        account,
-        account_id,
-        ctx,
-        session_key,
-        runtime,
-        idle_timeout,
-        CommitWitness::new(),
-        // C9 Task 2: this delegator's signature is unchanged — see `execute_with_watchdog`'s
-        // matching comment.
-        None,
-    )
-    .await
-}
-
-/// B4 Task 4 hook: identical behavior to [`execute_recovery`], additionally threading a
-/// [`CommitWitness`] through to the wrapped stream — see [`execute_with_watchdog_tracked`]'s doc
-/// for the general shape.
-#[allow(clippy::too_many_arguments)] // mirrors `execute_recovery`; one added handle.
 pub async fn execute_recovery_tracked(
     executor: &dyn Executor,
     continuity: Arc<dyn Continuity>,
