@@ -187,6 +187,20 @@ pub struct AppState {
     /// release guarantee Task 1-2 already established for `in_flight` itself. In-memory only (like
     /// `FailoverMetrics`/`StarvationMetrics`/`HealthTierMetrics`); resets on restart.
     pub lease_metrics: std::sync::Arc<crate::observability::LeaseMetrics>,
+    /// C12 Task 3: `request_log` age-retention, in days (`POLYFLARE_REQUEST_LOG_RETENTION_DAYS`,
+    /// resolved ONCE at startup by `crate::config::request_log_retention_days_from_env` — never
+    /// read per-request). Read only by `crate::retention::run_retention_pass`, once per tick.
+    /// `0` (the default) ⇒ disabled — the pruner no-ops for this table, today's unbounded-growth
+    /// behavior.
+    pub request_log_retention_days: u32,
+    /// C12 Task 3: `usage_history` age-retention, in days
+    /// (`POLYFLARE_USAGE_HISTORY_RETENTION_DAYS`, resolved ONCE at startup by
+    /// `crate::config::usage_history_retention_days_from_env`). Read only by
+    /// `crate::retention::run_retention_pass`. `0` (the default) ⇒ disabled. Pruning always
+    /// protects the latest row per `(account_id, window)` regardless of age (see
+    /// `AccountRepo::prune_usage_history_older_than`) — this field only gates whether pruning
+    /// happens at all.
+    pub usage_history_retention_days: u32,
 }
 
 impl AppState {

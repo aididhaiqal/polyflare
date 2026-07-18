@@ -116,6 +116,8 @@ async fn spawn_polyflare(upstream: String, idle: Duration) -> String {
         // e2e harness in this crate (see `tests/e2e_passthrough.rs`).
         stream_idle_timeout: idle,
         soft_drain_enabled: true,
+        request_log_retention_days: 0,
+        usage_history_retention_days: 0,
     });
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -106,6 +106,20 @@ pub struct ServeConfig {
     /// documented disable lever: `AccountSnapshot.in_flight` is still tracked (Tasks 1-2), it is
     /// simply folded in at zero weight, a byte-for-byte rollback to pre-C9 selection scoring.
     pub inflight_penalty_pct: f64,
+    /// C12 Task 3: `request_log` age-retention, in days (`POLYFLARE_REQUEST_LOG_RETENTION_DAYS`;
+    /// see [`request_log_retention_days_from_env`] for the default/clamp/disable-lever decision).
+    /// Resolved ONCE here at startup and threaded through `AppState` — never a per-request
+    /// `env::var` read (mirrors every other knob in this struct). `0` (the default) ⇒ disabled —
+    /// `crate::retention::run_retention_pass` no-ops for `request_log` (today's unbounded-growth
+    /// behavior, the documented clean-rollback lever).
+    pub request_log_retention_days: u32,
+    /// C12 Task 3: `usage_history` age-retention, in days
+    /// (`POLYFLARE_USAGE_HISTORY_RETENTION_DAYS`; see
+    /// [`usage_history_retention_days_from_env`]). Resolved ONCE here at startup and threaded
+    /// through `AppState`. `0` (the default) ⇒ disabled. A non-zero value never risks the routing
+    /// gate: `AccountRepo::prune_usage_history_older_than` always protects the latest row per
+    /// `(account_id, window)` regardless of age.
+    pub usage_history_retention_days: u32,
 }
 
 /// TA6(b) Task 5: the one capability name resolved today. A pool tagged with this capability (via
@@ -456,6 +470,49 @@ pub fn inflight_penalty_pct_from_env() -> f64 {
     }
 }
 
+/// C12 Task 3: `POLYFLARE_REQUEST_LOG_RETENTION_DAYS` — how many days of `request_log` rows to
+/// keep before `crate::retention::run_retention_pass` age-prunes them (batched, hourly; see
+/// `crate::retention`). Unset ⇒ `0` — **disabled is the default**, unlike most numeric knobs in
+/// this module: retention pruning is a destructive, irreversible background DELETE, so an operator
+/// must opt IN explicitly rather than an absent env var accidentally enabling data loss on a fresh
+/// deploy (mirrors the plan's Global Constraints: "Disabled by default; disable lever").
+///
+/// A well-formed value is clamped to `[0, 3650]` (10 years — an absolute ceiling; the field is
+/// `u32` and days-since-epoch multiplied by 86400 must stay a sane `i64`, but the real reason for
+/// the cap is that any larger number is not a meaningful "retention window" for an append-only log
+/// table). A MALFORMED value (non-numeric, negative, or out of `u32` range) resolves to `0`
+/// (disabled) — the SAME fail-safe rationale as every malformed-input decision in this module, but
+/// inverted from the usual "malformed ⇒ safe non-zero default" shape: here `0` (disabled) IS the
+/// safe value, so a typo can never silently turn ON an irreversible bulk-delete background task.
+pub fn request_log_retention_days_from_env() -> u32 {
+    retention_days_from_env("POLYFLARE_REQUEST_LOG_RETENTION_DAYS")
+}
+
+/// C12 Task 3: `POLYFLARE_USAGE_HISTORY_RETENTION_DAYS` — how many days of `usage_history` rows to
+/// keep before `crate::retention::run_retention_pass` age-prunes them, ALWAYS protecting the latest
+/// row per `(account_id, window)` regardless of age (`AccountRepo::prune_usage_history_older_than`
+/// — the routing gate + dashboard depend on each account's last-known sample). Same
+/// default/clamp/malformed semantics as [`request_log_retention_days_from_env`] — see that
+/// function's doc for the full "disabled is the default, malformed ⇒ 0 not a safe non-zero
+/// default" rationale, which applies here identically.
+pub fn usage_history_retention_days_from_env() -> u32 {
+    retention_days_from_env("POLYFLARE_USAGE_HISTORY_RETENTION_DAYS")
+}
+
+/// Shared parse/clamp for the two C12 retention-days knobs (see the two `pub fn`s above): unset or
+/// malformed ⇒ `0` (disabled, fail-safe); a well-formed value clamps to `[0, 3650]`.
+fn retention_days_from_env(var: &str) -> u32 {
+    const MAX: u32 = 3650;
+    match std::env::var(var) {
+        Ok(raw) => match raw.trim().parse::<u32>() {
+            Ok(n) if n > MAX => MAX,
+            Ok(n) => n,
+            Err(_) => 0,
+        },
+        Err(_) => 0,
+    }
+}
+
 impl ServeConfig {
     pub fn from_env() -> Result<Self, String> {
         let bind_addr =
@@ -518,6 +575,8 @@ impl ServeConfig {
         let soft_drain_enabled = soft_drain_enabled_from_env();
         let wake_jitter_ms = wake_jitter_ms_from_env();
         let inflight_penalty_pct = inflight_penalty_pct_from_env();
+        let request_log_retention_days = request_log_retention_days_from_env();
+        let usage_history_retention_days = usage_history_retention_days_from_env();
         Ok(ServeConfig {
             bind_addr,
             upstream_base_url,
@@ -540,6 +599,8 @@ impl ServeConfig {
             soft_drain_enabled,
             wake_jitter_ms,
             inflight_penalty_pct,
+            request_log_retention_days,
+            usage_history_retention_days,
         })
     }
 }
@@ -1266,6 +1327,100 @@ mod tests {
         assert_eq!(inflight_penalty_pct_from_env(), 2.5);
         unsafe {
             std::env::remove_var("POLYFLARE_INFLIGHT_PENALTY_PCT");
+        }
+    }
+
+    // --- C12 Task 3: POLYFLARE_REQUEST_LOG_RETENTION_DAYS / POLYFLARE_USAGE_HISTORY_RETENTION_DAYS ---
+
+    /// Serializes tests in this module that mutate `POLYFLARE_REQUEST_LOG_RETENTION_DAYS` /
+    /// `POLYFLARE_USAGE_HISTORY_RETENTION_DAYS` — same rationale as the other env-lock helpers
+    /// above (env vars are process-global, tests run concurrently on separate threads by default).
+    fn retention_days_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// Unset ⇒ `0` — disabled is the DEFAULT for this knob (unlike most numeric knobs in this
+    /// module), since retention pruning is a destructive background delete an operator must opt
+    /// into explicitly.
+    #[test]
+    fn request_log_retention_days_unset_defaults_to_zero_disabled() {
+        let _guard = retention_days_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("POLYFLARE_REQUEST_LOG_RETENTION_DAYS");
+        }
+        assert_eq!(request_log_retention_days_from_env(), 0);
+    }
+
+    /// A well-formed, in-range value resolves to exactly itself.
+    #[test]
+    fn request_log_retention_days_reads_a_well_formed_value() {
+        let _guard = retention_days_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_REQUEST_LOG_RETENTION_DAYS", "30");
+        }
+        assert_eq!(request_log_retention_days_from_env(), 30);
+        unsafe {
+            std::env::remove_var("POLYFLARE_REQUEST_LOG_RETENTION_DAYS");
+        }
+    }
+
+    /// An absurdly large value (`99999`, above the `3650`-day = 10-year ceiling) clamps DOWN to
+    /// `3650` — never silently accepted as-is, never treated as malformed.
+    #[test]
+    fn request_log_retention_days_absurd_value_clamps_to_thirty_six_fifty() {
+        let _guard = retention_days_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_REQUEST_LOG_RETENTION_DAYS", "99999");
+        }
+        assert_eq!(request_log_retention_days_from_env(), 3650);
+        unsafe {
+            std::env::remove_var("POLYFLARE_REQUEST_LOG_RETENTION_DAYS");
+        }
+    }
+
+    /// A malformed value (non-numeric) ⇒ `0` (disabled) — the SAME fail-safe value as unset, never
+    /// silently enabling an irreversible bulk-delete background task off a typo.
+    #[test]
+    fn request_log_retention_days_malformed_defaults_to_zero_disabled() {
+        let _guard = retention_days_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_REQUEST_LOG_RETENTION_DAYS", "not-a-number");
+        }
+        assert_eq!(request_log_retention_days_from_env(), 0);
+        unsafe {
+            std::env::remove_var("POLYFLARE_REQUEST_LOG_RETENTION_DAYS");
+        }
+    }
+
+    /// `usage_history`'s knob shares the exact same parse/clamp/malformed logic (via the shared
+    /// `retention_days_from_env` helper) — one representative test proves the wiring reaches the
+    /// right env var, distinct from `request_log`'s.
+    #[test]
+    fn usage_history_retention_days_reads_its_own_env_var() {
+        let _guard = retention_days_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_USAGE_HISTORY_RETENTION_DAYS", "45");
+            std::env::remove_var("POLYFLARE_REQUEST_LOG_RETENTION_DAYS");
+        }
+        assert_eq!(usage_history_retention_days_from_env(), 45);
+        assert_eq!(
+            request_log_retention_days_from_env(),
+            0,
+            "the two knobs are independent env vars"
+        );
+        unsafe {
+            std::env::remove_var("POLYFLARE_USAGE_HISTORY_RETENTION_DAYS");
         }
     }
 }

@@ -164,6 +164,8 @@ async fn spawn(upstream_url: String) -> (String, Arc<AppState>) {
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
         soft_drain_enabled: true,
+        request_log_retention_days: 0,
+        usage_history_retention_days: 0,
         runtime: Default::default(),
     });
     let app = build_app(state.clone());
