@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
@@ -13,6 +14,9 @@ use polyflare_core::{Continuity, Executor, Selector};
 use polyflare_server::app::{build_app, build_codex_executor, AppState};
 use polyflare_server::config::{self, ServeConfig};
 use polyflare_server::continuity::CodexContinuity;
+use polyflare_server::model_catalog::{
+    floor_only_cache, HttpModelSource, ModelCatalogCache, ModelSource,
+};
 use polyflare_store::{import_from_codex_lb, Account, PlainTokens, Store, TokenCipher};
 
 #[derive(Parser)]
@@ -198,6 +202,41 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // D15 Task 3: the live upstream model-catalog cache. Built AFTER `store`/`cipher`/
+    // `codex_version` above (all three already-owned handles it needs), BEFORE `AppState` — see
+    // `crate::model_catalog::HttpModelSource`'s doc for why (it needs its own owned
+    // store/cipher/version-cache handles, never a circular `Arc<AppState>` back-reference). The
+    // floor (`codex_bootstrap_floor()`) is the SAME never-empty static bootstrap `catalog.rs`
+    // served before this feature existed, so every fallback rung — disabled, no accounts, fetch
+    // failure — degrades to exactly that pre-D15 `/models` behavior.
+    let model_catalog_floor = polyflare_server::catalog::codex_bootstrap_floor();
+    let model_catalog = Arc::new(if config.model_catalog_enabled {
+        let source: Box<dyn ModelSource> = Box::new(HttpModelSource::new(
+            store.clone(),
+            cipher.clone(),
+            config.upstream_base_url.clone(),
+            codex_version.clone(),
+        )?);
+        ModelCatalogCache::new(
+            source,
+            Duration::from_secs(config.model_catalog_ttl_secs),
+            model_catalog_floor,
+        )
+    } else {
+        floor_only_cache(model_catalog_floor)
+    });
+    // Background-warm ONLY when enabled — disabled means the floor-only cache never needs (or
+    // gets) a network-touching refresh at all, mirroring `codex_version`'s warm-loop shape above.
+    if config.model_catalog_enabled {
+        let cache = model_catalog.clone();
+        tokio::spawn(async move {
+            loop {
+                cache.get_or_refresh().await;
+                tokio::time::sleep(cache.refresh_interval()).await;
+            }
+        });
+    }
+
     let state = Arc::new(AppState {
         codex_executor,
         control_client: polyflare_codex::build_client().expect("build control_client"),
@@ -235,6 +274,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
         upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
+        model_catalog,
     });
     // Runtime usage-refresh loop: keeps each Codex account's rate-limit windows (5h + weekly) and
     // routing gate live, instead of the frozen numbers the importer left.

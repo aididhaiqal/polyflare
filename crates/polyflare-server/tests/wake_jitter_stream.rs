@@ -184,6 +184,7 @@ fn build_state(
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
         upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
+        model_catalog: polyflare_server::model_catalog::floor_only_model_catalog(),
     })
 }
 

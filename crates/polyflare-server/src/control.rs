@@ -481,6 +481,7 @@ mod tests {
             lease_metrics: crate::observability::LeaseMetrics::new(),
             upstream_request_metrics: crate::observability::UpstreamRequestMetrics::new(),
             rate_limit_metrics: crate::observability::RateLimitMetrics::new(),
+            model_catalog: crate::model_catalog::floor_only_model_catalog(),
         })
     }
 

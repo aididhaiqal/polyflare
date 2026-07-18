@@ -16,6 +16,7 @@ use crate::request_log_repo::RequestLogRepo;
 use crate::StoreError;
 
 /// Owns the SQLite connection pool. The pool is reference-counted, so cloning it is cheap.
+#[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
     /// In-process account-write generation counter. Every `AccountRepo` write bumps it; a reader

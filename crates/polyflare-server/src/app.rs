@@ -211,6 +211,13 @@ pub struct AppState {
     /// inside `crate::runtime_state::RuntimeStates::record_rate_limit`, the single 429 chokepoint.
     /// In-memory only; resets on restart.
     pub rate_limit_metrics: std::sync::Arc<crate::observability::RateLimitMetrics>,
+    /// D15 Task 3: the live upstream Codex model-catalog cache (see `crate::model_catalog`),
+    /// merged onto the static bootstrap floor with a TTL + single-flight, falling back airtight to
+    /// the floor on disable/no-accounts/fetch-failure. Read on the `/models` hot path via the sync
+    /// `cached_or_fallback()` (`crate::catalog::build_catalog`'s callers); warmed by a background
+    /// task in `serve` only when `POLYFLARE_MODEL_CATALOG_ENABLED` (default on). `/models` is
+    /// advertised metadata only — this field is never consulted by routing/selection.
+    pub model_catalog: Arc<crate::model_catalog::ModelCatalogCache>,
 }
 
 impl AppState {
