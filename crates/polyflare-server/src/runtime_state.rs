@@ -17,7 +17,7 @@
 //! [`overlay`]: RuntimeStates::overlay
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use polyflare_core::{AccountId, AccountSnapshot};
 
@@ -123,11 +123,23 @@ pub struct RuntimeState {
     /// Consecutive successes recorded while PROBING. Reaching
     /// [`PROBE_SUCCESS_STREAK_REQUIRED`] promotes PROBING→HEALTHY; any error while PROBING resets it.
     pub probe_success_streak: u32,
+    /// C9 Task 1: live count of requests currently in flight on this account, written exclusively
+    /// via [`RuntimeStates::acquire_in_flight`]'s [`InFlightGuard`] (increment on acquire, decrement
+    /// on the guard's `Drop`). Read by `overlay` onto the snapshot (mirrors `health_tier`) for
+    /// `select.rs`'s soft in-flight penalty (a later task). While `> 0`, [`RuntimeState::is_neutral`]
+    /// must return `false` — an in-flight account can never be GC'd out of the map mid-request, or
+    /// the count would be lost. Defaults to `0`, which stays neutral like every other field.
+    pub in_flight: u32,
 }
 
 impl RuntimeState {
     /// `true` when this state carries no signal — used to drop empty entries so the map doesn't grow
     /// unbounded with accounts that recovered.
+    ///
+    /// C9 Task 1: this derived `==` comparison already keeps an entry with `in_flight > 0` non-neutral
+    /// (it differs from `RuntimeState::default()`, whose `in_flight` is `0`) — no hand-written special
+    /// case needed. A defaulted `in_flight == 0` with every other field also at its default stays
+    /// neutral, same as before this field was added.
     fn is_neutral(&self) -> bool {
         *self == RuntimeState::default()
     }
@@ -304,6 +316,38 @@ pub struct RuntimeStates {
     inner: RwLock<HashMap<AccountId, RuntimeState>>,
 }
 
+/// C9 Task 1: a leak-proof RAII lease on one account's `in_flight` count, returned by
+/// [`RuntimeStates::acquire_in_flight`]. Holds the `Arc<RuntimeStates>` the entry lives in (the map
+/// is process-lifetime, so a strong clone is simplest — no `Weak` upgrade-failure case to handle) plus
+/// the leased [`AccountId`]. `Drop` is the ENTIRE release mechanism: it fires on every way this value
+/// stops existing — falling out of scope, an early explicit `drop(guard)`, a panic unwind — which is
+/// exactly the "release on every exit path" guarantee C9's crux requires (a later task embeds this as
+/// a field of `ObservingStream` so a client disconnect / mid-stream error / panic all release too, with
+/// zero change to the stream's poll logic).
+///
+/// Deliberately NOT `Clone`/`Copy`: Rust's ownership model already guarantees `drop` runs at most once
+/// for a given value (there is no way to "double-drop" a live `InFlightGuard` short of `mem::forget`,
+/// which by construction skips `Drop` entirely rather than double-firing it) — so a single decrement is
+/// structural, not something this type needs to defend against with extra bookkeeping. `#[must_use]`
+/// flags the easy-to-write bug of acquiring a lease and immediately discarding the guard as a temporary
+/// (which would release it before the caller ever holds it for the request).
+#[must_use]
+pub struct InFlightGuard {
+    runtime: Arc<RuntimeStates>,
+    id: AccountId,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        // saturating_sub: never underflow even if in_flight was somehow already at 0 for this id
+        // (e.g. a bug elsewhere zeroed it, or the entry was never observed above 0) — a stray
+        // decrement below zero would be a worse defect than a silently-clamped no-op.
+        self.runtime.mutate(&self.id, |rt| {
+            rt.in_flight = rt.in_flight.saturating_sub(1);
+        });
+    }
+}
+
 impl RuntimeStates {
     pub fn new() -> Self {
         Self::default()
@@ -336,6 +380,9 @@ impl RuntimeStates {
                 // entry leaves the snapshot at its neutral `health_tier: 0` default (the loop
                 // above already skips it entirely).
                 snap.health_tier = rt.health_tier;
+                // C9 Task 1: expose the live in-flight lease count. An absent entry leaves the
+                // snapshot at its neutral `in_flight: 0` default (the loop above already skips it).
+                snap.in_flight = rt.in_flight;
             }
         }
     }
@@ -568,6 +615,27 @@ impl RuntimeStates {
     /// on every selection.
     pub fn record_selected(&self, id: &AccountId, now: i64) {
         self.mutate(id, |rt| rt.last_selected_at = Some(now));
+    }
+
+    /// C9 Task 1: acquire a leak-proof in-flight lease on `id` — increments `RuntimeState.in_flight`
+    /// now and returns an [`InFlightGuard`] whose `Drop` decrements it exactly once, whenever/however
+    /// this guard's owner (a later task: the request's `ObservingStream`) goes away. Takes `self` as
+    /// `&Arc<Self>` (not `&self`) because the returned guard must own a live handle back into this map
+    /// to release later, and `RuntimeStates` lives for the process — `Arc::clone` is the simplest
+    /// correct handle (see [`InFlightGuard`]'s doc for why `Weak` isn't needed here).
+    ///
+    /// `now` is accepted for symmetry with every other `mutate`-driving method on this type (and
+    /// reserved for a possible future TTL-stamp / stale-reclaim sweep — see the plan's Task 4
+    /// follow-ups) but is not otherwise read by v1's pure increment.
+    pub fn acquire_in_flight(self: &Arc<Self>, id: &AccountId, now: i64) -> InFlightGuard {
+        let _ = now;
+        self.mutate(id, |rt| {
+            rt.in_flight = rt.in_flight.saturating_add(1);
+        });
+        InFlightGuard {
+            runtime: Arc::clone(self),
+            id: id.clone(),
+        }
     }
 
     /// TEST-ONLY seam (B5 Task 4 adversarial review, FIX 3): stamp `cooldown_until` on an account's
@@ -1123,5 +1191,127 @@ mod tests {
         let mut snaps = vec![snap("a")];
         rs.overlay(&mut snaps, 1000);
         assert_eq!(snaps[0].health_tier, 2, "frozen ⇒ tier unchanged despite used%=99");
+    }
+
+    // --- C9 Task 1: the leak-proof InFlightGuard + in_flight runtime field + overlay ---
+
+    #[test]
+    fn acquire_in_flight_increments_and_dropping_guards_decrements_and_gcs() {
+        // (a) two acquires ⇒ in_flight 2; dropping one ⇒ 1; dropping the other ⇒ 0 and the entry
+        // is fully GC'd from the map (peek == None) since a neutral entry decays out.
+        let rs = Arc::new(RuntimeStates::new());
+        let id = AccountId::from("a");
+
+        let guard1 = rs.acquire_in_flight(&id, 1000);
+        assert_eq!(
+            peek(&rs, &id).map(|rt| rt.in_flight),
+            Some(1),
+            "first acquire ⇒ in_flight 1"
+        );
+
+        let guard2 = rs.acquire_in_flight(&id, 1000);
+        assert_eq!(
+            peek(&rs, &id).map(|rt| rt.in_flight),
+            Some(2),
+            "second acquire ⇒ in_flight 2"
+        );
+
+        drop(guard1);
+        assert_eq!(
+            peek(&rs, &id).map(|rt| rt.in_flight),
+            Some(1),
+            "dropping one guard decrements to 1; entry survives (still non-neutral)"
+        );
+
+        drop(guard2);
+        assert_eq!(
+            peek(&rs, &id),
+            None,
+            "dropping the last guard decrements to 0; the now-fully-neutral entry is GC'd"
+        );
+    }
+
+    #[test]
+    fn overlay_copies_in_flight_and_defaults_absent_entry_to_zero() {
+        // (b) overlay copies in_flight for a known entry; an absent entry stays at the neutral 0.
+        let rs = Arc::new(RuntimeStates::new());
+        let id = AccountId::from("a");
+        let _guard = rs.acquire_in_flight(&id, 1000);
+
+        let mut snaps = vec![snap("a"), snap("b")];
+        rs.overlay(&mut snaps, 1000);
+        assert_eq!(snaps[0].in_flight, 1, "known entry: in_flight copied from runtime state");
+        assert_eq!(snaps[1].in_flight, 0, "absent entry: stays at the neutral default");
+    }
+
+    #[test]
+    fn is_neutral_is_false_while_in_flight_positive_and_true_once_it_returns_to_zero() {
+        // (c) is_neutral must respect in_flight: non-neutral while > 0 (never GC'd mid-flight),
+        // neutral again once back at 0 with no other signal.
+        let mut rt = RuntimeState {
+            in_flight: 1,
+            ..RuntimeState::default()
+        };
+        assert!(!rt.is_neutral(), "in_flight > 0 must never be neutral");
+
+        rt.in_flight = 0;
+        assert!(rt.is_neutral(), "in_flight back at 0 with nothing else set ⇒ neutral");
+
+        // End-to-end via the map: while a guard is held, the account's entry must survive `mutate`'s
+        // neutral-GC (e.g. record_selected on some other bookkeeping) rather than vanish mid-flight.
+        let rs = Arc::new(RuntimeStates::new());
+        let id = AccountId::from("a");
+        let guard = rs.acquire_in_flight(&id, 1000);
+        rs.record_selected(&id, 1000); // triggers another mutate/GC-check cycle
+        assert_eq!(
+            peek(&rs, &id).map(|rt| rt.in_flight),
+            Some(1),
+            "entry with in_flight > 0 survives a mutate cycle instead of being GC'd"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn guard_is_not_clone_and_decrements_exactly_once() {
+        // (d) InFlightGuard is not Clone/Copy (a single owned value ⇒ Drop can fire at most once by
+        // Rust's ownership model). Two independent acquires simulate "two guards for one account";
+        // each must decrement exactly once on its own drop, never double-counting the other's release.
+        let rs = Arc::new(RuntimeStates::new());
+        let id = AccountId::from("a");
+
+        let guard_a = rs.acquire_in_flight(&id, 1000);
+        let guard_b = rs.acquire_in_flight(&id, 1000);
+        assert_eq!(peek(&rs, &id).map(|rt| rt.in_flight), Some(2));
+
+        drop(guard_a);
+        assert_eq!(
+            peek(&rs, &id).map(|rt| rt.in_flight),
+            Some(1),
+            "dropping guard_a decrements exactly once, leaving guard_b's lease intact"
+        );
+
+        drop(guard_b);
+        assert_eq!(peek(&rs, &id), None, "dropping guard_b releases the last lease ⇒ GC'd");
+    }
+
+    #[test]
+    fn in_flight_decrement_saturates_and_cannot_underflow() {
+        // (e) a stray decrement below zero must clamp at 0, never wrap/panic. Simulate via the
+        // test-only seed seam: an entry already at in_flight == 0 that still gets decremented
+        // (e.g. a defensive extra release) must not underflow to u32::MAX.
+        let rs = Arc::new(RuntimeStates::new());
+        let id = AccountId::from("a");
+        seed(&rs, &id, |rt| {
+            rt.in_flight = 0;
+            rt.error_count = 1; // keep the entry non-neutral so it isn't GC'd before we can inspect it
+        });
+        rs.mutate(&id, |rt| {
+            rt.in_flight = rt.in_flight.saturating_sub(1);
+        });
+        assert_eq!(
+            peek(&rs, &id).map(|rt| rt.in_flight),
+            Some(0),
+            "saturating_sub clamps at 0 instead of underflowing"
+        );
     }
 }
