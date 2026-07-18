@@ -227,26 +227,55 @@ discrete-event sim. Needs per-account weekly usage rows (capacity/remaining/rese
 grow the usage schema feature-by-feature.
 *codex-lb:* `core/usage/depletion.py`, `modules/dashboard/weekly_pace.py`.
 
-### D17. Codex control-endpoint surface  · MEDIUM · medium
-PolyFlare serves `/responses` (+ `/v1/messages`, `/models`) and nothing else, so every other endpoint
+### D17. Codex control-endpoint surface  · MEDIUM · medium · **DONE (minimal)**
+PolyFlare served `/responses` (+ `/v1/messages`, `/models`) and nothing else, so every other endpoint
 the Codex CLI can call 404s. codex-lb proxies eleven, each a thin pass-through funnelling into one
 helper — `_codex_control_proxy` → `service.codex_control_request(path, …, codex_session_affinity=True)`:
 `thread/goal/{set,clear,get}`, `analytics-events/events`, `memories/trace_summarize`, `realtime/calls`,
 `safety/arc`, `alpha/search`, `agent-identities/jwks` (GET), `opportunistic/admission` (GET),
 `images/{generations,edits}`. (`/responses/compact` is separate and larger — see D14.)
 
-The work is small per endpoint but has two real design points:
-- **`codex_session_affinity=True`** — a control call must land on the SAME account as the conversation
-  it belongs to, not a freshly-selected one. This is M3 ownership resolution applied to a non-`/responses`
-  path, where PolyFlare's owner resolution does not currently reach.
-- **Header handling both ways** — requests need the same fingerprint synthesis `/responses` gets;
-  responses are filtered downstream through `_codex_control_downstream_headers`.
+**The minimal set is now built** (`docs/superpowers/plans/2026-07-18-d17-control-endpoints.md`,
+Tasks 1–3), covering the 3 endpoints codex-rs actually emits (`codex-rs/core/src/client.rs:157-163`):
+- **`thread/goal/{set,clear,get}`** (`POST`/`POST`/`GET`), **`agent-identities/jwks`** (`GET`, +
+  the `wham/`-prefixed variant, also `GET`), **`memories/trace_summarize`** (`POST`) —
+  `crates/polyflare-server/src/control.rs`'s handlers, registered on the D18-gated `proxy`
+  sub-router (`crates/polyflare-server/src/app.rs`, unpooled — no `/{pool}/…` variant).
+- A generic parameterized-path UNARY forward primitive, `polyflare_codex::control_forward`
+  (`crates/polyflare-codex/src/control_forward.rs`): reuses the executor's client/bearer/header
+  rules, filters response headers to codex-lb's exact 8-name allow-set
+  (`_CODEX_CONTROL_RESPONSE_HEADERS`), and makes the deferred rest (below) a route-registration
+  exercise, not new plumbing.
+- **`codex_session_affinity` (SOFT, not hard)** — `crate::control::resolve_control_account`: binds
+  to the conversation's owner account ONLY when a session header is present AND that owner is
+  currently eligible; otherwise falls through to normal (any-eligible) selection — a control call
+  is NEVER stranded by an absent/unavailable owner, unlike `/responses`'s hard
+  `previous_response_id` anchor.
+- **Content-safety (inviolable, proven end-to-end)**: the control body is forwarded upstream
+  verbatim and NEVER logged — the persisted `request_log` row uses the existing `path` column as
+  the content-free kind discriminator (`"codex_control_<path>"`, e.g.
+  `"codex_control_memories/trace_summarize"`; there is no separate `request_kind` column in the
+  schema). `crates/polyflare-server/tests/control_endpoints_e2e.rs`'s
+  `sentinel_body_is_forwarded_but_never_reaches_the_request_log` drives a real sentinel-bearing
+  body through the real `build_app` stack and asserts the mock RECEIVED it (forwarding genuinely
+  works) while the persisted row's `Debug` format never contains it.
+- **D18 gate inheritance** verified (`keyless_control_request_is_401_when_enforced`): a keyless
+  control request 401s exactly like `/responses`/`/v1/messages`, including the GETs (`jwks`,
+  `thread/goal/get`) — parity with codex-lb, not left open like `/models`.
+- **Routing** verified not to shadow / be shadowed by `/{pool}/responses` or `/responses`
+  (`responses_and_control_routes_do_not_shadow_each_other`) — none of the 6 routes' literal first
+  segments (`thread`, `agent-identities`, `wham`, `memories`) can collide with the `{pool}` param
+  route, and matchit prefers a static segment over a param one at the same position regardless.
 
-Which endpoints the CLI actually fires depends on config: the endpoint constants live in
-`codex-rs/core/src/client.rs:157-163`, and the user's codex-lb config comments that `name = "openai"`
-is what enables remote `/responses/compact` — **the gate for that was not located in the source; verify
-before assuming any endpoint is dormant.** PolyFlare's dev harness names the provider
-`"PolyFlare (local dev)"`, which is why the gap is currently unhit rather than handled.
+**Deferred — trivial follow-ons on the primitive, not built** (add if/when a real need appears):
+`realtime/calls`, `analytics-events/events`, `alpha/search`, `safety/arc`, `images/{generations,edits}`,
+`opportunistic/admission` (GET). Each is a `control_forward` call + a route registration + (for any
+that need it) a `resolve_control_account` affinity check — the same three-line shape as the 6
+endpoints just built; no new architecture is needed. Which of these the CLI actually fires depends
+on config — the user's codex-lb config comments that `name = "openai"` is what enables remote
+`/responses/compact` (**the gate for that was not located in the source; verify before assuming any
+endpoint is dormant**). PolyFlare's dev harness names the provider `"PolyFlare (local dev)"`, which
+is why this gap was unhit until now rather than handled.
 *codex-lb:* `modules/proxy/api.py:491-597,1744,1931`.
 
 ### D18. Client API-key auth on the proxy surface  · MEDIUM · medium · **DONE** (minimal gate)

@@ -203,7 +203,12 @@ const DROPPED_INBOUND_HEADERS: &[&str] = &[
 /// codex-identity headers to forward upstream untouched (see `DROPPED_INBOUND_HEADERS`). A header
 /// value that isn't valid visible-ASCII (`to_str()` fails) is silently skipped rather than
 /// forwarded lossily.
-fn forward_headers_from_inbound(headers: &HeaderMap) -> Vec<(String, String)> {
+///
+/// D17 Task 3: promoted `pub(crate)` (from private) so `crate::control`'s handlers can reuse this
+/// SAME hop-by-hop drop-list for the codex CONTROL-endpoint forward — the "dumb executor, smart
+/// ingress" doctrine means control's forward headers should be filtered identically to
+/// `/responses`'s, not a second, independently-maintained list.
+pub(crate) fn forward_headers_from_inbound(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
         .filter(|(name, _)| {
@@ -313,7 +318,11 @@ fn stream_response(stream: ResponseStream) -> Response {
 /// The row is content-free by construction — it comes from `RequestLog::record`, the same audited
 /// field set the tracing event carries (see `crate::observability`). `repo` is taken by value (it
 /// owns a cheap pool clone) so the caller can build it before `state` is consumed by the handler.
-fn spawn_persist_request_log(repo: RequestLogRepo, record: RequestLogRecord) {
+///
+/// D17 Task 3: promoted `pub(crate)` (from private) so `crate::control`'s handlers persist their
+/// content-free control-endpoint log rows through this SAME fire-and-forget funnel, rather than a
+/// second, parallel `tokio::spawn` write path.
+pub(crate) fn spawn_persist_request_log(repo: RequestLogRepo, record: RequestLogRecord) {
     tokio::spawn(async move {
         if let Err(e) = repo.insert(&record).await {
             tracing::warn!(
