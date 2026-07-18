@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use std::time::Duration;
 
 use polyflare_core::RoutingStrategy;
@@ -99,6 +100,15 @@ fn parse_pool_capabilities(raw: &str) -> Result<HashMap<String, String>, String>
 /// never lowers the selector's hard capability filter, and Task 2's reactive move still catches a
 /// genuine `cyber_policy` rejection regardless of this proactive signal, so a startup-time crash
 /// isn't needed for correctness here the way it is for `POLYFLARE_ROUTING_STRATEGY`.
+///
+/// TA6(b) Task 5 review finding: fail-open used to be SILENT, giving an operator who typos the
+/// value zero signal that their pool's capability tagging is disabled (every fresh session in that
+/// pool then pays a wasted reactive round-trip). This function runs on every request, so the warn
+/// is emitted at most ONCE per process via `POOL_CAPABILITIES_WARN_ONCE` — a per-request warning
+/// would flood the logs, which is a worse bug than the original silence. The logged text is the
+/// parse error from `parse_pool_capabilities` (pool slugs + capability tags, e.g. "expected
+/// 'slug:capability', got 'cyber-security_work'") — never a secret, since this var is a pool→
+/// capability map, not credentials.
 pub fn pool_requires_capability(pool: Option<&str>, capability: &str) -> bool {
     let Some(pool) = pool.filter(|p| !p.is_empty()) else {
         return false;
@@ -109,7 +119,21 @@ pub fn pool_requires_capability(pool: Option<&str>, capability: &str) -> bool {
     };
     match parse_pool_capabilities(&raw) {
         Ok(map) => map.get(pool).is_some_and(|c| c == capability),
-        Err(_) => false,
+        Err(e) => {
+            static WARN_ONCE: Once = Once::new();
+            WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    "POLYFLARE_POOL_CAPABILITIES is malformed ({e}); pool-capability tagging is \
+                     disabled for the rest of this process's lifetime as a result (fails open — no \
+                     pool is treated as requiring a capability from this source). The selector's \
+                     hard capability filter and TA6(b) Task 2's reactive cyber_policy move remain in \
+                     effect regardless, so this is a routing-efficiency signal, not a safety one. \
+                     Fix the value and restart the process to re-enable pool tagging. (This warning \
+                     is logged only once per process to avoid per-request spam.)"
+                );
+            });
+            false
+        }
     }
 }
 
@@ -268,5 +292,67 @@ mod tests {
             "empty capability → err"
         );
         assert!(parse_pool_capabilities("").unwrap().is_empty());
+    }
+
+    /// Serializes tests in this module that mutate `POLYFLARE_POOL_CAPABILITIES` — env vars are
+    /// process-global, and Rust's test harness runs `#[test]` fns on separate threads in the same
+    /// process by default. Mirrors the guard pattern in
+    /// `tests/cyber_pool_capability_resolution.rs::env_lock` (that file uses `tokio::sync::Mutex`
+    /// because its guard is held across `.await`; these tests are synchronous, so a plain
+    /// `std::sync::Mutex` suffices — and lock poisoning is recovered rather than propagated so one
+    /// failing test's guard drop can't cascade-fail the others).
+    fn pool_capabilities_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// TA6(b) Task 5 review finding: `pool_requires_capability` used to fail open *silently* on a
+    /// malformed `POLYFLARE_POOL_CAPABILITIES`. The fix adds a warn-once `tracing::warn!`, but the
+    /// FAIL-OPEN BEHAVIOR itself is unchanged — this test proves that: a malformed value still
+    /// resolves to `false` (never panics, never spuriously requires the capability). The warn-once
+    /// emission itself isn't asserted here: capturing/asserting on global `tracing` subscriber
+    /// output from a unit test would need a custom subscriber wired in just for this, which is more
+    /// machinery than this visibility-only, non-safety-relevant signal warrants (the doc comment on
+    /// `pool_requires_capability` documents the log-once contract instead). Calling the function
+    /// twice back-to-back exercises the `Once` guard without observing its output, confirming it
+    /// doesn't alter the return value or panic on a second hit.
+    #[test]
+    fn pool_requires_capability_malformed_value_fails_open_without_panicking() {
+        let _guard = pool_capabilities_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_POOL_CAPABILITIES", "not-a-valid-pair");
+        }
+
+        assert!(!pool_requires_capability(Some("cyber"), SECURITY_WORK_CAPABILITY));
+        // Second call: same malformed value, `Once` already fired — must still fail open cleanly.
+        assert!(!pool_requires_capability(Some("cyber"), SECURITY_WORK_CAPABILITY));
+
+        unsafe {
+            std::env::remove_var("POLYFLARE_POOL_CAPABILITIES");
+        }
+    }
+
+    /// The well-formed path is unaffected by the warn-once addition: a valid
+    /// `POLYFLARE_POOL_CAPABILITIES` still resolves exactly as before (tagged pool + matching
+    /// capability ⇒ true; untagged pool, mismatched capability, or `pool: None` ⇒ false).
+    #[test]
+    fn pool_requires_capability_valid_value_resolves_correctly() {
+        let _guard = pool_capabilities_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_POOL_CAPABILITIES", "cyber:security_work");
+        }
+
+        assert!(pool_requires_capability(Some("cyber"), SECURITY_WORK_CAPABILITY));
+        assert!(!pool_requires_capability(Some("general"), SECURITY_WORK_CAPABILITY));
+        assert!(!pool_requires_capability(Some("cyber"), "some_other_capability"));
+        assert!(!pool_requires_capability(None, SECURITY_WORK_CAPABILITY));
+
+        unsafe {
+            std::env::remove_var("POLYFLARE_POOL_CAPABILITIES");
+        }
     }
 }
