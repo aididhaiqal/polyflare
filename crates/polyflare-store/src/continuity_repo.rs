@@ -19,11 +19,27 @@ pub struct SessionRow {
     pub created_at: i64,
     pub updated_at: i64,
     pub last_activity_at: i64,
+    /// TA6(b) Task 3 (`migrations/0008`): a comma-separated capability-tag SET stamped by
+    /// `set_required_capability` once a cyber-rejected turn is successfully rerouted onto a
+    /// capability-holding account. `NULL`/empty ⇒ no sticky requirement (the common case).
+    /// Content-free — a capability tag, never conversation content.
+    pub required_capabilities: Option<String>,
+}
+
+impl SessionRow {
+    /// Whether `capability` is present in this session's sticky capability set.
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.required_capabilities
+            .as_deref()
+            .map(|set| set.split(',').any(|tag| tag == capability))
+            .unwrap_or(false)
+    }
 }
 
 const SELECT_SESSION: &str = "SELECT session_key, key_strength, owning_account_id, \
     anchor_response_id, last_input_fingerprint, last_input_count, reasoning_cache_ref, state, \
-    created_at, updated_at, last_activity_at FROM continuity_sessions WHERE session_key = ?";
+    created_at, updated_at, last_activity_at, required_capabilities \
+    FROM continuity_sessions WHERE session_key = ?";
 
 /// CRUD over the continuity state machine. Cheap to construct (clones the pool handle).
 pub struct ContinuityRepo {
@@ -232,6 +248,45 @@ impl ContinuityRepo {
         }
         Ok(())
     }
+
+    /// TA6(b) Task 3: stamp `capability` into the session's sticky capability SET (union, not
+    /// overwrite — a no-op if already present). Called once, right when a cyber-rejected turn is
+    /// successfully rerouted onto a capability-holding account
+    /// (`ingress.rs::reroute_cyber_rejection`), so a LATER `prepare` on this session pre-filters
+    /// via `SelectionCtx.require_security_work_authorized` instead of re-hitting the rejection —
+    /// the reject-and-move cost is paid ONCE per session, not once per turn. Content-free:
+    /// `capability` is a fixed capability tag, never conversation content. A no-op (no rows
+    /// touched) if the session row doesn't exist yet — the caller only ever reaches this after a
+    /// turn on that session already completed `prepare` (which `ensure_session`s the row).
+    pub async fn set_required_capability(
+        &self,
+        session_key: &str,
+        capability: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let existing: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT required_capabilities FROM continuity_sessions WHERE session_key = ?",
+        )
+        .bind(session_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        let current = existing.and_then(|(c,)| c).unwrap_or_default();
+        let mut tags: Vec<&str> = current.split(',').filter(|t| !t.is_empty()).collect();
+        if !tags.contains(&capability) {
+            tags.push(capability);
+        }
+        let updated = tags.join(",");
+        sqlx::query(
+            "UPDATE continuity_sessions SET required_capabilities = ?, updated_at = ? \
+             WHERE session_key = ?",
+        )
+        .bind(updated)
+        .bind(now)
+        .bind(session_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -322,5 +377,60 @@ mod tests {
         let s = store().await;
         let repo = s.continuity();
         assert!(repo.get_anchor_owner("nope").await.unwrap().is_none());
+    }
+
+    // ---- TA6(b) Task 3: sticky-cyber capability -----------------------------------------------
+
+    #[tokio::test]
+    async fn set_required_capability_stamps_the_session_row() {
+        let s = store().await;
+        let repo = s.continuity();
+        repo.ensure_session("skCap", "soft", 1).await.unwrap();
+
+        // Before the stamp: no capability requirement (the common, non-cyber case).
+        let before = repo.get_session("skCap").await.unwrap().unwrap();
+        assert!(!before.has_capability("security_work"));
+
+        repo.set_required_capability("skCap", "security_work", 2)
+            .await
+            .unwrap();
+
+        let after = repo.get_session("skCap").await.unwrap().unwrap();
+        assert!(
+            after.has_capability("security_work"),
+            "the session row carries the sticky-cyber flag after the stamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_required_capability_is_idempotent_and_content_free() {
+        let s = store().await;
+        let repo = s.continuity();
+        repo.ensure_session("skCap2", "soft", 1).await.unwrap();
+        repo.set_required_capability("skCap2", "security_work", 2)
+            .await
+            .unwrap();
+        // Stamping the SAME capability again must not duplicate it in the set.
+        repo.set_required_capability("skCap2", "security_work", 3)
+            .await
+            .unwrap();
+        let row = repo.get_session("skCap2").await.unwrap().unwrap();
+        assert_eq!(
+            row.required_capabilities.as_deref(),
+            Some("security_work"),
+            "the tag set stays a single entry, not duplicated"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_cyber_session_never_carries_the_capability_flag() {
+        // Regression: an ordinary session that never went through a cyber move must never report
+        // `has_capability` true — the column defaults to NULL/absent.
+        let s = store().await;
+        let repo = s.continuity();
+        repo.ensure_session("skPlain", "soft", 1).await.unwrap();
+        let row = repo.get_session("skPlain").await.unwrap().unwrap();
+        assert!(!row.has_capability("security_work"));
+        assert_eq!(row.required_capabilities, None);
     }
 }

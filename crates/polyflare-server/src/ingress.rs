@@ -487,6 +487,10 @@ async fn reroute_cyber_rejection(
         Err(r) => return r,
     };
     let health_id = fresh.clone(); // `fresh` is moved into the executor below.
+    // TA6(b) Task 3: captured BEFORE `session_key` moves into `execute_recovery` below — the stamp
+    // (on success) is what makes the NEXT turn on this session pre-filter from the start instead
+    // of paying the reject-and-move cost again.
+    let session_key_for_stamp = session_key.clone();
     match execute_recovery(
         state.executor_for(provider).as_ref(),
         state.continuity.clone(),
@@ -499,7 +503,20 @@ async fn reroute_cyber_rejection(
     )
     .await
     {
-        Ok(stream) => stream_response(stream),
+        Ok(stream) => {
+            // The move succeeded (upstream accepted the anchor-stripped resend on the
+            // capability-holding account): stamp the session sticky-cyber NOW, so a LATER `prepare`
+            // on this session pre-filters via `SelectionCtx.require_security_work_authorized`
+            // instead of re-hitting a `cyber_policy` rejection — cost paid ONCE per session. Best-
+            // effort: a stamp failure never fails the (already-successful) turn itself.
+            if let Some(sk) = session_key_for_stamp {
+                let _ = state
+                    .continuity
+                    .mark_required_capability(&sk, "security_work")
+                    .await;
+            }
+            stream_response(stream)
+        }
         Err(e) => {
             record_failure(state, &health_id, &e, unix_now()).await;
             (StatusCode::BAD_GATEWAY, "upstream error").into_response()
@@ -676,7 +693,10 @@ async fn responses_handler_impl(
     let selector = state.selector_for(pool);
     let sel_ctx = SelectionCtx {
         now,
-        require_security_work_authorized: false,
+        // TA6(b) Task 3: a session `prepare` already recognized as sticky-cyber (Task 2 stamped
+        // it on a prior successful move) pre-filters THIS turn's selection up front — no need to
+        // re-hit a `cyber_policy` rejection to rediscover the requirement every turn.
+        require_security_work_authorized: prepared.directive.require_security_work_authorized,
         rng_seed: None,
         session_id: ctx.session_id.clone(),
         tier,
@@ -809,6 +829,9 @@ async fn responses_handler_impl(
                                         watchdog: prepared.directive.watchdog,
                                         recovery: RecoveryPlan::None,
                                         session_key: prepared.directive.session_key.clone(),
+                                        require_security_work_authorized: prepared
+                                            .directive
+                                            .require_security_work_authorized,
                                     },
                                 };
                                 let health_id = fresh.clone(); // moved into the executor below.

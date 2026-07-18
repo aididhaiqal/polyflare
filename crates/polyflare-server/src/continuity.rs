@@ -6,9 +6,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use polyflare_core::{
     AccountId, Continuity, ContinuityDirective, ContinuityError, KeyStrength, Prepared,
-    PreparedRequest, RecoveryPlan, RequestCtx, TurnOutcome, WatchdogArm,
+    PreparedRequest, RecoveryPlan, RequestCtx, SessionKey, TurnOutcome, WatchdogArm,
 };
 use polyflare_store::{ContinuityRepo, StoreError};
+
+/// TA6(b)'s sole capability tag today (mirrors `WatchdogError::CapabilityRejection`'s
+/// `"security_work"` label and `AccountSnapshot::security_work_authorized`'s naming). Kept as a
+/// constant so the sticky-stamp call site (`mark_required_capability`) and the sticky-read site
+/// (`prepare`) can never drift apart on the literal.
+const SECURITY_WORK_CAPABILITY: &str = "security_work";
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -56,6 +62,9 @@ impl Continuity for CodexContinuity {
         let anchor = ctx.client_previous_response_id.clone();
 
         // Resolve the owner: the client-supplied anchor map is authoritative; else the session row.
+        // The session row is ALSO where TA6(b) Task 3's sticky-cyber stamp lives, so fetch it
+        // unconditionally (not just on an owner-resolution miss) — a turn whose owner resolved via
+        // the anchor map must still pick up the sticky requirement for this turn's selection.
         let mut owner: Option<AccountId> = None;
         if let Some(rid) = anchor.as_deref() {
             if let Some(acc) = self
@@ -67,16 +76,18 @@ impl Continuity for CodexContinuity {
                 owner = Some(AccountId::from(acc));
             }
         }
-        if owner.is_none() {
-            if let Some(sk) = session_key.as_ref() {
-                if let Some(row) = self
-                    .repo
-                    .get_session(&sk.value)
-                    .await
-                    .map_err(box_store_err)?
-                {
-                    owner = row.owning_account_id.map(AccountId::from);
+        let mut require_security_work_authorized = false;
+        if let Some(sk) = session_key.as_ref() {
+            if let Some(row) = self
+                .repo
+                .get_session(&sk.value)
+                .await
+                .map_err(box_store_err)?
+            {
+                if owner.is_none() {
+                    owner = row.owning_account_id.clone().map(AccountId::from);
                 }
+                require_security_work_authorized = row.has_capability(SECURITY_WORK_CAPABILITY);
             }
         }
 
@@ -149,6 +160,7 @@ impl Continuity for CodexContinuity {
                 watchdog,
                 recovery,
                 session_key,
+                require_security_work_authorized,
             },
         })
     }
@@ -204,6 +216,18 @@ impl Continuity for CodexContinuity {
             }
             TurnOutcome::Failed { .. } => Ok(()),
         }
+    }
+
+    async fn mark_required_capability(
+        &self,
+        session_key: &SessionKey,
+        capability: &'static str,
+    ) -> Result<(), ContinuityError> {
+        let now = now_secs();
+        self.repo
+            .set_required_capability(&session_key.value, capability, now)
+            .await
+            .map_err(box_store_err)
     }
 }
 
@@ -433,6 +457,86 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.state, "anchored");
+    }
+
+    // ---- TA6(b) Task 3: sticky-cyber pre-filter ------------------------------------------------
+
+    /// After `mark_required_capability` stamps a session (simulating a successful cyber move), a
+    /// LATER `prepare` on that SAME session must set `require_security_work_authorized = true` for
+    /// the turn — WITHOUT any second `cyber_policy` rejection ever occurring. This is the
+    /// "cost-once" contract: the capability requirement is read off the session row, not
+    /// re-discovered by hitting a rejection again.
+    #[tokio::test]
+    async fn sticky_session_prefilters_a_later_turn_without_a_second_rejection() {
+        let (_store, cont) = make().await;
+        let sk = polyflare_core::SessionKey {
+            value: "sk-sticky".into(),
+            strength: KeyStrength::Soft,
+        };
+        // Turn 1 equivalent: a session row exists (as `prepare` would have ensured).
+        cont.repo.ensure_session("sk-sticky", "soft", 1).await.unwrap();
+        // The stamp `reroute_cyber_rejection` performs on a successful cyber move.
+        cont.mark_required_capability(&sk, "security_work")
+            .await
+            .unwrap();
+
+        // Turn 2: a fresh (unanchored) request on the SAME session.
+        let ctx = RequestCtx {
+            session_key: Some(sk),
+            ..Default::default()
+        };
+        let p = cont
+            .prepare(req(serde_json::json!({"input": "turn 2"})), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            p.directive.require_security_work_authorized,
+            "a sticky-cyber session pre-filters the very next turn, cost paid once"
+        );
+    }
+
+    /// Regression: a session that never had a cyber move (never stamped) must NOT pre-filter —
+    /// the capability requirement stays false, and non-cyber sessions are entirely unaffected.
+    #[tokio::test]
+    async fn non_cyber_session_is_never_capability_filtered() {
+        let (_store, cont) = make().await;
+        let sk = polyflare_core::SessionKey {
+            value: "sk-plain".into(),
+            strength: KeyStrength::Soft,
+        };
+        cont.repo.ensure_session("sk-plain", "soft", 1).await.unwrap();
+
+        let ctx = RequestCtx {
+            session_key: Some(sk),
+            ..Default::default()
+        };
+        let p = cont
+            .prepare(req(serde_json::json!({"input": "turn 2"})), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            !p.directive.require_security_work_authorized,
+            "a session with no cyber history is never capability-filtered"
+        );
+    }
+
+    /// A session that was never even `ensure_session`'d yet (a genuinely brand-new session key)
+    /// also must not spuriously require the capability.
+    #[tokio::test]
+    async fn brand_new_session_is_never_capability_filtered() {
+        let (_store, cont) = make().await;
+        let ctx = RequestCtx {
+            session_key: Some(polyflare_core::SessionKey {
+                value: "sk-new".into(),
+                strength: KeyStrength::Soft,
+            }),
+            ..Default::default()
+        };
+        let p = cont
+            .prepare(req(serde_json::json!({"input": "turn 1"})), &ctx)
+            .await
+            .unwrap();
+        assert!(!p.directive.require_security_work_authorized);
     }
 
     #[tokio::test]

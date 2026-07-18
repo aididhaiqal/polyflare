@@ -83,6 +83,7 @@ fn armed_full_resend(body: serde_json::Value) -> Prepared {
                 },
             },
             session_key: None,
+            require_security_work_authorized: false,
         },
     }
 }
@@ -100,6 +101,7 @@ fn disarmed(body: serde_json::Value) -> Prepared {
             watchdog: WatchdogArm::Disarmed,
             recovery: RecoveryPlan::None,
             session_key: None,
+            require_security_work_authorized: false,
         },
     }
 }

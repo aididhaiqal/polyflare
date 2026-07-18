@@ -176,6 +176,13 @@ pub struct ContinuityDirective {
     pub recovery: RecoveryPlan,
     /// Threaded back to `observe` so it knows which session/turn this was.
     pub session_key: Option<SessionKey>,
+    /// TA6(b) Task 3: `true` when `prepare` read a sticky-cyber stamp off the session row (a
+    /// prior turn on this session was rerouted onto a `security_work_authorized` account after a
+    /// `cyber_policy` rejection — Task 2). The ingress selection site threads this straight into
+    /// `SelectionCtx.require_security_work_authorized` for THIS turn, so the selector pre-filters
+    /// to capability-holding accounts from the start instead of re-hitting the rejection — the
+    /// reject-and-move cost is paid ONCE per session, not once per turn.
+    pub require_security_work_authorized: bool,
 }
 
 /// Whether the silence watchdog is armed, and with what timeout.
