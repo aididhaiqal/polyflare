@@ -621,3 +621,81 @@ async fn test_seam_with_default_bound_still_fails_over() {
     assert_eq!(resp.status(), 200);
     assert_eq!(exec.calls(), vec!["A".to_string(), "B".to_string()]);
 }
+
+/// C9 Task 2 (THE CRUX): `run_failover_loop`'s A(fail)->B(succeed) cycle releases A's in-flight
+/// lease before B is ever picked, and holds B's lease for the true lifetime of B's stream — no
+/// double-count, no leak on A.
+///
+/// The precise timing this test exploits: `stream_response` wraps the returned `ResponseStream` in
+/// `axum::body::Body::from_stream`, which is LAZY — the body is never polled just to construct the
+/// `Response`. So the instant `responses_handler_impl_for_test(..).await` resolves (still holding
+/// `resp`, its body untouched), B's `ObservingStream` — and the `InFlightGuard` embedded in it —
+/// exists but has not yielded a single byte yet. This gives a deterministic (no timing race, no
+/// custom pausable-stream fixture needed) window in which to observe "B's lease is genuinely held
+/// while its stream is alive, not yet polled to completion" alongside "A's lease is already gone".
+#[tokio::test]
+async fn failover_releases_as_lease_before_b_is_picked_and_holds_bs_lease_while_streaming() {
+    let (store, cipher, _dir) = spawn_store().await;
+    store
+        .accounts()
+        .insert(&account("A", false), &tokens("tokA"), &cipher)
+        .await
+        .unwrap();
+    store
+        .accounts()
+        .insert(&account("B", false), &tokens("tokB"), &cipher)
+        .await
+        .unwrap();
+    let exec = Arc::new(FailoverStubExecutor::new());
+    exec.script("A", vec![AttemptBehavior::Fail(429)]);
+    exec.script("B", vec![AttemptBehavior::Success]);
+    let state = build_state(store, cipher, exec.clone());
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+    let body = Bytes::from(
+        serde_json::to_vec(&serde_json::json!({"model": "m", "input": "hi"})).unwrap(),
+    );
+    let resp = responses_handler_impl_for_test(state.clone(), None, headers, body, 3).await;
+    assert_eq!(resp.status(), 200, "B's stream is the client's response");
+    assert_eq!(
+        exec.calls(),
+        vec!["A".to_string(), "B".to_string()],
+        "A tried and failed, then B was picked and succeeded"
+    );
+
+    // Read the live runtime state DIRECTLY (in-process, no network) — before the response body is
+    // ever polled.
+    let mut snaps = vec![AccountSnapshot::new("A"), AccountSnapshot::new("B")];
+    state.runtime.overlay(&mut snaps, 0);
+    assert_eq!(
+        snaps[0].in_flight, 0,
+        "A's lease released the instant its failed attempt's own stack frame ended — strictly \
+         before B was ever picked (never held past its failed attempt, never leaked)"
+    );
+    assert_eq!(
+        snaps[1].in_flight, 1,
+        "B's lease is genuinely held — inside the not-yet-polled ObservingStream this response's \
+         body lazily wraps — proving the guard survived the handoff into the stream, not merely \
+         until the function returned"
+    );
+
+    // Now drain B's stream to completion (clean EOF), dropping the ObservingStream.
+    let _ = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("draining B's clean completion must not hang or fail");
+
+    let mut snaps = vec![AccountSnapshot::new("A"), AccountSnapshot::new("B")];
+    state.runtime.overlay(&mut snaps, 0);
+    assert_eq!(
+        snaps[0].in_flight, 0,
+        "A's lease stays released (no resurrection, no double-count)"
+    );
+    assert_eq!(
+        snaps[1].in_flight, 0,
+        "B's lease releases once its stream is fully drained and dropped — no leak"
+    );
+}

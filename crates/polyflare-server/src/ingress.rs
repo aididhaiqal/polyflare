@@ -31,9 +31,8 @@ use crate::snapshot::filter_by_provider_and_pool;
 use crate::starvation;
 use crate::translate_stream::wrap_translating_stream;
 use crate::watchdog::{
-    apply_ownership, execute_recovery, execute_recovery_tracked, execute_with_watchdog,
-    execute_with_watchdog_tracked, signal_client_stream, CommitWitness, RouteDecision,
-    WatchdogError,
+    apply_ownership, execute_recovery_tracked, execute_with_watchdog_tracked,
+    signal_client_stream, CommitWitness, RouteDecision, WatchdogError,
 };
 
 fn unix_now() -> i64 {
@@ -553,7 +552,12 @@ async fn try_layer1_serve_now(
         Err(r) => return Some(r),
     };
     let health_id = fresh.clone(); // `fresh` is moved into the executor below.
-    let response = match execute_recovery(
+    // C9 Task 2: a real upstream attempt on `fresh` — same lease treatment as every other
+    // streaming selection site (see `execute_recovery_tracked`'s call below, which is
+    // `execute_recovery`'s exact behavior plus this one added, never-read `in_flight` capability —
+    // see `execute_recovery`'s doc for why its own signature stays untouched).
+    let in_flight = state.runtime.acquire_in_flight(&fresh, now);
+    let response = match execute_recovery_tracked(
         state.executor_for(provider).as_ref(),
         state.continuity.clone(),
         req,
@@ -563,6 +567,8 @@ async fn try_layer1_serve_now(
         session_key,
         state.runtime.clone(),
         state.stream_idle_timeout,
+        CommitWitness::new(),
+        Some(in_flight),
     )
     .await
     {
@@ -945,7 +951,10 @@ fn layer2_wait_stream(
             }
         };
         let health_id = fresh.clone(); // `fresh` is moved into the executor below.
-        match execute_recovery(
+        // C9 Task 2: the Layer-2 wait's actual served attempt is a real upstream request on
+        // `fresh` — same lease treatment as every other streaming selection site.
+        let in_flight = state.runtime.acquire_in_flight(&fresh, fresh_now);
+        match execute_recovery_tracked(
             state.executor_for(provider).as_ref(),
             state.continuity.clone(),
             req,
@@ -955,6 +964,8 @@ fn layer2_wait_stream(
             session_key,
             state.runtime.clone(),
             state.stream_idle_timeout,
+            CommitWitness::new(),
+            Some(in_flight),
         )
         .await
         {
@@ -1051,7 +1062,10 @@ async fn reroute_cyber_rejection(
                                    // (on success) is what makes the NEXT turn on this session pre-filter from the start instead
                                    // of paying the reject-and-move cost again.
     let session_key_for_stamp = session_key.clone();
-    match execute_recovery(
+    // C9 Task 2: the cyber-reroute's move onto the capability-holding account is a real upstream
+    // attempt on `fresh` — same lease treatment as every other streaming selection site.
+    let in_flight = state.runtime.acquire_in_flight(&fresh, now);
+    match execute_recovery_tracked(
         state.executor_for(provider).as_ref(),
         state.continuity.clone(),
         anchorless_req,
@@ -1061,6 +1075,8 @@ async fn reroute_cyber_rejection(
         session_key,
         state.runtime.clone(),
         state.stream_idle_timeout,
+        CommitWitness::new(),
+        Some(in_flight),
     )
     .await
     {
@@ -1265,6 +1281,16 @@ async fn run_failover_loop(
         };
         let health_id = fresh.clone(); // `fresh` is moved into the executor below.
         let commit = CommitWitness::new();
+        // C9 Task 2 (THE CRUX — release A before B): a fresh lease for THIS iteration's account,
+        // acquired right after selection. Moved into `execute_recovery_tracked` below: on `Ok`, it
+        // rides inside the returned `ObservingStream` for the life of the client's response. On
+        // `Err(e2)` it is released BY THE TIME `.await` resolves here — `execute_recovery_tracked`
+        // only reaches `wrap_stream` (which is where the guard would move into a stream) on its own
+        // success path, so a failed attempt drops the guard inside that function's own stack frame,
+        // strictly before this match arm runs, and therefore strictly before the loop's next
+        // `selector.pick` (at the top of the next iteration) can ever select account B. No explicit
+        // `drop()` needed — this is Rust's ordinary move-then-scope-end semantics, not a special case.
+        let in_flight = state.runtime.acquire_in_flight(&fresh, now);
         match execute_recovery_tracked(
             state.executor_for(provider).as_ref(),
             state.continuity.clone(),
@@ -1276,6 +1302,7 @@ async fn run_failover_loop(
             state.runtime.clone(),
             state.stream_idle_timeout,
             commit.clone(),
+            Some(in_flight),
         )
         .await
         {
@@ -1593,6 +1620,13 @@ async fn responses_handler_impl_with_max_attempts(
                     Err(r) => return (r, outcome),
                 };
                 let health_id = id.clone(); // `id` is moved into the executor below.
+                // C9 Task 2: the in-flight lease for this FIRST attempt on `id`. On success it
+                // rides inside the returned stream; on any `Err` below (including the
+                // `CapabilityRejection`/general-failure arms) it releases when
+                // `execute_with_watchdog_tracked`'s own frame ends — strictly before
+                // `reroute_cyber_rejection`/`run_failover_loop` (each of which acquires its OWN
+                // fresh lease for whatever account it tries next) ever runs.
+                let in_flight = state.runtime.acquire_in_flight(&id, now);
                                             // TA6(b) Task 2: capture the recovery plan + a `ctx` clone BEFORE `prepared`/`ctx`
                                             // move into the executor below, so a `CapabilityRejection` can trigger the cyber
                                             // reselect+resend (`reroute_cyber_rejection`) without re-preparing the request.
@@ -1625,6 +1659,7 @@ async fn responses_handler_impl_with_max_attempts(
                     state.runtime.clone(),
                     state.stream_idle_timeout,
                     commit.clone(),
+                    Some(in_flight),
                 )
                 .await
                 {
@@ -1730,7 +1765,11 @@ async fn responses_handler_impl_with_max_attempts(
                                 Err(r) => return (r, outcome),
                             };
                         let health_id = fresh.clone(); // `fresh` is moved into the executor below.
-                        match execute_recovery(
+                        // C9 Task 2: the owner-ineligible recovery's reselected attempt on `fresh`
+                        // is a real upstream request — same lease treatment as every other
+                        // streaming selection site.
+                        let in_flight = state.runtime.acquire_in_flight(&fresh, now);
+                        match execute_recovery_tracked(
                             state.executor_for(provider).as_ref(),
                             state.continuity.clone(),
                             anchorless_req,
@@ -1740,6 +1779,8 @@ async fn responses_handler_impl_with_max_attempts(
                             session_key,
                             state.runtime.clone(),
                             state.stream_idle_timeout,
+                            CommitWitness::new(),
+                            Some(in_flight),
                         )
                         .await
                         {
@@ -1794,7 +1835,11 @@ async fn responses_handler_impl_with_max_attempts(
                                     },
                                 };
                                 let health_id = fresh.clone(); // moved into the executor below.
-                                match execute_with_watchdog(
+                                // C9 Task 2: the pin-ignoring fallback's attempt on `fresh` is a
+                                // real upstream request — same lease treatment as every other
+                                // streaming selection site.
+                                let in_flight = state.runtime.acquire_in_flight(&fresh, now);
+                                match execute_with_watchdog_tracked(
                                     state.executor_for(provider).as_ref(),
                                     state.continuity.clone(),
                                     fallback,
@@ -1803,6 +1848,8 @@ async fn responses_handler_impl_with_max_attempts(
                                     ctx,
                                     state.runtime.clone(),
                                     state.stream_idle_timeout,
+                                    CommitWitness::new(),
+                                    Some(in_flight),
                                 )
                                 .await
                                 {
@@ -2043,7 +2090,10 @@ async fn messages_handler_native(
     };
 
     let health_id = picked.clone(); // moved into the executor below.
-    let response = match execute_with_watchdog(
+    // C9 Task 2: the native `/v1/messages` streaming selection site — same lease treatment as
+    // `/responses`'s Route arm.
+    let in_flight = state.runtime.acquire_in_flight(&picked, now);
+    let response = match execute_with_watchdog_tracked(
         state.executor_for(provider).as_ref(),
         Arc::new(NoopContinuity) as Arc<dyn Continuity>,
         prepared,
@@ -2052,6 +2102,8 @@ async fn messages_handler_native(
         ctx,
         state.runtime.clone(),
         state.stream_idle_timeout,
+        CommitWitness::new(),
+        Some(in_flight),
     )
     .await
     {
@@ -2165,7 +2217,12 @@ async fn messages_handler_codex_aliased(
     };
 
     let health_id = picked.clone(); // moved into the executor below.
-    let response = match execute_with_watchdog(
+    // C9 Task 2: the Codex-aliased `/v1/messages` streaming selection site — same lease treatment
+    // as `/responses`'s Route arm. `wrap_translating_stream` below just wraps the returned
+    // `ResponseStream` (the `ObservingStream` carrying `_in_flight`) in another stream layer that
+    // owns it by value — the lease's lifetime is unaffected by the translation wrapper.
+    let in_flight = state.runtime.acquire_in_flight(&picked, now);
+    let response = match execute_with_watchdog_tracked(
         state.executor_for(provider).as_ref(),
         Arc::new(NoopContinuity) as Arc<dyn Continuity>,
         prepared,
@@ -2174,6 +2231,8 @@ async fn messages_handler_codex_aliased(
         ctx,
         state.runtime.clone(),
         state.stream_idle_timeout,
+        CommitWitness::new(),
+        Some(in_flight),
     )
     .await
     {
