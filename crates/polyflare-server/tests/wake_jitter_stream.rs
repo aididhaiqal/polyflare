@@ -182,6 +182,8 @@ fn build_state(
         runtime: Default::default(),
         inflight_penalty_pct: 2.5,
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
+        upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
+        rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
     })
 }
 

@@ -17,8 +17,9 @@
 //! one struct so there is a single content-safety chokepoint for both the ephemeral event and the
 //! durable row. The constraint above binds the persisted record identically.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::http::StatusCode;
 use polyflare_core::Provider;
@@ -532,6 +533,91 @@ impl LeaseMetrics {
     }
 }
 
+/// C11b Task 1: a process-global, content-free counter of completed proxied requests, labeled by
+/// `(account_id, status)`. In memory only (like `FailoverMetrics`/`StarvationMetrics`/
+/// `HealthTierMetrics`/`LeaseMetrics`) — resets on restart. Bumped exactly ONCE per client request,
+/// at each of the 3 request-completion wrapper sites (`control_route`/`responses_route`/
+/// `messages_route`), from the same content-free `RequestLog` those sites already build — never
+/// derived from the `request_log` table (which C12 prunes; a pruned-derived counter would
+/// decrement, breaking Prometheus counter monotonicity). `account_id` is the opaque store-row id
+/// (same content-free class `RequestLog::account_id` already carries) — `None` (e.g. a
+/// 503-no-eligible outcome, no account was ever selected) is stored under the `""` key rather than
+/// dropped, mirroring the existing `pool: None → pool=""` render convention (`metrics.rs`), so a
+/// no-eligible-account rate stays visible to an operator. `status` is the numeric HTTP status code
+/// only — never an upstream error message/body. Cardinality is bounded: accounts are
+/// operator-managed (tens), statuses are a small fixed HTTP-code set.
+#[derive(Default)]
+pub struct UpstreamRequestMetrics {
+    inner: RwLock<HashMap<(String, u16), u64>>,
+}
+
+impl UpstreamRequestMetrics {
+    /// A fresh, empty map, `Arc`-wrapped to match `FailoverMetrics::new`'s / `LeaseMetrics::new`'s
+    /// `AppState`-field shape.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Records one completed request for `(account_id, status)`. `account_id: None` is stored
+    /// under the `""` key (see the struct doc). Recovers from a poisoned lock (a prior writer
+    /// panic) rather than panicking itself, mirroring `RuntimeStates::overlay`'s
+    /// `.unwrap_or_else(|e| e.into_inner())` idiom — a metrics bump must never be the thing that
+    /// takes down a request-completion path.
+    pub fn record(&self, account_id: Option<&str>, status: u16) {
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let entry = map
+            .entry((account_id.unwrap_or("").to_string(), status))
+            .or_insert(0);
+        *entry += 1;
+    }
+
+    /// A cloned-out snapshot of every `(account_id, status, count)` recorded so far (test/render
+    /// read path — see `crate::metrics`).
+    pub fn snapshot(&self) -> Vec<(String, u16, u64)> {
+        let map = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .map(|((account_id, status), count)| (account_id.clone(), *status, *count))
+            .collect()
+    }
+}
+
+/// C11b Task 1: a process-global, content-free counter of 429 rate-limit writebacks, labeled by a
+/// FIXED `type` string (`"upstream"` when the upstream supplied a `Retry-After`, `"backoff"` when
+/// PolyFlare computed its own exponential backoff). In memory only (like `UpstreamRequestMetrics`
+/// above) — resets on restart. Bumped exactly ONCE per `RuntimeStates::record_rate_limit` call —
+/// the single true 429 chokepoint (all ~10 `record_failure` callers funnel through the one
+/// `sig.status == 429` branch). `type` is never an upstream error message/body/retry-after value —
+/// only one of the two fixed labels, so cardinality is a constant 2.
+#[derive(Default)]
+pub struct RateLimitMetrics {
+    inner: RwLock<HashMap<&'static str, u64>>,
+}
+
+impl RateLimitMetrics {
+    /// A fresh, empty map, `Arc`-wrapped to match `UpstreamRequestMetrics::new`'s `AppState`-field
+    /// shape.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Records one 429 writeback of `kind` (`"upstream"` or `"backoff"`). Recovers from a poisoned
+    /// lock rather than panicking, exactly like `UpstreamRequestMetrics::record`.
+    pub fn record(&self, kind: &'static str) {
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let entry = map.entry(kind).or_insert(0);
+        *entry += 1;
+    }
+
+    /// A cloned-out snapshot of every `(type, count)` recorded so far (test/render read path — see
+    /// `crate::metrics`).
+    pub fn snapshot(&self) -> Vec<(String, u64)> {
+        let map = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .map(|(kind, count)| (kind.to_string(), *count))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -998,5 +1084,92 @@ mod tests {
         assert_eq!(m.acquired(), 0);
         assert_eq!(m.released(), 2);
         assert_eq!(m.current(), 0, "saturates at 0, never underflows");
+    }
+
+    // C11b Task 1: `UpstreamRequestMetrics` — labeled by `(account_id, status)`.
+
+    #[test]
+    fn upstream_request_metrics_records_and_dedupes_by_account_and_status() {
+        let m = UpstreamRequestMetrics::new();
+        m.record(Some("a"), 200);
+        m.record(Some("a"), 200);
+        let snapshot = m.snapshot();
+        assert_eq!(
+            snapshot,
+            vec![("a".to_string(), 200, 2)],
+            "same (account_id, status) accumulates into one entry"
+        );
+    }
+
+    #[test]
+    fn upstream_request_metrics_distinct_account_or_status_are_distinct_keys() {
+        let m = UpstreamRequestMetrics::new();
+        m.record(Some("a"), 200);
+        m.record(Some("b"), 200);
+        m.record(Some("a"), 500);
+        let mut snapshot = m.snapshot();
+        snapshot.sort();
+        assert_eq!(
+            snapshot,
+            vec![
+                ("a".to_string(), 200, 1),
+                ("a".to_string(), 500, 1),
+                ("b".to_string(), 200, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn upstream_request_metrics_none_account_id_records_under_empty_string_key() {
+        let m = UpstreamRequestMetrics::new();
+        m.record(None, 503);
+        let snapshot = m.snapshot();
+        assert_eq!(
+            snapshot,
+            vec![("".to_string(), 503, 1)],
+            "None account_id (e.g. 503-no-eligible) must still be visible, keyed as \"\""
+        );
+    }
+
+    #[test]
+    fn upstream_request_metrics_is_monotonic() {
+        let m = UpstreamRequestMetrics::new();
+        for i in 1..=5u64 {
+            m.record(Some("a"), 200);
+            let snapshot = m.snapshot();
+            let (_, _, count) = snapshot
+                .iter()
+                .find(|(id, status, _)| id == "a" && *status == 200)
+                .expect("entry present");
+            assert_eq!(*count, i, "count only ever increases, never resets");
+        }
+    }
+
+    #[test]
+    fn upstream_request_metrics_empty_snapshot_is_empty_vec() {
+        let m = UpstreamRequestMetrics::new();
+        assert_eq!(m.snapshot(), Vec::<(String, u16, u64)>::new());
+    }
+
+    // C11b Task 1: `RateLimitMetrics` — labeled by a fixed `type` string.
+
+    #[test]
+    fn rate_limit_metrics_records_distinct_kinds_and_increments() {
+        let m = RateLimitMetrics::new();
+        m.record("upstream");
+        m.record("backoff");
+        m.record("upstream");
+        let mut snapshot = m.snapshot();
+        snapshot.sort();
+        assert_eq!(
+            snapshot,
+            vec![("backoff".to_string(), 1), ("upstream".to_string(), 2),]
+        );
+    }
+
+    #[test]
+    fn rate_limit_metrics_empty_snapshot_is_empty_vec() {
+        let m = RateLimitMetrics::new();
+        assert_eq!(m.snapshot(), Vec::<(String, u64)>::new());
     }
 }

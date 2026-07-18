@@ -201,6 +201,16 @@ pub struct AppState {
     /// `AccountRepo::prune_usage_history_older_than`) — this field only gates whether pruning
     /// happens at all.
     pub usage_history_retention_days: u32,
+    /// C11b Task 1: content-free counter of completed proxied requests, labeled by
+    /// `(account_id, status)` (see `crate::observability::UpstreamRequestMetrics`). Bumped once
+    /// per client request at each of the 3 request-completion wrapper sites (`control_route`/
+    /// `responses_route`/`messages_route`). In-memory only; resets on restart.
+    pub upstream_request_metrics: std::sync::Arc<crate::observability::UpstreamRequestMetrics>,
+    /// C11b Task 1: content-free counter of 429 rate-limit writebacks, labeled by a fixed `type`
+    /// string (`"upstream"`/`"backoff"`) (see `crate::observability::RateLimitMetrics`). Bumped
+    /// inside `crate::runtime_state::RuntimeStates::record_rate_limit`, the single 429 chokepoint.
+    /// In-memory only; resets on restart.
+    pub rate_limit_metrics: std::sync::Arc<crate::observability::RateLimitMetrics>,
 }
 
 impl AppState {
