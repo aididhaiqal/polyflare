@@ -74,6 +74,17 @@ enum AccountsCommands {
         #[arg(long = "pool", value_name = "SLUG")]
         pool: Option<String>,
     },
+    /// Mark (or unmark) an existing account as authorized for cyber/security work (TA6). This is
+    /// the operator write path for `security_work_authorized` — otherwise only `insert` and the
+    /// codex-lb importer can set it.
+    SetCapability {
+        /// The account id to flip (as shown by `accounts` listing / the dashboard).
+        #[arg(long = "id", value_name = "ACCOUNT_ID")]
+        id: String,
+        /// `true` to authorize the account for cyber/security work, `false` to revoke it.
+        #[arg(long = "security-work", value_name = "BOOL", action = clap::ArgAction::Set)]
+        security_work: bool,
+    },
 }
 
 /// Content-safe request logging (SPEC-M5 §3.4): env-filtered (`RUST_LOG`, default `info`) plain
@@ -100,6 +111,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => accounts_import(&from, &fernet_key, dry_run).await,
             AccountsCommands::Login { open, pool } => accounts_login(open, pool).await,
             AccountsCommands::SetPool { id, pool } => accounts_set_pool(&id, pool).await,
+            AccountsCommands::SetCapability { id, security_work } => {
+                accounts_set_capability(&id, security_work).await
+            }
         },
     }
 }
@@ -311,6 +325,26 @@ async fn accounts_set_pool(
     Ok(())
 }
 
+async fn accounts_set_capability(
+    id: &str,
+    security_work: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = config::data_dir_from_env();
+    let store = Store::open(&config::db_path(&data_dir)).await?;
+    let repo = store.accounts();
+    if repo.get(id).await?.is_none() {
+        return Err(format!("no account with id {id}").into());
+    }
+    repo.update_security_work_authorized(id, security_work)
+        .await?;
+    if security_work {
+        println!("account {id} authorized for cyber/security work");
+    } else {
+        println!("account {id} cyber/security-work authorization revoked");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +465,46 @@ mod tests {
                 command: AccountsCommands::SetPool { pool, .. },
             } => assert!(pool.is_none(), "omitting --pool clears the pool"),
             _ => panic!("expected `accounts set-pool`"),
+        }
+    }
+
+    #[test]
+    fn set_capability_parses_true_and_false() {
+        let on = Cli::try_parse_from([
+            "polyflare",
+            "accounts",
+            "set-capability",
+            "--id",
+            "codex_1",
+            "--security-work",
+            "true",
+        ])
+        .unwrap();
+        match on.command {
+            Commands::Accounts {
+                command: AccountsCommands::SetCapability { id, security_work },
+            } => {
+                assert_eq!(id, "codex_1");
+                assert!(security_work);
+            }
+            _ => panic!("expected `accounts set-capability`"),
+        }
+
+        let off = Cli::try_parse_from([
+            "polyflare",
+            "accounts",
+            "set-capability",
+            "--id",
+            "codex_1",
+            "--security-work",
+            "false",
+        ])
+        .unwrap();
+        match off.command {
+            Commands::Accounts {
+                command: AccountsCommands::SetCapability { security_work, .. },
+            } => assert!(!security_work),
+            _ => panic!("expected `accounts set-capability`"),
         }
     }
 }

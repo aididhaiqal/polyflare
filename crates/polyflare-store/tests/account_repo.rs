@@ -265,6 +265,9 @@ async fn account_and_token_generations_decouple_by_write_kind() {
     repo.update_routing_policy("acct-1", "burn_first")
         .await
         .unwrap();
+    repo.update_security_work_authorized("acct-1", true)
+        .await
+        .unwrap();
     assert_eq!(
         store.token_generation(),
         t_before_meta,
@@ -284,6 +287,64 @@ async fn account_and_token_generations_decouple_by_write_kind() {
     assert!(
         store.token_generation() > t2,
         "token refresh bumps token gen"
+    );
+}
+
+#[tokio::test]
+async fn update_security_work_authorized_toggles_and_bumps_generation() {
+    // TA6 Task 4: the operator write path for the capability flag. `sample_account` seeds it
+    // `true`; flip it both directions and assert the read-back reflects each flip AND the account
+    // (snapshot) generation bumps each time — that's what invalidates the running server's
+    // `AccountCache` without a restart.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[23u8; 32]).unwrap();
+    let repo = store.accounts();
+    repo.insert(&sample_account("acct-1"), &sample_tokens(), &cipher)
+        .await
+        .unwrap();
+    assert!(
+        repo.get("acct-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .security_work_authorized,
+        "sample_account seeds true"
+    );
+
+    // true -> false
+    let gen_before = store.account_generation();
+    repo.update_security_work_authorized("acct-1", false)
+        .await
+        .unwrap();
+    assert!(
+        !repo
+            .get("acct-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .security_work_authorized
+    );
+    assert!(
+        store.account_generation() > gen_before,
+        "flipping true->false must bump the account generation"
+    );
+
+    // false -> true
+    let gen_before = store.account_generation();
+    repo.update_security_work_authorized("acct-1", true)
+        .await
+        .unwrap();
+    assert!(
+        repo.get("acct-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .security_work_authorized
+    );
+    assert!(
+        store.account_generation() > gen_before,
+        "flipping false->true must bump the account generation"
     );
 }
 
