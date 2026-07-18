@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use crate::traits::Continuity;
 use crate::types::{
     ContinuityDirective, ContinuityError, Prepared, PreparedRequest, RecoveryPlan, RequestCtx,
-    TurnOutcome, WatchdogArm,
+    SessionKey, TurnOutcome, WatchdogArm,
 };
 
 /// A `Continuity` that does nothing — for backends without continuity (e.g. Anthropic in M3).
@@ -27,6 +27,8 @@ impl Continuity for NoopContinuity {
                 watchdog: WatchdogArm::Disarmed,
                 recovery: RecoveryPlan::None,
                 session_key: ctx.session_key.clone(),
+                // No-op backend: there is no session store to read a sticky-cyber stamp from.
+                require_security_work_authorized: false,
             },
         })
     }
@@ -36,6 +38,15 @@ impl Continuity for NoopContinuity {
         _outcome: TurnOutcome,
         _ctx: &RequestCtx,
     ) -> Result<(), ContinuityError> {
+        Ok(())
+    }
+
+    async fn mark_required_capability(
+        &self,
+        _session_key: &SessionKey,
+        _capability: &'static str,
+    ) -> Result<(), ContinuityError> {
+        // No-op backend: nothing persisted here, so nothing to stamp.
         Ok(())
     }
 }

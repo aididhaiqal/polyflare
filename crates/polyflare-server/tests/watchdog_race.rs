@@ -86,6 +86,7 @@ fn armed_full_resend(body: serde_json::Value) -> Prepared {
                 },
             },
             session_key: None,
+            require_security_work_authorized: false,
         },
     }
 }

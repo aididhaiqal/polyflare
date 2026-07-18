@@ -7,7 +7,7 @@ use async_trait::async_trait;
 
 use crate::types::{
     Account, AccountId, AccountSnapshot, ContinuityError, ExecError, Prepared, PreparedRequest,
-    RequestCtx, ResponseStream, SelectionCtx, TurnOutcome,
+    RequestCtx, ResponseStream, SelectionCtx, SessionKey, TurnOutcome,
 };
 
 /// Executes a prepared request against an upstream using an account, returning a byte stream.
@@ -50,6 +50,18 @@ pub trait Continuity: Send + Sync {
     ) -> Result<Prepared, ContinuityError>;
 
     async fn observe(&self, outcome: TurnOutcome, ctx: &RequestCtx) -> Result<(), ContinuityError>;
+
+    /// TA6(b) Task 3: stamp `capability` as a sticky requirement on `session_key`'s session, so a
+    /// LATER `prepare` on that session pre-filters (see `ContinuityDirective::require_security_work_authorized`).
+    /// Called once, right when a cyber-rejected turn is successfully rerouted onto a
+    /// capability-holding account (`ingress.rs::reroute_cyber_rejection`) — NOT on every ordinary
+    /// silence-recovery, only on a genuine capability move. Content-free: `capability` is a fixed
+    /// label (e.g. `"security_work"`), never conversation content.
+    async fn mark_required_capability(
+        &self,
+        session_key: &SessionKey,
+        capability: &'static str,
+    ) -> Result<(), ContinuityError>;
 }
 
 /// Coordinates session ownership + admission. (In-process pass in M1.)

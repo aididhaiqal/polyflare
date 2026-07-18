@@ -1,0 +1,18 @@
+-- TA6(b) Task 3: persist a sticky-capability requirement on the session so a LATER turn can
+-- pre-filter to a capability-holding account from the start, instead of re-hitting a
+-- `cyber_policy` rejection every turn. Task 2 already pays the reject-and-move cost once per
+-- move (`ingress.rs::reroute_cyber_rejection` reselects + re-homes ownership on rejection); this
+-- column makes that filtering durable ACROSS turns, so the cost is paid only ONCE per session.
+--
+-- Content-free: a capability TAG SET (e.g. "security_work"), never conversation content — same
+-- invariant as every other column on this table.
+--
+-- Shape: TEXT holding a comma-separated capability-tag SET, not a single bool column. TA6 itself
+-- frames this as a "capability set" (see the Global Constraints' "Required-cap resolution
+-- (header/alias/pool)" row, and `AccountSnapshot::security_work_authorized`'s eventual siblings
+-- once more capability tags exist) — a set shape absorbs a second/third capability tag with no
+-- further migration, whereas a bool column would need a new `ALTER TABLE ADD COLUMN` (and a new
+-- accessor) per future capability. Today it only ever holds `security_work` (the only capability
+-- TA6(b) defines), so the set is a single-element string, but the shape is chosen for where this
+-- is headed, not just where it is today. NULL / empty ⇒ no sticky requirement (the common case).
+ALTER TABLE continuity_sessions ADD COLUMN required_capabilities TEXT;
