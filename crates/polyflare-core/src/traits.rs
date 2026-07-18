@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 
-use crate::select::Recovery;
+use crate::select::{BackoffCensus, Recovery};
 use crate::types::{
     Account, AccountId, AccountSnapshot, ContinuityError, ExecError, Prepared, PreparedRequest,
     RequestCtx, ResponseStream, SelectionCtx, SessionKey, TurnOutcome,
@@ -54,6 +54,16 @@ pub trait Selector: Send + Sync {
         ctx: &SelectionCtx,
     ) -> Option<Recovery> {
         crate::select::soonest_recover(snapshots, ctx)
+    }
+
+    /// B5 Task 3: the Layer-1 serve-now GUARD's tally — how many capability-filtered accounts are
+    /// currently in `ErrorBackoff`, and whether a capability-filtered `HardBlocked` peer exists.
+    /// The ingress evaluates the guard (`error_backoff_count > 1 || (error_backoff_count == 1 &&
+    /// has_hardblocked)`, ported from codex-lb `logic.py:499-524`) off this before serving the
+    /// `soonest_recover` `ErrorBackoff` candidate. Same shared-default shape as `soonest_recover`
+    /// above (strategy-independent, capability-filtered identically) — no impl overrides it.
+    fn backoff_census(&self, snapshots: &[AccountSnapshot], ctx: &SelectionCtx) -> BackoffCensus {
+        crate::select::backoff_census(snapshots, ctx)
     }
 }
 

@@ -292,6 +292,57 @@ pub(crate) fn soonest_recover(
         .min_by_key(|r| r.recover_at)
 }
 
+/// B5 Task 3: the ingress's Layer-1 GUARD tally — how many capability-filtered accounts are
+/// currently in `ErrorBackoff`, and whether a capability-filtered `HardBlocked` account also
+/// exists. Ported from codex-lb's serve-soonest guard (`logic.py:499-524`): Layer 1 (serve-now on
+/// the soonest `ErrorBackoff` account, no wait) only fires when there is MORE THAN ONE
+/// error-backoff account, OR exactly one AND a `HardBlocked` peer exists — a LONE error-backoff
+/// account with no hard-blocked peer must NOT be served-now (avoids hammering a single flaky
+/// account on every request). The ingress reads both fields off this struct to evaluate that
+/// guard; this function only tallies, it never decides serve-now itself.
+///
+/// Capability-filtered IDENTICALLY to `soonest_recover` (the same `!ctx.require_security_work_authorized
+/// || s.security_work_authorized` pre-filter, applied BEFORE classification) — a non-authorized
+/// account can never contribute to either count under a capability-requiring `ctx` (the security
+/// floor: it must not even be able to satisfy the guard for a cyber request, let alone be served).
+///
+/// `Cooldown`-kind `InBackoff` accounts are NOT tallied in `error_backoff_count` (Layer-2 territory,
+/// Task 4 — never a Layer-1 serve-now target) and do not set `has_hardblocked` either.
+pub(crate) fn backoff_census(snapshots: &[AccountSnapshot], ctx: &SelectionCtx) -> BackoffCensus {
+    let mut error_backoff_count = 0usize;
+    let mut has_hardblocked = false;
+    for s in snapshots
+        .iter()
+        .filter(|s| !ctx.require_security_work_authorized || s.security_work_authorized)
+    {
+        match eligibility(s, ctx.now) {
+            Eligibility::InBackoff {
+                kind: BackoffKind::ErrorBackoff,
+                ..
+            } => error_backoff_count += 1,
+            Eligibility::HardBlocked => has_hardblocked = true,
+            Eligibility::InBackoff {
+                kind: BackoffKind::Cooldown,
+                ..
+            }
+            | Eligibility::Eligible(_) => {}
+        }
+    }
+    BackoffCensus {
+        error_backoff_count,
+        has_hardblocked,
+    }
+}
+
+/// B5 Task 3: the Layer-1 guard's tally — see [`backoff_census`]. `error_backoff_count`/
+/// `has_hardblocked` are ids/counts only (content-safe); the ingress combines them into the
+/// serve-now guard (`count > 1 || (count == 1 && has_hardblocked)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BackoffCensus {
+    pub error_backoff_count: usize,
+    pub has_hardblocked: bool,
+}
+
 /// Health-tier pooling (step 2): prefer healthy(0), then probing(2), then draining(1) — mirrors
 /// codex-lb's `healthy or probing or draining or available`.
 fn health_tier_pool<'a>(pool: &[Candidate<'a>], now: i64) -> Vec<Candidate<'a>> {
@@ -1297,5 +1348,100 @@ mod tests {
     fn soonest_recover_empty_snapshots_yields_none() {
         let sel = CapacityWeighted;
         assert!(sel.soonest_recover(&[], &ctx(0, 1)).is_none());
+    }
+
+    // ---- B5 Task 3: `backoff_census` (capability-filtered, the Layer-1 guard's tally) ----
+
+    #[test]
+    fn backoff_census_counts_two_error_backoff_accounts_no_hardblocked() {
+        let mut a = snap("a", "plus", 0.0);
+        a.error_count = 3;
+        a.last_error_at = Some(0);
+        let mut b = snap("b", "plus", 0.0);
+        b.error_count = 3;
+        b.last_error_at = Some(0);
+
+        let sel = CapacityWeighted;
+        let census = sel.backoff_census(&[a, b], &ctx(1, 1));
+        assert_eq!(census.error_backoff_count, 2);
+        assert!(!census.has_hardblocked);
+    }
+
+    #[test]
+    fn backoff_census_one_error_backoff_plus_hardblocked_peer() {
+        let mut backoff = snap("backoff-acct", "plus", 0.0);
+        backoff.error_count = 3;
+        backoff.last_error_at = Some(0);
+        let mut blocked = snap("blocked-acct", "plus", 0.0);
+        blocked.status = "paused".to_string();
+
+        let sel = CapacityWeighted;
+        let census = sel.backoff_census(&[backoff, blocked], &ctx(1, 1));
+        assert_eq!(census.error_backoff_count, 1);
+        assert!(census.has_hardblocked);
+    }
+
+    #[test]
+    fn backoff_census_lone_error_backoff_no_hardblocked_peer() {
+        let mut backoff = snap("backoff-acct", "plus", 0.0);
+        backoff.error_count = 3;
+        backoff.last_error_at = Some(0);
+
+        let sel = CapacityWeighted;
+        let census = sel.backoff_census(&[backoff], &ctx(1, 1));
+        assert_eq!(census.error_backoff_count, 1);
+        assert!(!census.has_hardblocked);
+    }
+
+    #[test]
+    fn backoff_census_cooldown_only_does_not_count_as_error_backoff() {
+        let mut cooldown = snap("cooldown-acct", "plus", 0.0);
+        cooldown.cooldown_until = Some(100);
+
+        let sel = CapacityWeighted;
+        let census = sel.backoff_census(&[cooldown], &ctx(1, 1));
+        assert_eq!(
+            census.error_backoff_count, 0,
+            "a Cooldown-kind account must never be tallied as error-backoff"
+        );
+        assert!(!census.has_hardblocked);
+    }
+
+    #[test]
+    fn backoff_census_never_counts_a_non_authorized_account_under_cyber_ctx() {
+        // SECURITY FLOOR: the capability filter runs BEFORE classification, so a non-authorized
+        // error-backoff account under a cyber ctx must not contribute to the count at all.
+        let mut non_authorized_backoff = snap("non-authorized-acct", "plus", 0.0);
+        non_authorized_backoff.error_count = 3;
+        non_authorized_backoff.last_error_at = Some(0);
+        let mut authorized_cooldown = snap("capable-acct", "plus", 0.0);
+        authorized_cooldown.security_work_authorized = true;
+        authorized_cooldown.cooldown_until = Some(50);
+
+        let cyber_ctx = SelectionCtx {
+            now: 1,
+            require_security_work_authorized: true,
+            rng_seed: Some(1),
+            session_id: None,
+            tier: None,
+        };
+
+        let sel = CapacityWeighted;
+        let census = sel.backoff_census(&[non_authorized_backoff, authorized_cooldown], &cyber_ctx);
+        assert_eq!(
+            census.error_backoff_count, 0,
+            "the non-authorized error-backoff account must never be counted"
+        );
+        assert!(!census.has_hardblocked);
+    }
+
+    #[test]
+    fn backoff_census_all_eligible_yields_zero_count_no_hardblocked() {
+        let a = snap("a", "plus", 10.0);
+        let b = snap("b", "plus", 20.0);
+        let sel = CapacityWeighted;
+        let census = sel.backoff_census(&[a, b], &ctx(0, 1));
+        assert_eq!(census.error_backoff_count, 0);
+        assert!(!census.has_hardblocked);
     }
 }

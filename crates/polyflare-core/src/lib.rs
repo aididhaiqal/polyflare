@@ -12,8 +12,8 @@ pub use continuity::NoopContinuity;
 pub use format::Format;
 pub use provider::Provider;
 pub use select::{
-    BackoffKind, CacheAffinityTier, CapacityWeighted, FillFirst, Recovery, RoundRobin,
-    RoutingStrategy, SequentialDrain, UsageWeighted,
+    BackoffCensus, BackoffKind, CacheAffinityTier, CapacityWeighted, FillFirst, Recovery,
+    RoundRobin, RoutingStrategy, SequentialDrain, UsageWeighted,
 };
 pub use traits::{Continuity, Coordinator, Executor, Selector};
 pub use translate::{IdentityTranslator, Translator, TranslatorRegistry};
