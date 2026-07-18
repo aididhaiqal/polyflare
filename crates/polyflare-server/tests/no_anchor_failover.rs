@@ -124,6 +124,9 @@ async fn no_anchor_request_on_ineligible_owner_fails_over_not_500() {
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         max_account_attempts: 3,
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
+        starvation_wait_budget: std::time::Duration::from_secs(60),
+        starvation_heartbeat: std::time::Duration::from_secs(10),
+        starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
 
         runtime: Default::default(),
     });

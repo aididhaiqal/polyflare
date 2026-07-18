@@ -207,6 +207,118 @@ impl FailoverSignal<'_> {
     }
 }
 
+/// B5 Task 5: a process-global, content-free counter of Layer 2 keepalive-wait TERMINAL outcomes
+/// (see `crate::ingress::layer2_wait_stream`). In memory only (like `FailoverMetrics`/
+/// `RuntimeStates`/`LogBus`) — resets on restart. Incremented exactly ONCE per wait's terminal exit
+/// (recovered-and-spliced, budget-exceeded, still-nothing, or executor-error — every `return`/
+/// stream-end site in `layer2_wait_stream`), mirroring `FailoverMetrics`'s "once per real
+/// transition, never per mere classification" contract, so its total is a genuine count of "how
+/// many times did a client actually sit through a Layer 2 wait."
+#[derive(Default)]
+pub struct StarvationMetrics {
+    total: AtomicU64,
+}
+
+impl StarvationMetrics {
+    /// A fresh, zeroed counter, `Arc`-wrapped to match `FailoverMetrics::new`'s `AppState`-field
+    /// shape.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Records one Layer 2 wait's terminal outcome, returning the new total.
+    pub fn record(&self) -> u64 {
+        self.total.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The current total (test/dashboard read path).
+    pub fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+}
+
+/// B5 Task 5: the content-free signal for one Layer 2 keepalive-wait's terminal outcome — emitted
+/// from INSIDE `crate::ingress::layer2_wait_stream`'s generator, at the moment the outcome is
+/// actually known (the same "emit at the real transition, not at commit time" discipline
+/// `FailoverSignal` already establishes for cross-account failover).
+///
+/// **This is the fix for the disclosed `outcome.account_id` observability gap** (B5 Task 4's
+/// report, "Known limitation, not fixed here"): `RouteOutcome`/`RequestLog` for a Layer-2-served
+/// request are both finalized SYNCHRONOUSLY inside `responses_handler_impl_with_max_attempts`,
+/// BEFORE `layer2_wait_stream`'s generator body is ever polled by axum — i.e. before the wait, the
+/// re-select, or the splice have even started. Structurally, `RouteOutcome.account_id` can
+/// therefore only ever record the WAIT TARGET (the account `soonest_recover` was waiting for at
+/// commit time), never the account the post-wait re-select actually spliced in — which CAN differ
+/// in a multi-account pool (a different, also-recovered account may win the post-wait `pick`).
+/// Restructuring the ingress to defer `RequestLog` emission until the stream drains would be a much
+/// larger, riskier change to the reviewed B5 Task 4 control flow than this task's scope allows (see
+/// the plan's Global Constraints: "Do NOT change the Layer 2 control flow beyond ... emitting the
+/// signal"). Emitting a SEPARATE, authoritative signal at the splice point — the option the B5 Task
+/// 5 brief itself names — is the minimal correct fix: `served_account` on this struct carries the
+/// ACTUAL account that served the request (`Some` only on a genuine splice; `None` on every failure
+/// terminal, since no account ever actually served the client in those cases), distinct from
+/// `wait_target_account` (the best-effort id `RouteOutcome` still carries). Both are the same
+/// content-free id class `RequestLog::account_id`/`FailoverSignal`'s account ids already use — NEVER
+/// a body/message/frame, and `waited_ms` is a plain duration, never upstream content.
+pub struct StarvationSignal<'a> {
+    /// `crate::starvation::STARVATION_RECOVERED_REASON` on success, or one of
+    /// `crate::starvation::StarvationOutcome::code()`'s three fixed labels on failure.
+    pub reason: &'static str,
+    /// The account `soonest_recover` selected as the wait target at commit time.
+    pub wait_target_account: &'a str,
+    /// The account actually spliced in and serving the client — `Some` ONLY on a genuine post-wait
+    /// splice success, `None` on every failure terminal (budget-exceeded / still-nothing /
+    /// executor-error), since no account ever actually served the client in those cases.
+    pub served_account: Option<&'a str>,
+    /// Wall-clock milliseconds actually spent waiting (from the moment the generator started, to
+    /// this terminal outcome) — a plain duration, never derived from request/response content.
+    pub waited_ms: u64,
+}
+
+impl StarvationSignal<'_> {
+    /// Emits the structured `tracing` event (target `polyflare_server::starvation`, isolable from
+    /// other crates' traffic exactly like `RequestLog::emit`/`FailoverSignal::emit`'s own targets).
+    pub fn emit(&self) {
+        tracing::warn!(
+            target: "polyflare_server::starvation",
+            reason = self.reason,
+            wait_target_account = self.wait_target_account,
+            served_account = self.served_account.unwrap_or(""),
+            waited_ms = self.waited_ms,
+            "layer 2 starvation wait"
+        );
+    }
+
+    /// The content-free live-log-bus form (see `crate::log_bus`) — same sink `RequestLog`/
+    /// `FailoverSignal` feed, so the dashboard's live log stream shows starvation waits inline.
+    /// `account` prefers the SERVED account (the authoritative fix) and falls back to the wait
+    /// target only when nothing was ever actually served — never `None` outright, so a starvation
+    /// event is always attributable to at least the account it was scoped to.
+    pub fn to_log_event(&self) -> LogEvent {
+        let account = self
+            .served_account
+            .map(str::to_string)
+            .unwrap_or_else(|| self.wait_target_account.to_string());
+        LogEvent {
+            ts_ms: log_bus::now_ms(),
+            level: LogLevel::Warn,
+            provider: None,
+            account: Some(account),
+            model: None,
+            status: None,
+            latency_ms: Some(self.waited_ms as i64),
+            kind: "starvation".to_string(),
+            message: format!(
+                "starvation wait reason={} wait_target={} served={} waited_ms={}",
+                self.reason,
+                self.wait_target_account,
+                self.served_account.unwrap_or("none"),
+                self.waited_ms
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +525,121 @@ mod tests {
                 ev.message
             );
         }
+    }
+
+    #[test]
+    fn starvation_metrics_counts_exactly_the_recorded_events() {
+        let m = StarvationMetrics::new();
+        assert_eq!(m.total(), 0, "starts at zero");
+        assert_eq!(m.record(), 1);
+        assert_eq!(m.record(), 2);
+        assert_eq!(m.total(), 2);
+    }
+
+    /// The starvation signal's `tracing` event carries reason + both account fields + the waited
+    /// duration ONLY — this is the content-safety-critical assertion, same class as
+    /// `failover_signal_event_carries_only_reason_ids_and_attempt`.
+    #[test]
+    fn starvation_signal_event_carries_only_reason_ids_and_waited_ms() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let dispatch =
+            tracing::Dispatch::new(Capture(captured.clone(), "polyflare_server::starvation"));
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            StarvationSignal {
+                reason: crate::starvation::STARVATION_RECOVERED_REASON,
+                wait_target_account: "acct-a",
+                served_account: Some("acct-b"),
+                waited_ms: 1234,
+            }
+            .emit();
+        });
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1, "expected exactly one starvation event");
+        let line = &events[0];
+        for expected in [
+            "reason=starvation_wait_recovered",
+            "wait_target_account=acct-a",
+            "served_account=acct-b",
+            "waited_ms=1234",
+        ] {
+            assert!(line.contains(expected), "missing `{expected}` in: {line}");
+        }
+    }
+
+    /// A failure terminal (`served_account: None`) emits an empty `served_account` field — never a
+    /// panic, never a substituted value that could be mistaken for a real account id.
+    #[test]
+    fn starvation_signal_event_with_no_served_account_emits_empty_field() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let dispatch =
+            tracing::Dispatch::new(Capture(captured.clone(), "polyflare_server::starvation"));
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            StarvationSignal {
+                reason: crate::starvation::StarvationOutcome::BudgetExceeded.code(),
+                wait_target_account: "acct-a",
+                served_account: None,
+                waited_ms: 60000,
+            }
+            .emit();
+        });
+
+        let events = captured.lock().unwrap();
+        let line = &events[0];
+        assert!(line.contains("reason=starvation_wait_budget_exceeded"));
+        assert!(line.contains("served_account= ") || line.contains("served_account=\"\""));
+    }
+
+    /// The starvation signal's `LogEvent` (dashboard live-log form) must never carry a body,
+    /// message, or frame — only the reason code, both account fields, and the waited duration,
+    /// exactly like `failover_signal_log_event_is_content_free`. On success, `account` prefers the
+    /// SERVED account — the fix for the disclosed `outcome.account_id` gap.
+    #[test]
+    fn starvation_signal_log_event_prefers_served_account_and_is_content_free() {
+        let ev = StarvationSignal {
+            reason: crate::starvation::STARVATION_RECOVERED_REASON,
+            wait_target_account: "acct-a",
+            served_account: Some("acct-b"),
+            waited_ms: 2000,
+        }
+        .to_log_event();
+
+        assert_eq!(ev.kind, "starvation");
+        assert_eq!(
+            ev.account.as_deref(),
+            Some("acct-b"),
+            "the SERVED account (not the wait target) is the authoritative attribution"
+        );
+        assert!(ev.message.contains("wait_target=acct-a"));
+        assert!(ev.message.contains("served=acct-b"));
+        assert!(ev.message.contains("waited_ms=2000"));
+
+        for forbidden in [
+            "bearer", "body", "content", "delta", "text", "input", "message\":",
+        ] {
+            assert!(
+                !ev.message.to_lowercase().contains(forbidden),
+                "forbidden content `{forbidden}` leaked into starvation log event: {}",
+                ev.message
+            );
+        }
+    }
+
+    /// A failure terminal falls back to the wait-target account for `LogEvent.account` — always
+    /// attributable to at least the account the wait was scoped to, never `None` outright.
+    #[test]
+    fn starvation_signal_log_event_falls_back_to_wait_target_when_nothing_served() {
+        let ev = StarvationSignal {
+            reason: crate::starvation::StarvationOutcome::StillNothing.code(),
+            wait_target_account: "acct-a",
+            served_account: None,
+            waited_ms: 500,
+        }
+        .to_log_event();
+
+        assert_eq!(ev.account.as_deref(), Some("acct-a"));
+        assert!(ev.message.contains("served=none"));
     }
 }

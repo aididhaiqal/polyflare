@@ -21,13 +21,17 @@ use polyflare_core::ExecError;
 /// content. This is the ENTIRE keepalive payload; nothing is ever appended to it.
 pub const KEEPALIVE_FRAME: &[u8] = b": keepalive\n\n";
 
-/// Task 4 hardcodes these (the plan's "use a const default 60 for now" for the budget; codex-lb's
-/// `retry.py` HEARTBEAT=10s for the heartbeat). Task 5 wires
-/// `POLYFLARE_STARVATION_WAIT_BUDGET_SECS` (clamped to codex-lb's `[MIN=1s, MAX=300s]`) and
-/// `POLYFLARE_STARVATION_HEARTBEAT_SECS` over these, resolved ONCE into `AppState` at startup —
-/// NOT a per-request env read. Until then, every production call site uses these two consts
-/// directly; only the test seam (`ingress::responses_handler_impl_for_test_with_starvation_timing`)
-/// overrides them, to keep the test suite from ever performing a real 10-60s sleep.
+/// Task 4 hardcoded these (the plan's "use a const default 60 for now" for the budget; codex-lb's
+/// `retry.py` HEARTBEAT=10s for the heartbeat). Task 5 wires `POLYFLARE_STARVATION_WAIT_BUDGET_SECS`
+/// (clamped to codex-lb's `[MIN=1s, MAX=300s]`, with `0` as a documented DISABLE lever — see
+/// `crate::config::starvation_wait_budget_secs_from_env`'s doc) and
+/// `POLYFLARE_STARVATION_HEARTBEAT_SECS` (clamped to `[1, budget]`) over these, resolved ONCE into
+/// `AppState`/`ServeConfig` at startup — NOT a per-request env read. **These two consts now serve
+/// ONLY as the two test seams' explicit defaults** (`ingress::responses_handler_impl_for_test` /
+/// `responses_handler_impl_for_test_with_starvation_timing`'s fallback), so the test suite never
+/// performs a real 10-60s sleep by accident; the PRODUCTION entrypoint
+/// (`ingress::responses_handler_impl`) reads `AppState.starvation_wait_budget`/
+/// `starvation_heartbeat` instead, never these consts.
 pub const DEFAULT_WAIT_BUDGET: Duration = Duration::from_secs(60);
 pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(10);
 
@@ -86,6 +90,14 @@ pub fn in_band_error_frame(outcome: StarvationOutcome) -> Bytes {
 pub fn keepalive_item() -> Result<Bytes, ExecError> {
     Ok(Bytes::from_static(KEEPALIVE_FRAME))
 }
+
+/// B5 Task 5: the fixed reason label for a Layer 2 wait's SUCCESS terminal — a real account was
+/// re-selected, resolved, and a real upstream stream was spliced in. The counterpart to
+/// [`StarvationOutcome`]'s three FAILURE reason codes (which only cover the ways a wait can fail);
+/// threaded into `crate::observability::StarvationSignal::reason` from the splice site in
+/// `crate::ingress::layer2_wait_stream`. A fixed `&'static str`, never built from request/response
+/// content (content-safety).
+pub const STARVATION_RECOVERED_REASON: &str = "starvation_wait_recovered";
 
 #[cfg(test)]
 mod tests {
