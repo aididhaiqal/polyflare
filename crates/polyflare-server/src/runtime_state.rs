@@ -55,6 +55,18 @@ pub const PROBE_QUIET_SECS: i64 = 60;
 /// Consecutive successes required while PROBING before promotion back to HEALTHY.
 pub const PROBE_SUCCESS_STREAK_REQUIRED: u32 = 3;
 
+/// Wall-clock seconds since the Unix epoch. `record_success`'s signature is fixed (callers, e.g.
+/// `watchdog.rs`, invoke it with no `now` param — out of this task's file scope to change), but the
+/// PROBING-streak / error-driven health-tier evaluation it now performs needs a clock reading. Mirrors
+/// the identical private-`unix_now`-per-file idiom already used elsewhere in this crate (`watchdog.rs`,
+/// `ingress.rs`, `usage_refresh.rs`, ...).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Deterministic exponential backoff in SECONDS for the n-th consecutive error (n ≥ 1). No jitter
 /// here — the active same-account retry jitter is a separate concern (porting item B10); this is the
 /// exclusion window the selector reads, which must be stable per (error_count, last_error_at).
@@ -110,6 +122,40 @@ impl RuntimeState {
             self.probe_success_streak = 0;
         }
         self.health_tier = new_tier;
+    }
+
+    /// Apply an ERROR-ONLY health-tier re-evaluation from the per-request funnel (B8 Task 2 —
+    /// `record_success` / `record_transient_error` / `record_rate_limit`). The funnel only ever
+    /// knows about the error signal (`compute_should_drain` is called with `used_percent`/
+    /// `secondary_percent = None`), never usage — that's the poller's (Task 3) exclusive signal.
+    ///
+    /// **THE CARE POINT (plan Task 2, "the funnel has no usage%"):** an account can be DRAINING
+    /// purely because of USAGE (poller-set), with zero errors. If this fn is invoked right after a
+    /// success clears the error state (or after an error that's alone not yet `should_drain`), the
+    /// ERROR-ONLY `should_drain` is `false` even though the account is genuinely still draining by
+    /// usage — a signal this fn cannot see. Naively feeding that `false` into
+    /// [`evaluate_health_tier`] would let its DRAINING branch's quiet-timer fire
+    /// (`now - drain_entered_at >= PROBE_QUIET_SECS`) and wrongly promote DRAINING→PROBING from a
+    /// blind spot. So: compute the candidate `new_tier` as normal, but refuse to apply it when it
+    /// is specifically a DRAINING(1)→PROBING(2) promotion — leave the tier DRAINING untouched in
+    /// that one case (the poller, which has usage%, owns that demotion exclusively). Every other
+    /// edge (HEALTHY→DRAINING, PROBING→DRAINING, PROBING→HEALTHY via streak, and any no-op) is
+    /// safe to apply from the error-only view because it only ever moves the tier toward MORE
+    /// drained, or completes an already-independently-tracked probe streak.
+    fn apply_funnel_transition(&mut self, should_drain: bool, now: i64) {
+        let new_tier = evaluate_health_tier(
+            self.health_tier,
+            should_drain,
+            self.drain_entered_at,
+            self.probe_success_streak,
+            false, // frozen: the funnel only fires on completed/failed requests, i.e. not blocked.
+            now,
+        );
+        if self.health_tier == 1 && new_tier == 2 {
+            // THE CARE POINT: never let an error-only view promote DRAINING -> PROBING.
+            return;
+        }
+        self.transition(new_tier, now);
     }
 }
 
@@ -233,6 +279,11 @@ impl RuntimeStates {
                 // turn (or the entry is GC'd once neutral).
                 snap.cooldown_until = rt.cooldown_until.filter(|&cd| now < cd);
                 snap.last_selected_at = rt.last_selected_at;
+                // B8 Task 2: expose the live soft-drain tier so select.rs's already-built
+                // health_tier_pool sees real values instead of the always-0 default. An absent
+                // entry leaves the snapshot at its neutral `health_tier: 0` default (the loop
+                // above already skips it entirely).
+                snap.health_tier = rt.health_tier;
             }
         }
     }
@@ -264,6 +315,15 @@ impl RuntimeStates {
                 .clamp(RATE_LIMITED_MIN_COOLDOWN_SECS, MAX_COOLDOWN_SECS);
             let until = now.saturating_add(delay);
             rt.cooldown_until = Some(rt.cooldown_until.map_or(until, |c| c.max(until)));
+            // B8 Task 2: error-driven health-tier re-evaluation (see `apply_funnel_transition`'s
+            // doc for the care point about never promoting DRAINING->PROBING from here). A PROBING
+            // account resets its streak on any error, same as `record_transient_error`.
+            if rt.health_tier == 2 {
+                rt.probe_success_streak = 0;
+            }
+            let should_drain =
+                compute_should_drain(None, None, rt.error_count, rt.last_error_at, now);
+            rt.apply_funnel_transition(should_drain, now);
         });
     }
 
@@ -310,6 +370,14 @@ impl RuntimeStates {
         self.mutate(id, |rt| {
             rt.error_count = rt.error_count.saturating_add(1);
             rt.last_error_at = Some(now);
+            // B8 Task 2: error-driven health-tier re-evaluation. See `apply_funnel_transition`'s
+            // doc for the care point (never promote DRAINING->PROBING from an error-only view).
+            if rt.health_tier == 2 {
+                rt.probe_success_streak = 0;
+            }
+            let should_drain =
+                compute_should_drain(None, None, rt.error_count, rt.last_error_at, now);
+            rt.apply_funnel_transition(should_drain, now);
         });
     }
 
@@ -318,10 +386,27 @@ impl RuntimeStates {
     /// Leaves `cooldown_until` alone (it expires on its own) and does NOT touch `last_selected_at`:
     /// that marker is owned by [`record_selected`] (stamped at SELECTION), so an error-only entry
     /// that succeeds decays back to neutral here and is GC'd — keeping the map bounded.
+    ///
+    /// B8 Task 2: also advances the PROBING streak. If the account is currently PROBING (`health_tier
+    /// == 2`), this success bumps `probe_success_streak`; reaching
+    /// [`PROBE_SUCCESS_STREAK_REQUIRED`] then promotes PROBING→HEALTHY (clearing the aux fields) via
+    /// [`RuntimeState::apply_funnel_transition`], evaluated with the ERROR-ONLY `should_drain`
+    /// (`used_percent`/`secondary_percent = None`) computed AFTER the error state above was cleared
+    /// — so a success can never itself look like an error-drain. `apply_funnel_transition`'s care
+    /// point still applies here too: it refuses to let this call promote an unrelated DRAINING
+    /// account to PROBING (see its doc) — only the PROBING->HEALTHY streak edge, or a no-op, can
+    /// result from a success.
     pub fn record_success(&self, id: &AccountId) {
         self.mutate(id, |rt| {
             rt.error_count = 0;
             rt.last_error_at = None;
+            if rt.health_tier == 2 {
+                rt.probe_success_streak = rt.probe_success_streak.saturating_add(1);
+            }
+            let now = unix_now();
+            let should_drain =
+                compute_should_drain(None, None, rt.error_count, rt.last_error_at, now);
+            rt.apply_funnel_transition(should_drain, now);
         });
     }
 
@@ -349,6 +434,25 @@ mod tests {
 
     fn snap(id: &str) -> AccountSnapshot {
         AccountSnapshot::new(id)
+    }
+
+    /// Test-only seam: directly mutate an account's runtime entry, bypassing the funnel API, so a
+    /// test can seed an arbitrary starting state (e.g. a PROBING or DRAINING entry with a specific
+    /// `drain_entered_at`) without needing a production code path to reach it. `mod tests` is a
+    /// descendant of this module, so it may reach the private `inner` field directly — no new public
+    /// API surface needed.
+    fn seed(rs: &RuntimeStates, id: &AccountId, f: impl FnOnce(&mut RuntimeState)) {
+        let mut map = rs.inner.write().unwrap();
+        let entry = map.entry(id.clone()).or_default();
+        f(entry);
+    }
+
+    /// Test-only seam: read an account's raw runtime entry (or `None` if absent/GC'd), for
+    /// asserting on aux state (`drain_entered_at`/`probe_success_streak`) that `overlay` never
+    /// exposes on the snapshot.
+    fn peek(rs: &RuntimeStates, id: &AccountId) -> Option<RuntimeState> {
+        let map = rs.inner.read().unwrap();
+        map.get(id).cloned()
     }
 
     #[test]
@@ -650,5 +754,144 @@ mod tests {
             "reaches the select.rs error-backoff threshold"
         );
         assert_eq!(snaps[0].cooldown_until, None, "transient sets no cooldown");
+    }
+
+    // --- B8 Task 2: error-driven evaluation in the funnel + overlay copy ---
+
+    #[test]
+    fn overlay_copies_health_tier_and_defaults_absent_entry_to_zero() {
+        // (e) overlay copies health_tier for a known entry; an absent entry stays 0.
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        rs.record_transient_error(&id, 1000);
+        rs.record_transient_error(&id, 1001); // error_count=2 within 60s ⇒ error-drain ⇒ DRAINING
+        let mut snaps = vec![snap("a"), snap("b")];
+        rs.overlay(&mut snaps, 1001);
+        assert_eq!(snaps[0].health_tier, 1, "known entry: tier copied from runtime state");
+        assert_eq!(snaps[1].health_tier, 0, "absent entry: stays at the neutral default");
+    }
+
+    #[test]
+    fn two_transient_errors_within_window_drain_the_account() {
+        // (a) error_count reaches 2 within 60s via record_transient_error ⇒ overlay health_tier == 1.
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        rs.record_transient_error(&id, 1000);
+        rs.record_transient_error(&id, 1010);
+        let mut snaps = vec![snap("a")];
+        rs.overlay(&mut snaps, 1010);
+        assert_eq!(snaps[0].health_tier, 1, "2 errors within 60s ⇒ DRAINING");
+    }
+
+    #[test]
+    fn record_rate_limit_also_drains_on_error_flapping() {
+        // record_rate_limit must wire the same error-driven transition as record_transient_error.
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        rs.record_rate_limit(&id, Some(5), 1000); // error_count=1, cooldown clamped to floor
+        rs.record_rate_limit(&id, Some(5), 1010); // error_count=2, within 60s ⇒ error-drain
+        let mut snaps = vec![snap("a")];
+        rs.overlay(&mut snaps, 1010);
+        assert_eq!(snaps[0].health_tier, 1, "2 rate-limit hits within 60s ⇒ DRAINING");
+    }
+
+    #[test]
+    fn probing_streak_of_three_successes_promotes_to_healthy_and_clears_aux() {
+        // (b) seed a PROBING entry, 3x record_success ⇒ health_tier == 0 (HEALTHY) + aux cleared.
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        rs.record_transient_error(&id, 500); // create the entry
+        seed(&rs, &id, |rt| {
+            rt.health_tier = 2; // PROBING
+            rt.drain_entered_at = Some(100);
+            rt.probe_success_streak = 0;
+            rt.error_count = 0;
+            rt.last_error_at = None;
+        });
+        rs.record_success(&id);
+        rs.record_success(&id);
+        rs.record_success(&id); // 3rd success completes the streak ⇒ HEALTHY
+        let mut snaps = vec![snap("a")];
+        rs.overlay(&mut snaps, 2000);
+        assert_eq!(snaps[0].health_tier, 0, "3 successes while PROBING ⇒ HEALTHY");
+        assert_eq!(snaps[0].error_count, 0);
+        assert_eq!(snaps[0].last_error_at, None);
+        assert_eq!(
+            peek(&rs, &id),
+            None,
+            "HEALTHY + cleared aux + zero error state is fully neutral ⇒ GC'd from the map"
+        );
+    }
+
+    #[test]
+    fn probing_streak_below_three_stays_probing() {
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        rs.record_transient_error(&id, 500);
+        seed(&rs, &id, |rt| {
+            rt.health_tier = 2;
+            rt.drain_entered_at = Some(100);
+            rt.probe_success_streak = 0;
+            rt.error_count = 0;
+            rt.last_error_at = None;
+        });
+        rs.record_success(&id);
+        rs.record_success(&id); // only 2 successes ⇒ still PROBING
+        let mut snaps = vec![snap("a")];
+        rs.overlay(&mut snaps, 2000);
+        assert_eq!(snaps[0].health_tier, 2, "2 successes while PROBING ⇒ stays PROBING");
+    }
+
+    #[test]
+    fn probing_error_resets_streak_and_may_drain() {
+        // (c) a PROBING account that gets a record_transient_error ⇒ streak reset to 0 (and tier
+        // DRAINING if error-drain fires).
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        rs.record_transient_error(&id, 500);
+        seed(&rs, &id, |rt| {
+            rt.health_tier = 2; // PROBING
+            rt.drain_entered_at = Some(100);
+            rt.probe_success_streak = 2;
+            rt.error_count = 0;
+            rt.last_error_at = None;
+        });
+        // One error alone isn't enough to error-drain (needs 2 within 60s), so tier stays PROBING,
+        // but the streak must reset to 0.
+        rs.record_transient_error(&id, 1000);
+        seed(&rs, &id, |rt| {
+            assert_eq!(rt.probe_success_streak, 0, "streak reset on any error while PROBING");
+            assert_eq!(rt.health_tier, 2, "single error alone doesn't error-drain");
+        });
+        // A second error within 60s DOES error-drain ⇒ PROBING -> DRAINING.
+        rs.record_transient_error(&id, 1010);
+        let mut snaps = vec![snap("a")];
+        rs.overlay(&mut snaps, 1010);
+        assert_eq!(snaps[0].health_tier, 1, "2nd error within 60s while PROBING ⇒ DRAINING");
+    }
+
+    #[test]
+    fn draining_account_is_not_promoted_to_probing_by_a_usage_blind_success() {
+        // (d) THE CARE POINT: an account whose tier is DRAINING with drain_entered_at older than
+        // 60s, then a record_success with NO usage signal, must NOT be promoted to PROBING via the
+        // funnel — only the poller (which sees usage) may perform that quiet-timer promotion.
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        rs.record_transient_error(&id, 500);
+        seed(&rs, &id, |rt| {
+            rt.health_tier = 1; // DRAINING
+            rt.drain_entered_at = Some(100); // far more than PROBE_QUIET_SECS (60) before `now`
+            rt.probe_success_streak = 0;
+            rt.error_count = 0;
+            rt.last_error_at = None;
+        });
+        rs.record_success(&id); // now = irrelevant here, but overlay below uses 2000 (>> 100+60)
+        let mut snaps = vec![snap("a")];
+        rs.overlay(&mut snaps, 2000);
+        assert_eq!(
+            snaps[0].health_tier, 1,
+            "the funnel must never promote DRAINING->PROBING; only the poller (Task 3) does, \
+             because only it has usage%"
+        );
     }
 }
