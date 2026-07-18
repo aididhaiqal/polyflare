@@ -99,6 +99,7 @@ async fn large_request_body_is_not_rejected_with_413() {
         starvation_heartbeat: std::time::Duration::from_secs(10),
         wake_jitter_ms: 0,
         inflight_penalty_pct: 2.5,
+        lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),

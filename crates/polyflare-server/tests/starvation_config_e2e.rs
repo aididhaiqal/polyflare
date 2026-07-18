@@ -115,6 +115,7 @@ fn build_state(
         starvation_heartbeat,
         wake_jitter_ms: 0,
         inflight_penalty_pct: 2.5,
+        lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),

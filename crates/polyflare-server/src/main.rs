@@ -230,6 +230,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         stream_idle_timeout: config.stream_idle_timeout,
         soft_drain_enabled: config.soft_drain_enabled,
         inflight_penalty_pct: config.inflight_penalty_pct,
+        lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
     });
     // Runtime usage-refresh loop: keeps each Codex account's rate-limit windows (5h + weekly) and
     // routing gate live, instead of the frozen numbers the importer left.

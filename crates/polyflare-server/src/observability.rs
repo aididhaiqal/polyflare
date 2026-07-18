@@ -474,6 +474,64 @@ pub fn emit_health_tier_signal(
     metrics.record();
 }
 
+/// C9 Task 4: a process-global, content-free pair of counters for the in-flight lease lifecycle
+/// (see `crate::runtime_state::RuntimeStates::acquire_in_flight` / `crate::runtime_state::
+/// InFlightGuard`). In memory only (like `FailoverMetrics`/`StarvationMetrics`/`HealthTierMetrics`)
+/// — resets on restart. `acquired` is bumped exactly once per `acquire_in_flight` call (one per
+/// streaming selection attempt); `released` is bumped exactly once per `InFlightGuard::drop` — i.e.
+/// once per way that lease actually ends (clean drain, client disconnect, mid-stream error,
+/// idle-timeout, or a failover reselect's dropped pre-stream attempt). Carries NO content — counts
+/// only, same class as every other counter in this module.
+///
+/// Deliberately two independent monotonic counters rather than a single live gauge: `acquired -
+/// released` (see [`Self::current`]) already recovers the instantaneous in-flight total for a
+/// dashboard, while keeping both cumulative totals visible separately lets an operator distinguish
+/// "traffic volume" from "steady-state concurrency" and, if `released` ever permanently lags
+/// `acquired` by a growing margin, spot a leaked-guard regression (Task 1-2's leak-proof guarantee
+/// should make that impossible in practice, but the counters make a violation observable rather
+/// than silent).
+#[derive(Default)]
+pub struct LeaseMetrics {
+    acquired: AtomicU64,
+    released: AtomicU64,
+}
+
+impl LeaseMetrics {
+    /// A fresh, zeroed pair of counters, `Arc`-wrapped to match `FailoverMetrics::new`'s /
+    /// `StarvationMetrics::new`'s / `HealthTierMetrics::new`'s `AppState`-field shape.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Records one lease acquisition (one `acquire_in_flight` call), returning the new total.
+    pub fn record_acquire(&self) -> u64 {
+        self.acquired.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Records one lease release (one `InFlightGuard::drop`), returning the new total.
+    pub fn record_release(&self) -> u64 {
+        self.released.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The cumulative acquire count (test/dashboard read path).
+    pub fn acquired(&self) -> u64 {
+        self.acquired.load(Ordering::Relaxed)
+    }
+
+    /// The cumulative release count (test/dashboard read path).
+    pub fn released(&self) -> u64 {
+        self.released.load(Ordering::Relaxed)
+    }
+
+    /// The derived instantaneous in-flight total (`acquired - released`), saturating at `0` so a
+    /// transient read race between the two independent atomics can never underflow into a bogus
+    /// huge `u64` — a dashboard gauge reading, not a source of truth (the authoritative live count
+    /// per-account is `RuntimeState.in_flight`; this is the process-wide aggregate view).
+    pub fn current(&self) -> u64 {
+        self.acquired().saturating_sub(self.released())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,7 +730,13 @@ mod tests {
         assert!(ev.message.contains("attempt=3"));
 
         for forbidden in [
-            "bearer", "body", "content", "delta", "text", "input", "message\":",
+            "bearer",
+            "body",
+            "content",
+            "delta",
+            "text",
+            "input",
+            "message\":",
         ] {
             assert!(
                 !ev.message.to_lowercase().contains(forbidden),
@@ -777,7 +841,13 @@ mod tests {
         assert!(ev.message.contains("wake_jitter_applied_ms=350"));
 
         for forbidden in [
-            "bearer", "body", "content", "delta", "text", "input", "message\":",
+            "bearer",
+            "body",
+            "content",
+            "delta",
+            "text",
+            "input",
+            "message\":",
         ] {
             assert!(
                 !ev.message.to_lowercase().contains(forbidden),
@@ -860,7 +930,15 @@ mod tests {
         assert!(ev.message.contains("to=2"));
 
         for forbidden in [
-            "bearer", "body", "content", "delta", "text", "input", "percent", "used", "message\":",
+            "bearer",
+            "body",
+            "content",
+            "delta",
+            "text",
+            "input",
+            "percent",
+            "used",
+            "message\":",
         ] {
             assert!(
                 !ev.message.to_lowercase().contains(forbidden),
@@ -885,5 +963,40 @@ mod tests {
 
         assert_eq!(ev.account.as_deref(), Some("acct-a"));
         assert!(ev.message.contains("served=none"));
+    }
+
+    #[test]
+    fn lease_metrics_counts_acquire_and_release_independently() {
+        let m = LeaseMetrics::new();
+        assert_eq!(m.acquired(), 0, "starts at zero");
+        assert_eq!(m.released(), 0, "starts at zero");
+        assert_eq!(m.current(), 0);
+
+        assert_eq!(m.record_acquire(), 1);
+        assert_eq!(m.record_acquire(), 2);
+        assert_eq!(m.acquired(), 2);
+        assert_eq!(m.released(), 0);
+        assert_eq!(m.current(), 2, "2 acquired, 0 released ⇒ 2 in flight");
+
+        assert_eq!(m.record_release(), 1);
+        assert_eq!(m.acquired(), 2);
+        assert_eq!(m.released(), 1);
+        assert_eq!(m.current(), 1, "2 acquired, 1 released ⇒ 1 in flight");
+
+        assert_eq!(m.record_release(), 2);
+        assert_eq!(m.current(), 0, "balanced acquire/release ⇒ 0 in flight");
+    }
+
+    /// A stray release (more releases than acquires — should never happen given the leak-proof
+    /// guard, but the counter is a plain accumulator, not itself the enforcement mechanism) must
+    /// saturate rather than underflow/panic.
+    #[test]
+    fn lease_metrics_current_saturates_when_released_exceeds_acquired() {
+        let m = LeaseMetrics::new();
+        m.record_release();
+        m.record_release();
+        assert_eq!(m.acquired(), 0);
+        assert_eq!(m.released(), 2);
+        assert_eq!(m.current(), 0, "saturates at 0, never underflows");
     }
 }

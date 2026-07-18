@@ -178,6 +178,15 @@ pub struct AppState {
     /// into `eff_used`/`eff_secondary_used` as `in_flight * inflight_penalty_pct`. `0.0` ⇒ the
     /// disable lever (in_flight still tracked, never folded into the weight).
     pub inflight_penalty_pct: f64,
+    /// C9 Task 4: content-free counter of in-flight lease acquire/release events (see
+    /// `crate::observability::LeaseMetrics`) — bumped from `crate::runtime_state::RuntimeStates::
+    /// acquire_in_flight` (acquired) and `crate::runtime_state::InFlightGuard`'s `Drop` (released),
+    /// via a handle threaded into `acquire_in_flight`'s call sites (`crate::ingress`) and stored on
+    /// the returned guard so the release bump fires wherever/however the guard is dropped —
+    /// disconnect, drain, error, timeout, panic, or failover reselect, mirroring the leak-proof
+    /// release guarantee Task 1-2 already established for `in_flight` itself. In-memory only (like
+    /// `FailoverMetrics`/`StarvationMetrics`/`HealthTierMetrics`); resets on restart.
+    pub lease_metrics: std::sync::Arc<crate::observability::LeaseMetrics>,
 }
 
 impl AppState {

@@ -1108,13 +1108,20 @@ mod tests {
     async fn dropping_the_stream_before_polling_to_completion_releases_the_in_flight_lease() {
         let rs = Arc::new(RuntimeStates::new());
         let id = AccountId::from("acct");
-        let guard = rs.acquire_in_flight(&id, 0);
+        let metrics = crate::observability::LeaseMetrics::new();
+        let guard = rs.acquire_in_flight(&id, 0, &metrics);
         let mut snaps = vec![polyflare_core::AccountSnapshot::new("acct")];
         rs.overlay(&mut snaps, 0);
         assert_eq!(
             snaps[0].in_flight, 1,
             "the lease is held before the stream ever exists"
         );
+        assert_eq!(
+            metrics.acquired(),
+            1,
+            "acquire_in_flight bumped the counter"
+        );
+        assert_eq!(metrics.released(), 0, "not yet released");
 
         // A stream with plenty left to yield — never polled at all here, mirroring a client that
         // disconnects before the server even gets to relay the first byte.
@@ -1149,6 +1156,11 @@ mod tests {
             snaps[0].in_flight, 0,
             "the lease releases on an unpolled drop — a client disconnect must never leak it"
         );
+        assert_eq!(
+            metrics.released(),
+            1,
+            "the guard's Drop bumped the release counter even on an unpolled disconnect"
+        );
     }
 
     /// C9 Task 2: a clean drain (poll to `Poll::Ready(None)`, then drop) releases the lease AND
@@ -1162,7 +1174,8 @@ mod tests {
         // Pre-seed an error so `record_success` actually clearing it (error_count -> 0) is
         // observable, not merely "never touched" — mirrors the existing idle-timeout test's idiom.
         rs.record_transient_error(&id, 0);
-        let guard = rs.acquire_in_flight(&id, 0);
+        let metrics = crate::observability::LeaseMetrics::new();
+        let guard = rs.acquire_in_flight(&id, 0, &metrics);
 
         let inner: ResponseStream = Box::pin(stream::iter(vec![Ok::<Bytes, ExecError>(
             Bytes::from_static(
@@ -1229,7 +1242,8 @@ mod tests {
     async fn mid_stream_error_releases_the_lease_and_record_transient_error_still_fires() {
         let rs = Arc::new(RuntimeStates::new());
         let id = AccountId::from("acct");
-        let guard = rs.acquire_in_flight(&id, 0);
+        let metrics = crate::observability::LeaseMetrics::new();
+        let guard = rs.acquire_in_flight(&id, 0, &metrics);
 
         let inner: ResponseStream = Box::pin(stream::iter(vec![
             Ok::<Bytes, ExecError>(Bytes::from_static(b"data: first\n\n")),
