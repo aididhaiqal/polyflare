@@ -295,10 +295,19 @@ async fn lone_error_backoff_with_no_hardblocked_peer_does_not_serve_now() {
     );
 }
 
-/// (4) Empty pool + only Cooldown accounts (rate_limited, `reset_at` in the future) ⇒ Layer 1
-/// does NOT apply (Cooldown is Layer-2 territory, not built here) ⇒ today's 503.
+/// (4) Empty pool + only Cooldown accounts (rate_limited, `reset_at` in the future) ⇒ Layer 1 does
+/// NOT serve-now (unchanged; this is still the assertion this test locks in). Layer 1 in isolation
+/// would have 503'd here (this was this test's assertion before B5 Task 4 landed); NOW that Task 4
+/// (`try_layer2_recovery_wait`) is wired at the SAME empty-pool site, a Cooldown-kind
+/// `soonest_recover` result correctly falls through to Layer 2 instead — which commits its own 200
+/// SSE and starts waiting (bounded by the production default 60s budget; both accounts here
+/// recover far past that, at +3600s/+7200s, so the wait itself is not exercised or awaited here —
+/// see `tests/starvation_layer2.rs` for the dedicated Layer 2 suite, including its own
+/// budget-exceeded-in-band-error test using a short test-scale budget). This test's OWN scope is
+/// narrower than that: it only proves Layer 1 itself never serves a Cooldown-kind candidate — the
+/// executor is never attempted, which is what `exec.calls()` asserts below.
 #[tokio::test]
-async fn cooldown_only_accounts_do_not_serve_now() {
+async fn cooldown_only_accounts_do_not_serve_now_via_layer1() {
     let (store, cipher, _dir) = spawn_store().await;
     let mut a = account("A", false, "rate_limited");
     a.reset_at = Some(now() + 3600); // far in the future — still Cooldown at request time
@@ -326,12 +335,17 @@ async fn cooldown_only_accounts_do_not_serve_now() {
         .unwrap();
     assert_eq!(
         resp.status(),
-        503,
-        "Cooldown-kind candidates are Layer-2 territory (Task 4), not Layer 1"
+        200,
+        "B5 Task 4: a Cooldown-kind candidate now falls through to Layer 2's keepalive wait \
+         (which commits its own 200 immediately) instead of Layer 1's 503 — see this test's doc"
     );
+    // Deliberately does NOT drain the response body here: the production 60s wait budget would
+    // make this test hang for up to a real minute. `tests/starvation_layer2.rs` owns exercising
+    // the wait/budget/splice behavior itself, with short, test-scale timing overrides.
     assert!(
         exec.calls().is_empty(),
-        "no cooldown account may ever be served-now by Layer 1"
+        "no cooldown account may ever be served-now by Layer 1 (Layer 2's own wait hasn't even \
+         started re-selecting yet at the point this test observes the response)"
     );
 }
 

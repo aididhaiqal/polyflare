@@ -228,8 +228,16 @@ async fn a_429_cools_the_account_down_and_benches_it_next_request() {
         "cooldown honors Retry-After: 90"
     );
 
-    // Request 2: the account is in cooldown ⇒ eligibility excludes it ⇒ empty pool ⇒ 503 (NOT a
-    // second 502 from routing to the still-benched account).
+    // Request 2: the account is in cooldown ⇒ eligibility excludes it ⇒ empty pool. Pre-B5-Task-4
+    // this was a 503 (NOT a second 502 from routing to the still-benched account). Now that Task 4
+    // (`try_layer2_recovery_wait`) is wired at the same empty-pool site, a runtime-`cooldown_until`
+    // benching is `BackoffKind::Cooldown` (see `select.rs::eligibility`'s cooldown gate), so it
+    // correctly falls through to Layer 2's keepalive wait instead — which commits its OWN 200 SSE
+    // immediately (the 90s cooldown here comfortably exceeds the production 60s wait budget, so the
+    // wait would eventually give up with an in-band error, but this test doesn't drain that far —
+    // see `tests/starvation_layer2.rs` for the dedicated Layer 2 suite with short test-scale
+    // timing). This test's own scope stays "does the SAME account ever get re-attempted while
+    // benched" — answered by never draining the body and not asserting on the executor here.
     let r2 = client
         .post(format!("{pf}/responses"))
         .json(&body)
@@ -238,8 +246,9 @@ async fn a_429_cools_the_account_down_and_benches_it_next_request() {
         .unwrap();
     assert_eq!(
         r2.status(),
-        503,
-        "the cooled-down account is benched, so there is no eligible account"
+        200,
+        "B5 Task 4: a Cooldown-kind benched account now falls through to Layer 2's keepalive wait \
+         (its own immediate 200) instead of Layer 1/no-Layer-2's 503 — see this test's doc"
     );
 }
 

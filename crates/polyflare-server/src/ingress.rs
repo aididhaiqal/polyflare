@@ -9,6 +9,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Json, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use futures_util::StreamExt;
 
 use polyflare_anthropic::AnthropicToResponses;
 use polyflare_codex::oauth::{classify_failure, should_refresh, token_exp, OAuthError};
@@ -27,6 +28,7 @@ use crate::fingerprint_capture::{append_fingerprint_capture, capture_request_fin
 use crate::observability::{FailoverSignal, RequestLog};
 use crate::session_key::parse_inbound;
 use crate::snapshot::filter_by_provider_and_pool;
+use crate::starvation;
 use crate::translate_stream::wrap_translating_stream;
 use crate::watchdog::{
     apply_ownership, execute_recovery, execute_recovery_tracked, execute_with_watchdog,
@@ -520,6 +522,205 @@ async fn try_layer1_serve_now(
     Some(response)
 }
 
+/// B5 Task 4 (THE CRUX) — Layer 2: for a `Cooldown`-kind `soonest_recover` result within budget,
+/// commit HTTP 200 SSE IMMEDIATELY (by handing [`layer2_wait_stream`] to [`stream_response`]) and
+/// move the wait + re-select + splice entirely INSIDE the stream body. Called at the SAME
+/// empty-pool sites as [`try_layer1_serve_now`], immediately after it returns `None`.
+///
+/// # Why this is safe to call unconditionally after Layer 1 falls through
+/// `soonest_recover` is a pure, cheap function over already-fetched snapshots — calling it again
+/// here (Layer 1 already called it once, internally) costs nothing and keeps the two layers
+/// fully decoupled: Layer 2 never needs Layer 1's internal `Recovery` value threaded across a
+/// function boundary. Returns `None` in exactly two cases, both of which mean "Layer 2 does not
+/// apply here; the caller must fall through to today's PRE-response fast 503/502":
+/// - `soonest_recover` itself returns `None` — every capability-filtered account is either
+///   `Eligible` (impossible; the caller only reaches here when selection failed) or `HardBlocked`.
+///   Global Constraint: HARDBLOCKED IS NEVER A WAIT TARGET — no HTTP 200 is ever committed for an
+///   all-HardBlocked pool, so the caller's ordinary 503/502 fires exactly as before B5.
+/// - `recovery.kind == ErrorBackoff` — that account is Layer 1's territory (a lone backoff account
+///   whose guard was rejected, per `try_layer1_serve_now`'s doc). Layer 2 must NOT wait on it:
+///   waiting the full `error_backoff_secs` window for a single flaky account on every request that
+///   happens to see an empty pool would be strictly worse than today's immediate 503, and would
+///   silently change `lone_error_backoff_with_no_hardblocked_peer_does_not_serve_now`'s regression
+///   contract (Task 3) from an immediate 503 to a slow one.
+///
+/// # Security floor (inviolable)
+/// `soonest_recover` applies the SAME capability pre-filter `try_layer1_serve_now`/`standard_pool`
+/// use, so a cyber request can only ever wait for a `security_work_authorized` account. `sel_ctx`
+/// (carrying `require_security_work_authorized`) is cloned UNCHANGED into `layer2_wait_stream`,
+/// which re-derives its post-wait `fresh_sel_ctx` from that same clone (only `now` is refreshed) —
+/// see that function's doc for the re-select-side proof.
+#[allow(clippy::too_many_arguments)]
+fn try_layer2_recovery_wait(
+    state: Arc<AppState>,
+    snapshots: &[AccountSnapshot],
+    pool: Option<String>,
+    selector: Arc<dyn Selector>,
+    sel_ctx: &SelectionCtx,
+    req: PreparedRequest,
+    ctx: RequestCtx,
+    session_key: Option<SessionKey>,
+    now: i64,
+    budget: Duration,
+    heartbeat: Duration,
+    outcome: &mut RouteOutcome,
+) -> Option<Response> {
+    let recovery = selector.soonest_recover(snapshots, sel_ctx)?;
+    if recovery.kind != BackoffKind::Cooldown {
+        return None;
+    }
+    // Best-effort observability id: the account this request is WAITING for at commit time — not
+    // necessarily the one that ends up served (the post-wait re-select can land on a different,
+    // also-recovered account, or none at all). Same content-safe id class every other
+    // `outcome.account_id` assignment in this file uses.
+    outcome.account_id = Some(recovery.account_id.as_str().to_string());
+    let stream = layer2_wait_stream(
+        state,
+        pool,
+        selector,
+        sel_ctx.clone(),
+        req,
+        ctx,
+        session_key,
+        recovery.recover_at,
+        now,
+        heartbeat,
+        budget,
+    );
+    Some(stream_response(stream))
+}
+
+/// B5 Task 4: the actual keepalive-wait-then-splice `ResponseStream`. Built with
+/// `async_stream::stream!` — the bounded sleep/keepalive loop, the re-select, and the executor call
+/// all run INSIDE the stream body, polled lazily by `Body::from_stream` (i.e. AFTER
+/// `stream_response` has already returned its 200). Every `Arc`/owned value here is captured by the
+/// generator and must outlive the call that constructed it — this is exactly why `state`/`selector`
+/// arrive as owned `Arc`s (not borrows) and `req`/`ctx`/`session_key`/`pool`/`sel_ctx` arrive owned
+/// (cloned by the caller, [`try_layer2_recovery_wait`]).
+///
+/// # Global Constraint — POST-200 COMMIT (the crux)
+/// Every exit from this generator after the loop begins is a `yield Ok(..in_band_error_frame..)`
+/// followed by `return`, NEVER an `Err` item (which would abort the chunked/HTTP-2 body
+/// ungracefully — see `starvation::in_band_error_frame`'s doc) and NEVER anything that could
+/// surface as a second HTTP status (impossible by construction: axum's `Body::from_stream` has
+/// already committed the 200 by the time this generator is ever polled).
+///
+/// # Global Constraint — BOUNDED BUDGET
+/// `target = recover_at.min(budget_deadline)` caps the sleep loop itself; the explicit
+/// `now >= budget_deadline` check after the loop additionally distinguishes "recovered in time"
+/// from "budget exceeded" for accounts whose `recover_at` sits PAST the budget. Either way the
+/// wait never runs past `wait_start + budget`.
+///
+/// # Global Constraint — RE-SNAPSHOT AFTER THE WAIT (the load-bearing gotcha)
+/// After the wait, this RE-FETCHES the account cache (`state.account_cache.snapshots`) AND
+/// re-`overlay`s it with a FRESH `unix_now()` — `RuntimeStates::overlay` (`runtime_state.rs:88-97`)
+/// deliberately DROPS an elapsed `cooldown_until`, so re-using the pre-wait `snapshots`/`now` here
+/// would still see the stale (pre-recovery) cooldown and this would never serve. `fresh_sel_ctx` is
+/// `sel_ctx.clone()` with ONLY `now` overwritten — `require_security_work_authorized`/`tier`/
+/// `session_id` are carried over from the ORIGINAL ctx untouched, so the post-wait re-select
+/// preserves the security floor exactly as strictly as the pre-wait one did.
+#[allow(clippy::too_many_arguments)]
+fn layer2_wait_stream(
+    state: Arc<AppState>,
+    pool: Option<String>,
+    selector: Arc<dyn Selector>,
+    sel_ctx: SelectionCtx,
+    req: PreparedRequest,
+    ctx: RequestCtx,
+    session_key: Option<SessionKey>,
+    recover_at: i64,
+    wait_start: i64,
+    heartbeat: Duration,
+    budget: Duration,
+) -> ResponseStream {
+    Box::pin(async_stream::stream! {
+        let budget_deadline = wait_start.saturating_add(budget.as_secs() as i64);
+        // Never sleep past whichever comes first: the account's own recovery time, or the budget.
+        let target = recover_at.min(budget_deadline);
+
+        loop {
+            let t = unix_now();
+            if t >= target {
+                break;
+            }
+            let remaining_secs = (target - t).max(1) as u64;
+            let tick = heartbeat.min(Duration::from_secs(remaining_secs));
+            tokio::time::sleep(tick).await;
+            // Only emit a keepalive if we're still genuinely waiting (avoids one trailing,
+            // pointless keepalive emitted in the same instant selection is about to be retried).
+            if unix_now() < target {
+                yield starvation::keepalive_item();
+            }
+        }
+
+        // BOUNDED BUDGET: the account's own recovery may sit PAST the budget (`target` above was
+        // capped at `budget_deadline` in that case) — distinguish that from a genuine recovery.
+        if unix_now() >= budget_deadline && unix_now() < recover_at {
+            yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::BudgetExceeded));
+            return;
+        }
+
+        // RE-SNAPSHOT (see this function's doc): fresh fetch + fresh overlay + fresh `now`.
+        let fresh_now = unix_now();
+        let mut fresh_sel_ctx = sel_ctx.clone();
+        fresh_sel_ctx.now = fresh_now; // every other field (notably
+                                        // `require_security_work_authorized`) is carried over
+                                        // from `sel_ctx` UNCHANGED — the security floor.
+        let fresh_snapshots = match state.account_cache.snapshots(&state.store).await {
+            Ok(s) => s,
+            Err(_) => {
+                yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::StillNothing));
+                return;
+            }
+        };
+        let mut fresh_snapshots =
+            filter_by_provider_and_pool(&fresh_snapshots, Provider::Codex, pool.as_deref());
+        state.runtime.overlay(&mut fresh_snapshots, fresh_now);
+
+        let fresh = match selector.pick(&fresh_snapshots, &fresh_sel_ctx) {
+            Some(id) => id,
+            None => {
+                yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::StillNothing));
+                return;
+            }
+        };
+
+        state.runtime.record_selected(&fresh, fresh_now);
+        let (account, provider) = match resolve_core_account(&state, &fresh, fresh_now).await {
+            Ok(a) => a,
+            Err(_) => {
+                yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::ExecutorError));
+                return;
+            }
+        };
+        let health_id = fresh.clone(); // `fresh` is moved into the executor below.
+        match execute_recovery(
+            state.executor_for(provider).as_ref(),
+            state.continuity.clone(),
+            req,
+            &account,
+            fresh,
+            ctx,
+            session_key,
+            state.runtime.clone(),
+        )
+        .await
+        {
+            Ok(mut real_stream) => {
+                // SPLICE: forward every item from the real upstream stream verbatim — this is the
+                // client's actual answer, not a synthetic frame.
+                while let Some(item) = real_stream.next().await {
+                    yield item;
+                }
+            }
+            Err(e) => {
+                record_failure(&state, &health_id, &e, unix_now()).await;
+                yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::ExecutorError));
+            }
+        }
+    })
+}
+
 /// TA6(b) Task 2: react to a `WatchdogError::CapabilityRejection` surfaced by Task 1's Armed-path
 /// peek — the current owner cannot serve `cyber_policy`-gated (security) work. Reuses the EXACT
 /// `ResendFull`/`execute_recovery` machinery `RouteDecision::Recover` already uses (see
@@ -662,18 +863,33 @@ async fn reroute_cyber_rejection(
 /// reintroduce a double-relay risk without this loop's own logic changing to match.
 #[allow(clippy::too_many_arguments)]
 async fn run_failover_loop(
-    state: &AppState,
+    // B5 Task 4: widened from `&AppState` to `&Arc<AppState>` SOLELY so this function can hand an
+    // owned `Arc<AppState>` (`state.clone()`) into `try_layer2_recovery_wait`'s 'static stream —
+    // every pre-existing `state.field`/`resolve_core_account(state, ..)` use below is unchanged
+    // (Rust's deref coercion resolves `&Arc<AppState>` to `&AppState` identically to before).
+    state: &Arc<AppState>,
     first_failed_id: AccountId,
     first_err: WatchdogError,
     first_committed: bool,
     resend_req: PreparedRequest,
     snapshots: &[AccountSnapshot],
     selector: &dyn Selector,
+    // B5 Task 4: an owned twin of `selector` (the caller's `Arc<dyn Selector>`), needed alongside
+    // the borrowed `selector` above because `try_layer2_recovery_wait`'s stream must own it
+    // ('static). Kept as a SEPARATE param (rather than widening `selector` itself, as `state`
+    // was) to avoid touching this function's many pre-existing `selector.pick(..)` call sites.
+    selector_arc: Arc<dyn Selector>,
     sel_ctx: &SelectionCtx,
     ctx: RequestCtx,
     session_key: Option<SessionKey>,
     now: i64,
     max_attempts: u32,
+    // B5 Task 4: this site's own empty-pool candidate pool is narrowed by (provider=Codex, pool) —
+    // `pool` wasn't previously threaded into this function at all; Layer 2's re-select needs it to
+    // re-run the identical `filter_by_provider_and_pool` narrowing post-wait.
+    pool: Option<String>,
+    starvation_budget: Duration,
+    starvation_heartbeat: Duration,
     outcome: &mut RouteOutcome,
 ) -> Response {
     let mut tried: HashSet<AccountId> = HashSet::new();
@@ -700,19 +916,41 @@ async fn run_failover_loop(
                 // B5 Task 3 — Layer 1: before surfacing the exhaustion error below, try the
                 // guarded serve-soonest-error-backoff candidate over the SAME `candidates` (already
                 // `exclude_tried`'d, so an account this request already tried is never re-served).
-                if let Some(resp) = try_layer1_serve_now(
+                // Cloned (not moved) so the ORIGINALS survive for Layer 2 below when Layer 1
+                // doesn't apply — `try_layer1_serve_now`'s signature is untouched (Task 3 is
+                // frozen), so the caller must clone instead.
+                let layer1 = try_layer1_serve_now(
                     state,
                     &candidates,
                     selector,
+                    sel_ctx,
+                    resend_req.clone(),
+                    ctx.clone(),
+                    session_key.clone(),
+                    now,
+                    outcome,
+                )
+                .await;
+                if let Some(resp) = layer1 {
+                    return resp;
+                }
+                // B5 Task 4 — Layer 2: Cooldown-kind (or nothing at all / HardBlocked-only) is
+                // Layer 1's fall-through territory. `state.clone()` is a cheap `Arc` clone (this
+                // function's own `state` param is `&Arc<AppState>` — see its doc above).
+                if let Some(resp) = try_layer2_recovery_wait(
+                    state.clone(),
+                    &candidates,
+                    pool.clone(),
+                    selector_arc.clone(),
                     sel_ctx,
                     resend_req,
                     ctx,
                     session_key,
                     now,
+                    starvation_budget,
+                    starvation_heartbeat,
                     outcome,
-                )
-                .await
-                {
+                ) {
                     return resp;
                 }
                 // SECURITY FLOOR: the flag is never reset — a filtered exhaustion is the distinct
@@ -895,7 +1133,19 @@ async fn responses_handler_impl(
     raw: Bytes,
 ) -> (Response, RouteOutcome) {
     let max_attempts = state.max_account_attempts;
-    responses_handler_impl_with_max_attempts(state, pool, headers, raw, max_attempts).await
+    // B5 Task 4: production always uses the hardcoded defaults (Task 5 moves these into
+    // `AppState`, resolved once at startup from `POLYFLARE_STARVATION_WAIT_BUDGET_SECS`/
+    // `POLYFLARE_STARVATION_HEARTBEAT_SECS` — see `starvation.rs`'s doc on the two consts).
+    responses_handler_impl_with_max_attempts(
+        state,
+        pool,
+        headers,
+        raw,
+        max_attempts,
+        starvation::DEFAULT_WAIT_BUDGET,
+        starvation::DEFAULT_HEARTBEAT,
+    )
+    .await
 }
 
 /// B4 Task 4 test seam: drives the SAME real ingress logic `responses_handler_impl` does, but with
@@ -914,9 +1164,46 @@ pub async fn responses_handler_impl_for_test(
     body: Bytes,
     max_attempts: u32,
 ) -> Response {
-    responses_handler_impl_with_max_attempts(state, pool.as_deref(), headers, body, max_attempts)
-        .await
-        .0
+    responses_handler_impl_with_max_attempts(
+        state,
+        pool.as_deref(),
+        headers,
+        body,
+        max_attempts,
+        starvation::DEFAULT_WAIT_BUDGET,
+        starvation::DEFAULT_HEARTBEAT,
+    )
+    .await
+    .0
+}
+
+/// B5 Task 4 test seam: identical to [`responses_handler_impl_for_test`], but ALSO overrides
+/// Layer 2's wait budget + heartbeat. This is the ONLY way B5's test suite exercises a bounded,
+/// fast keepalive wait without a real 10-60s sleep (the plan's own instruction: "Do NOT write a
+/// test that really sleeps 10-60s"). Production (`responses_handler_impl`) always uses
+/// `starvation::DEFAULT_WAIT_BUDGET`/`DEFAULT_HEARTBEAT`; Task 5 will replace both call sites' hard
+/// consts with `AppState` fields resolved once at startup, at which point this seam gains the
+/// equivalent override those fields would otherwise fix at process-start.
+pub async fn responses_handler_impl_for_test_with_starvation_timing(
+    state: Arc<AppState>,
+    pool: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+    max_attempts: u32,
+    starvation_budget: Duration,
+    starvation_heartbeat: Duration,
+) -> Response {
+    responses_handler_impl_with_max_attempts(
+        state,
+        pool.as_deref(),
+        headers,
+        body,
+        max_attempts,
+        starvation_budget,
+        starvation_heartbeat,
+    )
+    .await
+    .0
 }
 
 async fn responses_handler_impl_with_max_attempts(
@@ -925,6 +1212,8 @@ async fn responses_handler_impl_with_max_attempts(
     headers: HeaderMap,
     raw: Bytes,
     max_attempts: u32,
+    starvation_budget: Duration,
+    starvation_heartbeat: Duration,
 ) -> (Response, RouteOutcome) {
     // Parse ONCE — but only the scalars + the `input` SHAPE, NOT the deep conversation tree. The
     // wire bytes are forwarded verbatim (see `PreparedRequest::raw_body`), so `body` stays `None`
@@ -985,6 +1274,9 @@ async fn responses_handler_impl_with_max_attempts(
     state.runtime.overlay(&mut snapshots, now);
     // The selector for this pool (its configured strategy override, else the global default).
     let selector = state.selector_for(pool);
+    // B5 Task 4: an OWNED copy of the pool slug, needed wherever Layer 2's post-wait re-select
+    // must re-run the identical `filter_by_provider_and_pool` narrowing inside a 'static stream.
+    let pool_owned = pool.map(str::to_string);
     // TA6(b) Task 5: proactive resolution — OR two more independent true-sources onto Task 3's
     // directive value, NEVER overwrite it. A cyber-tagged pool (`POLYFLARE_POOL_CAPABILITIES`) or
     // the `X-PolyFlare-Capability: security_work` header requires the capability from turn 1, with
@@ -1090,11 +1382,15 @@ async fn responses_handler_impl_with_max_attempts(
                                     resend_req,
                                     &snapshots,
                                     selector.as_ref(),
+                                    selector.clone(),
                                     &sel_ctx,
                                     ctx,
                                     session_key.clone(),
                                     now,
                                     max_attempts,
+                                    pool_owned.clone(),
+                                    starvation_budget,
+                                    starvation_heartbeat,
                                     &mut outcome,
                                 )
                                 .await
@@ -1115,19 +1411,36 @@ async fn responses_handler_impl_with_max_attempts(
                             None => {
                                 // B5 Task 3 — Layer 1: guarded serve-soonest-error-backoff before
                                 // the 503, over the SAME snapshots the pick above just exhausted.
+                                // Cloned (not moved) so the ORIGINALS survive for Layer 2 below.
                                 let layer1 = try_layer1_serve_now(
                                     &state,
                                     &snapshots,
                                     selector.as_ref(),
                                     &sel_ctx,
-                                    anchorless_req,
-                                    ctx,
-                                    session_key,
+                                    anchorless_req.clone(),
+                                    ctx.clone(),
+                                    session_key.clone(),
                                     now,
                                     &mut outcome,
                                 )
                                 .await;
-                                return (layer1.unwrap_or_else(no_eligible), outcome);
+                                let resp = layer1.or_else(|| {
+                                    try_layer2_recovery_wait(
+                                        state.clone(),
+                                        &snapshots,
+                                        pool_owned.clone(),
+                                        selector.clone(),
+                                        &sel_ctx,
+                                        anchorless_req,
+                                        ctx,
+                                        session_key,
+                                        now,
+                                        starvation_budget,
+                                        starvation_heartbeat,
+                                        &mut outcome,
+                                    )
+                                });
+                                return (resp.unwrap_or_else(no_eligible), outcome);
                             }
                         };
                         state.runtime.record_selected(&fresh, now);
@@ -1223,19 +1536,37 @@ async fn responses_handler_impl_with_max_attempts(
                                 // B5 Task 3 — Layer 1: guarded serve-soonest-error-backoff before
                                 // the 503. `prepared.req` is still owned here (see the comment
                                 // above — only `directive.recovery` was moved by the outer match).
-                                try_layer1_serve_now(
+                                // Cloned (not moved) so the ORIGINAL survives for Layer 2 below.
+                                let layer1 = try_layer1_serve_now(
                                     &state,
                                     &snapshots,
                                     selector.as_ref(),
                                     &sel_ctx,
-                                    prepared.req,
-                                    ctx,
-                                    session_key,
+                                    prepared.req.clone(),
+                                    ctx.clone(),
+                                    session_key.clone(),
                                     now,
                                     &mut outcome,
                                 )
-                                .await
-                                .unwrap_or_else(no_eligible)
+                                .await;
+                                layer1
+                                    .or_else(|| {
+                                        try_layer2_recovery_wait(
+                                            state.clone(),
+                                            &snapshots,
+                                            pool_owned.clone(),
+                                            selector.clone(),
+                                            &sel_ctx,
+                                            prepared.req,
+                                            ctx,
+                                            session_key,
+                                            now,
+                                            starvation_budget,
+                                            starvation_heartbeat,
+                                            &mut outcome,
+                                        )
+                                    })
+                                    .unwrap_or_else(no_eligible)
                             }
                         }
                     }
@@ -1244,19 +1575,37 @@ async fn responses_handler_impl_with_max_attempts(
             RouteDecision::NoEligibleAccount => {
                 // B5 Task 3 — Layer 1: the unowned first-attempt pick found the eligible pool
                 // empty; try the guarded serve-soonest-error-backoff candidate before the 503.
-                try_layer1_serve_now(
+                // Cloned (not moved) so the ORIGINAL survives for Layer 2 below.
+                let layer1 = try_layer1_serve_now(
                     &state,
                     &snapshots,
                     selector.as_ref(),
                     &sel_ctx,
-                    prepared.req,
-                    ctx,
-                    session_key,
+                    prepared.req.clone(),
+                    ctx.clone(),
+                    session_key.clone(),
                     now,
                     &mut outcome,
                 )
-                .await
-                .unwrap_or_else(no_eligible)
+                .await;
+                layer1
+                    .or_else(|| {
+                        try_layer2_recovery_wait(
+                            state.clone(),
+                            &snapshots,
+                            pool_owned.clone(),
+                            selector.clone(),
+                            &sel_ctx,
+                            prepared.req,
+                            ctx,
+                            session_key,
+                            now,
+                            starvation_budget,
+                            starvation_heartbeat,
+                            &mut outcome,
+                        )
+                    })
+                    .unwrap_or_else(no_eligible)
             }
         };
     (response, outcome)
