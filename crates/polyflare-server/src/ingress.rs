@@ -43,6 +43,17 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Millisecond-resolution counterpart of [`unix_now`] — used ONLY by [`layer2_wait_stream`]'s
+/// budget-deadline math (B5 Task 4 adversarial review, FIX 1). `unix_now()`'s whole-second
+/// granularity is fine for durable `reset_at`/`cooldown_until` timestamps, but truncating a
+/// sub-second wait *budget* to `.as_secs()` silently floors it to 0 — see that function's doc.
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Bounded retries for the post-refresh token persist (the one write whose loss kills an account —
 /// see the call site). `busy_timeout` is the first line of defense; this is the backstop.
 const PERSIST_MAX_ATTEMPTS: u32 = 3;
@@ -606,10 +617,20 @@ fn try_layer2_recovery_wait(
 /// already committed the 200 by the time this generator is ever polled).
 ///
 /// # Global Constraint — BOUNDED BUDGET
-/// `target = recover_at.min(budget_deadline)` caps the sleep loop itself; the explicit
-/// `now >= budget_deadline` check after the loop additionally distinguishes "recovered in time"
-/// from "budget exceeded" for accounts whose `recover_at` sits PAST the budget. Either way the
-/// wait never runs past `wait_start + budget`.
+/// `target_ms = recover_at_ms.min(budget_deadline_ms)` caps the sleep loop itself; the explicit
+/// `now_ms >= budget_deadline_ms` check after the loop additionally distinguishes "recovered in
+/// time" from "budget exceeded" for accounts whose `recover_at` sits PAST the budget. Either way
+/// the wait never runs past `wait_start + budget`.
+///
+/// # Precision note (B5 Task 4 adversarial review, FIX 1)
+/// `budget` is honored to MILLISECOND resolution via [`unix_now_ms`], never truncated to whole
+/// seconds. `wait_start`/`recover_at` stay `i64` UNIX-*seconds* (their natural granularity — they
+/// come from durable `rate_limited`/`cooldown_until` timestamps that are already second-grained),
+/// but the budget deadline itself is computed and compared in milliseconds. Doing
+/// `wait_start.saturating_add(budget.as_secs() as i64)` — the pre-fix code — silently floors any
+/// sub-second budget (e.g. 700ms) to 0, collapsing the entire wait to a same-instant no-op and
+/// making the "emit keepalives → hit the budget ceiling" path structurally untestable. DO NOT
+/// reintroduce a `.as_secs()` truncation here.
 ///
 /// # Global Constraint — RE-SNAPSHOT AFTER THE WAIT (the load-bearing gotcha)
 /// After the wait, this RE-FETCHES the account cache (`state.account_cache.snapshots`) AND
@@ -634,28 +655,33 @@ fn layer2_wait_stream(
     budget: Duration,
 ) -> ResponseStream {
     Box::pin(async_stream::stream! {
-        let budget_deadline = wait_start.saturating_add(budget.as_secs() as i64);
+        // See this function's "Precision note" doc: millisecond math, never `.as_secs()`.
+        let budget_deadline_ms = wait_start
+            .saturating_mul(1000)
+            .saturating_add(budget.as_millis() as i64);
+        let recover_at_ms = recover_at.saturating_mul(1000);
         // Never sleep past whichever comes first: the account's own recovery time, or the budget.
-        let target = recover_at.min(budget_deadline);
+        let target_ms = recover_at_ms.min(budget_deadline_ms);
 
         loop {
-            let t = unix_now();
-            if t >= target {
+            let t_ms = unix_now_ms();
+            if t_ms >= target_ms {
                 break;
             }
-            let remaining_secs = (target - t).max(1) as u64;
-            let tick = heartbeat.min(Duration::from_secs(remaining_secs));
+            let remaining_ms = (target_ms - t_ms).max(1) as u64;
+            let tick = heartbeat.min(Duration::from_millis(remaining_ms));
             tokio::time::sleep(tick).await;
             // Only emit a keepalive if we're still genuinely waiting (avoids one trailing,
             // pointless keepalive emitted in the same instant selection is about to be retried).
-            if unix_now() < target {
+            if unix_now_ms() < target_ms {
                 yield starvation::keepalive_item();
             }
         }
 
-        // BOUNDED BUDGET: the account's own recovery may sit PAST the budget (`target` above was
-        // capped at `budget_deadline` in that case) — distinguish that from a genuine recovery.
-        if unix_now() >= budget_deadline && unix_now() < recover_at {
+        // BOUNDED BUDGET: the account's own recovery may sit PAST the budget (`target_ms` above
+        // was capped at `budget_deadline_ms` in that case) — distinguish that from a genuine
+        // recovery.
+        if unix_now_ms() >= budget_deadline_ms && unix_now_ms() < recover_at_ms {
             yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::BudgetExceeded));
             return;
         }
