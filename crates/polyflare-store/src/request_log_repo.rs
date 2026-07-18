@@ -333,6 +333,57 @@ impl RequestLogRepo {
         Ok(rows)
     }
 
+    /// Delete `request_log` rows with `requested_at < cutoff`, in batches of `batch_size`, looping
+    /// until a batch deletes fewer than `batch_size` rows (or zero). Returns the total number of
+    /// rows deleted across all batches. Content-free: only a count crosses this boundary, never row
+    /// contents, and nothing is logged here.
+    ///
+    /// # Batching approach
+    /// Each batch runs `DELETE FROM request_log WHERE rowid IN (SELECT rowid FROM request_log WHERE
+    /// requested_at < ?1 LIMIT ?2)` as its own statement (own implicit transaction), rather than one
+    /// unbounded `DELETE ... WHERE requested_at < ?`, so a large prune never holds SQLite's single
+    /// writer lock for longer than one batch. The `rowid IN (SELECT ... LIMIT)` form is used instead
+    /// of `DELETE ... LIMIT` directly because the latter requires SQLite's
+    /// `SQLITE_ENABLE_UPDATE_DELETE_LIMIT` compile flag, which sqlx's bundled SQLite build may lack;
+    /// the subselect form is portable standard SQL.
+    ///
+    /// # `batch_size <= 0` guard
+    /// Treated as a no-op (returns `0` immediately, deletes nothing) rather than looping. This is
+    /// deliberately defensive: today's only caller always passes a positive batch size (e.g.
+    /// `10_000`), but binding a non-positive value into SQLite's `LIMIT` means "no limit" (SQLite
+    /// treats `LIMIT <= -1` as unbounded, and `LIMIT 0` matches zero rows some engines but SQLite's
+    /// own `LIMIT 0` is well-defined as "zero rows" — the ambiguity across a negative batch size is
+    /// what's dangerous), and would either turn one "batch" into an unbounded delete or, combined
+    /// with the "loop until a batch affects `< batch_size` rows" termination check, could underflow /
+    /// never terminate. Rejecting non-positive `batch_size` up front avoids relying on that SQLite
+    /// edge-case behavior entirely.
+    pub async fn prune_older_than(&self, cutoff: i64, batch_size: i64) -> Result<u64, StoreError> {
+        if batch_size <= 0 {
+            return Ok(0);
+        }
+
+        let mut total: u64 = 0;
+        loop {
+            let result = sqlx::query(
+                "DELETE FROM request_log WHERE rowid IN \
+                 (SELECT rowid FROM request_log WHERE requested_at < ?1 LIMIT ?2)",
+            )
+            .bind(cutoff)
+            .bind(batch_size)
+            .execute(&self.pool)
+            .await?;
+
+            let affected = result.rows_affected();
+            total += affected;
+
+            if affected < batch_size as u64 {
+                break;
+            }
+        }
+
+        Ok(total)
+    }
+
     /// Append a `WHERE ...` clause (or nothing, if `filter` is empty) binding only the filters that
     /// are present. Shared between the row query and the matching count query in [`Self::page`] so
     /// the total always reflects the same filter as the page.
@@ -729,5 +780,91 @@ mod tests {
         let limited = repo.recent_errors(1).await.unwrap();
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].status, 429);
+    }
+
+    /// `prune_older_than` deletes ONLY rows with `requested_at < cutoff`, leaving rows at/after the
+    /// cutoff intact, and returns the exact number of rows deleted.
+    #[tokio::test]
+    async fn prune_older_than_deletes_only_rows_strictly_before_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        repo.insert(&row_at(50, 200, Some(1), 50)).await.unwrap(); // older — pruned
+        repo.insert(&row_at(99, 200, Some(1), 50)).await.unwrap(); // older — pruned
+        repo.insert(&row_at(100, 200, Some(1), 50)).await.unwrap(); // == cutoff — kept
+        repo.insert(&row_at(150, 200, Some(1), 50)).await.unwrap(); // newer — kept
+
+        let deleted = repo.prune_older_than(100, 100).await.unwrap();
+        assert_eq!(deleted, 2, "only the two rows before ts=100 are pruned");
+        assert_eq!(repo.count().await.unwrap(), 2);
+
+        let remaining = repo.list(10, 0).await.unwrap();
+        assert!(remaining.iter().all(|r| r.requested_at >= 100));
+    }
+
+    /// Batching: when more than `batch_size` rows are eligible, `prune_older_than` loops
+    /// internally across multiple batches until all eligible rows are gone, returning the TOTAL
+    /// deleted across all batches (not just the last one).
+    #[tokio::test]
+    async fn prune_older_than_deletes_all_eligible_rows_across_multiple_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        // 5 old rows (well before cutoff), batch_size=2 forces 3 internal batches (2+2+1).
+        for ts in [10, 20, 30, 40, 50] {
+            repo.insert(&row_at(ts, 200, Some(1), 50)).await.unwrap();
+        }
+        // 1 row at/after cutoff — must survive.
+        repo.insert(&row_at(1000, 200, Some(1), 50)).await.unwrap();
+
+        let deleted = repo.prune_older_than(1000, 2).await.unwrap();
+        assert_eq!(deleted, 5, "all 5 old rows deleted across batches of 2");
+        assert_eq!(repo.count().await.unwrap(), 1);
+        let remaining = repo.list(10, 0).await.unwrap();
+        assert_eq!(remaining[0].requested_at, 1000);
+    }
+
+    /// A cutoff in the future deletes every row; a cutoff before every row's timestamp deletes
+    /// nothing and returns 0.
+    #[tokio::test]
+    async fn prune_older_than_future_cutoff_deletes_all_past_cutoff_deletes_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        repo.insert(&row_at(100, 200, Some(1), 50)).await.unwrap();
+        repo.insert(&row_at(200, 200, Some(1), 50)).await.unwrap();
+
+        // Cutoff before all rows → deletes none.
+        let deleted = repo.prune_older_than(50, 100).await.unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(repo.count().await.unwrap(), 2);
+
+        // Cutoff far in the future → deletes all.
+        let deleted = repo.prune_older_than(1_000_000, 100).await.unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(repo.count().await.unwrap(), 0);
+    }
+
+    /// `batch_size <= 0` is treated as a no-op (returns 0, deletes nothing) rather than looping
+    /// forever or being misinterpreted by SQLite's `LIMIT` semantics (a non-positive `LIMIT` binds
+    /// to "no limit" in SQLite, which would turn one batch into an unbounded delete).
+    #[tokio::test]
+    async fn prune_older_than_non_positive_batch_size_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        repo.insert(&row_at(10, 200, Some(1), 50)).await.unwrap();
+
+        assert_eq!(repo.prune_older_than(1_000_000, 0).await.unwrap(), 0);
+        assert_eq!(repo.prune_older_than(1_000_000, -5).await.unwrap(), 0);
+        assert_eq!(
+            repo.count().await.unwrap(),
+            1,
+            "no-op guard must not delete anything"
+        );
     }
 }
