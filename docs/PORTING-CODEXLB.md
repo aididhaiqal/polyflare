@@ -249,19 +249,35 @@ before assuming any endpoint is dormant.** PolyFlare's dev harness names the pro
 `"PolyFlare (local dev)"`, which is why the gap is currently unhit rather than handled.
 *codex-lb:* `modules/proxy/api.py:491-597,1744,1931`.
 
-### D18. Client API-key auth on the proxy surface  · MEDIUM · medium
-`POST /responses` / `/v1/messages` (and their `/{pool}/…` variants) are **unauthenticated** — a
-deliberate stance (network-boundary trust; see FEATURE-MAP's api-keys rows), safe only while bound to
-`127.0.0.1`. Note the `/api/*` surface is NOT in this gap: `require_admin` already covers it, reads and
-the account PATCH alike (`app.rs:112-134`). This item is about the proxy surface only.
-Anything that can reach the port spends the pool's quota anonymously, so this gates any non-loopback
-bind. codex-lb's equivalent is `api_key: ApiKeyData | None = Security(validate_proxy_api_key)` on every
-proxy route — note the `| None`: it permits unauthenticated calls when no keys are configured, so the
-*default posture* matches PolyFlare's; what differs is that codex-lb has the mechanism at all.
-The shape already exists here: `crate::auth::require_admin` is exactly this middleware, pointed at one
-env var. v1 = the same gate against a keys table. The full codex-lb feature set (per-key account/source
-scoping, enforced model/effort/tier, per-key usage rollup) is separately tracked in FEATURE-MAP and is
-NOT part of v1.
+### D18. Client API-key auth on the proxy surface  · MEDIUM · medium · **DONE** (minimal gate)
+`POST /responses` / `/v1/messages` (and their `/{pool}/…` variants) were unauthenticated by
+default — safe only while bound to `127.0.0.1`. **The minimal gate is now built and merged**
+(`docs/superpowers/plans/2026-07-18-d18-client-auth.md`, Tasks 1–5): an `api_keys` table
+(hash-at-rest, reveal-once — `crates/polyflare-store/src/api_key_repo.rs`), a `polyflare keys
+create/list/revoke` CLI (`crates/polyflare-server/src/keys.rs`), a `require_client_key`
+hash-lookup middleware that never logs the presented key (`crates/polyflare-server/src/auth.rs`),
+and a bind-address-aware startup posture (`crates/polyflare-server/src/posture.rs`) wired onto an
+extracted `proxy` sub-router in `crate::app::build_app` — any key existing ⇒ enforce; no keys +
+loopback bind ⇒ open (unchanged zero-config behavior); no keys + non-loopback bind ⇒ **refuse to
+start** unless `POLYFLARE_ALLOW_UNAUTHENTICATED_REMOTE=1`. Note the `/api/*` surface was never in
+this gap: `require_admin` already covers it, reads and the account PATCH alike (`app.rs:112-134`)
+— this item was about the proxy surface only.
+codex-lb's equivalent is `api_key: ApiKeyData | None = Security(validate_proxy_api_key)` on every
+proxy route — note the `| None`: it permits unauthenticated calls when no keys are configured, so
+the *default posture* matches PolyFlare's; what differed is that codex-lb had the mechanism at all.
+D18 ported that mechanism, plus the bind-aware refuse-to-start half codex-lb does NOT have.
+Content safety verified end-to-end (`crates/polyflare-server/tests/client_key_never_log_e2e.rs`):
+the raw key never appears in the persisted `request_log` row, the `/api/logs/stream` SSE feed, or
+any `tracing` output, for a real successful proxied request through the real `build_app` stack.
+
+**Deferred — explicit follow-ons, not part of v1 minimal gate** (still tracked in FEATURE-MAP):
+- **Per-key account scoping** — restricting a key to a subset of accounts/pools (codex-lb:
+  `api_keys.account_ids`-style association).
+- **Per-key source scoping** — restricting a key to specific caller sources/IPs.
+- **Enforced model/effort/tier** — a key limited to specific models, reasoning efforts, or service
+  tiers (codex-lb's `allowed_models`/tier fields).
+- **Per-key usage rollup** — token/request accounting attributed to the calling key (today usage
+  rolls up by account only; `last_used_at` is the only per-key signal that exists).
 *codex-lb:* `modules/api_keys/{service,repository,api}.py`; `modules/proxy/api.py:495`.
 
 ---
