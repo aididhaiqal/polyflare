@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod config;
 pub mod continuity;
 pub mod dashboard;
+pub mod failover;
 pub mod fingerprint_capture;
 pub mod ingress;
 pub mod log_bus;
