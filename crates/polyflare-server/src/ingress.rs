@@ -12,8 +12,9 @@ use axum::response::{IntoResponse, Response};
 use polyflare_anthropic::AnthropicToResponses;
 use polyflare_codex::oauth::{classify_failure, should_refresh, token_exp, OAuthError};
 use polyflare_core::{
-    Account, AccountId, Continuity, ContinuityDirective, NoopContinuity, Prepared, PreparedRequest,
-    Provider, RecoveryPlan, RequestCtx, ResponseStream, SelectionCtx, Tier, Translator,
+    Account, AccountId, AccountSnapshot, Continuity, ContinuityDirective, NoopContinuity, Prepared,
+    PreparedRequest, Provider, RecoveryPlan, RequestCtx, ResponseStream, SelectionCtx, Selector,
+    SessionKey, Tier, Translator,
 };
 use polyflare_store::{PlainTokens, RequestLogRecord, RequestLogRepo};
 
@@ -63,6 +64,18 @@ fn internal_error() -> Response {
 
 fn no_eligible() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "no eligible account").into_response()
+}
+
+/// TA6(b) Task 2 SECURITY FLOOR response: the capability-filtered reselect (triggered by a
+/// `CapabilityRejection`) found no `security_work_authorized` account. A clean, DISTINCT 503 —
+/// never the generic `BAD_GATEWAY` an ordinary upstream failure gets, and never a silent unfiltered
+/// retry. See `reroute_cyber_rejection`'s doc for the invariant this protects.
+fn no_authorized_account_for_security_work() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no authorized account available for security work",
+    )
+        .into_response()
 }
 
 /// Classify a watchdog failure and write the routing-health signal for the account `id` that
@@ -418,6 +431,82 @@ async fn resolve_core_account(
     ))
 }
 
+/// TA6(b) Task 2: react to a `WatchdogError::CapabilityRejection` surfaced by Task 1's Armed-path
+/// peek — the current owner cannot serve `cyber_policy`-gated (security) work. Reuses the EXACT
+/// `ResendFull`/`execute_recovery` machinery `RouteDecision::Recover` already uses (see
+/// `responses_handler_impl`'s `ingress.rs:~630` sibling branch): the caller passes the SAME
+/// `anchorless_req` shape Task 1's rejecting attempt was armed with, this re-selects with
+/// `SelectionCtx.require_security_work_authorized = true` (the selector's existing TA6 hard
+/// pre-filter — `select.rs:294,454`), executes on the chosen capability-holding account, and
+/// relays. `execute_recovery`'s `wrap_stream(..., OutcomeKind::Recovered, ...)` re-homes ownership
+/// via `record_recovery` at stream completion — the same machinery `RouteDecision::Recover` uses,
+/// so this function never calls `record_recovery` directly.
+///
+/// SECURITY FLOOR (inviolable): if the capability-filtered re-select yields no account, this
+/// returns [`no_authorized_account_for_security_work`] — a clean, DISTINCT client error — and
+/// NEVER falls back to an unfiltered pick or retries on a non-authorized account. `recovery` is
+/// expected to be `RecoveryPlan::ResendFull` (the only shape an Armed watchdog that reached a real
+/// upstream response can be armed with alongside a full-resend-shaped turn); any other shape (a
+/// bare-tail `SignalClient` turn, which carries no self-sufficient resend body to safely reroute)
+/// falls back to the ordinary generic-failure response, unchanged — content-safe, and still never
+/// an unfiltered retry.
+///
+/// No double-relay: this is only ever reached when `CapabilityRejection` was returned as an `Err`
+/// from `execute_with_watchdog` — which (per Task 1's peek-before-relay) means NO client byte was
+/// ever written for this turn. This function's own relay is therefore the client's first and only
+/// response, never a second one layered on top of content already sent.
+#[allow(clippy::too_many_arguments)]
+async fn reroute_cyber_rejection(
+    state: &AppState,
+    recovery: RecoveryPlan,
+    snapshots: &[AccountSnapshot],
+    selector: &dyn Selector,
+    sel_ctx: &SelectionCtx,
+    ctx: RequestCtx,
+    session_key: Option<SessionKey>,
+    now: i64,
+    outcome: &mut RouteOutcome,
+) -> Response {
+    let anchorless_req = match recovery {
+        RecoveryPlan::ResendFull { anchorless_req } => anchorless_req,
+        _ => return (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
+    };
+
+    // SECURITY FLOOR: filter to capability-holders BEFORE picking — never an unfiltered fallback.
+    let mut cyber_ctx = sel_ctx.clone();
+    cyber_ctx.require_security_work_authorized = true;
+    let fresh = match selector.pick(snapshots, &cyber_ctx) {
+        Some(id) => id,
+        None => return no_authorized_account_for_security_work(),
+    };
+
+    state.runtime.record_selected(&fresh, now);
+    outcome.account_id = Some(fresh.as_str().to_string());
+    let (account, provider) = match resolve_core_account(state, &fresh, now).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let health_id = fresh.clone(); // `fresh` is moved into the executor below.
+    match execute_recovery(
+        state.executor_for(provider).as_ref(),
+        state.continuity.clone(),
+        anchorless_req,
+        &account,
+        fresh,
+        ctx,
+        session_key,
+        state.runtime.clone(),
+    )
+    .await
+    {
+        Ok(stream) => stream_response(stream),
+        Err(e) => {
+            record_failure(state, &health_id, &e, unix_now()).await;
+            (StatusCode::BAD_GATEWAY, "upstream error").into_response()
+        }
+    }
+}
+
 /// The bare `/responses` ingress entrypoint: selects over ALL Codex accounts (no pool filter).
 /// Takes the RAW request bytes (not the `Json` extractor) so the native path can forward them
 /// upstream verbatim — no parse→re-serialize round-trip (see `PreparedRequest::raw_body`).
@@ -607,6 +696,11 @@ async fn responses_handler_impl(
                     Err(r) => return (r, outcome),
                 };
                 let health_id = id.clone(); // `id` is moved into the executor below.
+                // TA6(b) Task 2: capture the recovery plan + a `ctx` clone BEFORE `prepared`/`ctx`
+                // move into the executor below, so a `CapabilityRejection` can trigger the cyber
+                // reselect+resend (`reroute_cyber_rejection`) without re-preparing the request.
+                let recovery_for_cyber = prepared.directive.recovery.clone();
+                let ctx_for_cyber = ctx.clone();
                 match execute_with_watchdog(
                     state.executor_for(provider).as_ref(),
                     state.continuity.clone(),
@@ -619,6 +713,22 @@ async fn responses_handler_impl(
                 .await
                 {
                     Ok(stream) => stream_response(stream),
+                    Err(WatchdogError::CapabilityRejection { .. }) => {
+                        // NOT an account-health signal (see `record_failure`'s doc): a capability
+                        // rejection says nothing about the owner's health, so no writeback here.
+                        reroute_cyber_rejection(
+                            &state,
+                            recovery_for_cyber,
+                            &snapshots,
+                            selector.as_ref(),
+                            &sel_ctx,
+                            ctx_for_cyber,
+                            session_key.clone(),
+                            now,
+                            &mut outcome,
+                        )
+                        .await
+                    }
                     Err(e) => {
                         record_failure(&state, &health_id, &e, unix_now()).await;
                         (StatusCode::BAD_GATEWAY, "upstream error").into_response()
