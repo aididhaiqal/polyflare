@@ -190,6 +190,7 @@ async fn spawn_app(store: Store, cipher: TokenCipher, upstream_url: String) -> (
         starvation_wait_budget: std::time::Duration::from_secs(60),
         starvation_heartbeat: std::time::Duration::from_secs(10),
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
+        stream_idle_timeout: std::time::Duration::from_secs(300),
         runtime: Default::default(),
     });
     let app = build_app(state.clone());

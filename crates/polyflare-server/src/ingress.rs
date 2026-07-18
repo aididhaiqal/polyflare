@@ -60,13 +60,16 @@ const PERSIST_MAX_ATTEMPTS: u32 = 3;
 /// Fixed backoff between persist retries (small — the write is on the hot lock).
 const PERSIST_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Stream-idle-timeout plan (`docs/superpowers/plans/2026-07-18-stream-idle-timeout.md`) Task 1:
-/// a placeholder default for the mid-stream idle deadline every `execute_with_watchdog*`/
-/// `execute_recovery*` call site threads today. Matches codex's own `stream_idle_timeout` default
-/// (`model-provider-info/src/lib.rs:26`, 300000ms). Task 2 replaces every use of this constant with
-/// a real, config-resolved `Duration` read off `AppState` (`POLYFLARE_STREAM_IDLE_TIMEOUT_SECS`,
-/// `0` = disabled) — this is intentionally NOT that config plumbing yet.
-const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Stream-idle-timeout plan (`docs/superpowers/plans/2026-07-18-stream-idle-timeout.md`) Task 2:
+/// the DEFAULT source for the mid-stream idle deadline — matches codex's own `stream_idle_timeout`
+/// default (`model-provider-info/src/lib.rs:26`, 300000ms). Every `execute_with_watchdog*`/
+/// `execute_recovery*` call site below now threads `state.stream_idle_timeout` (the real,
+/// config-resolved `Duration` on `AppState` — see `crate::config::stream_idle_timeout_secs_from_env`
+/// and `ServeConfig::from_env`, resolved ONCE at startup, never per-request). This constant is no
+/// longer read on the per-request path; it survives as `crate::config`'s single-source-of-truth
+/// default (referenced directly by `stream_idle_timeout_secs_from_env`'s unset-env case) so the
+/// "300s matches codex" fact lives in exactly one place.
+pub(crate) const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Map a reasoning-effort string to a routing `Tier` (the subagent-tier signal the
 /// `cache_affinity_tier` strategy reads). `minimal`/`low` → Low, `medium` → Medium, `high` → High.
@@ -529,7 +532,7 @@ async fn try_layer1_serve_now(
         ctx,
         session_key,
         state.runtime.clone(),
-        DEFAULT_STREAM_IDLE_TIMEOUT,
+        state.stream_idle_timeout,
     )
     .await
     {
@@ -824,7 +827,7 @@ fn layer2_wait_stream(
             ctx,
             session_key,
             state.runtime.clone(),
-            DEFAULT_STREAM_IDLE_TIMEOUT,
+            state.stream_idle_timeout,
         )
         .await
         {
@@ -928,7 +931,7 @@ async fn reroute_cyber_rejection(
         ctx,
         session_key,
         state.runtime.clone(),
-        DEFAULT_STREAM_IDLE_TIMEOUT,
+        state.stream_idle_timeout,
     )
     .await
     {
@@ -1142,7 +1145,7 @@ async fn run_failover_loop(
             ctx.clone(),
             session_key.clone(),
             state.runtime.clone(),
-            DEFAULT_STREAM_IDLE_TIMEOUT,
+            state.stream_idle_timeout,
             commit.clone(),
         )
         .await
@@ -1491,7 +1494,7 @@ async fn responses_handler_impl_with_max_attempts(
                     id,
                     ctx.clone(),
                     state.runtime.clone(),
-                    DEFAULT_STREAM_IDLE_TIMEOUT,
+                    state.stream_idle_timeout,
                     commit.clone(),
                 )
                 .await
@@ -1607,7 +1610,7 @@ async fn responses_handler_impl_with_max_attempts(
                             ctx,
                             session_key,
                             state.runtime.clone(),
-                            DEFAULT_STREAM_IDLE_TIMEOUT,
+                            state.stream_idle_timeout,
                         )
                         .await
                         {
@@ -1670,7 +1673,7 @@ async fn responses_handler_impl_with_max_attempts(
                                     fresh,
                                     ctx,
                                     state.runtime.clone(),
-                                    DEFAULT_STREAM_IDLE_TIMEOUT,
+                                    state.stream_idle_timeout,
                                 )
                                 .await
                                 {
@@ -1919,7 +1922,7 @@ async fn messages_handler_native(
         picked,
         ctx,
         state.runtime.clone(),
-        DEFAULT_STREAM_IDLE_TIMEOUT,
+        state.stream_idle_timeout,
     )
     .await
     {
@@ -2041,7 +2044,7 @@ async fn messages_handler_codex_aliased(
         picked,
         ctx,
         state.runtime.clone(),
-        DEFAULT_STREAM_IDLE_TIMEOUT,
+        state.stream_idle_timeout,
     )
     .await
     {

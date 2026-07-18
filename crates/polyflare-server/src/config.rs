@@ -68,6 +68,14 @@ pub struct ServeConfig {
     /// exactly `"1"` is treated as unset (mirrors `live_logs`/`ws_upstream` above) — a typo here
     /// must never accidentally grant the dangerous path.
     pub allow_unauthenticated_remote: bool,
+    /// Stream-idle-timeout plan Task 2: the per-response mid-stream idle deadline
+    /// (`POLYFLARE_STREAM_IDLE_TIMEOUT_SECS`; see [`stream_idle_timeout_secs_from_env`] for the
+    /// default/clamp/disable-lever decision). Resolved ONCE here at startup and threaded through
+    /// `AppState` — never a per-request `env::var` read (mirrors `max_account_attempts`/
+    /// `starvation_wait_budget` above; same debt class the TA6(b) T5 review flagged).
+    /// `Duration::ZERO` ⇒ Task 1's `IdleDeadline::Disabled` (no idle bound — today's pre-fix
+    /// behavior, the documented `=0` rollback lever).
+    pub stream_idle_timeout: Duration,
 }
 
 /// TA6(b) Task 5: the one capability name resolved today. A pool tagged with this capability (via
@@ -291,6 +299,44 @@ pub fn starvation_heartbeat_secs_from_env(budget_secs: u32) -> u32 {
     raw.clamp(1, budget_secs.max(1))
 }
 
+/// Stream-idle-timeout plan (`docs/superpowers/plans/2026-07-18-stream-idle-timeout.md`) Task 2:
+/// `POLYFLARE_STREAM_IDLE_TIMEOUT_SECS` — the per-response mid-stream idle deadline
+/// (`crate::watchdog::ObservingStream`'s `IdleDeadline`; Task 1's mechanism). Unset ⇒
+/// `crate::ingress::DEFAULT_STREAM_IDLE_TIMEOUT.as_secs()` (`300`, matching codex's own
+/// `stream_idle_timeout` default — see that constant's doc for the single-source-of-truth
+/// rationale).
+///
+/// **`0` is the documented DISABLE LEVER, not a clamp target** — mirrors
+/// [`starvation_wait_budget_secs_from_env`]'s `0` semantics (a sane, useful, unambiguous reading
+/// of its own: "never bound a stall — behave exactly as before this feature"), NOT
+/// [`max_account_attempts_from_env`]'s `0` (which floors UP to `1` because a failover loop with
+/// zero attempts has no sane reading). Here, `0` resolves to `Duration::ZERO` downstream, which
+/// `crate::watchdog::IdleDeadline::new` reads as `Disabled` — Task 1's byte-for-byte pre-fix
+/// behavior (bare `Poll::Pending` on inner silence, no deadline). This is the plan's Global
+/// Constraints "Disable lever" bullet, verbatim.
+///
+/// A malformed value (non-numeric, negative, or out of `u64` range) resolves to the SAME default
+/// as unset (`300`) — never silently collapsed to `0` (disabled), which would be a **safety**
+/// regression (a typo would silently remove the proxy-wide stall bound). Identical rationale to
+/// `starvation_wait_budget_secs_from_env`'s malformed handling.
+///
+/// A well-formed value above `MAX` (`3600`s = 1h — an absurd upper bound no genuine upstream
+/// response should ever legitimately need to stay silent for) clamps DOWN to `MAX` — never
+/// silently accepted as-is, never treated as malformed.
+pub fn stream_idle_timeout_secs_from_env() -> u64 {
+    let default = crate::ingress::DEFAULT_STREAM_IDLE_TIMEOUT.as_secs();
+    const MAX: u64 = 3600;
+    match std::env::var("POLYFLARE_STREAM_IDLE_TIMEOUT_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => 0,
+            Ok(n) if n > MAX => MAX,
+            Ok(n) => n,
+            Err(_) => default,
+        },
+        Err(_) => default,
+    }
+}
+
 impl ServeConfig {
     pub fn from_env() -> Result<Self, String> {
         let bind_addr =
@@ -349,6 +395,7 @@ impl ServeConfig {
             starvation_heartbeat_secs_from_env(starvation_wait_budget_secs);
         let starvation_wait_budget = Duration::from_secs(starvation_wait_budget_secs as u64);
         let starvation_heartbeat = Duration::from_secs(starvation_heartbeat_secs as u64);
+        let stream_idle_timeout = Duration::from_secs(stream_idle_timeout_secs_from_env());
         Ok(ServeConfig {
             bind_addr,
             upstream_base_url,
@@ -367,6 +414,7 @@ impl ServeConfig {
             starvation_wait_budget,
             starvation_heartbeat,
             allow_unauthenticated_remote,
+            stream_idle_timeout,
         })
     }
 }
@@ -712,5 +760,94 @@ mod tests {
             std::env::remove_var("POLYFLARE_STARVATION_HEARTBEAT_SECS");
         }
         assert_eq!(starvation_heartbeat_secs_from_env(0), 1);
+    }
+
+    /// Serializes tests in this module that mutate `POLYFLARE_STREAM_IDLE_TIMEOUT_SECS` — same
+    /// rationale as the other env-lock helpers above (env vars are process-global, tests run
+    /// concurrently on separate threads by default).
+    fn stream_idle_timeout_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// Stream-idle-timeout plan Task 2: `POLYFLARE_STREAM_IDLE_TIMEOUT_SECS=30` resolves to
+    /// exactly `30`.
+    #[test]
+    fn stream_idle_timeout_reads_a_well_formed_value() {
+        let _guard = stream_idle_timeout_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_STREAM_IDLE_TIMEOUT_SECS", "30");
+        }
+        assert_eq!(stream_idle_timeout_secs_from_env(), 30);
+        unsafe {
+            std::env::remove_var("POLYFLARE_STREAM_IDLE_TIMEOUT_SECS");
+        }
+    }
+
+    /// Unset ⇒ the documented default, `300` (matches codex's `stream_idle_timeout` default —
+    /// `crate::ingress::DEFAULT_STREAM_IDLE_TIMEOUT`).
+    #[test]
+    fn stream_idle_timeout_unset_defaults_to_three_hundred() {
+        let _guard = stream_idle_timeout_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("POLYFLARE_STREAM_IDLE_TIMEOUT_SECS");
+        }
+        assert_eq!(stream_idle_timeout_secs_from_env(), 300);
+    }
+
+    /// `0` is the DISABLE LEVER — resolves to exactly `0`, distinct from both the default (300)
+    /// and any clamp floor. See the function's doc for the full justification (mirrors
+    /// `starvation_wait_budget_secs_from_env`'s `0` decision, not `max_account_attempts_from_env`'s
+    /// floor-to-1).
+    #[test]
+    fn stream_idle_timeout_zero_is_the_disable_lever() {
+        let _guard = stream_idle_timeout_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_STREAM_IDLE_TIMEOUT_SECS", "0");
+        }
+        assert_eq!(stream_idle_timeout_secs_from_env(), 0);
+        unsafe {
+            std::env::remove_var("POLYFLARE_STREAM_IDLE_TIMEOUT_SECS");
+        }
+    }
+
+    /// A malformed value (non-numeric) ⇒ the SAME safe default as unset (300) — never a boot
+    /// crash, and never silently collapsed to the disable lever (0), which would be a safety
+    /// regression (a typo would silently remove the proxy-wide stall bound).
+    #[test]
+    fn stream_idle_timeout_malformed_defaults_to_three_hundred_not_zero() {
+        let _guard = stream_idle_timeout_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_STREAM_IDLE_TIMEOUT_SECS", "not-a-number");
+        }
+        assert_eq!(stream_idle_timeout_secs_from_env(), 300);
+        unsafe {
+            std::env::remove_var("POLYFLARE_STREAM_IDLE_TIMEOUT_SECS");
+        }
+    }
+
+    /// An absurdly large value (above the `3600`s = 1h upper bound) clamps DOWN to `3600` — never
+    /// silently accepted as-is, never treated as malformed (unlike the truly non-numeric case
+    /// above, which resolves to the default instead).
+    #[test]
+    fn stream_idle_timeout_absurd_value_clamps_to_one_hour() {
+        let _guard = stream_idle_timeout_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_STREAM_IDLE_TIMEOUT_SECS", "999999");
+        }
+        assert_eq!(stream_idle_timeout_secs_from_env(), 3600);
+        unsafe {
+            std::env::remove_var("POLYFLARE_STREAM_IDLE_TIMEOUT_SECS");
+        }
     }
 }

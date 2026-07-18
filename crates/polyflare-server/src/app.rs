@@ -116,6 +116,14 @@ pub struct AppState {
     /// the correct default for every existing test/dev harness that builds `AppState` directly
     /// without going through `resolve_proxy_enforcement` (a loopback-bind, no-keys posture).
     pub enforce_client_keys: bool,
+    /// Stream-idle-timeout plan Task 2: the per-response mid-stream idle deadline
+    /// (`POLYFLARE_STREAM_IDLE_TIMEOUT_SECS`, resolved ONCE at startup by
+    /// `crate::config::stream_idle_timeout_secs_from_env` — never read per-request). Threaded
+    /// into every `execute_with_watchdog*`/`execute_recovery*` call site in `crate::ingress`,
+    /// which passes it through to `crate::watchdog::wrap_stream` → `ObservingStream`'s
+    /// `IdleDeadline` (Task 1's mechanism). `Duration::ZERO` ⇒ disabled (today's pre-fix
+    /// behavior — the documented `=0` rollback lever).
+    pub stream_idle_timeout: std::time::Duration,
 }
 
 impl AppState {

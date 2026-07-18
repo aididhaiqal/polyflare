@@ -112,6 +112,7 @@ fn build_state(
         starvation_wait_budget,
         starvation_heartbeat,
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
+        stream_idle_timeout: std::time::Duration::from_secs(300),
         runtime: Default::default(),
     })
 }

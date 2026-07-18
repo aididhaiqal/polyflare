@@ -871,6 +871,18 @@ impl Stream for ObservingStream {
                                 // double-relay. Treated like any other transient account fault.
                                 this.runtime
                                     .record_transient_error(&this.account, unix_now());
+                                // Review Minor 1: proactively free the inner stream HERE, a poll
+                                // earlier than the consumer would otherwise force it — the next
+                                // poll only reaches `ObserveState::Done => Poll::Ready(None)`, which
+                                // never touches `this.inner` again, so without this the dead
+                                // upstream's `reqwest` response body (and its socket) would sit held
+                                // until this whole `ObservingStream` is dropped. Reassigning `inner`
+                                // drops the old boxed stream inline, releasing it immediately.
+                                // Mirrors the explicit `drop(stream)` on the pre-relay recovery path
+                                // above (`Ok(None) | Err(_)` arm of the peek), just applied post-relay.
+                                // Terminate semantics are UNCHANGED: still yields the idle `Err` here,
+                                // then `Poll::Ready(None)` on the following poll.
+                                this.inner = Box::pin(stream::empty());
                                 this.state = ObserveState::Done;
                                 Poll::Ready(Some(Err(ExecError::Stream(
                                     "upstream idle timeout".into(),
@@ -1469,5 +1481,92 @@ mod tests {
             tracked[0].error_count, 0,
             "disabled path never calls record_transient_error"
         );
+    }
+
+    /// A byte-then-stall inner stream that flips `dropped` the instant it is DROPPED (not merely
+    /// exhausted) — used to prove Task 2's Minor 1: on idle-terminate, `ObservingStream` frees
+    /// `this.inner` proactively (a poll earlier than the consumer forcing it), rather than holding
+    /// the dead upstream's socket until the whole `ObservingStream` itself is later dropped.
+    struct DropSpyStall {
+        yielded: bool,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Stream for DropSpyStall {
+        type Item = Result<Bytes, ExecError>;
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            if !this.yielded {
+                this.yielded = true;
+                Poll::Ready(Some(Ok(Bytes::from_static(b"data: first\n\n"))))
+            } else {
+                Poll::Pending // genuine silence — never resolves again
+            }
+        }
+    }
+
+    impl Drop for DropSpyStall {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Minor 1 (from the Task 1 review): on idle-terminate, `ObservingStream` must free its inner
+    /// stream PROACTIVELY — the instant the idle deadline fires, not merely whenever the whole
+    /// `ObservingStream` eventually gets dropped. Proven directly: the inner stream's `Drop` flips
+    /// a flag, and this test asserts that flag is set immediately after the idle `Err` poll
+    /// returns — BEFORE the consumer ever polls again for the terminal `None`. Terminate semantics
+    /// are unchanged (still `Err` then `None`), asserted alongside.
+    #[tokio::test]
+    async fn idle_terminate_proactively_drops_the_inner_stream() {
+        let idle = Duration::from_millis(200);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let inner: ResponseStream = Box::pin(DropSpyStall {
+            yielded: false,
+            dropped: dropped.clone(),
+        });
+        let runtime = Arc::new(RuntimeStates::new());
+        let mut wrapped = wrap_stream(
+            inner,
+            Arc::new(polyflare_core::NoopContinuity),
+            RequestCtx::default(),
+            AccountId::from("acct"),
+            None,
+            OutcomeKind::Completed {
+                fp: String::new(),
+                count: 0,
+            },
+            runtime,
+            idle,
+            CommitWitness::new(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let first = wrapped.next().await;
+            assert!(matches!(first, Some(Ok(_))), "first byte relays cleanly");
+            assert!(
+                !dropped.load(Ordering::SeqCst),
+                "inner must still be alive right after the first byte — nothing to free yet"
+            );
+
+            let second = wrapped.next().await;
+            assert!(
+                matches!(second, Some(Err(ExecError::Stream(_)))),
+                "the idle timeout still surfaces as an Err item: {second:?}"
+            );
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "the inner stream must be dropped THE MOMENT the idle Err is yielded — before the \
+                 consumer's next poll, not after"
+            );
+
+            let third = wrapped.next().await;
+            assert!(
+                third.is_none(),
+                "terminate semantics unchanged: idle Err THEN a clean None: {third:?}"
+            );
+        })
+        .await
+        .expect("bounded: must not hang");
     }
 }

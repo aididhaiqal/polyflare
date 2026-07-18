@@ -55,6 +55,7 @@ async fn build_state() -> Arc<AppState> {
         starvation_wait_budget: Duration::from_secs(60),
         starvation_heartbeat: Duration::from_secs(10),
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
+        stream_idle_timeout: std::time::Duration::from_secs(300),
         runtime: Default::default(),
     })
 }
