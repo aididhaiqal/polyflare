@@ -112,7 +112,8 @@ async fn spawn_app(enforce_client_keys: bool, mock_base: &str) -> (String, Arc<A
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: Duration::from_secs(60),
         starvation_heartbeat: Duration::from_secs(10),
-        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+        wake_jitter_ms: 0,
+        inflight_penalty_pct: 2.5,
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: Duration::from_secs(300),
@@ -192,7 +193,10 @@ async fn sentinel_body_is_forwarded_but_never_reaches_the_request_log() {
         "a non-allow-listed response header must be dropped"
     );
     let body = resp.text().await.unwrap();
-    assert_eq!(body, r#"{"ok":true}"#, "the mock's body is relayed verbatim");
+    assert_eq!(
+        body, r#"{"ok":true}"#,
+        "the mock's body is relayed verbatim"
+    );
 
     let recorded = mock.last_request().expect("the mock received a request");
     assert_eq!(recorded.path, "/codex/memories/trace_summarize");
@@ -202,7 +206,11 @@ async fn sentinel_body_is_forwarded_but_never_reaches_the_request_log() {
     );
 
     let rows = rows_eventually(&state.store).await;
-    assert_eq!(rows.len(), 1, "exactly one content-free request_log row: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one content-free request_log row: {rows:?}"
+    );
     let row = &rows[0];
     let row_debug = format!("{row:?}");
     assert!(
@@ -300,7 +308,11 @@ async fn keyless_control_request_is_401_when_enforced() {
         401,
         "no Authorization header ⇒ 401, inheriting the D18 gate from the proxy sub-router"
     );
-    assert_eq!(mock.request_count(), 0, "an unauthenticated request must never reach the upstream");
+    assert_eq!(
+        mock.request_count(),
+        0,
+        "an unauthenticated request must never reach the upstream"
+    );
 
     let resp = client
         .post(format!("{base}/memories/trace_summarize"))
@@ -335,7 +347,10 @@ async fn jwks_and_wham_jwks_are_forwarded_and_returned() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), r#"{"keys":["k1"]}"#);
-    assert_eq!(mock.last_request().unwrap().path, "/codex/agent-identities/jwks");
+    assert_eq!(
+        mock.last_request().unwrap().path,
+        "/codex/agent-identities/jwks"
+    );
 
     let resp = client
         .get(format!("{base}/wham/agent-identities/jwks"))
@@ -381,7 +396,10 @@ async fn thread_goal_set_clear_get_are_forwarded() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(mock.last_request().unwrap().path, "/codex/thread/goal/clear");
+    assert_eq!(
+        mock.last_request().unwrap().path,
+        "/codex/thread/goal/clear"
+    );
 
     let resp = client
         .get(format!("{base}/thread/goal/get"))

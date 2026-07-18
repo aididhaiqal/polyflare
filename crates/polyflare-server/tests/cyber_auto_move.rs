@@ -142,7 +142,10 @@ async fn cyber_handler(
         .unwrap()
 }
 
-async fn spawn_cyber_mock(owner_token: String, behavior: OwnerAnchorBehavior) -> (String, CyberMock) {
+async fn spawn_cyber_mock(
+    owner_token: String,
+    behavior: OwnerAnchorBehavior,
+) -> (String, CyberMock) {
     let mock = CyberMock {
         owner_token,
         behavior,
@@ -160,7 +163,11 @@ async fn spawn_cyber_mock(owner_token: String, behavior: OwnerAnchorBehavior) ->
     (format!("http://{addr}"), mock)
 }
 
-async fn spawn_app(store: Store, cipher: TokenCipher, upstream_url: String) -> (String, Arc<AppState>) {
+async fn spawn_app(
+    store: Store,
+    cipher: TokenCipher,
+    upstream_url: String,
+) -> (String, Arc<AppState>) {
     let continuity: Arc<dyn Continuity> = Arc::new(CodexContinuity::new(
         store.continuity(),
         Duration::from_secs(30),
@@ -191,7 +198,8 @@ async fn spawn_app(store: Store, cipher: TokenCipher, upstream_url: String) -> (
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: std::time::Duration::from_secs(60),
         starvation_heartbeat: std::time::Duration::from_secs(10),
-        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+        wake_jitter_ms: 0,
+        inflight_penalty_pct: 2.5,
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
@@ -230,7 +238,11 @@ async fn owner_rejects_cyber_policy_reroutes_to_capable_account_and_rehomes_owne
     let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
     store
         .accounts()
-        .insert(&account("owner-acct", false), &tokens(&owner_token), &cipher)
+        .insert(
+            &account("owner-acct", false),
+            &tokens(&owner_token),
+            &cipher,
+        )
         .await
         .unwrap();
 
@@ -340,7 +352,11 @@ async fn no_capable_account_yields_a_clear_error_and_never_retries_unfiltered() 
     let cipher = TokenCipher::from_key_bytes(&[9u8; 32]).unwrap();
     store
         .accounts()
-        .insert(&account("owner-only", false), &tokens(&owner_token), &cipher)
+        .insert(
+            &account("owner-only", false),
+            &tokens(&owner_token),
+            &cipher,
+        )
         .await
         .unwrap();
 
@@ -384,8 +400,7 @@ async fn no_capable_account_yields_a_clear_error_and_never_retries_unfiltered() 
     );
     let body2 = r2.text().await.unwrap();
     assert!(
-        body2.to_lowercase().contains("security")
-            || body2.to_lowercase().contains("authorized"),
+        body2.to_lowercase().contains("security") || body2.to_lowercase().contains("authorized"),
         "body should clearly state no authorized account is available: {body2}"
     );
 
@@ -425,7 +440,11 @@ async fn non_cyber_failure_still_routes_to_record_failure_and_502() {
     let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
     store
         .accounts()
-        .insert(&account("owner-plain", false), &tokens(&owner_token), &cipher)
+        .insert(
+            &account("owner-plain", false),
+            &tokens(&owner_token),
+            &cipher,
+        )
         .await
         .unwrap();
 
@@ -465,7 +484,11 @@ async fn non_cyber_failure_still_routes_to_record_failure_and_502() {
     // Exactly 2 attempts: turn1 + the failed owner attempt — the new branch must NOT have
     // triggered any reselect/resend for a non-CapabilityRejection error.
     let tokens_seen = mock.tokens_seen.lock().unwrap().clone();
-    assert_eq!(tokens_seen.len(), 2, "no cyber reroute for a plain failure: {tokens_seen:?}");
+    assert_eq!(
+        tokens_seen.len(),
+        2,
+        "no cyber reroute for a plain failure: {tokens_seen:?}"
+    );
 
     // `record_failure`'s ordinary transient-error bookkeeping still fires (unchanged behavior).
     let mut snaps = vec![polyflare_core::AccountSnapshot::new("owner-plain")];

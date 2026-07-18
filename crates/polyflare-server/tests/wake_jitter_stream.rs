@@ -243,7 +243,13 @@ fn extract_wake_jitter_applied_ms(message: &str) -> u64 {
 /// hand-built unit-test one.
 fn assert_content_free(message: &str) {
     for forbidden in [
-        "bearer", "body", "content", "delta", "text", "input", "message\":",
+        "bearer",
+        "body",
+        "content",
+        "delta",
+        "text",
+        "input",
+        "message\":",
     ] {
         assert!(
             !message.to_lowercase().contains(forbidden),

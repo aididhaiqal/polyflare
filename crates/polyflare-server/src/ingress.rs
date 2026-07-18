@@ -31,8 +31,8 @@ use crate::snapshot::filter_by_provider_and_pool;
 use crate::starvation;
 use crate::translate_stream::wrap_translating_stream;
 use crate::watchdog::{
-    apply_ownership, execute_recovery_tracked, execute_with_watchdog_tracked,
-    signal_client_stream, CommitWitness, RouteDecision, WatchdogError,
+    apply_ownership, execute_recovery_tracked, execute_with_watchdog_tracked, signal_client_stream,
+    CommitWitness, RouteDecision, WatchdogError,
 };
 
 fn unix_now() -> i64 {
@@ -552,10 +552,10 @@ async fn try_layer1_serve_now(
         Err(r) => return Some(r),
     };
     let health_id = fresh.clone(); // `fresh` is moved into the executor below.
-    // C9 Task 2: a real upstream attempt on `fresh` — same lease treatment as every other
-    // streaming selection site (see `execute_recovery_tracked`'s call below, which is
-    // `execute_recovery`'s exact behavior plus this one added, never-read `in_flight` capability —
-    // see `execute_recovery`'s doc for why its own signature stays untouched).
+                                   // C9 Task 2: a real upstream attempt on `fresh` — same lease treatment as every other
+                                   // streaming selection site (see `execute_recovery_tracked`'s call below, which is
+                                   // `execute_recovery`'s exact behavior plus this one added, never-read `in_flight` capability —
+                                   // see `execute_recovery`'s doc for why its own signature stays untouched).
     let in_flight = state.runtime.acquire_in_flight(&fresh, now);
     let response = match execute_recovery_tracked(
         state.executor_for(provider).as_ref(),
@@ -800,8 +800,14 @@ pub fn wake_jitter_offset_ms(request_key: &str, wake_jitter_ms: u64) -> u64 {
 /// `target_ms` (jitter only ever ADDS delay) and never more than `budget_deadline_ms` (jitter can
 /// only spend room already inside the existing B5 budget ceiling — it can never extend the wait
 /// past it).
-pub(crate) fn jittered_wake_target_ms(target_ms: i64, jitter_ms: u64, budget_deadline_ms: i64) -> i64 {
-    target_ms.saturating_add(jitter_ms as i64).min(budget_deadline_ms)
+pub(crate) fn jittered_wake_target_ms(
+    target_ms: i64,
+    jitter_ms: u64,
+    budget_deadline_ms: i64,
+) -> i64 {
+    target_ms
+        .saturating_add(jitter_ms as i64)
+        .min(budget_deadline_ms)
 }
 
 /// B10 Task 1: the per-request identifier [`wake_jitter_offset_ms`] is seeded with. The native
@@ -1623,16 +1629,16 @@ async fn responses_handler_impl_with_max_attempts(
                     Err(r) => return (r, outcome),
                 };
                 let health_id = id.clone(); // `id` is moved into the executor below.
-                // C9 Task 2: the in-flight lease for this FIRST attempt on `id`. On success it
-                // rides inside the returned stream; on any `Err` below (including the
-                // `CapabilityRejection`/general-failure arms) it releases when
-                // `execute_with_watchdog_tracked`'s own frame ends — strictly before
-                // `reroute_cyber_rejection`/`run_failover_loop` (each of which acquires its OWN
-                // fresh lease for whatever account it tries next) ever runs.
+                                            // C9 Task 2: the in-flight lease for this FIRST attempt on `id`. On success it
+                                            // rides inside the returned stream; on any `Err` below (including the
+                                            // `CapabilityRejection`/general-failure arms) it releases when
+                                            // `execute_with_watchdog_tracked`'s own frame ends — strictly before
+                                            // `reroute_cyber_rejection`/`run_failover_loop` (each of which acquires its OWN
+                                            // fresh lease for whatever account it tries next) ever runs.
                 let in_flight = state.runtime.acquire_in_flight(&id, now);
-                                            // TA6(b) Task 2: capture the recovery plan + a `ctx` clone BEFORE `prepared`/`ctx`
-                                            // move into the executor below, so a `CapabilityRejection` can trigger the cyber
-                                            // reselect+resend (`reroute_cyber_rejection`) without re-preparing the request.
+                // TA6(b) Task 2: capture the recovery plan + a `ctx` clone BEFORE `prepared`/`ctx`
+                // move into the executor below, so a `CapabilityRejection` can trigger the cyber
+                // reselect+resend (`reroute_cyber_rejection`) without re-preparing the request.
                 let recovery_for_cyber = prepared.directive.recovery.clone();
                 let ctx_for_cyber = ctx.clone();
                 // B4 Task 4 — CONTINUITY OWNERSHIP gate (see the plan's Global Constraints): the
@@ -1768,9 +1774,9 @@ async fn responses_handler_impl_with_max_attempts(
                                 Err(r) => return (r, outcome),
                             };
                         let health_id = fresh.clone(); // `fresh` is moved into the executor below.
-                        // C9 Task 2: the owner-ineligible recovery's reselected attempt on `fresh`
-                        // is a real upstream request — same lease treatment as every other
-                        // streaming selection site.
+                                                       // C9 Task 2: the owner-ineligible recovery's reselected attempt on `fresh`
+                                                       // is a real upstream request — same lease treatment as every other
+                                                       // streaming selection site.
                         let in_flight = state.runtime.acquire_in_flight(&fresh, now);
                         match execute_recovery_tracked(
                             state.executor_for(provider).as_ref(),
@@ -1838,9 +1844,9 @@ async fn responses_handler_impl_with_max_attempts(
                                     },
                                 };
                                 let health_id = fresh.clone(); // moved into the executor below.
-                                // C9 Task 2: the pin-ignoring fallback's attempt on `fresh` is a
-                                // real upstream request — same lease treatment as every other
-                                // streaming selection site.
+                                                               // C9 Task 2: the pin-ignoring fallback's attempt on `fresh` is a
+                                                               // real upstream request — same lease treatment as every other
+                                                               // streaming selection site.
                                 let in_flight = state.runtime.acquire_in_flight(&fresh, now);
                                 match execute_with_watchdog_tracked(
                                     state.executor_for(provider).as_ref(),
@@ -2095,8 +2101,8 @@ async fn messages_handler_native(
     };
 
     let health_id = picked.clone(); // moved into the executor below.
-    // C9 Task 2: the native `/v1/messages` streaming selection site — same lease treatment as
-    // `/responses`'s Route arm.
+                                    // C9 Task 2: the native `/v1/messages` streaming selection site — same lease treatment as
+                                    // `/responses`'s Route arm.
     let in_flight = state.runtime.acquire_in_flight(&picked, now);
     let response = match execute_with_watchdog_tracked(
         state.executor_for(provider).as_ref(),
@@ -2224,10 +2230,10 @@ async fn messages_handler_codex_aliased(
     };
 
     let health_id = picked.clone(); // moved into the executor below.
-    // C9 Task 2: the Codex-aliased `/v1/messages` streaming selection site — same lease treatment
-    // as `/responses`'s Route arm. `wrap_translating_stream` below just wraps the returned
-    // `ResponseStream` (the `ObservingStream` carrying `_in_flight`) in another stream layer that
-    // owns it by value — the lease's lifetime is unaffected by the translation wrapper.
+                                    // C9 Task 2: the Codex-aliased `/v1/messages` streaming selection site — same lease treatment
+                                    // as `/responses`'s Route arm. `wrap_translating_stream` below just wraps the returned
+                                    // `ResponseStream` (the `ObservingStream` carrying `_in_flight`) in another stream layer that
+                                    // owns it by value — the lease's lifetime is unaffected by the translation wrapper.
     let in_flight = state.runtime.acquire_in_flight(&picked, now);
     let response = match execute_with_watchdog_tracked(
         state.executor_for(provider).as_ref(),

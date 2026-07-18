@@ -66,7 +66,8 @@ async fn state(soft_drain_enabled: bool) -> Arc<AppState> {
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: Duration::from_secs(60),
         starvation_heartbeat: Duration::from_secs(10),
-        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+        wake_jitter_ms: 0,
+        inflight_penalty_pct: 2.5,
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: Duration::from_secs(300),
@@ -161,7 +162,10 @@ async fn disable_lever_resets_tier_and_unskews_selection() {
     state.runtime.record_transient_error(&a, now);
     let mut mid = vec![eligible_snap("acct-a")];
     state.runtime.overlay(&mut mid, now);
-    assert_eq!(mid[0].health_tier, 1, "funnel drained acct-a (not flag-gated)");
+    assert_eq!(
+        mid[0].health_tier, 1,
+        "funnel drained acct-a (not flag-gated)"
+    );
 
     // ...but a poller cycle with the lever OFF forces the tier back to HEALTHY + emits a
     // `disabled_reset` transition — the codex-lb disable path, end-to-end.
@@ -169,7 +173,10 @@ async fn disable_lever_resets_tier_and_unskews_selection() {
         .runtime
         .evaluate_with_usage(&a, Some(10.0), None, false, state.soft_drain_enabled, now)
         .expect("the poller reset from DRAINING→HEALTHY is a real transition");
-    assert_eq!((reset.from, reset.to, reset.reason), (1, 0, "disabled_reset"));
+    assert_eq!(
+        (reset.from, reset.to, reset.reason),
+        (1, 0, "disabled_reset")
+    );
 
     let mut snaps = vec![eligible_snap("acct-a"), eligible_snap("acct-b")];
     state.runtime.overlay(&mut snaps, now);
@@ -192,7 +199,14 @@ async fn disable_lever_resets_tier_and_unskews_selection() {
     // ⇒ selection reverts to pure capacity weighting over EQUAL accounts ⇒ acct-a is NOT skewed out
     // (it wins a fair share of seeds), exactly today's pre-B8 behavior.
     let a_wins = (0..64u64)
-        .filter(|&seed| state.selector.pick(&snaps, &ctx(now, seed)).unwrap().as_str() == "acct-a")
+        .filter(|&seed| {
+            state
+                .selector
+                .pick(&snaps, &ctx(now, seed))
+                .unwrap()
+                .as_str()
+                == "acct-a"
+        })
         .count();
     assert!(
         a_wins > 0,

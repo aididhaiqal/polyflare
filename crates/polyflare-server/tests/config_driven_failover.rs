@@ -120,7 +120,10 @@ impl Executor for StubExecutor {
         account: &Account,
         _ctx: &RequestCtx,
     ) -> Result<ResponseStream, ExecError> {
-        self.calls.lock().unwrap().push(account.id.as_str().to_string());
+        self.calls
+            .lock()
+            .unwrap()
+            .push(account.id.as_str().to_string());
         let behavior = {
             let mut map = self.behaviors.lock().unwrap();
             match map.get_mut(account.id.as_str()) {
@@ -132,7 +135,8 @@ impl Executor for StubExecutor {
         match behavior {
             AttemptBehavior::Success => {
                 let id = format!("resp_{}", account.id);
-                let created = format!(r#"{{"type":"response.created","response":{{"id":"{id}"}}}}"#);
+                let created =
+                    format!(r#"{{"type":"response.created","response":{{"id":"{id}"}}}}"#);
                 let completed =
                     format!(r#"{{"type":"response.completed","response":{{"id":"{id}"}}}}"#);
                 Ok(Box::pin(stream::iter(vec![
@@ -196,7 +200,8 @@ fn build_state(
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: std::time::Duration::from_secs(60),
         starvation_heartbeat: std::time::Duration::from_secs(10),
-        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+        wake_jitter_ms: 0,
+        inflight_penalty_pct: 2.5,
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
@@ -365,7 +370,10 @@ async fn env_var_max_attempts_one_is_config_driven_one_shot_regression() {
         }
         resolved
     };
-    assert_eq!(resolved, 1, "the env var round-trips through the real config parser");
+    assert_eq!(
+        resolved, 1,
+        "the env var round-trips through the real config parser"
+    );
 
     let (store, cipher, _dir) = spawn_store().await;
     store

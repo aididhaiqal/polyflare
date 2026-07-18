@@ -322,10 +322,7 @@ pub async fn jwks_handler(State(state): State<Arc<AppState>>, headers: HeaderMap
 
 /// `GET /wham/agent-identities/jwks` — the `wham/`-prefixed variant, joined WITHOUT a `/codex/`
 /// segment (see `polyflare_codex::control_url`).
-pub async fn wham_jwks_handler(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn wham_jwks_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     control_route(
         state,
         "codex_control_wham/agent-identities/jwks",

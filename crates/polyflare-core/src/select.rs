@@ -302,14 +302,16 @@ pub(crate) fn soonest_recover(
     snapshots
         .iter()
         .filter(|s| !ctx.require_security_work_authorized || s.security_work_authorized)
-        .filter_map(|s| match eligibility(s, ctx.now, ctx.inflight_penalty_pct) {
-            Eligibility::InBackoff { recover_at, kind } => Some(Recovery {
-                recover_at,
-                account_id: s.id.clone(),
-                kind,
-            }),
-            Eligibility::Eligible(_) | Eligibility::HardBlocked => None,
-        })
+        .filter_map(
+            |s| match eligibility(s, ctx.now, ctx.inflight_penalty_pct) {
+                Eligibility::InBackoff { recover_at, kind } => Some(Recovery {
+                    recover_at,
+                    account_id: s.id.clone(),
+                    kind,
+                }),
+                Eligibility::Eligible(_) | Eligibility::HardBlocked => None,
+            },
+        )
         .min_by_key(|r| r.recover_at)
 }
 
@@ -1171,7 +1173,10 @@ mod tests {
     #[test]
     fn eligibility_clean_account_is_eligible() {
         let s = snap("a", "plus", 10.0);
-        assert!(matches!(eligibility(&s, 1000, 0.0), Eligibility::Eligible(_)));
+        assert!(matches!(
+            eligibility(&s, 1000, 0.0),
+            Eligibility::Eligible(_)
+        ));
     }
 
     #[test]
@@ -1193,7 +1198,10 @@ mod tests {
         let mut s = snap("a", "plus", 50.0);
         s.status = "rate_limited".to_string();
         s.reset_at = None;
-        assert!(matches!(eligibility(&s, 1000, 0.0), Eligibility::HardBlocked));
+        assert!(matches!(
+            eligibility(&s, 1000, 0.0),
+            Eligibility::HardBlocked
+        ));
     }
 
     #[test]
@@ -1202,7 +1210,10 @@ mod tests {
         let mut s = snap("a", "plus", 50.0);
         s.status = "quota_exceeded".to_string();
         s.reset_at = None;
-        assert!(matches!(eligibility(&s, 1000, 0.0), Eligibility::HardBlocked));
+        assert!(matches!(
+            eligibility(&s, 1000, 0.0),
+            Eligibility::HardBlocked
+        ));
     }
 
     #[test]

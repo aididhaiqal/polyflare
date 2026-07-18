@@ -122,7 +122,8 @@ async fn spawn(enforce_client_keys: bool) -> (String, Arc<AppState>) {
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: Duration::from_secs(60),
         starvation_heartbeat: Duration::from_secs(10),
-        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+        wake_jitter_ms: 0,
+        inflight_penalty_pct: 2.5,
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
@@ -150,7 +151,9 @@ fn responses_body() -> serde_json::Value {
 #[tokio::test]
 async fn enforced_keyless_post_responses_is_401() {
     let (base, state) = spawn(true).await;
-    create_key(&state.store, Some("caller"), now()).await.unwrap();
+    create_key(&state.store, Some("caller"), now())
+        .await
+        .unwrap();
 
     let client = reqwest::Client::new();
     let resp = client
@@ -169,7 +172,9 @@ async fn enforced_keyless_post_responses_is_401() {
 #[tokio::test]
 async fn enforced_valid_key_post_responses_reaches_the_handler() {
     let (base, state) = spawn(true).await;
-    let created = create_key(&state.store, Some("caller"), now()).await.unwrap();
+    let created = create_key(&state.store, Some("caller"), now())
+        .await
+        .unwrap();
 
     let client = reqwest::Client::new();
     let resp = client
@@ -255,7 +260,11 @@ async fn enforced_keyless_get_responses_is_426_not_401() {
     create_key(&state.store, None, now()).await.unwrap();
 
     let client = reqwest::Client::new();
-    let resp = client.get(format!("{base}/responses")).send().await.unwrap();
+    let resp = client
+        .get(format!("{base}/responses"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(
         resp.status(),
         426,
@@ -288,7 +297,11 @@ async fn dashboard_reachable_keyless_when_enforced() {
     create_key(&state.store, None, now()).await.unwrap();
 
     let client = reqwest::Client::new();
-    let resp = client.get(format!("{base}/dashboard")).send().await.unwrap();
+    let resp = client
+        .get(format!("{base}/dashboard"))
+        .send()
+        .await
+        .unwrap();
     assert_ne!(
         resp.status(),
         401,
@@ -302,7 +315,11 @@ async fn dashboard_reachable_keyless_when_unenforced() {
     let (base, _state) = spawn(false).await;
 
     let client = reqwest::Client::new();
-    let resp = client.get(format!("{base}/dashboard")).send().await.unwrap();
+    let resp = client
+        .get(format!("{base}/dashboard"))
+        .send()
+        .await
+        .unwrap();
     assert_ne!(resp.status(), 401);
 }
 
@@ -320,7 +337,11 @@ async fn api_whoami_still_requires_the_admin_token_when_proxy_enforcement_is_on(
     let client = reqwest::Client::new();
     // No Authorization at all ⇒ still 401 from require_admin (unaffected by the new proxy layer,
     // which doesn't cover /api/* at all).
-    let resp = client.get(format!("{base}/api/whoami")).send().await.unwrap();
+    let resp = client
+        .get(format!("{base}/api/whoami"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 401);
 
     // The correct admin token ⇒ still works, exactly as before D18.
@@ -330,7 +351,11 @@ async fn api_whoami_still_requires_the_admin_token_when_proxy_enforcement_is_on(
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "the admin token must still unlock /api/* unaffected by D18");
+    assert_eq!(
+        resp.status(),
+        200,
+        "the admin token must still unlock /api/* unaffected by D18"
+    );
 }
 
 #[tokio::test]

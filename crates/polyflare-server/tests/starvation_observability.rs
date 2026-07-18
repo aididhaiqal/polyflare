@@ -154,7 +154,8 @@ fn build_state(
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: Duration::from_secs(60),
         starvation_heartbeat: Duration::from_secs(10),
-        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+        wake_jitter_ms: 0,
+        inflight_penalty_pct: 2.5,
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
@@ -212,7 +213,11 @@ async fn layer2_recovery_fires_content_free_signal_with_waited_duration_and_serv
     let exec = Arc::new(RecordingExecutor::default());
     let state = build_state(store, cipher, exec.clone(), Arc::new(CapacityWeighted));
 
-    assert_eq!(state.starvation_metrics.total(), 0, "no wait has happened yet");
+    assert_eq!(
+        state.starvation_metrics.total(),
+        0,
+        "no wait has happened yet"
+    );
 
     let resp = responses_handler_impl_for_test_with_starvation_timing(
         state.clone(),
@@ -330,11 +335,7 @@ async fn layer2_wait_target_and_spliced_account_differ_signal_records_the_splice
     // Sanity: confirm the WAIT TARGET really is "a-acct" (the ascending-id tie winner), not
     // "b-acct" — this is what `soonest_recover` alone would resolve to right now, independent of
     // the wait/re-select machinery.
-    let snapshots = state
-        .account_cache
-        .snapshots(&state.store)
-        .await
-        .unwrap();
+    let snapshots = state.account_cache.snapshots(&state.store).await.unwrap();
     let mut snaps: Vec<_> = (*snapshots).clone();
     state.runtime.overlay(&mut snaps, now());
     let sel_ctx = SelectionCtx {

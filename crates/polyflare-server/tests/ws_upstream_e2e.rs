@@ -116,7 +116,8 @@ async fn spawn_state(
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: std::time::Duration::from_secs(60),
         starvation_heartbeat: std::time::Duration::from_secs(10),
-        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+        wake_jitter_ms: 0,
+        inflight_penalty_pct: 2.5,
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
@@ -239,7 +240,7 @@ async fn ws_flag_on_two_sequential_turns_reuse_one_handshake_and_send_a_delta() 
 #[tokio::test]
 async fn ws_flag_off_uses_the_http_mock_upstream_unchanged() {
     let mock = MockUpstream::with_ids(vec![
-        r#"{"type":"response.output_text.delta","delta":"x"}"#.to_string(),
+        r#"{"type":"response.output_text.delta","delta":"x"}"#.to_string()
     ]);
     let http_base = mock.clone().spawn().await;
 
