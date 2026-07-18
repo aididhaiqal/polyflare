@@ -581,18 +581,27 @@ async fn try_layer1_serve_now(
 /// `log_bus.publish(..)` + `metrics.record()`, together, at the real transition). Called from every
 /// terminal exit of [`layer2_wait_stream`]'s generator — `served` is `Some` ONLY at the genuine
 /// splice-success site (see that function's doc, "B5 Task 5" section).
+///
+/// B10 Task 2: `wake_jitter_applied_ms` is this wait's own [`wake_jitter_offset_ms`] result — the
+/// SAME value `layer2_wait_stream` already computed once at wait entry to build
+/// `jittered_wake_target_ms` — passed through unchanged so the content-free signal lets an operator
+/// see herd-damping is active (and roughly how spread out concurrent waiters are) without a new
+/// signal type. `0` on every call site when `wake_jitter_ms` is unset/`0` (the disable lever).
+#[allow(clippy::too_many_arguments)]
 fn emit_starvation_signal(
     state: &AppState,
     wait_target: &AccountId,
     wait_started: Instant,
     reason: &'static str,
     served: Option<&str>,
+    wake_jitter_applied_ms: u64,
 ) {
     let signal = crate::observability::StarvationSignal {
         reason,
         wait_target_account: wait_target.as_str(),
         served_account: served,
         waited_ms: wait_started.elapsed().as_millis() as u64,
+        wake_jitter_applied_ms,
     };
     signal.emit();
     state.log_bus.publish(signal.to_log_event());
@@ -872,6 +881,7 @@ fn layer2_wait_stream(
                 wait_started,
                 starvation::StarvationOutcome::BudgetExceeded.code(),
                 None,
+                jitter_ms,
             );
             yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::BudgetExceeded));
             return;
@@ -892,6 +902,7 @@ fn layer2_wait_stream(
                     wait_started,
                     starvation::StarvationOutcome::StillNothing.code(),
                     None,
+                    jitter_ms,
                 );
                 yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::StillNothing));
                 return;
@@ -910,6 +921,7 @@ fn layer2_wait_stream(
                     wait_started,
                     starvation::StarvationOutcome::StillNothing.code(),
                     None,
+                    jitter_ms,
                 );
                 yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::StillNothing));
                 return;
@@ -926,6 +938,7 @@ fn layer2_wait_stream(
                     wait_started,
                     starvation::StarvationOutcome::ExecutorError.code(),
                     None,
+                    jitter_ms,
                 );
                 yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::ExecutorError));
                 return;
@@ -956,6 +969,7 @@ fn layer2_wait_stream(
                     wait_started,
                     starvation::STARVATION_RECOVERED_REASON,
                     Some(health_id.as_str()),
+                    jitter_ms,
                 );
                 while let Some(item) = real_stream.next().await {
                     yield item;
@@ -969,6 +983,7 @@ fn layer2_wait_stream(
                     wait_started,
                     starvation::StarvationOutcome::ExecutorError.code(),
                     None,
+                    jitter_ms,
                 );
                 yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::ExecutorError));
             }

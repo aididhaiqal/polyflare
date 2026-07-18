@@ -273,6 +273,16 @@ pub struct StarvationSignal<'a> {
     /// Wall-clock milliseconds actually spent waiting (from the moment the generator started, to
     /// this terminal outcome) — a plain duration, never derived from request/response content.
     pub waited_ms: u64,
+    /// B10 Task 2: the per-waiter herd-damping jitter offset actually applied to THIS wait's wake
+    /// target — `crate::ingress::wake_jitter_offset_ms(request_key, wake_jitter_ms)`'s return value,
+    /// a plain `u64` count of milliseconds in `[0, wake_jitter_ms]`. Content-free by construction:
+    /// it is a bounded integer derived from a hash of the session key, never the key itself, a
+    /// body, or any request/response content — same class as `waited_ms`. Lets an operator see
+    /// herd-damping is active (and roughly how spread out concurrent waiters on the same account
+    /// are) straight from the existing starvation signal, without a new signal type. Always `0`
+    /// when `POLYFLARE_STARVATION_WAKE_JITTER_MS` is unset/`0` (the disable lever) — see
+    /// `crate::ingress::wake_jitter_offset_ms`'s doc.
+    pub wake_jitter_applied_ms: u64,
 }
 
 impl StarvationSignal<'_> {
@@ -285,6 +295,7 @@ impl StarvationSignal<'_> {
             wait_target_account = self.wait_target_account,
             served_account = self.served_account.unwrap_or(""),
             waited_ms = self.waited_ms,
+            wake_jitter_applied_ms = self.wake_jitter_applied_ms,
             "layer 2 starvation wait"
         );
     }
@@ -309,11 +320,12 @@ impl StarvationSignal<'_> {
             latency_ms: Some(self.waited_ms as i64),
             kind: "starvation".to_string(),
             message: format!(
-                "starvation wait reason={} wait_target={} served={} waited_ms={}",
+                "starvation wait reason={} wait_target={} served={} waited_ms={} wake_jitter_applied_ms={}",
                 self.reason,
                 self.wait_target_account,
                 self.served_account.unwrap_or("none"),
-                self.waited_ms
+                self.waited_ms,
+                self.wake_jitter_applied_ms
             ),
         }
     }
@@ -689,6 +701,7 @@ mod tests {
                 wait_target_account: "acct-a",
                 served_account: Some("acct-b"),
                 waited_ms: 1234,
+                wake_jitter_applied_ms: 777,
             }
             .emit();
         });
@@ -701,6 +714,7 @@ mod tests {
             "wait_target_account=acct-a",
             "served_account=acct-b",
             "waited_ms=1234",
+            "wake_jitter_applied_ms=777",
         ] {
             assert!(line.contains(expected), "missing `{expected}` in: {line}");
         }
@@ -720,6 +734,7 @@ mod tests {
                 wait_target_account: "acct-a",
                 served_account: None,
                 waited_ms: 60000,
+                wake_jitter_applied_ms: 0,
             }
             .emit();
         });
@@ -741,6 +756,7 @@ mod tests {
             wait_target_account: "acct-a",
             served_account: Some("acct-b"),
             waited_ms: 2000,
+            wake_jitter_applied_ms: 350,
         }
         .to_log_event();
 
@@ -753,6 +769,7 @@ mod tests {
         assert!(ev.message.contains("wait_target=acct-a"));
         assert!(ev.message.contains("served=acct-b"));
         assert!(ev.message.contains("waited_ms=2000"));
+        assert!(ev.message.contains("wake_jitter_applied_ms=350"));
 
         for forbidden in [
             "bearer", "body", "content", "delta", "text", "input", "message\":",
@@ -857,6 +874,7 @@ mod tests {
             wait_target_account: "acct-a",
             served_account: None,
             waited_ms: 500,
+            wake_jitter_applied_ms: 0,
         }
         .to_log_event();
 
