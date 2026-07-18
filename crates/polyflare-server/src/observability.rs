@@ -322,10 +322,23 @@ impl StarvationSignal<'_> {
 /// B8 Task 4: a process-global, content-free counter of health-tier soft-drain TRANSITIONS (an
 /// account actually changing tier — HEALTHY↔DRAINING↔PROBING). In memory only (like
 /// `FailoverMetrics`/`StarvationMetrics`/`RuntimeStates`/`LogBus`) — resets on restart. Incremented
-/// exactly ONCE per real tier change (`from != to`) actually applied by the runtime funnel or the
-/// usage poller — never per mere evaluation that leaves the tier where it was — so its total is the
-/// soft-drain churn RATE an operator can watch (codex-lb drained invisibly; this is the visibility
-/// the porting doc calls for).
+/// exactly ONCE per real tier change (`from != to`) actually applied at one of the sites that calls
+/// [`emit_health_tier_signal`] — never per mere evaluation that leaves the tier where it was.
+///
+/// **Scope (B8 review, Finding 3 — read before treating this as a complete churn rate):** this
+/// counter/signal covers only PRE-STREAM failures (`crate::ingress::record_failure`) and the
+/// usage-refresh poller's transitions (`crate::usage_refresh`, both the codex and, since the
+/// Finding 1 fix, the non-codex pass). It does NOT cover mid-stream funnel transitions: the
+/// watchdog's own `record_success`/`record_transient_error` calls (`crate::watchdog`'s
+/// `ObservingStream::poll_next`) discard the returned `HealthTierTransition` — so a mid-stream
+/// `error_drain` (a stream that fails after the first byte, or times out idle) and essentially ALL
+/// funnel-driven `probe_promote` recoveries (`record_success` is only ever called from the watchdog)
+/// silently update the tier without incrementing this counter or emitting a signal. This is an
+/// accepted, deliberate scope choice — threading the log bus/metrics handles into the
+/// `ObservingStream` machinery to close it is disproportionate to the gap — not an oversight; see
+/// `crate::watchdog`'s `poll_next` for where the transition is dropped. Full recovery telemetry
+/// (counting every tier change, not just the pre-stream-failure and poller ones) is a follow-up, not
+/// part of B8.
 #[derive(Default)]
 pub struct HealthTierMetrics {
     total: AtomicU64,
@@ -369,9 +382,12 @@ impl HealthTierMetrics {
 /// - `"disabled_reset"`— the `POLYFLARE_SOFT_DRAIN_ENABLED=0` disable lever forced a non-HEALTHY
 ///   account back to HEALTHY.
 ///
-/// Emitted (via [`emit_health_tier_signal`]) from exactly two call sites that own the log
-/// bus/metrics handles: `crate::ingress::record_failure` (the error-driven funnel edge) and
-/// `crate::usage_refresh::refresh_account` (the usage-driven poller edge).
+/// Emitted (via [`emit_health_tier_signal`]) from the call sites that own the log bus/metrics
+/// handles: `crate::ingress::record_failure` (pre-stream failures) and `crate::usage_refresh`'s
+/// poller loop (both the codex `refresh_account` usage-driven edge and, since the B8-review
+/// Finding 1 fix, the disjoint non-codex error-driven pass). **Not** emitted for mid-stream
+/// transitions the watchdog's funnel calls produce — see [`HealthTierMetrics`]'s doc for that scope
+/// gap.
 pub struct HealthTierSignal<'a> {
     pub account_id: &'a str,
     pub from_tier: u8,

@@ -240,6 +240,41 @@ async fn refresh_account(
     Ok(())
 }
 
+/// B8 review Finding 1: the poller's error-driven health-tier evaluation for ONE NON-codex account.
+/// Codex accounts get the FULL usage+error evaluation inside [`refresh_account`] (it polls real
+/// `used_percent` from `/wham/usage`); a non-codex account (e.g. Anthropic) has no such usage source
+/// at all, so `refresh_account` is never called for it — but the per-request funnel
+/// (`RuntimeState::apply_funnel_transition`) deliberately REFUSES the DRAINING→PROBING quiet-timer
+/// promotion for every provider (it never sees usage, so it can't tell a usage-drain from an
+/// error-drain). Without this pass, a non-codex account that error-flaps into DRAINING would never
+/// see a poller cycle at all and would be stranded there until restart.
+///
+/// This calls the SAME [`RuntimeStates::evaluate_with_usage`] the codex path uses, but with
+/// `used_percent`/`secondary_percent = None` — i.e. purely error-driven `should_drain`. That still
+/// gives the account the quiet-timer DRAINING→PROBING promotion, the PROBING→HEALTHY streak (already
+/// funnel-driven), and the `soft_drain_enabled` disable lever, closing the stranding gap while never
+/// pretending to know a usage percentage it doesn't have.
+///
+/// `status_frozen` reuses [`HEALTH_TIER_FROZEN_STATUSES`] — the exact same blocked-status set the
+/// codex path passes to `evaluate_with_usage`, so a benched/paused/deactivated non-codex account is
+/// frozen identically to a benched codex account (no duplicated set).
+fn evaluate_non_codex_health_tier(
+    runtime: &RuntimeStates,
+    account: &Account,
+    soft_drain_enabled: bool,
+    now: i64,
+) -> Option<crate::runtime_state::HealthTierTransition> {
+    let status_frozen = HEALTH_TIER_FROZEN_STATUSES.contains(&account.status.as_str());
+    runtime.evaluate_with_usage(
+        &AccountId::from(account.id.as_str()),
+        None,
+        None,
+        status_frozen,
+        soft_drain_enabled,
+        now,
+    )
+}
+
 /// Spawn the background usage-refresh loop: every [`REFRESH_INTERVAL`], poll each Codex account.
 pub fn spawn_usage_refresh(state: Arc<AppState>) {
     let http = match reqwest::Client::builder()
@@ -271,6 +306,30 @@ pub fn spawn_usage_refresh(state: Arc<AppState>) {
                 .await
                 {
                     tracing::warn!(error = %e, "usage refresh failed for an account");
+                }
+            }
+            // B8 review Finding 1: NON-codex accounts (disjoint filter from the codex loop above —
+            // never re-evaluates a codex account, which would clobber its real-usage-driven drain
+            // with a None-usage view). No HTTP usage poll for them (no usage source exists); this
+            // just runs the poller's error-driven tier evaluation so they get the same
+            // recovery/disable-lever coverage as codex accounts instead of being stranded in
+            // DRAINING once the funnel refuses the quiet-timer promotion.
+            for account in accounts.iter().filter(|a| a.provider != "codex") {
+                let transition = evaluate_non_codex_health_tier(
+                    &state.runtime,
+                    account,
+                    state.soft_drain_enabled,
+                    unix_now(),
+                );
+                if let Some(t) = transition {
+                    crate::observability::emit_health_tier_signal(
+                        &state.log_bus,
+                        &state.health_tier_metrics,
+                        &account.id,
+                        t.from,
+                        t.to,
+                        t.reason,
+                    );
                 }
             }
             // Warm the account snapshot cache off the request path: this cycle's usage/status writes
@@ -380,5 +439,144 @@ mod tests {
         assert_eq!(s.used_percent, Some(73.5));
         assert_eq!(s.reset_at, Some(1783900000));
         assert_eq!(s.limit_window_seconds, Some(604800));
+    }
+
+    // --- B8 review Finding 1: non-codex accounts must not be stranded in DRAINING ---
+
+    fn account(id: &str, provider: &str, status: &str) -> Account {
+        Account {
+            id: id.to_string(),
+            chatgpt_account_id: None,
+            chatgpt_user_id: None,
+            email: "u@example.test".to_string(),
+            alias: None,
+            workspace_id: None,
+            workspace_label: None,
+            seat_type: None,
+            plan_type: "pro".to_string(),
+            routing_policy: "normal".to_string(),
+            last_refresh: 0,
+            created_at: 0,
+            status: status.to_string(),
+            deactivation_reason: None,
+            reset_at: None,
+            blocked_at: None,
+            security_work_authorized: false,
+            provider: provider.to_string(),
+            pool: None,
+        }
+    }
+
+    /// THE regression this finding fixes: a non-codex account driven to DRAINING purely by the
+    /// error funnel (2 `record_transient_error` within 60s) has no other recovery path — the funnel
+    /// itself refuses the DRAINING->PROBING quiet-timer promotion for every provider (that's
+    /// `apply_funnel_transition`'s care point, not a codex-only rule), and `refresh_account`'s HTTP
+    /// usage poll never runs for a non-codex account. `evaluate_non_codex_health_tier` is the poller
+    /// pass that rescues it: called with `used_percent = None` (no usage source), it still owns the
+    /// quiet-timer demotion because it's invoked from the poller side of the split, not the funnel
+    /// side.
+    #[test]
+    fn non_codex_account_error_drained_is_not_stranded_in_draining() {
+        let runtime = RuntimeStates::new();
+        let acct = account("anthro-a", "anthropic", "active");
+        let id = AccountId::from(acct.id.as_str());
+
+        let t = runtime.record_transient_error(&id, 1000);
+        assert_eq!(t, None, "the FIRST error alone does not reach the drain threshold");
+        let t = runtime
+            .record_transient_error(&id, 1010)
+            .expect("the SECOND error within 60s crosses the error-drain threshold");
+        assert_eq!((t.from, t.to, t.reason), (0, 1, "error_drain"));
+
+        // Well past PROBE_QUIET_SECS (60) since drain_entered_at (stamped at 1010), no further
+        // errors: the poller pass must promote DRAINING -> PROBING.
+        let now_quiet = 1010 + 61;
+        let transition = evaluate_non_codex_health_tier(&runtime, &acct, true, now_quiet)
+            .expect("the non-codex poller pass promotes the quiet, error-drained account");
+        assert_eq!(
+            (transition.from, transition.to, transition.reason),
+            (1, 2, "quiet_promote"),
+            "the poller pass owns the DRAINING->PROBING demotion for non-codex too, exactly like \
+             the codex path's evaluate_with_usage call"
+        );
+
+        let mut snaps = vec![polyflare_core::AccountSnapshot::new("anthro-a")];
+        runtime.overlay(&mut snaps, now_quiet);
+        assert_eq!(
+            snaps[0].health_tier, 2,
+            "not stranded: promoted to PROBING by the non-codex poller pass"
+        );
+
+        // Close the loop: 3 successes while PROBING (funnel-owned, unaffected by this finding)
+        // complete the recovery back to HEALTHY.
+        runtime.record_success(&id);
+        runtime.record_success(&id);
+        runtime.record_success(&id);
+        let mut snaps2 = vec![polyflare_core::AccountSnapshot::new("anthro-a")];
+        runtime.overlay(&mut snaps2, now_quiet);
+        assert_eq!(
+            snaps2[0].health_tier, 0,
+            "full recovery: PROBING -> HEALTHY via the funnel's success streak"
+        );
+    }
+
+    /// The `soft_drain_enabled` disable lever must reach non-codex accounts too, exactly like it
+    /// reaches codex accounts via `evaluate_with_usage` in `refresh_account`.
+    #[test]
+    fn non_codex_pass_disabled_forces_healthy() {
+        let runtime = RuntimeStates::new();
+        let acct = account("anthro-b", "anthropic", "active");
+        let id = AccountId::from(acct.id.as_str());
+
+        runtime.record_transient_error(&id, 2000);
+        runtime
+            .record_transient_error(&id, 2010)
+            .expect("2nd error within 60s crosses the error-drain threshold");
+        let mut mid = vec![polyflare_core::AccountSnapshot::new("anthro-b")];
+        runtime.overlay(&mut mid, 2010);
+        assert_eq!(mid[0].health_tier, 1, "funnel drained anthro-b (not flag-gated)");
+
+        let transition = evaluate_non_codex_health_tier(&runtime, &acct, false, 2010)
+            .expect("the disable lever forces a real HEALTHY transition");
+        assert_eq!(
+            (transition.from, transition.to, transition.reason),
+            (1, 0, "disabled_reset")
+        );
+
+        let mut snaps = vec![polyflare_core::AccountSnapshot::new("anthro-b")];
+        runtime.overlay(&mut snaps, 2010);
+        assert_eq!(
+            snaps[0].health_tier, 0,
+            "disable lever reaches non-codex accounts too, not just codex"
+        );
+    }
+
+    /// A frozen (blocked-status) non-codex account's tier must pass through unchanged, matching the
+    /// codex path's contract exactly (same `HEALTH_TIER_FROZEN_STATUSES` set): even well past the
+    /// quiet timer, a frozen account is not promoted DRAINING->PROBING.
+    #[test]
+    fn non_codex_pass_respects_frozen_statuses() {
+        let runtime = RuntimeStates::new();
+        // Drive to DRAINING via the funnel while still `active` (status is irrelevant to the
+        // funnel's own error-only evaluation).
+        let id = AccountId::from("anthro-c");
+        runtime.record_transient_error(&id, 3000);
+        runtime
+            .record_transient_error(&id, 3010)
+            .expect("2nd error within 60s crosses the error-drain threshold");
+
+        // Now the account is (durably) frozen, e.g. rate_limited. Even well past the quiet timer,
+        // the poller pass must NOT promote it.
+        let acct_frozen = account("anthro-c", "anthropic", "rate_limited");
+        let now_quiet = 3010 + 61;
+        let transition = evaluate_non_codex_health_tier(&runtime, &acct_frozen, true, now_quiet);
+        assert_eq!(transition, None, "frozen: no transition even though the quiet timer elapsed");
+
+        let mut snaps = vec![polyflare_core::AccountSnapshot::new("anthro-c")];
+        runtime.overlay(&mut snaps, now_quiet);
+        assert_eq!(
+            snaps[0].health_tier, 1,
+            "tier stays DRAINING while frozen, not promoted to PROBING"
+        );
     }
 }

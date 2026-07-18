@@ -102,10 +102,12 @@ pub struct AppState {
     /// `crate::observability::FailoverSignal` log/event.
     pub failover_metrics: std::sync::Arc<crate::observability::FailoverMetrics>,
     /// B8 Task 4: content-free counter of health-tier soft-drain TRANSITIONS (see
-    /// `crate::observability::HealthTierMetrics`) — incremented at the same two sites that emit the
-    /// `crate::observability::HealthTierSignal`: `crate::ingress::record_failure` (the error-driven
-    /// funnel edge) and `crate::usage_refresh::refresh_account` (the usage-driven poller edge).
-    /// In-memory only; resets on restart.
+    /// `crate::observability::HealthTierMetrics`) — incremented at the same sites that emit the
+    /// `crate::observability::HealthTierSignal`: `crate::ingress::record_failure` (pre-stream
+    /// failures) and `crate::usage_refresh`'s poller loop (the codex usage-driven pass and, since
+    /// the B8-review Finding 1 fix, the disjoint non-codex error-driven pass). Does NOT cover
+    /// mid-stream watchdog-funnel transitions — see `HealthTierMetrics`'s doc for that known,
+    /// accepted scope gap. In-memory only; resets on restart.
     pub health_tier_metrics: std::sync::Arc<crate::observability::HealthTierMetrics>,
     /// B5 Task 5: the Layer 2 keepalive recovery-wait's bounded wait budget
     /// (`POLYFLARE_STARVATION_WAIT_BUDGET_SECS`, resolved ONCE at startup by
@@ -146,13 +148,19 @@ pub struct AppState {
     /// (`POLYFLARE_SOFT_DRAIN_ENABLED`, resolved ONCE at startup by
     /// `crate::config::soft_drain_enabled_from_env` — never read per-request). Read by
     /// `crate::usage_refresh`'s poller loop (which owns the only usage-driven health-tier
-    /// evaluation site) and threaded into `RuntimeStates::evaluate_with_usage` on every refresh
-    /// cycle. `false` forces every account's health tier to HEALTHY with cleared aux state
-    /// (codex-lb's disable path, `load_balancer.py:2245-2249`) — the documented clean-rollback
-    /// lever, matching today's exact pre-B8 behavior (`select.rs`'s `health_tier_pool` becomes a
-    /// no-op single bucket). Defaults to `true` in every test/dev harness that builds `AppState`
-    /// directly, matching `POLYFLARE_SOFT_DRAIN_ENABLED`'s unset-default (mirrors
-    /// `enforce_client_keys`'s doc above for why test harnesses hardcode a value here).
+    /// evaluation site — and, since the B8-review Finding 1 fix, the disjoint non-codex
+    /// error-driven pass in the same loop) and threaded into `RuntimeStates::evaluate_with_usage`
+    /// on every refresh cycle for BOTH the codex and non-codex passes. `false` forces every
+    /// account's health tier to HEALTHY with cleared aux state (codex-lb's disable path,
+    /// `load_balancer.py:2245-2249`) — the documented clean-rollback lever, matching today's exact
+    /// pre-B8 behavior (`select.rs`'s `health_tier_pool` becomes a no-op single bucket) **in steady
+    /// state**: the flag is honored only by the poller, so the per-request funnel (not flag-gated)
+    /// can still transiently drive an account into DRAINING from errors between poller cycles
+    /// (bounded to ≤600s, the poller's `REFRESH_INTERVAL`, before the next tick resets it — see
+    /// `crate::config::soft_drain_enabled_from_env`'s doc for the same caveat). Defaults to `true`
+    /// in every test/dev harness that builds `AppState` directly, matching
+    /// `POLYFLARE_SOFT_DRAIN_ENABLED`'s unset-default (mirrors `enforce_client_keys`'s doc above for
+    /// why test harnesses hardcode a value here).
     pub soft_drain_enabled: bool,
 }
 
