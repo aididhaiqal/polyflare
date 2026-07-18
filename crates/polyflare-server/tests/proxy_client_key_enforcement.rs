@@ -121,6 +121,7 @@ async fn spawn(enforce_client_keys: bool) -> (String, Arc<AppState>) {
         starvation_wait_budget: Duration::from_secs(60),
         starvation_heartbeat: Duration::from_secs(10),
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
+        stream_idle_timeout: std::time::Duration::from_secs(300),
         enforce_client_keys,
     });
 
