@@ -379,6 +379,54 @@ impl AccountRepo {
         Ok(())
     }
 
+    /// Delete `usage_history` rows older than `cutoff`, EXCEPT the latest row per
+    /// `(account_id, "window")` — always kept regardless of age, because the routing gate
+    /// (`derive_gate`/`latest_usage`) and dashboard need each account's last-known sample per
+    /// window. Batched (loops the delete until a batch affects fewer than `batch_size` rows, each
+    /// batch its own statement so the writer lock is never held for an unbounded delete). Returns
+    /// the total rows deleted. Content-free (row counts only — no usage values are read or logged).
+    ///
+    /// The `"window"` column is nullable, so the per-group comparison uses SQLite's null-safe
+    /// `IS` (not `=`): `NULL = NULL` evaluates to `NULL` (not true), so two `NULL`-window rows
+    /// would never compare equal under `=` and would each look like a lone (protected) group —
+    /// `IS` correctly treats `NULL IS NULL` as true and groups them together.
+    pub async fn prune_usage_history_older_than(
+        &self,
+        cutoff: i64,
+        batch_size: i64,
+    ) -> Result<u64, StoreError> {
+        if batch_size <= 0 {
+            return Ok(0);
+        }
+
+        let mut total: u64 = 0;
+        loop {
+            let result = sqlx::query(
+                "DELETE FROM usage_history WHERE rowid IN ( \
+                    SELECT uh.rowid FROM usage_history uh \
+                    WHERE uh.recorded_at < ?1 \
+                      AND uh.recorded_at < ( \
+                        SELECT MAX(m.recorded_at) FROM usage_history m \
+                        WHERE m.account_id = uh.account_id AND m.\"window\" IS uh.\"window\" \
+                      ) \
+                    LIMIT ?2)",
+            )
+            .bind(cutoff)
+            .bind(batch_size)
+            .execute(&self.pool)
+            .await?;
+
+            let affected = result.rows_affected();
+            total += affected;
+
+            if affected < batch_size as u64 {
+                break;
+            }
+        }
+
+        Ok(total)
+    }
+
     /// Replace an account's tokens (re-encrypting) and stamp `last_refresh`.
     pub async fn update_tokens(
         &self,
@@ -545,6 +593,359 @@ mod tests {
             .await
             .unwrap();
         assert!(empty.is_empty());
+    }
+
+    /// Minimal account row, for tests that only need an id to satisfy the `usage_history`
+    /// foreign key — no tokens/pool/status matter.
+    async fn seed_account(repo: &AccountRepo, cipher: &TokenCipher, id: &str) {
+        let account = Account {
+            id: id.to_string(),
+            chatgpt_account_id: None,
+            chatgpt_user_id: None,
+            email: format!("{id}@example.test"),
+            alias: None,
+            workspace_id: None,
+            workspace_label: None,
+            seat_type: None,
+            plan_type: "pro".to_string(),
+            routing_policy: "normal".to_string(),
+            last_refresh: 0,
+            created_at: 0,
+            status: "active".to_string(),
+            deactivation_reason: None,
+            reset_at: None,
+            blocked_at: None,
+            security_work_authorized: false,
+            provider: "codex".to_string(),
+            pool: None,
+        };
+        let tokens = PlainTokens {
+            access_token: "a".to_string(),
+            refresh_token: "b".to_string(),
+            id_token: "c".to_string(),
+        };
+        repo.insert(&account, &tokens, cipher).await.unwrap();
+    }
+
+    /// Insert a `usage_history` row with a `NULL` `"window"` directly (bypassing
+    /// `insert_usage_window`, which only accepts a non-null `&str`) — used to prove the
+    /// protect-latest guard's null-safe `IS` comparison groups `NULL`-window rows together.
+    async fn insert_null_window_usage(
+        store: &crate::Store,
+        account_id: &str,
+        used_percent: f64,
+        recorded_at: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO usage_history (account_id, recorded_at, \"window\", used_percent) \
+             VALUES (?, ?, NULL, ?)",
+        )
+        .bind(account_id)
+        .bind(recorded_at)
+        .bind(used_percent)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
+    /// All the `recorded_at` timestamps still present for an account, across every window
+    /// (including `NULL`) — used by the prune tests to assert exactly which rows survived.
+    async fn remaining_recorded_ats(store: &crate::Store, account_id: &str) -> Vec<i64> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT recorded_at FROM usage_history WHERE account_id = ? ORDER BY recorded_at ASC",
+        )
+        .bind(account_id)
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        rows.into_iter().map(|(ts,)| ts).collect()
+    }
+
+    #[tokio::test]
+    async fn prune_usage_history_keeps_newest_row_even_if_all_rows_are_older_than_cutoff() {
+        // (a) An idle account: 3 rows in one window, ALL older than cutoff. The newest of the
+        // three must survive — an idle account never loses the sample the routing gate depends on.
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
+        let repo = store.accounts();
+        seed_account(&repo, &cipher, "acct-1").await;
+
+        let cutoff = 1_000_000_i64;
+        repo.insert_usage_window("acct-1", "primary", 10.0, None, None, cutoff - 300)
+            .await
+            .unwrap(); // older — pruned
+        repo.insert_usage_window("acct-1", "primary", 20.0, None, None, cutoff - 200)
+            .await
+            .unwrap(); // older — pruned
+        repo.insert_usage_window("acct-1", "primary", 30.0, None, None, cutoff - 100)
+            .await
+            .unwrap(); // newest of the three, still < cutoff — KEPT (protect-latest guard)
+
+        let deleted = repo
+            .prune_usage_history_older_than(cutoff, 100)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2, "only the two older rows are pruned");
+
+        let remaining = remaining_recorded_ats(&store, "acct-1").await;
+        assert_eq!(
+            remaining,
+            vec![cutoff - 100],
+            "the newest row must survive even though it is older than cutoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_usage_history_protects_each_window_independently() {
+        // (b) primary + secondary each keep their own latest row, independent of the other window.
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
+        let repo = store.accounts();
+        seed_account(&repo, &cipher, "acct-1").await;
+
+        let cutoff = 1_000_000_i64;
+        repo.insert_usage_window("acct-1", "primary", 10.0, None, None, cutoff - 300)
+            .await
+            .unwrap(); // pruned
+        repo.insert_usage_window("acct-1", "primary", 20.0, None, None, cutoff - 100)
+            .await
+            .unwrap(); // primary latest — kept
+        repo.insert_usage_window("acct-1", "secondary", 40.0, None, None, cutoff - 250)
+            .await
+            .unwrap(); // pruned
+        repo.insert_usage_window("acct-1", "secondary", 50.0, None, None, cutoff - 150)
+            .await
+            .unwrap(); // secondary latest — kept
+
+        let deleted = repo
+            .prune_usage_history_older_than(cutoff, 100)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2);
+
+        let remaining = remaining_recorded_ats(&store, "acct-1").await;
+        let mut expected = vec![cutoff - 150, cutoff - 100];
+        expected.sort_unstable();
+        let mut remaining_sorted = remaining;
+        remaining_sorted.sort_unstable();
+        assert_eq!(remaining_sorted, expected);
+    }
+
+    #[tokio::test]
+    async fn prune_usage_history_never_touches_rows_at_or_after_cutoff() {
+        // (c) Rows >= cutoff are untouched regardless of the guard.
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
+        let repo = store.accounts();
+        seed_account(&repo, &cipher, "acct-1").await;
+
+        let cutoff = 1_000_000_i64;
+        repo.insert_usage_window("acct-1", "primary", 20.0, None, None, cutoff)
+            .await
+            .unwrap(); // == cutoff — kept (not strictly before cutoff)
+        repo.insert_usage_window("acct-1", "primary", 30.0, None, None, cutoff + 500)
+            .await
+            .unwrap(); // newer — kept
+
+        let deleted = repo
+            .prune_usage_history_older_than(cutoff, 100)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0, "nothing is strictly before cutoff and prunable");
+
+        let remaining = remaining_recorded_ats(&store, "acct-1").await;
+        assert_eq!(remaining, vec![cutoff, cutoff + 500]);
+    }
+
+    #[tokio::test]
+    async fn prune_usage_history_keeps_single_row_group() {
+        // (d) A group with exactly one row (older than cutoff) is kept — it's trivially the max.
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
+        let repo = store.accounts();
+        seed_account(&repo, &cipher, "acct-1").await;
+
+        let cutoff = 1_000_000_i64;
+        repo.insert_usage_window("acct-1", "primary", 10.0, None, None, cutoff - 100)
+            .await
+            .unwrap();
+
+        let deleted = repo
+            .prune_usage_history_older_than(cutoff, 100)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(
+            remaining_recorded_ats(&store, "acct-1").await,
+            vec![cutoff - 100]
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_usage_history_batches_across_many_deletable_rows() {
+        // (e) Many deletable rows in one window, forced through several small batches; the
+        // window's single newest row (also older than cutoff) must still survive.
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
+        let repo = store.accounts();
+        seed_account(&repo, &cipher, "acct-1").await;
+
+        let cutoff = 1_000_000_i64;
+        // 9 deletable rows + 1 protected newest row (all < cutoff), batch_size = 2.
+        for i in 0..9 {
+            repo.insert_usage_window(
+                "acct-1",
+                "primary",
+                1.0,
+                None,
+                None,
+                cutoff - 1000 + i as i64,
+            )
+            .await
+            .unwrap();
+        }
+        repo.insert_usage_window("acct-1", "primary", 99.0, None, None, cutoff - 10)
+            .await
+            .unwrap(); // newest of the group — kept
+
+        let deleted = repo
+            .prune_usage_history_older_than(cutoff, 2)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 9, "all 9 deletable rows removed across batches");
+        assert_eq!(
+            remaining_recorded_ats(&store, "acct-1").await,
+            vec![cutoff - 10]
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_usage_history_protects_latest_per_account_independently() {
+        // (f) Two accounts: each account's per-window latest is protected independently of the
+        // other account's rows.
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
+        let repo = store.accounts();
+        seed_account(&repo, &cipher, "acct-1").await;
+        seed_account(&repo, &cipher, "acct-2").await;
+
+        let cutoff = 1_000_000_i64;
+        repo.insert_usage_window("acct-1", "primary", 10.0, None, None, cutoff - 300)
+            .await
+            .unwrap(); // pruned
+        repo.insert_usage_window("acct-1", "primary", 20.0, None, None, cutoff - 100)
+            .await
+            .unwrap(); // acct-1 latest — kept
+        repo.insert_usage_window("acct-2", "primary", 40.0, None, None, cutoff - 250)
+            .await
+            .unwrap(); // pruned
+        repo.insert_usage_window("acct-2", "primary", 50.0, None, None, cutoff - 150)
+            .await
+            .unwrap(); // acct-2 latest — kept
+
+        let deleted = repo
+            .prune_usage_history_older_than(cutoff, 100)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2);
+
+        assert_eq!(
+            remaining_recorded_ats(&store, "acct-1").await,
+            vec![cutoff - 100]
+        );
+        assert_eq!(
+            remaining_recorded_ats(&store, "acct-2").await,
+            vec![cutoff - 150]
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_usage_history_groups_null_window_rows_via_null_safe_is() {
+        // NULL-window rows must group together for the protect-latest guard: a naive `=`
+        // comparison evaluates to NULL (not true) when both sides are NULL, so two NULL-window
+        // rows would never compare equal and the guard would misbehave. This proves the
+        // implementation uses null-safe `IS` instead.
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
+        let repo = store.accounts();
+        seed_account(&repo, &cipher, "acct-1").await;
+
+        let cutoff = 1_000_000_i64;
+        insert_null_window_usage(&store, "acct-1", 10.0, cutoff - 300).await; // pruned
+        insert_null_window_usage(&store, "acct-1", 20.0, cutoff - 200).await; // pruned
+        insert_null_window_usage(&store, "acct-1", 30.0, cutoff - 100).await; // newest NULL-window row — kept
+                                                                              // A normal "primary" row too, to prove NULL and "primary" don't cross-protect each other.
+        repo.insert_usage_window("acct-1", "primary", 99.0, None, None, cutoff - 400)
+            .await
+            .unwrap(); // primary group's only row — kept (single-row group, it's the max)
+
+        let deleted = repo
+            .prune_usage_history_older_than(cutoff, 100)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2, "only the two older NULL-window rows are pruned");
+
+        let mut remaining = remaining_recorded_ats(&store, "acct-1").await;
+        remaining.sort_unstable();
+        let mut expected = vec![cutoff - 400, cutoff - 100];
+        expected.sort_unstable();
+        assert_eq!(remaining, expected);
+    }
+
+    #[tokio::test]
+    async fn prune_usage_history_zero_or_negative_batch_size_is_a_no_op() {
+        // Mirrors RequestLogRepo::prune_older_than's guard: a non-positive batch_size must not
+        // loop forever and must not delete anything.
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
+        let repo = store.accounts();
+        seed_account(&repo, &cipher, "acct-1").await;
+
+        let cutoff = 1_000_000_i64;
+        repo.insert_usage_window("acct-1", "primary", 10.0, None, None, cutoff - 300)
+            .await
+            .unwrap();
+        repo.insert_usage_window("acct-1", "primary", 20.0, None, None, cutoff - 100)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.prune_usage_history_older_than(cutoff, 0)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            repo.prune_usage_history_older_than(cutoff, -5)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(remaining_recorded_ats(&store, "acct-1").await.len(), 2);
     }
 
     #[test]
