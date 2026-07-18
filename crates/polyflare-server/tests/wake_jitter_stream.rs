@@ -14,6 +14,15 @@
 //! 2. `two_concurrent_waiters_on_the_same_account_stay_in_lockstep_when_jitter_is_zero` — the
 //!    `wake_jitter_ms = 0` disable-lever baseline: the two waiters' re-select times stay close
 //!    together (today's exact pre-B10 lockstep behavior), proving B10 changes nothing when off.
+//!
+//! B10 Task 2 additionally extends both tests (rather than adding new ones — the stream-level
+//! desync + both-served properties were already fully proven by Task 1's two tests above) to
+//! subscribe to `state.log_bus` BEFORE firing the waiters and assert the content-free
+//! `wake_jitter_applied_ms` field on the resulting `StarvationSignal`/`LogEvent`s: (1) with
+//! `wake_jitter_ms > 0` the two waiters' applied offsets DIFFER (an operator can see spreading is
+//! actually active, not just infer it from timing), and (2) with `wake_jitter_ms = 0` both applied
+//! offsets are `0` (the disable lever leaves the observable itself inert too). Both assertions also
+//! reuse `observability.rs`'s forbidden-word content-safety idiom on the emitted messages.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -191,6 +200,57 @@ fn json_body() -> Bytes {
     )
 }
 
+/// B10 Task 2: drains every `kind == "starvation"` event currently queued on a `LogBus` receiver
+/// (non-blocking — both waiters have already fully completed by the time this is called, so every
+/// `StarvationSignal` they emitted is already published). Mirrors
+/// `observability.rs::starvation_signal_log_event_*`'s content-safety idiom, applied here at the
+/// e2e/`LogBus` layer instead of the unit-test/`tracing`-capture layer — the same struct, a
+/// different, equally authoritative observation point.
+fn drain_starvation_events(
+    rx: &mut tokio::sync::broadcast::Receiver<polyflare_server::log_bus::LogEvent>,
+) -> Vec<polyflare_server::log_bus::LogEvent> {
+    let mut out = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if ev.kind == "starvation" {
+            out.push(ev);
+        }
+    }
+    out
+}
+
+/// B10 Task 2: pulls the `wake_jitter_applied_ms=<N>` value out of a starvation `LogEvent.message`
+/// — plain digit-parsing (no regex dependency in this crate), matching
+/// `observability.rs::to_log_event`'s fixed `"... wake_jitter_applied_ms={}"` suffix exactly.
+fn extract_wake_jitter_applied_ms(message: &str) -> u64 {
+    let marker = "wake_jitter_applied_ms=";
+    let start = message
+        .find(marker)
+        .unwrap_or_else(|| panic!("message missing `{marker}`: {message}"))
+        + marker.len();
+    let digits: String = message[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("could not parse wake_jitter_applied_ms from: {message}"))
+}
+
+/// B10 Task 2: the same forbidden-word content-safety check `observability.rs`'s
+/// `starvation_signal_log_event_is_content_free` runs, reused here at the e2e layer — a starvation
+/// `LogEvent` fired through the REAL Layer-2 wait path must be exactly as content-free as the
+/// hand-built unit-test one.
+fn assert_content_free(message: &str) {
+    for forbidden in [
+        "bearer", "body", "content", "delta", "text", "input", "message\":",
+    ] {
+        assert!(
+            !message.to_lowercase().contains(forbidden),
+            "forbidden content `{forbidden}` leaked into starvation log event: {message}"
+        );
+    }
+}
+
 async fn collect_body(resp: axum::response::Response) -> (axum::http::StatusCode, String) {
     let status = resp.status();
     let mut data = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -253,6 +313,11 @@ async fn two_concurrent_waiters_on_the_same_account_desync_when_jitter_is_positi
     let exec = Arc::new(RecordingExecutor::new());
     let wake_jitter_ms = 4000u64;
     let state = build_state(store, cipher, exec.clone(), wake_jitter_ms);
+    // B10 Task 2: subscribe BEFORE firing either waiter so no `StarvationSignal` `LogEvent` can be
+    // published before this receiver exists (mirrors `LogBus::subscribe`'s own doc — the
+    // ring-buffer lock makes "subscribe first" race-free either way, but this keeps ordering
+    // obvious).
+    let (_backfill, mut log_rx) = state.log_bus.subscribe();
 
     let fire_at = now();
     state
@@ -330,6 +395,42 @@ async fn two_concurrent_waiters_on_the_same_account_desync_when_jitter_is_positi
         "positive jitter must desync the two waiters' wake/re-select times (gap={gap:?}, \
          calls={calls:?})"
     );
+
+    // B10 Task 2: the content-free observable — both waiters must have fired a `StarvationSignal`
+    // recording the applied jitter, and (since `key_a`/`key_b` were chosen to hash to PREDICTED
+    // offsets at least 1000ms apart within the 4000ms window) the two APPLIED offsets recorded on
+    // the real, end-to-end-emitted signals must differ too — an operator can see spreading is
+    // active straight from the signal, not just infer it from timing.
+    let starvation_events = drain_starvation_events(&mut log_rx);
+    assert_eq!(
+        starvation_events.len(),
+        2,
+        "both waiters must each emit exactly one starvation signal: {starvation_events:?}"
+    );
+    let applied: Vec<u64> = starvation_events
+        .iter()
+        .map(|ev| {
+            assert_content_free(&ev.message);
+            assert!(
+                ev.message.contains("reason=starvation_wait_recovered"),
+                "both waiters were genuinely served, so both signals must carry the recovered \
+                 reason: {}",
+                ev.message
+            );
+            let applied_ms = extract_wake_jitter_applied_ms(&ev.message);
+            assert!(
+                applied_ms <= wake_jitter_ms,
+                "applied jitter must never exceed the configured window: {applied_ms} > \
+                 {wake_jitter_ms}"
+            );
+            applied_ms
+        })
+        .collect();
+    assert_ne!(
+        applied[0], applied[1],
+        "the two waiters' RECORDED applied jitter must differ — the content-free observable must \
+         actually reflect the desync, not just a constant: {applied:?}"
+    );
 }
 
 /// (2) The `wake_jitter_ms = 0` disable-lever baseline: the two waiters' re-select times stay
@@ -348,6 +449,8 @@ async fn two_concurrent_waiters_on_the_same_account_stay_in_lockstep_when_jitter
 
     let exec = Arc::new(RecordingExecutor::new());
     let state = build_state(store, cipher, exec.clone(), 0);
+    // B10 Task 2: subscribe BEFORE firing either waiter — see the sibling test's doc.
+    let (_backfill, mut log_rx) = state.log_bus.subscribe();
 
     let fire_at = now();
     state
@@ -413,4 +516,24 @@ async fn two_concurrent_waiters_on_the_same_account_stay_in_lockstep_when_jitter
         "with wake_jitter_ms=0 the two waiters must wake at (statistically) the SAME instant — \
          today's exact pre-B10 lockstep behavior (gap={gap:?}, calls={calls:?})"
     );
+
+    // B10 Task 2: the disable-lever baseline for the content-free observable too — with
+    // `wake_jitter_ms=0` BOTH waiters' recorded applied jitter must be exactly `0` (never merely
+    // "small" or "equal to each other by coincidence"), proving the observable itself goes fully
+    // inert under the default, not just the timing.
+    let starvation_events = drain_starvation_events(&mut log_rx);
+    assert_eq!(
+        starvation_events.len(),
+        2,
+        "both waiters must each emit exactly one starvation signal: {starvation_events:?}"
+    );
+    for ev in &starvation_events {
+        assert_content_free(&ev.message);
+        assert_eq!(
+            extract_wake_jitter_applied_ms(&ev.message),
+            0,
+            "wake_jitter_ms=0 must record zero applied jitter on the signal: {}",
+            ev.message
+        );
+    }
 }
