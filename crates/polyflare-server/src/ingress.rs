@@ -13,9 +13,9 @@ use axum::response::{IntoResponse, Response};
 use polyflare_anthropic::AnthropicToResponses;
 use polyflare_codex::oauth::{classify_failure, should_refresh, token_exp, OAuthError};
 use polyflare_core::{
-    Account, AccountId, AccountSnapshot, Continuity, ContinuityDirective, NoopContinuity, Prepared,
-    PreparedRequest, Provider, RecoveryPlan, RequestCtx, ResponseStream, SelectionCtx, Selector,
-    SessionKey, Tier, Translator, WatchdogArm,
+    Account, AccountId, AccountSnapshot, BackoffKind, Continuity, ContinuityDirective,
+    NoopContinuity, Prepared, PreparedRequest, Provider, RecoveryPlan, RequestCtx, ResponseStream,
+    SelectionCtx, Selector, SessionKey, Tier, Translator, WatchdogArm,
 };
 use polyflare_store::{PlainTokens, RequestLogRecord, RequestLogRepo};
 
@@ -46,7 +46,6 @@ fn unix_now() -> i64 {
 const PERSIST_MAX_ATTEMPTS: u32 = 3;
 /// Fixed backoff between persist retries (small — the write is on the hot lock).
 const PERSIST_RETRY_BACKOFF: Duration = Duration::from_millis(100);
-
 
 /// Map a reasoning-effort string to a routing `Tier` (the subagent-tier signal the
 /// `cache_affinity_tier` strategy reads). `minimal`/`low` → Low, `medium` → Medium, `high` → High.
@@ -118,7 +117,11 @@ async fn record_failure(state: &AppState, id: &AccountId, err: &WatchdogError, n
     if let Some(sig) = signal {
         if let Some(code) = &sig.error_code {
             if let Some(status) = classify_failure(code).status() {
-                let _ = state.store.accounts().update_status(id.as_str(), status).await;
+                let _ = state
+                    .store
+                    .accounts()
+                    .update_status(id.as_str(), status)
+                    .await;
                 return;
             }
         }
@@ -436,6 +439,87 @@ async fn resolve_core_account(
     ))
 }
 
+/// B5 Task 3 — Layer 1: serve the soonest `ErrorBackoff` account IMMEDIATELY (no wait) when the
+/// caller's own selection just found the eligible pool empty. An error-backoff account is a
+/// *probably-fine* soft signal (a short transient-upstream-error window) — better to try it than a
+/// fast 503. Called at every empty-pool site in `responses_handler_impl`/`run_failover_loop`;
+/// returns `None` when Layer 1 does not apply, and the CALLER must fall through to today's
+/// behavior (a 503/502, unchanged) — this function never itself produces the empty-pool error.
+///
+/// # The GUARD (ported from codex-lb `logic.py:499-524`)
+/// Only serves-now when there is MORE THAN ONE capability-filtered `ErrorBackoff` account, OR
+/// EXACTLY ONE AND a capability-filtered `HardBlocked` account also exists
+/// (`BackoffCensus::error_backoff_count`/`has_hardblocked`, `selector.backoff_census`). A LONE
+/// error-backoff account with no hard-blocked peer is NOT served-now — this avoids hammering a
+/// single flaky account on every request that happens to arrive while its pool is empty. A
+/// `Cooldown`-kind `soonest_recover` result never applies either (it would 429 again; that's Layer
+/// 2 / Task 4's wait, not implemented here).
+///
+/// # Security floor (inviolable)
+/// `soonest_recover`/`backoff_census` both apply `standard_pool`'s capability pre-filter BEFORE
+/// classifying (`select.rs`), so a cyber request can only ever resolve/count/serve a
+/// `security_work_authorized` account here — structurally never a non-authorized one, regardless of
+/// which account would otherwise recover soonest.
+///
+/// # Reuses the existing resolve+execute path — no new execution machinery
+/// Exactly the same `resolve_core_account` + `execute_recovery` shape `RouteDecision::Recover`'s
+/// `ResendFull` arm and `reroute_cyber_rejection` already use for "reselect after the pool didn't
+/// hand back the original candidate, then relay as an anchorless resend" — Layer 1 is just a
+/// different CANDIDATE SOURCE (`soonest_recover` instead of `selector.pick`) feeding the same
+/// machinery, guarded by the census above.
+#[allow(clippy::too_many_arguments)]
+async fn try_layer1_serve_now(
+    state: &AppState,
+    snapshots: &[AccountSnapshot],
+    selector: &dyn Selector,
+    sel_ctx: &SelectionCtx,
+    req: PreparedRequest,
+    ctx: RequestCtx,
+    session_key: Option<SessionKey>,
+    now: i64,
+    outcome: &mut RouteOutcome,
+) -> Option<Response> {
+    let recovery = selector.soonest_recover(snapshots, sel_ctx)?;
+    if recovery.kind != BackoffKind::ErrorBackoff {
+        // Cooldown-kind ⇒ Layer 2 territory (the keepalive wait, Task 4) — not Layer 1.
+        return None;
+    }
+    let census = selector.backoff_census(snapshots, sel_ctx);
+    let guard_satisfied = census.error_backoff_count > 1
+        || (census.error_backoff_count == 1 && census.has_hardblocked);
+    if !guard_satisfied {
+        return None;
+    }
+
+    let fresh = recovery.account_id;
+    state.runtime.record_selected(&fresh, now);
+    outcome.account_id = Some(fresh.as_str().to_string());
+    let (account, provider) = match resolve_core_account(state, &fresh, now).await {
+        Ok(a) => a,
+        Err(r) => return Some(r),
+    };
+    let health_id = fresh.clone(); // `fresh` is moved into the executor below.
+    let response = match execute_recovery(
+        state.executor_for(provider).as_ref(),
+        state.continuity.clone(),
+        req,
+        &account,
+        fresh,
+        ctx,
+        session_key,
+        state.runtime.clone(),
+    )
+    .await
+    {
+        Ok(stream) => stream_response(stream),
+        Err(e) => {
+            record_failure(state, &health_id, &e, unix_now()).await;
+            (StatusCode::BAD_GATEWAY, "upstream error").into_response()
+        }
+    };
+    Some(response)
+}
+
 /// TA6(b) Task 2: react to a `WatchdogError::CapabilityRejection` surfaced by Task 1's Armed-path
 /// peek — the current owner cannot serve `cyber_policy`-gated (security) work. Reuses the EXACT
 /// `ResendFull`/`execute_recovery` machinery `RouteDecision::Recover` already uses (see
@@ -492,9 +576,9 @@ async fn reroute_cyber_rejection(
         Err(r) => return r,
     };
     let health_id = fresh.clone(); // `fresh` is moved into the executor below.
-    // TA6(b) Task 3: captured BEFORE `session_key` moves into `execute_recovery` below — the stamp
-    // (on success) is what makes the NEXT turn on this session pre-filter from the start instead
-    // of paying the reject-and-move cost again.
+                                   // TA6(b) Task 3: captured BEFORE `session_key` moves into `execute_recovery` below — the stamp
+                                   // (on success) is what makes the NEXT turn on this session pre-filter from the start instead
+                                   // of paying the reject-and-move cost again.
     let session_key_for_stamp = session_key.clone();
     match execute_recovery(
         state.executor_for(provider).as_ref(),
@@ -613,6 +697,24 @@ async fn run_failover_loop(
         let fresh = match selector.pick(&candidates, sel_ctx) {
             Some(id) => id,
             None => {
+                // B5 Task 3 — Layer 1: before surfacing the exhaustion error below, try the
+                // guarded serve-soonest-error-backoff candidate over the SAME `candidates` (already
+                // `exclude_tried`'d, so an account this request already tried is never re-served).
+                if let Some(resp) = try_layer1_serve_now(
+                    state,
+                    &candidates,
+                    selector,
+                    sel_ctx,
+                    resend_req,
+                    ctx,
+                    session_key,
+                    now,
+                    outcome,
+                )
+                .await
+                {
+                    return resp;
+                }
                 // SECURITY FLOOR: the flag is never reset — a filtered exhaustion is the distinct
                 // security 503, never an unfiltered fallback. Otherwise, ordinary exhaustion
                 // (e.g. a single-account pool whose only account just failed) surfaces exactly
@@ -921,9 +1023,9 @@ async fn responses_handler_impl_with_max_attempts(
                     Err(r) => return (r, outcome),
                 };
                 let health_id = id.clone(); // `id` is moved into the executor below.
-                // TA6(b) Task 2: capture the recovery plan + a `ctx` clone BEFORE `prepared`/`ctx`
-                // move into the executor below, so a `CapabilityRejection` can trigger the cyber
-                // reselect+resend (`reroute_cyber_rejection`) without re-preparing the request.
+                                            // TA6(b) Task 2: capture the recovery plan + a `ctx` clone BEFORE `prepared`/`ctx`
+                                            // move into the executor below, so a `CapabilityRejection` can trigger the cyber
+                                            // reselect+resend (`reroute_cyber_rejection`) without re-preparing the request.
                 let recovery_for_cyber = prepared.directive.recovery.clone();
                 let ctx_for_cyber = ctx.clone();
                 // B4 Task 4 — CONTINUITY OWNERSHIP gate (see the plan's Global Constraints): the
@@ -1010,7 +1112,23 @@ async fn responses_handler_impl_with_max_attempts(
                     RecoveryPlan::ResendFull { anchorless_req } => {
                         let fresh = match selector.pick(&snapshots, &sel_ctx) {
                             Some(id) => id,
-                            None => return (no_eligible(), outcome),
+                            None => {
+                                // B5 Task 3 — Layer 1: guarded serve-soonest-error-backoff before
+                                // the 503, over the SAME snapshots the pick above just exhausted.
+                                let layer1 = try_layer1_serve_now(
+                                    &state,
+                                    &snapshots,
+                                    selector.as_ref(),
+                                    &sel_ctx,
+                                    anchorless_req,
+                                    ctx,
+                                    session_key,
+                                    now,
+                                    &mut outcome,
+                                )
+                                .await;
+                                return (layer1.unwrap_or_else(no_eligible), outcome);
+                            }
                         };
                         state.runtime.record_selected(&fresh, now);
                         outcome.account_id = Some(fresh.as_str().to_string());
@@ -1101,12 +1219,45 @@ async fn responses_handler_impl_with_max_attempts(
                                     }
                                 }
                             }
-                            None => no_eligible(),
+                            None => {
+                                // B5 Task 3 — Layer 1: guarded serve-soonest-error-backoff before
+                                // the 503. `prepared.req` is still owned here (see the comment
+                                // above — only `directive.recovery` was moved by the outer match).
+                                try_layer1_serve_now(
+                                    &state,
+                                    &snapshots,
+                                    selector.as_ref(),
+                                    &sel_ctx,
+                                    prepared.req,
+                                    ctx,
+                                    session_key,
+                                    now,
+                                    &mut outcome,
+                                )
+                                .await
+                                .unwrap_or_else(no_eligible)
+                            }
                         }
                     }
                 }
             }
-            RouteDecision::NoEligibleAccount => no_eligible(),
+            RouteDecision::NoEligibleAccount => {
+                // B5 Task 3 — Layer 1: the unowned first-attempt pick found the eligible pool
+                // empty; try the guarded serve-soonest-error-backoff candidate before the 503.
+                try_layer1_serve_now(
+                    &state,
+                    &snapshots,
+                    selector.as_ref(),
+                    &sel_ctx,
+                    prepared.req,
+                    ctx,
+                    session_key,
+                    now,
+                    &mut outcome,
+                )
+                .await
+                .unwrap_or_else(no_eligible)
+            }
         };
     (response, outcome)
 }
