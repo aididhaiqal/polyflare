@@ -83,6 +83,9 @@ pub async fn resolve_control_account(
     let selector = state.selector_for(None);
     let sel_ctx = SelectionCtx {
         now,
+        // C9 Task 3: startup-resolved, never a per-request env read (mirrors the `/responses`/
+        // `/v1/messages` sel_ctx sites in `crate::ingress`).
+        inflight_penalty_pct: state.inflight_penalty_pct,
         ..Default::default()
     };
 
@@ -469,6 +472,7 @@ mod tests {
             stream_idle_timeout: Duration::from_secs(300),
             soft_drain_enabled: true,
             runtime: Default::default(),
+            inflight_penalty_pct: 2.5,
         })
     }
 

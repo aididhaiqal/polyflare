@@ -66,7 +66,8 @@ async fn state(soft_drain_enabled: bool) -> Arc<AppState> {
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: Duration::from_secs(60),
         starvation_heartbeat: Duration::from_secs(10),
-        wake_jitter_ms: 0,
+        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: Duration::from_secs(300),
         soft_drain_enabled,
@@ -93,6 +94,7 @@ fn ctx(now: i64, seed: u64) -> SelectionCtx {
         rng_seed: Some(seed),
         session_id: None,
         tier: None,
+        inflight_penalty_pct: 0.0,
     }
 }
 

@@ -107,7 +107,8 @@ async fn spawn_polyflare(upstream: String, idle: Duration) -> String {
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: Duration::from_secs(60),
         starvation_heartbeat: Duration::from_secs(10),
-        wake_jitter_ms: 0,
+        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         // The field under test: everything else here is boilerplate identical to every other
         // e2e harness in this crate (see `tests/e2e_passthrough.rs`).

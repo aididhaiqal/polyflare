@@ -171,6 +171,13 @@ pub struct AppState {
     /// `POLYFLARE_SOFT_DRAIN_ENABLED`'s unset-default (mirrors `enforce_client_keys`'s doc above for
     /// why test harnesses hardcode a value here).
     pub soft_drain_enabled: bool,
+    /// C9 Task 3: the in-flight soft-penalty pct (`POLYFLARE_INFLIGHT_PENALTY_PCT`, resolved ONCE
+    /// at startup by `crate::config::inflight_penalty_pct_from_env` — never read per-request).
+    /// Copied onto each per-request `SelectionCtx.inflight_penalty_pct` at the selection sites in
+    /// `crate::ingress`/`crate::control`, which `polyflare_core::select`'s `eligibility()` folds
+    /// into `eff_used`/`eff_secondary_used` as `in_flight * inflight_penalty_pct`. `0.0` ⇒ the
+    /// disable lever (in_flight still tracked, never folded into the weight).
+    pub inflight_penalty_pct: f64,
 }
 
 impl AppState {

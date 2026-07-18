@@ -159,7 +159,22 @@ pub enum BackoffKind {
 /// — when the eligible pool is empty but accounts sit in error-backoff, it serves the
 /// soonest-to-recover instead of failing. This verdict (surfacing `recover_at`) is the foundation
 /// for that; the actual serve-soonest / wait selection is B5 Task 2 onward — out of scope here.
-fn eligibility(s: &AccountSnapshot, now: i64) -> Eligibility<'_> {
+///
+/// C9 Task 3 (the in-flight soft penalty): on the `Eligible` path only, `penalty_pct` folds
+/// `AccountSnapshot.in_flight` into BOTH `eff_used` and `eff_secondary_used` — faithfully
+/// mirroring codex-lb `load_balancer.py:2251-2263`'s `inflight_pressure_pct = in_flight *
+/// PENALTY; effective_used_percent = min(100, used_percent + pressure_pct)` (and the same for the
+/// secondary window). This is a SCORING-INPUT change only: it happens at `Candidate` construction,
+/// AFTER the hard eligibility gates above have already decided Eligible/InBackoff/HardBlocked, so
+/// a busy account can never be pushed out of the eligible pool by this fold — it only gets less
+/// weight once it's already in. **The should_drain coupling decision (C9 plan Task 3 CAUTION,
+/// codex-lb-faithful choice):** because `Candidate::should_drain` reads `eff_used`/
+/// `eff_secondary_used` (not the raw snapshot), a heavily in-flight account's PRESSURE can push it
+/// past the `should_drain` threshold (≥85/≥90) the same way raw usage does — this is INTENTIONAL,
+/// matching codex-lb's single-effective-used-percent design, and is desirable: a busy account
+/// should be de-preferred both by weight AND by the health-tier drain pool, not just one. See
+/// `should_drain_coupling_*` tests below for the proof.
+fn eligibility(s: &AccountSnapshot, now: i64, penalty_pct: f64) -> Eligibility<'_> {
     // Terminal / operator-held: never eligible, and no known recovery time (logic.py:444-447).
     if matches!(
         s.status.as_str(),
@@ -246,10 +261,16 @@ fn eligibility(s: &AccountSnapshot, now: i64) -> Eligibility<'_> {
         eff_last_error_at = None;
     }
 
+    // C9 Task 3: the soft penalty, applied last (after recovery/cooldown/backoff have already
+    // settled eff_used/eff_secondary_used) — `min(100.0, ..)` mirrors codex-lb's clamp exactly.
+    // `penalty_pct == 0.0` (the config's `=0` disable lever, and `SelectionCtx`'s `Default`) is a
+    // pure no-op: `in_flight * 0.0 == 0.0` for any `in_flight`, so this is a byte-for-byte
+    // rollback to pre-C9 scoring.
+    let pressure_pct = s.in_flight as f64 * penalty_pct;
     Eligibility::Eligible(Candidate {
         snap: s,
-        eff_used,
-        eff_secondary_used,
+        eff_used: (eff_used + pressure_pct).min(100.0),
+        eff_secondary_used: (eff_secondary_used + pressure_pct).min(100.0),
         eff_error_count,
         eff_last_error_at,
     })
@@ -281,7 +302,7 @@ pub(crate) fn soonest_recover(
     snapshots
         .iter()
         .filter(|s| !ctx.require_security_work_authorized || s.security_work_authorized)
-        .filter_map(|s| match eligibility(s, ctx.now) {
+        .filter_map(|s| match eligibility(s, ctx.now, ctx.inflight_penalty_pct) {
             Eligibility::InBackoff { recover_at, kind } => Some(Recovery {
                 recover_at,
                 account_id: s.id.clone(),
@@ -315,7 +336,7 @@ pub(crate) fn backoff_census(snapshots: &[AccountSnapshot], ctx: &SelectionCtx) 
         .iter()
         .filter(|s| !ctx.require_security_work_authorized || s.security_work_authorized)
     {
-        match eligibility(s, ctx.now) {
+        match eligibility(s, ctx.now, ctx.inflight_penalty_pct) {
             Eligibility::InBackoff {
                 kind: BackoffKind::ErrorBackoff,
                 ..
@@ -439,7 +460,7 @@ fn standard_pool<'a>(candidates: &'a [AccountSnapshot], ctx: &SelectionCtx) -> V
     let eligible: Vec<Candidate> = candidates
         .iter()
         .filter(|s| !ctx.require_security_work_authorized || s.security_work_authorized)
-        .filter_map(|s| eligibility(s, ctx.now).into_eligible())
+        .filter_map(|s| eligibility(s, ctx.now, ctx.inflight_penalty_pct).into_eligible())
         .collect();
     if eligible.is_empty() {
         return Vec::new();
@@ -599,7 +620,7 @@ impl Selector for CacheAffinityTier {
         let eligible: Vec<Candidate> = candidates
             .iter()
             .filter(|s| !ctx.require_security_work_authorized || s.security_work_authorized)
-            .filter_map(|s| eligibility(s, ctx.now).into_eligible())
+            .filter_map(|s| eligibility(s, ctx.now, ctx.inflight_penalty_pct).into_eligible())
             .collect();
         if eligible.is_empty() {
             return None;
@@ -696,6 +717,15 @@ mod tests {
             rng_seed: Some(seed),
             session_id: None,
             tier: None,
+            inflight_penalty_pct: 0.0,
+        }
+    }
+
+    /// C9 Task 3: `ctx()` with an explicit in-flight penalty pct (the production default is 2.5).
+    fn ctx_penalty(now: i64, seed: u64, penalty_pct: f64) -> SelectionCtx {
+        SelectionCtx {
+            inflight_penalty_pct: penalty_pct,
+            ..ctx(now, seed)
         }
     }
 
@@ -781,6 +811,7 @@ mod tests {
             rng_seed: Some(1),
             session_id: None,
             tier: None,
+            inflight_penalty_pct: 0.0,
         };
         assert_eq!(sel.pick(&[a, b], &c).unwrap().as_str(), "b");
     }
@@ -795,6 +826,7 @@ mod tests {
             rng_seed: Some(1),
             session_id: None,
             tier: None,
+            inflight_penalty_pct: 0.0,
         };
         assert!(sel.pick(&[a], &c).is_none());
     }
@@ -1139,7 +1171,7 @@ mod tests {
     #[test]
     fn eligibility_clean_account_is_eligible() {
         let s = snap("a", "plus", 10.0);
-        assert!(matches!(eligibility(&s, 1000), Eligibility::Eligible(_)));
+        assert!(matches!(eligibility(&s, 1000, 0.0), Eligibility::Eligible(_)));
     }
 
     #[test]
@@ -1148,7 +1180,7 @@ mod tests {
             let mut s = snap("a", "plus", 0.0);
             s.status = status.to_string();
             assert!(
-                matches!(eligibility(&s, 1000), Eligibility::HardBlocked),
+                matches!(eligibility(&s, 1000, 0.0), Eligibility::HardBlocked),
                 "status {status} must be HardBlocked"
             );
         }
@@ -1161,7 +1193,7 @@ mod tests {
         let mut s = snap("a", "plus", 50.0);
         s.status = "rate_limited".to_string();
         s.reset_at = None;
-        assert!(matches!(eligibility(&s, 1000), Eligibility::HardBlocked));
+        assert!(matches!(eligibility(&s, 1000, 0.0), Eligibility::HardBlocked));
     }
 
     #[test]
@@ -1170,7 +1202,7 @@ mod tests {
         let mut s = snap("a", "plus", 50.0);
         s.status = "quota_exceeded".to_string();
         s.reset_at = None;
-        assert!(matches!(eligibility(&s, 1000), Eligibility::HardBlocked));
+        assert!(matches!(eligibility(&s, 1000, 0.0), Eligibility::HardBlocked));
     }
 
     #[test]
@@ -1178,7 +1210,7 @@ mod tests {
         let mut s = snap("a", "plus", 50.0);
         s.status = "rate_limited".to_string();
         s.reset_at = Some(2000);
-        match eligibility(&s, 1500) {
+        match eligibility(&s, 1500, 0.0) {
             Eligibility::InBackoff { recover_at, kind } => {
                 assert_eq!(recover_at, 2000);
                 assert!(matches!(kind, BackoffKind::Cooldown));
@@ -1197,7 +1229,7 @@ mod tests {
         s.status = "rate_limited".to_string();
         s.reset_at = Some(1000); // reset has passed at now=1000 → recovers
         s.cooldown_until = Some(2000); // …but cooldown is still active
-        match eligibility(&s, 1000) {
+        match eligibility(&s, 1000, 0.0) {
             Eligibility::InBackoff { recover_at, kind } => {
                 assert_eq!(
                     recover_at, 2000,
@@ -1213,7 +1245,7 @@ mod tests {
     fn eligibility_cooldown_before_expiry_is_in_backoff_cooldown() {
         let mut s = snap("a", "plus", 0.0);
         s.cooldown_until = Some(5000);
-        match eligibility(&s, 4999) {
+        match eligibility(&s, 4999, 0.0) {
             Eligibility::InBackoff { recover_at, kind } => {
                 assert_eq!(recover_at, 5000);
                 assert!(matches!(kind, BackoffKind::Cooldown));
@@ -1227,7 +1259,7 @@ mod tests {
         let mut s = snap("a", "plus", 0.0);
         s.error_count = 4; // backoff = min(300, 30*2^(4-3)) = 60s
         s.last_error_at = Some(1000);
-        match eligibility(&s, 1030) {
+        match eligibility(&s, 1030, 0.0) {
             Eligibility::InBackoff { recover_at, kind } => {
                 assert_eq!(
                     recover_at, 1060,
@@ -1279,6 +1311,7 @@ mod tests {
             rng_seed: Some(1),
             session_id: None,
             tier: None,
+            inflight_penalty_pct: 0.0,
         };
 
         let sel = CapacityWeighted;
@@ -1311,6 +1344,7 @@ mod tests {
             rng_seed: Some(1),
             session_id: None,
             tier: None,
+            inflight_penalty_pct: 0.0,
         };
 
         let sel = CapacityWeighted;
@@ -1424,6 +1458,7 @@ mod tests {
             rng_seed: Some(1),
             session_id: None,
             tier: None,
+            inflight_penalty_pct: 0.0,
         };
 
         let sel = CapacityWeighted;
@@ -1443,5 +1478,115 @@ mod tests {
         let census = sel.backoff_census(&[a, b], &ctx(0, 1));
         assert_eq!(census.error_backoff_count, 0);
         assert!(!census.has_hardblocked);
+    }
+
+    // ---- C9 Task 3: the in-flight soft penalty ----
+
+    #[test]
+    fn less_busy_account_wins_the_weighted_pick_more_often_than_a_high_inflight_peer() {
+        // (a) Two otherwise-identical eligible accounts (same plan/capacity/secondary_used), but
+        // "busy" carries in_flight=4. At the default-shaped penalty (2.5), that's +10 pressure —
+        // pushed onto secondary_used=79 (89, still under the 90 should_drain line, so this is
+        // purely a WEIGHT effect, not a health-tier exclusion) — enough to skew
+        // `remaining_secondary_credits` (and thus the weighted pick) toward "idle" across enough
+        // seeds, without making "busy" ineligible or excluding it from the health-tier pool.
+        let idle = snap("idle", "pro", 79.0);
+        let mut busy = snap("busy", "pro", 79.0);
+        busy.in_flight = 4;
+
+        let sel = CapacityWeighted;
+        let mut idle_wins = 0;
+        for seed in 0..1000u64 {
+            if sel
+                .pick(&[idle.clone(), busy.clone()], &ctx_penalty(0, seed, 2.5))
+                .unwrap()
+                .as_str()
+                == "idle"
+            {
+                idle_wins += 1;
+            }
+        }
+        assert!(
+            idle_wins > 580,
+            "the less-busy account should win more often, got {idle_wins}/1000"
+        );
+    }
+
+    #[test]
+    fn penalty_pct_zero_is_a_byte_for_byte_rollback() {
+        // (b) `POLYFLARE_INFLIGHT_PENALTY_PCT=0` ⇒ in_flight has ZERO effect on scoring — the
+        // documented disable/rollback lever. "busy" carries a large in_flight (9), but with the
+        // penalty disabled its pick distribution against an otherwise-identical "idle" peer must
+        // be statistically EVEN (no in_flight-driven skew at all — same as pre-C9 selection).
+        let idle = snap("idle", "pro", 79.0);
+        let mut busy = snap("busy", "pro", 79.0);
+        busy.in_flight = 9;
+
+        let sel = CapacityWeighted;
+        let mut idle_wins = 0;
+        for seed in 0..1000u64 {
+            if sel
+                .pick(&[idle.clone(), busy.clone()], &ctx_penalty(0, seed, 0.0))
+                .unwrap()
+                .as_str()
+                == "idle"
+            {
+                idle_wins += 1;
+            }
+        }
+        assert!(
+            (400..600).contains(&idle_wins),
+            "penalty=0 must not skew toward either account, got idle={idle_wins}/1000"
+        );
+    }
+
+    #[test]
+    fn fully_busy_pool_still_selects_someone() {
+        // (c) SOFT PENALTY ONLY (Global Constraints — inviolable): even when EVERY account's
+        // pressure clamps eff_used/eff_secondary_used to 100 (all weights zero ⇒ deterministic
+        // tiebreak), the eligible pool must NEVER go empty — someone is still picked. This is the
+        // structural guarantee that in_flight is a weight, never a hard cap/filter.
+        let mut a = snap("a", "pro", 50.0);
+        a.in_flight = 100;
+        let mut b = snap("b", "pro", 50.0);
+        b.in_flight = 100;
+
+        let sel = CapacityWeighted;
+        let picked = sel.pick(&[a, b], &ctx_penalty(0, 1, 2.5));
+        assert!(
+            picked.is_some(),
+            "a fully-busy pool must still select someone, never empty"
+        );
+    }
+
+    #[test]
+    fn should_drain_coupling_high_inflight_pressure_can_drain_prefer_away_a_busy_account() {
+        // (e) THE should_drain COUPLING DECISION (documented on `eligibility`'s doc above,
+        // codex-lb-faithful choice): pressure feeds eff_used/eff_secondary_used UNIFORMLY, so it
+        // can push `should_drain`'s ≥90 secondary threshold the same way raw usage does.
+        // "pressured" sits at secondary_used=50 (well under the raw 90 threshold) but in_flight=20
+        // at penalty=2.5 adds +50 pressure ⇒ eff_secondary_used=100 ⇒ DRAINING. "healthy" has the
+        // SAME raw secondary_used but in_flight=0 ⇒ no pressure ⇒ stays healthy (tier 0).
+        // `health_tier_pool` prefers the healthy tier whenever it's non-empty, so "pressured" must
+        // lose to "healthy" on EVERY seed once pushed into the draining tier by pressure alone —
+        // this is the intentional, desirable coupling: a busy account is de-preferred both by
+        // weight AND by the health-tier drain pool.
+        let mut pressured = snap("pressured", "pro", 50.0);
+        pressured.in_flight = 20;
+        let healthy = snap("healthy", "pro", 50.0);
+
+        let sel = CapacityWeighted;
+        for seed in 0..20u64 {
+            assert_eq!(
+                sel.pick(
+                    &[pressured.clone(), healthy.clone()],
+                    &ctx_penalty(0, seed, 2.5)
+                )
+                .unwrap()
+                .as_str(),
+                "healthy",
+                "in-flight pressure alone must be able to drain-prefer away the busy account"
+            );
+        }
     }
 }
