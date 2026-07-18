@@ -41,6 +41,31 @@ const SELECT_SESSION: &str = "SELECT session_key, key_strength, owning_account_i
     created_at, updated_at, last_activity_at, required_capabilities \
     FROM continuity_sessions WHERE session_key = ?";
 
+/// One `continuity_sessions` row joined to its owning account's email (TA6(c): operator
+/// session->account affinity visibility). Content-free: no `anchor_response_id`,
+/// `last_input_fingerprint`, `last_input_count`, or `reasoning_cache_ref` — those stay internal
+/// to `SessionRow`, out of scope for this read-only surface.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SessionWithOwner {
+    pub session_key: String,
+    pub key_strength: String,
+    pub owning_account_id: Option<String>,
+    pub owner_email: Option<String>,
+    pub state: String,
+    pub required_capabilities: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_activity_at: i64,
+}
+
+const SELECT_SESSIONS_WITH_OWNER: &str = "SELECT s.session_key, s.key_strength, \
+    s.owning_account_id, a.email AS owner_email, s.state, s.required_capabilities, \
+    s.created_at, s.updated_at, s.last_activity_at \
+    FROM continuity_sessions s \
+    LEFT JOIN accounts a ON a.id = s.owning_account_id \
+    ORDER BY s.last_activity_at DESC \
+    LIMIT ? OFFSET ?";
+
 /// CRUD over the continuity state machine. Cheap to construct (clones the pool handle).
 pub struct ContinuityRepo {
     pool: SqlitePool,
@@ -69,6 +94,31 @@ impl ContinuityRepo {
         .fetch_optional(&self.pool)
         .await?;
         Ok(owner.map(|(o,)| o))
+    }
+
+    /// List `continuity_sessions` rows LEFT JOINed to their owning account's email (a session
+    /// with `owning_account_id IS NULL` — never completed a turn, or its owner was deleted — MUST
+    /// still be returned, with `owner_email = None`; an INNER JOIN would silently drop it).
+    /// Ordered by `last_activity_at DESC` (backed by `idx_continuity_sessions_activity`).
+    pub async fn list_sessions_with_owner(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<SessionWithOwner>, sqlx::Error> {
+        sqlx::query_as::<_, SessionWithOwner>(SELECT_SESSIONS_WITH_OWNER)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// Total count of `continuity_sessions` rows (for the `{total, rows}` pagination envelope).
+    pub async fn count_sessions(&self) -> Result<i64, sqlx::Error> {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM continuity_sessions")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count)
     }
 
     /// Create the session row `state='fresh'` if it does not already exist (idempotent).
@@ -314,6 +364,20 @@ mod tests {
         .unwrap();
     }
 
+    /// Like `seed_account` but with a caller-chosen email, so the list-with-owner tests can prove
+    /// the joined `owner_email` tracks the RIGHT account per row (not just any non-null value).
+    async fn seed_account_with_email(s: &Store, id: &str, email: &str) {
+        sqlx::query(
+            "INSERT INTO accounts (id, email, access_token_enc, refresh_token_enc, id_token_enc, created_at) \
+             VALUES (?, ?, X'00', X'00', X'00', 0)",
+        )
+        .bind(id)
+        .bind(email)
+        .execute(s.pool())
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn completion_records_owner_anchor_and_map() {
         let s = store().await;
@@ -432,5 +496,71 @@ mod tests {
         let row = repo.get_session("skPlain").await.unwrap().unwrap();
         assert!(!row.has_capability("security_work"));
         assert_eq!(row.required_capabilities, None);
+    }
+
+    // ---- TA6(c) Task 1: list sessions with owner email (LEFT JOIN accounts) -------------------
+
+    #[tokio::test]
+    async fn list_sessions_with_owner_left_joins_email_and_orders_by_activity_desc() {
+        let s = store().await;
+        seed_account_with_email(&s, "A", "a@example.com").await;
+        seed_account_with_email(&s, "B", "b@example.com").await;
+        let repo = s.continuity();
+
+        // skA: owned by A, last_activity_at = 300 (most recent).
+        repo.ensure_session("skA", "soft", 1).await.unwrap();
+        repo.record_completion("skA", "soft", "A", "respA", "fp", 1, 300)
+            .await
+            .unwrap();
+        // skB: owned by B, last_activity_at = 200 (oldest).
+        repo.ensure_session("skB", "soft", 1).await.unwrap();
+        repo.record_completion("skB", "soft", "B", "respB", "fp", 1, 200)
+            .await
+            .unwrap();
+        // skNone: NEVER completed a turn -> owning_account_id stays NULL (a fresh session), with
+        // last_activity_at = 250 (middle) so ordering + the LEFT JOIN survival are both proved.
+        repo.ensure_session("skNone", "soft", 250).await.unwrap();
+
+        // (d) count_sessions() == 3.
+        assert_eq!(repo.count_sessions().await.unwrap(), 3);
+
+        // (a) list_sessions_with_owner(10, 0) returns all 3, ordered by last_activity_at DESC.
+        let rows = repo.list_sessions_with_owner(10, 0).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].session_key, "skA");
+        assert_eq!(rows[1].session_key, "skNone");
+        assert_eq!(rows[2].session_key, "skB");
+
+        // (b) each owned row's owner_email matches ITS OWN account, not just any non-null value.
+        assert_eq!(rows[0].owning_account_id.as_deref(), Some("A"));
+        assert_eq!(rows[0].owner_email.as_deref(), Some("a@example.com"));
+        assert_eq!(rows[2].owning_account_id.as_deref(), Some("B"));
+        assert_eq!(rows[2].owner_email.as_deref(), Some("b@example.com"));
+
+        // (c) the NO-owner row survives the LEFT JOIN: owner_email == None, owning_account_id ==
+        // None (an INNER JOIN would silently drop this row instead).
+        assert_eq!(rows[1].owning_account_id, None);
+        assert_eq!(rows[1].owner_email, None);
+        assert_eq!(rows[1].state, "fresh");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_with_owner_paginates_via_limit_and_offset() {
+        let s = store().await;
+        let repo = s.continuity();
+        repo.ensure_session("p1", "soft", 100).await.unwrap();
+        repo.ensure_session("p2", "soft", 200).await.unwrap();
+        repo.ensure_session("p3", "soft", 300).await.unwrap();
+
+        // (e) LIMIT/OFFSET paginate: limit 2 -> first 2 (by last_activity_at DESC: p3, p2); offset
+        // 2 -> the 3rd (p1).
+        let page1 = repo.list_sessions_with_owner(2, 0).await.unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1[0].session_key, "p3");
+        assert_eq!(page1[1].session_key, "p2");
+
+        let page2 = repo.list_sessions_with_owner(2, 2).await.unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].session_key, "p1");
     }
 }
