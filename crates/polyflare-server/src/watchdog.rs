@@ -5,6 +5,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -66,6 +67,56 @@ pub enum WatchdogError {
     CapabilityRejection { capability: &'static str },
 }
 
+/// B4 Task 3 — the commit barrier's detection primitive: whether ANY response byte has reached
+/// the client yet for a given attempt (`docs/superpowers/plans/2026-07-18-phase-b-failover.md`,
+/// Global Constraints: "the loop may retry ONLY before the first byte reaches the client").
+///
+/// A cheap, `Clone`-and-share handle over a single `Arc<AtomicBool>`: the caller (Task 4's loop)
+/// holds one clone and threads another into [`execute_with_watchdog_tracked`] /
+/// [`execute_recovery_tracked`]; [`ObservingStream`] marks it the instant it successfully yields
+/// its FIRST chunk (idempotent on every chunk after — a plain store, no branch needed). Starts
+/// `false`.
+///
+/// # Why every `WatchdogError` is `committed == false` by construction
+/// `execute_with_watchdog`/`execute_with_watchdog_tracked` and `execute_recovery`/
+/// `execute_recovery_tracked` only ever return `Err` BEFORE constructing/returning the
+/// `Ok(ResponseStream)` — every `Err` site in this module runs strictly before `wrap_stream` is
+/// called (a pre-relay executor failure, or a first-frame reject/hard-error caught by the Armed
+/// peek/scan, all documented at each call site below). Once these functions return `Ok`, their job
+/// is done; nothing that happens LATER while the stream is polled (by `stream_response`/axum, well
+/// outside this module) can flow back through their already-returned `Result`. So a witness paired
+/// with any `Err` from these functions is, structurally, always still `false` when read — Task 4
+/// never needs to inspect it for that path, only for the (separate) mid-stream case below.
+///
+/// It only ever becomes `true` once the returned `Ok(ResponseStream)` is ACTUALLY polled by
+/// whoever consumes it and yields a real byte — i.e. strictly after the loop has already handed
+/// the stream off and lost its one chance to retry (retrying past that point would double-relay,
+/// the exact thing the commit barrier exists to prevent). This is why `committed` is threaded as
+/// its own out-of-band signal rather than a field on `WatchdogError`: `WatchdogError` only ever
+/// describes the pre-relay case (see above), while a mid-stream failure never produces a
+/// `WatchdogError` at all — it's an `Err` item inside the already-`Ok` stream (see
+/// `ObservingStream::poll_next`), a completely different point in the control flow.
+#[derive(Clone, Default)]
+pub struct CommitWitness(Arc<AtomicBool>);
+
+impl CommitWitness {
+    /// A fresh, not-yet-committed witness.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `true` once at least one byte of the tracked stream has been yielded to its poller.
+    pub fn is_committed(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    /// Idempotent: called on every successfully-yielded chunk, not just the first — cheaper than a
+    /// load-then-conditional-store, and correctness doesn't depend on it firing only once.
+    fn mark(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// HARD ownership pre-filter: narrow candidates to the pinned owner BEFORE `Selector::pick` (no
 /// Selector-trait change). Owner ineligible ⇒ `Recover`; unowned + empty ⇒ `NoEligibleAccount`.
 pub fn apply_ownership(
@@ -118,6 +169,12 @@ fn input_fingerprint_and_count(req: &PreparedRequest, ctx: &RequestCtx) -> (Stri
 /// Execute a prepared request under the watchdog. Disarmed (no anchor) ⇒ relay + sniff + observe
 /// Completed. Armed ⇒ race the first byte: alive ⇒ rebuild + relay; hard error ⇒ observe Failed +
 /// `Upstream`; silence/empty ⇒ drop the dead stream and recover per the directive.
+///
+/// Signature-identical to every caller today (ingress.rs's three non-failover-loop call sites, and
+/// the wedge test suites) — B4 Task 3 added the commit-barrier signal as a SEPARATE entry point,
+/// [`execute_with_watchdog_tracked`], rather than a new parameter here, specifically so this
+/// function's callers never had to change. This one simply discards a throwaway [`CommitWitness`];
+/// behavior is byte-for-byte identical to before Task 3.
 pub async fn execute_with_watchdog(
     executor: &dyn Executor,
     continuity: Arc<dyn Continuity>,
@@ -126,6 +183,35 @@ pub async fn execute_with_watchdog(
     account_id: AccountId,
     ctx: RequestCtx,
     runtime: Arc<RuntimeStates>,
+) -> Result<ResponseStream, WatchdogError> {
+    execute_with_watchdog_tracked(
+        executor,
+        continuity,
+        prepared,
+        account,
+        account_id,
+        ctx,
+        runtime,
+        CommitWitness::new(),
+    )
+    .await
+}
+
+/// B4 Task 4 hook: identical relay/observe/recovery behavior to [`execute_with_watchdog`] — this
+/// IS that function's body, just also threading a [`CommitWitness`] through to whichever stream
+/// ends up wrapped (or leaving it unmarked on every pre-relay `Err` path — see the type's doc for
+/// why that's always correct). Task 4's loop calls this variant so it can later ask
+/// `commit.is_committed()` without re-deriving first-byte state.
+#[allow(clippy::too_many_arguments)] // mirrors `execute_with_watchdog`; one added handle.
+pub async fn execute_with_watchdog_tracked(
+    executor: &dyn Executor,
+    continuity: Arc<dyn Continuity>,
+    prepared: Prepared,
+    account: &Account,
+    account_id: AccountId,
+    ctx: RequestCtx,
+    runtime: Arc<RuntimeStates>,
+    commit: CommitWitness,
 ) -> Result<ResponseStream, WatchdogError> {
     let Prepared { req, directive } = prepared;
     let session_key = directive.session_key.clone();
@@ -146,6 +232,7 @@ pub async fn execute_with_watchdog(
                 session_key,
                 OutcomeKind::Completed { fp, count },
                 runtime,
+                commit,
             ))
         }
         WatchdogArm::Armed { timeout } => {
@@ -207,6 +294,7 @@ pub async fn execute_with_watchdog(
                                 session_key,
                                 OutcomeKind::Completed { fp, count },
                                 runtime,
+                                commit,
                             ))
                         }
                         ScanOutcome::Silence => {
@@ -225,6 +313,7 @@ pub async fn execute_with_watchdog(
                                 ctx,
                                 session_key,
                                 runtime,
+                                commit,
                             )
                             .await
                         }
@@ -257,6 +346,7 @@ pub async fn execute_with_watchdog(
                         ctx,
                         session_key,
                         runtime,
+                        commit,
                     )
                     .await
                 }
@@ -270,6 +360,12 @@ pub async fn execute_with_watchdog(
 /// place that turns a `RecoveryPlan` into an outcome. Both call sites are valid here for the same
 /// reason: in each, peek-before-relay held for the whole time the dead stream was alive — nothing
 /// was ever relayed to the client — so restarting via `ResendFull`/`SignalClient` is clean.
+/// `commit`: threaded through so the ONE branch that produces a real (re-)relay
+/// (`RecoveryPlan::ResendFull`) can keep tracking commit state for THAT resend attempt — a
+/// full-resend can itself mid-stream-fail after relaying bytes, same as any other attempt. The
+/// other two branches never touch it: `SignalClient` emits a synthetic, always-succeeding one-shot
+/// frame (no failure path to track), and `None` returns `Err` before any stream exists at all (the
+/// witness is correctly left unmarked, i.e. still `false`, in both).
 #[allow(clippy::too_many_arguments)] // internal fn; each param is a distinct, clearly-named handle.
 async fn recover_from_silence(
     executor: &dyn Executor,
@@ -280,10 +376,11 @@ async fn recover_from_silence(
     ctx: RequestCtx,
     session_key: Option<SessionKey>,
     runtime: Arc<RuntimeStates>,
+    commit: CommitWitness,
 ) -> Result<ResponseStream, WatchdogError> {
     match recovery {
         RecoveryPlan::ResendFull { anchorless_req } => {
-            execute_recovery(
+            execute_recovery_tracked(
                 executor,
                 continuity,
                 anchorless_req,
@@ -292,6 +389,7 @@ async fn recover_from_silence(
                 ctx,
                 session_key,
                 runtime,
+                commit,
             )
             .await
         }
@@ -304,6 +402,9 @@ async fn recover_from_silence(
 
 /// Re-execute an anchor-stripped request (Strategy A). Anchorless ⇒ cannot be silent, so no second
 /// watchdog. Sniffs the new id and observes `Recovered`.
+///
+/// Signature-identical to before B4 Task 3 (see [`execute_with_watchdog`]'s doc for why) — a thin
+/// delegator over [`execute_recovery_tracked`] with a throwaway [`CommitWitness`].
 #[allow(clippy::too_many_arguments)] // internal fn; each param is a distinct, clearly-named handle.
 pub async fn execute_recovery(
     executor: &dyn Executor,
@@ -314,6 +415,35 @@ pub async fn execute_recovery(
     ctx: RequestCtx,
     session_key: Option<SessionKey>,
     runtime: Arc<RuntimeStates>,
+) -> Result<ResponseStream, WatchdogError> {
+    execute_recovery_tracked(
+        executor,
+        continuity,
+        anchorless_req,
+        account,
+        account_id,
+        ctx,
+        session_key,
+        runtime,
+        CommitWitness::new(),
+    )
+    .await
+}
+
+/// B4 Task 4 hook: identical behavior to [`execute_recovery`], additionally threading a
+/// [`CommitWitness`] through to the wrapped stream — see [`execute_with_watchdog_tracked`]'s doc
+/// for the general shape.
+#[allow(clippy::too_many_arguments)] // mirrors `execute_recovery`; one added handle.
+pub async fn execute_recovery_tracked(
+    executor: &dyn Executor,
+    continuity: Arc<dyn Continuity>,
+    anchorless_req: PreparedRequest,
+    account: &Account,
+    account_id: AccountId,
+    ctx: RequestCtx,
+    session_key: Option<SessionKey>,
+    runtime: Arc<RuntimeStates>,
+    commit: CommitWitness,
 ) -> Result<ResponseStream, WatchdogError> {
     let stream = executor
         .execute(anchorless_req, account, &ctx)
@@ -327,6 +457,7 @@ pub async fn execute_recovery(
         session_key,
         OutcomeKind::Recovered,
         runtime,
+        commit,
     ))
 }
 
@@ -603,6 +734,11 @@ struct ObservingStream {
     /// known, and the synthetic `signal_client_stream` (not wrapped in `ObservingStream`) is
     /// correctly excluded.
     runtime: Arc<RuntimeStates>,
+    /// B4 Task 3: marked the instant the FIRST chunk is successfully yielded below — a pure
+    /// addition, read by no code in this struct. It does not gate, delay, or otherwise touch relay
+    /// (every chunk is still forwarded unconditionally, in order) or the `record_transient_error`/
+    /// `record_success`/`observe` calls, which fire exactly as before Task 3.
+    commit: CommitWitness,
 }
 
 impl Stream for ObservingStream {
@@ -614,6 +750,11 @@ impl Stream for ObservingStream {
             match &mut this.state {
                 ObserveState::Streaming => match this.inner.as_mut().poll_next(cx) {
                     Poll::Ready(Some(Ok(bytes))) => {
+                        // B4 Task 3: this IS "a byte reached the client" — the commit barrier.
+                        // Idempotent, unconditional, and ordered before the return: by the time any
+                        // LATER poll on this same stream can yield `Err` (the mid-stream-failure
+                        // case), the witness is already `true`.
+                        this.commit.mark();
                         this.sniffer.feed(&bytes);
                         return Poll::Ready(Some(Ok(bytes)));
                     }
@@ -657,6 +798,7 @@ impl Stream for ObservingStream {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // internal fn; each param is a distinct, clearly-named handle.
 fn wrap_stream(
     inner: ResponseStream,
     continuity: Arc<dyn Continuity>,
@@ -665,6 +807,7 @@ fn wrap_stream(
     session_key: Option<SessionKey>,
     kind: OutcomeKind,
     runtime: Arc<RuntimeStates>,
+    commit: CommitWitness,
 ) -> ResponseStream {
     Box::pin(ObservingStream {
         inner,
@@ -676,6 +819,7 @@ fn wrap_stream(
         kind,
         state: ObserveState::Streaming,
         runtime,
+        commit,
     })
 }
 
@@ -706,6 +850,100 @@ mod tests {
             WatchdogError::Continuity.to_string(),
             "continuity recovery unavailable"
         );
+    }
+
+    #[test]
+    fn commit_witness_starts_uncommitted_and_marks_true() {
+        let w = CommitWitness::new();
+        assert!(!w.is_committed(), "a fresh witness starts uncommitted");
+        w.mark();
+        assert!(w.is_committed(), "mark() flips it to committed");
+    }
+
+    #[test]
+    fn commit_witness_clones_share_the_same_underlying_flag() {
+        // A clone must observe a mark made through the ORIGINAL (and vice versa) — this is the
+        // property the caller relies on: hold one clone, thread another into the tracked watchdog
+        // call, and read the held clone back later.
+        let w = CommitWitness::new();
+        let held = w.clone();
+        assert!(!held.is_committed());
+        w.mark();
+        assert!(held.is_committed(), "a clone must see the mark");
+    }
+
+    /// B4 Task 3 Step 1 (failing-first): `ObservingStream` marks the [`CommitWitness`] on its FIRST
+    /// successfully-yielded chunk, and the mark is still visible after a LATER mid-stream error —
+    /// proving "committed" survives past the failure, exactly what Task 4's loop needs to read. This
+    /// tests `ObservingStream` directly (white-box, same module) rather than through
+    /// `execute_with_watchdog_tracked`, isolating the detection primitive from the watchdog/Armed
+    /// peek machinery — the integration-level version (via the public API, a Disarmed request whose
+    /// stream yields a byte then errors) lives in `tests/commit_barrier.rs`.
+    #[tokio::test]
+    async fn observing_stream_marks_commit_on_first_byte_and_it_survives_a_later_error() {
+        let inner: ResponseStream = Box::pin(stream::iter(vec![
+            Ok::<Bytes, ExecError>(Bytes::from_static(b"data: first\n\n")),
+            Err(ExecError::Stream("mid-stream drop".into())),
+        ]));
+        let commit = CommitWitness::new();
+        let mut observing = ObservingStream {
+            inner,
+            sniffer: ResponseIdSniffer::new(),
+            continuity: Arc::new(polyflare_core::NoopContinuity),
+            ctx: RequestCtx::default(),
+            account: AccountId::from("acct"),
+            session_key: None,
+            kind: OutcomeKind::Completed {
+                fp: String::new(),
+                count: 0,
+            },
+            state: ObserveState::Streaming,
+            runtime: Arc::new(RuntimeStates::new()),
+            commit: commit.clone(),
+        };
+
+        assert!(
+            !commit.is_committed(),
+            "nothing relayed yet before the first poll"
+        );
+        let first = Pin::new(&mut observing).next().await;
+        assert!(matches!(first, Some(Ok(_))), "first chunk relays cleanly");
+        assert!(
+            commit.is_committed(),
+            "committed the instant the first byte was yielded"
+        );
+
+        let second = Pin::new(&mut observing).next().await;
+        assert!(
+            matches!(second, Some(Err(_))),
+            "the mid-stream error is still forwarded unchanged"
+        );
+        assert!(
+            commit.is_committed(),
+            "committed stays true across the mid-stream failure — it must never un-commit"
+        );
+
+        // A3 regression: `record_transient_error` still fired for the mid-stream drop, unperturbed
+        // by the new commit-tracking field.
+        let mut tracked = vec![polyflare_core::AccountSnapshot::new("acct")];
+        observing.runtime.overlay(&mut tracked, 0);
+        assert_eq!(
+            tracked[0].error_count, 1,
+            "record_transient_error still bumped the count exactly once"
+        );
+    }
+
+    /// Regression: a pre-relay failure never marks the witness — proven directly against
+    /// `CommitWitness`'s own semantics (a witness that's never had `mark()` called on it, or a
+    /// clone of one, always reports `false`). The public-API version (an executor `Err` through
+    /// `execute_with_watchdog_tracked`) lives in `tests/commit_barrier.rs`.
+    #[test]
+    fn a_witness_never_marked_stays_uncommitted() {
+        let w = CommitWitness::new();
+        // Simulates every pre-relay `Err` path in this module: the witness is constructed, handed
+        // in, and the function returns `Err` WITHOUT ever calling `wrap_stream` (so `.mark()` is
+        // never reached) — see `CommitWitness`'s doc for the exhaustive list of such sites.
+        assert!(!w.is_committed());
     }
 
     #[test]
