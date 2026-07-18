@@ -8,6 +8,7 @@ pub mod select;
 pub mod traits;
 pub mod translate;
 pub mod types;
+pub mod weekly_pace;
 
 pub use continuity::NoopContinuity;
 pub use format::Format;
