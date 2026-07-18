@@ -1,6 +1,7 @@
 //! PolyFlare neutral core: formats, translator registry, core types, and the trait spine.
 
 pub mod continuity;
+pub mod depletion;
 pub mod format;
 pub mod provider;
 pub mod select;
