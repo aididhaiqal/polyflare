@@ -389,11 +389,22 @@ async fn bounded_wait_never_exceeds_the_budget_even_if_the_account_never_recover
 /// until `T` with budget > `T` ⇒ after the (short, real) wait, it IS re-selected and served —
 /// proving the post-wait re-select re-fetched + re-overlaid with a FRESH `now` rather than reusing
 /// the stale pre-wait snapshot (which would have kept seeing the cooldown as still active forever).
+///
+/// Anti-flake: same class/fix as sibling test (6)'s (see that test's doc for the full mechanism);
+/// reproduced independently while investigating (6) — running many `starvation_layer2` processes
+/// CONCURRENTLY (approximating `cargo test --workspace`'s full-parallel-load CPU contention) failed
+/// THIS test's `body.contains(": keepalive")` assertion at a similar rate to (6)'s, via the exact
+/// same mechanism (the pre-`build_state` `reset_at = now() + 2` margin consumed by setup I/O before
+/// the wait loop's first heartbeat tick). Fixed identically: re-anchor `reset_at` to a real, short
+/// window via `update_status_and_reset` immediately before the handler call, widened from 2s to 4s,
+/// with `heartbeat` shrunk from 300ms to 150ms.
 #[tokio::test]
 async fn re_snapshot_after_the_wait_serves_a_now_recovered_account() {
     let (store, cipher, _dir) = spawn_store().await;
+    // Far-future placeholder — re-anchored to a real, short margin immediately before the request
+    // fires below (see this test's doc for why).
     let mut a = account("A", false, "rate_limited");
-    a.reset_at = Some(now() + 2); // recovers ~2 REAL seconds after the request starts
+    a.reset_at = Some(now() + 3600);
     store
         .accounts()
         .insert(&a, &tokens("tokA"), &cipher)
@@ -402,14 +413,22 @@ async fn re_snapshot_after_the_wait_serves_a_now_recovered_account() {
     let exec = Arc::new(RecordingExecutor::default());
     let state = build_state(store, cipher, exec.clone());
 
+    let fire_at = now();
+    state
+        .store
+        .accounts()
+        .update_status_and_reset("A", "rate_limited", Some(fire_at + 4))
+        .await
+        .unwrap();
+
     let resp = responses_handler_impl_for_test_with_starvation_timing(
         state,
         None,
         json_headers(),
         json_body(),
         3,
-        Duration::from_secs(6), // budget comfortably exceeds the 2s cooldown
-        Duration::from_millis(300), // heartbeat ticks several times during the wait
+        Duration::from_secs(6), // budget comfortably exceeds the 4s cooldown margin
+        Duration::from_millis(150), // heartbeat ticks many times during the wait
     )
     .await;
     let (status, body) = tokio::time::timeout(Duration::from_secs(8), collect_body(resp))
@@ -576,11 +595,30 @@ async fn hardblocked_only_pool_never_waits_and_503s_fast() {
 /// EXACTLY the fixed `": keepalive\n\n"` bytes — never the request's own content (asserted via a
 /// distinctive marker string planted in the request body, `json_body()`'s
 /// "TOTALLY-SECRET-REQUEST-MARKER-12345") and never an account id.
+///
+/// Anti-flake (same class as `starvation_config_e2e.rs`'s already-fixed flake — wall-clock timing
+/// racing real time under `cargo test --workspace`'s CPU contention): pre-fix, `reset_at` was set
+/// to `now() + 2` BEFORE the SQLite insert + `build_state`, so under scheduling delay from a fully
+/// parallel workspace run that setup I/O could itself eat a large fraction of the already-thin ~2s
+/// margin (or all of it), letting the account's `recover_at` elapse before the wait loop's FIRST
+/// `heartbeat = 250ms` tick ever landed — zero keepalives fired and
+/// `!keepalive_segments.is_empty()` failed. Fixed by (a) re-anchoring `reset_at` to a REAL, short
+/// recovery window via `update_status_and_reset` (which bumps the account_cache generation so the
+/// fresh value is what the wait loop's pre-wait snapshot observes) captured immediately BEFORE the
+/// handler call, after all store-insert/`build_state` setup I/O is already done — the margin now
+/// only has to absorb the wait loop's own scheduling, not test setup; and (b) widening that margin
+/// from 2s to 4s while shrinking `heartbeat` from 250ms to 150ms, so upwards of 25 heartbeat ticks
+/// fit inside the window — a single delayed tokio schedule, even one stretching several hundred
+/// ms, cannot swallow the entire margin. `budget` stays 6s, comfortably exceeding the 4s recovery
+/// margin with slack for the post-wait re-select + splice (unchanged from pre-fix, matching
+/// sibling tests (3)/(7) and `starvation_config_e2e.rs`'s own budget=6s/margin=4s precedent).
 #[tokio::test]
 async fn keepalive_frames_in_the_wire_body_are_exactly_the_fixed_content_free_bytes() {
     let (store, cipher, _dir) = spawn_store().await;
+    // Far-future placeholder — the REAL, short recovery margin is re-anchored immediately before
+    // the request fires below (see this test's doc for why).
     let mut a = account("A", false, "rate_limited");
-    a.reset_at = Some(now() + 2);
+    a.reset_at = Some(now() + 3600);
     store
         .accounts()
         .insert(&a, &tokens("tokA"), &cipher)
@@ -589,6 +627,18 @@ async fn keepalive_frames_in_the_wire_body_are_exactly_the_fixed_content_free_by
     let exec = Arc::new(RecordingExecutor::default());
     let state = build_state(store, cipher, exec.clone());
 
+    // Re-anchor `reset_at` to a real, short window captured HERE — after all setup I/O (store
+    // insert + `build_state`) is done — so the margin only has to absorb the wait loop's own
+    // scheduling, not test setup. `update_status_and_reset` bumps the account_cache generation so
+    // the fresh `reset_at` is what the pre-wait snapshot actually observes.
+    let fire_at = now();
+    state
+        .store
+        .accounts()
+        .update_status_and_reset("A", "rate_limited", Some(fire_at + 4))
+        .await
+        .unwrap();
+
     let resp = responses_handler_impl_for_test_with_starvation_timing(
         state,
         None,
@@ -596,7 +646,7 @@ async fn keepalive_frames_in_the_wire_body_are_exactly_the_fixed_content_free_by
         json_body(),
         3,
         Duration::from_secs(6),
-        Duration::from_millis(250),
+        Duration::from_millis(150),
     )
     .await;
     let (status, body) = tokio::time::timeout(Duration::from_secs(8), collect_body(resp))
