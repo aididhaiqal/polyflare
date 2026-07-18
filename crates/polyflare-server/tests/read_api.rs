@@ -103,6 +103,27 @@ async fn seed_store() -> Store {
         })
         .await
         .unwrap();
+    // One owned + one unowned continuity session so /api/sessions returns real rows.
+    // Without this the content-safety SECRET-loop below would hit an empty /api/sessions
+    // and pass vacuously; the owned row (owning_account_id = the real "codex-a") makes it
+    // surface a joined owner_email, giving the leak assertion real teeth for this endpoint.
+    let continuity = store.continuity();
+    continuity
+        .record_completion(
+            "sk-seed-owned",
+            "hard",
+            "codex-a",
+            "resp-seed",
+            "fp-seed",
+            1,
+            now(),
+        )
+        .await
+        .unwrap();
+    continuity
+        .ensure_session("sk-seed-unowned", "soft", now())
+        .await
+        .unwrap();
     std::mem::forget(dir);
     store
 }
