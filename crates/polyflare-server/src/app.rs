@@ -78,6 +78,17 @@ pub struct AppState {
     /// later task exposes this over `/api/logs/stream`; present now so publishing starts
     /// immediately at the chokepoint instead of only once the SSE endpoint lands.
     pub log_bus: std::sync::Arc<crate::log_bus::LogBus>,
+    /// B4/B5 Task 5: the bounded cross-account failover loop's total upstream-attempt cap
+    /// (`POLYFLARE_MAX_ACCOUNT_ATTEMPTS`, resolved ONCE at startup by
+    /// `crate::config::max_account_attempts_from_env` — never read per-request). The production
+    /// `/responses` entrypoint (`crate::ingress::responses_handler_impl`) reads this field; the
+    /// `responses_handler_impl_for_test` seam still takes an explicit override for tests.
+    pub max_account_attempts: u32,
+    /// B4/B5 Task 5: content-free counter of cross-account failover events (see
+    /// `crate::observability::FailoverMetrics`) — incremented from
+    /// `crate::ingress::run_failover_loop` at the same site that emits the
+    /// `crate::observability::FailoverSignal` log/event.
+    pub failover_metrics: std::sync::Arc<crate::observability::FailoverMetrics>,
 }
 
 impl AppState {

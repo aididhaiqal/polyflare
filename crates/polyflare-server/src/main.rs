@@ -174,6 +174,8 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         admin_token: config.admin_token,
         live_logs: config.live_logs,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
+        max_account_attempts: config.max_account_attempts,
+        failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
     });
     // Runtime usage-refresh loop: keeps each Codex account's rate-limit windows (5h + weekly) and
     // routing gate live, instead of the frozen numbers the importer left.

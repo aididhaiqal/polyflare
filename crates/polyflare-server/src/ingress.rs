@@ -22,9 +22,9 @@ use polyflare_store::{PlainTokens, RequestLogRecord, RequestLogRepo};
 use crate::alias::{self, ModelAlias};
 use crate::app::AppState;
 use crate::config;
-use crate::failover::{exclude_tried, failover_verdict, FailoverVerdict};
+use crate::failover::{exclude_tried, failover_reason_code, failover_verdict, FailoverVerdict};
 use crate::fingerprint_capture::{append_fingerprint_capture, capture_request_fingerprint};
-use crate::observability::RequestLog;
+use crate::observability::{FailoverSignal, RequestLog};
 use crate::session_key::parse_inbound;
 use crate::snapshot::filter_by_provider_and_pool;
 use crate::translate_stream::wrap_translating_stream;
@@ -47,13 +47,6 @@ const PERSIST_MAX_ATTEMPTS: u32 = 3;
 /// Fixed backoff between persist retries (small — the write is on the hot lock).
 const PERSIST_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
-/// B4 Task 4: total upstream attempts allowed for one client request (the first pick + bounded
-/// failover) — INCLUSIVE, i.e. `1` reproduces today's one-shot behavior exactly (the plan's
-/// clean-rollback lever; see `responses_handler_impl_for_test`'s doc + `tests/failover_loop.rs`'s
-/// `(g)` regression). Task 5 will make this configurable via `POLYFLARE_MAX_ACCOUNT_ATTEMPTS` and
-/// pass the resolved value through instead of this const; for now this constant IS the default it
-/// will read (`docs/superpowers/plans/2026-07-18-phase-b-failover.md`, Global Constraints).
-const DEFAULT_MAX_ACCOUNT_ATTEMPTS: u32 = 3;
 
 /// Map a reasoning-effort string to a routing `Tier` (the subagent-tier signal the
 /// `cache_affinity_tier` strategy reads). `minimal`/`low` → Low, `medium` → Medium, `high` → High.
@@ -610,7 +603,10 @@ async fn run_failover_loop(
         if failover_verdict(&err, attempts_left, committed) == FailoverVerdict::Surface {
             return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
         }
-        // FailoverNext: this account is excluded from every future pick this request (T2).
+        // FailoverNext: this account is excluded from every future pick this request (T2). Clone
+        // the id BEFORE it moves into `tried` — the observability signal below needs it as
+        // `from_account` once `fresh` (the `to_account`) is known.
+        let from_id = failed_id.clone();
         tried.insert(failed_id);
 
         let candidates = exclude_tried(snapshots, &tried);
@@ -632,6 +628,24 @@ async fn run_failover_loop(
                 };
             }
         };
+        // B4/B5 Task 5: the content-free failover signal — emitted exactly HERE, the actual
+        // `FailoverNext` transition (a fresh account was just selected to replace `from_id`),
+        // never merely at classification time. `attempt` is the 1-indexed upstream attempt this
+        // request is now making (`tried.len()` already counts every account tried so far,
+        // including `from_id`, per the "Bookkeeping order" doc above). Content-safety: `reason` is
+        // a fixed bucket label (never the raw upstream code/message — see `failover_reason_code`),
+        // and both ids are the same content-free row-id class `RequestLog::account_id` already
+        // carries. NEVER a body/message/frame.
+        let failover_signal = FailoverSignal {
+            reason: failover_reason_code(&err),
+            from_account: from_id.as_str(),
+            to_account: fresh.as_str(),
+            attempt: tried.len() as u32 + 1,
+        };
+        failover_signal.emit();
+        state.log_bus.publish(failover_signal.to_log_event());
+        state.failover_metrics.record();
+
         state.runtime.record_selected(&fresh, now);
         outcome.account_id = Some(fresh.as_str().to_string());
         let (account, provider) = match resolve_core_account(state, &fresh, now).await {
@@ -766,29 +780,31 @@ async fn responses_route(
     response
 }
 
+/// B4/B5 Task 5: the production entrypoint reads the bounded failover loop's attempt cap from
+/// `AppState.max_account_attempts` — resolved ONCE at startup by
+/// `crate::config::max_account_attempts_from_env` and threaded through `AppState`/`ServeConfig`
+/// (see that field's doc). Deliberately NOT a per-request `std::env::var` read — the TA6(b) T5
+/// review flagged that pattern as debt; `max_attempts` is a plain `u32` copied out of `state`
+/// before `state` (an `Arc`) moves into the impl below.
 async fn responses_handler_impl(
     state: Arc<AppState>,
     pool: Option<&str>,
     headers: HeaderMap,
     raw: Bytes,
 ) -> (Response, RouteOutcome) {
-    responses_handler_impl_with_max_attempts(
-        state,
-        pool,
-        headers,
-        raw,
-        DEFAULT_MAX_ACCOUNT_ATTEMPTS,
-    )
-    .await
+    let max_attempts = state.max_account_attempts;
+    responses_handler_impl_with_max_attempts(state, pool, headers, raw, max_attempts).await
 }
 
 /// B4 Task 4 test seam: drives the SAME real ingress logic `responses_handler_impl` does, but with
-/// an explicit `max_attempts` for the bounded failover loop — the production HTTP entrypoints
-/// (via `responses_handler_impl` above) always use [`DEFAULT_MAX_ACCOUNT_ATTEMPTS`]. Exists so
+/// an explicit `max_attempts` for the bounded failover loop — the production HTTP entrypoint (via
+/// `responses_handler_impl` above) uses `AppState.max_account_attempts` (Task 5's
+/// `POLYFLARE_MAX_ACCOUNT_ATTEMPTS`, resolved once at startup) instead. This seam still exists so
 /// integration tests can exercise a non-default bound (most importantly `max_attempts == 1`, the
-/// "reproduces today's one-shot behavior EXACTLY" regression proof) without needing Task 5's
-/// `POLYFLARE_MAX_ACCOUNT_ATTEMPTS` config to exist yet. Returns only the `Response` — `RouteOutcome`
-/// is a private, logging-only type and can't cross the crate boundary in a `pub` signature.
+/// "reproduces today's one-shot behavior EXACTLY" regression proof) directly, without needing to
+/// thread an env var through process startup for a unit-scale test. Returns only the `Response` —
+/// `RouteOutcome` is a private, logging-only type and can't cross the crate boundary in a `pub`
+/// signature.
 pub async fn responses_handler_impl_for_test(
     state: Arc<AppState>,
     pool: Option<String>,

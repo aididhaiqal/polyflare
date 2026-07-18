@@ -44,6 +44,13 @@ pub struct ServeConfig {
     /// "HTTP-SSE remains the fallback on every path"). Consumed by
     /// `crate::app::build_codex_executor`.
     pub ws_upstream: bool,
+    /// B4/B5 Task 5: the bounded cross-account failover loop's total upstream-attempt cap
+    /// (`POLYFLARE_MAX_ACCOUNT_ATTEMPTS`; see [`max_account_attempts_from_env`] for the
+    /// malformed/zero handling decision). Resolved ONCE here at startup and threaded through
+    /// `AppState` — never read per-request (see `crate::ingress::responses_handler_impl`, which
+    /// used to hardcode this as a const before this task, and the TA6(b) T5 review that flagged
+    /// per-request `env::var` as debt).
+    pub max_account_attempts: u32,
 }
 
 /// TA6(b) Task 5: the one capability name resolved today. A pool tagged with this capability (via
@@ -167,6 +174,42 @@ fn parse_pool_strategies(raw: &str) -> Result<HashMap<String, RoutingStrategy>, 
     Ok(map)
 }
 
+/// B4/B5 Task 5: `POLYFLARE_MAX_ACCOUNT_ATTEMPTS` — total upstream attempts allowed per client
+/// request for the bounded cross-account failover loop (`crate::ingress::run_failover_loop`).
+/// Unset ⇒ `3` (the plan's `Global Constraints` bound, matching codex-lb's
+/// `_STREAM_MAX_ACCOUNT_ATTEMPTS`); `1` ⇒ today's one-shot behavior (the clean-rollback lever).
+///
+/// **Malformed/zero handling — documented decision (this function IS the decision record):**
+/// - A value that fails to parse as a `u32` (non-numeric, negative, out of range) resolves to the
+///   SAME default as unset: `3`. We deliberately do NOT fall back to `1` (one-shot) on a parse
+///   failure: `1` is a real, intentional configuration (the clean-rollback lever the plan
+///   describes) that an operator must set EXPLICITLY and correctly. Silently collapsing a typo
+///   (e.g. a stray trailing character, an accidentally-unset shell variable expansion) into the
+///   MOST conservative behavior available — failover disabled — would quietly remove resilience
+///   exactly when config has already drifted, which is a worse failure mode than falling back to
+///   the field-proven default of 3. A malformed value therefore reads exactly like an absent one.
+/// - An explicit, well-formed `0` is clamped UP to the floor of `1` — never down, and never
+///   treated as "malformed → 3". `0` has no sane reading as "unset" (an operator who writes `0`
+///   clearly intended a small, deliberate number, unlike a parse failure); it can only sanely mean
+///   "as few attempts as possible", and the loop's own invariant (`ingress.rs`'s "Bookkeeping
+///   order" doc) requires at least one attempt — a request must be tried, or the request path is
+///   effectively disabled, indistinguishable from an outage. So `0` floors to `1`, not `3`.
+///
+/// Every malformed/absent case converges on `3`; only a well-formed `0` gets the special-cased
+/// floor of `1`. This mirrors `ws_upstream`/`live_logs`'s "malformed ⇒ safe default, never a boot
+/// crash" convention (`ServeConfig::from_env`'s doc), extended with one numeric clamp.
+pub fn max_account_attempts_from_env() -> u32 {
+    const DEFAULT: u32 = 3;
+    match std::env::var("POLYFLARE_MAX_ACCOUNT_ATTEMPTS") {
+        Ok(raw) => match raw.trim().parse::<u32>() {
+            Ok(0) => 1,
+            Ok(n) => n,
+            Err(_) => DEFAULT,
+        },
+        Err(_) => DEFAULT,
+    }
+}
+
 impl ServeConfig {
     pub fn from_env() -> Result<Self, String> {
         let bind_addr =
@@ -211,6 +254,7 @@ impl ServeConfig {
             std::env::var("POLYFLARE_WS_UPSTREAM").as_deref(),
             Ok("1") | Ok("true")
         );
+        let max_account_attempts = max_account_attempts_from_env();
         Ok(ServeConfig {
             bind_addr,
             upstream_base_url,
@@ -225,6 +269,7 @@ impl ServeConfig {
             admin_token,
             live_logs,
             ws_upstream,
+            max_account_attempts,
         })
     }
 }
@@ -353,6 +398,75 @@ mod tests {
 
         unsafe {
             std::env::remove_var("POLYFLARE_POOL_CAPABILITIES");
+        }
+    }
+
+    /// Serializes tests in this module that mutate `POLYFLARE_MAX_ACCOUNT_ATTEMPTS` — same
+    /// rationale as `pool_capabilities_env_lock` (env vars are process-global, tests run
+    /// concurrently on separate threads by default).
+    fn max_account_attempts_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// B4/B5 Task 5: `POLYFLARE_MAX_ACCOUNT_ATTEMPTS=5` resolves to exactly `5`.
+    #[test]
+    fn max_account_attempts_reads_a_well_formed_value() {
+        let _guard = max_account_attempts_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_MAX_ACCOUNT_ATTEMPTS", "5");
+        }
+        assert_eq!(max_account_attempts_from_env(), 5);
+        unsafe {
+            std::env::remove_var("POLYFLARE_MAX_ACCOUNT_ATTEMPTS");
+        }
+    }
+
+    /// Unset ⇒ the documented default, 3.
+    #[test]
+    fn max_account_attempts_unset_defaults_to_three() {
+        let _guard = max_account_attempts_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("POLYFLARE_MAX_ACCOUNT_ATTEMPTS");
+        }
+        assert_eq!(max_account_attempts_from_env(), 3);
+    }
+
+    /// A malformed value (non-numeric) ⇒ the SAME safe default as unset (3) — never a boot crash,
+    /// and never silently collapsed to the one-shot value 1. See the function's doc for the full
+    /// justification of this decision.
+    #[test]
+    fn max_account_attempts_malformed_defaults_to_three_not_one() {
+        let _guard = max_account_attempts_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_MAX_ACCOUNT_ATTEMPTS", "not-a-number");
+        }
+        assert_eq!(max_account_attempts_from_env(), 3);
+        unsafe {
+            std::env::remove_var("POLYFLARE_MAX_ACCOUNT_ATTEMPTS");
+        }
+    }
+
+    /// An explicit `0` is clamped UP to the floor of 1 (a request must attempt at least once) —
+    /// never treated as malformed-hence-3, and never left at 0 (which would disable the request
+    /// path entirely).
+    #[test]
+    fn max_account_attempts_zero_clamps_to_one_not_three() {
+        let _guard = max_account_attempts_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_MAX_ACCOUNT_ATTEMPTS", "0");
+        }
+        assert_eq!(max_account_attempts_from_env(), 1);
+        unsafe {
+            std::env::remove_var("POLYFLARE_MAX_ACCOUNT_ATTEMPTS");
         }
     }
 }

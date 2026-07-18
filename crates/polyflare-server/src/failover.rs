@@ -127,6 +127,40 @@ fn classify_upstream(signal: Option<&FailureSignal>) -> FailoverVerdict {
     }
 }
 
+/// B4/B5 Task 5: a content-free, fixed-label bucket for the failure that just produced a
+/// `FailoverVerdict::FailoverNext` verdict — read ONLY by the ingress observability signal
+/// (`crate::observability::FailoverSignal`), never by [`failover_verdict`] itself (this function is
+/// a labeling convenience over its result, not a second decision). Mirrors [`classify_upstream`]'s
+/// bucket boundaries exactly (see the module doc's "No second classification"): every branch here
+/// corresponds 1:1 to a `FailoverNext` arm above, so the label always matches why the loop actually
+/// retried. `CapabilityRejection`/`Continuity` are `Surface`-only in `failover_verdict` (never reach
+/// a `FailoverNext` transition — see the module doc), so their arms here are unreachable in
+/// practice; they exist only to keep the match exhaustive without panicking if that ever changes.
+///
+/// Content-safety: every arm returns a fixed `&'static str` or reads `sig.status`/`sig.error_code`
+/// (both already audited content-free fields, per [`FailureSignal`]'s own doc) — never
+/// `Display`/`Debug` of the error, never a body/message.
+pub fn failover_reason_code(err: &WatchdogError) -> &'static str {
+    match err {
+        WatchdogError::Upstream(Some(sig)) => {
+            if let Some(code) = &sig.error_code {
+                if classify_failure(code).status().is_some() {
+                    return "permanent_auth";
+                }
+            }
+            match sig.status {
+                429 => "rate_limited",
+                s if (500..=599).contains(&s) => "transient",
+                401 | 403 | 408 => "transient",
+                _ => "other",
+            }
+        }
+        WatchdogError::Upstream(None) => "transport_error",
+        WatchdogError::CapabilityRejection { .. } => "capability_rejection",
+        WatchdogError::Continuity => "continuity",
+    }
+}
+
 /// B4 Task 2 — the tried-account exclusion primitive for failover reselection.
 ///
 /// A PURE, self-contained helper: NOT wired into the ingress request path here (Task 4 does that).
@@ -359,5 +393,50 @@ mod tests {
             failover_verdict(&err, false, true),
             FailoverVerdict::Surface
         );
+    }
+
+    // --- B4/B5 Task 5: failover_reason_code ---------------------------------------------------
+
+    #[test]
+    fn reason_code_rate_limited() {
+        let err = WatchdogError::Upstream(Some(signal(429, None)));
+        assert_eq!(failover_reason_code(&err), "rate_limited");
+    }
+
+    #[test]
+    fn reason_code_transient_covers_5xx_and_401_403_408() {
+        for status in [500, 502, 503, 401, 403, 408] {
+            let err = WatchdogError::Upstream(Some(signal(status, None)));
+            assert_eq!(
+                failover_reason_code(&err),
+                "transient",
+                "status {status} should classify as transient"
+            );
+        }
+    }
+
+    #[test]
+    fn reason_code_permanent_auth_takes_priority_over_status() {
+        let err = WatchdogError::Upstream(Some(signal(401, Some("invalid_grant"))));
+        assert_eq!(failover_reason_code(&err), "permanent_auth");
+    }
+
+    #[test]
+    fn reason_code_transport_error_for_no_signal() {
+        let err = WatchdogError::Upstream(None);
+        assert_eq!(failover_reason_code(&err), "transport_error");
+    }
+
+    #[test]
+    fn reason_code_is_content_free_never_the_raw_error_code_string() {
+        // A bespoke, non-permanent, non-standard error_code must never leak verbatim into the
+        // reason label — only the fixed bucket names are ever returned.
+        let err = WatchdogError::Upstream(Some(signal(
+            429,
+            Some("some_arbitrary_upstream_code_value"),
+        )));
+        let reason = failover_reason_code(&err);
+        assert_eq!(reason, "rate_limited");
+        assert!(!reason.contains("arbitrary"));
     }
 }
