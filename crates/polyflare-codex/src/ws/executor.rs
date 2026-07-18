@@ -111,8 +111,8 @@ use super::codec::build_response_create;
 use super::conn::{connect_detailed, ConnectOutcome, WsConn};
 use super::delta::{plan_request_for_conn, RequestPlan};
 use super::turn::{
-    shared_conn, turn_stream_with_guard, SharedWsConn, ANCHOR_MISS_MARKER,
-    CONNECTION_LIMIT_MARKER, SOCKET_CLOSED_MARKER,
+    shared_conn, turn_stream_with_guard, SharedWsConn, ANCHOR_MISS_MARKER, CONNECTION_LIMIT_MARKER,
+    SOCKET_CLOSED_MARKER,
 };
 
 /// Bounded attempts for the same-socket anchor-miss recovery (strip anchor, full resend). Chosen
@@ -358,7 +358,9 @@ impl CodexWsExecutor {
                         drop(guard);
                         continue;
                     }
-                    RecoveryAction::Reconnect if reconnect_attempts < self.max_reconnect_retries => {
+                    RecoveryAction::Reconnect
+                        if reconnect_attempts < self.max_reconnect_retries =>
+                    {
                         reconnect_attempts += 1;
                         log_wedge_recovery(
                             "reconnect_full_resend",
@@ -762,8 +764,14 @@ mod tests {
         assert_eq!(frames.len(), 4);
         assert_eq!(frames[0].input_len, 2, "turn 1: full 2-item send");
         assert_eq!(frames[1].input_len, 1, "turn 2: 1-item delta");
-        assert_eq!(frames[2].input_len, 1, "turn 3: 1-item delta (the regression guard)");
-        assert_eq!(frames[3].input_len, 1, "turn 4: 1-item delta (the chain holds)");
+        assert_eq!(
+            frames[2].input_len, 1,
+            "turn 3: 1-item delta (the regression guard)"
+        );
+        assert_eq!(
+            frames[3].input_len, 1,
+            "turn 4: 1-item delta (the chain holds)"
+        );
     }
 
     // ---- Concurrency (M5a Task 8): two execute() calls on the SAME session key must not race ---
@@ -797,88 +805,90 @@ mod tests {
     /// the first handful of iterations — see `.superpowers/sdd/m5a-task-8-report.md`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_execute_calls_on_the_same_session_key_do_not_corrupt_the_delta_chain() {
-      for _trial in 0..300u32 {
-        let mock = MockWsUpstream::scripted(vec![
-            ScriptedTurn::normal(vec![]),
-            ScriptedTurn::normal(vec![]),
-            ScriptedTurn::normal(vec![]),
-            ScriptedTurn::normal(vec![]),
-        ]);
-        let base = mock.clone().spawn().await;
-        let executor = Arc::new(CodexWsExecutor::new(never_called_fallback()));
-        let account = test_account(base);
-        let ctx = ctx_with_session("race");
+        for _trial in 0..300u32 {
+            let mock = MockWsUpstream::scripted(vec![
+                ScriptedTurn::normal(vec![]),
+                ScriptedTurn::normal(vec![]),
+                ScriptedTurn::normal(vec![]),
+                ScriptedTurn::normal(vec![]),
+            ]);
+            let base = mock.clone().spawn().await;
+            let executor = Arc::new(CodexWsExecutor::new(never_called_fallback()));
+            let account = test_account(base);
+            let ctx = ctx_with_session("race");
 
-        // Warm-up (sequential): seeds a real anchor (resp_1) + a 2-item history, and — just as
-        // importantly — gets the connection CACHED before the race starts. The initial-connect
-        // race (two concurrent calls with NOTHING cached yet, both dialing fresh sockets) is a
-        // separate, pre-existing concern in `connect_and_cache`, out of this test's scope; this
-        // test isolates the plan-vs-send race specifically.
-        let warmup = json!({"model": "m", "input": [item(0), item(1)]});
-        let s0 = executor
-            .execute(prepared(warmup), &account, &ctx)
-            .await
-            .expect("warm-up turn must succeed");
-        drain(s0).await;
-        assert_eq!(mock.handshake_count(), 1);
+            // Warm-up (sequential): seeds a real anchor (resp_1) + a 2-item history, and — just as
+            // importantly — gets the connection CACHED before the race starts. The initial-connect
+            // race (two concurrent calls with NOTHING cached yet, both dialing fresh sockets) is a
+            // separate, pre-existing concern in `connect_and_cache`, out of this test's scope; this
+            // test isolates the plan-vs-send race specifically.
+            let warmup = json!({"model": "m", "input": [item(0), item(1)]});
+            let s0 = executor
+                .execute(prepared(warmup), &account, &ctx)
+                .await
+                .expect("warm-up turn must succeed");
+            drain(s0).await;
+            assert_eq!(mock.handshake_count(), 1);
 
-        // Two concurrent execute() calls, SAME session key, IDENTICAL body: a genuine one-item
-        // strict extension of the warm-up's 2-item history (item2).
-        let body = json!({"model": "m", "input": [item(0), item(1), item(2)]});
-        let spawn_racer = |executor: Arc<CodexWsExecutor>,
-                           account: Account,
-                           ctx: RequestCtx,
-                           body: Value| {
-            tokio::spawn(async move {
-                let stream = executor
-                    .execute(prepared(body), &account, &ctx)
-                    .await
-                    .expect("a racing call must succeed");
-                drain(stream).await
-            })
-        };
-        let task_a = spawn_racer(executor.clone(), account.clone(), ctx.clone(), body.clone());
-        let task_b = spawn_racer(executor.clone(), account.clone(), ctx.clone(), body.clone());
-        let (a, b) = tokio::join!(task_a, task_b);
-        let a = a.expect("racer A must not panic");
-        let b = b.expect("racer B must not panic");
-        assert!(a.iter().all(|i| i.is_ok()), "racer A: {a:?}");
-        assert!(b.iter().all(|i| i.is_ok()), "racer B: {b:?}");
+            // Two concurrent execute() calls, SAME session key, IDENTICAL body: a genuine one-item
+            // strict extension of the warm-up's 2-item history (item2).
+            let body = json!({"model": "m", "input": [item(0), item(1), item(2)]});
+            let spawn_racer =
+                |executor: Arc<CodexWsExecutor>, account: Account, ctx: RequestCtx, body: Value| {
+                    tokio::spawn(async move {
+                        let stream = executor
+                            .execute(prepared(body), &account, &ctx)
+                            .await
+                            .expect("a racing call must succeed");
+                        drain(stream).await
+                    })
+                };
+            let task_a = spawn_racer(executor.clone(), account.clone(), ctx.clone(), body.clone());
+            let task_b = spawn_racer(executor.clone(), account.clone(), ctx.clone(), body.clone());
+            let (a, b) = tokio::join!(task_a, task_b);
+            let a = a.expect("racer A must not panic");
+            let b = b.expect("racer B must not panic");
+            assert!(a.iter().all(|i| i.is_ok()), "racer A: {a:?}");
+            assert!(b.iter().all(|i| i.is_ok()), "racer B: {b:?}");
 
-        // No reconnect was ever needed — both racing turns went over the SAME already-cached
-        // socket; the race is about planning, not about the connection cache itself.
-        assert_eq!(mock.handshake_count(), 1, "no reconnect should ever be triggered by this race");
+            // No reconnect was ever needed — both racing turns went over the SAME already-cached
+            // socket; the race is about planning, not about the connection cache itself.
+            assert_eq!(
+                mock.handshake_count(),
+                1,
+                "no reconnect should ever be triggered by this race"
+            );
 
-        let frames = mock.frames();
-        assert_eq!(
+            let frames = mock.frames();
+            assert_eq!(
             frames.len(),
             3,
             "warm-up(1) + exactly 2 racing turns(1 each) — no extra resend from an unrecovered or \
              re-recovered corruption"
         );
-        assert_eq!(frames[0].previous_response_id, None);
-        assert_eq!(frames[0].input_len, 2, "warm-up: full 2-item send");
+            assert_eq!(frames[0].previous_response_id, None);
+            assert_eq!(frames[0].input_len, 2, "warm-up: full 2-item send");
 
-        // The two racing frames, asserted as a SET (task scheduling order is not deterministic):
-        // exactly one must be the genuine extension (anchored on the warm-up's resp_1, 1-item
-        // suffix) and the OTHER must be a correctly-recomputed Full send (no anchor, the full
-        // 3-item body) — because it planned against the FIRST racer's already-applied state. The
-        // corrupted-race shape this guards against is TWO identical anchored 1-item frames (both
-        // claiming resp_1 as parent, only one of which is actually true).
-        let racing = &frames[1..];
-        let debug_racing: Vec<(Option<String>, usize)> = racing
-            .iter()
-            .map(|f| (f.previous_response_id.clone(), f.input_len))
-            .collect();
-        let incremental_count = racing
-            .iter()
-            .filter(|f| f.previous_response_id.as_deref() == Some("resp_1") && f.input_len == 1)
-            .count();
-        let full_count = racing
-            .iter()
-            .filter(|f| f.previous_response_id.is_none() && f.input_len == 3)
-            .count();
-        assert_eq!(
+            // The two racing frames, asserted as a SET (task scheduling order is not deterministic):
+            // exactly one must be the genuine extension (anchored on the warm-up's resp_1, 1-item
+            // suffix) and the OTHER must be a correctly-recomputed Full send (no anchor, the full
+            // 3-item body) — because it planned against the FIRST racer's already-applied state. The
+            // corrupted-race shape this guards against is TWO identical anchored 1-item frames (both
+            // claiming resp_1 as parent, only one of which is actually true).
+            let racing = &frames[1..];
+            let debug_racing: Vec<(Option<String>, usize)> = racing
+                .iter()
+                .map(|f| (f.previous_response_id.clone(), f.input_len))
+                .collect();
+            let incremental_count = racing
+                .iter()
+                .filter(|f| f.previous_response_id.as_deref() == Some("resp_1") && f.input_len == 1)
+                .count();
+            let full_count = racing
+                .iter()
+                .filter(|f| f.previous_response_id.is_none() && f.input_len == 3)
+                .count();
+            assert_eq!(
             (incremental_count, full_count),
             (1, 1),
             "exactly one racing turn must be a genuine 1-item delta off resp_1 and the other a \
@@ -886,30 +896,30 @@ mod tests {
              resp_1 (that would be the race corrupting the chain): {debug_racing:?}"
         );
 
-        // The chain still holds going forward: a THIRD, sequential (non-racing) turn extending the
-        // now-merged 3-item history by one more item must still be planned as a genuine delta, not
-        // a permanently-broken Full — proving the race didn't leave the connection's local
-        // delta-tracking state corrupted for future turns either.
-        let follow_up = json!({
-            "model": "m",
-            "input": [item(0), item(1), item(2), item(3)],
-        });
-        let s3 = executor
-            .execute(prepared(follow_up), &account, &ctx)
-            .await
-            .expect("follow-up turn must succeed");
-        drain(s3).await;
-        assert_eq!(mock.handshake_count(), 1, "still the same one connection");
-        let last = mock.frames().last().cloned().unwrap();
-        assert_eq!(
-            last.input_len, 1,
-            "the chain must still be a genuine 1-item delta after the race resolved cleanly"
-        );
-        assert!(
-            last.previous_response_id.is_some(),
-            "must still be anchored after the race — the chain was not corrupted"
-        );
-      }
+            // The chain still holds going forward: a THIRD, sequential (non-racing) turn extending the
+            // now-merged 3-item history by one more item must still be planned as a genuine delta, not
+            // a permanently-broken Full — proving the race didn't leave the connection's local
+            // delta-tracking state corrupted for future turns either.
+            let follow_up = json!({
+                "model": "m",
+                "input": [item(0), item(1), item(2), item(3)],
+            });
+            let s3 = executor
+                .execute(prepared(follow_up), &account, &ctx)
+                .await
+                .expect("follow-up turn must succeed");
+            drain(s3).await;
+            assert_eq!(mock.handshake_count(), 1, "still the same one connection");
+            let last = mock.frames().last().cloned().unwrap();
+            assert_eq!(
+                last.input_len, 1,
+                "the chain must still be a genuine 1-item delta after the race resolved cleanly"
+            );
+            assert!(
+                last.previous_response_id.is_some(),
+                "must still be anchored after the race — the chain was not corrupted"
+            );
+        }
     }
 
     // ---- Row: previous_response_not_found -> strip anchor, full resend, SAME socket, bounded ---
@@ -955,9 +965,9 @@ mod tests {
             "the client must see a CLEAN stream — the anchor-miss must never surface: {items:?}"
         );
         assert!(
-            items
-                .iter()
-                .any(|i| matches!(i, Ok(b) if String::from_utf8_lossy(b).contains("response.completed"))),
+            items.iter().any(
+                |i| matches!(i, Ok(b) if String::from_utf8_lossy(b).contains("response.completed"))
+            ),
             "must still see a real completion after recovery: {items:?}"
         );
 
@@ -1077,7 +1087,9 @@ mod tests {
             .expect("must give up rather than reconnect forever");
 
         match err {
-            ExecError::Stream(msg) => assert!(msg.contains("websocket_connection_limit_reached"), "{msg}"),
+            ExecError::Stream(msg) => {
+                assert!(msg.contains("websocket_connection_limit_reached"), "{msg}")
+            }
             other => panic!("expected ExecError::Stream, got {other:?}"),
         }
         assert_eq!(
@@ -1139,7 +1151,11 @@ mod tests {
             .expect("the first byte succeeded, so execute() itself returns Ok");
         let items = drain(stream).await;
 
-        assert_eq!(items.len(), 2, "one good delta byte, then the surfaced error: {items:?}");
+        assert_eq!(
+            items.len(),
+            2,
+            "one good delta byte, then the surfaced error: {items:?}"
+        );
         assert!(items[0].is_ok());
         match &items[1] {
             Err(msg) => assert!(msg.contains("closed"), "{msg}"),
@@ -1218,7 +1234,11 @@ mod tests {
             }
             other => panic!("expected ExecError::UpstreamStatus, got {other:?}"),
         }
-        assert_eq!(mock.frames().len(), 1, "a general error must never be retried");
+        assert_eq!(
+            mock.frames().len(),
+            1,
+            "a general error must never be retried"
+        );
 
         // Content-safety: the envelope's `error.message` must never surface via Display or Debug.
         let display = format!("{err}");

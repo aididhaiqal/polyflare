@@ -229,7 +229,11 @@ mod tests {
         let (store, _dir) = open_test_store().await;
         let created = create_key(&store, None, 7).await.unwrap();
 
-        store.api_keys().set_enabled(&created.id, false).await.unwrap();
+        store
+            .api_keys()
+            .set_enabled(&created.id, false)
+            .await
+            .unwrap();
 
         let hash = sha256_hex(&created.raw);
         let row = store.api_keys().get_by_hash(&hash).await.unwrap().unwrap();

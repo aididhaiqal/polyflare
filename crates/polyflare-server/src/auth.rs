@@ -112,7 +112,11 @@ pub async fn require_client_key(
             let state = s.clone();
             let id = row.id.clone();
             tokio::spawn(async move {
-                let _ = state.store.api_keys().touch_last_used(&id, unix_now()).await;
+                let _ = state
+                    .store
+                    .api_keys()
+                    .touch_last_used(&id, unix_now())
+                    .await;
             });
             next.run(req).await
         }

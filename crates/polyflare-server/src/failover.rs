@@ -306,7 +306,10 @@ mod tests {
     #[test]
     fn bad_request_surfaces() {
         let err = WatchdogError::Upstream(Some(signal(400, None)));
-        assert_eq!(failover_verdict(&err, true, false), FailoverVerdict::Surface);
+        assert_eq!(
+            failover_verdict(&err, true, false),
+            FailoverVerdict::Surface
+        );
     }
 
     #[test]
@@ -375,13 +378,19 @@ mod tests {
         let err = WatchdogError::CapabilityRejection {
             capability: "security_work_authorized",
         };
-        assert_eq!(failover_verdict(&err, true, false), FailoverVerdict::Surface);
+        assert_eq!(
+            failover_verdict(&err, true, false),
+            FailoverVerdict::Surface
+        );
     }
 
     #[test]
     fn continuity_error_surfaces() {
         let err = WatchdogError::Continuity;
-        assert_eq!(failover_verdict(&err, true, false), FailoverVerdict::Surface);
+        assert_eq!(
+            failover_verdict(&err, true, false),
+            FailoverVerdict::Surface
+        );
     }
 
     #[test]

@@ -37,12 +37,12 @@
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use tungstenite::extensions::ExtensionsConfig;
 use tungstenite::extensions::compression::deflate::DeflateConfig;
+use tungstenite::extensions::ExtensionsConfig;
 use tungstenite::protocol::WebSocketConfig;
 
 use polyflare_core::{Account, ExecError};
@@ -234,7 +234,8 @@ pub(crate) async fn connect_detailed(
         // timeout, DNS, any other HTTP status, a protocol-level handshake error, ...) collapses to
         // the generic `Failed` arm below, surfaced as `ExecError::Upstream` unchanged.
         Err(tokio_tungstenite::tungstenite::Error::Http(response))
-            if response.status() == tokio_tungstenite::tungstenite::http::StatusCode::UPGRADE_REQUIRED =>
+            if response.status()
+                == tokio_tungstenite::tungstenite::http::StatusCode::UPGRADE_REQUIRED =>
         {
             ConnectOutcome::UpgradeRequired
         }
@@ -248,8 +249,9 @@ impl WsConn {
     /// `Text` WS message. First consumer: Task 5's turn stream (`ws::turn`), hence `pub(crate)` —
     /// the socket itself stays private to this module.
     pub(crate) async fn send_frame(&mut self, envelope: &Value) -> Result<(), ExecError> {
-        let text = serde_json::to_string(envelope)
-            .map_err(|e| ExecError::Upstream(format!("failed to serialize response.create: {e}")))?;
+        let text = serde_json::to_string(envelope).map_err(|e| {
+            ExecError::Upstream(format!("failed to serialize response.create: {e}"))
+        })?;
         match self.socket.send(Message::Text(text.into())).await {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -411,10 +413,11 @@ mod tests {
         tokio::spawn(async move {
             if let Ok((stream, _)) = listener.accept().await {
                 let captured_cb = captured_task.clone();
-                let callback = move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
-                    *captured_cb.lock().unwrap() = Some(req.headers().clone());
-                    Ok(resp)
-                };
+                let callback =
+                    move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+                        *captured_cb.lock().unwrap() = Some(req.headers().clone());
+                        Ok(resp)
+                    };
                 let _ = tokio_tungstenite::accept_hdr_async_with_config(
                     stream,
                     callback,
@@ -463,7 +466,10 @@ mod tests {
             headers.get("authorization").unwrap(),
             "Bearer secret-bearer-abc"
         );
-        assert_eq!(headers.get("chatgpt-account-id").unwrap(), "chatgpt-acct-xyz");
+        assert_eq!(
+            headers.get("chatgpt-account-id").unwrap(),
+            "chatgpt-acct-xyz"
+        );
 
         // §7.1: the single easiest thing to get wrong — must be ABSENT, opposite of the HTTP path.
         assert!(

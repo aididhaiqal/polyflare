@@ -128,7 +128,10 @@ fn input_shape(input: Option<&RawValue>) -> (u32, bool) {
 /// implemented in terms of this fn plus its own soft fallback, so a `/responses` turn and a control
 /// request presenting the SAME `x-codex-turn-state`/`session_id` header always hash to the same
 /// [`SessionKey::value`] and therefore resolve the same continuity-session row.
-pub fn header_session_key(headers: &HeaderMap, prompt_cache_key: Option<&str>) -> Option<SessionKey> {
+pub fn header_session_key(
+    headers: &HeaderMap,
+    prompt_cache_key: Option<&str>,
+) -> Option<SessionKey> {
     if let Some(ts) = header_str(headers, "x-codex-turn-state") {
         return Some(SessionKey {
             value: sha256_hex(format!("turn:{ts}").as_bytes()),

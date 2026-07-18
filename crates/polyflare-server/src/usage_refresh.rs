@@ -482,7 +482,10 @@ mod tests {
         let id = AccountId::from(acct.id.as_str());
 
         let t = runtime.record_transient_error(&id, 1000);
-        assert_eq!(t, None, "the FIRST error alone does not reach the drain threshold");
+        assert_eq!(
+            t, None,
+            "the FIRST error alone does not reach the drain threshold"
+        );
         let t = runtime
             .record_transient_error(&id, 1010)
             .expect("the SECOND error within 60s crosses the error-drain threshold");
@@ -534,7 +537,10 @@ mod tests {
             .expect("2nd error within 60s crosses the error-drain threshold");
         let mut mid = vec![polyflare_core::AccountSnapshot::new("anthro-b")];
         runtime.overlay(&mut mid, 2010);
-        assert_eq!(mid[0].health_tier, 1, "funnel drained anthro-b (not flag-gated)");
+        assert_eq!(
+            mid[0].health_tier, 1,
+            "funnel drained anthro-b (not flag-gated)"
+        );
 
         let transition = evaluate_non_codex_health_tier(&runtime, &acct, false, 2010)
             .expect("the disable lever forces a real HEALTHY transition");
@@ -570,7 +576,10 @@ mod tests {
         let acct_frozen = account("anthro-c", "anthropic", "rate_limited");
         let now_quiet = 3010 + 61;
         let transition = evaluate_non_codex_health_tier(&runtime, &acct_frozen, true, now_quiet);
-        assert_eq!(transition, None, "frozen: no transition even though the quiet timer elapsed");
+        assert_eq!(
+            transition, None,
+            "frozen: no transition even though the quiet timer elapsed"
+        );
 
         let mut snaps = vec![polyflare_core::AccountSnapshot::new("anthro-c")];
         runtime.overlay(&mut snaps, now_quiet);

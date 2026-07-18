@@ -180,7 +180,9 @@ pub async fn control_forward(
     let filtered_headers: Vec<(String, String)> = resp
         .headers()
         .iter()
-        .filter(|(name, _)| ALLOWED_RESPONSE_HEADERS.contains(&name.as_str().to_ascii_lowercase().as_str()))
+        .filter(|(name, _)| {
+            ALLOWED_RESPONSE_HEADERS.contains(&name.as_str().to_ascii_lowercase().as_str())
+        })
         .filter_map(|(name, value)| {
             value
                 .to_str()

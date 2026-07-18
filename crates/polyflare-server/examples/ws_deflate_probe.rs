@@ -86,7 +86,11 @@ fn user_msg(text: &str) -> Value {
 /// Same shape as `ws_vs_sse_probe.rs`'s `codex_headers` — the codex identity + auth headers that
 /// ride every WS handshake, before the two WS-specific headers (`OpenAI-Beta`,
 /// `Sec-WebSocket-Extensions`) that `WsConn::connect` adds on top.
-fn codex_headers(session_key: &str, bearer: &str, account_id: Option<&str>) -> Vec<(String, String)> {
+fn codex_headers(
+    session_key: &str,
+    bearer: &str,
+    account_id: Option<&str>,
+) -> Vec<(String, String)> {
     let id = TurnIdentity::derive(session_key);
     let mut h = vec![
         ("authorization".to_string(), format!("Bearer {bearer}")),
@@ -137,7 +141,9 @@ fn is_sensitive_header(name: &str) -> bool {
 /// `WsConn::connect`). No `Sec-WebSocket-Extensions` header here — that's negotiated by the
 /// library itself from the `WebSocketConfig` passed to `connect_async_with_config` (see
 /// `ws_config_for`), the same mechanism `WsConn::connect` uses.
-fn build_request(hdrs: &[(String, String)]) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+fn build_request(
+    hdrs: &[(String, String)],
+) -> tokio_tungstenite::tungstenite::handshake::client::Request {
     let mut req = WS_URL.into_client_request().expect("ws request");
     let headers = req.headers_mut();
     for (name, value) in hdrs {
@@ -252,7 +258,9 @@ async fn run_variant(label: &str, hdrs: &[(String, String)], model: &str, offer_
                         Err(_) => FrameReadability::InvalidUtf8OrBinary,
                     };
                     let tag = match readability {
-                        FrameReadability::PlainUtf8Json => "Binary-but-valid-utf8-json (unexpected)",
+                        FrameReadability::PlainUtf8Json => {
+                            "Binary-but-valid-utf8-json (unexpected)"
+                        }
                         FrameReadability::PlainUtf8NotJson => "Binary, utf8 but not JSON",
                         FrameReadability::InvalidUtf8OrBinary => {
                             "Binary, INVALID UTF-8 (compressed/unreadable)"
@@ -278,9 +286,7 @@ async fn run_variant(label: &str, hdrs: &[(String, String)], model: &str, offer_
         println!("  TIMEOUT (>60s) waiting for completion");
     }
     let _ = ws.send(Message::Close(None)).await;
-    println!(
-        "  → frames observed: {frame_no}, any binary/unreadable frame: {any_unreadable}"
-    );
+    println!("  → frames observed: {frame_no}, any binary/unreadable frame: {any_unreadable}");
 }
 
 #[tokio::main]

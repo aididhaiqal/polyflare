@@ -303,13 +303,15 @@ impl RequestLogRepo {
 
         Ok(rows
             .into_iter()
-            .map(|(ts, requests, errors, avg_latency_ms, total_tokens)| RequestBucket {
-                ts,
-                requests,
-                errors,
-                avg_latency_ms,
-                total_tokens,
-            })
+            .map(
+                |(ts, requests, errors, avg_latency_ms, total_tokens)| RequestBucket {
+                    ts,
+                    requests,
+                    errors,
+                    avg_latency_ms,
+                    total_tokens,
+                },
+            )
             .collect())
     }
 
@@ -577,9 +579,7 @@ mod tests {
 
         // bucket_secs = 100 → buckets start at multiples of 100.
         // Bucket [0, 100): one row at ts=50.
-        repo.insert(&row_at(50, 200, Some(500), 100))
-            .await
-            .unwrap();
+        repo.insert(&row_at(50, 200, Some(500), 100)).await.unwrap();
         // Bucket [100, 200): two rows, one success one error, at ts=120 and ts=150.
         repo.insert(&row_at(120, 200, Some(1000), 100))
             .await
@@ -662,7 +662,7 @@ mod tests {
         let repo = store.request_log();
 
         repo.insert(&row_at(0, 200, Some(1), 50)).await.unwrap(); // bucket 0
-        // Buckets 100 and 200 have no rows at all.
+                                                                  // Buckets 100 and 200 have no rows at all.
         repo.insert(&row_at(300, 200, Some(1), 50)).await.unwrap(); // bucket 300
 
         let buckets = repo.series_since(0, 100).await.unwrap();

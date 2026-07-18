@@ -419,9 +419,10 @@ mod tests {
         body.to_string()
     }
 
-    async fn connect(base: &str) -> tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    > {
+    async fn connect(
+        base: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
         let (ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
             .await
             .expect("connect");

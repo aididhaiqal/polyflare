@@ -98,7 +98,10 @@ pub fn build_response_create(
         .as_object_mut()
         .expect("build_response_create: body must be a JSON object");
 
-    obj.insert("type".to_string(), Value::String("response.create".to_string()));
+    obj.insert(
+        "type".to_string(),
+        Value::String("response.create".to_string()),
+    );
     obj.insert("input".to_string(), Value::Array(input.to_vec()));
 
     match anchor {
@@ -272,7 +275,9 @@ mod tests {
         let out = build_response_create(&body, None, &[], None);
 
         assert!(
-            !out.as_object().unwrap().contains_key("previous_response_id"),
+            !out.as_object()
+                .unwrap()
+                .contains_key("previous_response_id"),
             "a stale previous_response_id already present on `body` must be actively stripped, \
              not left behind, when anchor is None: {out}"
         );
@@ -370,7 +375,10 @@ mod tests {
             "payload must be a single line: {text:?}"
         );
         let round_tripped: Value = serde_json::from_str(payload).expect("payload is valid JSON");
-        assert_eq!(round_tripped, json!({"type":"response.output_text.delta","delta":"hi"}));
+        assert_eq!(
+            round_tripped,
+            json!({"type":"response.output_text.delta","delta":"hi"})
+        );
     }
 
     #[test]
@@ -572,7 +580,9 @@ mod tests {
                 assert_eq!(sig.status, 429);
                 assert_eq!(sig.retry_after, Some(37));
             }
-            other => panic!("expected Error(UpstreamStatus{{status:429,retry_after:Some(37)}}), got {other:?}"),
+            other => panic!(
+                "expected Error(UpstreamStatus{{status:429,retry_after:Some(37)}}), got {other:?}"
+            ),
         }
     }
 
