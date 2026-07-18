@@ -154,6 +154,7 @@ fn build_state(
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: Duration::from_secs(60),
         starvation_heartbeat: Duration::from_secs(10),
+        wake_jitter_ms: 0,
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
         soft_drain_enabled: true,

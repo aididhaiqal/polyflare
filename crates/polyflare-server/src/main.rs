@@ -224,6 +224,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: config.starvation_wait_budget,
         starvation_heartbeat: config.starvation_heartbeat,
+        wake_jitter_ms: config.wake_jitter_ms,
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         enforce_client_keys,
         stream_idle_timeout: config.stream_idle_timeout,
