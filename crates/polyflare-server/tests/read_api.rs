@@ -398,7 +398,7 @@ async fn promo_shape_resolves_weekly_from_primary_slot_and_flags_stale() {
 async fn no_secret_token_is_ever_present_in_a_read_response() {
     let pf = spawn(seed_store().await).await;
     let client = reqwest::Client::new();
-    for path in ["/api/accounts", "/api/pools", "/api/requests"] {
+    for path in ["/api/accounts", "/api/pools", "/api/requests", "/api/sessions"] {
         let text = client
             .get(format!("{pf}{path}"))
             .header("authorization", "Bearer secret")
@@ -993,6 +993,199 @@ async fn account_trends_returns_empty_series_for_account_with_no_history() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["primary"].as_array().unwrap().is_empty());
     assert!(body["secondary"].as_array().unwrap().is_empty());
+}
+
+/// TA6(c) Task 2: `GET /api/sessions` — content-free session→account affinity view. Seeds two
+/// accounts and three sessions (one owned by each account, one never-owned/`fresh`) and asserts
+/// the `{total, rows}` envelope, the LEFT-JOINed `owner_email`, and that the NULL-owner row
+/// survives (serializes `owner_email: null`, not dropped — proves LEFT not INNER).
+#[tokio::test]
+async fn sessions_endpoint_surfaces_owner_email_and_keeps_null_owner_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
+    let repo = store.accounts();
+    repo.insert(
+        &account("sess-a", "sess-a@example.test", None),
+        &tokens(),
+        &cipher,
+    )
+    .await
+    .unwrap();
+    repo.insert(
+        &account("sess-b", "sess-b@example.test", None),
+        &tokens(),
+        &cipher,
+    )
+    .await
+    .unwrap();
+
+    let continuity = store.continuity();
+    let t0 = now() - 300;
+    let t1 = now() - 200;
+    let t2 = now() - 100;
+    continuity
+        .record_completion("sk-owned-a", "hard", "sess-a", "resp-a", "fp-a", 1, t0)
+        .await
+        .unwrap();
+    continuity
+        .record_completion("sk-owned-b", "soft", "sess-b", "resp-b", "fp-b", 1, t1)
+        .await
+        .unwrap();
+    // Fresh session, never completed a turn -> owning_account_id stays NULL.
+    continuity
+        .ensure_session("sk-unowned", "soft", t2)
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+
+    let pf = spawn(store).await;
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/sessions"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["total"], 3, "body: {body}");
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "rows: {rows:?}");
+
+    // Ordered by last_activity_at DESC: sk-unowned (t2) first, then sk-owned-b (t1), then
+    // sk-owned-a (t0).
+    assert_eq!(rows[0]["session_key"], "sk-unowned");
+    assert!(
+        rows[0]["owner_email"].is_null(),
+        "unowned session must serialize owner_email: null, not be dropped: {:?}",
+        rows[0]
+    );
+    assert!(rows[0]["owning_account_id"].is_null());
+    assert_eq!(rows[0]["state"], "fresh");
+    assert_eq!(rows[0]["key_strength"], "soft");
+
+    let by_key = |key: &str| -> serde_json::Value {
+        rows.iter()
+            .find(|r| r["session_key"] == key)
+            .cloned()
+            .unwrap_or_else(|| panic!("{key} not found in rows: {rows:?}"))
+    };
+
+    let owned_a = by_key("sk-owned-a");
+    assert_eq!(owned_a["owning_account_id"], "sess-a");
+    assert_eq!(owned_a["owner_email"], "sess-a@example.test");
+    assert_eq!(owned_a["state"], "anchored");
+    assert_eq!(owned_a["key_strength"], "hard");
+
+    let owned_b = by_key("sk-owned-b");
+    assert_eq!(owned_b["owning_account_id"], "sess-b");
+    assert_eq!(owned_b["owner_email"], "sess-b@example.test");
+    assert_eq!(owned_b["state"], "anchored");
+
+    // Every row must carry the timestamp fields too.
+    for row in rows {
+        assert!(row["created_at"].is_i64());
+        assert!(row["updated_at"].is_i64());
+        assert!(row["last_activity_at"].is_i64());
+    }
+}
+
+/// `limit`/`offset` are honored (like `/api/requests`) and clamped: `limit=0` clamps up to 1
+/// (never an empty-by-limit page when rows exist), `limit=5000` clamps down to the 1000 max.
+#[tokio::test]
+async fn sessions_endpoint_honors_pagination_and_clamps_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    std::mem::forget(dir);
+
+    let continuity = store.continuity();
+    let base = now();
+    for i in 0..3 {
+        continuity
+            .ensure_session(&format!("sk-page-{i}"), "soft", base + i)
+            .await
+            .unwrap();
+    }
+
+    let pf = spawn(store).await;
+    let client = reqwest::Client::new();
+
+    // limit=2 -> exactly 2 rows, total still reports the full 3.
+    let body: serde_json::Value = client
+        .get(format!("{pf}/api/sessions?limit=2"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+
+    // offset=2 -> the 3rd (last-activity-oldest) row only.
+    let body: serde_json::Value = client
+        .get(format!("{pf}/api/sessions?limit=2&offset=2"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+
+    // limit=0 clamps up to 1, not an empty page.
+    let body: serde_json::Value = client
+        .get(format!("{pf}/api/sessions?limit=0"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+
+    // limit=5000 clamps down to MAX_LIMIT (1000) -> still just returns all 3 available rows.
+    let body: serde_json::Value = client
+        .get(format!("{pf}/api/sessions?limit=5000"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["rows"].as_array().unwrap().len(), 3);
+}
+
+/// `/api/sessions` sits behind the SAME `require_admin` gate as `/api/accounts` — a keyless
+/// request must be rejected exactly like the other `/api/*` routes, never open.
+#[tokio::test]
+async fn sessions_endpoint_is_behind_the_admin_gate() {
+    let pf = spawn(seed_store().await).await;
+    let client = reqwest::Client::new();
+
+    let gated = client
+        .get(format!("{pf}/api/accounts"))
+        .send()
+        .await
+        .unwrap();
+    let sessions = client
+        .get(format!("{pf}/api/sessions"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_ne!(sessions.status(), 200, "must not be open: {sessions:?}");
+    assert_eq!(
+        sessions.status(),
+        gated.status(),
+        "must be gated identically to /api/accounts"
+    );
 }
 
 #[tokio::test]
