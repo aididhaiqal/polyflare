@@ -43,6 +43,9 @@ pub(crate) fn freshness_seconds(refresh_interval_secs: i64) -> f64 {
 /// Per-account forecast burn rate in **credits/hour** from the last 6h of samples via the EWMA.
 /// `None` if fewer than 2 recent rows or the rate never establishes. `%/s → credits/hr` uses
 /// `rate · full_credits · 36` (= rate% · full/100 · 3600).
+///
+/// Precondition: `rows` must be ordered oldest-first by `recorded_at` — the EWMA is replayed in
+/// order, same as the sibling `compute_depletion_for_account`.
 pub(crate) fn recent_burn_rate_credits_per_hour(
     rows: &[UsageSample],
     full_credits: f64,
@@ -364,5 +367,40 @@ mod tests {
     fn freshness_is_max_300_and_3x_interval() {
         assert_eq!(freshness_seconds(600), 1800.0); // 600*3
         assert_eq!(freshness_seconds(10), 300.0); // floor
+    }
+
+    #[test]
+    fn multi_account_drains_soonest_reset_first_and_refills_correct_account() {
+        // Regression pin for the multi-account sim crux: draining must be soonest-reset-first,
+        // and the refill-at-boundary must land on the SAME account whose reset just fired. A
+        // single-account sim test can never catch either bug (there's only one account to drain
+        // or refill), so this test uses two.
+        //
+        // A: resets in 1h (soonest), near-empty (200 of 1500 full). B: resets in 3h (outside the
+        // 2h horizon, so it never itself refills), ample balance (5000 of 5000 full). Burn is a
+        // constant 2000 credits/hr, low enough that the pool never exhausts either way -- but
+        // WHICH account absorbs each interval's burn changes how much gets restored when A hits
+        // its 1h refill: a fully-drained A gets a big injection back to full; an untouched A gets
+        // a small one. That difference then shows up in the *next* interval's trough.
+        //
+        // Hand-traced expectation (soonest-first == correct):
+        //   iter1 [0,1h): burn=2000 drains A(200->0) then overflows 1800 onto B(5000->3200); trough 3200
+        //   refill A: 0->1500 (full 1500 injection);                    total = 1500+3200 = 4700
+        //   iter2 [1h,2h): burn=2000 drains A(1500->0) then overflows 500 onto B(3200->2700); trough 2700
+        //   => projected_minimum_remaining_credits = 2700, no shortfall.
+        //
+        // A newest-first (wrong) drain order instead lets B -- which alone has enough balance --
+        // absorb each interval's burn, leaving A untouched (still near-empty) at the 1h refill.
+        // That's only a 1300 injection (1500-200), so the pool re-enters iter2 lower (4500, not
+        // 4700) and the iter2 trough comes out at 2500, not 2700. Verified in this task's RED
+        // proof: reversing consume_balance's drain order flips this assertion to 2500 (see the
+        // task-3 report for the exact mutation + before/after `cargo test` output).
+        let hour_ms = 3_600_000.0;
+        let a = sim(1_500.0, 200.0, hour_ms, hour_ms); // soonest reset, near-empty
+        let b = sim(5_000.0, 5_000.0, 3.0 * hour_ms, hour_ms); // later reset (outside horizon), ample balance
+        let p = project_weekly_pool(&[a, b], 0.0, Some(2_000.0));
+        assert_eq!(p.projected_shortfall_credits, 0.0);
+        assert_eq!(p.projected_depletion_hours, None);
+        assert_eq!(p.projected_minimum_remaining_credits, 2700.0);
     }
 }
