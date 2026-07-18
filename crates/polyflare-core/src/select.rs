@@ -120,14 +120,8 @@ impl Candidate<'_> {
 /// Global Constraints).
 enum Eligibility<'a> {
     Eligible(Candidate<'a>),
-    // `recover_at`/`kind` are produced starting here (B5 Task 1) but only *consumed* starting with
-    // B5 Task 2's `soonest_recover` — tests already read both fields, this silences the interim
-    // dead-code lint on the non-test build until that consumer lands.
-    #[allow(dead_code)]
-    InBackoff {
-        recover_at: i64,
-        kind: BackoffKind,
-    },
+    // `recover_at`/`kind` are consumed by `soonest_recover` (B5 Task 2) below.
+    InBackoff { recover_at: i64, kind: BackoffKind },
     HardBlocked,
 }
 
@@ -147,7 +141,8 @@ impl<'a> Eligibility<'a> {
 /// Which gate produced an `InBackoff` verdict. `ErrorBackoff` accounts are Layer-1 serve-now
 /// candidates (a short transient-upstream-error window); `Cooldown` accounts (rate_limited /
 /// quota_exceeded pending their reset, or an explicit `cooldown_until`) are Layer-2 wait targets.
-enum BackoffKind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackoffKind {
     ErrorBackoff,
     Cooldown,
 }
@@ -258,6 +253,43 @@ fn eligibility(s: &AccountSnapshot, now: i64) -> Eligibility<'_> {
         eff_error_count,
         eff_last_error_at,
     })
+}
+
+/// B5 Task 2: WHICH benched account recovers soonest, WHEN, and WHY — the ingress's answer when
+/// the eligible pool is empty (Layer 1 serve-soonest / Layer 2 keepalive-wait). `account_id` is
+/// owned (M2-GATE1 parity with `Selector::pick`'s return type); `kind` lets the ingress choose
+/// serve-now (`ErrorBackoff`) vs wait (`Cooldown`) without re-deriving it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recovery {
+    pub recover_at: i64,
+    pub account_id: AccountId,
+    pub kind: BackoffKind,
+}
+
+/// The soonest-to-recover benched account, capability-filtered and HardBlocked-excluded — the
+/// shared implementation behind `Selector::soonest_recover`'s default (B5 Task 2). Strategy-
+/// independent: applies the IDENTICAL capability pre-filter `standard_pool` uses
+/// (`!ctx.require_security_work_authorized || s.security_work_authorized`) BEFORE classifying, so
+/// it is structurally impossible to return a non-authorized account under a capability-requiring
+/// ctx (the security floor). `Eligible` (nothing to wait for) and `HardBlocked` (never a wait
+/// target — no known recovery time) are excluded from the `min`; `None` when no `InBackoff`
+/// verdict remains, including on an empty `snapshots` slice.
+pub(crate) fn soonest_recover(
+    snapshots: &[AccountSnapshot],
+    ctx: &SelectionCtx,
+) -> Option<Recovery> {
+    snapshots
+        .iter()
+        .filter(|s| !ctx.require_security_work_authorized || s.security_work_authorized)
+        .filter_map(|s| match eligibility(s, ctx.now) {
+            Eligibility::InBackoff { recover_at, kind } => Some(Recovery {
+                recover_at,
+                account_id: s.id.clone(),
+                kind,
+            }),
+            Eligibility::Eligible(_) | Eligibility::HardBlocked => None,
+        })
+        .min_by_key(|r| r.recover_at)
 }
 
 /// Health-tier pooling (step 2): prefer healthy(0), then probing(2), then draining(1) — mirrors
@@ -1105,8 +1137,8 @@ mod tests {
     }
 
     #[test]
-    fn eligibility_recovered_rate_limit_still_blocked_by_active_cooldown_reports_cooldown_recover_at()
-    {
+    fn eligibility_recovered_rate_limit_still_blocked_by_active_cooldown_reports_cooldown_recover_at(
+    ) {
         // PROVES the recovery-does-not-admit-early fall-through is preserved: the reset has
         // passed (which mutates eff_* state) but the verdict must come from the FIRST remaining
         // blocking gate — cooldown_until — not an early Eligible from the reset alone.
@@ -1116,7 +1148,10 @@ mod tests {
         s.cooldown_until = Some(2000); // …but cooldown is still active
         match eligibility(&s, 1000) {
             Eligibility::InBackoff { recover_at, kind } => {
-                assert_eq!(recover_at, 2000, "recover_at must be the cooldown, not the reset");
+                assert_eq!(
+                    recover_at, 2000,
+                    "recover_at must be the cooldown, not the reset"
+                );
                 assert!(matches!(kind, BackoffKind::Cooldown));
             }
             _ => panic!("expected InBackoff{{Cooldown}} — recovery must not admit early"),
@@ -1143,10 +1178,124 @@ mod tests {
         s.last_error_at = Some(1000);
         match eligibility(&s, 1030) {
             Eligibility::InBackoff { recover_at, kind } => {
-                assert_eq!(recover_at, 1060, "last_error_at(1000) + error_backoff_secs(4)=60");
+                assert_eq!(
+                    recover_at, 1060,
+                    "last_error_at(1000) + error_backoff_secs(4)=60"
+                );
                 assert!(matches!(kind, BackoffKind::ErrorBackoff));
             }
             _ => panic!("expected InBackoff{{ErrorBackoff}} mid-window"),
         }
+    }
+
+    // ---- B5 Task 2: `soonest_recover` (capability-filtered, HardBlocked-excluded) ----
+
+    #[test]
+    fn soonest_recover_returns_min_recover_at_excluding_hardblocked() {
+        // now=40: cooldown@100, error-backoff@50 (last_error_at=20, error_count=3 → +30 = 50),
+        // and a hardblocked (paused) peer that must never be considered.
+        let mut cooldown = snap("cooldown-acct", "plus", 0.0);
+        cooldown.cooldown_until = Some(100);
+        let mut backoff = snap("backoff-acct", "plus", 0.0);
+        backoff.error_count = 3;
+        backoff.last_error_at = Some(20);
+        let mut blocked = snap("blocked-acct", "plus", 0.0);
+        blocked.status = "paused".to_string();
+
+        let sel = CapacityWeighted;
+        let got = sel
+            .soonest_recover(&[cooldown, backoff, blocked], &ctx(40, 1))
+            .expect("an InBackoff account exists");
+        assert_eq!(got.recover_at, 50);
+        assert_eq!(got.account_id.as_str(), "backoff-acct");
+        assert_eq!(got.kind, BackoffKind::ErrorBackoff);
+    }
+
+    #[test]
+    fn soonest_recover_never_returns_a_non_authorized_account_under_cyber_ctx() {
+        // SECURITY FLOOR: the non-authorized account recovers sooner (@50) than the capable one
+        // (@200), but a cyber ctx must NEVER wait on / return the non-authorized account — the
+        // capability filter runs BEFORE the min, so the capable @200 account wins.
+        let mut capable = snap("capable-acct", "plus", 0.0);
+        capable.security_work_authorized = true;
+        capable.cooldown_until = Some(200);
+        let mut non_authorized = snap("non-authorized-acct", "plus", 0.0);
+        non_authorized.cooldown_until = Some(50);
+
+        let cyber_ctx = SelectionCtx {
+            now: 10,
+            require_security_work_authorized: true,
+            rng_seed: Some(1),
+            session_id: None,
+            tier: None,
+        };
+
+        let sel = CapacityWeighted;
+        let got = sel
+            .soonest_recover(&[capable, non_authorized], &cyber_ctx)
+            .expect("the capable account is InBackoff");
+        assert_eq!(
+            got.account_id.as_str(),
+            "capable-acct",
+            "must never return the sooner non-authorized account"
+        );
+        assert_eq!(got.recover_at, 200);
+        assert_eq!(got.kind, BackoffKind::Cooldown);
+    }
+
+    #[test]
+    fn soonest_recover_all_hardblocked_after_capability_filter_yields_none() {
+        let mut authorized_paused = snap("authorized-paused", "plus", 0.0);
+        authorized_paused.security_work_authorized = true;
+        authorized_paused.status = "paused".to_string();
+        let non_authorized_paused = {
+            let mut s = snap("non-authorized-paused", "plus", 0.0);
+            s.status = "paused".to_string();
+            s
+        };
+
+        let cyber_ctx = SelectionCtx {
+            now: 10,
+            require_security_work_authorized: true,
+            rng_seed: Some(1),
+            session_id: None,
+            tier: None,
+        };
+
+        let sel = CapacityWeighted;
+        assert!(sel
+            .soonest_recover(&[authorized_paused, non_authorized_paused], &cyber_ctx)
+            .is_none());
+    }
+
+    #[test]
+    fn soonest_recover_all_eligible_yields_none() {
+        let a = snap("a", "plus", 10.0);
+        let b = snap("b", "plus", 20.0);
+        let sel = CapacityWeighted;
+        assert!(sel.soonest_recover(&[a, b], &ctx(0, 1)).is_none());
+    }
+
+    #[test]
+    fn soonest_recover_mixed_min_is_cooldown_reports_cooldown_kind() {
+        let mut cooldown = snap("cooldown-acct", "plus", 0.0);
+        cooldown.cooldown_until = Some(30);
+        let mut backoff = snap("backoff-acct", "plus", 0.0);
+        backoff.error_count = 3;
+        backoff.last_error_at = Some(60); // recover_at = 60 + 30 = 90
+
+        let sel = CapacityWeighted;
+        let got = sel
+            .soonest_recover(&[cooldown, backoff], &ctx(0, 1))
+            .expect("cooldown account is InBackoff");
+        assert_eq!(got.account_id.as_str(), "cooldown-acct");
+        assert_eq!(got.recover_at, 30);
+        assert_eq!(got.kind, BackoffKind::Cooldown);
+    }
+
+    #[test]
+    fn soonest_recover_empty_snapshots_yields_none() {
+        let sel = CapacityWeighted;
+        assert!(sel.soonest_recover(&[], &ctx(0, 1)).is_none());
     }
 }

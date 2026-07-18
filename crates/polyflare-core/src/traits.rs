@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 
+use crate::select::Recovery;
 use crate::types::{
     Account, AccountId, AccountSnapshot, ContinuityError, ExecError, Prepared, PreparedRequest,
     RequestCtx, ResponseStream, SelectionCtx, SessionKey, TurnOutcome,
@@ -36,6 +37,24 @@ pub trait Selector: Send + Sync {
     /// `/api/pools`'s `strategy` field). Config-selectable strategies match
     /// `RoutingStrategy::name()`'s strings; ad hoc/test selectors just need a stable identifier.
     fn name(&self) -> &'static str;
+
+    /// B5 Task 2: when `pick` finds nothing (the eligible pool is empty), WHICH benched account
+    /// recovers soonest, WHEN, and WHY — the foundation for the ingress's serve-soonest (Layer 1)
+    /// and keepalive recovery-wait (Layer 2). Capability-filtered identically to `pick`'s pool
+    /// (never returns a non-authorized account under a capability-requiring `ctx` — the security
+    /// floor) and never a `HardBlocked` account (no known recovery time ⇒ not a wait target).
+    ///
+    /// This is a single SHARED default, not per-strategy: which account is soonest-to-recover is
+    /// capability + eligibility math over the raw snapshots, identical for every `Selector` impl
+    /// (it does not depend on health-tier pooling, the burn/normal/preserve waterfall, or the
+    /// weighting scheme any given strategy uses for `pick`). No impl overrides it.
+    fn soonest_recover(
+        &self,
+        snapshots: &[AccountSnapshot],
+        ctx: &SelectionCtx,
+    ) -> Option<Recovery> {
+        crate::select::soonest_recover(snapshots, ctx)
+    }
 }
 
 /// The continuity state machine seam (M3). `prepare` resolves session + ownership and decides
