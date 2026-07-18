@@ -133,6 +133,17 @@ async fn metrics_body_never_contains_seeded_email_or_secret_token() {
         .await
         .unwrap();
 
+    // C11b: populate the two new counter families keyed by the SAME opaque leak-check account id
+    // (and a fixed rate-limit type) — proves the `upstream_request_metrics`/`rate_limit_metrics` →
+    // `MetricsSnapshot` → `render_prometheus_text` pipeline is exactly as leak-proof as the
+    // pre-existing per-account gauge families: the maps only ever hold what `record()` is handed
+    // (an opaque account id, a numeric status, a fixed `&'static str` type), never a store row, so
+    // there is structurally nothing here that could carry the email/token seeded above.
+    state
+        .upstream_request_metrics
+        .record(Some("acct-leak-check"), 200);
+    state.rate_limit_metrics.record("upstream");
+
     let r = reqwest::Client::new()
         .get(format!("{pf}/metrics"))
         .header("authorization", "Bearer secret")
@@ -162,6 +173,19 @@ async fn metrics_body_never_contains_seeded_email_or_secret_token() {
     assert!(
         body.contains("account_id=\"acct-leak-check\""),
         "the opaque account id should still be present as the label: {body}"
+    );
+
+    // C11b: the two new counter families also carry only the opaque id / fixed type, never the
+    // seeded email or token.
+    assert!(
+        body.contains(
+            "polyflare_upstream_requests_total{account_id=\"acct-leak-check\",status=\"200\"} 1"
+        ),
+        "missing the seeded upstream_requests_total line: {body}"
+    );
+    assert!(
+        body.contains("polyflare_rate_limit_hits_total{type=\"upstream\"} 1"),
+        "missing the seeded rate_limit_hits_total line: {body}"
     );
 }
 
@@ -211,4 +235,91 @@ async fn metrics_reflect_live_lease_acquire_state() {
     );
 
     drop(guard);
+}
+
+/// (e) C11b: driving a REAL successful `/responses` request through the admin-gated harness bumps
+/// `polyflare_upstream_requests_total{account_id="acct-1",status="200"}`, visible on the very next
+/// admin-keyed `/metrics` scrape — proving the handler reads `state.upstream_request_metrics`
+/// live, exactly like the existing lease/account gauge families above.
+#[tokio::test]
+async fn metrics_reflects_a_live_successful_responses_request_as_upstream_requests_total() {
+    let up = polyflare_testkit::MockUpstream::new(vec![
+        r#"{"type":"response.output_text.delta","delta":"hi"}"#.to_string(),
+        r#"{"type":"response.completed"}"#.to_string(),
+    ])
+    .spawn()
+    .await;
+    let (pf, _state) = spawn(up).await; // seeds "acct-1"
+    let c = reqwest::Client::new();
+
+    let resp = c
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "m", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let _ = resp.bytes().await.unwrap();
+
+    let body = c
+        .get(format!("{pf}/metrics"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(body.contains("# TYPE polyflare_upstream_requests_total counter"));
+    assert!(
+        body.contains("polyflare_upstream_requests_total{account_id=\"acct-1\",status=\"200\"} 1"),
+        "the driven /responses request should be visible as an upstream_requests_total sample: {body}"
+    );
+}
+
+/// (f) C11b: driving a REAL upstream 429 through `/responses` (the only account 429s, so the
+/// client sees a generic `502`, mirroring `tests/failure_routing.rs`'s
+/// `a_429_cools_the_account_down_and_benches_it_next_request`) bumps
+/// `polyflare_rate_limit_hits_total{type="backoff"}` — `MockUpstream::error_status` never sets a
+/// `Retry-After` header, so `RuntimeStates::record_rate_limit` takes the computed-backoff branch —
+/// visible on the very next admin-keyed `/metrics` scrape.
+#[tokio::test]
+async fn metrics_reflects_a_live_429_as_rate_limit_hits_total() {
+    let up = polyflare_testkit::MockUpstream::error_status(
+        429,
+        r#"{"error":{"message":"rate limited"}}"#,
+    )
+    .spawn()
+    .await;
+    let (pf, _state) = spawn(up).await; // seeds "acct-1"
+    let c = reqwest::Client::new();
+
+    let resp = c
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "m", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        502,
+        "the only account 429ing with no failover target surfaces as a generic 502"
+    );
+
+    let body = c
+        .get(format!("{pf}/metrics"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(body.contains("# TYPE polyflare_rate_limit_hits_total counter"));
+    assert!(
+        body.contains("polyflare_rate_limit_hits_total{type=\"backoff\"} 1"),
+        "the driven 429 should be visible as a rate_limit_hits_total sample: {body}"
+    );
 }
