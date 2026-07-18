@@ -21,6 +21,8 @@ use std::sync::{Arc, RwLock};
 
 use polyflare_core::{AccountId, AccountSnapshot};
 
+use crate::observability::LeaseMetrics;
+
 /// Base for the exponential error backoff, in milliseconds (`0.2s * 2^(n-1)` — codex-lb
 /// `retry.py:51-77`). The eligibility error-backoff gate (`select.rs`) uses the same shape.
 const BACKOFF_BASE_MS: i64 = 200;
@@ -335,10 +337,15 @@ pub struct RuntimeStates {
 /// structural, not something this type needs to defend against with extra bookkeeping. `#[must_use]`
 /// flags the easy-to-write bug of acquiring a lease and immediately discarding the guard as a temporary
 /// (which would release it before the caller ever holds it for the request).
+///
+/// C9 Task 4: also holds an `Arc<LeaseMetrics>` handle so its `Drop` can bump the content-free
+/// `released` counter — see [`RuntimeStates::acquire_in_flight`]'s doc for why this is threaded in
+/// at acquire time (a call-site parameter) rather than stored on `RuntimeStates` itself.
 #[must_use]
 pub struct InFlightGuard {
     runtime: Arc<RuntimeStates>,
     id: AccountId,
+    metrics: Arc<LeaseMetrics>,
 }
 
 impl Drop for InFlightGuard {
@@ -349,6 +356,11 @@ impl Drop for InFlightGuard {
         self.runtime.mutate(&self.id, |rt| {
             rt.in_flight = rt.in_flight.saturating_sub(1);
         });
+        // C9 Task 4: the release counter. This fires on EVERY way this guard stops existing —
+        // clean drain, client disconnect, mid-stream error, idle-timeout, or a failover reselect's
+        // dropped pre-stream attempt — the exact same leak-proof coverage the `in_flight` decrement
+        // above already has, since both live in this one `Drop` impl.
+        self.metrics.record_release();
     }
 }
 
@@ -631,14 +643,36 @@ impl RuntimeStates {
     /// `now` is accepted for symmetry with every other `mutate`-driving method on this type (and
     /// reserved for a possible future TTL-stamp / stale-reclaim sweep — see the plan's Task 4
     /// follow-ups) but is not otherwise read by v1's pure increment.
-    pub fn acquire_in_flight(self: &Arc<Self>, id: &AccountId, now: i64) -> InFlightGuard {
+    ///
+    /// C9 Task 4: `metrics` is the content-free [`LeaseMetrics`] handle (an `AppState` field) that
+    /// this call bumps `acquired` on, and that the returned [`InFlightGuard`] carries forward so its
+    /// `Drop` can later bump `released` — the ONLY way to get a bump on every release path (a plain
+    /// `Drop` has no caller to report back to). Threaded in as a call-site PARAMETER (from
+    /// `crate::ingress`'s `state.lease_metrics`) rather than stored as a field on `RuntimeStates`
+    /// itself: `RuntimeStates`'s own construction (`::new`/`Default`) stays metrics-free and
+    /// unchanged, so none of the ~40 existing `AppState`-builder call sites that already write
+    /// `runtime: Default::default()` needed to change for this task — only the ~20 call sites that
+    /// actually invoke `acquire_in_flight` gained one argument. This is a deliberate, documented
+    /// exception to this module's usual "no dependency on `observability`" discipline (see this
+    /// file's `REASON_USAGE_DRAIN` doc for that precedent): `LeaseMetrics` is a pure content-free
+    /// counter with no risk of the coupling that precedent was guarding against, and returning a
+    /// value "upward" (the pattern `HealthTierTransition` uses) cannot work here — nobody is
+    /// necessarily present to act on a return value at the moment an `InFlightGuard` silently drops.
+    pub fn acquire_in_flight(
+        self: &Arc<Self>,
+        id: &AccountId,
+        now: i64,
+        metrics: &Arc<LeaseMetrics>,
+    ) -> InFlightGuard {
         let _ = now;
         self.mutate(id, |rt| {
             rt.in_flight = rt.in_flight.saturating_add(1);
         });
+        metrics.record_acquire();
         InFlightGuard {
             runtime: Arc::clone(self),
             id: id.clone(),
+            metrics: Arc::clone(metrics),
         }
     }
 
@@ -1239,15 +1273,16 @@ mod tests {
         // is fully GC'd from the map (peek == None) since a neutral entry decays out.
         let rs = Arc::new(RuntimeStates::new());
         let id = AccountId::from("a");
+        let metrics = LeaseMetrics::new();
 
-        let guard1 = rs.acquire_in_flight(&id, 1000);
+        let guard1 = rs.acquire_in_flight(&id, 1000, &metrics);
         assert_eq!(
             peek(&rs, &id).map(|rt| rt.in_flight),
             Some(1),
             "first acquire ⇒ in_flight 1"
         );
 
-        let guard2 = rs.acquire_in_flight(&id, 1000);
+        let guard2 = rs.acquire_in_flight(&id, 1000, &metrics);
         assert_eq!(
             peek(&rs, &id).map(|rt| rt.in_flight),
             Some(2),
@@ -1267,6 +1302,11 @@ mod tests {
             None,
             "dropping the last guard decrements to 0; the now-fully-neutral entry is GC'd"
         );
+
+        // C9 Task 4: the threaded LeaseMetrics handle saw both acquires and both releases.
+        assert_eq!(metrics.acquired(), 2, "one bump per acquire_in_flight call");
+        assert_eq!(metrics.released(), 2, "one bump per guard Drop");
+        assert_eq!(metrics.current(), 0, "balanced ⇒ 0 derived in-flight");
     }
 
     #[test]
@@ -1274,7 +1314,8 @@ mod tests {
         // (b) overlay copies in_flight for a known entry; an absent entry stays at the neutral 0.
         let rs = Arc::new(RuntimeStates::new());
         let id = AccountId::from("a");
-        let _guard = rs.acquire_in_flight(&id, 1000);
+        let metrics = LeaseMetrics::new();
+        let _guard = rs.acquire_in_flight(&id, 1000, &metrics);
 
         let mut snaps = vec![snap("a"), snap("b")];
         rs.overlay(&mut snaps, 1000);
@@ -1308,7 +1349,8 @@ mod tests {
         // neutral-GC (e.g. record_selected on some other bookkeeping) rather than vanish mid-flight.
         let rs = Arc::new(RuntimeStates::new());
         let id = AccountId::from("a");
-        let guard = rs.acquire_in_flight(&id, 1000);
+        let metrics = LeaseMetrics::new();
+        let guard = rs.acquire_in_flight(&id, 1000, &metrics);
         rs.record_selected(&id, 1000); // triggers another mutate/GC-check cycle
         assert_eq!(
             peek(&rs, &id).map(|rt| rt.in_flight),
@@ -1325,9 +1367,10 @@ mod tests {
         // each must decrement exactly once on its own drop, never double-counting the other's release.
         let rs = Arc::new(RuntimeStates::new());
         let id = AccountId::from("a");
+        let metrics = LeaseMetrics::new();
 
-        let guard_a = rs.acquire_in_flight(&id, 1000);
-        let guard_b = rs.acquire_in_flight(&id, 1000);
+        let guard_a = rs.acquire_in_flight(&id, 1000, &metrics);
+        let guard_b = rs.acquire_in_flight(&id, 1000, &metrics);
         assert_eq!(peek(&rs, &id).map(|rt| rt.in_flight), Some(2));
 
         drop(guard_a);

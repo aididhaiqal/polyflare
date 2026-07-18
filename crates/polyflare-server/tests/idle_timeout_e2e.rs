@@ -109,6 +109,7 @@ async fn spawn_polyflare(upstream: String, idle: Duration) -> String {
         starvation_heartbeat: Duration::from_secs(10),
         wake_jitter_ms: 0,
         inflight_penalty_pct: 2.5,
+        lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         // The field under test: everything else here is boilerplate identical to every other

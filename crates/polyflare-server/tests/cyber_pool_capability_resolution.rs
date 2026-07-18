@@ -187,6 +187,7 @@ async fn spawn_app(store: Store, cipher: TokenCipher, upstream_url: String) -> S
         starvation_heartbeat: std::time::Duration::from_secs(10),
         wake_jitter_ms: 0,
         inflight_penalty_pct: 2.5,
+        lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),

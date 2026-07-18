@@ -179,6 +179,7 @@ fn build_state(
         soft_drain_enabled: true,
         runtime: Default::default(),
         inflight_penalty_pct: 2.5,
+        lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
     })
 }
 
