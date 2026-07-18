@@ -211,11 +211,7 @@ async fn executor_extracts_error_code_from_openai_shape_without_leaking_message(
 
 #[tokio::test]
 async fn executor_does_not_scrape_a_code_out_of_prose_detail() {
-    let err = run_error_status(
-        429,
-        r#"{"detail":"you have been rate limited, try later"}"#,
-    )
-    .await;
+    let err = run_error_status(429, r#"{"detail":"you have been rate limited, try later"}"#).await;
     match &err {
         polyflare_core::ExecError::UpstreamStatus(s) => {
             assert_eq!(s.status, 429);

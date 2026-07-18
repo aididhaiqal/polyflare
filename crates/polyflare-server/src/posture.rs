@@ -146,10 +146,19 @@ mod tests {
 
     #[test]
     fn no_keys_loopback_bind_is_open() {
-        assert_eq!(resolve_proxy_enforcement(false, "127.0.0.1:8080", false), Ok(false));
-        assert_eq!(resolve_proxy_enforcement(false, "127.5.5.5:8080", false), Ok(false),
-            "the whole 127.0.0.0/8 block is loopback, not just 127.0.0.1");
-        assert_eq!(resolve_proxy_enforcement(false, "[::1]:8080", false), Ok(false));
+        assert_eq!(
+            resolve_proxy_enforcement(false, "127.0.0.1:8080", false),
+            Ok(false)
+        );
+        assert_eq!(
+            resolve_proxy_enforcement(false, "127.5.5.5:8080", false),
+            Ok(false),
+            "the whole 127.0.0.0/8 block is loopback, not just 127.0.0.1"
+        );
+        assert_eq!(
+            resolve_proxy_enforcement(false, "[::1]:8080", false),
+            Ok(false)
+        );
     }
 
     #[test]
@@ -265,6 +274,9 @@ mod tests {
         drop(guard);
 
         let captured = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert!(captured.is_empty(), "the refuse branch must not log anything, got: {captured:?}");
+        assert!(
+            captured.is_empty(),
+            "the refuse branch must not log anything, got: {captured:?}"
+        );
     }
 }

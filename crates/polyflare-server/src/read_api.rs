@@ -875,15 +875,13 @@ pub async fn overview_series_handler(State(state): State<Arc<AppState>>) -> impl
     let mut buckets = Vec::new();
     let mut ts = aligned_start;
     while ts <= aligned_now {
-        let bucket = by_ts
-            .remove(&ts)
-            .unwrap_or(polyflare_store::RequestBucket {
-                ts,
-                requests: 0,
-                errors: 0,
-                avg_latency_ms: 0.0,
-                total_tokens: 0,
-            });
+        let bucket = by_ts.remove(&ts).unwrap_or(polyflare_store::RequestBucket {
+            ts,
+            requests: 0,
+            errors: 0,
+            avg_latency_ms: 0.0,
+            total_tokens: 0,
+        });
         buckets.push(SeriesBucketView::from(bucket));
         ts += bucket_secs;
     }

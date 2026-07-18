@@ -114,10 +114,9 @@ impl ContinuityRepo {
 
     /// Total count of `continuity_sessions` rows (for the `{total, rows}` pagination envelope).
     pub async fn count_sessions(&self) -> Result<i64, sqlx::Error> {
-        let (count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM continuity_sessions")
-                .fetch_one(&self.pool)
-                .await?;
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM continuity_sessions")
+            .fetch_one(&self.pool)
+            .await?;
         Ok(count)
     }
 

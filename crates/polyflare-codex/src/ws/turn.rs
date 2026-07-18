@@ -329,9 +329,14 @@ pub fn turn_stream(conn: SharedWsConn, envelope: Value) -> ResponseStream {
 /// exactly mirroring ground truth §4's per-socket exclusivity, just widened to cover planning too.
 /// Turns on a DIFFERENT session key use a DIFFERENT `SharedWsConn` (a different `Mutex`), so this
 /// never serializes unrelated sessions against each other.
-pub(crate) fn turn_stream_with_guard(guard: OwnedMutexGuard<WsConn>, envelope: Value) -> ResponseStream {
+pub(crate) fn turn_stream_with_guard(
+    guard: OwnedMutexGuard<WsConn>,
+    envelope: Value,
+) -> ResponseStream {
     Box::pin(TurnStream {
-        state: TurnState::Sending(Box::pin(async move { send_and_track(guard, &envelope).await })),
+        state: TurnState::Sending(Box::pin(
+            async move { send_and_track(guard, &envelope).await },
+        )),
     })
 }
 
@@ -382,17 +387,30 @@ mod tests {
             json!({"type": "response.output_text.delta", "delta": "hi"}).to_string(),
         ]));
         let base = mock.clone().spawn().await;
-        let conn = WsConn::connect(&test_account(base), &[]).await.expect("connect");
+        let conn = WsConn::connect(&test_account(base), &[])
+            .await
+            .expect("connect");
         let shared = shared_conn(conn);
 
-        let mut stream = turn_stream(shared, envelope(vec![json!({"role": "user", "content": "hi"})], None));
+        let mut stream = turn_stream(
+            shared,
+            envelope(vec![json!({"role": "user", "content": "hi"})], None),
+        );
 
-        let first = stream.next().await.expect("expected the delta event").expect("ok");
+        let first = stream
+            .next()
+            .await
+            .expect("expected the delta event")
+            .expect("ok");
         let first = parse_sse(&first);
         assert_eq!(first["type"], "response.output_text.delta");
         assert_eq!(first["delta"], "hi");
 
-        let second = stream.next().await.expect("expected the terminal frame").expect("ok");
+        let second = stream
+            .next()
+            .await
+            .expect("expected the terminal frame")
+            .expect("ok");
         let second = parse_sse(&second);
         assert_eq!(second["type"], "response.completed");
         assert_eq!(second["response"]["id"], "resp_1");
@@ -416,7 +434,9 @@ mod tests {
             ScriptedTurn::normal(vec![]),
         ]);
         let base = mock.clone().spawn().await;
-        let conn = WsConn::connect(&test_account(base), &[]).await.expect("connect");
+        let conn = WsConn::connect(&test_account(base), &[])
+            .await
+            .expect("connect");
         let shared = shared_conn(conn);
 
         // Turn 1: full history, no anchor.
@@ -437,7 +457,10 @@ mod tests {
         // Turn 2, SAME shared handle: an anchored delta.
         let mut stream2 = turn_stream(
             shared.clone(),
-            envelope(vec![json!({"role": "user", "content": "second"})], Some("resp_1")),
+            envelope(
+                vec![json!({"role": "user", "content": "second"})],
+                Some("resp_1"),
+            ),
         );
         let mut second_id = None;
         while let Some(item) = stream2.next().await {
@@ -460,7 +483,9 @@ mod tests {
     async fn last_response_id_is_captured_onto_the_conn_from_the_completed_frame() {
         let mock = MockWsUpstream::new(ScriptedTurn::normal(vec![]));
         let base = mock.clone().spawn().await;
-        let conn = WsConn::connect(&test_account(base), &[]).await.expect("connect");
+        let conn = WsConn::connect(&test_account(base), &[])
+            .await
+            .expect("connect");
         let shared = shared_conn(conn);
         assert!(shared.lock().await.last_response_id.is_none());
 
@@ -480,13 +505,22 @@ mod tests {
             json!({"type": "response.output_text.delta", "delta": "partial"}).to_string(),
         ]));
         let base = mock.clone().spawn().await;
-        let conn = WsConn::connect(&test_account(base), &[]).await.expect("connect");
+        let conn = WsConn::connect(&test_account(base), &[])
+            .await
+            .expect("connect");
         let shared = shared_conn(conn);
 
-        let mut stream = turn_stream(shared, envelope(vec![json!({"role": "user", "content": "hi"})], None));
+        let mut stream = turn_stream(
+            shared,
+            envelope(vec![json!({"role": "user", "content": "hi"})], None),
+        );
 
         // The pre-close delta event still arrives, forwarded as normal.
-        let first = stream.next().await.expect("expected the delta event").expect("ok");
+        let first = stream
+            .next()
+            .await
+            .expect("expected the delta event")
+            .expect("ok");
         assert_eq!(parse_sse(&first)["delta"], "partial");
 
         // Then the close itself, surfaced as the required error shape — so

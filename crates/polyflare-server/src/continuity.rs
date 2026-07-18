@@ -474,7 +474,10 @@ mod tests {
             strength: KeyStrength::Soft,
         };
         // Turn 1 equivalent: a session row exists (as `prepare` would have ensured).
-        cont.repo.ensure_session("sk-sticky", "soft", 1).await.unwrap();
+        cont.repo
+            .ensure_session("sk-sticky", "soft", 1)
+            .await
+            .unwrap();
         // The stamp `reroute_cyber_rejection` performs on a successful cyber move.
         cont.mark_required_capability(&sk, "security_work")
             .await
@@ -504,7 +507,10 @@ mod tests {
             value: "sk-plain".into(),
             strength: KeyStrength::Soft,
         };
-        cont.repo.ensure_session("sk-plain", "soft", 1).await.unwrap();
+        cont.repo
+            .ensure_session("sk-plain", "soft", 1)
+            .await
+            .unwrap();
 
         let ctx = RequestCtx {
             session_key: Some(sk),

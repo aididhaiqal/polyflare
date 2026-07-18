@@ -472,7 +472,11 @@ async fn headroom_score(store: &Store, account_id: &str) -> f64 {
         .latest_usage(account_id)
         .await
         .unwrap_or_default();
-    let p = usage.primary.as_ref().map(|w| w.used_percent).unwrap_or(0.0);
+    let p = usage
+        .primary
+        .as_ref()
+        .map(|w| w.used_percent)
+        .unwrap_or(0.0);
     let s = usage
         .secondary
         .as_ref()
@@ -569,7 +573,9 @@ async fn main() {
             "\nDRY RUN (default) — zero network calls were made, zero quota consumed. Re-run with \
              `--live` appended only when you have headroom on both accounts above:\n"
         );
-        println!("  cargo run -p polyflare-server --example ws_ratelimit_probe --release -- --live\n");
+        println!(
+            "  cargo run -p polyflare-server --example ws_ratelimit_probe --release -- --live\n"
+        );
         return;
     }
 
@@ -626,7 +632,11 @@ async fn main() {
         "{}\n\nIn one word, what animal is mentioned above?",
         filler(&nonce_ws, ctx_kb)
     );
-    let seed = ws_turn(&mut ws, ws_body(&model, &nonce_ws, json!([user_msg(&seed_question)]), None)).await;
+    let seed = ws_turn(
+        &mut ws,
+        ws_body(&model, &nonce_ws, json!([user_msg(&seed_question)]), None),
+    )
+    .await;
     row("WS seed (full)", &seed);
     let mut anchor = seed.resp_id.clone();
     if anchor.is_none() {
@@ -651,7 +661,9 @@ async fn main() {
     let _ = ws.send(Message::Close(None)).await;
 
     // ── HTTP experiment: 1 seed turn + N full-resend continuations, growing history each time ──
-    println!("\n■ HTTP experiment — {n} full-resend continuation turns (PolyFlare's transport today)");
+    println!(
+        "\n■ HTTP experiment — {n} full-resend continuation turns (PolyFlare's transport today)"
+    );
     let nonce_http = format!("ratelimit-http-{}", now_millis());
     let http_hdrs = codex_headers(
         &nonce_http,
@@ -706,11 +718,17 @@ async fn main() {
     // ── Verdict ──────────────────────────────────────────────────────────────────────────────
     println!("\n════════════════════════════════════════════════════════════════════════════");
     println!("VERDICT — used_percent movement over {n} continuation turns (÷N = per-turn cost)");
-    let ws_delta = match (ws_before.as_ref().ok().and_then(UsagePoint::headline), ws_after.as_ref().ok().and_then(UsagePoint::headline)) {
+    let ws_delta = match (
+        ws_before.as_ref().ok().and_then(UsagePoint::headline),
+        ws_after.as_ref().ok().and_then(UsagePoint::headline),
+    ) {
         (Some(b), Some(a)) => Some(a - b),
         _ => None,
     };
-    let http_delta = match (http_before.as_ref().ok().and_then(UsagePoint::headline), http_after.as_ref().ok().and_then(UsagePoint::headline)) {
+    let http_delta = match (
+        http_before.as_ref().ok().and_then(UsagePoint::headline),
+        http_after.as_ref().ok().and_then(UsagePoint::headline),
+    ) {
         (Some(b), Some(a)) => Some(a - b),
         _ => None,
     };
@@ -745,7 +763,9 @@ async fn main() {
                 );
             }
         }
-        _ => println!("  INCOMPLETE — could not read usage windows before/after (see errors above)."),
+        _ => {
+            println!("  INCOMPLETE — could not read usage windows before/after (see errors above).")
+        }
     }
     println!("════════════════════════════════════════════════════════════════════════════\n");
 }

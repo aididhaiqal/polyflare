@@ -343,7 +343,11 @@ async fn headroom_score(store: &Store, account_id: &str) -> f64 {
         .latest_usage(account_id)
         .await
         .unwrap_or_default();
-    let p = usage.primary.as_ref().map(|w| w.used_percent).unwrap_or(0.0);
+    let p = usage
+        .primary
+        .as_ref()
+        .map(|w| w.used_percent)
+        .unwrap_or(0.0);
     let s = usage
         .secondary
         .as_ref()
@@ -373,14 +377,22 @@ fn row(label: &str, t: &Turn) {
             u.total_tokens,
             fmt_ms(t.total_ms),
             t.sse_bytes,
-            if t.response_id.is_some() { "yes" } else { "NONE" },
+            if t.response_id.is_some() {
+                "yes"
+            } else {
+                "NONE"
+            },
         ),
         None => println!(
             "    {:<28} (no usage in response)   total_ms={} ({} B) resp_id={}",
             label,
             fmt_ms(t.total_ms),
             t.sse_bytes,
-            if t.response_id.is_some() { "yes" } else { "NONE" },
+            if t.response_id.is_some() {
+                "yes"
+            } else {
+                "NONE"
+            },
         ),
     }
 }
@@ -467,7 +479,9 @@ async fn main() {
             "\nDRY RUN (default) — zero network calls were made, zero quota consumed. Re-run with \
              `--live` appended only when you have headroom on the account(s) above:\n"
         );
-        println!("  cargo run -p polyflare-server --example cache_billing_probe --release -- --live\n");
+        println!(
+            "  cargo run -p polyflare-server --example cache_billing_probe --release -- --live\n"
+        );
         return;
     }
 
@@ -575,7 +589,9 @@ async fn main() {
     if let Some(u) = &turn2_same.usage {
         if let Some(p) = u.cached_fraction_pct() {
             let cross_note = match &turn2_cross {
-                Some(Turn { usage: Some(cu), .. }) if cu.input_tokens > 0 => format!(
+                Some(Turn {
+                    usage: Some(cu), ..
+                }) if cu.input_tokens > 0 => format!(
                     "; 0-account-bounce would have re-billed ~{:.1}% of that turn's input at full \
                      rate instead",
                     100.0 - (100.0 * cu.cached_tokens as f64 / cu.input_tokens as f64)
