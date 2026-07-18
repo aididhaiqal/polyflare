@@ -51,6 +51,17 @@ pub struct ServeConfig {
     /// used to hardcode this as a const before this task, and the TA6(b) T5 review that flagged
     /// per-request `env::var` as debt).
     pub max_account_attempts: u32,
+    /// B5 Task 5: the Layer 2 keepalive recovery-wait's bounded wait budget
+    /// (`POLYFLARE_STARVATION_WAIT_BUDGET_SECS`; see [`starvation_wait_budget_secs_from_env`] for
+    /// the default/clamp/disable-lever decision). `Duration::ZERO` ⇒ Layer 2 is DISABLED (the
+    /// documented `=0` lever). Resolved ONCE here at startup and threaded through `AppState` —
+    /// never a per-request `env::var` (mirrors `max_account_attempts` above; this is the exact
+    /// debt class the TA6(b) T5 review flagged, applied to B5's own two new knobs).
+    pub starvation_wait_budget: Duration,
+    /// B5 Task 5: the Layer 2 keepalive tick interval (`POLYFLARE_STARVATION_HEARTBEAT_SECS`; see
+    /// [`starvation_heartbeat_secs_from_env`]). Resolved ONCE here, clamped against the ALREADY-
+    /// resolved `starvation_wait_budget` above.
+    pub starvation_heartbeat: Duration,
 }
 
 /// TA6(b) Task 5: the one capability name resolved today. A pool tagged with this capability (via
@@ -210,6 +221,70 @@ pub fn max_account_attempts_from_env() -> u32 {
     }
 }
 
+/// B5 Task 5: `POLYFLARE_STARVATION_WAIT_BUDGET_SECS` — the Layer 2 keepalive recovery-wait's
+/// bounded wait budget (`crate::ingress::layer2_wait_stream`). Unset ⇒ `60` (the plan's Task 4
+/// default, matching codex-lb's `retry.py` DEFAULT); a WELL-FORMED, non-zero value is clamped to
+/// `[1, 300]` (codex-lb's `MIN=1s`/`MAX=300s`); a MALFORMED value (non-numeric, negative, or out of
+/// `u32` range) resolves to the SAME default as unset (`60`) — identical rationale to
+/// [`max_account_attempts_from_env`]'s doc: a typo must never silently collapse to the most
+/// conservative behavior available (here, that would be "wait disabled", which is a **safety**
+/// regression — starvation protection silently turned off — not a conservative one).
+///
+/// **`0` is the documented DISABLE LEVER, not a clamp target — this is the load-bearing decision
+/// this function encodes.** An explicit, well-formed `0` resolves to `Duration::ZERO`, which
+/// `crate::ingress::try_layer2_recovery_wait` reads as "Layer 2 off": it returns `None`
+/// immediately, before ever calling `soonest_recover` or committing an HTTP 200 — the caller falls
+/// straight through to today's pre-response fast 503/502, with zero keepalives ever emitted. This
+/// is DELIBERATELY different from `max_account_attempts_from_env`'s `0` handling (which floors UP
+/// to `1`, since a failover loop always needs at least one upstream attempt to mean anything):
+/// - `max_account_attempts = 0` has NO sane reading of its own (a request path that never attempts
+///   a single upstream call is indistinguishable from an outage) — so it floors to the nearest
+///   sane value, `1`.
+/// - `starvation_wait_budget = 0` DOES have a sane, useful, and unambiguous reading of its own:
+///   "never hold the client open waiting for a recovery — always fail fast." The plan's Task 5
+///   explicitly names this as the intended operator lever (e.g., a deployment sitting behind a
+///   proxy/load-balancer with a hard idle-connection timeout shorter than any sane wait budget,
+///   where Layer 2's SSE keepalive strategy would itself get killed mid-wait by an intermediary
+///   that PolyFlare has no visibility into — better to fail fast and let the CLIENT'S OWN retry
+///   logic handle it than to commit a 200 that later gets silently truncated).
+/// - A `1s`-floor treatment (mirroring `max_account_attempts`) would NOT satisfy that use case: it
+///   would still commit an HTTP 200 and briefly delay the 503-equivalent outcome behind an in-band
+///   SSE error frame instead of surfacing a real status code the client's own retry logic can act
+///   on immediately.
+pub fn starvation_wait_budget_secs_from_env() -> u32 {
+    const DEFAULT: u32 = 60;
+    const MAX: u32 = 300;
+    match std::env::var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS") {
+        Ok(raw) => match raw.trim().parse::<u32>() {
+            Ok(0) => 0,
+            Ok(n) if n > MAX => MAX,
+            Ok(n) => n,
+            Err(_) => DEFAULT,
+        },
+        Err(_) => DEFAULT,
+    }
+}
+
+/// B5 Task 5: `POLYFLARE_STARVATION_HEARTBEAT_SECS` — the keepalive tick interval during a Layer 2
+/// wait. Unset ⇒ `10` (the plan's Task 4 default, matching codex-lb's `retry.py` HEARTBEAT); a
+/// malformed value resolves to the same default as unset (`10`); EVERY value (default, well-formed,
+/// or the malformed fallback) is then clamped to `[1, budget_secs.max(1)]` — the heartbeat can
+/// never exceed the wait budget it ticks within (a heartbeat longer than the budget would mean the
+/// client could see ZERO keepalives before the wait's own budget-exceeded outcome fires), and can
+/// never be `0` (a `0`-second heartbeat has no sane reading of its own, unlike the wait budget's
+/// `0` — see [`starvation_wait_budget_secs_from_env`]'s doc for why THAT `0` is different). Takes
+/// the ALREADY-resolved `budget_secs` as a parameter — call this AFTER
+/// [`starvation_wait_budget_secs_from_env`], never independently, so the clamp is against the real
+/// resolved budget rather than an unresolved env read.
+pub fn starvation_heartbeat_secs_from_env(budget_secs: u32) -> u32 {
+    const DEFAULT: u32 = 10;
+    let raw = match std::env::var("POLYFLARE_STARVATION_HEARTBEAT_SECS") {
+        Ok(s) => s.trim().parse::<u32>().unwrap_or(DEFAULT),
+        Err(_) => DEFAULT,
+    };
+    raw.clamp(1, budget_secs.max(1))
+}
+
 impl ServeConfig {
     pub fn from_env() -> Result<Self, String> {
         let bind_addr =
@@ -255,6 +330,11 @@ impl ServeConfig {
             Ok("1") | Ok("true")
         );
         let max_account_attempts = max_account_attempts_from_env();
+        let starvation_wait_budget_secs = starvation_wait_budget_secs_from_env();
+        let starvation_heartbeat_secs =
+            starvation_heartbeat_secs_from_env(starvation_wait_budget_secs);
+        let starvation_wait_budget = Duration::from_secs(starvation_wait_budget_secs as u64);
+        let starvation_heartbeat = Duration::from_secs(starvation_heartbeat_secs as u64);
         Ok(ServeConfig {
             bind_addr,
             upstream_base_url,
@@ -270,6 +350,8 @@ impl ServeConfig {
             live_logs,
             ws_upstream,
             max_account_attempts,
+            starvation_wait_budget,
+            starvation_heartbeat,
         })
     }
 }
@@ -468,5 +550,152 @@ mod tests {
         unsafe {
             std::env::remove_var("POLYFLARE_MAX_ACCOUNT_ATTEMPTS");
         }
+    }
+
+    /// Serializes tests in this module that mutate `POLYFLARE_STARVATION_WAIT_BUDGET_SECS`/
+    /// `POLYFLARE_STARVATION_HEARTBEAT_SECS` — same rationale as the other env-lock helpers above.
+    fn starvation_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// B5 Task 5: `POLYFLARE_STARVATION_WAIT_BUDGET_SECS=120` resolves to exactly `120` (within the
+    /// `[1, 300]` clamp range — unchanged).
+    #[test]
+    fn starvation_wait_budget_reads_a_well_formed_in_range_value() {
+        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS", "120");
+        }
+        assert_eq!(starvation_wait_budget_secs_from_env(), 120);
+        unsafe {
+            std::env::remove_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS");
+        }
+    }
+
+    /// Unset ⇒ the documented default, 60.
+    #[test]
+    fn starvation_wait_budget_unset_defaults_to_sixty() {
+        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS");
+        }
+        assert_eq!(starvation_wait_budget_secs_from_env(), 60);
+    }
+
+    /// `500` (above codex-lb's `MAX=300`) clamps DOWN to 300 — never silently accepted, never
+    /// treated as malformed.
+    #[test]
+    fn starvation_wait_budget_above_max_clamps_to_three_hundred() {
+        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS", "500");
+        }
+        assert_eq!(starvation_wait_budget_secs_from_env(), 300);
+        unsafe {
+            std::env::remove_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS");
+        }
+    }
+
+    /// `0` is the DISABLE LEVER — resolves to exactly `0`, distinct from BOTH the default (60) and
+    /// the clamp floor (1). See the function's doc for the full justification of this decision.
+    #[test]
+    fn starvation_wait_budget_zero_is_the_disable_lever_not_a_clamp_to_one() {
+        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS", "0");
+        }
+        assert_eq!(starvation_wait_budget_secs_from_env(), 0);
+        unsafe {
+            std::env::remove_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS");
+        }
+    }
+
+    /// A malformed value (non-numeric) ⇒ the SAME safe default as unset (60) — never a boot crash,
+    /// and never silently collapsed to the disable lever (0), which would be a safety regression.
+    #[test]
+    fn starvation_wait_budget_malformed_defaults_to_sixty_not_zero() {
+        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS", "not-a-number");
+        }
+        assert_eq!(starvation_wait_budget_secs_from_env(), 60);
+        unsafe {
+            std::env::remove_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS");
+        }
+    }
+
+    /// Unset heartbeat, against the default budget (60) ⇒ the documented default, 10 (well within
+    /// the `[1, 60]` clamp range).
+    #[test]
+    fn starvation_heartbeat_unset_defaults_to_ten() {
+        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("POLYFLARE_STARVATION_HEARTBEAT_SECS");
+        }
+        assert_eq!(starvation_heartbeat_secs_from_env(60), 10);
+    }
+
+    /// A heartbeat larger than the (already-resolved) budget clamps DOWN to the budget — a
+    /// heartbeat that never fires before the wait ends would defeat its purpose.
+    #[test]
+    fn starvation_heartbeat_larger_than_budget_clamps_down_to_budget() {
+        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_STARVATION_HEARTBEAT_SECS", "50");
+        }
+        assert_eq!(
+            starvation_heartbeat_secs_from_env(5),
+            5,
+            "clamped down to the 5s budget, not left at 50"
+        );
+        unsafe {
+            std::env::remove_var("POLYFLARE_STARVATION_HEARTBEAT_SECS");
+        }
+    }
+
+    /// An explicit `0` heartbeat clamps UP to the floor of 1 — never `0` (unlike the wait budget's
+    /// `0`, which has its own dedicated disable-lever meaning; a `0`-second heartbeat does not).
+    #[test]
+    fn starvation_heartbeat_zero_clamps_to_one_not_left_at_zero() {
+        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_STARVATION_HEARTBEAT_SECS", "0");
+        }
+        assert_eq!(starvation_heartbeat_secs_from_env(60), 1);
+        unsafe {
+            std::env::remove_var("POLYFLARE_STARVATION_HEARTBEAT_SECS");
+        }
+    }
+
+    /// A malformed heartbeat ⇒ the same default as unset (10), then clamped identically to a
+    /// well-formed one.
+    #[test]
+    fn starvation_heartbeat_malformed_defaults_to_ten_then_clamps() {
+        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_STARVATION_HEARTBEAT_SECS", "nope");
+        }
+        assert_eq!(starvation_heartbeat_secs_from_env(60), 10);
+        assert_eq!(
+            starvation_heartbeat_secs_from_env(5),
+            5,
+            "malformed default (10) still clamps down against a smaller budget"
+        );
+        unsafe {
+            std::env::remove_var("POLYFLARE_STARVATION_HEARTBEAT_SECS");
+        }
+    }
+
+    /// When the wait budget is disabled (`0`), the heartbeat clamp's upper bound floors to `1`
+    /// (`budget_secs.max(1)`) rather than collapsing to an invalid `1..=0` range — irrelevant in
+    /// practice (Layer 2 never runs when the budget is `0`), but must not panic or produce `0`.
+    #[test]
+    fn starvation_heartbeat_against_a_disabled_zero_budget_does_not_panic() {
+        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("POLYFLARE_STARVATION_HEARTBEAT_SECS");
+        }
+        assert_eq!(starvation_heartbeat_secs_from_env(0), 1);
     }
 }

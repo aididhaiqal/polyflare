@@ -89,6 +89,25 @@ pub struct AppState {
     /// `crate::ingress::run_failover_loop` at the same site that emits the
     /// `crate::observability::FailoverSignal` log/event.
     pub failover_metrics: std::sync::Arc<crate::observability::FailoverMetrics>,
+    /// B5 Task 5: the Layer 2 keepalive recovery-wait's bounded wait budget
+    /// (`POLYFLARE_STARVATION_WAIT_BUDGET_SECS`, resolved ONCE at startup by
+    /// `crate::config::starvation_wait_budget_secs_from_env` — never read per-request). The
+    /// production `/responses` entrypoint (`crate::ingress::responses_handler_impl`) reads this
+    /// field instead of `crate::starvation::DEFAULT_WAIT_BUDGET`. `Duration::ZERO` ⇒ Layer 2 is
+    /// DISABLED (the documented `=0` disable lever — see that config function's doc):
+    /// `crate::ingress::try_layer2_recovery_wait` returns `None` immediately, falling straight
+    /// through to today's pre-response fast 503/502.
+    pub starvation_wait_budget: std::time::Duration,
+    /// B5 Task 5: the Layer 2 keepalive tick interval (`POLYFLARE_STARVATION_HEARTBEAT_SECS`,
+    /// resolved ONCE at startup by `crate::config::starvation_heartbeat_secs_from_env`, clamped
+    /// against `starvation_wait_budget` above). The production entrypoint reads this field instead
+    /// of `crate::starvation::DEFAULT_HEARTBEAT`.
+    pub starvation_heartbeat: std::time::Duration,
+    /// B5 Task 5: content-free counter of Layer 2 keepalive-wait terminal outcomes (see
+    /// `crate::observability::StarvationMetrics`) — incremented from
+    /// `crate::ingress::layer2_wait_stream` at the same site that emits the
+    /// `crate::observability::StarvationSignal` log/event.
+    pub starvation_metrics: std::sync::Arc<crate::observability::StarvationMetrics>,
 }
 
 impl AppState {

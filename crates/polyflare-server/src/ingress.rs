@@ -533,6 +533,30 @@ async fn try_layer1_serve_now(
     Some(response)
 }
 
+/// B5 Task 5: emits one [`crate::observability::StarvationSignal`] — the `tracing` event, the
+/// `log_bus` event, and the `StarvationMetrics` bump — at a single call site, mirroring the exact
+/// triple `run_failover_loop` already performs for [`FailoverSignal`] (`emit()` +
+/// `log_bus.publish(..)` + `metrics.record()`, together, at the real transition). Called from every
+/// terminal exit of [`layer2_wait_stream`]'s generator — `served` is `Some` ONLY at the genuine
+/// splice-success site (see that function's doc, "B5 Task 5" section).
+fn emit_starvation_signal(
+    state: &AppState,
+    wait_target: &AccountId,
+    wait_started: Instant,
+    reason: &'static str,
+    served: Option<&str>,
+) {
+    let signal = crate::observability::StarvationSignal {
+        reason,
+        wait_target_account: wait_target.as_str(),
+        served_account: served,
+        waited_ms: wait_started.elapsed().as_millis() as u64,
+    };
+    signal.emit();
+    state.log_bus.publish(signal.to_log_event());
+    state.starvation_metrics.record();
+}
+
 /// B5 Task 4 (THE CRUX) — Layer 2: for a `Cooldown`-kind `soonest_recover` result within budget,
 /// commit HTTP 200 SSE IMMEDIATELY (by handing [`layer2_wait_stream`] to [`stream_response`]) and
 /// move the wait + re-select + splice entirely INSIDE the stream body. Called at the SAME
@@ -576,6 +600,15 @@ fn try_layer2_recovery_wait(
     heartbeat: Duration,
     outcome: &mut RouteOutcome,
 ) -> Option<Response> {
+    // B5 Task 5: the config-driven DISABLE LEVER — `POLYFLARE_STARVATION_WAIT_BUDGET_SECS=0`
+    // resolves to `Duration::ZERO` (see `crate::config::starvation_wait_budget_secs_from_env`'s
+    // doc), which turns Layer 2 off entirely: return `None` before even calling `soonest_recover`,
+    // so the caller falls straight through to today's PRE-response fast 503/502 — no HTTP 200 is
+    // ever committed and not a single keepalive is ever emitted, exactly like an all-HardBlocked
+    // pool (Task 4's inviolable 5).
+    if budget.is_zero() {
+        return None;
+    }
     let recovery = selector.soonest_recover(snapshots, sel_ctx)?;
     if recovery.kind != BackoffKind::Cooldown {
         return None;
@@ -584,6 +617,15 @@ fn try_layer2_recovery_wait(
     // necessarily the one that ends up served (the post-wait re-select can land on a different,
     // also-recovered account, or none at all). Same content-safe id class every other
     // `outcome.account_id` assignment in this file uses.
+    //
+    // B5 Task 5: `RouteOutcome`/`RequestLog` are finalized SYNCHRONOUSLY, before
+    // `layer2_wait_stream`'s generator body is ever polled (i.e. before the wait has even started)
+    // — so this field can ONLY ever record the wait target, structurally, no matter what happens
+    // inside the stream. This is the disclosed observability gap from Task 4's report. The fix
+    // lives in `layer2_wait_stream`: `crate::observability::StarvationSignal`, emitted from INSIDE
+    // the generator at the moment the real account is known, is the authoritative,
+    // correctly-attributed record of who actually served a Layer-2 request — see that function's
+    // doc and `crate::observability::StarvationSignal`'s doc for the full rationale.
     outcome.account_id = Some(recovery.account_id.as_str().to_string());
     let stream = layer2_wait_stream(
         state,
@@ -593,6 +635,7 @@ fn try_layer2_recovery_wait(
         req,
         ctx,
         session_key,
+        recovery.account_id,
         recovery.recover_at,
         now,
         heartbeat,
@@ -640,6 +683,16 @@ fn try_layer2_recovery_wait(
 /// `sel_ctx.clone()` with ONLY `now` overwritten — `require_security_work_authorized`/`tier`/
 /// `session_id` are carried over from the ORIGINAL ctx untouched, so the post-wait re-select
 /// preserves the security floor exactly as strictly as the pre-wait one did.
+///
+/// # B5 Task 5 — the content-free starvation signal + the `outcome.account_id` fix
+/// `wait_target` (new in Task 5) is the account `try_layer2_recovery_wait` was waiting for at
+/// commit time — the SAME id `RouteOutcome.account_id` was already best-effort-set to before this
+/// generator was ever polled. [`emit_starvation_signal`] fires at every terminal exit below, always
+/// carrying `wait_target`, and carrying the SERVED account (`Some`) only at the genuine
+/// splice-success site — this is the authoritative, correctly-attributed record of who actually
+/// served the request, fixing the disclosed gap where `RouteOutcome`/`RequestLog` can only ever
+/// record the wait target (see `crate::observability::StarvationSignal`'s doc for the full
+/// rationale).
 #[allow(clippy::too_many_arguments)]
 fn layer2_wait_stream(
     state: Arc<AppState>,
@@ -649,12 +702,17 @@ fn layer2_wait_stream(
     req: PreparedRequest,
     ctx: RequestCtx,
     session_key: Option<SessionKey>,
+    wait_target: AccountId,
     recover_at: i64,
     wait_start: i64,
     heartbeat: Duration,
     budget: Duration,
 ) -> ResponseStream {
     Box::pin(async_stream::stream! {
+        // B5 Task 5: wall-clock start of the wait, purely for the content-free
+        // `StarvationSignal.waited_ms` field — independent of the `wait_start`/`recover_at`
+        // UNIX-second math above (that math is unchanged from Task 4; this is additive).
+        let wait_started = Instant::now();
         // See this function's "Precision note" doc: millisecond math, never `.as_secs()`.
         let budget_deadline_ms = wait_start
             .saturating_mul(1000)
@@ -682,6 +740,13 @@ fn layer2_wait_stream(
         // was capped at `budget_deadline_ms` in that case) — distinguish that from a genuine
         // recovery.
         if unix_now_ms() >= budget_deadline_ms && unix_now_ms() < recover_at_ms {
+            emit_starvation_signal(
+                &state,
+                &wait_target,
+                wait_started,
+                starvation::StarvationOutcome::BudgetExceeded.code(),
+                None,
+            );
             yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::BudgetExceeded));
             return;
         }
@@ -695,6 +760,13 @@ fn layer2_wait_stream(
         let fresh_snapshots = match state.account_cache.snapshots(&state.store).await {
             Ok(s) => s,
             Err(_) => {
+                emit_starvation_signal(
+                    &state,
+                    &wait_target,
+                    wait_started,
+                    starvation::StarvationOutcome::StillNothing.code(),
+                    None,
+                );
                 yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::StillNothing));
                 return;
             }
@@ -706,6 +778,13 @@ fn layer2_wait_stream(
         let fresh = match selector.pick(&fresh_snapshots, &fresh_sel_ctx) {
             Some(id) => id,
             None => {
+                emit_starvation_signal(
+                    &state,
+                    &wait_target,
+                    wait_started,
+                    starvation::StarvationOutcome::StillNothing.code(),
+                    None,
+                );
                 yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::StillNothing));
                 return;
             }
@@ -715,6 +794,13 @@ fn layer2_wait_stream(
         let (account, provider) = match resolve_core_account(&state, &fresh, fresh_now).await {
             Ok(a) => a,
             Err(_) => {
+                emit_starvation_signal(
+                    &state,
+                    &wait_target,
+                    wait_started,
+                    starvation::StarvationOutcome::ExecutorError.code(),
+                    None,
+                );
                 yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::ExecutorError));
                 return;
             }
@@ -733,14 +819,30 @@ fn layer2_wait_stream(
         .await
         {
             Ok(mut real_stream) => {
-                // SPLICE: forward every item from the real upstream stream verbatim — this is the
-                // client's actual answer, not a synthetic frame.
+                // SPLICE: the account actually serving this request is known NOW — this is the fix
+                // for the disclosed `outcome.account_id` gap (see `try_layer2_recovery_wait`'s doc):
+                // emit the AUTHORITATIVE served-account signal HERE, before forwarding the real
+                // upstream stream verbatim (the client's actual answer, not a synthetic frame).
+                emit_starvation_signal(
+                    &state,
+                    &wait_target,
+                    wait_started,
+                    starvation::STARVATION_RECOVERED_REASON,
+                    Some(health_id.as_str()),
+                );
                 while let Some(item) = real_stream.next().await {
                     yield item;
                 }
             }
             Err(e) => {
                 record_failure(&state, &health_id, &e, unix_now()).await;
+                emit_starvation_signal(
+                    &state,
+                    &wait_target,
+                    wait_started,
+                    starvation::StarvationOutcome::ExecutorError.code(),
+                    None,
+                );
                 yield Ok(starvation::in_band_error_frame(starvation::StarvationOutcome::ExecutorError));
             }
         }
@@ -1152,6 +1254,13 @@ async fn responses_route(
 /// (see that field's doc). Deliberately NOT a per-request `std::env::var` read — the TA6(b) T5
 /// review flagged that pattern as debt; `max_attempts` is a plain `u32` copied out of `state`
 /// before `state` (an `Arc`) moves into the impl below.
+///
+/// B5 Task 5: `AppState.starvation_wait_budget`/`starvation_heartbeat` are read the SAME way —
+/// resolved ONCE at startup by `crate::config::starvation_wait_budget_secs_from_env`/
+/// `starvation_heartbeat_secs_from_env` into `ServeConfig`/`AppState` (see those fields' docs), NOT
+/// `starvation::DEFAULT_WAIT_BUDGET`/`DEFAULT_HEARTBEAT` (Task 4's placeholder consts — those now
+/// serve ONLY the test seams below, which need a fixed, sleep-free default independent of any
+/// `AppState` under test).
 async fn responses_handler_impl(
     state: Arc<AppState>,
     pool: Option<&str>,
@@ -1159,17 +1268,16 @@ async fn responses_handler_impl(
     raw: Bytes,
 ) -> (Response, RouteOutcome) {
     let max_attempts = state.max_account_attempts;
-    // B5 Task 4: production always uses the hardcoded defaults (Task 5 moves these into
-    // `AppState`, resolved once at startup from `POLYFLARE_STARVATION_WAIT_BUDGET_SECS`/
-    // `POLYFLARE_STARVATION_HEARTBEAT_SECS` — see `starvation.rs`'s doc on the two consts).
+    let starvation_wait_budget = state.starvation_wait_budget;
+    let starvation_heartbeat = state.starvation_heartbeat;
     responses_handler_impl_with_max_attempts(
         state,
         pool,
         headers,
         raw,
         max_attempts,
-        starvation::DEFAULT_WAIT_BUDGET,
-        starvation::DEFAULT_HEARTBEAT,
+        starvation_wait_budget,
+        starvation_heartbeat,
     )
     .await
 }
