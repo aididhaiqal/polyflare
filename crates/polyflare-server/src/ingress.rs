@@ -20,6 +20,7 @@ use polyflare_store::{PlainTokens, RequestLogRecord, RequestLogRepo};
 
 use crate::alias::{self, ModelAlias};
 use crate::app::AppState;
+use crate::config;
 use crate::fingerprint_capture::{append_fingerprint_capture, capture_request_fingerprint};
 use crate::observability::RequestLog;
 use crate::session_key::parse_inbound;
@@ -691,12 +692,25 @@ async fn responses_handler_impl(
     state.runtime.overlay(&mut snapshots, now);
     // The selector for this pool (its configured strategy override, else the global default).
     let selector = state.selector_for(pool);
+    // TA6(b) Task 5: proactive resolution — OR two more independent true-sources onto Task 3's
+    // directive value, NEVER overwrite it. A cyber-tagged pool (`POLYFLARE_POOL_CAPABILITIES`) or
+    // the `X-PolyFlare-Capability: security_work` header requires the capability from turn 1, with
+    // no rejection needed to discover it — but a session already sticky-cyber from a PRIOR move
+    // must keep requiring it even when THIS turn routes through a non-cyber pool with no header.
+    let pool_requires_cyber =
+        config::pool_requires_capability(pool, config::SECURITY_WORK_CAPABILITY);
+    let capability_header_present = headers
+        .get(config::CAPABILITY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim() == config::SECURITY_WORK_CAPABILITY)
+        .unwrap_or(false);
     let sel_ctx = SelectionCtx {
         now,
-        // TA6(b) Task 3: a session `prepare` already recognized as sticky-cyber (Task 2 stamped
-        // it on a prior successful move) pre-filters THIS turn's selection up front — no need to
-        // re-hit a `cyber_policy` rejection to rediscover the requirement every turn.
-        require_security_work_authorized: prepared.directive.require_security_work_authorized,
+        // The OR: Task 3's sticky-cyber directive, a cyber-tagged pool, or the capability header —
+        // any ONE true-source is enough; none of the three can turn OFF another.
+        require_security_work_authorized: prepared.directive.require_security_work_authorized
+            || pool_requires_cyber
+            || capability_header_present,
         rng_seed: None,
         session_id: ctx.session_id.clone(),
         tier,
