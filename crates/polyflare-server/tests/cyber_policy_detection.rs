@@ -137,6 +137,7 @@ async fn armed_first_frame_cyber_policy_is_detected_before_relay() {
         polyflare_core::AccountId::from("acct"),
         RequestCtx::default(),
         Default::default(),
+        Duration::ZERO, // idle_timeout: disabled, not under test here
     )
     .await;
 
@@ -171,6 +172,7 @@ async fn cyber_policy_message_never_leaks_into_the_signal() {
         polyflare_core::AccountId::from("acct"),
         RequestCtx::default(),
         Default::default(),
+        Duration::ZERO, // idle_timeout: disabled, not under test here
     )
     .await;
     let err = match res {
@@ -211,6 +213,7 @@ async fn non_cyber_response_failed_is_unaffected() {
         polyflare_core::AccountId::from("acct"),
         RequestCtx::default(),
         Default::default(),
+        Duration::ZERO, // idle_timeout: disabled, not under test here
     )
     .await
     .expect("a non-cyber response.failed must relay exactly as before");
@@ -253,6 +256,7 @@ async fn cyber_policy_after_content_already_relayed_falls_back_to_pass_through()
         polyflare_core::AccountId::from("acct"),
         RequestCtx::default(),
         Default::default(),
+        Duration::ZERO, // idle_timeout: disabled, not under test here
     )
     .await
     .expect("first chunk is plain content => alive => relay, no CapabilityRejection");
@@ -302,6 +306,7 @@ async fn armed_created_then_later_cyber_policy_is_detected_before_relay() {
             polyflare_core::AccountId::from("acct"),
             RequestCtx::default(),
             Default::default(),
+            Duration::ZERO, // idle_timeout: disabled, not under test here
         ),
     )
     .await
@@ -348,6 +353,7 @@ async fn armed_normal_stream_relays_every_frame_in_order() {
         polyflare_core::AccountId::from("acct"),
         RequestCtx::default(),
         Default::default(),
+        Duration::ZERO, // idle_timeout: disabled, not under test here
     )
     .await
     .expect("a normal created->content->completed turn must relay, not reject");
@@ -401,6 +407,7 @@ async fn armed_created_then_silence_during_scan_recovers_via_resend() {
             polyflare_core::AccountId::from("acct"),
             RequestCtx::default(),
             Default::default(),
+            Duration::ZERO, // idle_timeout: disabled, not under test here
         ),
     )
     .await
@@ -441,6 +448,7 @@ async fn disarmed_cyber_policy_is_unaffected_by_this_task() {
         polyflare_core::AccountId::from("acct"),
         RequestCtx::default(),
         Default::default(),
+        Duration::ZERO, // idle_timeout: disabled, not under test here
     )
     .await
     .expect("Disarmed is untouched by this task: no peek, no CapabilityRejection");

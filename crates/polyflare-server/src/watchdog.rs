@@ -175,6 +175,7 @@ fn input_fingerprint_and_count(req: &PreparedRequest, ctx: &RequestCtx) -> (Stri
 /// [`execute_with_watchdog_tracked`], rather than a new parameter here, specifically so this
 /// function's callers never had to change. This one simply discards a throwaway [`CommitWitness`];
 /// behavior is byte-for-byte identical to before Task 3.
+#[allow(clippy::too_many_arguments)] // mirrors `execute_with_watchdog_tracked`; one added handle.
 pub async fn execute_with_watchdog(
     executor: &dyn Executor,
     continuity: Arc<dyn Continuity>,
@@ -183,6 +184,7 @@ pub async fn execute_with_watchdog(
     account_id: AccountId,
     ctx: RequestCtx,
     runtime: Arc<RuntimeStates>,
+    idle_timeout: Duration,
 ) -> Result<ResponseStream, WatchdogError> {
     execute_with_watchdog_tracked(
         executor,
@@ -192,6 +194,7 @@ pub async fn execute_with_watchdog(
         account_id,
         ctx,
         runtime,
+        idle_timeout,
         CommitWitness::new(),
     )
     .await
@@ -211,6 +214,7 @@ pub async fn execute_with_watchdog_tracked(
     account_id: AccountId,
     ctx: RequestCtx,
     runtime: Arc<RuntimeStates>,
+    idle_timeout: Duration,
     commit: CommitWitness,
 ) -> Result<ResponseStream, WatchdogError> {
     let Prepared { req, directive } = prepared;
@@ -232,6 +236,7 @@ pub async fn execute_with_watchdog_tracked(
                 session_key,
                 OutcomeKind::Completed { fp, count },
                 runtime,
+                idle_timeout,
                 commit,
             ))
         }
@@ -294,6 +299,7 @@ pub async fn execute_with_watchdog_tracked(
                                 session_key,
                                 OutcomeKind::Completed { fp, count },
                                 runtime,
+                                idle_timeout,
                                 commit,
                             ))
                         }
@@ -313,6 +319,7 @@ pub async fn execute_with_watchdog_tracked(
                                 ctx,
                                 session_key,
                                 runtime,
+                                idle_timeout,
                                 commit,
                             )
                             .await
@@ -346,6 +353,7 @@ pub async fn execute_with_watchdog_tracked(
                         ctx,
                         session_key,
                         runtime,
+                        idle_timeout,
                         commit,
                     )
                     .await
@@ -376,6 +384,7 @@ async fn recover_from_silence(
     ctx: RequestCtx,
     session_key: Option<SessionKey>,
     runtime: Arc<RuntimeStates>,
+    idle_timeout: Duration,
     commit: CommitWitness,
 ) -> Result<ResponseStream, WatchdogError> {
     match recovery {
@@ -389,6 +398,7 @@ async fn recover_from_silence(
                 ctx,
                 session_key,
                 runtime,
+                idle_timeout,
                 commit,
             )
             .await
@@ -415,6 +425,7 @@ pub async fn execute_recovery(
     ctx: RequestCtx,
     session_key: Option<SessionKey>,
     runtime: Arc<RuntimeStates>,
+    idle_timeout: Duration,
 ) -> Result<ResponseStream, WatchdogError> {
     execute_recovery_tracked(
         executor,
@@ -425,6 +436,7 @@ pub async fn execute_recovery(
         ctx,
         session_key,
         runtime,
+        idle_timeout,
         CommitWitness::new(),
     )
     .await
@@ -443,6 +455,7 @@ pub async fn execute_recovery_tracked(
     ctx: RequestCtx,
     session_key: Option<SessionKey>,
     runtime: Arc<RuntimeStates>,
+    idle_timeout: Duration,
     commit: CommitWitness,
 ) -> Result<ResponseStream, WatchdogError> {
     let stream = executor
@@ -457,6 +470,7 @@ pub async fn execute_recovery_tracked(
         session_key,
         OutcomeKind::Recovered,
         runtime,
+        idle_timeout,
         commit,
     ))
 }
@@ -716,6 +730,59 @@ enum ObserveState {
     Done,
 }
 
+/// Task 1: the mid-stream idle deadline — "no byte since". `Disabled` when the configured idle
+/// timeout is zero (the disable lever, `POLYFLARE_STREAM_IDLE_TIMEOUT_SECS=0`): [`poll`](Self::poll)
+/// then always reports `Poll::Pending` and never registers a timer, so the `Streaming` arm's
+/// `Poll::Pending` path is byte-for-byte identical to before this task. `Armed` holds a resettable
+/// `tokio::time::Sleep`, boxed+pinned so it can be reset in place (`Sleep::reset`) across polls from
+/// `&mut self` without re-pinning — mirrors `ObserveState::Observing`'s existing
+/// `Pin<Box<dyn Future...>>` idiom, the only precedent in this module for a manually-polled future
+/// stored on a struct. `Pin<Box<T>>` is `Unpin` unconditionally (the pin-ness lives in the heap
+/// allocation, independent of whether `T` itself is `Unpin` — `Sleep` is not), so this field does not
+/// disturb `ObservingStream`'s existing "all fields Unpin" invariant.
+enum IdleDeadline {
+    Disabled,
+    Armed {
+        sleep: Pin<Box<tokio::time::Sleep>>,
+        timeout: Duration,
+    },
+}
+
+impl IdleDeadline {
+    /// `timeout == Duration::ZERO` ⇒ disabled (today's behavior, no deadline at all). Otherwise
+    /// armed with the deadline starting at construction time — this is what bounds the very FIRST
+    /// byte too, for a Disarmed request with no pre-relay wedge timer of its own.
+    fn new(timeout: Duration) -> Self {
+        if timeout.is_zero() {
+            IdleDeadline::Disabled
+        } else {
+            IdleDeadline::Armed {
+                sleep: Box::pin(tokio::time::sleep(timeout)),
+                timeout,
+            }
+        }
+    }
+
+    /// A byte just arrived — push the deadline back out to `now + timeout`. No-op when disabled.
+    fn reset(&mut self) {
+        if let IdleDeadline::Armed { sleep, timeout } = self {
+            sleep.as_mut().reset(tokio::time::Instant::now() + *timeout);
+        }
+    }
+
+    /// Poll the deadline. `Disabled` never fires (always `Poll::Pending`, registering nothing) —
+    /// this is exactly what makes the disabled path indistinguishable from "no deadline at all".
+    /// `Armed` polls the underlying `Sleep` directly, registering ITS waker so a wake from the timer
+    /// alone re-polls this stream (the caller polls the inner stream too in the same turn, so a
+    /// wake from either side re-polls — both wakers end up registered per turn).
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        match self {
+            IdleDeadline::Disabled => Poll::Pending,
+            IdleDeadline::Armed { sleep, .. } => sleep.as_mut().poll(cx),
+        }
+    }
+}
+
 /// Wraps a byte stream: forwards every chunk unchanged while sniffing the `response.id`, then — on
 /// stream end — awaits `continuity.observe(...)` INLINE before yielding the terminal `None`. This
 /// makes ownership deterministic (turn N's state is persisted before the client sees end-of-stream).
@@ -734,6 +801,9 @@ struct ObservingStream {
     /// known, and the synthetic `signal_client_stream` (not wrapped in `ObservingStream`) is
     /// correctly excluded.
     runtime: Arc<RuntimeStates>,
+    /// Task 1: "no byte since" deadline — reset on every successfully-yielded chunk, checked only
+    /// when the inner stream reports `Poll::Pending`. See [`IdleDeadline`]'s doc.
+    idle_deadline: IdleDeadline,
     /// B4 Task 3: marked the instant the FIRST chunk is successfully yielded below — a pure
     /// addition, read by no code in this struct. It does not gate, delay, or otherwise touch relay
     /// (every chunk is still forwarded unconditionally, in order) or the `record_transient_error`/
@@ -750,6 +820,10 @@ impl Stream for ObservingStream {
             match &mut this.state {
                 ObserveState::Streaming => match this.inner.as_mut().poll_next(cx) {
                     Poll::Ready(Some(Ok(bytes))) => {
+                        // Task 1: a byte arrived — push the idle deadline back out. No-op when
+                        // disabled. Ordered before `mark`/`feed`/return so a LATER poll's deadline
+                        // check always sees the reset from this byte, never a stale one.
+                        this.idle_deadline.reset();
                         // B4 Task 3: this IS "a byte reached the client" — the commit barrier.
                         // Idempotent, unconditional, and ordered before the return: by the time any
                         // LATER poll on this same stream can yield `Err` (the mid-stream-failure
@@ -783,7 +857,28 @@ impl Stream for ObservingStream {
                         this.state = ObserveState::Observing(fut);
                         // loop: poll the observe future this wakeup
                     }
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        // Task 1: the inner stream registered its waker above (it's a real
+                        // `poll_next(cx)` call, not skipped) — now ALSO poll the idle deadline so a
+                        // wake from EITHER side re-polls this stream. `Disabled` never resolves here
+                        // (see `IdleDeadline::poll`), so this is a pure no-op — bare `Poll::Pending`,
+                        // byte-for-byte as before this task — whenever the idle timeout is off.
+                        return match this.idle_deadline.poll(cx) {
+                            Poll::Ready(()) => {
+                                // Genuine silence past the deadline. This is POST-commit (bytes were
+                                // already relayed — commit-barrier doc on `CommitWitness`), so this
+                                // TERMINATES the stream rather than recovering: a reselect here would
+                                // double-relay. Treated like any other transient account fault.
+                                this.runtime
+                                    .record_transient_error(&this.account, unix_now());
+                                this.state = ObserveState::Done;
+                                Poll::Ready(Some(Err(ExecError::Stream(
+                                    "upstream idle timeout".into(),
+                                ))))
+                            }
+                            Poll::Pending => Poll::Pending,
+                        };
+                    }
                 },
                 ObserveState::Observing(fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(()) => {
@@ -798,6 +893,10 @@ impl Stream for ObservingStream {
     }
 }
 
+/// `idle_timeout`: Task 1's mid-stream idle deadline, `Duration::ZERO` = disabled (today's
+/// behavior). Task 2 will resolve this from config (`POLYFLARE_STREAM_IDLE_TIMEOUT_SECS`,
+/// startup-resolved into `AppState`, NOT re-read per request); every caller today passes an
+/// explicit value (see each call site).
 #[allow(clippy::too_many_arguments)] // internal fn; each param is a distinct, clearly-named handle.
 fn wrap_stream(
     inner: ResponseStream,
@@ -807,6 +906,7 @@ fn wrap_stream(
     session_key: Option<SessionKey>,
     kind: OutcomeKind,
     runtime: Arc<RuntimeStates>,
+    idle_timeout: Duration,
     commit: CommitWitness,
 ) -> ResponseStream {
     Box::pin(ObservingStream {
@@ -819,6 +919,7 @@ fn wrap_stream(
         kind,
         state: ObserveState::Streaming,
         runtime,
+        idle_deadline: IdleDeadline::new(idle_timeout),
         commit,
     })
 }
@@ -899,6 +1000,7 @@ mod tests {
             },
             state: ObserveState::Streaming,
             runtime: Arc::new(RuntimeStates::new()),
+            idle_deadline: IdleDeadline::new(Duration::ZERO), // disabled: not under test here
             commit: commit.clone(),
         };
 
@@ -1028,5 +1130,344 @@ mod tests {
         };
         assert_eq!(err.to_string(), "capability rejection: security_work");
         assert!(!format!("{err:?}").contains("message"));
+    }
+
+    // ---- Task 1: mid-stream idle deadline (THE CRUX) ---------------------------------------
+
+    use std::sync::atomic::AtomicUsize;
+
+    use async_trait::async_trait;
+    use polyflare_core::ContinuityError;
+
+    fn idle_test_account() -> Account {
+        Account {
+            id: "acct".into(),
+            base_url: "http://unused.invalid".into(),
+            bearer_token: "tok".into(),
+            chatgpt_account_id: None,
+        }
+    }
+
+    fn idle_test_disarmed(body: serde_json::Value) -> Prepared {
+        Prepared {
+            req: PreparedRequest {
+                body: Some(body),
+                model: "m".into(),
+                forward_headers: vec![],
+                raw_body: None,
+            },
+            directive: ContinuityDirective {
+                pin_account: None,
+                watchdog: WatchdogArm::Disarmed,
+                recovery: RecoveryPlan::None,
+                session_key: None,
+                require_security_work_authorized: false,
+            },
+        }
+    }
+
+    /// A test-only `Executor` whose stream yields exactly ONE real byte, then never yields again
+    /// (no `Poll::Ready` of any kind — genuine silence, not a clean EOF). Counts its own calls so
+    /// tests can assert no second attempt was ever made (the commit barrier: this module never
+    /// reselects post-relay).
+    struct ByteThenStallExecutor {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Executor for ByteThenStallExecutor {
+        async fn execute(
+            &self,
+            _req: PreparedRequest,
+            _account: &Account,
+            _ctx: &RequestCtx,
+        ) -> Result<ResponseStream, ExecError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let first = Ok::<Bytes, ExecError>(Bytes::from_static(b"data: first\n\n"));
+            Ok(Box::pin(
+                stream::once(async move { first })
+                    .chain(stream::pending::<Result<Bytes, ExecError>>()),
+            ))
+        }
+    }
+
+    /// A `Continuity` that only counts `observe` calls — used to prove `observe` DID/DID NOT run,
+    /// without depending on `NoopContinuity`'s (silent) internals.
+    #[derive(Clone, Default)]
+    struct SpyContinuity {
+        observe_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Continuity for SpyContinuity {
+        async fn prepare(
+            &self,
+            _req: PreparedRequest,
+            _ctx: &RequestCtx,
+        ) -> Result<Prepared, ContinuityError> {
+            unimplemented!("not exercised by these tests — only observe() is under test")
+        }
+
+        async fn observe(
+            &self,
+            _outcome: TurnOutcome,
+            _ctx: &RequestCtx,
+        ) -> Result<(), ContinuityError> {
+            self.observe_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn mark_required_capability(
+            &self,
+            _session_key: &SessionKey,
+            _capability: &'static str,
+        ) -> Result<(), ContinuityError> {
+            unimplemented!("not exercised by these tests — only observe() is under test")
+        }
+    }
+
+    /// Step 1 (failing-first): a stream that relays one byte then goes genuinely silent forever
+    /// must be TERMINATED by `ObservingStream` once the configured idle window elapses — proving
+    /// the gap this task closes (`Poll::Pending` returned forever today). Bounded by an outer
+    /// `tokio::time::timeout` so a regression (no idle path) fails as "timed out", never hangs
+    /// CI. Uses a short (250ms) idle window so the test is fast.
+    #[tokio::test]
+    async fn wrap_stream_terminates_after_genuine_mid_stream_silence() {
+        let idle = Duration::from_millis(250);
+        let inner: ResponseStream = Box::pin(
+            stream::once(async { Ok::<Bytes, ExecError>(Bytes::from_static(b"data: first\n\n")) })
+                .chain(stream::pending::<Result<Bytes, ExecError>>()),
+        );
+        let runtime = Arc::new(RuntimeStates::new());
+        let mut wrapped = wrap_stream(
+            inner,
+            Arc::new(polyflare_core::NoopContinuity),
+            RequestCtx::default(),
+            AccountId::from("acct"),
+            None,
+            OutcomeKind::Completed {
+                fp: String::new(),
+                count: 0,
+            },
+            runtime.clone(),
+            idle,
+            CommitWitness::new(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let first = wrapped.next().await;
+            assert!(
+                matches!(first, Some(Ok(ref b)) if b.as_ref() == b"data: first\n\n"),
+                "the first byte relays cleanly before any silence: {first:?}"
+            );
+
+            let start = tokio::time::Instant::now();
+            let second = wrapped.next().await;
+            let elapsed = start.elapsed();
+            match second {
+                Some(Err(ExecError::Stream(msg))) => {
+                    assert_eq!(
+                        msg, "upstream idle timeout",
+                        "the idle error is a fixed, content-free reason string"
+                    );
+                }
+                other => panic!("expected an idle-timeout Err, got {other:?}"),
+            }
+            assert!(
+                elapsed >= idle,
+                "the idle error must not fire before the configured window: {elapsed:?} < {idle:?}"
+            );
+
+            let third = wrapped.next().await;
+            assert!(
+                third.is_none(),
+                "after the idle error the stream is terminal (Done): {third:?}"
+            );
+        })
+        .await
+        .expect(
+            "bounded: a genuine mid-stream stall must terminate within the idle window, not hang",
+        );
+
+        let mut tracked = vec![AccountSnapshot::new("acct")];
+        runtime.overlay(&mut tracked, 0);
+        assert_eq!(
+            tracked[0].error_count, 1,
+            "record_transient_error fired exactly once for the idle timeout"
+        );
+    }
+
+    /// Same gap, driven through the PUBLIC API (`execute_with_watchdog_tracked`, Disarmed) so the
+    /// commit-barrier claim is checked for real: after the idle timeout, `commit.is_committed()`
+    /// must read `true` (a byte WAS relayed) and the executor must have been called EXACTLY ONCE —
+    /// no reselect/retry, because retrying post-commit would double-relay.
+    #[tokio::test]
+    async fn idle_timeout_is_post_commit_and_never_triggers_a_second_attempt() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let exec = ByteThenStallExecutor {
+            calls: calls.clone(),
+        };
+        let commit = CommitWitness::new();
+        let runtime = Arc::new(RuntimeStates::new());
+
+        let stream = execute_with_watchdog_tracked(
+            &exec,
+            Arc::new(polyflare_core::NoopContinuity),
+            idle_test_disarmed(serde_json::json!({"input": [{"a":1}]})),
+            &idle_test_account(),
+            AccountId::from("acct"),
+            RequestCtx::default(),
+            runtime,
+            Duration::from_millis(250),
+            commit.clone(),
+        )
+        .await
+        .expect("Disarmed relays immediately: Ok(stream)");
+
+        let mut s = stream;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let first = s.next().await;
+            assert!(matches!(first, Some(Ok(_))), "first byte relays cleanly");
+            assert!(
+                commit.is_committed(),
+                "committed the instant the byte was relayed"
+            );
+
+            let second = s.next().await;
+            assert!(
+                matches!(second, Some(Err(ExecError::Stream(_)))),
+                "the idle timeout surfaces as an Err item inside the already-Ok stream: {second:?}"
+            );
+        })
+        .await
+        .expect("bounded: must not hang");
+
+        assert!(
+            commit.is_committed(),
+            "commit stays true — the idle path never un-commits"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no reselect/second attempt: a mid-stream idle timeout is post-commit"
+        );
+    }
+
+    /// **No spurious timeout.** A stream producing a byte every `idle/2`, then a clean EOF, must
+    /// complete NORMALLY — no idle error, `record_success` fires (clearing a pre-seeded error),
+    /// and `observe` runs. This proves the deadline genuinely RESETS on every byte rather than
+    /// being some fixed budget for the whole stream.
+    #[tokio::test]
+    async fn no_spurious_idle_timeout_when_bytes_keep_arriving_within_the_window() {
+        let idle = Duration::from_millis(200);
+        let gap = idle / 2;
+        // 4 live chunks, each within `gap` of the last, then a clean end (`None`).
+        let chunks: Vec<Bytes> = (0..4)
+            .map(|i| Bytes::from(format!("data: chunk-{i}\n\n")))
+            .collect();
+        let inner: ResponseStream = Box::pin(stream::unfold(
+            chunks.into_iter(),
+            move |mut it| async move {
+                let next = it.next()?;
+                tokio::time::sleep(gap).await;
+                Some((Ok::<Bytes, ExecError>(next), it))
+            },
+        ));
+
+        let runtime = Arc::new(RuntimeStates::new());
+        // Pre-seed an error so a later `error_count == 0` proves `record_success` actually ran
+        // (not merely "was never touched").
+        runtime.record_transient_error(&AccountId::from("acct"), 0);
+        let observe_calls = Arc::new(AtomicUsize::new(0));
+        let continuity: Arc<dyn Continuity> = Arc::new(SpyContinuity {
+            observe_calls: observe_calls.clone(),
+        });
+
+        let mut wrapped = wrap_stream(
+            inner,
+            continuity,
+            RequestCtx::default(),
+            AccountId::from("acct"),
+            None,
+            OutcomeKind::Completed {
+                fp: String::new(),
+                count: 0,
+            },
+            runtime.clone(),
+            idle,
+            CommitWitness::new(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut yielded = 0;
+            while let Some(item) = wrapped.next().await {
+                match item {
+                    Ok(_) => yielded += 1,
+                    Err(e) => panic!("no idle error must fire while bytes keep arriving: {e}"),
+                }
+            }
+            assert_eq!(yielded, 4, "all 4 live chunks relayed before the clean end");
+        })
+        .await
+        .expect("bounded: a genuinely-alive stream must complete, not hang");
+
+        let mut tracked = vec![AccountSnapshot::new("acct")];
+        runtime.overlay(&mut tracked, 0);
+        assert_eq!(
+            tracked[0].error_count, 0,
+            "record_success cleared the pre-seeded error on clean completion"
+        );
+        assert_eq!(
+            observe_calls.load(Ordering::SeqCst),
+            1,
+            "continuity.observe ran exactly once at true stream end"
+        );
+    }
+
+    /// **Disabled (timeout 0).** A byte-then-stall stream with the idle timeout DISABLED must
+    /// behave byte-for-byte as today: bare `Poll::Pending` forever, no idle termination. Proven by
+    /// racing the second poll against a SHORT external timeout and asserting THAT elapses (the
+    /// stream itself never resolves) — this keeps the test bounded without ever depending on the
+    /// stream actually finishing.
+    #[tokio::test]
+    async fn disabled_idle_timeout_never_terminates_a_stalled_stream() {
+        let inner: ResponseStream = Box::pin(
+            stream::once(async { Ok::<Bytes, ExecError>(Bytes::from_static(b"data: first\n\n")) })
+                .chain(stream::pending::<Result<Bytes, ExecError>>()),
+        );
+        let runtime = Arc::new(RuntimeStates::new());
+        let mut wrapped = wrap_stream(
+            inner,
+            Arc::new(polyflare_core::NoopContinuity),
+            RequestCtx::default(),
+            AccountId::from("acct"),
+            None,
+            OutcomeKind::Completed {
+                fp: String::new(),
+                count: 0,
+            },
+            runtime.clone(),
+            Duration::ZERO, // disabled
+            CommitWitness::new(),
+        );
+
+        let first = wrapped.next().await;
+        assert!(matches!(first, Some(Ok(_))), "first byte still relays");
+
+        // The disabled path must NOT resolve within this short window — if it does (idle error
+        // or anything else), the outer `timeout` here would return `Ok(_)` instead of `Err`
+        // (elapsed), and the assert below catches that as a real failure, bounded.
+        let raced = tokio::time::timeout(Duration::from_millis(300), wrapped.next()).await;
+        assert!(
+            raced.is_err(),
+            "disabled (timeout=0) must never terminate a genuine stall: {raced:?}"
+        );
+
+        let mut tracked = vec![AccountSnapshot::new("acct")];
+        runtime.overlay(&mut tracked, 0);
+        assert_eq!(
+            tracked[0].error_count, 0,
+            "disabled path never calls record_transient_error"
+        );
     }
 }
