@@ -717,13 +717,6 @@ function mergeTrend(primary: Point[], secondary: Point[]): TrendRow[] {
 // the badge entirely rather than rendering a misleading "safe" default.
 // ---------------------------------------------------------------------------------------------
 
-const RISK_LABEL: Record<RiskLevel, string> = {
-  safe: "safe",
-  warning: "warning",
-  danger: "danger",
-  critical: "critical",
-};
-
 /** safe = muted, warning = warn/gold, danger = flare-amber accent, critical = red — an escalating
  * ramp one step past `PACE_STATUS_CLASS` (Overview.tsx), consistent with this file's `RiskLevel`. */
 const RISK_CLASS: Record<RiskLevel, string> = {
@@ -742,7 +735,7 @@ function DepletionRiskBadge({ forecast }: { forecast: DepletionForecast }) {
       )}
       title={`Projected to reach ${pct(Math.min(100, forecast.risk * 100))} of the weekly window by reset`}
     >
-      depletion · {RISK_LABEL[forecast.risk_level]}
+      depletion · {forecast.risk_level}
     </span>
   );
 }

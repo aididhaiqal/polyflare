@@ -12,10 +12,10 @@
 // Task 5 shipped only the first of these (no time series / no per-account list existed yet) and
 // documented three deferred mockup rows in task-5-report.md: the request-volume chart, the
 // account-health table, and a weekly-pace forecast. Task 5a added the series endpoint; task 5b
-// restored the first two using ONLY real, derived-from-real-fields data (see task-5b-report.md) but
-// stood the weekly-pace card up as a per-provider client-side linear extrapolation — a deliberate,
-// documented placeholder for the real backend forecast D16 ships. D16 T6 (this pass) replaces that
-// stand-in with `usePace()`'s real EWMA-burn-rate + pool-drain-simulation report; see
+// restored the first two using ONLY real, derived-from-real-fields data (see task-5b-report.md) and
+// stood the weekly-pace card up as a legitimate client-side per-provider linear-extrapolation
+// derivation. The Weekly Pace card now sources GET /api/pace (backend EWMA burn-rate + pool-drain
+// simulation), replacing that earlier client-side per-provider linear-extrapolation estimate; see
 // task-6-report.md (D16) for the field mapping.
 import { useEffect, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
@@ -499,10 +499,10 @@ function AccountHealthCard(
 // discrete-event pool-drain-simulation forecast (see `polyflare_core::weekly_pace`). Admin-gated,
 // content-free (credits/percentages/hours/counts + status/confidence enums only — see
 // `read_api.rs::pace_handler`'s doc comment). This replaces the earlier per-provider client-side
-// linear-extrapolation stand-in (task-5b's `computeWeeklyPace`), which was documented there as a
-// placeholder for exactly this real forecast. Unlike that stand-in, the report is a single
-// pool-wide number aggregated across every eligible account regardless of provider — it doesn't
-// respond to the page's provider filter (the backend has no per-provider breakdown to filter).
+// linear-extrapolation estimate (task-5b's `computeWeeklyPace`), a legitimate stand-in derivation
+// now superseded by this backend forecast. Unlike that estimate, the report is a single pool-wide
+// number aggregated across every eligible account regardless of provider — it doesn't respond to
+// the page's provider filter (the backend has no per-provider breakdown to filter).
 // ---------------------------------------------------------------------------------------------
 
 const PACE_STATUS_LABEL: Record<PaceStatus, string> = {
@@ -512,14 +512,14 @@ const PACE_STATUS_LABEL: Record<PaceStatus, string> = {
   danger: "at risk",
 };
 
-/** on_track = muted (neither over nor under budget), ahead = success/green (using less than
- * scheduled), behind = warn/gold (using more than scheduled but no simulated shortfall yet),
- * danger = flare-amber accent (the pool-drain sim projects running dry before enough resets
- * refill it) — the brief's "amber/critical" tone. */
+/** on_track = muted (neither over nor under budget), ahead = warn/gold (consuming FASTER than the
+ * linear schedule — delta > +5%, caution), behind = success/green (consuming SLOWER than the
+ * linear schedule — delta < -5%, more headroom), danger = flare-amber accent (the pool-drain sim
+ * projects running dry before enough resets refill it) — the brief's "amber/critical" tone. */
 const PACE_STATUS_CLASS: Record<PaceStatus, string> = {
   on_track: "bg-muted text-fg opacity-70",
-  ahead: "bg-success/15 text-success",
-  behind: "bg-warn/15 text-warn",
+  ahead: "bg-warn/15 text-warn",
+  behind: "bg-success/15 text-success",
   danger: "bg-accent/15 text-accent",
 };
 
@@ -574,7 +574,7 @@ function PaceCard(props: AsyncCardState & { pace: WeeklyCreditPaceReport | null 
                 "h-full rounded-full",
                 pace.status === "danger"
                   ? "bg-accent"
-                  : pace.status === "behind"
+                  : pace.status === "ahead"
                     ? "bg-warn"
                     : "bg-success",
               )}
