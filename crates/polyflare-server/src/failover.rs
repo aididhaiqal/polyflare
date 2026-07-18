@@ -51,8 +51,10 @@
 //! is no resend strategy, so this classifier maps it to `Surface` — the conservative choice that
 //! keeps today's behavior (a `Continuity` error currently surfaces as a plain 502, never retried).
 
+use std::collections::HashSet;
+
 use polyflare_codex::oauth::classify_failure;
-use polyflare_core::FailureSignal;
+use polyflare_core::{AccountId, AccountSnapshot, FailureSignal};
 
 use crate::watchdog::WatchdogError;
 
@@ -125,9 +127,110 @@ fn classify_upstream(signal: Option<&FailureSignal>) -> FailoverVerdict {
     }
 }
 
+/// B4 Task 2 — the tried-account exclusion primitive for failover reselection.
+///
+/// A PURE, self-contained helper: NOT wired into the ingress request path here (Task 4 does that).
+/// Task 4's loop calls this immediately before each `selector.pick(&candidates, &ctx)`, narrowing
+/// `snapshots` to accounts NOT already tried this request — mirroring `apply_ownership`'s slice-
+/// narrowing idiom (`watchdog.rs:79-83`, filter BEFORE `Selector::pick`, no `Selector`-trait change,
+/// no `SelectionCtx` field). `tried` accumulates the `AccountId`s that already produced a
+/// `FailoverVerdict::FailoverNext` verdict earlier in the SAME request's loop, so the account that
+/// just failed is never re-picked on the next iteration.
+///
+/// # Order preservation (load-bearing)
+/// `CapacityWeighted::pick` (`select.rs`) samples a seeded `StdRng` draw against a `WeightedIndex`
+/// built 1:1 over the candidate pool's position — the eligibility filter, health-tier pooling, and
+/// policy waterfall all narrow via `.iter().filter(...)`/`.copied().filter(...)`, which preserve
+/// relative input order end-to-end. Reordering the slice here would change which account a given
+/// `(seed, weights)` draw lands on even when NO account was excluded. This helper therefore uses
+/// `.iter().filter(...).cloned().collect()` (a `retain`-shaped pass), never a sort or a reordering
+/// collect — an empty `tried` set reproduces `snapshots` byte-for-byte, same order, same clones.
+///
+/// # No-op on an unknown id
+/// An id in `tried` that is not present in `snapshots` (e.g. the pool was refreshed between
+/// attempts and no longer contains that account) removes nothing and never panics — `HashSet`
+/// membership is checked per-candidate, not the other way around.
+pub fn exclude_tried(
+    snapshots: &[AccountSnapshot],
+    tried: &HashSet<AccountId>,
+) -> Vec<AccountSnapshot> {
+    snapshots
+        .iter()
+        .filter(|s| !tried.contains(&s.id))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snap(id: &str) -> AccountSnapshot {
+        AccountSnapshot::new(id)
+    }
+
+    fn ids(pool: &[AccountSnapshot]) -> Vec<&str> {
+        pool.iter().map(|s| s.id.as_str()).collect()
+    }
+
+    #[test]
+    fn excludes_the_one_tried_account_from_a_two_account_pool() {
+        let pool = [snap("A"), snap("B")];
+        let tried: HashSet<AccountId> = [AccountId::from("A")].into_iter().collect();
+        let result = exclude_tried(&pool, &tried);
+        assert_eq!(ids(&result), vec!["B"], "A must be excluded, B must remain");
+    }
+
+    #[test]
+    fn all_tried_yields_an_empty_pool() {
+        // The exhaustion case Task 4's security-floor/503 path depends on: every candidate has
+        // already been tried this request ⇒ nothing left to pick from.
+        let pool = [snap("A"), snap("B")];
+        let tried: HashSet<AccountId> = [AccountId::from("A"), AccountId::from("B")]
+            .into_iter()
+            .collect();
+        let result = exclude_tried(&pool, &tried);
+        assert!(result.is_empty(), "all-tried must yield an empty pool");
+    }
+
+    #[test]
+    fn empty_tried_set_reproduces_the_input_pool_exactly_including_order() {
+        // The no-failover case must reproduce today's candidate set EXACTLY: same accounts, same
+        // count, same ORDER (load-bearing for `CapacityWeighted`'s seeded weighted sampling — see
+        // the function doc). Feed the pool in a non-alphabetical order to prove this isn't
+        // accidentally satisfied by a sort.
+        let pool = [snap("B"), snap("A")];
+        let tried: HashSet<AccountId> = HashSet::new();
+        let result = exclude_tried(&pool, &tried);
+        assert_eq!(
+            ids(&result),
+            vec!["B", "A"],
+            "empty tried-set must be a byte-for-byte, order-preserving no-op"
+        );
+        assert_eq!(result.len(), pool.len());
+    }
+
+    #[test]
+    fn tried_id_not_in_the_pool_is_a_no_op() {
+        let pool = [snap("A"), snap("B")];
+        let tried: HashSet<AccountId> = [AccountId::from("Z")].into_iter().collect();
+        let result = exclude_tried(&pool, &tried);
+        assert_eq!(
+            ids(&result),
+            vec!["A", "B"],
+            "an id absent from the pool must not remove anything or panic"
+        );
+    }
+
+    #[test]
+    fn preserves_relative_order_when_excluding_from_a_larger_pool() {
+        // Order preservation must hold even when the excluded account is in the middle, not just
+        // at an edge — proves `filter` (retain-shaped), not a reorder-then-remove.
+        let pool = [snap("C"), snap("A"), snap("B")];
+        let tried: HashSet<AccountId> = [AccountId::from("A")].into_iter().collect();
+        let result = exclude_tried(&pool, &tried);
+        assert_eq!(ids(&result), vec!["C", "B"]);
+    }
 
     fn signal(status: u16, error_code: Option<&str>) -> FailureSignal {
         FailureSignal {
