@@ -1,5 +1,6 @@
 //! Write API: dashboard-driven account configuration. Mutates only non-secret account SETTINGS —
-//! pool, routing policy, and pause/resume (status) — never a token or any secret. Gated on
+//! pool, routing policy, pause/resume (status), and the `security_work_authorized` capability
+//! flag (TA6) — never a token or any secret. Gated on
 //! `POLYFLARE_ADMIN_TOKEN` (`crate::auth::require_admin`) like every other `/api/*` route — the
 //! proxy surface (`/responses`, `/v1/messages`) remains unauthenticated network-boundary trust; see
 //! PORTING-CODEXLB.md D18. Every write bumps the store generation, so
@@ -45,6 +46,10 @@ pub struct AccountPatch {
     routing_policy: Option<String>,
     #[serde(default)]
     status: Option<String>,
+    /// The cyber-work capability flag (TA6). Absent means "leave unchanged"; `Some(bool)` sets it.
+    /// Never a token/secret field — this is the only capability toggle the operator surface exposes.
+    #[serde(default)]
+    security_work_authorized: Option<bool>,
 }
 
 fn bad_request(msg: &'static str) -> Response {
@@ -94,6 +99,15 @@ pub async fn patch_account_handler(
     }
     if let Some(st) = &patch.status {
         if repo.update_status(&id, st).await.is_err() {
+            return internal_error();
+        }
+    }
+    if let Some(authorized) = patch.security_work_authorized {
+        if repo
+            .update_security_work_authorized(&id, authorized)
+            .await
+            .is_err()
+        {
             return internal_error();
         }
     }

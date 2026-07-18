@@ -299,6 +299,24 @@ impl AccountRepo {
         Ok(())
     }
 
+    /// Set (or clear) an account's `security_work_authorized` capability flag — the operator write
+    /// path (dashboard PATCH / CLI). Previously this column was only ever set by `insert` and the
+    /// codex-lb importer; this is the first setter that can flip it post-onboard. Bumps the
+    /// generation so the account cache re-reads on the next selection.
+    pub async fn update_security_work_authorized(
+        &self,
+        id: &str,
+        authorized: bool,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE accounts SET security_work_authorized = ? WHERE id = ?")
+            .bind(authorized)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        self.bump_generation();
+        Ok(())
+    }
+
     /// Set an account's routing policy (`normal` | `burn_first` | `preserve`). Bumps the generation.
     pub async fn update_routing_policy(
         &self,

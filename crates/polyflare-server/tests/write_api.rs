@@ -173,6 +173,71 @@ async fn patch_assigns_pool_and_pauses_then_clears() {
 }
 
 #[tokio::test]
+async fn patch_toggles_security_work_authorized_and_leaves_it_alone_when_absent() {
+    // TA6 Task 4: the operator write path for the cyber-capability flag. `account()` seeds
+    // `security_work_authorized: false`.
+    let store = store_with_one().await;
+    let repo = store.accounts();
+    let pf = spawn_with(store).await;
+    let client = reqwest::Client::new();
+
+    // A patch WITH the field flips it.
+    let resp = client
+        .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "security_work_authorized": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // security_work_authorized isn't in the /api/accounts LIST view (only the per-account detail
+    // view), so verify it via the store — same pattern as routing_policy above.
+    assert!(
+        repo.get("acct-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .security_work_authorized
+    );
+
+    // A patch WITHOUT the field (Option semantics regression) must leave it unchanged.
+    let resp = client
+        .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "status": "paused" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        repo.get("acct-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .security_work_authorized,
+        "a patch omitting the field must not clear it"
+    );
+
+    // Flip it back off explicitly.
+    let resp = client
+        .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "security_work_authorized": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        !repo
+            .get("acct-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .security_work_authorized
+    );
+}
+
+#[tokio::test]
 async fn patch_validation_fails_closed() {
     let pf = spawn_with(store_with_one().await).await;
     let client = reqwest::Client::new();
