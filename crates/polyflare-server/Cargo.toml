@@ -45,6 +45,15 @@ tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 # Embedded dashboard assets (dashboard/dist), served under /dashboard.
 rust-embed = { workspace = true }
+# D18 Task 2: `keys.rs`'s CSPRNG client-key generation. Same vetted RNG this workspace already
+# uses for other security-critical randomness (`polyflare_codex::oauth`'s PKCE verifier/state) —
+# reused here, not a redundant/second RNG dependency.
+rand = { workspace = true }
+# D18 Task 2: `keys.rs` base64url-nopad-encodes the raw client key. Already a workspace dep used
+# identically by `polyflare_codex::oauth` for PKCE — promoted from this crate's dev-dependencies
+# (where it was already present for test code) to a real dependency now that `src/keys.rs` needs
+# it too.
+base64 = { workspace = true }
 
 [dev-dependencies]
 polyflare-testkit = { path = "../polyflare-testkit" }
@@ -53,7 +62,6 @@ futures-util = { workspace = true }
 sqlx = { workspace = true }
 tempfile = { workspace = true }
 zeroize = { workspace = true }
-base64 = { workspace = true }
 # ws_vs_sse_probe example: a WebSocket client for the Codex backend POC. Pinned to the same
 # rustls 0.23 the workspace uses so it reuses the installed aws-lc-rs crypto provider.
 #
