@@ -502,9 +502,12 @@ async fn pools_endpoint_carries_available_usage_percent_and_strategy() {
 
     // Cool codex-d2 down via the live runtime overlay (same mechanism `/api/overview` reads through
     // `RuntimeStates::overlay`) — it stays durably `active` but is not selectable right now.
-    state
-        .runtime
-        .record_rate_limit(&AccountId::from("codex-d2"), None, now());
+    state.runtime.record_rate_limit(
+        &AccountId::from("codex-d2"),
+        None,
+        now(),
+        &state.rate_limit_metrics,
+    );
 
     let body: serde_json::Value = reqwest::Client::new()
         .get(format!("{pf}/api/pools"))

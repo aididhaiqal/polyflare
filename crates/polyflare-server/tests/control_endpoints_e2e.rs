@@ -228,6 +228,37 @@ async fn sentinel_body_is_forwarded_but_never_reaches_the_request_log() {
 }
 
 // -------------------------------------------------------------------------------------------
+// C11b Task 2: `control_route` bumps the content-free `upstream_request_metrics` counter,
+// keyed by `(account_id, status)`, exactly once per real control request — the CONTROL traffic
+// class of the 3 request-completion wrapper sites.
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn control_request_records_upstream_request_metric() {
+    let mock = MockControlUpstream::new(200, r#"{"goal":"be nice"}"#);
+    let mock_base = mock.clone().spawn().await;
+
+    let (base, state) = spawn_app(true, &mock_base).await;
+    seed_account(&state.store, &state.cipher, "acct-a", "tok-a").await;
+    insert_key_for_raw(&state.store, "sk-pf-metrics-test", "metrics").await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/thread/goal/set"))
+        .header("authorization", "Bearer sk-pf-metrics-test")
+        .body(r#"{"goal":"be nice"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    assert_eq!(
+        state.upstream_request_metrics.snapshot(),
+        vec![("acct-a".to_string(), 200, 1)],
+        "control_route must record exactly one upstream_requests entry for the served account"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
 // Soft session→owner affinity: a control request carrying a session header lands on the
 // SESSION'S OWNER account (asserted via the mock's recorded bearer, which equals the owner's
 // raw access token since `last_refresh` is fresh — no OAuth refresh in play).

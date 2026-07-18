@@ -21,7 +21,7 @@ use std::sync::{Arc, RwLock};
 
 use polyflare_core::{AccountId, AccountSnapshot};
 
-use crate::observability::LeaseMetrics;
+use crate::observability::{LeaseMetrics, RateLimitMetrics};
 
 /// Base for the exponential error backoff, in milliseconds (`0.2s * 2^(n-1)` — codex-lb
 /// `retry.py:51-77`). The eligibility error-backoff gate (`select.rs`) uses the same shape.
@@ -421,12 +421,28 @@ impl RuntimeStates {
     /// account until `now + delay` (floored at [`RATE_LIMITED_MIN_COOLDOWN_SECS`]). `retry_after` is
     /// the upstream `Retry-After`, if any; absent ⇒ exponential backoff on the new error count. The
     /// LATER of an existing cooldown and the new one wins (never shorten a bench).
+    ///
+    /// C11b Task 2: `rate_limit_metrics` is the content-free [`RateLimitMetrics`] handle (an
+    /// `AppState` field) this call bumps once, keyed by `"upstream"` when `retry_after` was
+    /// upstream-supplied or `"backoff"` when PolyFlare computed its own exponential delay — the
+    /// single true 429 chokepoint (all `record_failure` callers funnel through the one
+    /// `sig.status == 429` branch that calls this). Threaded in as a call-site PARAMETER, exactly
+    /// mirroring [`Self::acquire_in_flight`]'s `metrics: &Arc<LeaseMetrics>` precedent (see that
+    /// method's doc for why: `RuntimeStates`'s own construction stays metrics-free, so none of the
+    /// existing `AppState`-builder call sites needed to change — only this method's callers gained
+    /// one argument).
     pub fn record_rate_limit(
         &self,
         id: &AccountId,
         retry_after: Option<i64>,
         now: i64,
+        rate_limit_metrics: &RateLimitMetrics,
     ) -> Option<HealthTierTransition> {
+        rate_limit_metrics.record(if retry_after.is_some() {
+            "upstream"
+        } else {
+            "backoff"
+        });
         self.mutate(id, |rt| {
             rt.error_count = rt.error_count.saturating_add(1);
             rt.last_error_at = Some(now);
@@ -736,8 +752,9 @@ mod tests {
     fn record_rate_limit_sets_cooldown_error_and_floor() {
         let rs = RuntimeStates::new();
         let id = AccountId::from("a");
+        let metrics = RateLimitMetrics::new();
         // No Retry-After ⇒ backoff, but floored to the 30s minimum.
-        rs.record_rate_limit(&id, None, 1000);
+        rs.record_rate_limit(&id, None, 1000, &metrics);
         let mut snaps = vec![snap("a")];
         rs.overlay(&mut snaps, 1000);
         assert_eq!(snaps[0].error_count, 1);
@@ -753,12 +770,59 @@ mod tests {
     fn record_rate_limit_honors_retry_after_and_never_shortens() {
         let rs = RuntimeStates::new();
         let id = AccountId::from("a");
-        rs.record_rate_limit(&id, Some(600), 1000); // cooldown until 1600
-        rs.record_rate_limit(&id, Some(60), 1010); // shorter → must NOT shorten the bench
+        let metrics = RateLimitMetrics::new();
+        rs.record_rate_limit(&id, Some(600), 1000, &metrics); // cooldown until 1600
+        rs.record_rate_limit(&id, Some(60), 1010, &metrics); // shorter → must NOT shorten the bench
         let mut snaps = vec![snap("a")];
         rs.overlay(&mut snaps, 1000);
         assert_eq!(snaps[0].cooldown_until, Some(1600), "later cooldown wins");
         assert_eq!(snaps[0].error_count, 2);
+    }
+
+    // --- C11b Task 2: `record_rate_limit` bumps the threaded `RateLimitMetrics` handle exactly
+    // once per call, keyed by whether `retry_after` was upstream-supplied vs computed backoff. ---
+
+    #[test]
+    fn record_rate_limit_with_retry_after_bumps_upstream_kind() {
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        let metrics = RateLimitMetrics::new();
+        rs.record_rate_limit(&id, Some(600), 1000, &metrics);
+        assert_eq!(
+            metrics.snapshot(),
+            vec![("upstream".to_string(), 1)],
+            "an upstream-supplied Retry-After records the \"upstream\" kind"
+        );
+    }
+
+    #[test]
+    fn record_rate_limit_without_retry_after_bumps_backoff_kind() {
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        let metrics = RateLimitMetrics::new();
+        rs.record_rate_limit(&id, None, 1000, &metrics);
+        assert_eq!(
+            metrics.snapshot(),
+            vec![("backoff".to_string(), 1)],
+            "no Retry-After (computed exponential backoff) records the \"backoff\" kind"
+        );
+    }
+
+    #[test]
+    fn record_rate_limit_bumps_metrics_once_per_call_across_kinds() {
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        let metrics = RateLimitMetrics::new();
+        rs.record_rate_limit(&id, Some(60), 1000, &metrics);
+        rs.record_rate_limit(&id, None, 1010, &metrics);
+        rs.record_rate_limit(&id, Some(60), 1020, &metrics);
+        let mut snapshot = metrics.snapshot();
+        snapshot.sort();
+        assert_eq!(
+            snapshot,
+            vec![("backoff".to_string(), 1), ("upstream".to_string(), 2)],
+            "exactly one bump per record_rate_limit call, keyed by kind"
+        );
     }
 
     #[test]
@@ -766,7 +830,8 @@ mod tests {
         // A huge Retry-After with a near-max `now` must saturate, not panic/overflow.
         let rs = RuntimeStates::new();
         let id = AccountId::from("a");
-        rs.record_rate_limit(&id, Some(i64::MAX), i64::MAX - 10);
+        let metrics = RateLimitMetrics::new();
+        rs.record_rate_limit(&id, Some(i64::MAX), i64::MAX - 10, &metrics);
         let mut snaps = vec![snap("a")];
         rs.overlay(&mut snaps, 1000);
         assert_eq!(
@@ -777,7 +842,7 @@ mod tests {
 
         // A finite-but-excessive Retry-After (48h) is clamped to the 24h ceiling.
         let rs2 = RuntimeStates::new();
-        rs2.record_rate_limit(&id, Some(48 * 3600), 1000);
+        rs2.record_rate_limit(&id, Some(48 * 3600), 1000, &metrics);
         let mut s2 = vec![snap("a")];
         rs2.overlay(&mut s2, 1000);
         assert_eq!(
@@ -795,8 +860,9 @@ mod tests {
         // account that has ever been 429'd.
         let rs = RuntimeStates::new();
         let id = AccountId::from("a");
-        rs.record_rate_limit(&id, Some(30), 1000); // cooldown until 1030 (error_count → 1)
-                                                   // Within the cooldown window ⇒ it IS supplied (the account is benched).
+        let metrics = RateLimitMetrics::new();
+        rs.record_rate_limit(&id, Some(30), 1000, &metrics); // cooldown until 1030 (error_count → 1)
+                                                             // Within the cooldown window ⇒ it IS supplied (the account is benched).
         let mut during = vec![snap("a")];
         rs.overlay(&mut during, 1000);
         assert_eq!(during[0].cooldown_until, Some(1030));
@@ -1054,8 +1120,9 @@ mod tests {
         // record_rate_limit must wire the same error-driven transition as record_transient_error.
         let rs = RuntimeStates::new();
         let id = AccountId::from("a");
-        rs.record_rate_limit(&id, Some(5), 1000); // error_count=1, cooldown clamped to floor
-        rs.record_rate_limit(&id, Some(5), 1010); // error_count=2, within 60s ⇒ error-drain
+        let metrics = RateLimitMetrics::new();
+        rs.record_rate_limit(&id, Some(5), 1000, &metrics); // error_count=1, cooldown clamped to floor
+        rs.record_rate_limit(&id, Some(5), 1010, &metrics); // error_count=2, within 60s ⇒ error-drain
         let mut snaps = vec![snap("a")];
         rs.overlay(&mut snaps, 1010);
         assert_eq!(
