@@ -130,7 +130,8 @@ async fn spawn(enforce_client_keys: bool) -> (String, Arc<AppState>) {
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: Duration::from_secs(60),
         starvation_heartbeat: Duration::from_secs(10),
-        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+        wake_jitter_ms: 0,
+        inflight_penalty_pct: 2.5,
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
@@ -260,7 +261,11 @@ async fn never_logs_the_client_key_end_to_end() {
     }
     drop(guard);
 
-    assert_eq!(rows.len(), 1, "exactly one request_log row for this request: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one request_log row for this request: {rows:?}"
+    );
     let row = &rows[0];
     // `RequestLogRow` is structurally content-free (no header/body field exists on the type at
     // all — see `polyflare_store::request_log_repo`'s module doc) — this Debug-format scan is
@@ -301,7 +306,11 @@ async fn never_logs_the_client_key_end_to_end() {
         .send()
         .await
         .unwrap();
-    assert_eq!(sse_resp.status(), 200, "live_logs:true ⇒ the SSE endpoint is reachable");
+    assert_eq!(
+        sse_resp.status(),
+        200,
+        "live_logs:true ⇒ the SSE endpoint is reachable"
+    );
     let mut sse_stream = sse_resp.bytes_stream();
     let mut sse_body = String::new();
     // Bounded read: enough bytes to definitely cover the backfilled request event, never the
@@ -370,7 +379,10 @@ async fn invalid_well_formed_key_gets_401() {
 
     let resp = reqwest::Client::new()
         .post(format!("{base}/responses"))
-        .header("authorization", "Bearer sk-pf-this-key-was-never-created-abcdef")
+        .header(
+            "authorization",
+            "Bearer sk-pf-this-key-was-never-created-abcdef",
+        )
         .json(&responses_body())
         .send()
         .await
@@ -422,5 +434,9 @@ async fn revoked_key_gets_401() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 401, "a revoked (disabled) key must be rejected");
+    assert_eq!(
+        resp.status(),
+        401,
+        "a revoked (disabled) key must be rejected"
+    );
 }

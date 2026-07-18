@@ -56,7 +56,8 @@ async fn build_state() -> Arc<AppState> {
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: Duration::from_secs(60),
         starvation_heartbeat: Duration::from_secs(10),
-        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+        wake_jitter_ms: 0,
+        inflight_penalty_pct: 2.5,
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
@@ -94,7 +95,9 @@ async fn spawn(state: Arc<AppState>) -> String {
 #[tokio::test]
 async fn valid_enabled_key_passes_through_and_touches_last_used() {
     let state = build_state().await;
-    let created = create_key(&state.store, Some("laptop"), 1_000).await.unwrap();
+    let created = create_key(&state.store, Some("laptop"), 1_000)
+        .await
+        .unwrap();
     let base = spawn(state.clone()).await;
 
     let client = reqwest::Client::new();
@@ -117,7 +120,13 @@ async fn valid_enabled_key_passes_through_and_touches_last_used() {
     let hash = sha256_hex(&created.raw);
     let mut last_used = None;
     for _ in 0..50 {
-        let row = state.store.api_keys().get_by_hash(&hash).await.unwrap().unwrap();
+        let row = state
+            .store
+            .api_keys()
+            .get_by_hash(&hash)
+            .await
+            .unwrap()
+            .unwrap();
         if row.last_used_at.is_some() {
             last_used = row.last_used_at;
             break;
@@ -164,7 +173,11 @@ async fn revoked_key_is_401() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 401, "a revoked (enabled=false) key must be rejected");
+    assert_eq!(
+        resp.status(),
+        401,
+        "a revoked (enabled=false) key must be rejected"
+    );
 }
 
 #[tokio::test]
@@ -261,7 +274,11 @@ async fn sentinel_key_never_leaks_on_failed_auth() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 401, "an unknown/attacker-controlled key must be rejected");
+    assert_eq!(
+        resp.status(),
+        401,
+        "an unknown/attacker-controlled key must be rejected"
+    );
     let body = resp.text().await.unwrap();
     drop(guard);
 

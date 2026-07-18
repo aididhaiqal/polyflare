@@ -133,7 +133,10 @@ impl Executor for FailoverStubExecutor {
         account: &Account,
         _ctx: &RequestCtx,
     ) -> Result<ResponseStream, ExecError> {
-        self.calls.lock().unwrap().push(account.id.as_str().to_string());
+        self.calls
+            .lock()
+            .unwrap()
+            .push(account.id.as_str().to_string());
         let behavior = {
             let mut map = self.behaviors.lock().unwrap();
             match map.get_mut(account.id.as_str()) {
@@ -145,7 +148,8 @@ impl Executor for FailoverStubExecutor {
         match behavior {
             AttemptBehavior::Success => {
                 let id = format!("resp_{}", account.id);
-                let created = format!(r#"{{"type":"response.created","response":{{"id":"{id}"}}}}"#);
+                let created =
+                    format!(r#"{{"type":"response.created","response":{{"id":"{id}"}}}}"#);
                 let completed =
                     format!(r#"{{"type":"response.completed","response":{{"id":"{id}"}}}}"#);
                 Ok(Box::pin(stream::iter(vec![
@@ -176,7 +180,11 @@ async fn spawn_store() -> (Store, TokenCipher, tempfile::TempDir) {
     (store, cipher, dir)
 }
 
-fn build_state(store: Store, cipher: TokenCipher, executor: Arc<FailoverStubExecutor>) -> Arc<AppState> {
+fn build_state(
+    store: Store,
+    cipher: TokenCipher,
+    executor: Arc<FailoverStubExecutor>,
+) -> Arc<AppState> {
     let continuity: Arc<dyn Continuity> = Arc::new(CodexContinuity::new(
         store.continuity(),
         Duration::from_secs(30),
@@ -207,7 +215,8 @@ fn build_state(store: Store, cipher: TokenCipher, executor: Arc<FailoverStubExec
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: std::time::Duration::from_secs(60),
         starvation_heartbeat: std::time::Duration::from_secs(10),
-        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+        wake_jitter_ms: 0,
+        inflight_penalty_pct: 2.5,
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
@@ -570,9 +579,8 @@ async fn max_attempts_one_reproduces_the_one_shot_regression_exactly() {
         axum::http::header::CONTENT_TYPE,
         "application/json".parse().unwrap(),
     );
-    let body = Bytes::from(
-        serde_json::to_vec(&serde_json::json!({"model": "m", "input": "hi"})).unwrap(),
-    );
+    let body =
+        Bytes::from(serde_json::to_vec(&serde_json::json!({"model": "m", "input": "hi"})).unwrap());
     let resp = responses_handler_impl_for_test(state, None, headers, body, 1).await;
 
     assert_eq!(
@@ -614,9 +622,8 @@ async fn test_seam_with_default_bound_still_fails_over() {
         axum::http::header::CONTENT_TYPE,
         "application/json".parse().unwrap(),
     );
-    let body = Bytes::from(
-        serde_json::to_vec(&serde_json::json!({"model": "m", "input": "hi"})).unwrap(),
-    );
+    let body =
+        Bytes::from(serde_json::to_vec(&serde_json::json!({"model": "m", "input": "hi"})).unwrap());
     let resp = responses_handler_impl_for_test(state, None, headers, body, 3).await;
 
     assert_eq!(resp.status(), 200);
@@ -657,9 +664,8 @@ async fn failover_releases_as_lease_before_b_is_picked_and_holds_bs_lease_while_
         axum::http::header::CONTENT_TYPE,
         "application/json".parse().unwrap(),
     );
-    let body = Bytes::from(
-        serde_json::to_vec(&serde_json::json!({"model": "m", "input": "hi"})).unwrap(),
-    );
+    let body =
+        Bytes::from(serde_json::to_vec(&serde_json::json!({"model": "m", "input": "hi"})).unwrap());
     let resp = responses_handler_impl_for_test(state.clone(), None, headers, body, 3).await;
     assert_eq!(resp.status(), 200, "B's stream is the client's response");
     assert_eq!(

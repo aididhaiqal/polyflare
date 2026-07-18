@@ -644,8 +644,7 @@ mod tests {
 
     #[test]
     fn keys_revoke_parses_id() {
-        let cli =
-            Cli::try_parse_from(["polyflare", "keys", "revoke", "--id", "key_abc"]).unwrap();
+        let cli = Cli::try_parse_from(["polyflare", "keys", "revoke", "--id", "key_abc"]).unwrap();
         match cli.command {
             Commands::Keys {
                 command: KeysCommands::Revoke { id },

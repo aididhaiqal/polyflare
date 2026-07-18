@@ -130,7 +130,11 @@ async fn spawn_sticky_mock(capable_token: String) -> (String, StickyMock) {
     (format!("http://{addr}"), mock)
 }
 
-async fn spawn_app(store: Store, cipher: TokenCipher, upstream_url: String) -> (String, Arc<AppState>) {
+async fn spawn_app(
+    store: Store,
+    cipher: TokenCipher,
+    upstream_url: String,
+) -> (String, Arc<AppState>) {
     let continuity: Arc<dyn Continuity> = Arc::new(CodexContinuity::new(
         store.continuity(),
         Duration::from_secs(30),
@@ -161,7 +165,8 @@ async fn spawn_app(store: Store, cipher: TokenCipher, upstream_url: String) -> (
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: std::time::Duration::from_secs(60),
         starvation_heartbeat: std::time::Duration::from_secs(10),
-        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+        wake_jitter_ms: 0,
+        inflight_penalty_pct: 2.5,
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
@@ -195,12 +200,20 @@ async fn sticky_session_selects_the_capable_account_directly_with_no_second_reje
     // Two accounts: a non-capable one (would earn a `cyber_policy` rejection) and the capable one.
     store
         .accounts()
-        .insert(&account("non-capable", false), &tokens("non-capable-tok"), &cipher)
+        .insert(
+            &account("non-capable", false),
+            &tokens("non-capable-tok"),
+            &cipher,
+        )
         .await
         .unwrap();
     store
         .accounts()
-        .insert(&account("capable-acct", true), &tokens(&capable_token), &cipher)
+        .insert(
+            &account("capable-acct", true),
+            &tokens(&capable_token),
+            &cipher,
+        )
         .await
         .unwrap();
 

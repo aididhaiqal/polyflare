@@ -1111,7 +1111,10 @@ mod tests {
         let guard = rs.acquire_in_flight(&id, 0);
         let mut snaps = vec![polyflare_core::AccountSnapshot::new("acct")];
         rs.overlay(&mut snaps, 0);
-        assert_eq!(snaps[0].in_flight, 1, "the lease is held before the stream ever exists");
+        assert_eq!(
+            snaps[0].in_flight, 1,
+            "the lease is held before the stream ever exists"
+        );
 
         // A stream with plenty left to yield — never polled at all here, mirroring a client that
         // disconnects before the server even gets to relay the first byte.
@@ -1162,7 +1165,9 @@ mod tests {
         let guard = rs.acquire_in_flight(&id, 0);
 
         let inner: ResponseStream = Box::pin(stream::iter(vec![Ok::<Bytes, ExecError>(
-            Bytes::from_static(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\"}}\n\n"),
+            Bytes::from_static(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\"}}\n\n",
+            ),
         )]));
         let mut observing = ObservingStream {
             inner,
@@ -1183,9 +1188,15 @@ mod tests {
         };
 
         let first = Pin::new(&mut observing).next().await;
-        assert!(matches!(first, Some(Ok(_))), "the one real chunk relays cleanly");
+        assert!(
+            matches!(first, Some(Ok(_))),
+            "the one real chunk relays cleanly"
+        );
         let end = Pin::new(&mut observing).next().await;
-        assert!(end.is_none(), "clean EOF: Poll::Ready(None) after observe completes");
+        assert!(
+            end.is_none(),
+            "clean EOF: Poll::Ready(None) after observe completes"
+        );
 
         // Still holding `observing` here (not yet dropped) — the lease must still be alive; the
         // field's own `Drop` is what releases it, not `poll_next` reaching `Done`.
@@ -1204,7 +1215,10 @@ mod tests {
         drop(observing);
         let mut snaps = vec![polyflare_core::AccountSnapshot::new("acct")];
         rs.overlay(&mut snaps, 0);
-        assert_eq!(snaps[0].in_flight, 0, "dropping the fully-drained stream releases the lease");
+        assert_eq!(
+            snaps[0].in_flight, 0,
+            "dropping the fully-drained stream releases the lease"
+        );
     }
 
     /// C9 Task 2: a mid-stream error (the `Poll::Ready(Some(Err(_)))` arm) forwards the error
@@ -1240,7 +1254,10 @@ mod tests {
         };
 
         let first = Pin::new(&mut observing).next().await;
-        assert!(matches!(first, Some(Ok(_))), "the first chunk relays cleanly");
+        assert!(
+            matches!(first, Some(Ok(_))),
+            "the first chunk relays cleanly"
+        );
         let second = Pin::new(&mut observing).next().await;
         assert!(
             matches!(second, Some(Err(_))),

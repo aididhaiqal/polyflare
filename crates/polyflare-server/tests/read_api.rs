@@ -167,7 +167,8 @@ async fn spawn_with_state(store: Store) -> (String, Arc<AppState>) {
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: std::time::Duration::from_secs(60),
         starvation_heartbeat: std::time::Duration::from_secs(10),
-        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+        wake_jitter_ms: 0,
+        inflight_penalty_pct: 2.5,
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
@@ -422,7 +423,12 @@ async fn promo_shape_resolves_weekly_from_primary_slot_and_flags_stale() {
 async fn no_secret_token_is_ever_present_in_a_read_response() {
     let pf = spawn(seed_store().await).await;
     let client = reqwest::Client::new();
-    for path in ["/api/accounts", "/api/pools", "/api/requests", "/api/sessions"] {
+    for path in [
+        "/api/accounts",
+        "/api/pools",
+        "/api/requests",
+        "/api/sessions",
+    ] {
         let text = client
             .get(format!("{pf}{path}"))
             .header("authorization", "Bearer secret")
@@ -840,7 +846,10 @@ async fn overview_series_reports_hourly_buckets_zero_filled_over_the_24h_window(
     assert_eq!(populated["errors"], 1);
     assert_eq!(populated["total_tokens"], 3500);
     let avg = populated["avg_latency_ms"].as_f64().unwrap();
-    assert!((avg - 100.0).abs() < 0.001, "all 3 rows use duration_ms=100");
+    assert!(
+        (avg - 100.0).abs() < 0.001,
+        "all 3 rows use duration_ms=100"
+    );
 
     // Every other bucket in the grid is zero-filled, not absent.
     let others: Vec<_> = buckets

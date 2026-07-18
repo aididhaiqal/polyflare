@@ -191,7 +191,11 @@ impl RuntimeState {
     /// an ENTERING-DRAINING edge (`to == 1` ⇒ [`REASON_ERROR_DRAIN`], since it can only see the error
     /// signal) or a PROBING→HEALTHY streak completion (`to == 0` ⇒ [`REASON_PROBE_PROMOTE`]); it can
     /// never produce a usage-drain or a quiet-promote (that's the poller's exclusive province).
-    fn apply_funnel_transition(&mut self, should_drain: bool, now: i64) -> Option<HealthTierTransition> {
+    fn apply_funnel_transition(
+        &mut self,
+        should_drain: bool,
+        now: i64,
+    ) -> Option<HealthTierTransition> {
         let from = self.health_tier;
         let new_tier = evaluate_health_tier(
             from,
@@ -850,9 +854,9 @@ mod tests {
         // DRAINING + !drain + now-drain_entered_at >= 60 ⇒ PROBING.
         assert_eq!(evaluate_health_tier(1, false, Some(940), 0, false, 1000), 2); // diff == 60
         assert_eq!(evaluate_health_tier(1, false, Some(500), 0, false, 1000), 2); // diff > 60
-        // DRAINING + !drain + < 60 ⇒ stays DRAINING.
+                                                                                  // DRAINING + !drain + < 60 ⇒ stays DRAINING.
         assert_eq!(evaluate_health_tier(1, false, Some(950), 0, false, 1000), 1); // diff == 50
-        // DRAINING + !drain + drain_entered_at == None ⇒ stays DRAINING (no promote without a stamp).
+                                                                                  // DRAINING + !drain + drain_entered_at == None ⇒ stays DRAINING (no promote without a stamp).
         assert_eq!(evaluate_health_tier(1, false, None, 0, false, 1000), 1);
     }
 
@@ -989,8 +993,14 @@ mod tests {
         rs.record_transient_error(&id, 1001); // error_count=2 within 60s ⇒ error-drain ⇒ DRAINING
         let mut snaps = vec![snap("a"), snap("b")];
         rs.overlay(&mut snaps, 1001);
-        assert_eq!(snaps[0].health_tier, 1, "known entry: tier copied from runtime state");
-        assert_eq!(snaps[1].health_tier, 0, "absent entry: stays at the neutral default");
+        assert_eq!(
+            snaps[0].health_tier, 1,
+            "known entry: tier copied from runtime state"
+        );
+        assert_eq!(
+            snaps[1].health_tier, 0,
+            "absent entry: stays at the neutral default"
+        );
     }
 
     #[test]
@@ -1014,7 +1024,10 @@ mod tests {
         rs.record_rate_limit(&id, Some(5), 1010); // error_count=2, within 60s ⇒ error-drain
         let mut snaps = vec![snap("a")];
         rs.overlay(&mut snaps, 1010);
-        assert_eq!(snaps[0].health_tier, 1, "2 rate-limit hits within 60s ⇒ DRAINING");
+        assert_eq!(
+            snaps[0].health_tier, 1,
+            "2 rate-limit hits within 60s ⇒ DRAINING"
+        );
     }
 
     #[test]
@@ -1035,7 +1048,10 @@ mod tests {
         rs.record_success(&id); // 3rd success completes the streak ⇒ HEALTHY
         let mut snaps = vec![snap("a")];
         rs.overlay(&mut snaps, 2000);
-        assert_eq!(snaps[0].health_tier, 0, "3 successes while PROBING ⇒ HEALTHY");
+        assert_eq!(
+            snaps[0].health_tier, 0,
+            "3 successes while PROBING ⇒ HEALTHY"
+        );
         assert_eq!(snaps[0].error_count, 0);
         assert_eq!(snaps[0].last_error_at, None);
         assert_eq!(
@@ -1061,7 +1077,10 @@ mod tests {
         rs.record_success(&id); // only 2 successes ⇒ still PROBING
         let mut snaps = vec![snap("a")];
         rs.overlay(&mut snaps, 2000);
-        assert_eq!(snaps[0].health_tier, 2, "2 successes while PROBING ⇒ stays PROBING");
+        assert_eq!(
+            snaps[0].health_tier, 2,
+            "2 successes while PROBING ⇒ stays PROBING"
+        );
     }
 
     #[test]
@@ -1082,14 +1101,20 @@ mod tests {
         // but the streak must reset to 0.
         rs.record_transient_error(&id, 1000);
         seed(&rs, &id, |rt| {
-            assert_eq!(rt.probe_success_streak, 0, "streak reset on any error while PROBING");
+            assert_eq!(
+                rt.probe_success_streak, 0,
+                "streak reset on any error while PROBING"
+            );
             assert_eq!(rt.health_tier, 2, "single error alone doesn't error-drain");
         });
         // A second error within 60s DOES error-drain ⇒ PROBING -> DRAINING.
         rs.record_transient_error(&id, 1010);
         let mut snaps = vec![snap("a")];
         rs.overlay(&mut snaps, 1010);
-        assert_eq!(snaps[0].health_tier, 1, "2nd error within 60s while PROBING ⇒ DRAINING");
+        assert_eq!(
+            snaps[0].health_tier, 1,
+            "2nd error within 60s while PROBING ⇒ DRAINING"
+        );
     }
 
     #[test]
@@ -1170,11 +1195,21 @@ mod tests {
         });
         rs.evaluate_with_usage(&id, Some(99.0), None, false, false, 1000);
         let entry = peek(&rs, &id).expect("non-neutral: error state survives");
-        assert_eq!(entry.health_tier, 0, "disabled ⇒ forced HEALTHY regardless of usage");
+        assert_eq!(
+            entry.health_tier, 0,
+            "disabled ⇒ forced HEALTHY regardless of usage"
+        );
         assert_eq!(entry.drain_entered_at, None, "aux cleared");
         assert_eq!(entry.probe_success_streak, 0, "aux cleared");
-        assert_eq!(entry.error_count, 3, "error state is NOT clobbered by the disable path");
-        assert_eq!(entry.last_error_at, Some(900), "error state is NOT clobbered");
+        assert_eq!(
+            entry.error_count, 3,
+            "error state is NOT clobbered by the disable path"
+        );
+        assert_eq!(
+            entry.last_error_at,
+            Some(900),
+            "error state is NOT clobbered"
+        );
     }
 
     #[test]
@@ -1190,7 +1225,10 @@ mod tests {
         rs.evaluate_with_usage(&id, Some(99.0), None, true, true, 1000);
         let mut snaps = vec![snap("a")];
         rs.overlay(&mut snaps, 1000);
-        assert_eq!(snaps[0].health_tier, 2, "frozen ⇒ tier unchanged despite used%=99");
+        assert_eq!(
+            snaps[0].health_tier, 2,
+            "frozen ⇒ tier unchanged despite used%=99"
+        );
     }
 
     // --- C9 Task 1: the leak-proof InFlightGuard + in_flight runtime field + overlay ---
@@ -1240,8 +1278,14 @@ mod tests {
 
         let mut snaps = vec![snap("a"), snap("b")];
         rs.overlay(&mut snaps, 1000);
-        assert_eq!(snaps[0].in_flight, 1, "known entry: in_flight copied from runtime state");
-        assert_eq!(snaps[1].in_flight, 0, "absent entry: stays at the neutral default");
+        assert_eq!(
+            snaps[0].in_flight, 1,
+            "known entry: in_flight copied from runtime state"
+        );
+        assert_eq!(
+            snaps[1].in_flight, 0,
+            "absent entry: stays at the neutral default"
+        );
     }
 
     #[test]
@@ -1255,7 +1299,10 @@ mod tests {
         assert!(!rt.is_neutral(), "in_flight > 0 must never be neutral");
 
         rt.in_flight = 0;
-        assert!(rt.is_neutral(), "in_flight back at 0 with nothing else set ⇒ neutral");
+        assert!(
+            rt.is_neutral(),
+            "in_flight back at 0 with nothing else set ⇒ neutral"
+        );
 
         // End-to-end via the map: while a guard is held, the account's entry must survive `mutate`'s
         // neutral-GC (e.g. record_selected on some other bookkeeping) rather than vanish mid-flight.
@@ -1291,7 +1338,11 @@ mod tests {
         );
 
         drop(guard_b);
-        assert_eq!(peek(&rs, &id), None, "dropping guard_b releases the last lease ⇒ GC'd");
+        assert_eq!(
+            peek(&rs, &id),
+            None,
+            "dropping guard_b releases the last lease ⇒ GC'd"
+        );
     }
 
     #[test]

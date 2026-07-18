@@ -640,9 +640,15 @@ mod tests {
             std::env::set_var("POLYFLARE_POOL_CAPABILITIES", "not-a-valid-pair");
         }
 
-        assert!(!pool_requires_capability(Some("cyber"), SECURITY_WORK_CAPABILITY));
+        assert!(!pool_requires_capability(
+            Some("cyber"),
+            SECURITY_WORK_CAPABILITY
+        ));
         // Second call: same malformed value, `Once` already fired — must still fail open cleanly.
-        assert!(!pool_requires_capability(Some("cyber"), SECURITY_WORK_CAPABILITY));
+        assert!(!pool_requires_capability(
+            Some("cyber"),
+            SECURITY_WORK_CAPABILITY
+        ));
 
         unsafe {
             std::env::remove_var("POLYFLARE_POOL_CAPABILITIES");
@@ -661,9 +667,18 @@ mod tests {
             std::env::set_var("POLYFLARE_POOL_CAPABILITIES", "cyber:security_work");
         }
 
-        assert!(pool_requires_capability(Some("cyber"), SECURITY_WORK_CAPABILITY));
-        assert!(!pool_requires_capability(Some("general"), SECURITY_WORK_CAPABILITY));
-        assert!(!pool_requires_capability(Some("cyber"), "some_other_capability"));
+        assert!(pool_requires_capability(
+            Some("cyber"),
+            SECURITY_WORK_CAPABILITY
+        ));
+        assert!(!pool_requires_capability(
+            Some("general"),
+            SECURITY_WORK_CAPABILITY
+        ));
+        assert!(!pool_requires_capability(
+            Some("cyber"),
+            "some_other_capability"
+        ));
         assert!(!pool_requires_capability(None, SECURITY_WORK_CAPABILITY));
 
         unsafe {
@@ -751,7 +766,9 @@ mod tests {
     /// `[1, 300]` clamp range — unchanged).
     #[test]
     fn starvation_wait_budget_reads_a_well_formed_in_range_value() {
-        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = starvation_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS", "120");
         }
@@ -764,7 +781,9 @@ mod tests {
     /// Unset ⇒ the documented default, 60.
     #[test]
     fn starvation_wait_budget_unset_defaults_to_sixty() {
-        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = starvation_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS");
         }
@@ -775,7 +794,9 @@ mod tests {
     /// treated as malformed.
     #[test]
     fn starvation_wait_budget_above_max_clamps_to_three_hundred() {
-        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = starvation_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS", "500");
         }
@@ -789,7 +810,9 @@ mod tests {
     /// the clamp floor (1). See the function's doc for the full justification of this decision.
     #[test]
     fn starvation_wait_budget_zero_is_the_disable_lever_not_a_clamp_to_one() {
-        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = starvation_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS", "0");
         }
@@ -803,7 +826,9 @@ mod tests {
     /// and never silently collapsed to the disable lever (0), which would be a safety regression.
     #[test]
     fn starvation_wait_budget_malformed_defaults_to_sixty_not_zero() {
-        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = starvation_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS", "not-a-number");
         }
@@ -817,7 +842,9 @@ mod tests {
     /// the `[1, 60]` clamp range).
     #[test]
     fn starvation_heartbeat_unset_defaults_to_ten() {
-        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = starvation_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("POLYFLARE_STARVATION_HEARTBEAT_SECS");
         }
@@ -828,7 +855,9 @@ mod tests {
     /// heartbeat that never fires before the wait ends would defeat its purpose.
     #[test]
     fn starvation_heartbeat_larger_than_budget_clamps_down_to_budget() {
-        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = starvation_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("POLYFLARE_STARVATION_HEARTBEAT_SECS", "50");
         }
@@ -846,7 +875,9 @@ mod tests {
     /// `0`, which has its own dedicated disable-lever meaning; a `0`-second heartbeat does not).
     #[test]
     fn starvation_heartbeat_zero_clamps_to_one_not_left_at_zero() {
-        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = starvation_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("POLYFLARE_STARVATION_HEARTBEAT_SECS", "0");
         }
@@ -860,7 +891,9 @@ mod tests {
     /// well-formed one.
     #[test]
     fn starvation_heartbeat_malformed_defaults_to_ten_then_clamps() {
-        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = starvation_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("POLYFLARE_STARVATION_HEARTBEAT_SECS", "nope");
         }
@@ -880,7 +913,9 @@ mod tests {
     /// practice (Layer 2 never runs when the budget is `0`), but must not panic or produce `0`.
     #[test]
     fn starvation_heartbeat_against_a_disabled_zero_budget_does_not_panic() {
-        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = starvation_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("POLYFLARE_STARVATION_HEARTBEAT_SECS");
         }
@@ -1076,7 +1111,9 @@ mod tests {
     /// they're the same value, so "unset" and "explicit 0" resolve identically).
     #[test]
     fn wake_jitter_ms_unset_defaults_to_zero() {
-        let _guard = wake_jitter_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = wake_jitter_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("POLYFLARE_STARVATION_WAKE_JITTER_MS");
         }
@@ -1086,7 +1123,9 @@ mod tests {
     /// A well-formed, in-range value resolves to exactly itself.
     #[test]
     fn wake_jitter_ms_reads_a_well_formed_value() {
-        let _guard = wake_jitter_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = wake_jitter_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("POLYFLARE_STARVATION_WAKE_JITTER_MS", "250");
         }
@@ -1100,7 +1139,9 @@ mod tests {
     /// as-is (a hostile/huge value must not be able to blow the B5 wait budget).
     #[test]
     fn wake_jitter_ms_absurd_value_clamps_to_thirty_seconds() {
-        let _guard = wake_jitter_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = wake_jitter_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("POLYFLARE_STARVATION_WAKE_JITTER_MS", "999999");
         }
@@ -1114,7 +1155,9 @@ mod tests {
     /// crash.
     #[test]
     fn wake_jitter_ms_malformed_defaults_to_zero() {
-        let _guard = wake_jitter_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = wake_jitter_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("POLYFLARE_STARVATION_WAKE_JITTER_MS", "not-a-number");
         }

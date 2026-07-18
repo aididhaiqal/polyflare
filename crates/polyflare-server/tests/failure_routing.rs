@@ -74,7 +74,9 @@ async fn spawn_error_code_upstream(status: u16, code: &'static str) -> String {
     async fn respond(status: u16, code: &'static str) -> axum::response::Response {
         (
             StatusCode::from_u16(status).unwrap(),
-            axum::Json(serde_json::json!({"error": {"code": code, "message": "do not persist this"}})),
+            axum::Json(
+                serde_json::json!({"error": {"code": code, "message": "do not persist this"}}),
+            ),
         )
             .into_response()
     }
@@ -155,7 +157,8 @@ async fn spawn(upstream_url: String) -> (String, Arc<AppState>) {
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget: std::time::Duration::from_secs(60),
         starvation_heartbeat: std::time::Duration::from_secs(10),
-        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+        wake_jitter_ms: 0,
+        inflight_penalty_pct: 2.5,
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
@@ -278,7 +281,11 @@ async fn a_401_invalid_grant_parks_a_durable_reauth_required_status() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 502, "surfaces as the generic 502 like any other upstream failure");
+    assert_eq!(
+        resp.status(),
+        502,
+        "surfaces as the generic 502 like any other upstream failure"
+    );
 
     // Durable status write: read straight from the store, not the runtime overlay.
     let stored = state
@@ -358,7 +365,11 @@ async fn an_insufficient_quota_code_on_a_429_still_routes_via_rate_limit_not_quo
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 502, "surfaces as the generic 502 like any other upstream failure");
+    assert_eq!(
+        resp.status(),
+        502,
+        "surfaces as the generic 502 like any other upstream failure"
+    );
 
     // No durable park: Transient has no `.status()`, so A7's branch is a no-op here too.
     let stored = state

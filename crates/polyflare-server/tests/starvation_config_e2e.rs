@@ -113,7 +113,8 @@ fn build_state(
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
         starvation_wait_budget,
         starvation_heartbeat,
-        wake_jitter_ms: 0,        inflight_penalty_pct: 2.5,
+        wake_jitter_ms: 0,
+        inflight_penalty_pct: 2.5,
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
@@ -186,7 +187,9 @@ async fn all_accounts_recover_during_the_wait_client_gets_keepalives_then_clean_
     // Scoped so the (synchronous) `MutexGuard` is dropped BEFORE any `.await` below —
     // `clippy::await_holding_lock` (mirrors `config_driven_failover.rs`'s own scoping).
     let (budget_secs, heartbeat_secs) = {
-        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = starvation_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS", "6");
             std::env::set_var("POLYFLARE_STARVATION_HEARTBEAT_SECS", "1");
@@ -199,7 +202,10 @@ async fn all_accounts_recover_during_the_wait_client_gets_keepalives_then_clean_
         }
         (budget_secs, heartbeat_secs)
     };
-    assert_eq!(budget_secs, 6, "the env var round-trips through the real config parser");
+    assert_eq!(
+        budget_secs, 6,
+        "the env var round-trips through the real config parser"
+    );
     assert_eq!(heartbeat_secs, 1);
 
     let (store, cipher, _dir) = spawn_store().await;
@@ -249,7 +255,11 @@ async fn all_accounts_recover_during_the_wait_client_gets_keepalives_then_clean_
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "the wait committed HTTP 200 immediately");
+    assert_eq!(
+        resp.status(),
+        200,
+        "the wait committed HTTP 200 immediately"
+    );
     let body = drain(resp).await;
     assert!(
         body.contains(": keepalive"),
@@ -292,7 +302,9 @@ async fn all_accounts_recover_during_the_wait_client_gets_keepalives_then_clean_
 async fn budget_zero_disables_layer_2_fast_503_config_driven() {
     // Scoped so the (synchronous) `MutexGuard` is dropped BEFORE any `.await` below.
     let (budget_secs, heartbeat_secs) = {
-        let _guard = starvation_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = starvation_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS", "0");
         }
@@ -303,7 +315,10 @@ async fn budget_zero_disables_layer_2_fast_503_config_driven() {
         }
         (budget_secs, heartbeat_secs)
     };
-    assert_eq!(budget_secs, 0, "the disable lever round-trips through the real config parser");
+    assert_eq!(
+        budget_secs, 0,
+        "the disable lever round-trips through the real config parser"
+    );
 
     let (store, cipher, _dir) = spawn_store().await;
     let mut a = account("A", "rate_limited");
@@ -333,7 +348,10 @@ async fn budget_zero_disables_layer_2_fast_503_config_driven() {
     let status = resp.status();
     let elapsed = start.elapsed();
 
-    assert_eq!(status, 503, "budget=0 ⇒ Layer 2 disabled ⇒ today's fast 503");
+    assert_eq!(
+        status, 503,
+        "budget=0 ⇒ Layer 2 disabled ⇒ today's fast 503"
+    );
     assert!(
         // Widened from 2s to 5s for slack against scheduler jitter under the full workspace test
         // suite's CPU contention — this only guards against a REGRESSION where Layer 2 accidentally
