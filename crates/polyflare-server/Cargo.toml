@@ -26,6 +26,14 @@ futures-core = { workspace = true }
 futures-util = { workspace = true }
 # /api/logs/stream: adapts the log bus's broadcast::Receiver into a Stream for the SSE body.
 tokio-stream = { version = "0.1", features = ["sync"] }
+# B5 Task 4: the keepalive recovery-wait combinator (`ingress.rs::layer2_wait_stream`) — its
+# control flow (a bounded sleep/keepalive loop, then an async re-select + executor call, then
+# either splice a real stream or yield one in-band error frame) is naturally expressed with
+# `stream!`'s `yield`/early-`return` syntax; a hand-rolled `poll_next` state machine for the same
+# shape would be materially harder to review for the POST-200 in-band-error invariant. Pinned to
+# the same major.minor line as the rest of this Cargo.toml's un-exotic deps (no pinned patch, no
+# git dep — a plain, small, widely-used crate).
+async-stream = "0.3"
 bytes = { workspace = true }
 async-trait = { workspace = true }
 sha2 = { workspace = true }
