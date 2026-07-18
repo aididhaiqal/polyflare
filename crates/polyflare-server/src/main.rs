@@ -35,6 +35,12 @@ enum Commands {
         #[command(subcommand)]
         command: AccountsCommands,
     },
+    /// Client API-key management (D18): keys authenticate the CALLER on the proxy surface,
+    /// distinct from the upstream account tokens `accounts` manages.
+    Keys {
+        #[command(subcommand)]
+        command: KeysCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -87,6 +93,27 @@ enum AccountsCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum KeysCommands {
+    /// Generate + store a new client API key. Prints the RAW key to stdout EXACTLY ONCE — save it
+    /// now, it is never shown again (only its hash is persisted).
+    Create {
+        /// Optional human-readable label (e.g. which caller/deployment this key is for).
+        #[arg(long = "label", value_name = "LABEL")]
+        label: Option<String>,
+    },
+    /// List all client API keys (id / prefix / label / enabled / created / last used). Never
+    /// prints a raw key — only what's stored (the hash never leaves the store, either).
+    List,
+    /// Revoke (disable) a client API key by id. The row is kept for audit history; a revoked key
+    /// is rejected by `require_client_key` (Task 3) but never deleted here.
+    Revoke {
+        /// The key id to revoke (as shown by `keys list`).
+        #[arg(long = "id", value_name = "KEY_ID")]
+        id: String,
+    },
+}
+
 /// Content-safe request logging (SPEC-M5 §3.4): env-filtered (`RUST_LOG`, default `info`) plain
 /// `fmt` output. Never initialize a subscriber that echoes request/response bodies — the fields
 /// logged are chosen entirely by `polyflare_server::observability::RequestLog`, not by anything
@@ -114,6 +141,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             AccountsCommands::SetCapability { id, security_work } => {
                 accounts_set_capability(&id, security_work).await
             }
+        },
+        Commands::Keys { command } => match command {
+            KeysCommands::Create { label } => keys_create(label).await,
+            KeysCommands::List => keys_list().await,
+            KeysCommands::Revoke { id } => keys_revoke(&id).await,
         },
     }
 }
@@ -350,6 +382,53 @@ async fn accounts_set_capability(
     Ok(())
 }
 
+/// Generate + store a new client API key, then reveal the RAW key to the operator EXACTLY ONCE
+/// (D18 Global Constraint — reveal-once). `println!` to stdout is the ONLY place the raw key is
+/// ever printed anywhere in this binary — never `tracing::`, never `eprintln!`. After this
+/// function returns, the raw key exists nowhere but whatever the operator copied from their
+/// terminal; only its hash + display prefix persist in the store.
+async fn keys_create(label: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = config::data_dir_from_env();
+    let store = Store::open(&config::db_path(&data_dir)).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let created = polyflare_server::keys::create_key(&store, label.as_deref(), now).await?;
+    println!("client API key created (id {}).", created.id);
+    println!();
+    println!("  {}", created.raw);
+    println!();
+    println!("SAVE THIS NOW — it will not be shown again. Only its hash is stored.");
+    Ok(())
+}
+
+/// List all client API keys. Never prints a raw key — `render_key_row` formats an `ApiKeyRow`,
+/// which has no raw-key/hash field to begin with (Task 1).
+async fn keys_list() -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = config::data_dir_from_env();
+    let store = Store::open(&config::db_path(&data_dir)).await?;
+    let rows = store.api_keys().list().await?;
+    if rows.is_empty() {
+        println!("no client API keys.");
+        return Ok(());
+    }
+    for row in &rows {
+        println!("{}", polyflare_server::keys::render_key_row(row));
+    }
+    Ok(())
+}
+
+/// Revoke (disable) a client API key by id. The row is kept (for audit history / `keys list`);
+/// only `enabled` flips — `require_client_key` (Task 3) is what actually rejects a revoked key.
+async fn keys_revoke(id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = config::data_dir_from_env();
+    let store = Store::open(&config::db_path(&data_dir)).await?;
+    store.api_keys().set_enabled(id, false).await?;
+    println!("client API key {id} revoked (disabled).");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +589,49 @@ mod tests {
                 command: AccountsCommands::SetCapability { security_work, .. },
             } => assert!(!security_work),
             _ => panic!("expected `accounts set-capability`"),
+        }
+    }
+
+    #[test]
+    fn keys_create_parses_label_and_defaults_to_none() {
+        let with =
+            Cli::try_parse_from(["polyflare", "keys", "create", "--label", "laptop"]).unwrap();
+        match with.command {
+            Commands::Keys {
+                command: KeysCommands::Create { label },
+            } => assert_eq!(label.as_deref(), Some("laptop")),
+            _ => panic!("expected `keys create`"),
+        }
+
+        let without = Cli::try_parse_from(["polyflare", "keys", "create"]).unwrap();
+        match without.command {
+            Commands::Keys {
+                command: KeysCommands::Create { label },
+            } => assert!(label.is_none(), "--label is optional"),
+            _ => panic!("expected `keys create`"),
+        }
+    }
+
+    #[test]
+    fn keys_list_parses() {
+        let cli = Cli::try_parse_from(["polyflare", "keys", "list"]).unwrap();
+        match cli.command {
+            Commands::Keys {
+                command: KeysCommands::List,
+            } => {}
+            _ => panic!("expected `keys list`"),
+        }
+    }
+
+    #[test]
+    fn keys_revoke_parses_id() {
+        let cli =
+            Cli::try_parse_from(["polyflare", "keys", "revoke", "--id", "key_abc"]).unwrap();
+        match cli.command {
+            Commands::Keys {
+                command: KeysCommands::Revoke { id },
+            } => assert_eq!(id, "key_abc"),
+            _ => panic!("expected `keys revoke`"),
         }
     }
 }
