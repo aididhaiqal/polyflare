@@ -10,6 +10,7 @@ use sqlx::sqlite::{
 };
 
 use crate::account::AccountRepo;
+use crate::api_key_repo::ApiKeyRepo;
 use crate::continuity_repo::ContinuityRepo;
 use crate::request_log_repo::RequestLogRepo;
 use crate::StoreError;
@@ -111,5 +112,12 @@ impl Store {
     /// The request-log repository over this store's pool.
     pub fn request_log(&self) -> RequestLogRepo {
         RequestLogRepo::new(self.pool.clone())
+    }
+
+    /// The client API-key repository over this store's pool (D18 Task 1). No generation-bump
+    /// wiring: see `ApiKeyRepo`'s doc comment for why — the middleware validates via a fresh
+    /// indexed `get_by_hash` per request, not a cached snapshot.
+    pub fn api_keys(&self) -> ApiKeyRepo {
+        ApiKeyRepo::new(self.pool.clone())
     }
 }
