@@ -322,6 +322,20 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         ));
     }
 
+    // C11 Task 2: the Prometheus scrape surface, top-level `/metrics` (Prometheus convention)
+    // rather than folded into the `api` sub-router above (which would force `/api/metrics`) —
+    // admin-gated by its own `route_layer` of the SAME `require_admin` middleware `api` uses, so
+    // a scraper authenticates identically (`Authorization: Bearer <POLYFLARE_ADMIN_TOKEN>`; unset
+    // token ⇒ 503, same "disabled, not silently open" posture). `/metrics` is a single static
+    // literal segment, so matchit's static-over-param preference means it can never be shadowed
+    // by (or shadow) the `/{pool}/...` proxy routes below.
+    let metrics = Router::new()
+        .route("/metrics", get(crate::metrics::metrics_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::require_admin,
+        ));
+
     Router::new()
         // `GET` on these two Codex-native proxy paths is a WebSocket-handshake attempt from a
         // WS-capable Codex client, never a real request — Codex only ever POSTs `/responses`.
@@ -355,6 +369,8 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         // Auth-gated dashboard API (see `api` above): pools/accounts/requests/overview reads,
         // the account-settings patch, and `/api/whoami`.
         .merge(api)
+        // Auth-gated Prometheus scrape surface (see `metrics` above): `GET /metrics`.
+        .merge(metrics)
         // Embedded dashboard UI (see `crate::dashboard`). `/dashboard` serves the SPA entrypoint;
         // `/dashboard/{*path}` serves its bundle assets (with SPA fallback to index.html).
         // Unauthenticated: it's a static asset bundle — the API calls it makes are what's gated.

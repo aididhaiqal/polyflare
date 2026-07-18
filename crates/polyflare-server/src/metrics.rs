@@ -12,6 +12,14 @@
 //! text. Label values are escaped per the format's rules (`\` → `\\`, `"` → `\"`, newline → `\n`).
 
 use std::fmt::Write as _;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::extract::State;
+use axum::http::{header, StatusCode};
+use axum::response::IntoResponse;
+
+use crate::app::AppState;
 
 /// A plain-data snapshot of everything `/metrics` renders — the 5 process-wide counters (4 read
 /// directly off `AppState`'s metric structs, `polyflare_lease_inflight` derived) plus one
@@ -206,6 +214,71 @@ fn write_accounts_total(out: &mut String, accounts: &[AccountMetric]) {
             escape_label_value(&status)
         );
     }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `GET /metrics` — admin-gated (see `crate::app::build_app`'s route registration and
+/// `crate::auth::require_admin`, whose `route_layer` is what actually enforces this — this
+/// handler itself performs no auth check of its own). Reads the 4 process-wide counters directly
+/// off `AppState`'s existing metric structs, and builds one [`AccountMetric`] per pool account
+/// from the SAME overlaid-snapshot read path the dashboard's `/api/pools`/`/api/overview` read
+/// (`state.account_cache.snapshots(&state.store)` + `state.runtime.overlay`) — never the store's
+/// account row, so the `AccountId`-only [`AccountMetric`] this maps into structurally cannot carry
+/// an email or token (see this module's top doc). A store-read error collapses to a generic `500`,
+/// mirroring `crate::read_api`'s `Response::error()` idiom — the store error's own text is never
+/// surfaced.
+pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let now = unix_now();
+
+    let snapshots = match state.account_cache.snapshots(&state.store).await {
+        Ok(s) => s,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+    // The cache's `Arc<Vec<..>>` is shared; the runtime overlay mutates in place, so clone the
+    // slice into an owned `Vec` first — the same pattern `read_api`'s handlers use before
+    // `state.runtime.overlay`.
+    let mut snapshots = (*snapshots).clone();
+    state.runtime.overlay(&mut snapshots, now);
+
+    let accounts = snapshots
+        .iter()
+        .map(|snap| AccountMetric {
+            // OPAQUE store-row id only — `AccountSnapshot` has no email/token field to leak.
+            account_id: snap.id.as_str().to_string(),
+            status: snap.status.clone(),
+            provider: snap.provider.to_string(),
+            pool: snap.pool.clone(),
+            in_flight: snap.in_flight,
+            error_count: snap.error_count,
+            health_tier: snap.health_tier,
+            cooldown_active: snap.cooldown_until.is_some_and(|c| now < c),
+        })
+        .collect();
+
+    let snapshot = MetricsSnapshot {
+        failover_total: state.failover_metrics.total(),
+        starvation_total: state.starvation_metrics.total(),
+        health_tier_transitions_total: state.health_tier_metrics.total(),
+        lease_acquired_total: state.lease_metrics.acquired(),
+        lease_released_total: state.lease_metrics.released(),
+        accounts,
+    };
+
+    let body = render_prometheus_text(&snapshot);
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        body,
+    )
+        .into_response()
 }
 
 #[cfg(test)]
