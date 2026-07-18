@@ -273,11 +273,16 @@ pub struct StarvationSignal<'a> {
     /// Wall-clock milliseconds actually spent waiting (from the moment the generator started, to
     /// this terminal outcome) — a plain duration, never derived from request/response content.
     pub waited_ms: u64,
-    /// B10 Task 2: the per-waiter herd-damping jitter offset actually applied to THIS wait's wake
-    /// target — `crate::ingress::wake_jitter_offset_ms(request_key, wake_jitter_ms)`'s return value,
-    /// a plain `u64` count of milliseconds in `[0, wake_jitter_ms]`. Content-free by construction:
-    /// it is a bounded integer derived from a hash of the session key, never the key itself, a
-    /// body, or any request/response content — same class as `waited_ms`. Lets an operator see
+    /// B10 Task 2: the per-waiter herd-damping jitter offset COMPUTED for THIS wait —
+    /// `crate::ingress::wake_jitter_offset_ms(request_key, wake_jitter_ms)`'s return value, a plain
+    /// `u64` count of milliseconds in `[0, wake_jitter_ms]`. This is the computed offset, not the
+    /// budget-clipped EFFECTIVE delay: in the rare case where the wake target already sits at the
+    /// wait-budget ceiling (`target_ms == budget_deadline_ms`), the offset is clamped away and the
+    /// effective added delay is smaller (or 0) — this field still reports the raw computed value, so
+    /// read it as "how much spread was configured/active for this waiter," not a precise delta. In
+    /// the common recover-within-budget case it equals the actual applied delay. Content-free by
+    /// construction: a bounded integer derived from a hash of the session key, never the key itself,
+    /// a body, or any request/response content — same class as `waited_ms`. Lets an operator see
     /// herd-damping is active (and roughly how spread out concurrent waiters on the same account
     /// are) straight from the existing starvation signal, without a new signal type. Always `0`
     /// when `POLYFLARE_STARVATION_WAKE_JITTER_MS` is unset/`0` (the disable lever) — see
