@@ -155,13 +155,30 @@ two aux inputs (`drain_entered_at`, `probe_success_streak`) in the runtime map. 
 `health_tier_pool` gate never narrows.
 *codex-lb:* `logic.py:1099-1157`, `load_balancer.py:2176-2210`.
 
-### B10. Active anti-thundering-herd damping  · MEDIUM · medium
+### B10. Active anti-thundering-herd damping  · MEDIUM · medium · **DONE (reframed)**
 Relevant only once B4 exists. (a) Between same-account transient retries in `watchdog.rs`, sleep
 `200ms·2^(attempt-1)·jitter(0.9-1.1)` while not yet committed — the jitter is the de-synchronizer.
 (b) In `ingress.rs no_eligible()`, optionally replace the immediate 503 with a bounded [1s, 300s]
 capacity-recovery wait derived from the soonest `reset_at` the snapshots already hold, chunked into
 ~10s keepalive SSE heartbeats so the client holds its connection instead of reconnecting into the herd.
 *codex-lb:* `core/utils/retry.py:51-77`, `_service/streaming/retry.py:162`, `_service/support.py:43-142`.
+
+**DONE 2026-07-18 (reframed — the literal port doesn't map to PolyFlare's B4/B5 architecture; plan
+`docs/superpowers/plans/2026-07-18-b10-herd-damping.md`).**
+- **(a) same-account-retry jitter = N/A.** PolyFlare's B4 `run_failover_loop` does immediate CROSS-account
+  failover (no same-account retry loop, no inter-attempt sleep in `watchdog.rs`); there is nowhere to attach
+  codex-lb's inter-attempt jitter without inventing a retry loop B4 deliberately replaced. Explicitly dropped.
+- **(b) wait-with-heartbeat ≈ already built by B5** (`try_layer2_recovery_wait`/`layer2_wait_stream`).
+- **The real herd B5 introduced + B10 damps:** every Layer-2 waiter on the same account computed an IDENTICAL
+  `target_ms` from the shared `recover_at` ⇒ all N woke in lockstep and re-selected onto the just-recovered
+  account simultaneously (could re-429 it). Fix = a bounded, deterministic-per-request (session-key-derived)
+  jitter added to each waiter's OWN wake target (`ingress.rs` `wake_jitter_offset_ms` +
+  `POLYFLARE_STARVATION_WAKE_JITTER_MS`, default 0 = disable). `pick`/`soonest_recover`/`backoff_secs` UNTOUCHED
+  (jitter is ingress-side only, never account/selection state); budget ceiling honored; content-free
+  `StarvationSignal.wake_jitter_applied_ms` observable. Adversarial + whole-branch reviewed.
+- **Deferred follow-ups:** write-side cooldown-desync jitter (a NEW knob — must keep `backoff_secs` a stable
+  deterministic selector input); Layer-2 wait extension to the Anthropic `/v1/messages` empty-pool sites (a
+  B5-completeness gap); C9 in-flight lease accounting (the orthogonal concurrent-convergence herd dimension).
 
 ---
 
