@@ -653,6 +653,7 @@ fn try_layer2_recovery_wait(
     state: Arc<AppState>,
     snapshots: &[AccountSnapshot],
     pool: Option<String>,
+    pool_provider: Provider,
     selector: Arc<dyn Selector>,
     sel_ctx: &SelectionCtx,
     req: PreparedRequest,
@@ -693,6 +694,7 @@ fn try_layer2_recovery_wait(
     let stream = layer2_wait_stream(
         state,
         pool,
+        pool_provider,
         selector,
         sel_ctx.clone(),
         req,
@@ -839,6 +841,7 @@ fn layer2_wait_request_key(session_key: &Option<SessionKey>) -> String {
 fn layer2_wait_stream(
     state: Arc<AppState>,
     pool: Option<String>,
+    pool_provider: Provider,
     selector: Arc<dyn Selector>,
     sel_ctx: SelectionCtx,
     req: PreparedRequest,
@@ -927,7 +930,7 @@ fn layer2_wait_stream(
             }
         };
         let mut fresh_snapshots =
-            filter_by_provider_and_pool(&fresh_snapshots, Provider::Codex, pool.as_deref());
+            filter_by_provider_and_pool(&fresh_snapshots, pool_provider, pool.as_deref());
         state.runtime.overlay(&mut fresh_snapshots, fresh_now);
 
         let fresh = match selector.pick(&fresh_snapshots, &fresh_sel_ctx) {
@@ -1242,6 +1245,7 @@ async fn run_failover_loop(
                     state.clone(),
                     &candidates,
                     pool.clone(),
+                    Provider::Codex,
                     selector_arc.clone(),
                     sel_ctx,
                     resend_req,
@@ -1772,6 +1776,7 @@ async fn responses_handler_impl_with_max_attempts(
                                         state.clone(),
                                         &snapshots,
                                         pool_owned.clone(),
+                                        Provider::Codex,
                                         selector.clone(),
                                         &sel_ctx,
                                         anchorless_req,
@@ -1919,6 +1924,7 @@ async fn responses_handler_impl_with_max_attempts(
                                             state.clone(),
                                             &snapshots,
                                             pool_owned.clone(),
+                                            Provider::Codex,
                                             selector.clone(),
                                             &sel_ctx,
                                             prepared.req,
@@ -1958,6 +1964,7 @@ async fn responses_handler_impl_with_max_attempts(
                             state.clone(),
                             &snapshots,
                             pool_owned.clone(),
+                            Provider::Codex,
                             selector.clone(),
                             &sel_ctx,
                             prepared.req,
