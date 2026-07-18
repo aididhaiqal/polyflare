@@ -30,6 +30,18 @@ const MAX_REQUEST_BODY_BYTES: usize = 100 * 1024 * 1024;
 pub struct AppState {
     pub codex_executor: Arc<dyn Executor>,
     pub anthropic_executor: Arc<dyn Executor>,
+    /// D17 Task 2: a shared `reqwest::Client` for the codex CONTROL-endpoint unary forward
+    /// (`polyflare_codex::control_forward`), which takes `&reqwest::Client` as its first
+    /// parameter rather than building its own. Built via `polyflare_codex::build_client()` — the
+    /// SAME rustls/aws-lc-rs-pinned builder `CodexExecutor` uses for `/responses` — so this is a
+    /// second `Client` *instance* sharing the identical TLS/fingerprint configuration, never an
+    /// independently-configured (and therefore potentially divergent) one. `reqwest::Client` is
+    /// `Arc`-backed internally, so holding a second instance here (rather than threading a
+    /// concrete `CodexExecutor` accessor through the `Arc<dyn Executor>` trait object) is cheap
+    /// and avoids a downcast. Control resolution itself (`crate::control::resolve_control_account`)
+    /// does not use this field — it exists so Task 3's route handlers have a client to call
+    /// `control_forward` with, without re-deriving the builder decision then.
+    pub control_client: reqwest::Client,
     /// The DEFAULT (global) routing selector — used for the bare paths and for any pool without an
     /// explicit override in `pool_selectors`.
     pub selector: Arc<dyn Selector>,

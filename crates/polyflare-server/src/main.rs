@@ -200,6 +200,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Arc::new(AppState {
         codex_executor,
+        control_client: polyflare_codex::build_client().expect("build control_client"),
         anthropic_executor,
         selector,
         pool_selectors,

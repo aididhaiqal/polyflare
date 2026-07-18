@@ -32,6 +32,7 @@ async fn build_state() -> Arc<AppState> {
     Arc::new(AppState {
         enforce_client_keys: false,
         codex_executor: Arc::new(CodexExecutor::new().unwrap()) as Arc<dyn Executor>,
+        control_client: polyflare_codex::build_client().expect("build control_client"),
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap())
             as Arc<dyn Executor>,
         selector: Arc::new(CapacityWeighted),

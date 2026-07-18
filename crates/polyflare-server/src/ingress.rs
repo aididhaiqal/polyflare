@@ -86,11 +86,15 @@ fn account_unavailable() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "account unavailable").into_response()
 }
 
-fn internal_error() -> Response {
+/// `pub(crate)`: also reused by `crate::control::resolve_control_account`'s snapshot-read failure
+/// path, for a byte-identical generic 500.
+pub(crate) fn internal_error() -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
 }
 
-fn no_eligible() -> Response {
+/// `pub(crate)`: also the D17 control-endpoint account resolution's (`crate::control`) no-eligible-
+/// account response, so both paths return byte-identical 503s.
+pub(crate) fn no_eligible() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "no eligible account").into_response()
 }
 
@@ -323,7 +327,11 @@ fn spawn_persist_request_log(repo: RequestLogRepo, record: RequestLogRecord) {
 
 /// Load + decrypt + refresh-if-stale the selected account, returning the core `Account` to execute
 /// with plus its `Provider`, or a ready client-facing error `Response`.
-async fn resolve_core_account(
+///
+/// `pub(crate)`: D17 Task 2's control-request account resolution (`crate::control::
+/// resolve_control_account`) reuses this UNCHANGED — same decrypt/refresh/persist machinery, no
+/// second implementation.
+pub(crate) async fn resolve_core_account(
     state: &AppState,
     picked: &AccountId,
     now: i64,

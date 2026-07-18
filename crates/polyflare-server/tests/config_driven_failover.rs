@@ -172,6 +172,7 @@ fn build_state(
     Arc::new(AppState {
         enforce_client_keys: false,
         codex_executor: executor,
+        control_client: polyflare_codex::build_client().expect("build control_client"),
         anthropic_executor: Arc::new(polyflare_anthropic::AnthropicExecutor::new().unwrap()),
         selector: Arc::new(FirstEligible),
         pool_selectors: Default::default(),
