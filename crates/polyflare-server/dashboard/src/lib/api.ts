@@ -165,11 +165,81 @@ export interface Point {
   v: number;
 }
 
-/** `read_api.rs::TrendsView` — `GET /api/accounts/{id}/trends` response. */
+/** `polyflare_core::depletion::RiskLevel` — `#[serde(rename_all = "lowercase")]`. Plain `>=`
+ * thresholds (0.60/0.80/0.95 of the depletion-risk fraction), no hysteresis. */
+export type RiskLevel = "safe" | "warning" | "danger" | "critical";
+
+/** `polyflare_core::depletion::DepletionForecast` — the per-account (secondary/weekly-window)
+ * EWMA depletion forecast. Content-free: numeric fields + a `RiskLevel` enum only. `rate_per_second`
+ * is smoothed d(used%)/dt; `burn_rate` is dimensionless (current/sustainable, >1 = burning faster
+ * than budget); `seconds_until_exhaustion`/`projected_exhaustion_at` are `null` when the projected
+ * exhaustion would land after the window's own reset (i.e. it resets before it would run out). */
+export interface DepletionForecast {
+  risk: number;
+  risk_level: RiskLevel;
+  rate_per_second: number;
+  burn_rate: number;
+  used_percent: number;
+  safe_usage_percent: number;
+  seconds_until_reset: number;
+  seconds_until_exhaustion: number | null;
+  projected_exhaustion_at: number | null;
+}
+
+/** `read_api.rs::TrendsView` — `GET /api/accounts/{id}/trends` response. `forecast` (D16 T5) is
+ * `null` when there are fewer than 2 secondary-window samples, the EWMA rate never establishes, or
+ * the window has already reset. */
 export interface TrendsView {
   account_id: string;
   primary: Point[];
   secondary: Point[];
+  forecast: DepletionForecast | null;
+}
+
+/** `polyflare_core::weekly_pace::PaceStatus` — `#[serde(rename_all = "snake_case")]`. */
+export type PaceStatus = "on_track" | "ahead" | "behind" | "danger";
+
+/** `polyflare_core::weekly_pace::Confidence` — `#[serde(rename_all = "lowercase")]`. How many of
+ * the pool's paced accounts have an established forecast burn rate, and whether any are stale. */
+export type PaceConfidence = "high" | "medium" | "low";
+
+/** `polyflare_core::weekly_pace::WeeklyCreditPaceReport` — the pool-wide weekly credit pace: actual
+ * vs. scheduled (linear-budget) usage, a discrete-event pool-drain simulation (soonest-reset-first,
+ * refilling at each account's own reset boundary) answering "does the pool run dry before enough
+ * resets refill it?", and the resulting recommendation fields. All fields content-free (credits/
+ * percentages/hours/counts + status/confidence enums only) — see `read_api.rs::pace_handler`. */
+export interface WeeklyCreditPaceReport {
+  total_full_credits: number;
+  total_actual_remaining_credits: number;
+  total_expected_remaining_credits: number;
+  actual_used_percent: number;
+  scheduled_used_percent: number;
+  delta_percent: number;
+  schedule_gap_credits: number;
+  smoothed_delta_percent: number;
+  smoothed_schedule_gap_credits: number;
+  projected_shortfall_credits: number;
+  pause_for_break_even_hours: number | null;
+  pace_multiplier: number | null;
+  throttle_to_percent: number | null;
+  reduce_by_percent: number | null;
+  pro_account_equivalent_to_cover_over_plan: number | null;
+  pro_accounts_to_cover_over_plan: number | null;
+  projected_depletion_hours: number | null;
+  projected_minimum_remaining_credits: number;
+  forecast_burn_rate_credits_per_hour: number | null;
+  scheduled_burn_rate_credits_per_hour: number;
+  status: PaceStatus;
+  account_count: number;
+  stale_account_count: number;
+  inactive_account_count: number;
+  confidence: PaceConfidence;
+}
+
+/** `read_api.rs::PaceView` — `GET /api/pace` response. `pace` is `null` when there is no eligible,
+ * fresh, positive-capacity account to project a pace for. */
+export interface PaceResponse {
+  pace: WeeklyCreditPaceReport | null;
 }
 
 /** `read_api.rs::PoolView` — one row of `GET /api/pools`. */
@@ -353,8 +423,14 @@ export const api = {
   accountTrends: (id: string) =>
     fetchJson<TrendsView>(`/api/accounts/${encodeURIComponent(id)}/trends`),
   pools: () => fetchJson<PoolView[]>("/api/pools"),
+  pace: () => fetchJson<PaceResponse>("/api/pace"),
   requests: (qs: string) => fetchJson<RequestsView>(`/api/requests${qs}`),
   sessions: (qs: string) => fetchJson<SessionsView>(`/api/sessions${qs}`),
   capabilities: () => fetchJson<CapabilitiesView>("/api/capabilities"),
   whoami: () => fetchJson<WhoamiView>("/api/whoami"),
 };
+
+/** `GET /api/pace` (admin-gated pool-wide weekly credit pace). Named alias for `api.pace`, kept as
+ * its own export since `usePace` (queries.ts) is written against a `fetchPace()`-shaped fetcher —
+ * same underlying `fetchJson` call as every other endpoint above. */
+export const fetchPace = api.pace;

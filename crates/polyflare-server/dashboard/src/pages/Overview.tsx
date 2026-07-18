@@ -1,4 +1,4 @@
-// The dashboard's landing page. Built from THREE real endpoints:
+// The dashboard's landing page. Built from FOUR real endpoints:
 //   - `useOverview()`      GET /api/overview         — content-free 24h aggregates (KPIs, per-
 //                                                       provider quota headroom, per-pool counts,
 //                                                       recent errors).
@@ -6,22 +6,27 @@
 //                                                       zero-filled by the handler (Task 5a).
 //   - `useAccounts()`      GET /api/accounts          — the live per-account list (status, usage
 //                                                       windows, token health, 24h request count).
+//   - `usePace()`          GET /api/pace              — the pool-wide weekly credit pace forecast
+//                                                       (admin-gated; D16 T6).
 //
 // Task 5 shipped only the first of these (no time series / no per-account list existed yet) and
 // documented three deferred mockup rows in task-5-report.md: the request-volume chart, the
-// account-health table, and a weekly-pace forecast. Task 5a added the series endpoint; this task
-// (5b) restores all three using ONLY real, derived-from-real-fields data — see task-5b-report.md
-// for the field-by-field mapping and the reasoning behind every derived number.
+// account-health table, and a weekly-pace forecast. Task 5a added the series endpoint; task 5b
+// restored the first two using ONLY real, derived-from-real-fields data (see task-5b-report.md) but
+// stood the weekly-pace card up as a per-provider client-side linear extrapolation — a deliberate,
+// documented placeholder for the real backend forecast D16 ships. D16 T6 (this pass) replaces that
+// stand-in with `usePace()`'s real EWMA-burn-rate + pool-drain-simulation report; see
+// task-6-report.md (D16) for the field mapping.
 import { useEffect, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import clsx from "clsx";
 
-import type { AccountView, RecentErrorView } from "../lib/api";
+import type { AccountView, PaceStatus, RecentErrorView, WeeklyCreditPaceReport } from "../lib/api";
 import { compactNum, latency, pct, relTime } from "../lib/format";
-import { useAccounts, useOverview, useOverviewSeries } from "../lib/queries";
+import { useAccounts, useOverview, useOverviewSeries, usePace } from "../lib/queries";
 import { Card } from "../ui/Card";
 import { Col, Grid } from "../ui/Grid";
-import { Activity, AlertTriangle, CheckCircle2, ChevronRight, Clock, Coins } from "../ui/icons";
+import { Activity, AlertTriangle, CheckCircle2, ChevronRight, Clock, Coins, Lock } from "../ui/icons";
 import { MetricCard } from "../ui/MetricCard";
 import { providerBrandKey, ProviderTag } from "../ui/ProviderTag";
 import { QuotaBars, type QuotaProviderGroup } from "../ui/QuotaBars";
@@ -44,6 +49,7 @@ export function Overview() {
   const { data, isLoading, isError, error, refetch, dataUpdatedAt } = useOverview();
   const seriesQuery = useOverviewSeries();
   const accountsQuery = useAccounts();
+  const paceQuery = usePace();
   const [providerFilter, setProviderFilter] = useState<ProviderFilter>("all");
 
   // Ticks the header's "updated Xs ago" text (and the weekly-pace elapsed-fraction math below)
@@ -187,14 +193,12 @@ export function Overview() {
         </Col>
 
         <Col span={4}>
-          <WeeklyPaceCard
-            isLoading={accountsQuery.isLoading}
-            isError={accountsQuery.isError}
-            error={accountsQuery.error}
-            onRetry={() => accountsQuery.refetch()}
-            accounts={accounts}
-            providerFilter={providerFilter}
-            nowMs={nowMs}
+          <PaceCard
+            isLoading={paceQuery.isLoading}
+            isError={paceQuery.isError}
+            error={paceQuery.error}
+            onRetry={() => paceQuery.refetch()}
+            pace={paceQuery.data?.pace ?? null}
           />
         </Col>
 
@@ -491,166 +495,144 @@ function AccountHealthCard(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Weekly-pace forecast — derived from `GET /api/accounts`'s `weekly` window (`used_percent` +
-// `reset_at`). `GET /api/overview`'s own `quota` aggregate does NOT carry `reset_at` (see
-// read_api.rs::ProviderQuotaView), so this card intentionally reads `useAccounts()`, not
-// `useOverview()`. See task-5b-report.md for the full derivation and its assumptions.
+// Weekly credit pace — `GET /api/pace` (D16 T6): the backend's pool-wide, EWMA-burn-rate +
+// discrete-event pool-drain-simulation forecast (see `polyflare_core::weekly_pace`). Admin-gated,
+// content-free (credits/percentages/hours/counts + status/confidence enums only — see
+// `read_api.rs::pace_handler`'s doc comment). This replaces the earlier per-provider client-side
+// linear-extrapolation stand-in (task-5b's `computeWeeklyPace`), which was documented there as a
+// placeholder for exactly this real forecast. Unlike that stand-in, the report is a single
+// pool-wide number aggregated across every eligible account regardless of provider — it doesn't
+// respond to the page's provider filter (the backend has no per-provider breakdown to filter).
 // ---------------------------------------------------------------------------------------------
 
-/** The real weekly window duration (`usage_windows.rs`: "real windows are 300 min (5h) and 10080
- * min (weekly)" — 10080 min = 7 days). Used to turn an absolute `reset_at` into "how far into the
- * current weekly period are we", not an invented constant. */
-const WEEKLY_PERIOD_SECS = 7 * 24 * 3600;
+const PACE_STATUS_LABEL: Record<PaceStatus, string> = {
+  on_track: "on track",
+  ahead: "ahead",
+  behind: "behind",
+  danger: "at risk",
+};
 
-/** Below this fraction of the weekly period elapsed (~3.4h), a linear projection to end-of-week is
- * too noisy to report honestly (a tiny denominator blows up the extrapolation) — shown as "not
- * enough data yet" instead of a wild number. */
-const PACE_MIN_ELAPSED_FRACTION = 0.02;
+/** on_track = muted (neither over nor under budget), ahead = success/green (using less than
+ * scheduled), behind = warn/gold (using more than scheduled but no simulated shortfall yet),
+ * danger = flare-amber accent (the pool-drain sim projects running dry before enough resets
+ * refill it) — the brief's "amber/critical" tone. */
+const PACE_STATUS_CLASS: Record<PaceStatus, string> = {
+  on_track: "bg-muted text-fg opacity-70",
+  ahead: "bg-success/15 text-success",
+  behind: "bg-warn/15 text-warn",
+  danger: "bg-accent/15 text-accent",
+};
 
-interface PaceGroup {
-  provider: string;
-  usedPercent: number;
-  expectedPercent: number;
-  /** Linear extrapolation of `usedPercent` to 100% of the period, given how much of the period has
-   * elapsed. `null` when too little of the period has elapsed to project responsibly. */
-  projectedEow: number | null;
+function PaceStatusPill({ status }: { status: PaceStatus }) {
+  return (
+    <span className={clsx("rounded px-1.5 py-0.5 text-[9px] font-bold", PACE_STATUS_CLASS[status])}>
+      {PACE_STATUS_LABEL[status]}
+    </span>
+  );
 }
 
-function computeWeeklyPace(accounts: AccountView[], nowSecs: number): PaceGroup[] {
-  const byProvider = new Map<string, AccountView[]>();
-  for (const a of accounts) {
-    // A stale window (upstream stopped refreshing it) is last-known, not live — using it to
-    // project a live pace would be misleading, so those accounts are excluded from this
-    // calculation (they still appear in the Quota card / health table as-is).
-    if (!a.weekly || a.weekly.reset_at === null || a.weekly.stale) continue;
-    const list = byProvider.get(a.provider) ?? [];
-    list.push(a);
-    byProvider.set(a.provider, list);
-  }
+const PACE_CONFIDENCE_CLASS: Record<WeeklyCreditPaceReport["confidence"], string> = {
+  high: "text-success",
+  medium: "text-fg opacity-80",
+  low: "text-warn",
+};
 
-  const groups: PaceGroup[] = [];
-  for (const [provider, list] of byProvider) {
-    // Worst case (highest used_percent) across the provider's accounts — same convention
-    // `overview_handler` uses for the Quota card's per-provider aggregation.
-    let worst: AccountView | null = null;
-    for (const a of list) {
-      if (!worst || a.weekly!.used_percent > worst.weekly!.used_percent) worst = a;
-    }
-    if (!worst?.weekly || worst.weekly.reset_at === null) continue;
-
-    const resetAt = worst.weekly.reset_at;
-    const remainingSecs = resetAt - nowSecs;
-    const elapsedSecs = WEEKLY_PERIOD_SECS - remainingSecs;
-    const elapsedFraction = Math.max(0, Math.min(1, elapsedSecs / WEEKLY_PERIOD_SECS));
-    const usedPercent = worst.weekly.used_percent;
-    const projectedEow =
-      elapsedFraction >= PACE_MIN_ELAPSED_FRACTION
-        ? Math.min(usedPercent / elapsedFraction, 999)
-        : null;
-
-    groups.push({
-      provider,
-      usedPercent,
-      expectedPercent: elapsedFraction * 100,
-      projectedEow,
-    });
-  }
-  return groups.sort((a, b) => a.provider.localeCompare(b.provider));
+/** Formats an hours-from-now duration (`projected_depletion_hours` is already relative, not an
+ * epoch second the way `format.ts::countdown`'s input is) as `"Nd Nh"` / `"Nh Nm"` / `"Nm"`. */
+function formatHoursFromNow(hours: number): string {
+  if (!Number.isFinite(hours) || hours < 0) return "—";
+  const totalMinutes = Math.round(hours * 60);
+  const days = Math.floor(totalMinutes / 1440);
+  const hrs = Math.floor((totalMinutes % 1440) / 60);
+  const mins = totalMinutes % 60;
+  if (days >= 1) return `${days}d ${hrs}h`;
+  if (hrs >= 1) return `${hrs}h ${mins}m`;
+  return `${mins}m`;
 }
 
-function WeeklyPaceCard(
-  props: AsyncCardState & {
-    accounts: AccountView[];
-    providerFilter: ProviderFilter;
-    nowMs: number;
-  },
-) {
+function PaceCard(props: AsyncCardState & { pace: WeeklyCreditPaceReport | null }) {
   const status = AsyncCardStatus({ title: "Weekly pace", state: props });
   if (status) return status;
 
-  const { accounts, providerFilter, nowMs } = props;
-  const groups = computeWeeklyPace(accounts, Math.floor(nowMs / 1000)).filter((g) =>
-    matchesFilter(g.provider, providerFilter),
-  );
+  const { pace } = props;
 
   return (
     <Card>
-      <div className="text-[10px] uppercase tracking-wide text-fg opacity-60">Weekly pace</div>
-      {accounts.length === 0 ? (
-        <p className="mt-2 text-[11px] text-fg opacity-50">No accounts configured yet.</p>
-      ) : groups.length === 0 ? (
+      <div className="flex items-center justify-between text-[10px] uppercase tracking-wide text-fg opacity-60">
+        <span>Weekly pace</span>
+        {pace && <PaceStatusPill status={pace.status} />}
+      </div>
+      {!pace ? (
         <p className="mt-2 text-[11px] text-fg opacity-50">
-          No weekly-quota data available yet for this provider.
+          No eligible accounts to project a pace for yet.
         </p>
       ) : (
-        <div className="mt-1.5 flex flex-col gap-3">
-          {groups.map((g) => (
-            <WeeklyPaceRow key={g.provider} group={g} />
-          ))}
+        <div className="mt-1.5 flex flex-col gap-2">
+          <div className="relative h-[9px] rounded-full bg-muted">
+            <div
+              className={clsx(
+                "h-full rounded-full",
+                pace.status === "danger"
+                  ? "bg-accent"
+                  : pace.status === "behind"
+                    ? "bg-warn"
+                    : "bg-success",
+              )}
+              style={{ width: `${Math.max(0, Math.min(100, pace.actual_used_percent))}%` }}
+            />
+            <div
+              className="absolute -top-[3px] -bottom-[3px] w-[2px] rounded-sm bg-fg"
+              style={{ left: `${Math.max(0, Math.min(100, pace.scheduled_used_percent))}%` }}
+            />
+          </div>
+
+          <div className="flex justify-between text-[10px]">
+            <span className="text-fg opacity-60">Used vs scheduled</span>
+            <span className="text-fg">
+              {pct(pace.actual_used_percent)} / {pct(pace.scheduled_used_percent)}{" "}
+              <span className={pace.delta_percent > 0 ? "text-warn" : "text-success"}>
+                {pace.delta_percent > 0 ? "+" : ""}
+                {Math.round(pace.delta_percent)}%
+              </span>
+            </span>
+          </div>
+          <div className="flex justify-between text-[10px]">
+            <span className="text-fg opacity-60">Capacity</span>
+            <span className="font-semibold text-fg">
+              {compactNum(pace.total_full_credits)} credits
+            </span>
+          </div>
+          <div className="flex justify-between text-[10px]">
+            <span className="text-fg opacity-60">Depletion</span>
+            <span className="font-semibold text-fg">
+              {pace.projected_depletion_hours === null
+                ? "no shortfall"
+                : `in ${formatHoursFromNow(pace.projected_depletion_hours)}`}
+            </span>
+          </div>
+          <div className="flex justify-between text-[10px]">
+            <span className="text-fg opacity-60">Confidence</span>
+            <span
+              className={clsx(
+                "font-semibold capitalize",
+                PACE_CONFIDENCE_CLASS[pace.confidence],
+              )}
+            >
+              {pace.confidence}
+            </span>
+          </div>
+
+          <div className="mt-0.5 border-t border-border pt-1.5 text-[9.5px] text-fg opacity-55">
+            {pace.account_count} paced · {pace.stale_account_count} stale ·{" "}
+            {pace.inactive_account_count} inactive
+          </div>
+          <div className="flex items-center gap-1.5 text-[9px] text-fg opacity-45">
+            <Lock className="h-2.5 w-2.5 shrink-0" strokeWidth={1.9} />
+            Credits and percentages only — no account identity or conversation content.
+          </div>
         </div>
       )}
     </Card>
-  );
-}
-
-function WeeklyPaceRow({ group }: { group: PaceGroup }) {
-  const { provider, usedPercent, expectedPercent, projectedEow } = group;
-  const onTrack = projectedEow !== null && projectedEow <= 100;
-  const delta = usedPercent - expectedPercent;
-
-  return (
-    <div>
-      <div className="flex items-center justify-between">
-        <ProviderTag provider={provider} />
-        {projectedEow !== null && (
-          <span
-            className={clsx(
-              "rounded px-1.5 py-0.5 text-[9px] font-bold",
-              onTrack ? "bg-success/15 text-success" : "bg-warn/15 text-warn",
-            )}
-          >
-            {onTrack ? "on track" : "at risk"}
-          </span>
-        )}
-      </div>
-      <div className="relative my-2 h-[9px] rounded-full bg-muted">
-        <div
-          className="h-full rounded-full bg-success"
-          style={{ width: `${Math.max(0, Math.min(100, usedPercent))}%` }}
-        />
-        <div
-          className="absolute -top-[3px] -bottom-[3px] w-[2px] rounded-sm bg-fg"
-          style={{ left: `${Math.max(0, Math.min(100, expectedPercent))}%` }}
-        />
-      </div>
-      <div className="flex justify-between text-[10px]">
-        <span className="text-fg opacity-60">Used</span>
-        <span className="font-semibold text-fg">{pct(usedPercent)}</span>
-      </div>
-      <div className="flex justify-between text-[10px]">
-        <span className="text-fg opacity-60">Expected by now</span>
-        <span className="text-fg">
-          {pct(expectedPercent)}{" "}
-          <span className={delta > 0 ? "text-warn" : "text-success"}>
-            {delta > 0 ? "+" : ""}
-            {Math.round(delta)}%
-          </span>
-        </span>
-      </div>
-      <div className="flex justify-between text-[10px]">
-        <span className="text-fg opacity-60">Projected EOW</span>
-        <span className="font-semibold text-fg">
-          {projectedEow === null ? "—" : pct(projectedEow)}
-        </span>
-      </div>
-      <p className="mt-1.5 text-[9.5px] text-fg opacity-60">
-        {projectedEow === null
-          ? "Not enough data yet this period to project a pace."
-          : onTrack
-            ? `At current pace, projects to ${pct(projectedEow)} of the weekly quota by reset.`
-            : `At current pace, this provider projects to exceed the weekly quota before reset (${pct(projectedEow)} projected).`}
-      </p>
-    </div>
   );
 }
 
