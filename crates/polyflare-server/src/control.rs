@@ -247,6 +247,12 @@ async fn control_route(
     };
     log.emit();
     log_bus.publish(log.to_log_event());
+    // C11b Task 2: the content-free `upstream_requests` counter, keyed by the SAME
+    // `(account_id, status)` pair the log/log-bus/persisted row already carry — bumped exactly
+    // once per client control request, mirroring `responses_route`/`messages_route`'s own bump.
+    state
+        .upstream_request_metrics
+        .record(log.account_id.as_deref(), log.status.as_u16());
     spawn_persist_request_log(log_repo, log.record(unix_now()));
 
     response
@@ -566,9 +572,12 @@ mod tests {
         // Bench the owner "B" (a real cooldown — `RuntimeStates::overlay` applies `cooldown_until`
         // onto the snapshot at selection time, and `select.rs`'s real eligibility gate rejects it
         // regardless of the account's durable `status`).
-        state
-            .runtime
-            .record_rate_limit(&AccountId::from("B"), Some(3600), now);
+        state.runtime.record_rate_limit(
+            &AccountId::from("B"),
+            Some(3600),
+            now,
+            &state.rate_limit_metrics,
+        );
 
         let (_account, picked) = resolve_control_account(&state, &headers)
             .await

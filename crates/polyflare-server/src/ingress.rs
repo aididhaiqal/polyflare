@@ -154,7 +154,11 @@ async fn record_failure(state: &AppState, id: &AccountId, err: &WatchdogError, n
         }
     }
     let transition = match signal {
-        Some(sig) if sig.status == 429 => state.runtime.record_rate_limit(id, sig.retry_after, now),
+        Some(sig) if sig.status == 429 => {
+            state
+                .runtime
+                .record_rate_limit(id, sig.retry_after, now, &state.rate_limit_metrics)
+        }
         // 5xx (server error), 401/403 (bad credential / account-scoped auth), 408 (request timeout):
         // an ACCOUNT-health problem — bump the error count so a repeat offender hits the backoff gate.
         Some(sig) if (500..=599).contains(&sig.status) || matches!(sig.status, 401 | 403 | 408) => {
@@ -1401,6 +1405,9 @@ async fn responses_route(
     let log_repo = state.store.request_log();
     // Same reason: `state` moves into the impl below, so grab the log-bus handle first.
     let log_bus = state.log_bus.clone();
+    // C11b Task 2: same reason — grab the content-free `upstream_requests` counter handle before
+    // `state` moves into the impl below.
+    let upstream_request_metrics = state.upstream_request_metrics.clone();
     let (response, outcome) = responses_handler_impl(state, pool.as_deref(), headers, body).await;
     let log = RequestLog {
         method: "POST",
@@ -1427,6 +1434,11 @@ async fn responses_route(
     };
     log.emit();
     log_bus.publish(log.to_log_event());
+    // C11b Task 2: the content-free `upstream_requests` counter, keyed by the SAME
+    // `(account_id, status)` pair `log` already carries — bumped exactly once per client request
+    // (the final outcome only; per-attempt retries are `FailoverMetrics`, never double-counted
+    // here).
+    upstream_request_metrics.record(log.account_id.as_deref(), log.status.as_u16());
     spawn_persist_request_log(log_repo, log.record(unix_now()));
     response
 }
@@ -2001,6 +2013,9 @@ async fn messages_route(
     let log_repo = state.store.request_log();
     // Same reason: `state` moves into a sub-handler below, so grab the log-bus handle first.
     let log_bus = state.log_bus.clone();
+    // C11b Task 2: same reason — grab the content-free `upstream_requests` counter handle before
+    // `state` moves into a sub-handler below.
+    let upstream_request_metrics = state.upstream_request_metrics.clone();
     let model = body
         .get("model")
         .and_then(|m| m.as_str())
@@ -2045,6 +2060,11 @@ async fn messages_route(
     };
     log.emit();
     log_bus.publish(log.to_log_event());
+    // C11b Task 2: the content-free `upstream_requests` counter, keyed by the SAME
+    // `(account_id, status)` pair `log` already carries — bumped exactly once per client request
+    // (the final outcome only; per-attempt retries are `FailoverMetrics`, never double-counted
+    // here).
+    upstream_request_metrics.record(log.account_id.as_deref(), log.status.as_u16());
     spawn_persist_request_log(log_repo, log.record(unix_now()));
 
     response

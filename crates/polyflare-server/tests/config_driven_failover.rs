@@ -424,3 +424,50 @@ async fn env_var_max_attempts_one_is_config_driven_one_shot_regression() {
         "no failover signal should fire for a one-shot request: {backfill:?}"
     );
 }
+
+/// (3) C11b Task 2: a request that fails over once (A rate-limited, B succeeds) must still
+/// record exactly ONE `upstream_requests` entry — `responses_route`'s `log` reflects only the
+/// FINAL attempt's outcome, so a request that takes N internal attempts must never be counted N
+/// times. This is the "no double-count on failover" global constraint.
+#[tokio::test]
+async fn failover_records_exactly_one_upstream_request_metric_entry() {
+    let (store, cipher, _dir) = spawn_store().await;
+    store
+        .accounts()
+        .insert(&account("A"), &tokens("tokA"), &cipher)
+        .await
+        .unwrap();
+    store
+        .accounts()
+        .insert(&account("B"), &tokens("tokB"), &cipher)
+        .await
+        .unwrap();
+    let exec = Arc::new(StubExecutor::new());
+    exec.script("A", vec![AttemptBehavior::Fail(429)]);
+    exec.script("B", vec![AttemptBehavior::Success]);
+    let state = build_state(store, cipher, exec.clone(), 3);
+    let pf = spawn_app(state.clone()).await;
+
+    assert_eq!(state.upstream_request_metrics.snapshot(), Vec::new());
+
+    let resp = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "m", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the client gets B's clean stream");
+    let _ = drain(resp).await;
+    assert_eq!(
+        exec.calls(),
+        vec!["A".to_string(), "B".to_string()],
+        "exactly 2 internal attempts, A then B"
+    );
+
+    assert_eq!(
+        state.upstream_request_metrics.snapshot(),
+        vec![("B".to_string(), 200, 1)],
+        "exactly ONE upstream_requests entry (the final outcome, account B) despite 2 internal \
+         attempts — never one per attempt"
+    );
+}
