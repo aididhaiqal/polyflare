@@ -229,12 +229,17 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         enforce_client_keys,
         stream_idle_timeout: config.stream_idle_timeout,
         soft_drain_enabled: config.soft_drain_enabled,
+        request_log_retention_days: config.request_log_retention_days,
+        usage_history_retention_days: config.usage_history_retention_days,
         inflight_penalty_pct: config.inflight_penalty_pct,
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
     });
     // Runtime usage-refresh loop: keeps each Codex account's rate-limit windows (5h + weekly) and
     // routing gate live, instead of the frozen numbers the importer left.
     polyflare_server::usage_refresh::spawn_usage_refresh(state.clone());
+    // C12: hourly age-retention pruning over `request_log` + `usage_history` (disabled by default
+    // via POLYFLARE_*_RETENTION_DAYS=0; see `polyflare_server::retention`).
+    polyflare_server::retention::spawn_retention_prune(state.clone());
 
     let app = build_app(state);
 

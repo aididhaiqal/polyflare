@@ -119,6 +119,8 @@ async fn spawn_app(enforce_client_keys: bool, mock_base: &str) -> (String, Arc<A
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: Duration::from_secs(300),
         soft_drain_enabled: true,
+        request_log_retention_days: 0,
+        usage_history_retention_days: 0,
         enforce_client_keys,
     });
 
