@@ -206,6 +206,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             get(crate::read_api::account_trends_handler),
         )
         .route("/api/requests", get(crate::read_api::requests_handler))
+        .route("/api/sessions", get(crate::read_api::sessions_handler))
         .route("/api/overview", get(crate::read_api::overview_handler))
         .route(
             "/api/overview/series",

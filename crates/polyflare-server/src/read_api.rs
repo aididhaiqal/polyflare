@@ -1,10 +1,13 @@
 //! Read-only JSON API backing the dashboard: pools, accounts (with their live rate-limit windows +
-//! reset times), and recent request-log rows. This surface is admin-facing and returns non-secret
-//! account METADATA only — id, email, pool, provider, status, plan, usage percentages and reset
-//! epochs. It NEVER returns a token, refresh token, or id_token (those never leave the store as
-//! plaintext except through the executor's own Bearer use). No conversation content is stored, so
-//! none can be exposed here. Like the rest of the MVP endpoints these are unauthenticated and rely
-//! on the network boundary; admin auth is a follow-up.
+//! reset times), recent request-log rows, and continuity sessions (session→account affinity). This
+//! surface is admin-facing and returns non-secret account METADATA only — id, email, pool,
+//! provider, status, plan, usage percentages and reset epochs. It NEVER returns a token, refresh
+//! token, or id_token (those never leave the store as plaintext except through the executor's own
+//! Bearer use). No conversation content is stored, so none can be exposed here. `/api/sessions`'s
+//! `session_key` is a sha256 hash of session-identifying input (see `crate::session_key`)
+//! — a one-way digest, content-free, never raw header/content — so it is safe to surface as-is.
+//! Like the rest of the MVP endpoints these are unauthenticated and rely on the network boundary;
+//! admin auth is a follow-up.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -888,6 +891,83 @@ pub async fn overview_series_handler(State(state): State<Arc<AppState>>) -> impl
     Response::ok(OverviewSeriesView {
         bucket_secs,
         buckets,
+    })
+}
+
+/// One `continuity_sessions` row for the dashboard, LEFT JOINed to its owning account's email
+/// (TA6(c): session→account affinity visibility). `session_key` is a sha256 hash — opaque,
+/// content-free (see module docs). `owning_account_id`/`owner_email` are `null` for a session that
+/// never completed a turn (`state == "fresh"`) or whose owning account was deleted (`ON DELETE
+/// SET NULL`) — that is NOT dropped, it's a valid row. `required_capabilities` is the TA6(b)
+/// sticky-cyber capability tag set (comma-separated), or `null` when none is stamped.
+#[derive(Serialize)]
+struct SessionRowView {
+    session_key: String,
+    key_strength: String,
+    owning_account_id: Option<String>,
+    owner_email: Option<String>,
+    state: String,
+    required_capabilities: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    last_activity_at: i64,
+}
+
+impl From<polyflare_store::continuity_repo::SessionWithOwner> for SessionRowView {
+    fn from(s: polyflare_store::continuity_repo::SessionWithOwner) -> Self {
+        SessionRowView {
+            session_key: s.session_key,
+            key_strength: s.key_strength,
+            owning_account_id: s.owning_account_id,
+            owner_email: s.owner_email,
+            state: s.state,
+            required_capabilities: s.required_capabilities,
+            created_at: s.created_at,
+            updated_at: s.updated_at,
+            last_activity_at: s.last_activity_at,
+        }
+    }
+}
+
+/// `GET /api/sessions` pagination. Mirrors `RequestsQuery` exactly: `limit` clamps to
+/// `[1, MAX_LIMIT]` (default `DEFAULT_LIMIT`), `offset` defaults to 0 and is floored at 0.
+#[derive(Deserialize)]
+pub struct SessionsQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct SessionsView {
+    /// Total rows in `continuity_sessions` (for the client to paginate); `rows` is one page.
+    total: i64,
+    rows: Vec<SessionRowView>,
+}
+
+/// `GET /api/sessions?limit=&offset=` — paginated `continuity_sessions` rows (most-recently-active
+/// first) LEFT JOINed to their owning account's email, plus the total row count. Content-free by
+/// construction (see module docs): no anchor id, input fingerprint, or reasoning-cache reference is
+/// ever surfaced. `ContinuityRepo::list_sessions_with_owner`/`count_sessions` return `sqlx::Error`
+/// (not the crate's usual `StoreError`) — a query failure maps to the same generic content-safe
+/// `500` every other handler here uses, never the store error's own text.
+pub async fn sessions_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SessionsQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let repo = state.store.continuity();
+    let rows = match repo.list_sessions_with_owner(limit, offset).await {
+        Ok(rows) => rows,
+        Err(_) => return Response::error(),
+    };
+    let total = match repo.count_sessions().await {
+        Ok(total) => total,
+        Err(_) => return Response::error(),
+    };
+    Response::ok(SessionsView {
+        total,
+        rows: rows.into_iter().map(SessionRowView::from).collect(),
     })
 }
 
