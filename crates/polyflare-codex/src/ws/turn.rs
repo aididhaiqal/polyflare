@@ -69,7 +69,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use polyflare_core::{ExecError, ResponseStream};
 
 use super::codec::{classify, frame_to_sse, FrameClass};
-use super::conn::{WsConn, TURN_STATE_HEADER};
+use super::conn::WsConn;
 use super::delta::{item_hashes, non_input_fingerprint};
 
 /// Substring markers embedded in the `ExecError::Stream` messages this module produces for the
@@ -154,13 +154,15 @@ impl Stream for TurnStream {
                             this.state = TurnState::Reading(Box::pin(read_next(guard)));
                             continue;
                         };
-                        // codex parity (`sse/responses.rs:203-211`): observe a server-issued
-                        // turn-state carried by a `response.metadata` frame and capture it onto the
-                        // connection (set-once, first-wins). A PURE SIDE-EFFECT — it neither
-                        // reclassifies the frame nor changes what any arm below yields; this
-                        // wedge-adjacent frame continues through `classify`/its arm byte-for-byte
-                        // unchanged (a `response.metadata` frame is still forwarded as an `Event`).
-                        observe_turn_state(&mut guard, &value);
+                        // NOTE: turn-state is NOT captured from frames here. PolyFlare sends one
+                        // `response.create` per turn and a `response.metadata` frame arrives only
+                        // AFTER that send; a same-turn retry re-dials (fresh upgrade token). So the
+                        // operative turn-state source is the WS UPGRADE-response header captured at
+                        // dial (`ws::conn`, consumed per-turn in `ws::executor::drive_turn`) — a
+                        // mid-response frame-captured token would have no effect in this model. This
+                        // also keeps the wedge-adjacent read path below untouched. (If a future
+                        // live-verify shows the backend relies on echoing a mid-response token, it
+                        // can be added back.)
                         match classify(&value) {
                             FrameClass::Event => {
                                 let bytes = frame_to_sse(&text);
@@ -239,59 +241,6 @@ impl Stream for TurnStream {
 async fn read_next(mut guard: OwnedMutexGuard<WsConn>) -> ReadOutcome {
     let result = guard.recv_frame().await;
     (guard, result)
-}
-
-/// codex parity (`sse/responses.rs:203-211`): capture a server-issued `x-codex-turn-state` carried
-/// by a `response.metadata` frame onto the connection, with **set-once, first-wins** semantics
-/// mirroring codex's per-connection `OnceLock` (`responses_websocket.rs:529-535`'s
-/// `let _ = turn_state.set(...)`, which ignores later sets). A pure side-effect on `conn`: it does
-/// NOT parse-for, reclassify, or consume the frame — the caller's existing `classify`/frame-arm
-/// handling runs afterward, unchanged. The token VALUE is never logged (content-free routing token;
-/// see [`WsConn::server_turn_state`]).
-fn observe_turn_state(conn: &mut WsConn, frame: &Value) {
-    // Per-connection first-wins: once captured (e.g. from the upgrade-response header at connect, or
-    // an earlier `response.metadata` frame), a later frame must NOT overwrite it — exactly
-    // `OnceLock::set` ignoring later sets. Checked first so a non-metadata frame costs one bool test.
-    if conn.server_turn_state.is_some() {
-        return;
-    }
-    if let Some(ts) = turn_state_from_metadata_frame(frame) {
-        conn.server_turn_state = Some(ts);
-    }
-}
-
-/// Extract the `x-codex-turn-state` a `response.metadata` frame carries in its top-level `headers`
-/// object, mirroring codex's `ResponsesStreamEvent::turn_state` + `header_turn_state_value_from_json`
-/// + `json_value_as_string` (`sse/responses.rs:203-211,263-311`) exactly:
-/// - gated on the frame `type` being the EXACT string `response.metadata` (`:204`),
-/// - the header-name match is case-insensitive (`:266`),
-/// - the value is a JSON string, or the FIRST element of a JSON array (`:306-311`); any other shape
-///   yields `None`.
-///
-/// Returns `None` for every non-metadata frame (the overwhelmingly common case) after the cheap
-/// `type` check — no allocation, no header scan.
-fn turn_state_from_metadata_frame(frame: &Value) -> Option<String> {
-    if frame.get("type").and_then(Value::as_str) != Some("response.metadata") {
-        return None;
-    }
-    let headers = frame.get("headers")?.as_object()?;
-    headers.iter().find_map(|(name, value)| {
-        if name.eq_ignore_ascii_case(TURN_STATE_HEADER) {
-            json_value_as_string(value)
-        } else {
-            None
-        }
-    })
-}
-
-/// Mirror of codex's `json_value_as_string` (`sse/responses.rs:306-311`): a JSON string is itself; a
-/// JSON array yields its first element (recursively); anything else is `None`.
-fn json_value_as_string(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) => Some(s.clone()),
-        Value::Array(items) => items.first().and_then(json_value_as_string),
-        _ => None,
-    }
 }
 
 /// Send `envelope` on an ALREADY-HELD `guard` and update the connection's delta-tracking state —
@@ -600,122 +549,6 @@ mod tests {
         assert!(
             stream.next().await.is_none(),
             "the stream must end right after surfacing the close"
-        );
-    }
-
-    // ---- Task 4: capture the server-issued turn-state from a response.metadata frame -----------
-
-    #[test]
-    fn turn_state_from_metadata_frame_matches_codex_shape() {
-        // The exact frame shape codex reads (`sse/responses.rs:203-211,263-311`).
-        assert_eq!(
-            turn_state_from_metadata_frame(&json!({
-                "type": "response.metadata",
-                "headers": {"x-codex-turn-state": "ts-1"},
-            })),
-            Some("ts-1".to_string()),
-            "a response.metadata frame's headers.x-codex-turn-state must be extracted"
-        );
-        // Gated on the EXACT type string: identical headers on a different frame type ⇒ None.
-        assert_eq!(
-            turn_state_from_metadata_frame(&json!({
-                "type": "response.created",
-                "headers": {"x-codex-turn-state": "ts-1"},
-            })),
-            None,
-            "turn-state is read ONLY from response.metadata frames (codex gates on kind())"
-        );
-        // Header-name match is case-insensitive (mirrors header_turn_state_value_from_json).
-        assert_eq!(
-            turn_state_from_metadata_frame(&json!({
-                "type": "response.metadata",
-                "headers": {"X-Codex-Turn-State": "ts-2"},
-            })),
-            Some("ts-2".to_string()),
-            "the headers key match must be case-insensitive"
-        );
-        // Array value ⇒ first element (mirrors json_value_as_string).
-        assert_eq!(
-            turn_state_from_metadata_frame(&json!({
-                "type": "response.metadata",
-                "headers": {"x-codex-turn-state": ["ts-a", "ts-b"]},
-            })),
-            Some("ts-a".to_string()),
-            "an array-valued header must yield its first element, like json_value_as_string"
-        );
-        // Metadata frame lacking the header ⇒ None (never fabricated).
-        assert_eq!(
-            turn_state_from_metadata_frame(&json!({
-                "type": "response.metadata",
-                "headers": {"x-something-else": "v"},
-            })),
-            None
-        );
-        // Metadata frame with no headers object at all ⇒ None (no panic).
-        assert_eq!(
-            turn_state_from_metadata_frame(&json!({"type": "response.metadata"})),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn response_metadata_frame_sets_turn_state_if_unset_and_never_overwrites() {
-        // (a) UNSET ⇒ captured from the frame (first-wins from the frame, since the mock upstream's
-        // handshake sets no x-codex-turn-state header, so server_turn_state starts None).
-        let metadata_frame = json!({
-            "type": "response.metadata",
-            "headers": {"x-codex-turn-state": "ts-frame"},
-        })
-        .to_string();
-        let mock = MockWsUpstream::new(ScriptedTurn::normal(vec![metadata_frame]));
-        let base = mock.clone().spawn().await;
-        let conn = WsConn::connect(&test_account(base), &[])
-            .await
-            .expect("connect");
-        let shared = shared_conn(conn);
-        assert!(
-            shared.lock().await.server_turn_state.is_none(),
-            "the mock handshake sets no turn-state header, so it must start None"
-        );
-
-        let mut stream = turn_stream(shared.clone(), envelope(vec![], None));
-        // The metadata frame is STILL forwarded as a normal SSE event — the capture side-effect
-        // must not swallow or reclassify it (frame arms unchanged).
-        let first = parse_sse(&stream.next().await.expect("metadata event").expect("ok"));
-        assert_eq!(
-            first["type"], "response.metadata",
-            "the response.metadata frame must still pass through as a normal SSE Event"
-        );
-        while stream.next().await.is_some() {} // drain to the terminal frame
-
-        assert_eq!(
-            shared.lock().await.server_turn_state.as_deref(),
-            Some("ts-frame"),
-            "an unset turn-state must be captured from a response.metadata frame (set-if-none)"
-        );
-
-        // (b) ALREADY SET ⇒ NOT overwritten by a later frame (per-connection set-once, first-wins —
-        // mirrors codex's OnceLock ignoring later sets; e.g. the upgrade header already won).
-        let metadata_frame = json!({
-            "type": "response.metadata",
-            "headers": {"x-codex-turn-state": "ts-second"},
-        })
-        .to_string();
-        let mock = MockWsUpstream::new(ScriptedTurn::normal(vec![metadata_frame]));
-        let base = mock.clone().spawn().await;
-        let conn = WsConn::connect(&test_account(base), &[])
-            .await
-            .expect("connect");
-        let shared = shared_conn(conn);
-        shared.lock().await.server_turn_state = Some("ts-first".to_string());
-
-        let mut stream = turn_stream(shared.clone(), envelope(vec![], None));
-        while stream.next().await.is_some() {}
-
-        assert_eq!(
-            shared.lock().await.server_turn_state.as_deref(),
-            Some("ts-first"),
-            "a turn-state already set must NOT be overwritten by a later frame — first-wins"
         );
     }
 }
