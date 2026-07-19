@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -371,6 +371,117 @@ pub async fn trace_summarize_handler(
         Some(body),
     )
     .await
+}
+
+// -------------------------------------------------------------------------------------------
+// D14a Task 2 (final): `/responses/compact` — a UNARY passthrough the real Codex CLI emits
+// (`codex-rs client.rs:159`) that PolyFlare previously 404'd. Unlike the D17 control endpoints
+// above, compact carries a `/responses`-SHAPED body (it has its own `prompt_cache_key`/`model`),
+// so its owner-affinity session key + content-free `model` are derived from that body via
+// `crate::session_key::parse_inbound` — the SAME parse (and SAME Hard-key derivation)
+// `/responses` itself uses — rather than the header-only key `resolve_control_account` derives.
+// Still sidesteps the SSE relay / `ObservingStream` / continuity `prepare` entirely: this is a
+// plain unary round-trip through `polyflare_codex::control_forward`, exactly like `control_route`.
+// -------------------------------------------------------------------------------------------
+
+/// D14a: the `/responses/compact` glue. UNARY, like `control_route`, but compact carries a
+/// `/responses`-shaped BODY, so it derives the owner-affinity session key + the (content-free)
+/// `model` from that body via `parse_inbound` — then forwards the SAME bytes verbatim to
+/// `{base}/responses/compact` (`control_forward` with path `"responses/compact"`). Sidesteps the
+/// SSE relay / `ObservingStream` / continuity entirely (unary round-trip).
+async fn compact_route(
+    state: Arc<AppState>,
+    pool: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let start = Instant::now();
+    let log_repo = state.store.request_log();
+    let log_bus = state.log_bus.clone();
+
+    // Shallow parse: derive the session key (for soft owner affinity) + the content-free model.
+    // None ⇒ malformed body ⇒ 400 (mirrors `/responses`'s malformed-body behavior); still log it.
+    let facts = crate::session_key::parse_inbound(&headers, &body);
+    let (session_key, model) = match &facts {
+        Some(f) => (f.ctx.session_key.clone(), Some(f.model.clone())),
+        None => (None, None),
+    };
+
+    let forward_headers = forward_headers_from_inbound(&headers);
+
+    let (response, account_id) = if facts.is_none() {
+        // Malformed compact body — do not forward garbage upstream.
+        (
+            (StatusCode::BAD_REQUEST, "malformed compact body").into_response(),
+            None,
+        )
+    } else {
+        match resolve_owner_affine_account(&state, session_key.as_ref(), pool.as_deref()).await {
+            Err(resp) => (resp, None),
+            Ok((account, account_id)) => {
+                let outcome = polyflare_codex::control_forward(
+                    &state.control_client,
+                    &account,
+                    "responses/compact",
+                    Method::POST,
+                    &forward_headers,
+                    Some(body),
+                )
+                .await;
+                let resp = match outcome {
+                    Ok(cr) => control_response_from(cr),
+                    Err(_e) => {
+                        (StatusCode::BAD_GATEWAY, "compact upstream forward failed").into_response()
+                    }
+                };
+                (resp, Some(account_id))
+            }
+        }
+    };
+
+    let log = RequestLog {
+        method: "POST",
+        path: "responses_compact",
+        provider: Provider::Codex,
+        aliased: false,
+        status: response.status(),
+        duration_ms: start.elapsed().as_millis() as u64,
+        account_id: account_id.map(|id| id.to_string()),
+        model,
+        reasoning_effort: None,
+        service_tier: None,
+        transport: Some("http".to_string()),
+        ttft_ms: None,
+        total_tokens: None,
+        cached_tokens: None,
+    };
+    log.emit();
+    log_bus.publish(log.to_log_event());
+    state
+        .upstream_request_metrics
+        .record(log.account_id.as_deref(), log.status.as_u16());
+    spawn_persist_request_log(log_repo, log.record(unix_now()));
+
+    response
+}
+
+/// `POST /responses/compact` — unpooled.
+pub async fn compact_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    compact_route(state, None, headers, body).await
+}
+
+/// `POST /{pool}/responses/compact` — pool-scoped.
+pub async fn pooled_compact_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pool): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    compact_route(state, Some(pool), headers, body).await
 }
 
 #[cfg(test)]
