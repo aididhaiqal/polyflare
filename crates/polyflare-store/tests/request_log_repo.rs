@@ -26,6 +26,7 @@ fn rec(
         ttft_ms: None,
         total_tokens: None,
         cached_tokens: None,
+        subagent: None,
     }
 }
 

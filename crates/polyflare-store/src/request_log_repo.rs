@@ -62,6 +62,10 @@ pub struct RequestLogRecord {
     pub total_tokens: Option<i64>,
     /// Cached tokens counted toward `total_tokens`, a content-free count.
     pub cached_tokens: Option<i64>,
+    /// The codex sub-agent role label (`x-openai-subagent`: `review`/`compact`/
+    /// `memory_consolidation`/`collab_spawn`), or `None` for the main agent — a bounded role slug,
+    /// never conversation content, same content-safety class as `model`/`transport`.
+    pub subagent: Option<String>,
 }
 
 /// A persisted request-log row: a [`RequestLogRecord`] plus its surrogate primary key. `status` is
@@ -84,6 +88,7 @@ pub struct RequestLogRow {
     pub ttft_ms: Option<i64>,
     pub total_tokens: Option<i64>,
     pub cached_tokens: Option<i64>,
+    pub subagent: Option<String>,
 }
 
 /// Dashboard filter set for [`RequestLogRepo::page`]. Every field is optional; an unset field
@@ -152,8 +157,8 @@ impl RequestLogRepo {
             "INSERT INTO request_log \
              (requested_at, provider, method, path, aliased, status, duration_ms, \
               account_id, model, reasoning_effort, service_tier, transport, ttft_ms, \
-              total_tokens, cached_tokens) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              total_tokens, cached_tokens, subagent) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.requested_at)
         .bind(&record.provider)
@@ -170,6 +175,7 @@ impl RequestLogRepo {
         .bind(record.ttft_ms)
         .bind(record.total_tokens)
         .bind(record.cached_tokens)
+        .bind(&record.subagent)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -180,7 +186,7 @@ impl RequestLogRepo {
         let rows = sqlx::query_as::<_, RequestLogRow>(
             "SELECT id, requested_at, provider, method, path, aliased, status, duration_ms, \
              account_id, model, reasoning_effort, service_tier, transport, ttft_ms, \
-             total_tokens, cached_tokens \
+             total_tokens, cached_tokens, subagent \
              FROM request_log \
              ORDER BY requested_at DESC, id DESC \
              LIMIT ? OFFSET ?",
@@ -213,7 +219,7 @@ impl RequestLogRepo {
         let mut select = QueryBuilder::<Sqlite>::new(
             "SELECT id, requested_at, provider, method, path, aliased, status, duration_ms, \
              account_id, model, reasoning_effort, service_tier, transport, ttft_ms, \
-             total_tokens, cached_tokens FROM request_log",
+             total_tokens, cached_tokens, subagent FROM request_log",
         );
         Self::push_where(&mut select, filter);
         select.push(" ORDER BY requested_at DESC, id DESC LIMIT ");
@@ -470,6 +476,7 @@ mod tests {
             ttft_ms: Some(700),
             total_tokens: Some(3204),
             cached_tokens: Some(1100),
+            subagent: Some("review".into()),
         };
         repo.insert(&rec).await.unwrap();
 
@@ -484,6 +491,25 @@ mod tests {
         assert_eq!(rows[0].ttft_ms, Some(700));
         assert_eq!(rows[0].total_tokens, Some(3204));
         assert_eq!(rows[0].cached_tokens, Some(1100));
+        assert_eq!(rows[0].subagent.as_deref(), Some("review"));
+    }
+
+    /// `page` (the dashboard's filtered/paginated query) round-trips `subagent` too — a SEPARATE
+    /// `QueryBuilder` SELECT from `list`'s, so this guards against the two SELECT column lists
+    /// drifting out of sync (a `FromRow` column-count mismatch panics at runtime, not compile time).
+    #[tokio::test]
+    async fn page_round_trips_subagent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        let mut rec = rec("codex", "/responses", 200, Some("gpt-5.6-sol"));
+        rec.subagent = Some("compact".into());
+        repo.insert(&rec).await.unwrap();
+
+        let (rows, _total) = repo.page(&RequestsFilter::default(), 10, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subagent.as_deref(), Some("compact"));
     }
 
     fn rec(provider: &str, path: &str, status: u16, model: Option<&str>) -> RequestLogRecord {
@@ -503,6 +529,7 @@ mod tests {
             ttft_ms: Some(200),
             total_tokens: Some(500),
             cached_tokens: None,
+            subagent: None,
         }
     }
 
@@ -582,6 +609,7 @@ mod tests {
             ttft_ms: None,
             total_tokens,
             cached_tokens: None,
+            subagent: None,
         }
     }
 

@@ -319,6 +319,11 @@ struct RouteOutcome {
     model: Option<String>,
     /// `reasoning.effort` for this request, when known.
     reasoning_effort: Option<String>,
+    /// The codex sub-agent role label (`x-openai-subagent`, see `RequestCtx::subagent`), when
+    /// known. Only the native `/responses` path can ever carry one (a real Codex client sends the
+    /// header); the alias/translated `/v1/messages` paths are Claude→Codex requests with no codex
+    /// sub-agent concept, so they always leave this `None`.
+    subagent: Option<String>,
 }
 
 fn stream_response(stream: ResponseStream) -> Response {
@@ -1521,6 +1526,7 @@ async fn responses_route(
         ttft_ms: None,
         total_tokens: None,
         cached_tokens: None,
+        subagent: outcome.subagent,
     };
     log.emit();
     log_bus.publish(log.to_log_event());
@@ -1653,11 +1659,14 @@ async fn responses_handler_impl_with_max_attempts(
     let now = unix_now();
     let tier = tier_from_effort(facts.effort.as_deref());
     // Model + effort are known from the parse itself, regardless of what happens next; account_id
-    // is filled in once (if ever) a `RouteDecision` actually selects one below.
+    // is filled in once (if ever) a `RouteDecision` actually selects one below. `subagent` comes
+    // straight off `facts.ctx` (Task 1's `x-openai-subagent` extraction) — read here, BEFORE the
+    // whole `facts.ctx` is moved into `ctx` below.
     let mut outcome = RouteOutcome {
         account_id: None,
         model: Some(model.clone()),
         reasoning_effort: facts.effort.clone(),
+        subagent: facts.ctx.subagent.clone(),
     };
 
     // C3: continuity ctx derived from headers + body at parse time.
@@ -2156,6 +2165,7 @@ async fn messages_route(
         ttft_ms: None,
         total_tokens: None,
         cached_tokens: None,
+        subagent: outcome.subagent,
     };
     log.emit();
     log_bus.publish(log.to_log_event());
@@ -2182,10 +2192,12 @@ async fn messages_handler_native(
     let now = unix_now();
     // The client-requested model is known up front, regardless of what happens next; the native
     // Anthropic path carries no Codex-style reasoning-effort concept, so that field stays `None`.
+    // No codex sub-agent concept either — this is a native Anthropic-Messages request.
     let mut outcome = RouteOutcome {
         account_id: None,
         model: Some(model.clone()),
         reasoning_effort: None,
+        subagent: None,
     };
     // Native Anthropic path: the AnthropicExecutor does not use `forward_headers` (that field is
     // the Codex egress identity set), so there is nothing to forward here.
@@ -2329,11 +2341,13 @@ async fn messages_handler_codex_aliased(
 ) -> (Response, RouteOutcome) {
     let now = unix_now();
     // The resolved target model + effort are known up front from the alias itself, regardless of
-    // what happens next.
+    // what happens next. No codex sub-agent concept here either — this is a translated
+    // Claude→Codex request, not a real Codex client turn carrying `x-openai-subagent`.
     let mut outcome = RouteOutcome {
         account_id: None,
         model: Some(model_alias.target_model.clone()),
         reasoning_effort: model_alias.reasoning_effort.clone(),
+        subagent: None,
     };
     let mut translator = AnthropicToResponses::new();
     let mut translated_body = translator.translate_request(body);

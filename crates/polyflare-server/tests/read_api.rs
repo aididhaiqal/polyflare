@@ -100,6 +100,7 @@ async fn seed_store() -> Store {
             ttft_ms: None,
             total_tokens: None,
             cached_tokens: None,
+            subagent: None,
         })
         .await
         .unwrap();
@@ -276,6 +277,7 @@ async fn accounts_endpoint_carries_provider_pool_usage_token_health_and_request_
             ttft_ms: None,
             total_tokens: None,
             cached_tokens: None,
+            subagent: None,
         })
         .await
         .unwrap();
@@ -584,6 +586,7 @@ async fn seed_store_for_filters() -> Store {
         ttft_ms: Some(500),
         total_tokens: Some(3000),
         cached_tokens: Some(1000),
+        subagent: Some("review".to_string()),
     })
     .await
     .unwrap();
@@ -603,6 +606,7 @@ async fn seed_store_for_filters() -> Store {
         ttft_ms: None,
         total_tokens: None,
         cached_tokens: None,
+        subagent: None,
     })
     .await
     .unwrap();
@@ -622,6 +626,7 @@ async fn seed_store_for_filters() -> Store {
         ttft_ms: None,
         total_tokens: None,
         cached_tokens: None,
+        subagent: None,
     })
     .await
     .unwrap();
@@ -661,6 +666,10 @@ async fn requests_endpoint_filters_by_provider_and_carries_content_free_metrics(
     assert_eq!(full["total_tokens"], 3000);
     assert_eq!(full["cached_tokens"], 1000);
     assert_eq!(full["tps"], 2000.0);
+    assert_eq!(
+        full["subagent"], "review",
+        "Task 3: read API surfaces the sub-agent label"
+    );
 
     // The row missing ttft_ms/total_tokens gets no derived tps.
     let partial = rows
@@ -669,12 +678,16 @@ async fn requests_endpoint_filters_by_provider_and_carries_content_free_metrics(
         .expect("acct-2 row present");
     assert!(partial["tps"].is_null());
     assert!(partial["ttft_ms"].is_null());
+    assert!(
+        partial["subagent"].is_null(),
+        "the main agent (no x-openai-subagent header) round-trips as null, not a placeholder"
+    );
 }
 
 /// A minimal content-free `request_log` row for the overview KPI test: only the fields the
 /// overview aggregation reads (`status`, `total_tokens`, `duration_ms`) are set; everything else
 /// (`account_id`, `model`, `reasoning_effort`, `service_tier`, `transport`, `ttft_ms`,
-/// `cached_tokens`) is `None` — those aren't exercised by `/api/overview`'s KPI tile.
+/// `cached_tokens`, `subagent`) is `None` — those aren't exercised by `/api/overview`'s KPI tile.
 fn req_row(status: u16, total_tokens: i64) -> RequestLogRecord {
     RequestLogRecord {
         requested_at: now(),
@@ -692,6 +705,7 @@ fn req_row(status: u16, total_tokens: i64) -> RequestLogRecord {
         ttft_ms: None,
         total_tokens: Some(total_tokens),
         cached_tokens: None,
+        subagent: None,
     }
 }
 
@@ -800,6 +814,7 @@ fn req_row_at(requested_at: i64, status: u16, total_tokens: i64) -> RequestLogRe
         ttft_ms: None,
         total_tokens: Some(total_tokens),
         cached_tokens: None,
+        subagent: None,
     }
 }
 
