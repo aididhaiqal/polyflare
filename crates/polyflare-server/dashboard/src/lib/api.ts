@@ -271,6 +271,10 @@ export interface RequestRowView {
   total_tokens: number | null;
   cached_tokens: number | null;
   tps: number | null;
+  /** The codex sub-agent role label from `x-openai-subagent` (`"review"` / `"compact"` /
+   * `"memory_consolidation"` / `"collab_spawn"`), or `null` for the main agent. A bounded role
+   * slug — content-free, same content-safety class as `model`. */
+  subagent: string | null;
 }
 
 /** `read_api.rs::RequestsView` — `GET /api/requests` response envelope. */
@@ -407,6 +411,10 @@ export interface LogEvent {
   model?: string;
   status?: number;
   latency_ms?: number;
+  /** The codex sub-agent role label (`x-openai-subagent`: `"review"` / `"compact"` /
+   * `"memory_consolidation"` / `"collab_spawn"`), absent for the main agent / non-request events.
+   * A bounded role slug — content-free, same content-safety class as `model`. */
+  subagent?: string | null;
   kind: string;
   message: string;
 }
