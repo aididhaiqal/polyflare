@@ -363,9 +363,13 @@ impl AccountRepo {
         window_minutes: Option<i64>,
         recorded_at: i64,
     ) -> Result<(), StoreError> {
+        // `OR IGNORE`: the `idx_usage_history_dedupe` UNIQUE index (account_id, "window",
+        // recorded_at) makes a repeat poll for the same account/window/second a no-op rather than a
+        // unique-constraint error. Normal 600s polls never collide (recorded_at advances); this is
+        // defensive so the dedupe index can never fail a live poll.
         sqlx::query(
-            "INSERT INTO usage_history (account_id, recorded_at, \"window\", used_percent, \
-             reset_at, window_minutes) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO usage_history (account_id, recorded_at, \"window\", \
+             used_percent, reset_at, window_minutes) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(account_id)
         .bind(recorded_at)
