@@ -613,6 +613,35 @@ fn materialize_body(req: &PreparedRequest) -> Result<Value, ExecError> {
     }
 }
 
+/// Task 3 F3 (codex parity, `common.rs:21-22`): RELAY the incoming request's W3C trace into the WS
+/// frame's `client_metadata` under codex's exact keys (`ws_request_header_traceparent` /
+/// `ws_request_header_tracestate`). codex forwards these from the request headers it received;
+/// PolyFlare does the same from `forward_headers` — and NEVER fabricates a trace when the incoming
+/// request carried none (an absent header inserts NOTHING). Header-name match is case-insensitive
+/// (HTTP header names are). Seeded onto `body` ONCE, before the turn loop, so every frame of the
+/// turn carries it; [`build_response_create`] then preserves it (it get-or-inserts the SAME
+/// `client_metadata` block it stamps the F2 send-timing into).
+///
+/// Content-safety: a `traceparent`/`tracestate` value is a client-sent W3C trace id (routing/
+/// telemetry metadata), never conversation content — and is never logged here regardless.
+fn seed_trace_headers(body: &mut Value, forward_headers: &[(String, String)]) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    for (target_key, header_name) in [
+        ("ws_request_header_traceparent", "traceparent"),
+        ("ws_request_header_tracestate", "tracestate"),
+    ] {
+        if let Some((_, value)) = forward_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(header_name))
+        {
+            super::codec::client_metadata_object_mut(obj)
+                .insert(target_key.to_string(), Value::String(value.clone()));
+        }
+    }
+}
+
 /// Content-free wedge-visibility logging for a bounded recovery attempt: reason code + counts
 /// only, per the module doc's content-safety section. Never a body, envelope, or frame.
 fn log_wedge_recovery(reason: &str, account_id: &str, session_key: Option<&str>, attempt: u32) {
@@ -658,7 +687,15 @@ impl Executor for CodexWsExecutor {
             return self.fallback.execute(req, account, ctx).await;
         }
 
-        let body = materialize_body(&req)?;
+        let mut body = materialize_body(&req)?;
+
+        // Task 3 F3: relay the incoming request's W3C trace (`traceparent`/`tracestate`) into the
+        // body's `client_metadata` ONCE, before the turn loop, so every frame of the turn carries
+        // it (codex parity). Never fabricates a trace when the incoming request had none. Done on
+        // `body` (not the built envelope) so it survives every `build_response_create` rebuild the
+        // recovery loop performs. Does NOT touch any `NON_INPUT_FIELDS` field, so the `conn_key`
+        // fingerprint computed just below (and the incremental-caching chain) is unaffected.
+        seed_trace_headers(&mut body, &req.forward_headers);
 
         // Per-account, per-thread, per-model-stream connection key. `account.id` LEADS the key:
         // a chatgpt.com WS socket is authenticated per-account at the handshake (Bearer +
@@ -845,6 +882,73 @@ mod tests {
             out.push(item.map_err(|e| e.to_string()));
         }
         out
+    }
+
+    // ---- Task 3 F3: relay the incoming W3C trace into the frame's client_metadata --------------
+
+    #[test]
+    fn seed_trace_headers_relays_traceparent_and_tracestate_into_client_metadata() {
+        // codex forwards the request's `traceparent`/`tracestate` into `client_metadata` under
+        // these exact keys (`common.rs:21-22`); PolyFlare RELAYS the incoming headers the same way.
+        let mut body = json!({"model": "gpt-5.6-sol", "input": []});
+        let headers = vec![
+            ("traceparent".to_string(), "00-abc-def-01".to_string()),
+            ("tracestate".to_string(), "x=1".to_string()),
+        ];
+
+        seed_trace_headers(&mut body, &headers);
+        let envelope = build_response_create(&body, None, &[], None);
+
+        assert_eq!(
+            envelope["client_metadata"]["ws_request_header_traceparent"],
+            json!("00-abc-def-01"),
+            "the incoming traceparent must be relayed verbatim into client_metadata: {envelope}"
+        );
+        assert_eq!(
+            envelope["client_metadata"]["ws_request_header_tracestate"],
+            json!("x=1"),
+            "the incoming tracestate must be relayed verbatim into client_metadata: {envelope}"
+        );
+    }
+
+    #[test]
+    fn seed_trace_headers_matches_header_name_case_insensitively() {
+        // HTTP header names are case-insensitive; a `TraceParent`-cased forward header must still
+        // relay (matching how a real ingress could present it).
+        let mut body = json!({"model": "m", "input": []});
+        let headers = vec![("TraceParent".to_string(), "00-XYZ-01".to_string())];
+
+        seed_trace_headers(&mut body, &headers);
+        let envelope = build_response_create(&body, None, &[], None);
+
+        assert_eq!(
+            envelope["client_metadata"]["ws_request_header_traceparent"],
+            json!("00-XYZ-01")
+        );
+    }
+
+    #[test]
+    fn seed_trace_headers_fabricates_nothing_when_the_headers_are_absent() {
+        // NEVER generate a trace when the incoming request carried none — the trace keys must be
+        // ABSENT. (F2's send-timing still creates client_metadata with only ITS key, which is why
+        // we assert on the specific trace keys' absence, not on client_metadata being absent.)
+        let mut body = json!({"model": "gpt-5.6-sol", "input": []});
+
+        seed_trace_headers(&mut body, &[]);
+        let envelope = build_response_create(&body, None, &[], None);
+
+        let cm = envelope
+            .get("client_metadata")
+            .and_then(Value::as_object)
+            .expect("F2 still stamps the timing key, so client_metadata exists");
+        assert!(
+            !cm.contains_key("ws_request_header_traceparent"),
+            "no traceparent must be fabricated when the incoming request had none: {envelope}"
+        );
+        assert!(
+            !cm.contains_key("ws_request_header_tracestate"),
+            "no tracestate must be fabricated when the incoming request had none: {envelope}"
+        );
     }
 
     // ---- THE central delta proof: two executor.execute() calls, one connection, a real delta --

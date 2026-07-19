@@ -17,10 +17,38 @@
 //! Any caller that wraps these in a struct must redact it in `Debug`, mirroring `PreparedRequest`
 //! (`polyflare-core/src/types.rs:42-50`).
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use bytes::Bytes;
 use serde_json::Value;
 
 use polyflare_core::{ExecError, FailureSignal};
+
+/// Get-or-insert a `client_metadata` object on `obj`, returning a mutable handle to it.
+///
+/// Mirrors codex-rs's `client_metadata.get_or_insert_with(HashMap::new)`: codex always sends a
+/// `client_metadata` map, creating one when the request had none. Defensively replaces a
+/// non-object `client_metadata` (a malformed/reused body) with a fresh object rather than
+/// panicking — the same "an object is the only shape this field ever legitimately has" stance
+/// codex's typed `HashMap` enforces structurally.
+///
+/// `pub(crate)` so `ws::executor` can seed the relayed W3C trace (`ws_request_header_*`, Task 3 F3)
+/// into the SAME block [`build_response_create`] stamps the per-frame send-timing into (F2), via one
+/// shared get-or-insert rather than two divergent inline copies. `client_metadata` is NOT one of
+/// `delta::NON_INPUT_FIELDS`, so nothing written through this helper perturbs `non_input_fingerprint`
+/// (the incremental-caching chain is untouched).
+pub(crate) fn client_metadata_object_mut(
+    obj: &mut serde_json::Map<String, Value>,
+) -> &mut serde_json::Map<String, Value> {
+    let slot = obj
+        .entry("client_metadata")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !slot.is_object() {
+        *slot = Value::Object(serde_json::Map::new());
+    }
+    slot.as_object_mut()
+        .expect("client_metadata was just ensured to be a JSON object")
+}
 
 /// The outcome of classifying one received (already-parsed) frame.
 ///
@@ -127,6 +155,24 @@ pub fn build_response_create(
             obj.remove("generate");
         }
     }
+
+    // Task 3 F2 (codex parity, `core/src/turn_timing.rs:183` / `client.rs:1850`): codex stamps the
+    // WS send-start wall-clock ms into `client_metadata` immediately before EVERY WS send. Fresh per
+    // build — each turn/attempt rebuilds this envelope, so each carries its own stamp, exactly as
+    // codex re-stamps per send. A JSON STRING (not a number), matching codex's serialization. This
+    // augments any `client_metadata` the caller already seeded (F3's relayed trace) rather than
+    // clobbering it, and creates the block when the body had none. `client_metadata` is NOT in
+    // `delta::NON_INPUT_FIELDS`, so this per-frame-varying value never changes `non_input_fingerprint`
+    // → the incremental-caching chain is untouched (precondition verified for this task).
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    client_metadata_object_mut(obj).insert(
+        "x-codex-ws-stream-request-start-ms".to_string(),
+        Value::String(now_ms.to_string()),
+    );
 
     envelope
 }
@@ -345,6 +391,76 @@ mod tests {
         assert_eq!(out["stream"], json!(true));
         assert_eq!(out["include"], json!([]));
         assert_eq!(out["prompt_cache_key"], json!("nonce-xyz"));
+    }
+
+    // ---- Task 3 F2: per-frame send-timing stamp in client_metadata --------------------------
+
+    #[test]
+    fn build_stamps_ws_stream_request_start_ms_as_a_string_when_body_had_no_client_metadata() {
+        // codex stamps `x-codex-ws-stream-request-start-ms` into `client_metadata` immediately
+        // before every WS send (`core/src/turn_timing.rs:183` / `client.rs:1850`). When the body
+        // carried no `client_metadata` at all, this call must CREATE the block with just this key.
+        let body = json!({"model": "gpt-5.6-sol", "input": []});
+
+        let out = build_response_create(&body, None, &[], None);
+
+        let cm = out["client_metadata"]
+            .as_object()
+            .expect("client_metadata object must be created when the body had none");
+        let stamp = cm["x-codex-ws-stream-request-start-ms"]
+            .as_str()
+            .expect("the timing stamp must be a JSON STRING (matching codex), not a number");
+        let ms: i64 = stamp
+            .parse()
+            .expect("the timing stamp must parse as an integer unix-ms");
+        assert!(
+            ms > 1_700_000_000_000,
+            "must be a plausible recent unix-ms (> 2023-11-14), got {ms}"
+        );
+    }
+
+    #[test]
+    fn build_augments_an_existing_client_metadata_preserving_other_keys() {
+        // When the reshaped HTTP body already carries a `client_metadata` block (codex's HTTP
+        // `/responses` body does), the timing stamp must be ADDED alongside, never clobber it.
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [],
+            "client_metadata": {"existing_key": "existing_value"},
+        });
+
+        let out = build_response_create(&body, None, &[], None);
+
+        let cm = out["client_metadata"].as_object().expect("object");
+        assert_eq!(
+            cm["existing_key"],
+            json!("existing_value"),
+            "a pre-existing client_metadata key must survive the augment: {out}"
+        );
+        assert!(
+            cm.get("x-codex-ws-stream-request-start-ms")
+                .and_then(Value::as_str)
+                .is_some(),
+            "the timing key must be added alongside the existing keys: {out}"
+        );
+    }
+
+    #[test]
+    fn build_replaces_a_non_object_client_metadata_defensively() {
+        // Mirrors codex's typed `HashMap` (`get_or_insert_with(HashMap::new)`): a `client_metadata`
+        // that is somehow NOT an object (a malformed/reused body) is replaced with a fresh object
+        // rather than panicking — the timing key still lands.
+        let body = json!({"model": "m", "client_metadata": "not-an-object"});
+
+        let out = build_response_create(&body, None, &[], None);
+
+        let cm = out["client_metadata"]
+            .as_object()
+            .expect("a non-object client_metadata must be replaced with a fresh object");
+        assert!(cm
+            .get("x-codex-ws-stream-request-start-ms")
+            .and_then(Value::as_str)
+            .is_some());
     }
 
     // ---- frame_to_sse ---------------------------------------------------------------------
