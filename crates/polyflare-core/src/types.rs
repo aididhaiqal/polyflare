@@ -131,6 +131,14 @@ pub struct RequestCtx {
     /// input counts as 1; absent as 0). Carried here so the watchdog's diagnostic input count no
     /// longer has to re-read the request body — which, on the native path, is never materialized.
     pub input_count: u32,
+    /// The codex sub-agent role slug from `x-openai-subagent` (`review`/`compact`/…), or `None`
+    /// for the main agent. Content-free routing metadata (a bounded role label), never conversation
+    /// content — used for observability labeling only.
+    pub subagent: Option<String>,
+    /// The thread-unique `x-codex-window-id` (`{thread_id}:0`), or `None`. Content-free. Folded into
+    /// the WS connection key so each codex thread gets its own socket regardless of which
+    /// `session_key` branch fired; NEVER used for ownership/continuity.
+    pub conn_discriminator: Option<String>,
 }
 
 /// A derived conversation key + its strength (hard binds routing; soft is best-effort).

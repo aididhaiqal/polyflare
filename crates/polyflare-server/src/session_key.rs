@@ -206,6 +206,8 @@ pub fn parse_inbound(headers: &HeaderMap, raw: &[u8]) -> Option<InboundFacts> {
         client_previous_response_id: raw_as_str(field("previous_response_id")),
         is_full_resend,
         input_count,
+        subagent: header_str(headers, "x-openai-subagent"),
+        conn_discriminator: header_str(headers, "x-codex-window-id"),
     };
     Some(InboundFacts {
         model: raw_as_str(field("model")).unwrap_or_default(),
@@ -463,6 +465,30 @@ mod tests {
         let via_header_fn2 = header_session_key(&h2, Some("thread-1")).unwrap();
         let via_full_derive2 = derive_session_key(&h2, Some("thread-1"), None);
         assert_eq!(via_header_fn2.value, via_full_derive2.value);
+    }
+
+    #[test]
+    fn subagent_and_window_id_are_extracted() {
+        let ctx = ctx_of(
+            &hdr(&[
+                ("x-openai-subagent", "review"),
+                ("x-codex-window-id", "tid-1:0"),
+            ]),
+            serde_json::json!({"input": "hi"}),
+        );
+        assert_eq!(ctx.subagent.as_deref(), Some("review"));
+        assert_eq!(ctx.conn_discriminator.as_deref(), Some("tid-1:0"));
+    }
+
+    #[test]
+    fn main_agent_has_no_subagent_label() {
+        // No x-openai-subagent header (Cli/Exec main agent) => None.
+        let ctx = ctx_of(
+            &hdr(&[("x-codex-window-id", "tid-1:0")]),
+            serde_json::json!({"input": "hi"}),
+        );
+        assert_eq!(ctx.subagent, None);
+        assert_eq!(ctx.conn_discriminator.as_deref(), Some("tid-1:0"));
     }
 
     #[test]
