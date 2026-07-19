@@ -13,7 +13,6 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use polyflare_core::ExecError;
 
 /// codex-lb's exact keepalive frame (`retry.py`/`support.py`'s
 /// `_iter_account_capacity_recovery_wait`): a comment-only SSE line carrying no `data:` field at
@@ -105,13 +104,6 @@ pub fn anthropic_ping_frame() -> Bytes {
     Bytes::from_static(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
 }
 
-/// A single keepalive item, pre-wrapped as the `ResponseStream` item type — mirrors
-/// `watchdog::signal_client_stream`'s established idiom: a synthetic frame is always yielded as
-/// `Ok`, never `Err` (see [`in_band_error_frame`]'s doc for why).
-pub fn keepalive_item() -> Result<Bytes, ExecError> {
-    Ok(Bytes::from_static(KEEPALIVE_FRAME))
-}
-
 /// B5 Task 5: the fixed reason label for a Layer 2 wait's SUCCESS terminal — a real account was
 /// re-selected, resolved, and a real upstream stream was spliced in. The counterpart to
 /// [`StarvationOutcome`]'s three FAILURE reason codes (which only cover the ways a wait can fail);
@@ -129,13 +121,6 @@ mod tests {
         assert_eq!(KEEPALIVE_FRAME, b": keepalive\n\n");
         // No `data:` field at all — content-safety: structurally incapable of carrying a body.
         assert!(!KEEPALIVE_FRAME.starts_with(b"data:"));
-    }
-
-    #[test]
-    fn keepalive_item_wraps_the_frame_as_ok() {
-        let item = keepalive_item();
-        assert!(item.is_ok());
-        assert_eq!(item.unwrap(), Bytes::from_static(KEEPALIVE_FRAME));
     }
 
     #[test]

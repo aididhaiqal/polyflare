@@ -512,9 +512,16 @@ enum WaitClient {
     /// Native Anthropic `/v1/messages` client: `event: error` frames, `event: ping` keepalives,
     /// recovered Anthropic stream forwarded verbatim.
     Anthropic,
-    // T4 adds: AnthropicTranslated(Arc<dyn Fn() -> Box<dyn Translator> + Send + Sync>) — the
-    // Codex-aliased `/v1/messages` path's Layer-2 wait, which speaks Anthropic to the client but
-    // waits on Codex accounts and must translate the recovered Codex stream before splicing it.
+    /// Anthropic client served from a Codex pool (the `/v1/messages`→Codex alias path): `event:
+    /// error`/`event: ping` frames like `Anthropic`, but the recovered CODEX stream is wrapped in a
+    /// FRESH translator (response-side state is built from the stream, so a fresh instance is
+    /// correct — see `AnthropicToResponses::translate_request`, which never touches
+    /// `message_start_emitted`/`next_block_index`/`blocks`) and emitted as Anthropic SSE. The
+    /// factory (rather than a moved instance) exists because Layer 1 and Layer 2 are
+    /// mutually-exclusive call sites and the wait fn moves its state into an `async_stream`
+    /// generator — a `Fn() -> Box<dyn Translator>` called ONLY at the actual serve site is cleaner
+    /// than threading one pre-built instance across the try-layer1-then-layer2 sequence.
+    AnthropicTranslated(std::sync::Arc<dyn Fn() -> Box<dyn Translator> + Send + Sync>),
 }
 
 impl WaitClient {
@@ -523,27 +530,37 @@ impl WaitClient {
     fn error_frame(&self, outcome: starvation::StarvationOutcome) -> Bytes {
         match self {
             WaitClient::Codex => starvation::in_band_error_frame(outcome),
-            WaitClient::Anthropic => starvation::anthropic_in_band_error_frame(outcome),
+            WaitClient::Anthropic | WaitClient::AnthropicTranslated(_) => {
+                starvation::anthropic_in_band_error_frame(outcome)
+            }
         }
     }
 
     /// The keepalive frame bytes for this dialect. Returns `Bytes` (not the stream's `Item` type
-    /// directly — see `starvation::keepalive_item`'s doc on why the two happen to coincide for
-    /// `Codex` today) so callers wrap it as `Ok(..)` at the yield site themselves.
+    /// directly) so callers wrap it as `Ok(..)` at the yield site themselves.
     fn keepalive_bytes(&self) -> Bytes {
         match self {
-            // Byte-identical to `starvation::KEEPALIVE_FRAME` / `keepalive_item()`'s existing Ok
-            // value — this is NOT a new frame, just the same constant reached through the new seam.
+            // Byte-identical to `starvation::KEEPALIVE_FRAME` — this is NOT a new frame, just the
+            // same constant reached through the new seam.
             WaitClient::Codex => Bytes::from_static(starvation::KEEPALIVE_FRAME),
-            WaitClient::Anthropic => starvation::anthropic_ping_frame(),
+            WaitClient::Anthropic | WaitClient::AnthropicTranslated(_) => {
+                starvation::anthropic_ping_frame()
+            }
         }
     }
 
-    /// How the recovered upstream stream reaches the client. Verbatim for Codex + native Anthropic
-    /// (T4's `AnthropicTranslated` wraps it in a fresh `Translator` instance instead).
+    /// How the recovered upstream stream reaches the client. Verbatim for Codex + native Anthropic;
+    /// `AnthropicTranslated` wraps the recovered CODEX stream in a FRESH `Translator` instance
+    /// (built by the factory, called here — right at the serve site) so it reaches the client as
+    /// Anthropic SSE. Only this recovered REAL stream is ever translated — the outer wait stream's
+    /// own keepalive/error frames (already Anthropic-native bytes) are never routed through it, so
+    /// they survive the `TranslatingStream` comment-drop untouched (`translate_stream.rs:60`).
     fn wrap_recovered(&self, stream: ResponseStream) -> ResponseStream {
         match self {
             WaitClient::Codex | WaitClient::Anthropic => stream,
+            WaitClient::AnthropicTranslated(factory) => {
+                crate::translate_stream::wrap_translating_stream(stream, factory())
+            }
         }
     }
 }
@@ -2385,7 +2402,54 @@ async fn messages_handler_codex_aliased(
     };
     let picked = match selector.pick(&snapshots, &sel_ctx) {
         Some(id) => id,
-        None => return (no_eligible(), outcome),
+        None => {
+            // B5-anthropic Task 4: the Codex-aliased `/v1/messages` mirror of
+            // `messages_handler_native`'s Layer 1 → Layer 2 → `no_eligible` empty-pool fallthrough
+            // (T3), but waiting ON the Codex pool (`pool_provider = Provider::Codex`, the SAME
+            // `snapshots`/`sel_ctx` this handler already built above) while speaking the
+            // TRANSLATED Anthropic dialect to the client: `WaitClient::AnthropicTranslated`'s
+            // `event: ping` keepalives (never Codex's `: keepalive`/`response.failed`), and — once
+            // recovered — the real Codex stream translated into Anthropic SSE by a FRESH
+            // `AnthropicToResponses` instance (built by the factory at the actual serve site, NOT
+            // this handler's own `translator` above, which is reserved for the immediate-pick
+            // success path below). `session_key` is `None`: `NoopContinuity` never derives one on
+            // this path either (same as the native path's rationale).
+            let client = WaitClient::AnthropicTranslated(std::sync::Arc::new(|| {
+                Box::new(AnthropicToResponses::new()) as Box<dyn Translator>
+            }));
+            let layer1 = try_layer1_serve_now(
+                &state,
+                &snapshots,
+                selector.as_ref(),
+                &sel_ctx,
+                prepared.req.clone(),
+                ctx.clone(),
+                None,
+                now,
+                &mut outcome,
+                &client,
+            )
+            .await;
+            let resp = layer1.or_else(|| {
+                try_layer2_recovery_wait(
+                    state.clone(),
+                    &snapshots,
+                    pool.map(|p| p.to_string()),
+                    Provider::Codex,
+                    selector.clone(),
+                    &sel_ctx,
+                    prepared.req,
+                    ctx,
+                    None,
+                    now,
+                    state.starvation_wait_budget,
+                    state.starvation_heartbeat,
+                    &mut outcome,
+                    client,
+                )
+            });
+            return (resp.unwrap_or_else(no_eligible), outcome);
+        }
     };
     state.runtime.record_selected(&picked, now);
     outcome.account_id = Some(picked.as_str().to_string());
