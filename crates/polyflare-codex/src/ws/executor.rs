@@ -500,7 +500,7 @@ fn classify_recovery(e: &ExecError) -> RecoveryAction {
         // socket (`WS_READ_IDLE_MARKER`, poisoned in `ws::conn::recv_frame_with_timeout`) is dead, so
         // reconnect + full-resend instead of surfacing/failing over — matching codex retrying its own
         // idle timeout in place. Bounded by the SAME `reconnect_attempts`/`max_reconnect_retries`
-        // budget the other two use (the `RecoveryAction::Reconnect` arm's guard in `run_turn`), so
+        // budget the other two use (the `RecoveryAction::Reconnect` arm's guard in `drive_turn`), so
         // this adds a trigger, never an unbounded loop.
         if msg.contains(CONNECTION_LIMIT_MARKER)
             || msg.contains(SOCKET_CLOSED_MARKER)
