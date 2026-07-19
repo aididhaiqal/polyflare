@@ -16,8 +16,10 @@
 //! (`watchdog.rs:29-33`), and not an authority for this mock's upstream-facing shape.
 //!
 //! Content-safety: [`RecordedFrame`] retains only structural facts (an anchor id — an opaque
-//! backend-issued identifier, not conversation content — and an item count), never the frame's
-//! `input` payload. Nothing here derives `Debug` over a full frame or request body.
+//! backend-issued identifier, not conversation content — and an item count, plus the replayed
+//! `x-codex-turn-state` — itself a content-free server-issued routing token, never conversation
+//! content), never the frame's `input` payload. Nothing here derives `Debug` over a full frame or
+//! request body.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -25,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
@@ -41,6 +43,12 @@ pub struct RecordedFrame {
     pub previous_response_id: Option<String>,
     /// `input` array length (0 if `input` was absent or not a JSON array).
     pub input_len: usize,
+    /// The `client_metadata["x-codex-turn-state"]` this frame carried, if any — the replayed
+    /// server-issued routing token (`ws::executor::plan_and_build_locked`). A content-free routing
+    /// token, never conversation content. `None` when the frame carried no turn-state key. Lets a
+    /// test prove the per-turn replay semantics: the upgrade token appears on the FIRST turn over a
+    /// socket and is ABSENT on every later turn (it is a one-shot consumed by the first turn).
+    pub turn_state: Option<String>,
 }
 
 /// A scripted response for the next (or every, once repeating) `response.create` turn a
@@ -175,6 +183,13 @@ pub struct MockWsUpstream {
     /// When set, every upgrade attempt is answered with a plain HTTP 426 instead of upgrading —
     /// see [`Self::rejecting_handshake`].
     reject_handshake: bool,
+    /// When set, the WS UPGRADE (101) response carries this value as its `x-codex-turn-state`
+    /// header — the PRIMARY turn-state capture path the real backend uses
+    /// (`responses_websocket.rs:529-535`). A content-free server-issued routing token. Lets a test
+    /// drive the per-turn "consume the upgrade token on the first turn, send nothing on later turns"
+    /// replay path end to end. `None` (the default) sends no such header. See
+    /// [`Self::with_upgrade_turn_state`].
+    upgrade_turn_state: Option<String>,
 }
 
 impl MockWsUpstream {
@@ -197,7 +212,19 @@ impl MockWsUpstream {
             frames: Arc::new(Mutex::new(Vec::new())),
             id_counter: Arc::new(AtomicU32::new(0)),
             reject_handshake: false,
+            upgrade_turn_state: None,
         }
+    }
+
+    /// Answer every WS UPGRADE with `x-codex-turn-state: {token}` on the 101 response header — the
+    /// PRIMARY turn-state capture path the real backend uses (`responses_websocket.rs:529-535`,
+    /// mirrored by `WsConn::connect_detailed_with_timeout`). A builder-style override so a test can
+    /// prove the per-turn replay semantics: the captured upgrade token is a ONE-SHOT consumed by the
+    /// FIRST turn on the socket, so it appears in that turn's frame `client_metadata` and is ABSENT
+    /// from every later turn's frame on the same reused socket. Content-free routing token.
+    pub fn with_upgrade_turn_state(mut self, token: impl Into<String>) -> Self {
+        self.upgrade_turn_state = Some(token.into());
+        self
     }
 
     /// A mock that answers every WS upgrade attempt with a plain HTTP 426 (`Upgrade Required`)
@@ -250,9 +277,16 @@ impl MockWsUpstream {
             .and_then(|v| v.as_array())
             .map(Vec::len)
             .unwrap_or(0);
+        // The replayed content-free routing token, if this frame carried one — read out of the
+        // frame's `client_metadata` (where the WS path replays it, never as a top-level field).
+        let turn_state = body
+            .pointer("/client_metadata/x-codex-turn-state")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         self.frames.lock().unwrap().push(RecordedFrame {
             previous_response_id,
             input_len,
+            turn_state,
         });
     }
 
@@ -293,8 +327,22 @@ async fn ws_handler(
         // established for this connection attempt.
         return (StatusCode::UPGRADE_REQUIRED, "Upgrade Required").into_response();
     }
-    ws.on_upgrade(move |socket| handle_socket(socket, mock))
-        .into_response()
+    let upgrade_turn_state = mock.upgrade_turn_state.clone();
+    let mut response = ws
+        .on_upgrade(move |socket| handle_socket(socket, mock))
+        .into_response();
+    // Primary turn-state capture path (`responses_websocket.rs:529-535`): stamp the server-issued
+    // `x-codex-turn-state` onto the 101 UPGRADE response so `WsConn::connect_detailed_with_timeout`
+    // captures it into `upgrade_turn_state`. Content-free routing token. Only when configured via
+    // `with_upgrade_turn_state`.
+    if let Some(ts) = upgrade_turn_state {
+        if let Ok(value) = HeaderValue::from_str(&ts) {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("x-codex-turn-state"), value);
+        }
+    }
+    response
 }
 
 async fn handle_socket(mut socket: WebSocket, mock: MockWsUpstream) {

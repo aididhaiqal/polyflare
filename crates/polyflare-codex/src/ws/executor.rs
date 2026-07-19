@@ -410,30 +410,30 @@ impl CodexWsExecutor {
     /// first turn is about to advance, then sending a now-stale envelope). This function no
     /// longer locks anything itself; it is plain, synchronous, content-free planning over a
     /// reference the caller already holds exclusively.
-    fn plan_and_build_locked(conn: &WsConn, body: &Value) -> Value {
+    fn plan_and_build_locked(conn: &WsConn, body: &Value, turn_state: Option<&str>) -> Value {
         let mut envelope = match plan_request_for_conn(conn, body) {
             RequestPlan::Incremental { anchor, suffix } => {
                 build_response_create(body, Some(&anchor), &suffix, None)
             }
             RequestPlan::Full => build_response_create(body, None, &full_input(body), None),
         };
-        // Task 4 F1 (codex parity, `client.rs:1568-1569`): replay the server-issued turn-state
-        // captured on THIS socket — from the WS upgrade-response header at connect, or a
-        // `response.metadata` frame (`WsConn::server_turn_state`, set-once/first-wins per socket) —
-        // into EVERY outbound frame's `client_metadata` under `x-codex-turn-state`. When the server
-        // never supplied one (`None`) insert NOTHING — never fabricated (codex inserts only when its
-        // OnceLock is set). Written through the SAME `client_metadata` get-or-insert
-        // `build_response_create` uses (F2 timing) / `seed_trace_headers` uses (F3 trace), so it
-        // augments — never clobbers — those keys. `client_metadata` is NOT a `delta::NON_INPUT_FIELDS`
-        // field, so this does NOT perturb `non_input_fingerprint` / the incremental-caching chain /
-        // the `conn_key` — the WS fingerprint parity gate stays green. It IS a fingerprint tell AND a
-        // warm-cache/sticky-routing signal on WS. Content-free routing token — its VALUE is never
-        // logged.
-        if let Some(turn_state) = &conn.server_turn_state {
+        // Task 4 F1 (codex parity, `client.rs:1568-1569`): replay the PER-TURN turn-state — the
+        // caller (`drive_turn`) supplies the socket's one-shot upgrade token to the turn that
+        // established the socket, and `None` to every later turn on a reused socket (codex scopes
+        // turn-state PER TURN via a fresh `OnceLock` per `ModelClientSession` that is empty at send
+        // time on a reused socket — `client.rs:479-484`; its doc `client.rs:268-283` forbids sending
+        // the token "between different turns"). When `turn_state` is `None` insert NOTHING — never
+        // fabricated. Written through the SAME `client_metadata` get-or-insert `build_response_create`
+        // uses (F2 timing) / `seed_trace_headers` uses (F3 trace), so it augments — never clobbers —
+        // those keys. `client_metadata` is NOT a `delta::NON_INPUT_FIELDS` field, so this does NOT
+        // perturb `non_input_fingerprint` / the incremental-caching chain / the `conn_key` — the WS
+        // fingerprint parity gate stays green. It IS a fingerprint tell AND a warm-cache/sticky-routing
+        // signal on WS. Content-free routing token — its VALUE is never logged.
+        if let Some(turn_state) = turn_state {
             if let Some(obj) = envelope.as_object_mut() {
                 super::codec::client_metadata_object_mut(obj).insert(
                     TURN_STATE_HEADER.to_string(),
-                    Value::String(turn_state.clone()),
+                    Value::String(turn_state.to_string()),
                 );
             }
         }
@@ -466,10 +466,23 @@ impl CodexWsExecutor {
     ) -> Result<ResponseStream, ExecError> {
         let mut anchor_attempts: u32 = 0;
         let mut reconnect_attempts: u32 = 0;
+        // Per-TURN turn-state (codex parity): this whole `drive_turn` is ONE turn. The socket's
+        // upgrade token is a one-shot consumed FIRST-WINS here — the turn that establishes the socket
+        // takes it (replayed into its frames), and every later turn on a REUSED socket sees `None`
+        // (its guard's `upgrade_turn_state` was already `.take()`n) and sends NO `x-codex-turn-state`.
+        // On a reconnect iteration the fresh socket's guard is used, and `if turn_state.is_none()`
+        // keeps first-wins: a reconnect after the token was set keeps the original; a reconnect during
+        // a turn that had none takes the new socket's — matching codex's set-if-empty `OnceLock`.
+        let mut turn_state: Option<String> = None;
 
         loop {
-            let guard = shared.clone().lock_owned().await;
-            let envelope = Self::plan_and_build_locked(&guard, body);
+            let mut guard = shared.clone().lock_owned().await;
+            // Consume the socket's one-shot upgrade token BEFORE the immutable `plan_and_build_locked`
+            // borrow below. `.take()` needs `&mut guard` (the `OwnedMutexGuard` derefs mut). First-wins.
+            if turn_state.is_none() {
+                turn_state = guard.upgrade_turn_state.take();
+            }
+            let envelope = Self::plan_and_build_locked(&guard, body, turn_state.as_deref());
             let mut stream = turn_stream_with_guard(guard, envelope);
 
             match stream.next().await {
@@ -979,29 +992,28 @@ mod tests {
     async fn plan_and_build_locked_replays_turn_state_into_client_metadata() {
         let mock = MockWsUpstream::new(ScriptedTurn::normal(vec![]));
         let base = mock.clone().spawn().await;
-        let mut conn = WsConn::connect(&test_account(base), &[])
+        let conn = WsConn::connect(&test_account(base), &[])
             .await
             .expect("connect");
         let body = json!({"model": "gpt-5.6-sol", "input": [item(0)]});
 
-        // None (the mock handshake supplies no turn-state header) ⇒ the replay key is ABSENT —
-        // never fabricated. (F2 still stamps its timing key, so client_metadata itself exists.)
-        let envelope = CodexWsExecutor::plan_and_build_locked(&conn, &body);
+        // `None` (no turn-state supplied for this turn) ⇒ the replay key is ABSENT — never
+        // fabricated. (F2 still stamps its timing key, so client_metadata itself exists.)
+        let envelope = CodexWsExecutor::plan_and_build_locked(&conn, &body, None);
         let cm = envelope["client_metadata"]
             .as_object()
             .expect("F2 always stamps a client_metadata object");
         assert!(
             !cm.contains_key("x-codex-turn-state"),
-            "no turn-state must be replayed when the socket never captured one: {envelope}"
+            "no turn-state must be replayed when this turn has none: {envelope}"
         );
 
-        // Some("ts-9") ⇒ replayed verbatim into client_metadata (codex parity, client.rs:1568-1569).
-        conn.server_turn_state = Some("ts-9".to_string());
-        let envelope = CodexWsExecutor::plan_and_build_locked(&conn, &body);
+        // `Some("ts-9")` ⇒ replayed verbatim into client_metadata (codex parity, client.rs:1568-1569).
+        let envelope = CodexWsExecutor::plan_and_build_locked(&conn, &body, Some("ts-9"));
         assert_eq!(
             envelope["client_metadata"]["x-codex-turn-state"],
             json!("ts-9"),
-            "the captured turn-state must be replayed into the frame's client_metadata: {envelope}"
+            "the per-turn turn-state must be replayed into the frame's client_metadata: {envelope}"
         );
     }
 
@@ -1126,6 +1138,71 @@ mod tests {
         assert_eq!(
             frames[3].input_len, 1,
             "turn 4: 1-item delta (the chain holds)"
+        );
+    }
+
+    // ---- Task 4 regression (per-turn turn-state): a REUSED socket's upgrade token is one-shot ---
+
+    /// The adversarial-review regression this fix exists for. The WS upgrade-response
+    /// `x-codex-turn-state` is a ONE-SHOT belonging to the turn that established the socket, NOT
+    /// persistent per-socket state. Real codex-rs scopes turn-state PER TURN (a fresh `OnceLock` per
+    /// `ModelClientSession`, empty at send time on a reused socket) even though it reuses the cached
+    /// socket; its own doc (`client.rs:268-283`) forbids sending the token "between different turns".
+    /// So on a REUSED socket, turn 1 replays the captured upgrade token and turns 2..N send NO
+    /// `x-codex-turn-state`. (RED against the per-socket code, which replayed the socket's token on
+    /// EVERY turn — the stale-cross-turn-token bug.)
+    #[tokio::test]
+    async fn reused_socket_replays_upgrade_turn_state_on_turn_1_only_never_on_later_turns() {
+        // Two turns on ONE socket (same session/account/model ⇒ one conn_key ⇒ reuse). The mock
+        // stamps `ts-upgrade` on the 101 upgrade response, captured into `WsConn::upgrade_turn_state`.
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::normal(vec![]),
+        ])
+        .with_upgrade_turn_state("ts-upgrade");
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
+        let account = test_account(base);
+        let ctx = ctx_with_session("turnstate");
+
+        // Turn 1 (the turn that established the socket): two items, no anchor yet.
+        let body1 = json!({"model": "gpt-5.6-sol", "input": [item(0), item(1)]});
+        drain(
+            executor
+                .execute(prepared(body1), &account, &ctx)
+                .await
+                .expect("turn 1 must succeed"),
+        )
+        .await;
+
+        // Turn 2 on the SAME reused socket: a strict extension (one new item).
+        let body2 = json!({"model": "gpt-5.6-sol", "input": [item(0), item(1), item(2)]});
+        drain(
+            executor
+                .execute(prepared(body2), &account, &ctx)
+                .await
+                .expect("turn 2 must succeed"),
+        )
+        .await;
+
+        assert_eq!(
+            mock.handshake_count(),
+            1,
+            "both turns must ride ONE reused socket — no new handshake between them"
+        );
+        let frames = mock.frames();
+        assert_eq!(frames.len(), 2, "exactly one frame per turn");
+        assert_eq!(
+            frames[0].turn_state.as_deref(),
+            Some("ts-upgrade"),
+            "turn 1 (which established the socket) must replay the captured upgrade turn-state into \
+             its frame's client_metadata"
+        );
+        assert_eq!(
+            frames[1].turn_state, None,
+            "turn 2 on the REUSED socket must send NO x-codex-turn-state — the upgrade token is a \
+             one-shot consumed by turn 1 (codex parity: the fresh per-turn OnceLock is empty on a \
+             reused socket; sending it between turns is forbidden, client.rs:268-283)"
         );
     }
 
