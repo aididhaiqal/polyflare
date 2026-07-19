@@ -16,11 +16,17 @@
 //! `x-codex-turn-state`). Nothing here changes that.
 //!
 //! # The connection cache
-//! Keyed by `ctx.session_key`'s hashed `value` (already content-free — `SessionKey::value` is a
-//! sha256 hex digest computed by `polyflare-server::session_key`, never raw conversation
-//! identifiers) — never the raw request body, and never recomputed here (the whole point of
-//! threading `RequestCtx` through the `Executor` seam in Task 1). A request with no session key
-//! (`ctx.session_key: None`) gets a fresh, uncached connection every call: no reuse is possible
+//! Keyed by `conn_key` = `ctx.session_key`'s hashed `value` folded with the request's
+//! `ws::delta::non_input_fingerprint` (`"<session>:<non-input-hash>"`). Both halves are
+//! content-free sha256 hex digests — `SessionKey::value` is computed by
+//! `polyflare-server::session_key`, the fingerprint hashes only non-input request fields (model,
+//! instructions, tools, …) — so the key never contains the raw request body. Folding in the
+//! non-input fingerprint gives each interleaved model-stream on one conversation (codex drives two
+//! models per turn) its OWN socket + anchor chain: without it, the two streams shared one socket
+//! and clobbered each other's stored fingerprint, forcing every turn to a full (uncached) send.
+//! The 426 WS-disable and all logging stay keyed on the plain `session_key` (a 426 disables WS for
+//! the whole session, every model-stream). A request with no session key
+//! (`ctx.session_key: None`) gets `conn_key: None` — a fresh, uncached connection every call: no reuse is possible
 //! without something to key on, but the request still completes correctly (as a full send with no
 //! anchor) — WS just delivers no benefit for it, which is a degraded-but-correct default, not a
 //! failure.
