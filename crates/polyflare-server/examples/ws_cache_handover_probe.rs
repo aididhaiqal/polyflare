@@ -1,3 +1,12 @@
+//! ⚠️ CORRECTION (2026-07-19): this probe reports **WS = 0% cached**, but that is UNREPRESENTATIVE
+//! of real usage — DO NOT trust it as "WS doesn't cache". Driving the REAL Codex CLI against a local
+//! `polyflare serve` with `POLYFLARE_WS_UPSTREAM=1` (transport confirmed by temporary WSPROBE
+//! instrumentation: "real WS handshake established" + "sending FULL over WS", no 426 fallback) showed
+//! codex's own rollout recording `cached_input_tokens: 5888` on a WS request — SAME as HTTP. So WS
+//! DOES cache for real codex. This probe's 0% is for a UNIQUE-per-run filler that only turn 1 could
+//! warm; real codex's big cache hit is its STABLE system-prompt/tools prefix (globally warm → hits on
+//! any transport). See memory `cache-billing-measured`. Kept as-is for the probe record.
+//!
 //! ws_cache_handover_probe — does prompt caching survive over WebSocket, and does it survive
 //! MOVING ACCOUNTS on WS? Companion to `cache_billing_probe` (HTTP: same-account ~95% cached,
 //! cross-account same-key ALSO ~95%) and `ws_ratelimit_probe` (found WS *incremental* turn 2 bills
