@@ -55,6 +55,11 @@ pub struct LogEvent {
     pub status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<i64>,
+    /// The codex sub-agent role label (`x-openai-subagent`: `review`/`compact`/
+    /// `memory_consolidation`/`collab_spawn`), or `None` for the main agent / non-request events —
+    /// a bounded role slug, never conversation content. Same content-safety class as `model`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<String>,
     pub kind: String,
     pub message: String,
 }
@@ -76,6 +81,7 @@ impl LogEvent {
             model: None,
             status: None,
             latency_ms: None,
+            subagent: None,
             kind: kind.to_string(),
             message: message.into(),
         }

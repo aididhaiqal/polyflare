@@ -8,9 +8,13 @@
 //! It must NEVER carry a bearer token, a session/thread/turn id, or the request/response body.
 //! `account_id` and `model` ARE carried (added by Task 12, SPEC-M5 §5/§6.7): both are content-free
 //! identifiers — a stable account row id and the requested/served model string, never conversation
-//! content — needed to populate the dashboard's per-account and per-model breakdowns. When in
-//! doubt about any OTHER field, leave it out — do not add fields to `RequestLog` without
-//! re-reading SPEC-M5 §3.4's content-safety constraint.
+//! content — needed to populate the dashboard's per-account and per-model breakdowns. `subagent`
+//! (sub-agent identity feature, Task 3) is carried the same way: a bounded role-label slug read off
+//! `x-openai-subagent` (`review`/`compact`/`memory_consolidation`/`collab_spawn`, or `None` for the
+//! main agent) — a fixed enum-like value, never a request-derived free-form string, so it is
+//! content-free by the same reasoning as `model`. When in doubt about any OTHER field, leave it
+//! out — do not add fields to `RequestLog` without re-reading SPEC-M5 §3.4's content-safety
+//! constraint.
 //!
 //! The SAME `RequestLog` also produces the content-free row persisted to the `request_log` table
 //! (the dashboard's history backend) via [`RequestLog::record`] — deliberately routed through this
@@ -54,6 +58,10 @@ pub struct RequestLog {
     pub total_tokens: Option<i64>,
     /// Cached tokens for this request, when observed from the response stream.
     pub cached_tokens: Option<i64>,
+    /// The codex sub-agent role label from `x-openai-subagent` (`review`/`compact`/
+    /// `memory_consolidation`/`collab_spawn`), or `None` for the main agent. A bounded role slug —
+    /// routing metadata, never conversation content — same content-safety class as `model`.
+    pub subagent: Option<String>,
 }
 
 impl RequestLog {
@@ -96,14 +104,15 @@ impl RequestLog {
             ttft_ms: self.ttft_ms,
             total_tokens: self.total_tokens,
             cached_tokens: self.cached_tokens,
+            subagent: self.subagent.clone(),
         }
     }
 
     /// The content-free live-log-bus form of this request outcome (see `crate::log_bus`). Draws
     /// from EXACTLY the same field set as [`Self::record`] — this is the same content-safety
     /// chokepoint feeding a second sink (an ephemeral broadcast + ring buffer instead of the
-    /// durable `request_log` table). `account`/`model` are populated from `self.account_id`/
-    /// `self.model` now that `RequestLog` carries them.
+    /// durable `request_log` table). `account`/`model`/`subagent` are populated from
+    /// `self.account_id`/`self.model`/`self.subagent` now that `RequestLog` carries them.
     pub fn to_log_event(&self) -> LogEvent {
         let status = self.status.as_u16();
         let level = if status == 429 || status >= 500 {
@@ -122,6 +131,7 @@ impl RequestLog {
             model: self.model.clone(),
             status: Some(status),
             latency_ms: Some(self.duration_ms as i64),
+            subagent: self.subagent.clone(),
             kind: "request".to_string(),
             message: format!("req {status} · {provider} · {}ms", self.duration_ms),
         }
@@ -199,6 +209,7 @@ impl FailoverSignal<'_> {
             model: None,
             status: None,
             latency_ms: None,
+            subagent: None,
             kind: "failover".to_string(),
             message: format!(
                 "failover reason={} from={} to={} attempt={}",
@@ -324,6 +335,7 @@ impl StarvationSignal<'_> {
             model: None,
             status: None,
             latency_ms: Some(self.waited_ms as i64),
+            subagent: None,
             kind: "starvation".to_string(),
             message: format!(
                 "starvation wait reason={} wait_target={} served={} waited_ms={} wake_jitter_applied_ms={}",
@@ -440,6 +452,7 @@ impl HealthTierSignal<'_> {
             model: None,
             status: None,
             latency_ms: None,
+            subagent: None,
             kind: "health_tier".to_string(),
             message: format!(
                 "health_tier reason={} account={} from={} to={}",
@@ -696,6 +709,7 @@ mod tests {
                 ttft_ms: None,
                 total_tokens: None,
                 cached_tokens: None,
+                subagent: None,
             }
             .emit();
         });
@@ -736,6 +750,79 @@ mod tests {
                 "forbidden content `{forbidden}` leaked into request log: {line}"
             );
         }
+    }
+
+    /// Task 3 (sub-agent identity): `RequestLog::record`/`RequestLog::to_log_event` — the two
+    /// content-safety chokepoints feeding the persisted `request_log` table and the live-log-bus —
+    /// carry `subagent` through unchanged, exactly like `account_id`/`model` already do. `emit()`'s
+    /// tracing event is untouched by this field (see `request_completion_event_carries_only_safe_fields`
+    /// above — `account_id`/`model`/`subagent` are deliberately NOT part of that narrower event).
+    #[test]
+    fn record_and_to_log_event_carry_subagent_like_model_and_account_id() {
+        let log = RequestLog {
+            method: "POST",
+            path: "/responses",
+            provider: Provider::Codex,
+            aliased: false,
+            status: StatusCode::OK,
+            duration_ms: 42,
+            account_id: Some("acct-1".to_string()),
+            model: Some("gpt-5.6-sol".to_string()),
+            reasoning_effort: None,
+            service_tier: None,
+            transport: Some("http".to_string()),
+            ttft_ms: None,
+            total_tokens: None,
+            cached_tokens: None,
+            subagent: Some("review".to_string()),
+        };
+
+        let record = log.record(100);
+        assert_eq!(record.subagent.as_deref(), Some("review"));
+        assert_eq!(record.account_id.as_deref(), Some("acct-1"));
+        assert_eq!(record.model.as_deref(), Some("gpt-5.6-sol"));
+
+        let ev = log.to_log_event();
+        assert_eq!(ev.subagent.as_deref(), Some("review"));
+        assert_eq!(ev.account.as_deref(), Some("acct-1"));
+        assert_eq!(ev.model.as_deref(), Some("gpt-5.6-sol"));
+
+        // Never a bearer/token/session id/raw body — `subagent` is a bounded role slug, not
+        // request/response content, same content-safety class as every other field here.
+        for forbidden in ["bearer", "token", "sess_", "session", "body", "input"] {
+            assert!(
+                !ev.message.to_lowercase().contains(forbidden),
+                "forbidden content `{forbidden}` leaked into request log event: {}",
+                ev.message
+            );
+        }
+    }
+
+    /// The main agent (no `x-openai-subagent` header) round-trips `subagent: None` through both
+    /// sinks — a missing label must never be silently substituted with an empty string or a
+    /// placeholder that could be mistaken for a real role slug.
+    #[test]
+    fn record_and_to_log_event_carry_none_subagent_for_the_main_agent() {
+        let log = RequestLog {
+            method: "POST",
+            path: "/responses",
+            provider: Provider::Codex,
+            aliased: false,
+            status: StatusCode::OK,
+            duration_ms: 10,
+            account_id: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            transport: None,
+            ttft_ms: None,
+            total_tokens: None,
+            cached_tokens: None,
+            subagent: None,
+        };
+
+        assert_eq!(log.record(0).subagent, None);
+        assert_eq!(log.to_log_event().subagent, None);
     }
 
     #[test]

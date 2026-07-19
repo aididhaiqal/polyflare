@@ -609,6 +609,7 @@ struct RequestRowView {
     total_tokens: Option<i64>,
     cached_tokens: Option<i64>,
     tps: Option<f64>,
+    subagent: Option<String>,
 }
 
 /// Tokens/sec over the post-first-token generation window, when derivable: needs both
@@ -691,6 +692,7 @@ pub async fn requests_handler(
             ttft_ms: r.ttft_ms,
             total_tokens: r.total_tokens,
             cached_tokens: r.cached_tokens,
+            subagent: r.subagent,
         })
         .collect();
     Response::ok(RequestsView {

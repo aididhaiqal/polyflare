@@ -258,6 +258,9 @@ async fn control_route(
         ttft_ms: None,
         total_tokens: None,
         cached_tokens: None,
+        // Not derived for control endpoints (Task 3's `RequestCtx.subagent` wiring covers only
+        // the `/responses`/`/v1/messages` set-sites); left `None` here.
+        subagent: None,
     };
     log.emit();
     log_bus.publish(log.to_log_event());
@@ -454,6 +457,8 @@ async fn compact_route(
         ttft_ms: None,
         total_tokens: None,
         cached_tokens: None,
+        // Not derived for control endpoints — see the sibling `control_route` set-site's note.
+        subagent: None,
     };
     log.emit();
     log_bus.publish(log.to_log_event());
