@@ -136,7 +136,8 @@ use polyflare_core::{Account, ExecError, Executor, PreparedRequest, RequestCtx, 
 
 use super::codec::build_response_create;
 use super::conn::{
-    connect_detailed, ConnectOutcome, WsConn, WS_PING_INTERVAL, WS_READ_IDLE_MARKER,
+    connect_detailed, ConnectOutcome, WsConn, TURN_STATE_HEADER, WS_PING_INTERVAL,
+    WS_READ_IDLE_MARKER,
 };
 use super::delta::{plan_request_for_conn, RequestPlan};
 use super::turn::{
@@ -410,12 +411,33 @@ impl CodexWsExecutor {
     /// longer locks anything itself; it is plain, synchronous, content-free planning over a
     /// reference the caller already holds exclusively.
     fn plan_and_build_locked(conn: &WsConn, body: &Value) -> Value {
-        match plan_request_for_conn(conn, body) {
+        let mut envelope = match plan_request_for_conn(conn, body) {
             RequestPlan::Incremental { anchor, suffix } => {
                 build_response_create(body, Some(&anchor), &suffix, None)
             }
             RequestPlan::Full => build_response_create(body, None, &full_input(body), None),
+        };
+        // Task 4 F1 (codex parity, `client.rs:1568-1569`): replay the server-issued turn-state
+        // captured on THIS socket — from the WS upgrade-response header at connect, or a
+        // `response.metadata` frame (`WsConn::server_turn_state`, set-once/first-wins per socket) —
+        // into EVERY outbound frame's `client_metadata` under `x-codex-turn-state`. When the server
+        // never supplied one (`None`) insert NOTHING — never fabricated (codex inserts only when its
+        // OnceLock is set). Written through the SAME `client_metadata` get-or-insert
+        // `build_response_create` uses (F2 timing) / `seed_trace_headers` uses (F3 trace), so it
+        // augments — never clobbers — those keys. `client_metadata` is NOT a `delta::NON_INPUT_FIELDS`
+        // field, so this does NOT perturb `non_input_fingerprint` / the incremental-caching chain /
+        // the `conn_key` — the WS fingerprint parity gate stays green. It IS a fingerprint tell AND a
+        // warm-cache/sticky-routing signal on WS. Content-free routing token — its VALUE is never
+        // logged.
+        if let Some(turn_state) = &conn.server_turn_state {
+            if let Some(obj) = envelope.as_object_mut() {
+                super::codec::client_metadata_object_mut(obj).insert(
+                    TURN_STATE_HEADER.to_string(),
+                    Value::String(turn_state.clone()),
+                );
+            }
         }
+        envelope
     }
 
     /// Drive one turn to completion, applying the two bounded recovery paths (module doc) to the
@@ -948,6 +970,38 @@ mod tests {
         assert!(
             !cm.contains_key("ws_request_header_tracestate"),
             "no tracestate must be fabricated when the incoming request had none: {envelope}"
+        );
+    }
+
+    // ---- Task 4 F1: replay the captured server turn-state into every frame's client_metadata ---
+
+    #[tokio::test]
+    async fn plan_and_build_locked_replays_turn_state_into_client_metadata() {
+        let mock = MockWsUpstream::new(ScriptedTurn::normal(vec![]));
+        let base = mock.clone().spawn().await;
+        let mut conn = WsConn::connect(&test_account(base), &[])
+            .await
+            .expect("connect");
+        let body = json!({"model": "gpt-5.6-sol", "input": [item(0)]});
+
+        // None (the mock handshake supplies no turn-state header) ⇒ the replay key is ABSENT —
+        // never fabricated. (F2 still stamps its timing key, so client_metadata itself exists.)
+        let envelope = CodexWsExecutor::plan_and_build_locked(&conn, &body);
+        let cm = envelope["client_metadata"]
+            .as_object()
+            .expect("F2 always stamps a client_metadata object");
+        assert!(
+            !cm.contains_key("x-codex-turn-state"),
+            "no turn-state must be replayed when the socket never captured one: {envelope}"
+        );
+
+        // Some("ts-9") ⇒ replayed verbatim into client_metadata (codex parity, client.rs:1568-1569).
+        conn.server_turn_state = Some("ts-9".to_string());
+        let envelope = CodexWsExecutor::plan_and_build_locked(&conn, &body);
+        assert_eq!(
+            envelope["client_metadata"]["x-codex-turn-state"],
+            json!("ts-9"),
+            "the captured turn-state must be replayed into the frame's client_metadata: {envelope}"
         );
     }
 

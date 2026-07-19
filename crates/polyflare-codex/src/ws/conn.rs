@@ -55,9 +55,18 @@ use crate::executor::ensure_rustls_crypto_provider;
 /// appended to.
 const OPENAI_BETA_WS: &str = "responses_websockets=2026-02-06";
 
-/// Ground truth §1/§7.1: MUST NOT appear as a WS handshake header — stripped from
-/// `forward_headers` even if present, since it belongs only inside frame `client_metadata`.
-const TURN_STATE_HEADER: &str = "x-codex-turn-state";
+/// The canonical `x-codex-turn-state` name — a single source of truth rather than three drifting
+/// literals, since this crate must keep it byte-identical in three places:
+/// 1. **Stripped** from the WS handshake headers here (ground truth §1/§7.1: on WS it must NOT be a
+///    handshake header — it belongs only inside frame `client_metadata`).
+/// 2. **Matched** as the `headers`-object key of a `response.metadata` frame in `ws::turn` (the
+///    secondary turn-state capture path, `sse/responses.rs:263-272`).
+/// 3. **Replayed** as the `client_metadata` key in `ws::executor` (`client.rs:1568-1569`).
+///
+/// It is ALSO the upgrade-response header this module reads in [`connect_detailed_with_timeout`] to
+/// PRIMARILY capture the server-issued token (`responses_websocket.rs:529-535`).
+/// `pub(crate)`: read by `ws::turn` and `ws::executor` for (2) and (3).
+pub(crate) const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 
 /// Bounded dial/handshake budget — a hung TCP/TLS/WS-upgrade must not stall a turn until the OS TCP
 /// timeout. Mirrors CLIProxyAPI's 30s codex WS dial bound. Overridable per-call via
@@ -136,6 +145,21 @@ pub struct WsConn {
     /// this. Never raw conversation content. Must be set at the same time and by the same sender
     /// as `last_item_hashes` (see that field's doc for the failure mode if it's forgotten).
     pub last_non_input_fingerprint: Option<String>,
+    /// The server-issued `x-codex-turn-state` sticky-routing token captured on THIS socket, or
+    /// `None` until the server supplies one. **Set-once, first-wins, per-connection** — mirroring
+    /// codex's per-`ModelClient` `OnceLock<String>` (`core/src/client.rs:285`,
+    /// `responses_websocket.rs:529-535`'s `let _ = turn_state.set(...)` which ignores later sets):
+    /// captured PRIMARILY from the WS UPGRADE-response header in [`connect_detailed_with_timeout`]
+    /// (this construction site), and SECONDARILY (set only if still `None`) from a
+    /// `response.metadata` frame in `ws::turn`. A RECONNECT dials a FRESH `WsConn`, which legitimately
+    /// captures the NEW socket's own turn-state — first-wins is scoped to one socket, exactly like
+    /// codex's per-connection `OnceLock`; it is NOT persisted across reconnects. Replayed verbatim
+    /// into EVERY outbound frame's `client_metadata["x-codex-turn-state"]` by
+    /// `ws::executor::plan_and_build_locked` (ground truth §7.1: on WS the token lives ONLY in frame
+    /// `client_metadata`, never as a handshake header — the opposite of the HTTP path). Content-free
+    /// routing token (server-issued, not conversation content) — safe to store/replay, but its VALUE
+    /// is NEVER logged. `pub(crate)`: set by `ws::turn`, read by `ws::executor`.
+    pub(crate) server_turn_state: Option<String>,
     /// Set once this socket is known dead: a `Close` frame / clean stream end observed by
     /// `recv_frame`, or a send/recv error. Ground truth §2: real codex reuse is "gated only on
     /// liveness (`conn.is_closed()`)" — Task 7's connection cache reads this via [`Self::is_closed`]
@@ -299,18 +323,32 @@ pub(crate) async fn connect_detailed_with_timeout(
             "upstream WS handshake timed out after {connect_timeout:?}"
         ))),
         Ok(inner) => match inner {
-            Ok((socket, _response)) => ConnectOutcome::Connected(Box::new(WsConn {
-                socket,
-                closed: false,
-                last_response_id: None,
-                last_input_count: None,
-                last_item_hashes: None,
-                last_non_input_fingerprint: None,
-                // `None` = codex-rs default: no client-initiated ping. `ws::executor` overrides
-                // this to `Some(WS_PING_INTERVAL)` right after connect ONLY when
-                // `POLYFLARE_WS_CLIENT_PING` is on.
-                client_ping_interval: None,
-            })),
+            Ok((socket, response)) => {
+                // codex parity (`responses_websocket.rs:529-535`): the PRIMARY turn-state capture —
+                // read the server-issued `x-codex-turn-state` off the WS UPGRADE response header
+                // (`.to_str().ok()`, exactly as codex does). `None` when the header is absent (never
+                // fabricated); a `response.metadata` frame is the secondary set-if-none path in
+                // `ws::turn`. First-wins is per-socket, so seeding it here at construction is the
+                // "first" value for this connection. The token VALUE is never logged.
+                let server_turn_state = response
+                    .headers()
+                    .get(TURN_STATE_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                ConnectOutcome::Connected(Box::new(WsConn {
+                    socket,
+                    closed: false,
+                    last_response_id: None,
+                    last_input_count: None,
+                    last_item_hashes: None,
+                    last_non_input_fingerprint: None,
+                    server_turn_state,
+                    // `None` = codex-rs default: no client-initiated ping. `ws::executor` overrides
+                    // this to `Some(WS_PING_INTERVAL)` right after connect ONLY when
+                    // `POLYFLARE_WS_CLIENT_PING` is on.
+                    client_ping_interval: None,
+                }))
+            }
             // Ground truth §5: HTTP 426 Upgrade Required, checked at handshake time, is the ONLY
             // `FallbackToHttp` trigger — "No other status falls back". Everything else (refused,
             // timeout, DNS, any other HTTP status, a protocol-level handshake error, ...) collapses
@@ -962,6 +1000,77 @@ mod tests {
         assert!(
             headers.get("sec-websocket-protocol").is_none(),
             "must never set a subprotocol"
+        );
+    }
+
+    /// A WS server that completes the handshake, optionally injecting an `x-codex-turn-state`
+    /// header into the UPGRADE RESPONSE (via the `accept_hdr` callback's mutable `Response`) — the
+    /// server-side of the primary turn-state capture path (`responses_websocket.rs:529-535`). Holds
+    /// the socket open briefly so the client's handshake response is fully read before teardown.
+    /// `Some(WebSocketConfig::default())` for the same permessage-deflate reason
+    /// `spawn_header_capture_server` documents.
+    async fn spawn_turn_state_response_server(turn_state: Option<String>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let ts = turn_state.clone();
+                let callback =
+                    move |_req: &Request, mut resp: Response| -> Result<Response, ErrorResponse> {
+                        if let Some(ts) = &ts {
+                            resp.headers_mut().insert(
+                                HeaderName::from_static("x-codex-turn-state"),
+                                HeaderValue::from_str(ts).expect("valid header value"),
+                            );
+                        }
+                        Ok(resp)
+                    };
+                if let Ok(_ws) = tokio_tungstenite::accept_hdr_async_with_config(
+                    stream,
+                    callback,
+                    Some(WebSocketConfig::default()),
+                )
+                .await
+                {
+                    // Hold the socket open briefly so the client can read the 101 response (with
+                    // our header) before EOF — no proactive send, no frame.
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(200),
+                        std::future::pending::<()>(),
+                    )
+                    .await;
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Primary capture path (`responses_websocket.rs:529-535`): the server-issued
+    /// `x-codex-turn-state` on the WS UPGRADE response header is captured onto the `WsConn`; an
+    /// absent header yields `None` (never fabricated).
+    #[tokio::test]
+    async fn connect_captures_server_turn_state_from_the_upgrade_response_header() {
+        // Present ⇒ captured verbatim.
+        let base = spawn_turn_state_response_server(Some("ts-123".to_string())).await;
+        let conn = WsConn::connect(&test_account(base), &[])
+            .await
+            .expect("connect");
+        assert_eq!(
+            conn.server_turn_state.as_deref(),
+            Some("ts-123"),
+            "the server-issued upgrade-response turn-state must be captured onto the WsConn"
+        );
+
+        // Absent ⇒ None (never fabricated).
+        let base = spawn_turn_state_response_server(None).await;
+        let conn = WsConn::connect(&test_account(base), &[])
+            .await
+            .expect("connect");
+        assert_eq!(
+            conn.server_turn_state, None,
+            "an absent upgrade-response header must leave server_turn_state None — never fabricated"
         );
     }
 }
