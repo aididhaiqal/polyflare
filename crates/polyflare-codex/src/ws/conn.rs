@@ -64,6 +64,15 @@ const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 /// [`connect_detailed_with_timeout`] (tests inject a short value); [`connect_detailed`] uses this.
 pub(crate) const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bounded send budget — a hung write (a backpressured/half-open peer that never drains the socket)
+/// must not stall a turn forever the way an untimed `self.socket.send(...).await` would. This is the
+/// missing third bound alongside the dial ([`WS_CONNECT_TIMEOUT`]) and per-read
+/// ([`WS_READ_IDLE_TIMEOUT`]) bounds — codex itself bounds its send with its idle timeout. On elapse
+/// the socket is poisoned (`self.closed = true`) exactly like any other send failure, so it is
+/// evicted on reuse. Overridable per-call via [`WsConn::send_frame_with_timeout`] (tests inject a
+/// short value); [`WsConn::send_frame`] uses this.
+pub(crate) const WS_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Max silence (per `recv_frame` call) before the socket is treated as stalled and poisoned
 /// (`self.closed = true` → [`WsConn::is_closed`] → evicted on next reuse). Deliberately ~10s BELOW
 /// `polyflare-server`'s `DEFAULT_STREAM_IDLE_TIMEOUT` (300s, codex's own `stream_idle_timeout`
@@ -323,16 +332,39 @@ impl WsConn {
     /// `Text` WS message. First consumer: Task 5's turn stream (`ws::turn`), hence `pub(crate)` —
     /// the socket itself stays private to this module.
     pub(crate) async fn send_frame(&mut self, envelope: &Value) -> Result<(), ExecError> {
+        self.send_frame_with_timeout(envelope, WS_SEND_TIMEOUT)
+            .await
+    }
+
+    /// [`send_frame`] with the send budget injected, so a test can pass a SHORT duration and prove a
+    /// hung write self-terminates (poisoning the socket) without sleeping the production 30s.
+    /// Production calls delegate here via [`send_frame`] with [`WS_SEND_TIMEOUT`]. The `Ok`/`Err`
+    /// arms below are unchanged from the untimed original; only the `tokio::time::timeout` wrapper
+    /// and its elapsed arm are new (the third transport bound alongside dial + read).
+    pub(crate) async fn send_frame_with_timeout(
+        &mut self,
+        envelope: &Value,
+        timeout: Duration,
+    ) -> Result<(), ExecError> {
         let text = serde_json::to_string(envelope).map_err(|e| {
             ExecError::Upstream(format!("failed to serialize response.create: {e}"))
         })?;
-        match self.socket.send(Message::Text(text.into())).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
+        match tokio::time::timeout(timeout, self.socket.send(Message::Text(text.into()))).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
                 // A send failure means this socket can no longer be trusted for reuse — see
                 // `closed`'s doc. Task 7's cache checks this before ever attempting reuse.
                 self.closed = true;
                 Err(ExecError::Upstream(e.to_string()))
+            }
+            // A hung write (backpressured or half-open peer) elapsed the budget: poison the socket
+            // like any other send failure so it is evicted on reuse, and surface the bounded timeout
+            // rather than stalling the turn until the OS TCP timeout.
+            Err(_elapsed) => {
+                self.closed = true;
+                Err(ExecError::Upstream(format!(
+                    "upstream WS send timed out after {timeout:?}"
+                )))
             }
         }
     }
@@ -623,6 +655,51 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "must return within the injected 50ms budget (well under the 300s default), took {elapsed:?}"
+        );
+    }
+
+    /// A send whose peer never drains the socket must not stall a turn forever: a frame far larger
+    /// than any socket send buffer + peer receive window, written to a server that never reads,
+    /// backpressures (WouldBlock) and never completes. `send_frame_with_timeout` must return an
+    /// `Upstream` send timeout AND poison the connection (`is_closed()`) within the SHORT injected
+    /// budget — not hang until the OS TCP timeout. A 200ms injected budget drives it with no 30s
+    /// production sleep. (`spawn_silent_ws_server` uses `WebSocketConfig::default()` → no
+    /// permessage-deflate is negotiated, so the filler bytes hit the wire uncompressed and actually
+    /// fill the buffers; without deflate a repetitive payload cannot be compressed away.)
+    #[tokio::test]
+    async fn send_frame_times_out_on_a_stalled_write() {
+        let base = spawn_silent_ws_server().await;
+        let account = test_account(base);
+        let mut conn = WsConn::connect(&account, &[]).await.expect("connect");
+        assert!(
+            !conn.is_closed(),
+            "a freshly connected socket is not closed"
+        );
+
+        // 16 MiB — comfortably beyond any default TCP send buffer + peer receive window, so the very
+        // first flush backpressures and the send future parks instead of completing.
+        let big = serde_json::json!({ "filler": "x".repeat(16 * 1024 * 1024) });
+
+        let start = std::time::Instant::now();
+        let result = conn
+            .send_frame_with_timeout(&big, Duration::from_millis(200))
+            .await;
+        let elapsed = start.elapsed();
+
+        match result {
+            Err(ExecError::Upstream(msg)) => assert!(
+                msg.contains("send timed out"),
+                "a stalled send must surface a send-timeout Upstream error, got: {msg}"
+            ),
+            other => panic!("expected a send-timeout Upstream error, got {other:?}"),
+        }
+        assert!(
+            conn.is_closed(),
+            "a send-timeout socket must be poisoned (is_closed → evicted on next reuse)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must return within the injected 200ms budget (well under the 30s default), took {elapsed:?}"
         );
     }
 
