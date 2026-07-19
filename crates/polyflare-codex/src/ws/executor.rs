@@ -16,25 +16,36 @@
 //! `x-codex-turn-state`). Nothing here changes that.
 //!
 //! # The connection cache
-//! Keyed by `conn_key` = `ctx.session_key`'s hashed `value` folded with the request's
-//! `ws::delta::non_input_fingerprint` and, when present, the hashed `ctx.conn_discriminator` (the
-//! thread-unique `x-codex-window-id`) — `"<session>:<non-input-hash>:<window-id-hash>"`. All three
-//! halves are content-free sha256 hex digests — `SessionKey::value` is computed by
+//! Keyed by `conn_key`, which LEADS with the owner `account.id`, then `ctx.session_key`'s hashed
+//! `value` folded with the request's `ws::delta::non_input_fingerprint`, and — when present — the
+//! hashed `ctx.conn_discriminator` (the thread-unique `x-codex-window-id`):
+//! `"<account_id>:<session>:<non-input-hash>:<window-id-hash>"`. The last three components are
+//! content-free sha256 hex digests — `SessionKey::value` is computed by
 //! `polyflare-server::session_key`, the fingerprint hashes only non-input request fields (model,
 //! instructions, tools, …), and the discriminator is a bounded thread id (`{thread_id}:0`), hashed
-//! via `ws::delta::sha256_hex` — so the key never contains the raw request body. Folding in the
-//! non-input fingerprint gives each interleaved model-stream on one conversation (codex drives two
-//! models per turn) its OWN socket + anchor chain: without it, the two streams shared one socket
-//! and clobbered each other's stored fingerprint, forcing every turn to a full (uncached) send.
-//! Folding in the window-id additionally isolates each codex THREAD (main / review / compact /
-//! spawn) even when its `session_key` AND `non_input_fingerprint` coincide with another thread's —
-//! the one gap the session+fingerprint key leaves, since the `x-codex-turn-state` `session_key`
-//! branch drops `prompt_cache_key`; each thread then gets its own socket regardless of which
-//! `session_key` branch fired. When `ctx.conn_discriminator` is `None` the third component is
-//! omitted entirely, so `conn_key` is BYTE-IDENTICAL to the pre-window-id `"<session>:<hash>"` form
-//! — a deliberate back-compat constraint that preserves the per-model-stream caching above exactly.
-//! This folding is transport-only and ownership-blind: it never touches continuity/wedge/`delta.rs`
-//! logic. The 426 WS-disable and all logging stay keyed on the plain `session_key` (a 426 disables
+//! via `ws::delta::sha256_hex` — so the key never contains the raw request body; the leading
+//! `account.id` is a non-secret internal id (the same one stored in `RequestLog.account_id`), never
+//! a token. **The `account.id` MUST lead the key because a chatgpt.com WS socket is authenticated
+//! per-account at the HANDSHAKE (Bearer + ChatGPT-Account-ID), and reuse is gated on liveness
+//! (`is_closed()`) alone — never on the account.** So a DIFFERENT account MUST resolve a DIFFERENT
+//! key and get its OWN socket: on a failover the session/conversation/body/window-id are all
+//! identical (owner account A -> account B), and without `account.id` in the key the two would be
+//! byte-identical, so B's turn would be driven over A's still-live, A-authenticated socket and be
+//! served/billed on A — the very account the failover exists to avoid. Leading with `account.id`
+//! makes a failover UNABLE to reuse the prior account's connection. Folding in the non-input
+//! fingerprint gives each interleaved model-stream on one conversation (codex drives two models per
+//! turn) its OWN socket + anchor chain: without it, the two streams shared one socket and clobbered
+//! each other's stored fingerprint, forcing every turn to a full (uncached) send. Folding in the
+//! window-id additionally isolates each codex THREAD (main / review / compact / spawn) even when
+//! its `session_key` AND `non_input_fingerprint` coincide with another thread's — the one gap the
+//! session+fingerprint key leaves, since the `x-codex-turn-state` `session_key` branch drops
+//! `prompt_cache_key`; each thread then gets its own socket regardless of which `session_key`
+//! branch fired. When `ctx.conn_discriminator` is `None` the window-id component is omitted
+//! entirely, so `conn_key` is BYTE-IDENTICAL to the `"<account_id>:<session>:<hash>"` form — a
+//! deliberate back-compat constraint that preserves the per-model-stream caching above exactly. A
+//! stable account keeps a stable key, so same-account reuse (hence the just-merged incremental
+//! caching) is untouched; only an account CHANGE yields a new key. This folding is transport-only
+//! and ownership-blind: it never touches continuity/wedge/`delta.rs` logic. The 426 WS-disable and all logging stay keyed on the plain `session_key` (a 426 disables
 //! WS for the whole session, every model-stream and thread). A request with no session key
 //! (`ctx.session_key: None`) gets `conn_key: None` — a fresh, uncached connection every call: no reuse is possible
 //! without something to key on, but the request still completes correctly (as a full send with no
@@ -249,10 +260,12 @@ impl CodexWsExecutor {
     /// Get a live cached connection for `conn_key`, or dial a fresh one — never reusing a
     /// connection [`WsConn::is_closed`] reports dead (module doc's eviction rule).
     ///
-    /// `conn_key` is purely the connection-cache key (`session_key` folded with the request's
-    /// `non_input_fingerprint` — see where it's computed in this impl's `execute` for why): this
-    /// function has no session-vs-model semantics of its own, it just get/insert/removes
-    /// `self.conns` by whatever key it's handed.
+    /// `conn_key` is purely the connection-cache key (the owner `account.id` leading `session_key`
+    /// folded with the request's `non_input_fingerprint` — see where it's computed in this impl's
+    /// `execute` for why): this function has no account-vs-session-vs-model semantics of its own, it
+    /// just get/insert/removes `self.conns` by whatever key it's handed. Because `account.id` leads
+    /// the key, a failover to a different account can never resolve — and so can never reuse — the
+    /// prior account's cached socket here.
     async fn connect_and_cache(
         &self,
         account: &Account,
@@ -539,21 +552,32 @@ impl Executor for CodexWsExecutor {
 
         let body = materialize_body(&req)?;
 
-        // Per-thread, per-model-stream connection key: codex interleaves multiple models (e.g.
-        // gpt-5.6-luna + gpt-5.6-sol) on ONE conversation, and drives several THREADS (main /
-        // review / compact / spawn) — each with a distinct `x-codex-window-id`. Keying the socket
-        // cache on session_key alone made model-streams share a socket and clobber each other's
-        // anchor/non-input fingerprint, forcing plan_request to Full every turn (0% cache). Folding
-        // the non-input fingerprint in gives each model-stream its OWN socket + clean
+        // Per-account, per-thread, per-model-stream connection key. `account.id` LEADS the key:
+        // a chatgpt.com WS socket is authenticated per-account at the handshake (Bearer +
+        // ChatGPT-Account-ID) and reuse is gated on liveness alone, so a different account MUST get
+        // a different key -> its own socket. On failover (owner A -> B) session/body/window-id are
+        // identical; without account.id the key would be byte-identical and B's turn would ride A's
+        // still-live A-authenticated socket -> served/billed on A. Then: codex interleaves multiple
+        // models (e.g. gpt-5.6-luna + gpt-5.6-sol) on ONE conversation, and drives several THREADS
+        // (main / review / compact / spawn) — each with a distinct `x-codex-window-id`. Keying the
+        // socket cache on session_key alone made model-streams share a socket and clobber each
+        // other's anchor/non-input fingerprint, forcing plan_request to Full every turn (0% cache).
+        // Folding the non-input fingerprint in gives each model-stream its OWN socket + clean
         // strict-extension chain -> Incremental -> the backend caches. Folding the hashed
-        // `conn_discriminator` (the `x-codex-window-id`) in as a THIRD component additionally
-        // isolates each THREAD even when session_key AND non_input_fingerprint coincide (the gap the
-        // `x-codex-turn-state` session_key branch leaves by dropping `prompt_cache_key`).
-        // Back-compat: when `conn_discriminator` is None the key is byte-identical to the pre-task
-        // `session:fingerprint` form, preserving the just-merged per-model-stream caching exactly.
-        // Content-free: all three halves are sha256 hex digests; `disc` is hashed, never used raw.
+        // `conn_discriminator` (the `x-codex-window-id`) in additionally isolates each THREAD even
+        // when session_key AND non_input_fingerprint coincide (the gap the `x-codex-turn-state`
+        // session_key branch leaves by dropping `prompt_cache_key`). Back-compat: a stable account
+        // keeps a stable key, and when `conn_discriminator` is None the window-id component is
+        // omitted, so same-account reuse and the just-merged per-model-stream caching are unchanged;
+        // only an account CHANGE yields a new key. Content-free: session/fingerprint/disc are
+        // sha256 hex digests (`disc` hashed, never used raw); `account.id` is a non-secret internal
+        // id (already in RequestLog.account_id), never a token — and conn_key is never logged.
         let conn_key = session_key.as_ref().map(|sk| {
-            let base = format!("{sk}:{}", crate::ws::delta::non_input_fingerprint(&body));
+            let base = format!(
+                "{}:{sk}:{}",
+                account.id,
+                crate::ws::delta::non_input_fingerprint(&body)
+            );
             match ctx.conn_discriminator.as_deref() {
                 Some(disc) => format!("{base}:{}", crate::ws::delta::sha256_hex(disc.as_bytes())),
                 None => base,
@@ -607,6 +631,17 @@ mod tests {
             base_url,
             bearer_token: "secret-bearer".into(),
             chatgpt_account_id: None,
+        }
+    }
+
+    /// Same as [`test_account`] but with an explicit `id` — used by the Task 1 account-isolation
+    /// test to construct two accounts pointing at the SAME mock upstream (same `base_url`) that
+    /// differ ONLY in `id`, so the shared `handshake_count` proves a different account gets its own
+    /// socket.
+    fn test_account_with_id(base_url: String, id: &str) -> Account {
+        Account {
+            id: id.into(),
+            ..test_account(base_url)
         }
     }
 
@@ -1020,6 +1055,83 @@ mod tests {
             mock.handshake_count(),
             2,
             "a repeat with the SAME window-id must REUSE the existing socket — no third handshake"
+        );
+    }
+
+    // ---- WS hardening Task 1 (account identity): a failover must NEVER reuse another account's socket
+
+    /// Root cause this guards: a WS socket to chatgpt.com is authenticated per-account at the
+    /// HANDSHAKE (Bearer + ChatGPT-Account-ID). On failover the owner account changes (A -> B) but
+    /// the session/conversation/body/window-id are all identical, so a `conn_key` that omits the
+    /// account is BYTE-IDENTICAL across the switch — and `connect_and_cache` reused the cached
+    /// socket on `is_closed()` alone, never the account. B's turn would then be driven over A's
+    /// still-live authenticated socket -> served/billed on A (the very account failover exists to
+    /// avoid). Folding `account.id` in as the FIRST `conn_key` component makes a different account
+    /// resolve a different key -> its own fresh handshake, while the SAME account keeps a stable key
+    /// -> the just-merged incremental caching is untouched.
+    #[tokio::test]
+    async fn two_accounts_same_session_and_body_get_distinct_sockets() {
+        // 3 turns for 3 execute() calls: account A dials, account B (different account.id, SAME
+        // session + SAME body + SAME/absent window-id) must dial its OWN socket, then account A
+        // REPEATED reuses A's socket — proving both that a DIFFERENT account.id splits AND that the
+        // SAME account.id reuses (same-account caching preserved), not merely that they differ once.
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::normal(vec![]),
+        ]);
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::new(never_called_fallback());
+
+        // Two accounts pointing at the SAME mock upstream, differing ONLY in `id`.
+        let account_a = test_account_with_id(base.clone(), "acct-A");
+        let account_b = test_account_with_id(base, "acct-B");
+
+        // ONE session_key, ONE model/body — the ONLY thing that differs is the account.
+        let ctx = ctx_with_session("failover");
+        let body = json!({"model": "gpt-5.6-sol", "input": [item(0), item(1)]});
+
+        // Account A, first call: dials its own fresh socket.
+        let stream = executor
+            .execute(prepared(body.clone()), &account_a, &ctx)
+            .await
+            .expect("account A must succeed");
+        drain(stream).await;
+        assert_eq!(
+            mock.handshake_count(),
+            1,
+            "account A's first call dials its own fresh socket"
+        );
+
+        // Account B: SAME session_key AND SAME body (hence SAME non_input_fingerprint) AND
+        // SAME/absent window-id, differing ONLY in account.id. Pre-fix this reused account A's
+        // still-live, A-authenticated socket -> B's turn served/billed on A. It must now dial its
+        // OWN socket — the whole point of Task 1.
+        let stream = executor
+            .execute(prepared(body.clone()), &account_b, &ctx)
+            .await
+            .expect("account B must succeed");
+        drain(stream).await;
+        assert_eq!(
+            mock.handshake_count(),
+            2,
+            "account B must dial its OWN socket — a different account.id yields a different \
+             conn_key even with an identical session_key, body, and window-id: a failover can \
+             never reuse the prior account's authenticated connection"
+        );
+
+        // Account A again, IDENTICAL in all of (account.id, session, body, window-id): must REUSE
+        // A's socket — proving same-account caching still works, not just that accounts split.
+        let stream = executor
+            .execute(prepared(body.clone()), &account_a, &ctx)
+            .await
+            .expect("account A's repeat must succeed");
+        drain(stream).await;
+        assert_eq!(
+            mock.handshake_count(),
+            2,
+            "a repeat on the SAME account must REUSE the existing socket — no third handshake: \
+             folding account.id in must not regress same-account incremental caching"
         );
     }
 
