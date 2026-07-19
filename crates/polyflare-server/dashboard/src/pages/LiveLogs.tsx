@@ -9,11 +9,18 @@
 // CONSTRUCTION (see that module's own doc comment) — it is built exclusively from
 // `RequestLog::to_log_event` (`observability.rs`), which draws from the same audited field set as
 // the persisted `request_log` row: counts, ids, statuses, timings, never a body/prompt/response/
-// key. This page renders ONLY the 9 real fields on the wire `LogEvent` type (`lib/api.ts`):
-// ts_ms, level, provider, account, model, status, latency_ms, kind, message. No tooltip, no
-// "expand for detail" affordance, no field beyond this set is added anywhere below — there is
-// nothing else in the event to show, so nothing else is shown. `message` itself is the backend's
-// own pre-built content-free string (e.g. `"req 200 · codex · 707ms"`, see
+// key. This page renders ONLY the 10 real fields on the wire `LogEvent` type (`lib/api.ts`):
+// ts_ms, level, provider, account, model, status, latency_ms, subagent, kind, message. `subagent`
+// is the codex sub-agent role label from `x-openai-subagent` (`"review"` / `"compact"` /
+// `"memory_consolidation"` / `"collab_spawn"`) — a bounded role slug, i.e. content-free routing
+// metadata, NOT conversation content; same content-safety class as `model`/`provider`. It is
+// `#[serde(skip_serializing_if = "Option::is_none")]` on the wire like `provider`/`account`/`model`,
+// so it is simply absent (not `null`) for the main agent and for non-request events — this page
+// therefore only renders the tag when the field is actually present, exactly like the other
+// optional fields below, never fabricating a "main" label for events that carry no such signal. No
+// tooltip, no "expand for detail" affordance, no field beyond this set is added anywhere below —
+// there is nothing else in the event to show, so nothing else is shown. `message` itself is the
+// backend's own pre-built content-free string (e.g. `"req 200 · codex · 707ms"`, see
 // `RequestLog::to_log_event`) and is rendered verbatim, never parsed/re-colorized by guessing at
 // substrings (the mockup's per-token rainbow message is its own illustrative embellishment, not a
 // real wire shape — reproducing it would require inventing structure the backend doesn't send).
@@ -118,13 +125,22 @@ function formatLogTs(tsMs: number): string {
  * `useLogStream.ts` out of this task — so instead of touching it, every render here first collapses
  * `stream.lines` down to one entry per distinct event. The key is every real content-free field
  * (never anything invented): two entries are "the same event" only if ts_ms/level/kind/message/
- * status/latency_ms/account/provider/model all match, which is true for a byte-for-byte repeat
- * backfill replay and false for any two genuinely different events (even ones a millisecond apart).
- * First occurrence wins, so chronological order is preserved. */
+ * status/latency_ms/account/provider/model/subagent all match, which is true for a byte-for-byte
+ * repeat backfill replay and false for any two genuinely different events (even ones a millisecond
+ * apart). First occurrence wins, so chronological order is preserved. */
 function logEventKey(ev: LogEvent): string {
-  return [ev.ts_ms, ev.level, ev.kind, ev.message, ev.status, ev.latency_ms, ev.account, ev.provider, ev.model].join(
-    "|",
-  );
+  return [
+    ev.ts_ms,
+    ev.level,
+    ev.kind,
+    ev.message,
+    ev.status,
+    ev.latency_ms,
+    ev.account,
+    ev.provider,
+    ev.model,
+    ev.subagent,
+  ].join("|");
 }
 
 function dedupeLogEvents(lines: LogEvent[]): LogEvent[] {
@@ -144,8 +160,16 @@ function dedupeLogEvents(lines: LogEvent[]): LogEvent[] {
  * a server query — there is nothing to deep-link to). */
 function matchesTextFilter(ev: LogEvent, needle: string): boolean {
   if (needle === "") return true;
-  const haystack = [ev.kind, ev.message, ev.account, ev.provider, ev.model, ev.status?.toString()]
-    .filter((v): v is string => v !== undefined)
+  const haystack = [
+    ev.kind,
+    ev.message,
+    ev.account,
+    ev.provider,
+    ev.model,
+    ev.subagent,
+    ev.status?.toString(),
+  ]
+    .filter((v): v is string => v !== undefined && v !== null)
     .join(" ")
     .toLowerCase();
   return haystack.includes(needle);
@@ -394,6 +418,11 @@ function LogLine({ ev }: { ev: LogEvent }) {
         <span className="shrink-0 text-fg opacity-45">{providerBrandKey(ev.provider)}</span>
       )}
       {ev.model !== undefined && <span className="shrink-0 text-fg opacity-45">{ev.model}</span>}
+      {ev.subagent != null && (
+        <span className="shrink-0 whitespace-nowrap rounded bg-accent/15 px-1 py-0 text-[9px] font-bold lowercase leading-none text-accent">
+          {ev.subagent}
+        </span>
+      )}
       <span className="min-w-0 flex-1 break-words text-fg opacity-90">{ev.message}</span>
       {ev.status !== undefined && (
         <span className={clsx("shrink-0 tabular-nums", httpStatusTextClass(ev.status))}>{ev.status}</span>

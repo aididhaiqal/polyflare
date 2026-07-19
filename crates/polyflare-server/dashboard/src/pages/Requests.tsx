@@ -10,9 +10,12 @@
 // COUNTS, never a body/prompt/response/key. This page renders ONLY the real fields on
 // `RequestRowView` (read_api.rs:490-508): id, requested_at, provider, method, path, aliased, status,
 // duration_ms, account_id, model, reasoning_effort, service_tier, transport, ttft_ms, total_tokens,
-// cached_tokens, tps (server-derived). Nothing else exists to render, so nothing else is rendered —
-// see the detail-row section below for the specific fields the mockup shows that are NOT real and
-// are therefore omitted rather than fabricated.
+// cached_tokens, tps (server-derived), subagent. `subagent` is the codex sub-agent role slug from
+// `x-openai-subagent` (`review`/`compact`/`memory_consolidation`/`collab_spawn`), or `null` for the
+// main agent — a bounded role slug, same content-safety class as `model`, never conversation
+// content. Nothing else exists to render, so nothing else is rendered — see the detail-row section
+// below for the specific fields the mockup shows that are NOT real and are therefore omitted rather
+// than fabricated.
 //
 // Field mapping (table columns, in order):
 //   Time        <- r.requested_at (unix secs -> local HH:MM:SS; a plain wall-clock display, not
@@ -21,7 +24,8 @@
 //                   page's other page-local helpers)
 //   Account     <- r.account_id (nullable — a request can fail before an account is chosen)
 //   Provider    <- r.provider via `ProviderTag` (wire value "codex"/"anthropic", never "claude")
-//   Model       <- r.model (+ r.reasoning_effort / r.service_tier as small chips, all nullable)
+//   Model       <- r.model (+ r.reasoning_effort / r.service_tier as small chips, all nullable) +
+//                   r.subagent as a small tag ("main" when null — the main agent, not missing data)
 //   Transport   <- r.transport ("http" today; "ws" once the WS milestone lands — see
 //                   observability.rs's own doc comment on `RequestLog.transport`). Historical rows
 //                   from before this field existed carry `null`, rendered as a dash, never a
@@ -39,9 +43,9 @@
 //                   a missing/unreported value is omitted entirely, never rendered as "0 cch" — the
 //                   brief's absent-vs-0 rule).
 //
-// Expandable detail row: request id, path (method+path), transport, model/effort/tier, requested-at
-// (full date+time), duration, TTFT, TPS, tokens(+cached), aliased — every one a real
-// `RequestRowView` field. The mockup's detail row ALSO shows an api key, a pool, a
+// Expandable detail row: request id, path (method+path), transport, model/effort/tier, subagent
+// ("main" when null), requested-at (full date+time), duration, TTFT, TPS, tokens(+cached), aliased
+// — every one a real `RequestRowView` field. The mockup's detail row ALSO shows an api key, a pool, a
 // downstream/upstream transport split, retry-after, an upstream error code, and a routing trail —
 // NONE of those exist on `RequestRowView` (no pool field; `transport` is a single value, not a
 // downstream/upstream pair; `error_code`/retry-after/routing trail exist nowhere on this endpoint —
@@ -150,14 +154,35 @@ function TransportPill({ transport }: { transport: string | null }) {
   );
 }
 
+/** The sub-agent role tag (`x-openai-subagent`: "review"/"compact"/"memory_consolidation"/
+ * "collab_spawn"), rendered next to the model. `null` means the main agent — a real, determined
+ * state (not missing data), so it renders the word "main" rather than the em-dash this page uses
+ * elsewhere for genuinely absent values. Styled like `TransportPill`'s "on" state (small
+ * accent-tinted pill) when a sub-agent role is present, and like the `effort`/`tier` chips in
+ * `ModelCell` (muted, low-emphasis) for the "main" fallback. */
+function SubagentTag({ subagent }: { subagent: string | null }) {
+  if (!subagent) {
+    return (
+      <span className="ml-1 rounded bg-muted px-1 py-0 text-[8.5px] text-fg opacity-50">main</span>
+    );
+  }
+  return (
+    <span className="ml-1 inline-block whitespace-nowrap rounded bg-accent/15 px-1 py-0 text-[8.5px] font-bold lowercase leading-none text-accent">
+      {subagent}
+    </span>
+  );
+}
+
 function ModelCell({
   model,
   effort,
   tier,
+  subagent,
 }: {
   model: string | null;
   effort: string | null;
   tier: string | null;
+  subagent: string | null;
 }) {
   if (!model) return <span className="text-fg opacity-40">—</span>;
   return (
@@ -173,6 +198,7 @@ function ModelCell({
           {tier}
         </span>
       )}
+      <SubagentTag subagent={subagent} />
     </span>
   );
 }
@@ -648,7 +674,12 @@ function RequestRow({
           <ProviderTag provider={r.provider} />
         </td>
         <td className="px-2 py-1.5">
-          <ModelCell model={r.model} effort={r.reasoning_effort} tier={r.service_tier} />
+          <ModelCell
+            model={r.model}
+            effort={r.reasoning_effort}
+            tier={r.service_tier}
+            subagent={r.subagent}
+          />
         </td>
         <td className="px-2 py-1.5">
           <TransportPill transport={r.transport} />
@@ -696,6 +727,7 @@ function RequestDetail({ row: r }: { row: RequestRowView }) {
           label="model"
           value={[r.model ?? "—", r.reasoning_effort, r.service_tier].filter(Boolean).join(" · ")}
         />
+        <DetailField label="subagent" value={r.subagent ?? "main"} />
       </div>
       <div className="flex flex-wrap gap-x-5 gap-y-1">
         <DetailField label="requested at" value={formatFullDateTime(r.requested_at)} />
