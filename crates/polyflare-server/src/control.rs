@@ -405,9 +405,13 @@ async fn compact_route(
     // Shallow parse: derive the session key (for soft owner affinity) + the content-free model.
     // None ⇒ malformed body ⇒ 400 (mirrors `/responses`'s malformed-body behavior); still log it.
     let facts = crate::session_key::parse_inbound(&headers, &body);
-    let (session_key, model) = match &facts {
-        Some(f) => (f.ctx.session_key.clone(), Some(f.model.clone())),
-        None => (None, None),
+    let (session_key, model, subagent) = match &facts {
+        Some(f) => (
+            f.ctx.session_key.clone(),
+            Some(f.model.clone()),
+            f.ctx.subagent.clone(),
+        ),
+        None => (None, None, None),
     };
 
     let forward_headers = forward_headers_from_inbound(&headers);
@@ -457,8 +461,10 @@ async fn compact_route(
         ttft_ms: None,
         total_tokens: None,
         cached_tokens: None,
-        // Not derived for control endpoints — see the sibling `control_route` set-site's note.
-        subagent: None,
+        // The compact endpoint forwards a real codex `/responses` body, so its sub-agent label
+        // (when the caller sends `x-openai-subagent`) is available on `facts.ctx` — carry it, unlike
+        // the bodyless `control_route` set-site which genuinely has no facts to derive it from.
+        subagent,
     };
     log.emit();
     log_bus.publish(log.to_log_event());
