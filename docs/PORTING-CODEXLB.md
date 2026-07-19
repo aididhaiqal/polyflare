@@ -135,7 +135,7 @@ Route arm (`:449`), ResendFull arm (`:478`), and `RecoveryPlan::None` arm (`:527
   PolyFlare's `apply_ownership` is already at parity — inherit it as the loop's gate.
 *codex-lb:* `_service/streaming/retry.py:218-1389`, `logic.py:1074`, `service.py:1594-2422`.
 
-### B5. Anti-starvation backoff-fallback (serve soonest-to-recover)  · HIGH · medium
+### B5. Anti-starvation backoff-fallback (serve soonest-to-recover)  · HIGH · medium · **DONE (+ Anthropic 2026-07-19)**
 Change `eligibility()` (`select.rs:126`) from `Option<Candidate>` to the enum the code's own comment
 already proposes at `select.rs:114-125`: `Eligible | InBackoff{recover_at} | HardBlocked`. In
 `standard_pool`/`select` (`select.rs:292+`) collect `InBackoff` candidates alongside eligible ones;
@@ -145,6 +145,33 @@ backoff + ≥1 hard-blocked) and force-admit `min-by recover_at`, where
 else blocked is NOT force-served. Thread `allow_backoff_fallback = false` on any sticky/pin grace path.
 Replace `ingress.rs no_eligible()` (`:64`)'s bare 503 with a soonest-reset retry hint.
 *codex-lb:* `logic.py:359-548`, `load_balancer.py:1361,2702`.
+
+**B5-anthropic — Layer-2 recovery-wait extended to `/v1/messages` (DONE 2026-07-19; plan
+`docs/superpowers/plans/2026-07-19-b5-anthropic-empty-pool.md`).** The core B5 above shipped
+Codex-`/responses`-only; this closes the deferred completeness gap by extending the SAME Layer-1/
+Layer-2 keepalive-wait to BOTH Anthropic `/v1/messages` empty-pool paths, so an exhausted pool holds
+the client with SSE keepalives + serves on recovery instead of a fast-fail 503.
+- **Two orthogonal axes** (the design): `pool_provider: Provider` (which accounts to wait on) +
+  a `WaitClient` enum (which SSE dialect the *client* speaks). `WaitClient::{Codex, Anthropic,
+  AnthropicTranslated(factory)}` owns every dialect-specific frame — the keepalive (Codex
+  `: keepalive` comment vs Anthropic `event: ping`), the in-band error (`response.failed` vs
+  `event: error`/`overloaded_error`, both content-free — fixed text + `StarvationOutcome::code()`
+  only), and how the recovered stream reaches the client (verbatim vs Codex→Anthropic translated).
+- **Native path** (Anthropic client → Anthropic pool): `WaitClient::Anthropic`, verbatim forward.
+- **Aliased path** (Anthropic client → Codex pool): `WaitClient::AnthropicTranslated`, wrapping ONLY
+  the recovered Codex stream in a FRESH `AnthropicToResponses` per serve (a translator factory —
+  its state is response-side, built from the stream, so fresh-per-serve is faithful). **Keepalive-
+  survival crux:** the `event: ping` frames are emitted by the outer wait stream and NEVER routed
+  through `TranslatingStream` (whose `feed_line` drops non-`data:` lines) — only `wrap_recovered`
+  touches the translator, and only the recovered stream. Proven by an e2e asserting `event: ping`
+  survives AND `message_start`/`message_stop` appear while raw `response.*` names are absent.
+- **Inviolables held** (whole-branch opus verified in source): ZERO Codex behavior change
+  (`WaitClient::Codex` reproduces today's exact bytes; the `starvation_layer2` `response.failed`
+  wire test exercises the new seam); wedge-neutral (both handlers `NoopContinuity`+`session_key=
+  None`; the recovery splice passes `CodexContinuity` but it's INERT under `session_key=None`, and
+  `watchdog.rs` is untouched); security floor + disable lever (`budget=0`) preserved for the
+  Anthropic paths. T1 refactor + T2 frames + T3 native + T4 aliased, each per-task reviewed (T3/T4
+  adversarial opus). 867 tests, clippy `-D warnings` + fmt clean.
 
 ### B8. Health-tier computation (soft-drain state machine)  · HIGH · medium
 Compute `health_tier` each selection instead of forcing it neutral (`select.rs:100-109` notes this is
@@ -177,8 +204,9 @@ capacity-recovery wait derived from the soonest `reset_at` the snapshots already
   (jitter is ingress-side only, never account/selection state); budget ceiling honored; content-free
   `StarvationSignal.wake_jitter_applied_ms` observable. Adversarial + whole-branch reviewed.
 - **Deferred follow-ups:** write-side cooldown-desync jitter (a NEW knob — must keep `backoff_secs` a stable
-  deterministic selector input); Layer-2 wait extension to the Anthropic `/v1/messages` empty-pool sites (a
-  B5-completeness gap); C9 in-flight lease accounting (the orthogonal concurrent-convergence herd dimension).
+  deterministic selector input); ~~Layer-2 wait extension to the Anthropic `/v1/messages` empty-pool sites~~
+  **(DONE 2026-07-19 — see B5-anthropic above)**; C9 in-flight lease accounting (the orthogonal
+  concurrent-convergence herd dimension, also since DONE).
 
 ---
 
