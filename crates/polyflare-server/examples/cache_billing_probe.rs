@@ -49,11 +49,13 @@
 //!   POLYFLARE_PROBE_MODEL   default "gpt-5.6-luna"
 //!   POLYFLARE_DATA_DIR      default $HOME/.polyflare
 //!
-//! Total live cost: this is intentionally the CHEAPEST probe in this directory — the cache signal
-//! lives in each response's `usage`, not in a moving window, so it needs only a SHORT conversation
-//! with TINY prompts:
+//! Total live cost: still one of the cheapest probes here — the cache signal lives in each
+//! response's `usage`, not in a moving window, so it needs only a SHORT conversation. Each turn
+//! carries a deterministic ~4k-token content-free prefix (see `stable_cache_prefix`) so turn 1
+//! clears OpenAI's ~1024-token prompt-cache minimum — WITHOUT it, `cached_tokens` is structurally 0
+//! and the probe measures nothing (the reason an earlier tiny-prompt version read 0% cache).
 //!   - 1 account (minimum): 2 real model generations (turn 1 seed + turn 2 same-account
-//!     continuation).
+//!     continuation), ~4k input tokens each.
 //!   - 2 accounts (if a 2nd ACTIVE account with headroom exists): +1 more generation (turn 2's
 //!     continuation replayed on the 2nd account) = 3 total.
 //!
@@ -62,7 +64,8 @@
 //!
 //! SAFETY: never prints a token, cookie, refresh token, or Authorization value — only header NAMES
 //! and non-secret usage numbers (account rank label, plan_type, token COUNTS). Never prints
-//! conversation content beyond the two short generic literal prompts below. Only touches `active`
+//! conversation content beyond the short generic literal prompts + the deterministic content-free
+//! padding block this probe itself authors. Only touches `active`
 //! accounts (never `quota_exceeded` / `rate_limited` / anything else), and of those, the ones with
 //! the MOST local headroom.
 
@@ -112,6 +115,24 @@ fn user_msg(text: &str) -> Value {
 
 fn assistant_msg(text: &str) -> Value {
     json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]})
+}
+
+/// A deterministic, content-free ~4k-token block prepended to the seed prompt ONLY to push turn 1's
+/// input above OpenAI's ~1024-token prompt-cache minimum prefix length — below that floor the
+/// backend never caches, so `cached_tokens` reads 0 regardless of same-account affinity (the reason
+/// a tiny-prompt run measures nothing). Identical bytes on every call (line index only, no
+/// randomness / no timestamp) so turn 1 and turn 2 share ONE cacheable prefix under a single
+/// `prompt_cache_key`. Carries no real conversation content — pure fixed padding.
+fn stable_cache_prefix() -> String {
+    let mut s = String::with_capacity(200 * 120);
+    s.push_str("Deterministic prompt-cache measurement context block (content-free padding):\n");
+    for i in 0..200 {
+        s.push_str(&format!(
+            "Line {i:04}: fixed padding to exceed the prompt-cache minimum prefix length; \
+             this line carries no real conversation content whatsoever.\n"
+        ));
+    }
+    s
 }
 
 /// The synthesized codex identity headers for a translated request — a verbatim copy of
@@ -468,9 +489,10 @@ async fn main() {
         println!("    Total: 2 real model generations. Zero /wham/usage reads (not needed).");
     }
     println!(
-        "    Prompts are tiny literal strings authored by this probe (no filler/context padding —\n\
-         \x20   unlike the rate-limit/handover probes, the cache SIGNAL is in `usage`, not in moving\n\
-         \x20   a window, so this is intentionally the cheapest probe in this directory)."
+        "    Each generation carries a deterministic ~4k-token content-free prefix (authored by this\n\
+         \x20   probe) so turn 1 clears OpenAI's ~1024-token prompt-cache minimum — below that floor\n\
+         \x20   cached_tokens is structurally 0 and the probe would measure nothing. Still cheap:\n\
+         \x20   ~4k input tokens/gen, trivial output, no /wham/usage reads."
     );
     println!("════════════════════════════════════════════════════════════════════════════");
 
@@ -498,12 +520,19 @@ async fn main() {
     let nonce = format!("cache-probe-{}", now_millis());
     println!("\n■ Same-account run — account A, stable prompt_cache_key={nonce}");
 
-    // Turn 1 (cold): a short seed message that establishes the prefix under this cache key.
+    // The seed prompt carries a large, deterministic, content-free prefix (see
+    // `stable_cache_prefix`) so turn 1's input clears OpenAI's ~1024-token prompt-cache MINIMUM —
+    // below that floor `cached_tokens` is structurally 0 no matter how warm the affinity, which is
+    // exactly why a tiny-prompt probe measures nothing. Turn 1 and turn 2 share these identical
+    // bytes verbatim, so they form one cacheable prefix under this run's `prompt_cache_key`.
+    let seed_prompt = format!(
+        "{}\nThis is turn one of a cache-affinity measurement. Reply with exactly the word: ok.",
+        stable_cache_prefix()
+    );
+
+    // Turn 1 (cold): establishes + WRITES the prefix cache under this key (expect cache_write>0).
     let mut t1 = base_params(&model, &nonce);
-    t1["input"] = json!([user_msg(
-        "This is turn one of a short cache-affinity measurement. Reply with exactly the word: \
-         ok."
-    )]);
+    t1["input"] = json!([user_msg(&seed_prompt)]);
     let seed = measure(&client, &a, t1).await;
     row("A turn 1 (cold, seed)", &seed);
     if seed.response_id.is_none() {
@@ -513,12 +542,11 @@ async fn main() {
 
     // Turn 2 (same account): continue the SAME conversation, same prompt_cache_key, via the
     // history-based continuation HTTP actually uses (no previous_response_id — TRANSPORT-FINDINGS
-    // fact 1: HTTP rejects it under store:false).
-    let seed_prompt = "This is turn one of a short cache-affinity measurement. Reply with exactly \
-                        the word: ok.";
+    // fact 1: HTTP rejects it under store:false). The shared long prefix should now READ the cache
+    // (expect cached_tokens ≈ the prefix size).
     let mut t2 = base_params(&model, &nonce);
     t2["input"] = json!([
-        user_msg(seed_prompt),
+        user_msg(&seed_prompt),
         assistant_msg(&o1),
         user_msg("Reply with the single word: ok."),
     ]);
