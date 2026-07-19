@@ -49,12 +49,18 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tungstenite::extensions::compression::deflate::DeflateConfig;
+use tungstenite::extensions::ExtensionsConfig;
+use tungstenite::protocol::WebSocketConfig;
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
 const WS_URL: &str = "wss://chatgpt.com/backend-api/codex/responses";
 const AUTH_BASE: &str = "https://auth.openai.com";
+/// The production WS beta header (`ws::conn::WsConn::connect` / `ws_deflate_probe`). WITHOUT it the
+/// backend may route to a different (non-caching?) path — the whole reason for this handshake fix.
+const OPENAI_BETA_WS: &str = "responses_websockets=2026-02-06";
 const INSTRUCTIONS: &str = "You are a terse assistant in a cache measurement probe. Answer in as \
      few tokens as possible. When asked to reply with a specific word, reply with exactly that \
      word and nothing else.";
@@ -326,9 +332,12 @@ fn scrape_usage(buf: &str) -> Option<Usage> {
     None
 }
 
-/// Open a fresh WS to the codex backend for `account`, keyed by `nonce` (the prompt_cache_key). The
-/// handshake is the plain (no permessage-deflate / no OpenAI-Beta) shape `ws_ratelimit_probe` proved
-/// the backend accepts (HTTP 101).
+/// Open a fresh WS to the codex backend for `account`, keyed by `nonce` (the prompt_cache_key),
+/// using the PRODUCTION-FAITHFUL handshake — codex identity headers + `OpenAI-Beta:
+/// responses_websockets=…` + a `permessage-deflate` offer via `connect_async_with_config` — exactly
+/// mirroring `ws::conn::WsConn::connect` and codex-lb's `proxy_websocket.py` (deflate decode is safe
+/// via the workspace's OpenAI-pinned tungstenite forks). This is the handshake the earlier plain
+/// version LACKED — the variable under test for whether WS caches when done the real way.
 async fn connect_ws(account: &Account, nonce: &str) -> Result<Ws, String> {
     let hdrs = codex_headers(
         nonce,
@@ -342,7 +351,15 @@ async fn connect_ws(account: &Account, nonce: &str) -> Result<Ws, String> {
             HeaderValue::from_str(value).map_err(|e| e.to_string())?,
         );
     }
-    let (ws, _resp) = tokio_tungstenite::connect_async(req)
+    req.headers_mut().insert(
+        HeaderName::from_static("openai-beta"),
+        HeaderValue::from_static(OPENAI_BETA_WS),
+    );
+    let mut config = WebSocketConfig::default();
+    let mut extensions = ExtensionsConfig::default();
+    extensions.permessage_deflate = Some(DeflateConfig::default());
+    config.extensions = extensions;
+    let (ws, _resp) = tokio_tungstenite::connect_async_with_config(req, Some(config), false)
         .await
         .map_err(|e| e.to_string())?;
     Ok(ws)
