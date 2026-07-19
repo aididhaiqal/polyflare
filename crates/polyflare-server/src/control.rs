@@ -738,21 +738,33 @@ mod tests {
     }
 
     /// With no owner on record, the `pool` parameter still scopes the INVIOLABLE fallback: an
-    /// account outside the requested pool ("U", unpooled) must never be picked when `pool =
+    /// account outside the requested pool (the unpooled decoy) must never be picked when `pool =
     /// Some("p")`, even though it would be a perfectly eligible candidate under `pool = None`.
+    ///
+    /// The seeded ids are deliberately chosen so this test has TEETH against a dropped `pool`
+    /// argument: `RoundRobin`'s full-tie tiebreak is pure ID-ascending-alphabetical
+    /// (`polyflare_core::select::deterministic_by`). If the pooled account's id sorted BEFORE the
+    /// unpooled decoy's, a regression that silently widened the candidate set to `None` (i.e. lost
+    /// the `pool` scoping) would still coincidentally pick the pooled account — the assertion would
+    /// pass for the wrong reason and the test would prove nothing. Seeding the pooled account as
+    /// `"z-pooled"` (sorts AFTER the decoy `"a-unpooled"`) makes the two behaviors diverge:
+    /// - correct (pool honored): only `"z-pooled"` is a candidate ⇒ picked == `"z-pooled"`.
+    /// - regressed (pool dropped to `None`): both are candidates ⇒ RoundRobin's ascending tiebreak
+    ///   picks `"a-unpooled"` first ⇒ the assertion below FAILS.
     #[tokio::test]
     async fn owner_affine_core_fallback_is_scoped_to_the_given_pool() {
         let state = build_state(Arc::new(RoundRobin)).await;
-        seed_pooled_account(&state.store, &state.cipher, "P", "tokP", "p").await;
-        seed_account(&state.store, &state.cipher, "U", "tokU").await;
+        seed_pooled_account(&state.store, &state.cipher, "z-pooled", "tokP", "p").await;
+        seed_account(&state.store, &state.cipher, "a-unpooled", "tokU").await;
 
         let (_account, picked) = resolve_owner_affine_account(&state, None, Some("p"))
             .await
             .expect("pool-scoped fallback must not error when the pool has an eligible account");
         assert_eq!(
             picked,
-            AccountId::from("P"),
-            "fallback must stay within the requested pool, never picking the unpooled account"
+            AccountId::from("z-pooled"),
+            "fallback must stay within the requested pool, never picking the unpooled decoy \
+             (would fail if a dropped `pool` arg let the alphabetically-first decoy win the tiebreak)"
         );
     }
 
