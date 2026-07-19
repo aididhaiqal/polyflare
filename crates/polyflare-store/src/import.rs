@@ -236,8 +236,12 @@ pub async fn import_from_codex_lb(
     }
 
     // --- usage_history (copied by value) ---
-    // Append-only within the transaction. Import targets a FRESH store; re-importing into a
-    // populated store may duplicate usage rows, which is acceptable for a one-time migration.
+    // Idempotent via the `idx_usage_history_dedupe` UNIQUE index on
+    // (account_id, "window", recorded_at) (migration 0010) + `INSERT OR IGNORE`: re-importing into
+    // a populated store skips any snapshot already present (from a prior import OR the live poller)
+    // and inserts only genuinely-new rows, so the importer can be re-run to pull a delta. The
+    // per-row `rows_affected()` (0 on an ignored collision, 1 on a real insert) makes the reported
+    // count reflect true inserts, mirroring the request_log loop below.
     let src_usage = sqlx::query_as::<_, SrcUsage>(
         "SELECT account_id, recorded_at, \"window\", used_percent, input_tokens, \
          output_tokens, reset_at, window_minutes, credits_has, credits_unlimited, \
@@ -250,8 +254,8 @@ pub async fn import_from_codex_lb(
         // recorded_at is ISO DATETIME text in codex-lb; parse to epoch seconds. `window` is
         // nullable and preserved as-is (NULL stays NULL).
         let recorded_at = parse_epoch(&row.recorded_at)?;
-        sqlx::query(
-            "INSERT INTO usage_history (\
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO usage_history (\
                 account_id, recorded_at, \"window\", used_percent, input_tokens, \
                 output_tokens, reset_at, window_minutes, credits_has, credits_unlimited, \
                 credits_balance\
@@ -270,7 +274,9 @@ pub async fn import_from_codex_lb(
         .bind(row.credits_balance)
         .execute(&mut *tx)
         .await?;
-        summary.usage_rows_imported += 1;
+        // `rows_affected()` is 0 when `OR IGNORE` skips an already-present snapshot, 1 on a real
+        // insert — so the count reflects true inserts (delta), not the full source size.
+        summary.usage_rows_imported += result.rows_affected() as usize;
     }
 
     // --- request_logs (the chat log) ---

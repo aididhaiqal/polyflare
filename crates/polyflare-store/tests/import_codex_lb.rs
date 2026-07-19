@@ -419,9 +419,11 @@ async fn imports_accounts_usage_and_tokens_roundtrip() {
     }
 }
 
-/// Re-importing the same codex-lb DB is idempotent for the chat log: the second run inserts zero
-/// request_log rows (the `import_source_id` unique index + `INSERT OR IGNORE` dedupe), leaving the
-/// row count unchanged.
+/// Re-importing the same codex-lb DB is idempotent for BOTH the chat log AND usage_history: the
+/// second run inserts zero request_log rows (the `import_source_id` unique index) AND zero
+/// usage_history rows (the `idx_usage_history_dedupe` UNIQUE index on
+/// (account_id, "window", recorded_at), migration 0010, + `INSERT OR IGNORE`), leaving both row
+/// counts unchanged — so a re-run pulls only genuinely-new rows (a delta), never duplicates.
 #[tokio::test]
 async fn reimport_is_idempotent_for_request_logs() {
     let dir = tempfile::tempdir().unwrap();
@@ -441,6 +443,7 @@ async fn reimport_is_idempotent_for_request_logs() {
         .await
         .unwrap();
     assert_eq!(first.request_logs_imported, 1);
+    assert_eq!(first.usage_rows_imported, 1);
 
     let second = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false)
         .await
@@ -449,12 +452,25 @@ async fn reimport_is_idempotent_for_request_logs() {
         second.request_logs_imported, 0,
         "re-import must not duplicate chat-log rows"
     );
+    assert_eq!(
+        second.usage_rows_imported, 0,
+        "re-import must not duplicate usage_history rows (idx_usage_history_dedupe)"
+    );
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_log")
         .fetch_one(store.pool())
         .await
         .unwrap();
     assert_eq!(count, 1);
+
+    let usage_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_history")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        usage_count, 1,
+        "usage_history must still hold exactly the one imported snapshot after a re-import"
+    );
 }
 
 /// A mid-import Fernet-decrypt failure must fail cleanly (no panic) AND roll the WHOLE import
