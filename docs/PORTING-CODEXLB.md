@@ -281,7 +281,7 @@ Four forward-only nullable tables (ProxyEndpoint / ProxyPool / ProxyPoolMember /
 per-account IP diversity / anti-ban.
 *codex-lb:* `core/upstream_proxy/resolver.py`, `core/clients/codex.py:150`.
 
-### D14. Tool-call dedupe engine + `/responses/compact`  · LOW · large
+### D14. Tool-call dedupe engine + `/responses/compact`  · LOW · large · **SPLIT: compact DONE 2026-07-19; dedupe DEFERRED (N/A reframe)**
 Port the dedupe module (pure JSON-in/JSON-out — directly translatable): suppress duplicate
 side-effect tool calls (apply_patch/exec_command/write_stdin/spawn_agent/update_plan — the
 `_SIDE_EFFECT_TOOL_CALL_NAMES` frozenset is the exact contract) within one stream **and** across
@@ -289,6 +289,37 @@ replayed input history, with volatile-arg canonicalizers + a 1024-entry LRU. Wir
 and the replayed-input path so a reconnect never forwards a duplicate destructive call. Separately add
 the `/responses/compact` passthrough.
 *codex-lb:* `tool_call_dedupe.py`, `_service/compact.py`.
+
+**`/responses/compact` — DONE 2026-07-19 (D14a, plan
+`docs/superpowers/plans/2026-07-19-d14a-responses-compact.md`).** The real Codex CLI emits
+`POST /responses/compact` (`codex-rs/core/src/client.rs:159`, `compact_conversation_history`, unary)
+to compact a conversation's history; PolyFlare used to 404 it. Now a UNARY passthrough that sidesteps
+the SSE relay / `ObservingStream` / continuity / wedge entirely: `compact_handler`/
+`pooled_compact_handler` → `compact_route` (`crate::control`) → `parse_inbound` (derives the owner-
+affinity `session_key` from the body's `prompt_cache_key` + the content-free `model`) →
+`resolve_owner_affine_account` (D17's soft session→owner affinity, **generalized this feature** to take
+a body-derived `session_key` + a `pool`; `resolve_control_account` is now a thin wrapper — control
+behavior byte-identical) → `polyflare_codex::control_forward` with path `"responses/compact"`
+(`control_url` yields `{base}/responses/compact`). Content-free (body opaque `Bytes`, never logged;
+`request_log` row = `model` + `path:"responses_compact"` + account/status/latency; `prompt_cache_key`
+only hashed into `session_key`, never logged raw — structurally enforced, `RequestLog` has no body-
+capable field). D18-gated (proxy sub-router; `/responses/compact` + `/{pool}/responses/compact`).
+Soft owner affinity (warm prompt cache; never over-binds — an ineligible/absent owner falls through to
+any-eligible). Reviewed clean (content-safety + affinity teeth both adversarially reproduced by the
+reviewer; whole-branch: ready to merge). 875 tests, clippy `-D warnings` + fmt clean.
+
+**Tool-call dedupe engine — DEFERRED (B10-style N/A reframe, not built).** codex-lb dedupes duplicate
+side-effect calls because its persistent WS bridge replays accumulated history and can double-send.
+PolyFlare's `/responses`+`/v1/messages` are stateless single HTTP responses where the CLIENT owns the
+input and full-resend replays the client's own (anchor-stripped) body — PolyFlare never fabricates a
+duplicate destructive call, and a well-behaved upstream emits each `output_item.done` once per
+response. The genuine analog (an upstream re-emitting a side-effect call across turns on one socket)
+only exists on the WS bridge, whose client-facing RAM-accumulation half is explicitly **M5b**. Building
+a frame-DROPPING stream layer now would solve a non-existent problem and is wedge-adjacent (dropping
+frames is exactly what `ObservingStream::poll_next` must never do). **If ever built** (with M5b): a
+`DedupingStream` OUTSIDE `ObservingStream` (mirroring `wrap_translating_stream`), hash-based (`sha256`
+`ItemHash`-style digests like `ws/delta.rs`, never retaining arg strings — cleaner than codex-lb's
+in-RAM canonical-arg keys), in the WS layer. Not on the critical path.
 
 ### D15. Live upstream model-catalog fetch/merge  · LOW · medium · **DONE (single-node)**
 PolyFlare serves static golden metadata pinned to one codex version. Port the fetcher
