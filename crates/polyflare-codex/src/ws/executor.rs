@@ -135,7 +135,7 @@ use serde_json::Value;
 use polyflare_core::{Account, ExecError, Executor, PreparedRequest, RequestCtx, ResponseStream};
 
 use super::codec::build_response_create;
-use super::conn::{connect_detailed, ConnectOutcome, WsConn};
+use super::conn::{connect_detailed, ConnectOutcome, WsConn, WS_PING_INTERVAL};
 use super::delta::{plan_request_for_conn, RequestPlan};
 use super::turn::{
     shared_conn, turn_stream_with_guard, SharedWsConn, ANCHOR_MISS_MARKER, CONNECTION_LIMIT_MARKER,
@@ -167,6 +167,13 @@ pub struct CodexWsExecutor {
     /// per-account dimension of the same fallback-scope decision.
     account_cooldown_until: StdMutex<HashMap<String, Instant>>,
     account_cooldown: Duration,
+    /// The client keepalive-ping cadence stamped onto every socket this executor dials, or `None`
+    /// for the **codex-rs-faithful default** (no client-initiated ping — real codex-rs never pings;
+    /// ground truth §7). Set from `POLYFLARE_WS_CLIENT_PING` (threaded in via `new`/`with_config`'s
+    /// `client_ping_enabled`): `false` ⇒ `None`; `true` ⇒ `Some(WS_PING_INTERVAL)`, the opt-in
+    /// codex-lb-style keepalive for deployments behind aggressive NAT/middleboxes that reap idle
+    /// sockets. Carried onto each fresh `WsConn` in [`Self::connect_and_cache`].
+    client_ping: Option<Duration>,
     max_anchor_miss_retries: u32,
     max_reconnect_retries: u32,
     /// HTTP-SSE fallback, used ONLY for the 426 case (and its per-session/per-account cooldown
@@ -185,29 +192,38 @@ impl CodexWsExecutor {
     /// takes any `Arc<dyn Executor>` so its own tests can inject a lightweight stand-in instead of
     /// standing up a real HTTP mock for a scenario this module never actually sends bytes over
     /// HTTP for — only delegates to).
-    pub fn new(fallback: Arc<dyn Executor>) -> Self {
+    ///
+    /// `client_ping_enabled` comes from `POLYFLARE_WS_CLIENT_PING` (see [`Self::client_ping`]):
+    /// `false` (the default) is codex-rs-faithful — no client-initiated keepalive ping; `true` opts
+    /// into codex-lb-style keepalive pings for aggressive-NAT/middlebox deployments.
+    pub fn new(fallback: Arc<dyn Executor>, client_ping_enabled: bool) -> Self {
         Self::with_config(
             fallback,
             DEFAULT_MAX_ANCHOR_MISS_RETRIES,
             DEFAULT_MAX_RECONNECT_RETRIES,
             DEFAULT_ACCOUNT_COOLDOWN,
+            client_ping_enabled,
         )
     }
 
     /// Construct with explicit bounds — used directly by this module's own tests (a 30s production
     /// cooldown and a real network round-trip make poor test material) and available to a future
-    /// caller that wants non-default bounds.
+    /// caller that wants non-default bounds. `client_ping_enabled` maps to [`Self::client_ping`]
+    /// exactly as in [`Self::new`].
     pub fn with_config(
         fallback: Arc<dyn Executor>,
         max_anchor_miss_retries: u32,
         max_reconnect_retries: u32,
         account_cooldown: Duration,
+        client_ping_enabled: bool,
     ) -> Self {
         Self {
             conns: StdMutex::new(HashMap::new()),
             session_ws_disabled: StdMutex::new(HashSet::new()),
             account_cooldown_until: StdMutex::new(HashMap::new()),
             account_cooldown,
+            // OFF ⇒ `None` = codex-rs default (no client ping); ON ⇒ `Some(WS_PING_INTERVAL)`.
+            client_ping: client_ping_enabled.then_some(WS_PING_INTERVAL),
             max_anchor_miss_retries,
             max_reconnect_retries,
             fallback,
@@ -220,6 +236,14 @@ impl CodexWsExecutor {
     #[cfg(test)]
     pub(crate) fn ws_connect_attempts(&self) -> usize {
         self.ws_connect_attempts.load(Ordering::SeqCst)
+    }
+
+    /// Test-only introspection: the client keepalive-ping cadence this executor stamps onto every
+    /// socket it dials — `None` for the codex-rs-faithful default, `Some(WS_PING_INTERVAL)` when
+    /// `POLYFLARE_WS_CLIENT_PING` is on. See [`Self::client_ping`].
+    #[cfg(test)]
+    pub(crate) fn client_ping(&self) -> Option<Duration> {
+        self.client_ping
     }
 
     fn is_session_ws_disabled(&self, session_key: &str) -> bool {
@@ -285,7 +309,11 @@ impl CodexWsExecutor {
 
         self.ws_connect_attempts.fetch_add(1, Ordering::SeqCst);
         match connect_detailed(account, forward_headers).await {
-            ConnectOutcome::Connected(fresh) => {
+            ConnectOutcome::Connected(mut fresh) => {
+                // Carry the executor's client-ping policy onto the fresh socket. `None` (default)
+                // keeps codex-rs behavior (no client ping); `Some(WS_PING_INTERVAL)` only when
+                // `POLYFLARE_WS_CLIENT_PING` is on. Set BEFORE `shared_conn` moves it behind the lock.
+                fresh.client_ping_interval = self.client_ping;
                 let shared = shared_conn(*fresh);
                 if let Some(key) = conn_key {
                     self.conns
@@ -756,7 +784,7 @@ mod tests {
             ScriptedTurn::normal(vec![]),
         ]);
         let base = mock.clone().spawn().await;
-        let executor = CodexWsExecutor::new(never_called_fallback());
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
         let account = test_account(base);
         let ctx = ctx_with_session("alpha");
 
@@ -886,7 +914,7 @@ mod tests {
             ScriptedTurn::normal(vec![]),
         ]);
         let base = mock.clone().spawn().await;
-        let executor = CodexWsExecutor::new(never_called_fallback());
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
         let account = test_account(base);
         let ctx = ctx_with_session("interleaved"); // ONE stable session_key for both models
 
@@ -1009,7 +1037,7 @@ mod tests {
             ScriptedTurn::normal(vec![]),
         ]);
         let base = mock.clone().spawn().await;
-        let executor = CodexWsExecutor::new(never_called_fallback());
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
         let account = test_account(base);
 
         // ONE session_key, ONE model/body — the ONLY thing that differs is the window-id.
@@ -1081,7 +1109,7 @@ mod tests {
             ScriptedTurn::normal(vec![]),
         ]);
         let base = mock.clone().spawn().await;
-        let executor = CodexWsExecutor::new(never_called_fallback());
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
 
         // Two accounts pointing at the SAME mock upstream, differing ONLY in `id`.
         let account_a = test_account_with_id(base.clone(), "acct-A");
@@ -1174,7 +1202,7 @@ mod tests {
                 ScriptedTurn::normal(vec![]),
             ]);
             let base = mock.clone().spawn().await;
-            let executor = Arc::new(CodexWsExecutor::new(never_called_fallback()));
+            let executor = Arc::new(CodexWsExecutor::new(never_called_fallback(), false));
             let account = test_account(base);
             let ctx = ctx_with_session("race");
 
@@ -1297,7 +1325,7 @@ mod tests {
             ScriptedTurn::normal(vec![]),
         ]);
         let base = mock.clone().spawn().await;
-        let executor = CodexWsExecutor::new(never_called_fallback());
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
         let account = test_account(base);
         let ctx = ctx_with_session("beta");
 
@@ -1365,6 +1393,7 @@ mod tests {
             2, // max_anchor_miss_retries
             2,
             Duration::from_secs(30),
+            false, // client_ping_enabled — codex-rs-faithful default
         );
         let account = test_account(base);
         let ctx = ctx_with_session("gamma");
@@ -1402,7 +1431,7 @@ mod tests {
             ScriptedTurn::normal(vec![]),
         ]);
         let base = mock.clone().spawn().await;
-        let executor = CodexWsExecutor::new(never_called_fallback());
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
         let account = test_account(base);
         let ctx = ctx_with_session("delta-session");
 
@@ -1433,6 +1462,7 @@ mod tests {
             2,
             2, // max_reconnect_retries
             Duration::from_secs(30),
+            false, // client_ping_enabled — codex-rs-faithful default
         );
         let account = test_account(base);
         let ctx = ctx_with_session("epsilon");
@@ -1470,7 +1500,7 @@ mod tests {
             ScriptedTurn::normal(vec![]),
         ]);
         let base = mock.clone().spawn().await;
-        let executor = CodexWsExecutor::new(never_called_fallback());
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
         let account = test_account(base);
         let ctx = ctx_with_session("zeta");
 
@@ -1498,7 +1528,7 @@ mod tests {
         })
         .to_string()]));
         let base = mock.clone().spawn().await;
-        let executor = CodexWsExecutor::new(never_called_fallback());
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
         let account = test_account(base);
         let ctx = ctx_with_session("eta");
 
@@ -1535,7 +1565,7 @@ mod tests {
     async fn rate_limit_429_surfaces_as_upstream_status_unchanged() {
         let mock = MockWsUpstream::new(ScriptedTurn::rate_limited_429(37));
         let base = mock.clone().spawn().await;
-        let executor = CodexWsExecutor::new(never_called_fallback());
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
         let account = test_account(base);
         let ctx = ctx_with_session("theta");
 
@@ -1574,7 +1604,7 @@ mod tests {
             headers: vec![],
         });
         let base = mock.clone().spawn().await;
-        let executor = CodexWsExecutor::new(never_called_fallback());
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
         let account = test_account(base);
         let ctx = ctx_with_session("mu");
 
@@ -1623,7 +1653,7 @@ mod tests {
             message: "too long".to_string(),
         });
         let base = mock.clone().spawn().await;
-        let executor = CodexWsExecutor::new(never_called_fallback());
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
         let account = test_account(base);
         let ctx = ctx_with_session("iota");
 
@@ -1653,7 +1683,7 @@ mod tests {
         let mock = MockWsUpstream::rejecting_handshake();
         let base = mock.clone().spawn().await;
         let fallback = RecordingExecutor::new();
-        let executor = CodexWsExecutor::new(Arc::new(fallback.clone()));
+        let executor = CodexWsExecutor::new(Arc::new(fallback.clone()), false);
         let account = test_account(base);
         let ctx = ctx_with_session("kappa");
 
@@ -1696,7 +1726,7 @@ mod tests {
         let mock = MockWsUpstream::rejecting_handshake();
         let base = mock.clone().spawn().await;
         let fallback = RecordingExecutor::new();
-        let executor = CodexWsExecutor::new(Arc::new(fallback.clone()));
+        let executor = CodexWsExecutor::new(Arc::new(fallback.clone()), false);
         let account = test_account(base);
 
         let ctx_a = ctx_with_session("session-A");
@@ -1737,7 +1767,7 @@ mod tests {
     #[tokio::test]
     async fn generic_connect_failure_surfaces_as_upstream_error_unchanged() {
         let fallback = RecordingExecutor::new();
-        let executor = CodexWsExecutor::new(Arc::new(fallback.clone()));
+        let executor = CodexWsExecutor::new(Arc::new(fallback.clone()), false);
         // Port 1 is a privileged/unassigned port: connection should be refused promptly.
         let account = test_account("ws://127.0.0.1:1".to_string());
         let ctx = ctx_with_session("lambda");
@@ -1772,7 +1802,7 @@ mod tests {
             ScriptedTurn::normal(vec![]),
         ]);
         let base = mock.clone().spawn().await;
-        let executor = CodexWsExecutor::new(never_called_fallback());
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
         let account = test_account(base);
         let ctx = RequestCtx::default(); // no session_key
 
@@ -1804,6 +1834,32 @@ mod tests {
             mock.last_frame_anchor(),
             None,
             "no reuse ⇒ no anchor ⇒ always a full send"
+        );
+    }
+
+    // ---- POLYFLARE_WS_CLIENT_PING: the flag maps to the per-socket keepalive-ping cadence -------
+
+    /// The opt-in client-ping flag (`POLYFLARE_WS_CLIENT_PING`, threaded in as `client_ping_enabled`)
+    /// must map to the executor's per-socket keepalive-ping cadence, which every fresh socket it
+    /// dials inherits (`connect_and_cache`) and `WsConn::recv_frame` then uses: OFF ⇒ `None` (the
+    /// codex-rs-faithful default — no client-initiated ping, matching real codex-rs, ground truth
+    /// §7); ON ⇒ `Some(WS_PING_INTERVAL)` (the codex-lb-style keepalive for aggressive-NAT
+    /// deployments). This is the executor half of the same fidelity property the conn-level
+    /// `recv_frame_with_no_client_ping_never_pings_during_silence` test proves behaviorally.
+    #[test]
+    fn ws_client_ping_flag_maps_to_the_socket_keepalive_cadence() {
+        let off = CodexWsExecutor::new(never_called_fallback(), false);
+        assert_eq!(
+            off.client_ping(),
+            None,
+            "flag OFF must be the codex-rs-faithful default: NO client keepalive ping (None)"
+        );
+
+        let on = CodexWsExecutor::new(never_called_fallback(), true);
+        assert_eq!(
+            on.client_ping(),
+            Some(WS_PING_INTERVAL),
+            "flag ON must enable codex-lb-style keepalive pings at WS_PING_INTERVAL"
         );
     }
 }
