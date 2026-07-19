@@ -195,7 +195,84 @@ struct Turn {
     resp_id: Option<String>,
     output_text: String,
     total_ms: u128,
+    /// Per-turn billing from the terminal `response.completed` `usage` block — the cache signal.
+    /// `None` when the turn errored / no completed usage was seen.
+    usage: Option<Usage>,
     err: Option<String>,
+}
+
+/// The `usage.{input_tokens, input_tokens_details.{cached_tokens, cache_write_tokens}, total_tokens}`
+/// block from a `response.completed` event — identical shape on WS and HTTP (same codex-rs
+/// `ResponseCompletedUsage`). This is the cache-billing signal: on a warm continuation the backend
+/// reports most of `input_tokens` as `cached_tokens` (billed at the cached rate). Content-free —
+/// pure token counts.
+#[derive(Default, Clone, Copy)]
+struct Usage {
+    input_tokens: i64,
+    cached_tokens: i64,
+    cache_write_tokens: i64,
+    total_tokens: i64,
+}
+
+impl Usage {
+    /// Fraction of `input_tokens` billed at the cached rate, as a percent (0 when input is 0).
+    fn cached_pct(&self) -> f64 {
+        if self.input_tokens <= 0 {
+            0.0
+        } else {
+            100.0 * self.cached_tokens as f64 / self.input_tokens as f64
+        }
+    }
+}
+
+/// Pull the [`Usage`] out of a single already-parsed event Value iff it is `response.completed`.
+fn completed_usage(v: &Value) -> Option<Usage> {
+    if v.get("type").and_then(Value::as_str) != Some("response.completed") {
+        return None;
+    }
+    let u = v.pointer("/response/usage")?;
+    Some(Usage {
+        input_tokens: u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0),
+        cached_tokens: u
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        cache_write_tokens: u
+            .pointer("/input_tokens_details/cache_write_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        total_tokens: u.get("total_tokens").and_then(Value::as_i64).unwrap_or(0),
+    })
+}
+
+/// Best-effort scrape of the terminal `response.completed` `usage` block out of a raw WS/SSE text
+/// buffer. TWO framings must both work: HTTP-SSE is newline-delimited `data:` lines, but a WS turn
+/// arrives as bare JSON event objects that concatenate in the buffer with NO separators
+/// (`{..completed..}` glued to its neighbours) — which `buf.lines()` alone cannot split. So try the
+/// line path first (HTTP), then fall back to a streaming parse of consecutive top-level JSON values
+/// over the whole buffer (WS). `None` if no completed-event usage was found (e.g. `response.failed`).
+fn scrape_usage(buf: &str) -> Option<Usage> {
+    // HTTP path: one `data:`-prefixed JSON event per line.
+    for line in buf.lines() {
+        let payload = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            if let Some(u) = completed_usage(&v) {
+                return Some(u);
+            }
+        }
+    }
+    // WS path: bare JSON objects, possibly concatenated without separators. `StreamDeserializer`
+    // reads consecutive top-level values; stop at the first parse error (a truncated trailing frame).
+    for v in serde_json::Deserializer::from_str(buf).into_iter::<Value>() {
+        let Ok(v) = v else { break };
+        if let Some(u) = completed_usage(&v) {
+            return Some(u);
+        }
+    }
+    None
 }
 
 fn find_resp_id(buf: &str) -> Option<String> {
@@ -233,12 +310,24 @@ fn row(label: &str, t: &Turn) {
         println!("    {label:<24} ERROR: {e}");
         return;
     }
+    let usage = match &t.usage {
+        Some(u) => format!(
+            "in={:>6} cached={:>6} ({:>5.1}%) cache_write={:>6} total={:>6}",
+            u.input_tokens,
+            u.cached_tokens,
+            u.cached_pct(),
+            u.cache_write_tokens,
+            u.total_tokens
+        ),
+        None => "usage=NONE".to_string(),
+    };
     println!(
-        "    {:<24} up={:>7}B  total={:>6}ms  resp_id={}",
+        "    {:<24} up={:>7}B  total={:>6}ms  resp_id={}  {}",
         label,
         t.up_bytes,
         t.total_ms,
-        if t.resp_id.is_some() { "yes" } else { "NONE" }
+        if t.resp_id.is_some() { "yes" } else { "NONE" },
+        usage,
     );
 }
 
@@ -255,17 +344,29 @@ async fn ws_turn(ws: &mut Ws, body: String) -> Turn {
         return t;
     }
     let mut buf = String::new();
+    // The single WS frame carrying `response.completed`, kept ISOLATED so it parses cleanly — WS
+    // events are per-frame bare JSON that concatenate in `buf` with no separators (which defeats a
+    // line/stream scrape over the whole buffer). Its `usage` is the cache signal.
+    let mut completed_frame: Option<String> = None;
     let read = tokio::time::timeout(Duration::from_secs(90), async {
         while let Some(msg) = ws.next().await {
             match msg {
                 Ok(Message::Text(txt)) => {
-                    buf.push_str(txt.as_str());
+                    let s = txt.as_str();
+                    buf.push_str(s);
+                    if s.contains("response.completed") {
+                        completed_frame = Some(s.to_string());
+                    }
                     if buf.contains("response.completed") || buf.contains("\"response.failed\"") {
                         break;
                     }
                 }
                 Ok(Message::Binary(b)) => {
-                    buf.push_str(&String::from_utf8_lossy(&b));
+                    let s = String::from_utf8_lossy(&b);
+                    if s.contains("response.completed") {
+                        completed_frame = Some(s.to_string());
+                    }
+                    buf.push_str(&s);
                     if buf.contains("response.completed") {
                         break;
                     }
@@ -289,6 +390,11 @@ async fn ws_turn(ws: &mut Ws, body: String) -> Turn {
     t.total_ms = t0.elapsed().as_millis();
     t.resp_id = find_resp_id(&buf);
     t.output_text = scrape_output_text(&buf);
+    // Prefer the isolated completed frame (parses cleanly); fall back to the whole buffer.
+    t.usage = completed_frame
+        .as_deref()
+        .and_then(scrape_usage)
+        .or_else(|| scrape_usage(&buf));
     t
 }
 
@@ -356,6 +462,7 @@ async fn http_turn(
     t.total_ms = t0.elapsed().as_millis();
     t.resp_id = find_resp_id(&buf);
     t.output_text = scrape_output_text(&buf);
+    t.usage = scrape_usage(&buf);
     t
 }
 
