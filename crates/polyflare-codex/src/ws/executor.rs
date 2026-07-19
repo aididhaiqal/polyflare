@@ -135,7 +135,9 @@ use serde_json::Value;
 use polyflare_core::{Account, ExecError, Executor, PreparedRequest, RequestCtx, ResponseStream};
 
 use super::codec::build_response_create;
-use super::conn::{connect_detailed, ConnectOutcome, WsConn, WS_PING_INTERVAL};
+use super::conn::{
+    connect_detailed, ConnectOutcome, WsConn, WS_PING_INTERVAL, WS_READ_IDLE_MARKER,
+};
 use super::delta::{plan_request_for_conn, RequestPlan};
 use super::turn::{
     shared_conn, turn_stream_with_guard, SharedWsConn, ANCHOR_MISS_MARKER, CONNECTION_LIMIT_MARKER,
@@ -479,6 +481,7 @@ enum ConnAttempt {
 /// What to do about the FIRST item of a turn's stream being an `Err`. See the module doc's
 /// "Recovery: how classification reaches this module" section for why this string-matches
 /// `ExecError::Stream` messages rather than reading a richer type.
+#[derive(Debug, PartialEq, Eq)]
 enum RecoveryAction {
     StripAnchorAndResend,
     Reconnect,
@@ -493,7 +496,16 @@ fn classify_recovery(e: &ExecError) -> RecoveryAction {
         if msg.contains(ANCHOR_MISS_MARKER) {
             return RecoveryAction::StripAnchorAndResend;
         }
-        if msg.contains(CONNECTION_LIMIT_MARKER) || msg.contains(SOCKET_CLOSED_MARKER) {
+        // Read-idle joins the connection-limit / socket-closed reconnect triggers: a ~290s silent
+        // socket (`WS_READ_IDLE_MARKER`, poisoned in `ws::conn::recv_frame_with_timeout`) is dead, so
+        // reconnect + full-resend instead of surfacing/failing over — matching codex retrying its own
+        // idle timeout in place. Bounded by the SAME `reconnect_attempts`/`max_reconnect_retries`
+        // budget the other two use (the `RecoveryAction::Reconnect` arm's guard in `run_turn`), so
+        // this adds a trigger, never an unbounded loop.
+        if msg.contains(CONNECTION_LIMIT_MARKER)
+            || msg.contains(SOCKET_CLOSED_MARKER)
+            || msg.contains(WS_READ_IDLE_MARKER)
+        {
             return RecoveryAction::Reconnect;
         }
     }
@@ -1861,5 +1873,19 @@ mod tests {
             Some(WS_PING_INTERVAL),
             "flag ON must enable codex-lb-style keepalive pings at WS_PING_INTERVAL"
         );
+    }
+
+    /// A read-idle-poisoned turn (its first stream item carries `WS_READ_IDLE_MARKER`) must
+    /// classify as `Reconnect` — a ~290s silent socket is dead, so reconnect + full-resend, bounded
+    /// by the SAME `max_reconnect_retries` budget as the connection-limit / socket-closed reconnect
+    /// triggers, matching codex retrying its idle timeout in place rather than surfacing/failing
+    /// over. (RED before R3: `classify_recovery` returns `Surface` for this marker.)
+    #[test]
+    fn read_idle_marker_classifies_as_reconnect() {
+        let e = ExecError::Stream(format!(
+            "{}: no frame within idle timeout",
+            crate::ws::conn::WS_READ_IDLE_MARKER
+        ));
+        assert_eq!(classify_recovery(&e), RecoveryAction::Reconnect);
     }
 }
