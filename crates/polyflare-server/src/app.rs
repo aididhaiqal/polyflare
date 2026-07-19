@@ -346,6 +346,15 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route(
             "/memories/trace_summarize",
             post(crate::control::trace_summarize_handler),
+        )
+        // D14a: `POST /responses/compact` — a UNARY passthrough the real Codex CLI emits
+        // (`codex-rs client.rs:159`), previously 404'd. Static seg 1 (`responses`) never collides
+        // with `/{pool}/responses`'s param seg 1 (matchit prefers the static route), and seg 2
+        // (`compact` vs `responses`) differs anyway — no possible shadowing either direction.
+        .route("/responses/compact", post(crate::control::compact_handler))
+        .route(
+            "/{pool}/responses/compact",
+            post(crate::control::pooled_compact_handler),
         );
     if state.enforce_client_keys {
         proxy = proxy.route_layer(axum::middleware::from_fn_with_state(
