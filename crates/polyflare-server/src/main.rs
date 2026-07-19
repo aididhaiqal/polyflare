@@ -173,7 +173,8 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let cipher = TokenCipher::load_or_create(&config.key_path)?;
     // M5a: `POLYFLARE_WS_UPSTREAM` (default OFF) selects `CodexWsExecutor` over the WS transport
     // instead of today's HTTP-SSE `CodexExecutor` — see `build_codex_executor`'s doc.
-    let codex_executor: Arc<dyn Executor> = build_codex_executor(config.ws_upstream)?;
+    let codex_executor: Arc<dyn Executor> =
+        build_codex_executor(config.ws_upstream, config.ws_client_ping)?;
     let anthropic_executor: Arc<dyn Executor> = Arc::new(AnthropicExecutor::new()?);
     // Routing: the global default strategy + any per-pool overrides, both from config.
     let selector: Arc<dyn Selector> = config.routing_strategy.selector();

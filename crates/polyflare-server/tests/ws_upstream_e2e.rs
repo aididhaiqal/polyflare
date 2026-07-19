@@ -156,7 +156,10 @@ async fn ws_flag_on_two_sequential_turns_reuse_one_handshake_and_send_a_delta() 
     ]);
     let ws_base = mock.clone().spawn().await;
 
-    let codex_executor = build_codex_executor(true).expect("build_codex_executor(true)");
+    // `false` = codex-rs-faithful default (no client keepalive ping); this test asserts the WS
+    // transport/delta behavior, which is independent of the ping policy.
+    let codex_executor =
+        build_codex_executor(true, false).expect("build_codex_executor(true, false)");
     let (pf, _state) = spawn_state(codex_executor, ws_base).await;
 
     let client = reqwest::Client::new();
@@ -250,7 +253,8 @@ async fn ws_flag_off_uses_the_http_mock_upstream_unchanged() {
     ]);
     let http_base = mock.clone().spawn().await;
 
-    let codex_executor = build_codex_executor(false).expect("build_codex_executor(false)");
+    let codex_executor =
+        build_codex_executor(false, false).expect("build_codex_executor(false, false)");
     let (pf, _state) = spawn_state(codex_executor, http_base).await;
 
     let client = reqwest::Client::new();

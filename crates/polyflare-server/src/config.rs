@@ -44,6 +44,15 @@ pub struct ServeConfig {
     /// "HTTP-SSE remains the fallback on every path"). Consumed by
     /// `crate::app::build_codex_executor`.
     pub ws_upstream: bool,
+    /// Opt-in client-initiated WS keepalive pings (`POLYFLARE_WS_CLIENT_PING=1|true`). **Default
+    /// OFF = codex-rs-faithful**: real codex-rs NEVER initiates a client ping (it only auto-pongs
+    /// inbound server pings and bounds reads with an idle timeout — `docs/WS-GROUND-TRUTH-CODEX.md`
+    /// §7; verified in `codex-api` + `websocket-client`), so OFF makes PolyFlare's WS egress match it
+    /// exactly. **ON = codex-lb-style keepalive pings** during a silent read, for deployments behind
+    /// aggressive NAT/middleboxes that reap idle sockets; this is a DELIBERATE, documented
+    /// fingerprint divergence from codex-rs. Consumed by `crate::app::build_codex_executor` →
+    /// `polyflare_codex::ws::CodexWsExecutor` (no effect unless `ws_upstream` is also on).
+    pub ws_client_ping: bool,
     /// B4/B5 Task 5: the bounded cross-account failover loop's total upstream-attempt cap
     /// (`POLYFLARE_MAX_ACCOUNT_ATTEMPTS`; see [`max_account_attempts_from_env`] for the
     /// malformed/zero handling decision). Resolved ONCE here at startup and threaded through
@@ -618,6 +627,14 @@ impl ServeConfig {
             std::env::var("POLYFLARE_WS_UPSTREAM").as_deref(),
             Ok("1") | Ok("true")
         );
+        // Opt-in client keepalive pings. Same fail-safe-default convention as `ws_upstream` above:
+        // any unset/empty/unrecognized value is OFF, which is the codex-rs-faithful default (no
+        // client-initiated ping). Only an explicit `1`/`true` opts into the codex-lb-style keepalive
+        // (a deliberate, documented fingerprint divergence for aggressive-NAT/middlebox deployments).
+        let ws_client_ping = matches!(
+            std::env::var("POLYFLARE_WS_CLIENT_PING").as_deref(),
+            Ok("1") | Ok("true")
+        );
         // D18 Task 4: same fail-safe-default convention as `live_logs`/`ws_upstream` above — any
         // unset/empty/unrecognized value is treated as OFF (never a startup error on its own; the
         // consequence of leaving it off on a non-loopback bind with no keys is a REFUSE-TO-START
@@ -654,6 +671,7 @@ impl ServeConfig {
             admin_token,
             live_logs,
             ws_upstream,
+            ws_client_ping,
             max_account_attempts,
             starvation_wait_budget,
             starvation_heartbeat,

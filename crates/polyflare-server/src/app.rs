@@ -260,10 +260,22 @@ impl AppState {
 /// impl backs the field — never new retry/failover machinery of its own (M5a plan's Global
 /// Constraints: "No new retry/failover machinery. M5a swaps the transport under today's
 /// behavior.").
-pub fn build_codex_executor(ws_upstream: bool) -> Result<Arc<dyn Executor>, ExecError> {
+///
+/// `ws_client_ping` (`POLYFLARE_WS_CLIENT_PING`, see `crate::config::ServeConfig`) selects the WS
+/// executor's client-keepalive-ping policy: `false` (the default) is codex-rs-faithful (no
+/// client-initiated ping); `true` opts into codex-lb-style keepalive pings for aggressive-NAT/
+/// middlebox deployments. It has NO effect when `ws_upstream` is `false` (the HTTP-SSE path has no
+/// WS socket to ping).
+pub fn build_codex_executor(
+    ws_upstream: bool,
+    ws_client_ping: bool,
+) -> Result<Arc<dyn Executor>, ExecError> {
     let http = CodexExecutor::new()?;
     if ws_upstream {
-        Ok(Arc::new(CodexWsExecutor::new(Arc::new(http))))
+        Ok(Arc::new(CodexWsExecutor::new(
+            Arc::new(http),
+            ws_client_ping,
+        )))
     } else {
         Ok(Arc::new(http))
     }
