@@ -107,7 +107,11 @@ const NON_INPUT_FIELDS: &[&str] = &[
 /// `session_key::sha256_hex` already uses for content-free session keys / input fingerprints.
 /// Reimplemented locally (rather than depending on `polyflare-server`, which depends on this
 /// crate, not the other way around) using `sha2` alone — no `hex` crate dependency needed.
-fn sha256_hex(bytes: &[u8]) -> String {
+///
+/// `pub(crate)` so `ws::executor` can hash the content-free `conn_discriminator`
+/// (`x-codex-window-id`) into `conn_key` with the SAME hashing convention as the other key halves,
+/// without reimplementing hashing inline or adding a dependency.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))

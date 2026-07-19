@@ -17,15 +17,25 @@
 //!
 //! # The connection cache
 //! Keyed by `conn_key` = `ctx.session_key`'s hashed `value` folded with the request's
-//! `ws::delta::non_input_fingerprint` (`"<session>:<non-input-hash>"`). Both halves are
-//! content-free sha256 hex digests — `SessionKey::value` is computed by
+//! `ws::delta::non_input_fingerprint` and, when present, the hashed `ctx.conn_discriminator` (the
+//! thread-unique `x-codex-window-id`) — `"<session>:<non-input-hash>:<window-id-hash>"`. All three
+//! halves are content-free sha256 hex digests — `SessionKey::value` is computed by
 //! `polyflare-server::session_key`, the fingerprint hashes only non-input request fields (model,
-//! instructions, tools, …) — so the key never contains the raw request body. Folding in the
+//! instructions, tools, …), and the discriminator is a bounded thread id (`{thread_id}:0`), hashed
+//! via `ws::delta::sha256_hex` — so the key never contains the raw request body. Folding in the
 //! non-input fingerprint gives each interleaved model-stream on one conversation (codex drives two
 //! models per turn) its OWN socket + anchor chain: without it, the two streams shared one socket
 //! and clobbered each other's stored fingerprint, forcing every turn to a full (uncached) send.
-//! The 426 WS-disable and all logging stay keyed on the plain `session_key` (a 426 disables WS for
-//! the whole session, every model-stream). A request with no session key
+//! Folding in the window-id additionally isolates each codex THREAD (main / review / compact /
+//! spawn) even when its `session_key` AND `non_input_fingerprint` coincide with another thread's —
+//! the one gap the session+fingerprint key leaves, since the `x-codex-turn-state` `session_key`
+//! branch drops `prompt_cache_key`; each thread then gets its own socket regardless of which
+//! `session_key` branch fired. When `ctx.conn_discriminator` is `None` the third component is
+//! omitted entirely, so `conn_key` is BYTE-IDENTICAL to the pre-window-id `"<session>:<hash>"` form
+//! — a deliberate back-compat constraint that preserves the per-model-stream caching above exactly.
+//! This folding is transport-only and ownership-blind: it never touches continuity/wedge/`delta.rs`
+//! logic. The 426 WS-disable and all logging stay keyed on the plain `session_key` (a 426 disables
+//! WS for the whole session, every model-stream and thread). A request with no session key
 //! (`ctx.session_key: None`) gets `conn_key: None` — a fresh, uncached connection every call: no reuse is possible
 //! without something to key on, but the request still completes correctly (as a full send with no
 //! anchor) — WS just delivers no benefit for it, which is a degraded-but-correct default, not a
@@ -529,16 +539,26 @@ impl Executor for CodexWsExecutor {
 
         let body = materialize_body(&req)?;
 
-        // Per-model-stream connection key: codex interleaves multiple models (e.g. gpt-5.6-luna +
-        // gpt-5.6-sol) on ONE conversation. Keying the socket cache on session_key alone made them
-        // share a socket and clobber each other's anchor/non-input fingerprint, forcing
-        // plan_request to Full every turn (0% cache). Folding the non-input fingerprint into the
-        // key gives each model-stream its OWN socket + clean strict-extension chain -> Incremental
-        // -> the backend caches.
-        // Content-free: session_key and non_input_fingerprint are both sha256 hex digests.
-        let conn_key = session_key
-            .as_ref()
-            .map(|sk| format!("{sk}:{}", crate::ws::delta::non_input_fingerprint(&body)));
+        // Per-thread, per-model-stream connection key: codex interleaves multiple models (e.g.
+        // gpt-5.6-luna + gpt-5.6-sol) on ONE conversation, and drives several THREADS (main /
+        // review / compact / spawn) — each with a distinct `x-codex-window-id`. Keying the socket
+        // cache on session_key alone made model-streams share a socket and clobber each other's
+        // anchor/non-input fingerprint, forcing plan_request to Full every turn (0% cache). Folding
+        // the non-input fingerprint in gives each model-stream its OWN socket + clean
+        // strict-extension chain -> Incremental -> the backend caches. Folding the hashed
+        // `conn_discriminator` (the `x-codex-window-id`) in as a THIRD component additionally
+        // isolates each THREAD even when session_key AND non_input_fingerprint coincide (the gap the
+        // `x-codex-turn-state` session_key branch leaves by dropping `prompt_cache_key`).
+        // Back-compat: when `conn_discriminator` is None the key is byte-identical to the pre-task
+        // `session:fingerprint` form, preserving the just-merged per-model-stream caching exactly.
+        // Content-free: all three halves are sha256 hex digests; `disc` is hashed, never used raw.
+        let conn_key = session_key.as_ref().map(|sk| {
+            let base = format!("{sk}:{}", crate::ws::delta::non_input_fingerprint(&body));
+            match ctx.conn_discriminator.as_deref() {
+                Some(disc) => format!("{base}:{}", crate::ws::delta::sha256_hex(disc.as_bytes())),
+                None => base,
+            }
+        });
 
         let shared = match self
             .connect_and_cache(account, &req.forward_headers, conn_key.as_deref())
@@ -597,6 +617,15 @@ mod tests {
                 strength: KeyStrength::Hard,
             }),
             ..Default::default()
+        }
+    }
+
+    /// Same as [`ctx_with_session`] but also sets `conn_discriminator` (the content-free
+    /// `x-codex-window-id`, `{thread_id}:0`) — used by the Task 2 thread-isolation test.
+    fn ctx_with_session_and_window(session: &str, window_id: &str) -> RequestCtx {
+        RequestCtx {
+            conn_discriminator: Some(window_id.to_string()),
+            ..ctx_with_session(session)
         }
     }
 
@@ -918,6 +947,79 @@ mod tests {
             Some(1),
             "model B's second turn must send only the one new item — a real delta on B's OWN \
              chain, independent of model A's"
+        );
+    }
+
+    // ---- Task 2 (sub-agent identity): distinct codex threads must NOT share a socket -----------
+
+    /// Root cause this guards: each codex THREAD (main / review / compact / spawn) carries a
+    /// distinct `x-codex-window-id` (`{thread_id}:0`), surfaced content-free as
+    /// `ctx.conn_discriminator`. Two threads can arrive on the SAME `session_key` AND SAME model
+    /// (hence identical `non_input_fingerprint`) — the one gap the just-merged
+    /// session+fingerprint key does NOT split (e.g. the `x-codex-turn-state` session_key branch
+    /// drops `prompt_cache_key`). Folding the hashed discriminator in as a THIRD component
+    /// (`session:fingerprint:window_id`) guarantees each thread gets its OWN socket + anchor chain
+    /// regardless of which branch fired. When `conn_discriminator` is `None` the key is
+    /// byte-identical to the pre-task key (back-compat — the interleaved-models test above still
+    /// passes unchanged), so this closes the gap without regressing that behavior.
+    #[tokio::test]
+    async fn distinct_window_ids_same_session_and_model_get_distinct_sockets() {
+        // 3 turns for 3 execute() calls: thread A dials, thread B (different window-id, SAME
+        // session + SAME body) dials its OWN socket, then thread A REPEATED (same window-id) reuses
+        // A's socket — proving both that a DIFFERENT window-id splits and that the SAME window-id
+        // reuses (the Some==Some path), not merely that Some!=None differs.
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::normal(vec![]),
+        ]);
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::new(never_called_fallback());
+        let account = test_account(base);
+
+        // ONE session_key, ONE model/body — the ONLY thing that differs is the window-id.
+        let ctx_a = ctx_with_session_and_window("threaded", "tid-A:0");
+        let ctx_b = ctx_with_session_and_window("threaded", "tid-B:0");
+        let body = json!({"model": "gpt-5.6-sol", "input": [item(0), item(1)]});
+
+        // Thread A, first call: dials its own fresh socket.
+        let stream = executor
+            .execute(prepared(body.clone()), &account, &ctx_a)
+            .await
+            .expect("thread A must succeed");
+        drain(stream).await;
+        assert_eq!(
+            mock.handshake_count(),
+            1,
+            "thread A's first call dials its own fresh socket"
+        );
+
+        // Thread B: SAME session_key AND SAME body (hence SAME non_input_fingerprint), differing
+        // ONLY in x-codex-window-id. Pre-fix this reused thread A's socket (identical
+        // session+fingerprint key). It must now dial its OWN socket — the whole point of Task 2.
+        let stream = executor
+            .execute(prepared(body.clone()), &account, &ctx_b)
+            .await
+            .expect("thread B must succeed");
+        drain(stream).await;
+        assert_eq!(
+            mock.handshake_count(),
+            2,
+            "thread B must dial its OWN socket — a different x-codex-window-id yields a different \
+             conn_key even with an identical session_key AND non_input_fingerprint"
+        );
+
+        // Thread A again, IDENTICAL in all three (session, fingerprint, window-id): must REUSE A's
+        // socket — proving same-discriminator reuse, not just that different-discriminators split.
+        let stream = executor
+            .execute(prepared(body.clone()), &account, &ctx_a)
+            .await
+            .expect("thread A's repeat must succeed");
+        drain(stream).await;
+        assert_eq!(
+            mock.handshake_count(),
+            2,
+            "a repeat with the SAME window-id must REUSE the existing socket — no third handshake"
         );
     }
 
