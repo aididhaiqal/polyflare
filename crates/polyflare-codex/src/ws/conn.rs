@@ -34,6 +34,8 @@
 //! for the re-run confirming frames now arrive readable WITH the offer, now backed by real decode
 //! support).
 
+use std::time::Duration;
+
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::net::TcpStream;
@@ -56,6 +58,25 @@ const OPENAI_BETA_WS: &str = "responses_websockets=2026-02-06";
 /// Ground truth §1/§7.1: MUST NOT appear as a WS handshake header — stripped from
 /// `forward_headers` even if present, since it belongs only inside frame `client_metadata`.
 const TURN_STATE_HEADER: &str = "x-codex-turn-state";
+
+/// Bounded dial/handshake budget — a hung TCP/TLS/WS-upgrade must not stall a turn until the OS TCP
+/// timeout. Mirrors CLIProxyAPI's 30s codex WS dial bound. Overridable per-call via
+/// [`connect_detailed_with_timeout`] (tests inject a short value); [`connect_detailed`] uses this.
+pub(crate) const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Max silence (per `recv_frame` call) before the socket is treated as stalled and poisoned
+/// (`self.closed = true` → [`WsConn::is_closed`] → evicted on next reuse). Set to codex's own
+/// `stream_idle_timeout` default (300s, = `polyflare-server`'s `DEFAULT_STREAM_IDLE_TIMEOUT`) so it
+/// fires ONLY on a genuinely dead socket, never on a slow-but-alive generation. Overridable per-call
+/// via [`WsConn::recv_frame_with_timeout`] (tests inject a short value); [`WsConn::recv_frame`] uses
+/// this.
+pub(crate) const WS_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Substring marker on the `ExecError::Stream` a read-idle poison raises, so a consumer could
+/// classify "the socket went silent" apart from other stream errors — mirrors `turn.rs`'s
+/// `SOCKET_CLOSED_MARKER` convention (a named constant shared by producer and any future consumer,
+/// rather than a bare literal that could silently drift).
+pub(crate) const WS_READ_IDLE_MARKER: &str = "websocket read idle timeout";
 
 /// An established WS connection to a codex backend account, plus the incremental-continuation
 /// state later tasks read/write: `last_response_id` (Task 5, from the most recent
@@ -210,6 +231,17 @@ pub(crate) async fn connect_detailed(
     account: &Account,
     forward_headers: &[(String, String)],
 ) -> ConnectOutcome {
+    connect_detailed_with_timeout(account, forward_headers, WS_CONNECT_TIMEOUT).await
+}
+
+/// [`connect_detailed`] with the dial budget injected, so a test can pass a SHORT duration and prove
+/// a hung handshake self-terminates without sleeping the production 30s. Production calls delegate
+/// here via [`connect_detailed`] with [`WS_CONNECT_TIMEOUT`].
+pub(crate) async fn connect_detailed_with_timeout(
+    account: &Account,
+    forward_headers: &[(String, String)],
+    connect_timeout: Duration,
+) -> ConnectOutcome {
     // Must run before the first WS TLS handshake so tokio-tungstenite's rustls backend picks up
     // aws-lc-rs instead of falling back to ring — same reason `CodexExecutor::new` calls this
     // before its first HTTP TLS use.
@@ -220,26 +252,40 @@ pub(crate) async fn connect_detailed(
         Err(e) => return ConnectOutcome::Failed(e),
     };
 
-    match tokio_tungstenite::connect_async_with_config(request, Some(ws_config()), false).await {
-        Ok((socket, _response)) => ConnectOutcome::Connected(Box::new(WsConn {
-            socket,
-            closed: false,
-            last_response_id: None,
-            last_input_count: None,
-            last_item_hashes: None,
-            last_non_input_fingerprint: None,
-        })),
-        // Ground truth §5: HTTP 426 Upgrade Required, checked at handshake time, is the ONLY
-        // `FallbackToHttp` trigger — "No other status falls back". Everything else (refused,
-        // timeout, DNS, any other HTTP status, a protocol-level handshake error, ...) collapses to
-        // the generic `Failed` arm below, surfaced as `ExecError::Upstream` unchanged.
-        Err(tokio_tungstenite::tungstenite::Error::Http(response))
-            if response.status()
-                == tokio_tungstenite::tungstenite::http::StatusCode::UPGRADE_REQUIRED =>
-        {
-            ConnectOutcome::UpgradeRequired
-        }
-        Err(e) => ConnectOutcome::Failed(ExecError::Upstream(e.to_string())),
+    // Bound the whole dial (TCP + TLS + WS upgrade). A hung handshake must not stall a turn until
+    // the OS TCP timeout — an elapsed budget maps to the SAME generic `Failed`/`ExecError::Upstream`
+    // outcome any other transport failure uses (the variant doc already lists "timeout"); it never
+    // becomes `UpgradeRequired`.
+    match tokio::time::timeout(
+        connect_timeout,
+        tokio_tungstenite::connect_async_with_config(request, Some(ws_config()), false),
+    )
+    .await
+    {
+        Err(_elapsed) => ConnectOutcome::Failed(ExecError::Upstream(format!(
+            "upstream WS handshake timed out after {connect_timeout:?}"
+        ))),
+        Ok(inner) => match inner {
+            Ok((socket, _response)) => ConnectOutcome::Connected(Box::new(WsConn {
+                socket,
+                closed: false,
+                last_response_id: None,
+                last_input_count: None,
+                last_item_hashes: None,
+                last_non_input_fingerprint: None,
+            })),
+            // Ground truth §5: HTTP 426 Upgrade Required, checked at handshake time, is the ONLY
+            // `FallbackToHttp` trigger — "No other status falls back". Everything else (refused,
+            // timeout, DNS, any other HTTP status, a protocol-level handshake error, ...) collapses
+            // to the generic `Failed` arm below, surfaced as `ExecError::Upstream` unchanged.
+            Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                if response.status()
+                    == tokio_tungstenite::tungstenite::http::StatusCode::UPGRADE_REQUIRED =>
+            {
+                ConnectOutcome::UpgradeRequired
+            }
+            Err(e) => ConnectOutcome::Failed(ExecError::Upstream(e.to_string())),
+        },
     }
 }
 
@@ -277,25 +323,53 @@ impl WsConn {
     ///   turns that into the required `ExecError::Stream("websocket closed by server before
     ///   response.completed")`.
     pub(crate) async fn recv_frame(&mut self) -> Result<Option<String>, ExecError> {
+        self.recv_frame_with_timeout(WS_READ_IDLE_TIMEOUT).await
+    }
+
+    /// [`recv_frame`] with the read-idle budget injected, so a test can pass a SHORT duration and
+    /// prove a stalled-but-alive socket poisons without sleeping the production 300s. Production
+    /// calls delegate here via [`recv_frame`] with [`WS_READ_IDLE_TIMEOUT`].
+    ///
+    /// The deadline is captured ONCE, before the loop, and enforced with `timeout_at` — NOT a fresh
+    /// per-iteration `timeout`. `recv_frame` is a `loop` that `continue`s on keepalive `Ping`/`Pong`
+    /// (and `Frame`); a per-iteration timeout would RESET on every inbound ping, so a socket that is
+    /// ping-alive but data-silent (the exact stall this guards against) would never fire. An
+    /// absolute deadline bounds total silence-since-entry regardless of intervening keepalives.
+    pub(crate) async fn recv_frame_with_timeout(
+        &mut self,
+        idle_timeout: Duration,
+    ) -> Result<Option<String>, ExecError> {
+        let deadline = tokio::time::Instant::now() + idle_timeout;
         loop {
-            match self.socket.next().await {
-                Some(Ok(Message::Text(text))) => return Ok(Some(text.as_str().to_string())),
-                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
-                Some(Ok(Message::Binary(_))) => {
-                    return Err(ExecError::Stream(
-                        "unexpected binary WS frame from codex backend".to_string(),
-                    ));
-                }
-                Some(Ok(Message::Frame(_))) => continue,
-                Some(Ok(Message::Close(_))) | None => {
-                    // Proven dead: no further reuse — see `closed`'s doc.
+            match tokio::time::timeout_at(deadline, self.socket.next()).await {
+                // No frame within the idle budget: a stalled-but-alive socket (backend silent, TCP
+                // open). Poison it via the SAME `closed` flag the Close/error arms use, so Task 7's
+                // cache evicts it on the next reuse instead of re-stalling every turn.
+                Err(_elapsed) => {
                     self.closed = true;
-                    return Ok(None);
+                    return Err(ExecError::Stream(format!(
+                        "{WS_READ_IDLE_MARKER}: no frame within idle timeout"
+                    )));
                 }
-                Some(Err(e)) => {
-                    self.closed = true;
-                    return Err(ExecError::Stream(e.to_string()));
-                }
+                Ok(next) => match next {
+                    Some(Ok(Message::Text(text))) => return Ok(Some(text.as_str().to_string())),
+                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+                    Some(Ok(Message::Binary(_))) => {
+                        return Err(ExecError::Stream(
+                            "unexpected binary WS frame from codex backend".to_string(),
+                        ));
+                    }
+                    Some(Ok(Message::Frame(_))) => continue,
+                    Some(Ok(Message::Close(_))) | None => {
+                        // Proven dead: no further reuse — see `closed`'s doc.
+                        self.closed = true;
+                        return Ok(None);
+                    }
+                    Some(Err(e)) => {
+                        self.closed = true;
+                        return Err(ExecError::Stream(e.to_string()));
+                    }
+                },
             }
         }
     }
@@ -371,6 +445,102 @@ mod tests {
             "ws://127.0.0.1:9999/responses"
         );
         assert!(ws_url_for("ftp://example.test").is_err());
+    }
+
+    /// A TCP listener bound but NEVER `accept`ing: the kernel completes the TCP handshake into the
+    /// backlog, so a client `connect` succeeds at the socket level, but the WS/HTTP-upgrade response
+    /// never comes — a "black hole" that hangs the handshake read. Returns the base URL and the
+    /// listener (kept alive by the caller so the port stays bound).
+    async fn spawn_black_hole() -> (String, tokio::net::TcpListener) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        (format!("http://{addr}"), listener)
+    }
+
+    /// A WS server that completes the handshake then goes permanently silent — never sends a frame,
+    /// never closes. The client connects fine, but any `recv_frame` blocks forever (until poisoned
+    /// by the read-idle deadline). Must pass `Some(WebSocketConfig::default())` for the same
+    /// permessage-deflate reason `spawn_header_capture_server` documents.
+    async fn spawn_silent_ws_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                if let Ok(_ws) = tokio_tungstenite::accept_async_with_config(
+                    stream,
+                    Some(WebSocketConfig::default()),
+                )
+                .await
+                {
+                    // Hold the socket open, forever silent — never send, never close.
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A hung dial (TCP connects into the backlog, but the WS-upgrade response never comes) must
+    /// self-terminate within the injected budget as a generic `Failed`, not hang until the OS TCP
+    /// timeout and never as `UpgradeRequired`. Uses a 50ms injected timeout — no 30s sleep.
+    #[tokio::test]
+    async fn connect_detailed_times_out_on_a_black_hole() {
+        let (base, _listener) = spawn_black_hole().await;
+        let account = test_account(base);
+
+        let start = std::time::Instant::now();
+        let outcome = connect_detailed_with_timeout(&account, &[], Duration::from_millis(50)).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(outcome, ConnectOutcome::Failed(_)),
+            "a hung dial must map to Failed, never UpgradeRequired or a hang"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must return within the injected 50ms budget (well under the 30s default), took {elapsed:?}"
+        );
+    }
+
+    /// A stalled-but-alive socket (handshake completed, backend then permanently silent) must be
+    /// poisoned so it is evicted on reuse rather than re-stalling every turn: `recv_frame` returns
+    /// the marked idle error AND `is_closed()` becomes true. Uses a 50ms injected deadline — no 300s
+    /// sleep.
+    #[tokio::test]
+    async fn recv_frame_poisons_conn_on_read_idle() {
+        let base = spawn_silent_ws_server().await;
+        let account = test_account(base);
+        let mut conn = WsConn::connect(&account, &[]).await.expect("connect");
+        assert!(
+            !conn.is_closed(),
+            "a freshly connected socket is not closed"
+        );
+
+        let start = std::time::Instant::now();
+        let result = conn
+            .recv_frame_with_timeout(Duration::from_millis(50))
+            .await;
+        let elapsed = start.elapsed();
+
+        match result {
+            Err(ExecError::Stream(msg)) => assert!(
+                msg.contains(WS_READ_IDLE_MARKER),
+                "idle error must carry the read-idle marker, got: {msg}"
+            ),
+            other => panic!("expected a read-idle Stream error, got {other:?}"),
+        }
+        assert!(
+            conn.is_closed(),
+            "a read-idle socket must be poisoned (is_closed → evicted on next reuse)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must return within the injected 50ms budget (well under the 300s default), took {elapsed:?}"
+        );
     }
 
     #[tokio::test]
