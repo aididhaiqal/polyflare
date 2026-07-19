@@ -470,17 +470,29 @@ impl CodexWsExecutor {
         // upgrade token is a one-shot consumed FIRST-WINS here — the turn that establishes the socket
         // takes it (replayed into its frames), and every later turn on a REUSED socket sees `None`
         // (its guard's `upgrade_turn_state` was already `.take()`n) and sends NO `x-codex-turn-state`.
-        // On a reconnect iteration the fresh socket's guard is used, and `if turn_state.is_none()`
-        // keeps first-wins: a reconnect after the token was set keeps the original; a reconnect during
-        // a turn that had none takes the new socket's — matching codex's set-if-empty `OnceLock`.
+        // On a reconnect iteration the fresh socket's guard is drained UNCONDITIONALLY (see below),
+        // but its token is ADOPTED only under first-wins: a reconnect after the token was already set
+        // keeps the ORIGINAL (and discards the fresh socket's), while a reconnect during a turn that
+        // had none takes the new socket's — matching codex's set-if-empty `OnceLock`.
         let mut turn_state: Option<String> = None;
 
         loop {
             let mut guard = shared.clone().lock_owned().await;
             // Consume the socket's one-shot upgrade token BEFORE the immutable `plan_and_build_locked`
-            // borrow below. `.take()` needs `&mut guard` (the `OwnedMutexGuard` derefs mut). First-wins.
+            // borrow below. `.take()` needs `&mut guard` (the `OwnedMutexGuard` derefs mut).
+            //
+            // ALWAYS drain THIS socket's token, even on a reconnect iteration whose token we will NOT
+            // adopt. A mid-turn reconnect (anchor-miss full-resend aside — connection-limit /
+            // socket-closed / read-idle) leaves `turn_state` already `Some` from the socket this turn
+            // started on, so first-wins keeps the original. But the fresh (declined) socket carries its
+            // OWN `upgrade_turn_state`; if we skipped the `.take()` here it would LINGER on that
+            // `WsConn`, `connect_and_cache` would cache the socket with the token still attached, and a
+            // LATER turn reusing that socket would `.take()` the leftover and replay a stale token codex
+            // never sends (codex's per-turn `OnceLock` is empty on a reused socket). So drain
+            // unconditionally; ADOPT only under first-wins.
+            let dialed = guard.upgrade_turn_state.take();
             if turn_state.is_none() {
-                turn_state = guard.upgrade_turn_state.take();
+                turn_state = dialed;
             }
             let envelope = Self::plan_and_build_locked(&guard, body, turn_state.as_deref());
             let mut stream = turn_stream_with_guard(guard, envelope);
@@ -1203,6 +1215,95 @@ mod tests {
             "turn 2 on the REUSED socket must send NO x-codex-turn-state — the upgrade token is a \
              one-shot consumed by turn 1 (codex parity: the fresh per-turn OnceLock is empty on a \
              reused socket; sending it between turns is forbidden, client.rs:268-283)"
+        );
+    }
+
+    /// Regression (re-review of the per-turn turn-state fix): a MID-TURN RECONNECT must not leave the
+    /// declined socket's one-shot upgrade token lingering for a LATER turn to leak.
+    ///
+    /// Scenario: turn 1's first socket (A) hits a `websocket_connection_limit_reached` reconnect
+    /// trigger, so `drive_turn` evicts A and reconnects to socket B. `with_upgrade_turn_state` stamps
+    /// the token on EVERY 101 upgrade, so BOTH A and B carry it. Turn 1's iteration-1 already adopted
+    /// A's token (first-wins), so when iteration 2 runs on B the token var is already `Some` — B's own
+    /// `upgrade_turn_state` is therefore NOT adopted. The bug: the pre-fix guarded `.take()`
+    /// (`if turn_state.is_none() { turn_state = guard.upgrade_turn_state.take(); }`) also skipped
+    /// DRAINING B, so B's token lingered on its cached `WsConn`; a LATER turn 2 reusing socket B
+    /// `.take()`d the leftover and replayed a stale `x-codex-turn-state` codex never sends. The fix
+    /// drains B unconditionally (adopting only under first-wins), so turn 2 sees `None`.
+    ///
+    /// RED against the guarded-take code (turn 2's frame carried the leftover token) → GREEN after
+    /// drain-then-assign. Complements the turn-1-only test above (simple-reuse case) by covering the
+    /// reconnect-with-token case explicitly.
+    #[tokio::test]
+    async fn reconnected_socket_upgrade_token_is_drained_so_it_never_leaks_into_a_later_turn() {
+        // Script: turn 1's first attempt (socket A) gets a reconnect trigger; its retry (socket B)
+        // completes; turn 2 (reusing socket B) completes. `next_turn` repeats the last entry, so this
+        // is exactly one reconnect then two clean completions. Every 101 upgrade carries `ts-upgrade`.
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::connection_limit_reached(409),
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::normal(vec![]),
+        ])
+        .with_upgrade_turn_state("ts-upgrade");
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
+        let account = test_account(base);
+        let ctx = ctx_with_session("reconnect-turnstate");
+
+        // Turn 1: dials socket A, gets the connection-limit envelope, reconnects to socket B, and
+        // still completes cleanly (the reconnect is transparent to the caller).
+        let body1 = json!({"model": "gpt-5.6-sol", "input": [item(0), item(1)]});
+        let items1 = drain(
+            executor
+                .execute(prepared(body1), &account, &ctx)
+                .await
+                .expect("turn 1 must recover via reconnect and still succeed"),
+        )
+        .await;
+        assert!(
+            items1.iter().all(|i| i.is_ok()),
+            "turn 1 must present a CLEAN stream after the mid-turn reconnect: {items1:?}"
+        );
+
+        // Turn 2 on the SAME reused (reconnected) socket B: a strict extension.
+        let body2 = json!({"model": "gpt-5.6-sol", "input": [item(0), item(1), item(2)]});
+        drain(
+            executor
+                .execute(prepared(body2), &account, &ctx)
+                .await
+                .expect("turn 2 must succeed on the reused socket"),
+        )
+        .await;
+
+        assert_eq!(
+            mock.handshake_count(),
+            2,
+            "socket A (dialed) + socket B (reconnected) = 2 handshakes; turn 2 must REUSE B, not dial \
+             a third"
+        );
+        let frames = mock.frames();
+        assert_eq!(
+            frames.len(),
+            3,
+            "turn 1 attempt on A (1) + turn 1 retry on B (1) + turn 2 on reused B (1) = 3 frames"
+        );
+        assert_eq!(
+            frames[0].turn_state.as_deref(),
+            Some("ts-upgrade"),
+            "turn 1's first attempt (which established socket A) replays A's captured upgrade token"
+        );
+        assert_eq!(
+            frames[1].turn_state.as_deref(),
+            Some("ts-upgrade"),
+            "turn 1's retry on the reconnected socket keeps the ORIGINAL token under first-wins — the \
+             reconnect does not re-adopt B's token, but the turn is still the same one turn"
+        );
+        assert_eq!(
+            frames[2].turn_state, None,
+            "turn 2 on the REUSED reconnected socket must send NO x-codex-turn-state — B's one-shot \
+             upgrade token was DRAINED (not adopted) during turn 1's reconnect iteration, so it can \
+             NOT leak into a later reused-socket turn (RED before the drain fix: this carried the \
+             leftover token)"
         );
     }
 
