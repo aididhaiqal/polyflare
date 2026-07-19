@@ -39,35 +39,41 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Resolve which account a control request should be forwarded to, then materialize it (decrypt +
-/// refresh-if-stale, via `crate::ingress::resolve_core_account` — unchanged from `/responses`).
+/// Resolve which account a request should be forwarded to given an already-derived `session_key`
+/// and `pool` scope, then materialize it (decrypt + refresh-if-stale, via
+/// `crate::ingress::resolve_core_account` — unchanged from `/responses`).
 ///
-/// 1. Derive a session key from the request's headers ONLY
-///    (`crate::session_key::header_session_key` — the SAME Hard-strength derivation
-///    `session_key::parse_inbound` uses for `x-codex-turn-state`/`session_id`/`x-session-id`;
-///    control carries no body to fall back into a content-derived soft key from, and doesn't need
-///    one for this purpose — an absent session header should read as "no affinity signal", not
-///    manufacture one).
-/// 2. If a session key was derived AND its continuity session row names an owner
+/// D14a Task 1: this is the soft-affinity core extracted out of `resolve_control_account`,
+/// generalized so a caller can supply a BODY-derived `session_key` (not just a header-only one)
+/// and a `pool` (so selection can be scoped to a single pool instead of "all Codex accounts").
+/// `resolve_control_account` below is a thin wrapper that derives its header-only key and passes
+/// `pool = None` — byte-identical behavior to the pre-extraction version.
+///
+/// 1. `session_key` names the affinity signal (or `None` for "no affinity signal" — the caller
+///    decides how it was derived; `resolve_control_account` uses
+///    `crate::session_key::header_session_key`, the SAME Hard-strength derivation
+///    `session_key::parse_inbound` uses for `x-codex-turn-state`/`session_id`/`x-session-id`).
+/// 2. If a session key was given AND its continuity session row names an owner
 ///    (`ContinuityRepo::get_session(..).owning_account_id` — the same read-only primitive
 ///    `CodexContinuity::prepare` uses) AND that owner is currently ELIGIBLE (appears pickable in
 ///    the overlaid + provider/pool-filtered snapshot — checked by narrowing candidates to just the
 ///    owner and running it through the SAME selector, mirroring `watchdog::apply_ownership`'s
 ///    narrow-then-pick shape) ⇒ use the owner (soft affinity hit).
-/// 3. OTHERWISE (no session header, no owner on record, or the owner is currently ineligible —
+/// 3. OTHERWISE (no session key, no owner on record, or the owner is currently ineligible —
 ///    benched/cooled-down/inactive/absent from the pool) ⇒ fall through to the SAME any-eligible
 ///    selection `/responses` uses when unowned: `account_cache.snapshots()` →
-///    `filter_by_provider_and_pool(Codex, None)` → `runtime.overlay` → `selector.pick`. **This
-///    fallback is INVIOLABLE** — a control call must never be stranded merely because its owner
-///    happens to be unavailable right now (contrast `apply_ownership`'s `RouteDecision::Recover`,
-///    which is correct for `/responses`'s hard anchor but would be over-binding here).
+///    `filter_by_provider_and_pool(Codex, pool)` → `runtime.overlay` → `selector.pick`. **This
+///    fallback is INVIOLABLE** — a call must never be stranded merely because its owner happens to
+///    be unavailable right now (contrast `apply_ownership`'s `RouteDecision::Recover`, which is
+///    correct for `/responses`'s hard anchor but would be over-binding here).
 /// 4. `resolve_core_account` the chosen id.
 ///
 /// No eligible account at all (neither the owner nor any fallback candidate) ⇒ a clean 503
 /// (`crate::ingress::no_eligible`, byte-identical to `/responses`'s empty-pool response).
-pub async fn resolve_control_account(
+pub(crate) async fn resolve_owner_affine_account(
     state: &AppState,
-    headers: &HeaderMap,
+    session_key: Option<&polyflare_core::SessionKey>,
+    pool: Option<&str>,
 ) -> Result<(Account, AccountId), Response> {
     let now = unix_now();
 
@@ -75,12 +81,9 @@ pub async fn resolve_control_account(
         Ok(s) => s,
         Err(_) => return Err(internal_error()),
     };
-    // D17 is scoped to Codex control endpoints only (the plan's entire subject); control requests
-    // are never pool-scoped today (no `/{pool}/…` control route exists), so `pool = None` — the
-    // same "select over ALL accounts" behavior the bare `/responses` path uses when unowned.
-    let mut snapshots = filter_by_provider_and_pool(&snapshots, Provider::Codex, None);
+    let mut snapshots = filter_by_provider_and_pool(&snapshots, Provider::Codex, pool);
     state.runtime.overlay(&mut snapshots, now);
-    let selector = state.selector_for(None);
+    let selector = state.selector_for(pool);
     let sel_ctx = SelectionCtx {
         now,
         // C9 Task 3: startup-resolved, never a per-request env read (mirrors the `/responses`/
@@ -89,13 +92,10 @@ pub async fn resolve_control_account(
         ..Default::default()
     };
 
-    // Step 1: header-only session key (no body — control has none to derive a soft key from).
-    let session_key = header_session_key(headers, None);
-
     // Step 2: soft owner lookup — a read-only session-row fetch, no write, no watchdog arm, no
     // recovery plan (control has none of those concepts; this is deliberately NOT
     // `Continuity::prepare`, which would also mutate the session row's state).
-    let owner: Option<AccountId> = match session_key.as_ref() {
+    let owner: Option<AccountId> = match session_key {
         Some(sk) => match state.store.continuity().get_session(&sk.value).await {
             Ok(Some(row)) => row.owning_account_id.map(AccountId::from),
             Ok(None) | Err(_) => None,
@@ -133,6 +133,20 @@ pub async fn resolve_control_account(
 
     let (account, _provider) = resolve_core_account(state, &picked, now).await?;
     Ok((account, picked))
+}
+
+/// D17's control-endpoint entry point. Control requests have no body ⇒ a header-only session key
+/// (no content to derive a soft key from), and are never pool-scoped today (no `/{pool}/…` control
+/// route exists) ⇒ `pool = None` — the same "select over ALL accounts" behavior the bare
+/// `/responses` path uses when unowned. See [`resolve_owner_affine_account`] for the full
+/// soft-affinity algorithm.
+pub async fn resolve_control_account(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(Account, AccountId), Response> {
+    // Control endpoints have no body ⇒ header-only session key, and are never pool-scoped.
+    let session_key = header_session_key(headers, None);
+    resolve_owner_affine_account(state, session_key.as_ref(), None).await
 }
 
 // -------------------------------------------------------------------------------------------
@@ -432,6 +446,33 @@ mod tests {
             .unwrap();
     }
 
+    /// D14a Task 1: same as `seed_account`, but assigns the account to `pool` — needed to exercise
+    /// `resolve_owner_affine_account`'s new `pool` parameter (`resolve_control_account`'s existing
+    /// coverage above never varies `pool` away from `None`).
+    async fn seed_pooled_account(
+        store: &Store,
+        cipher: &TokenCipher,
+        id: &str,
+        token: &str,
+        pool: &str,
+    ) {
+        let mut acct = account(id);
+        acct.pool = Some(pool.to_string());
+        store
+            .accounts()
+            .insert(
+                &acct,
+                &PlainTokens {
+                    access_token: token.into(),
+                    refresh_token: "r".into(),
+                    id_token: "i".into(),
+                },
+                cipher,
+            )
+            .await
+            .unwrap();
+    }
+
     /// Builds a full `AppState` for these tests, mirroring `tests/ownership.rs`'s construction
     /// pattern exactly. `Store` is NOT `Clone`, so (matching that existing pattern) callers reach
     /// the store/cipher back out via `state.store`/`state.cipher`, never a separately-held copy.
@@ -644,6 +685,92 @@ mod tests {
             picked,
             AccountId::from("A"),
             "an unrelated/unseen session key must fall back to normal selection, not B's ownership"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // D14a Task 1: `resolve_owner_affine_account` unit tests. `resolve_control_account`'s coverage
+    // above already proves the soft-affinity algorithm itself (owner hit / ineligible-owner
+    // fallback / no-header fallback / cross-session leak / empty-pool 503) end-to-end through the
+    // header-only, pool-less wrapper. These tests instead cover the TWO axes the extraction adds
+    // that the wrapper never exercises: a session key that did NOT come from
+    // `header_session_key` (simulating Task 2's body-derived key), and a non-`None` `pool` that
+    // narrows both the owner-eligibility check and the fallback candidate set.
+    // -----------------------------------------------------------------------------------------
+
+    use polyflare_core::{KeyStrength, SessionKey};
+
+    /// A body-derived-style session key (never touches `header_session_key`) whose owner sits in
+    /// pool "p" resolves to that owner when `pool = Some("p")` — proving the extracted core
+    /// honors an arbitrary `session_key` input, not just a header-derived one.
+    #[tokio::test]
+    async fn owner_affine_core_resolves_pooled_owner_via_non_header_key() {
+        let state = build_state(Arc::new(RoundRobin)).await;
+        seed_pooled_account(&state.store, &state.cipher, "P", "tokP", "p").await;
+        seed_account(&state.store, &state.cipher, "U", "tokU").await;
+
+        let key = SessionKey {
+            value: "body-derived-session-key-abc".to_string(),
+            strength: KeyStrength::Soft,
+        };
+        let now = now();
+        state
+            .store
+            .continuity()
+            .ensure_session(&key.value, "soft", now)
+            .await
+            .unwrap();
+        state
+            .store
+            .continuity()
+            .record_completion(&key.value, "soft", "P", "resp_p", "fp", 1, now)
+            .await
+            .unwrap();
+
+        let (_account, picked) = resolve_owner_affine_account(&state, Some(&key), Some("p"))
+            .await
+            .unwrap();
+        assert_eq!(
+            picked,
+            AccountId::from("P"),
+            "a non-header session key must still resolve to its owner when the owner is in-pool"
+        );
+    }
+
+    /// With no owner on record, the `pool` parameter still scopes the INVIOLABLE fallback: an
+    /// account outside the requested pool ("U", unpooled) must never be picked when `pool =
+    /// Some("p")`, even though it would be a perfectly eligible candidate under `pool = None`.
+    #[tokio::test]
+    async fn owner_affine_core_fallback_is_scoped_to_the_given_pool() {
+        let state = build_state(Arc::new(RoundRobin)).await;
+        seed_pooled_account(&state.store, &state.cipher, "P", "tokP", "p").await;
+        seed_account(&state.store, &state.cipher, "U", "tokU").await;
+
+        let (_account, picked) = resolve_owner_affine_account(&state, None, Some("p"))
+            .await
+            .expect("pool-scoped fallback must not error when the pool has an eligible account");
+        assert_eq!(
+            picked,
+            AccountId::from("P"),
+            "fallback must stay within the requested pool, never picking the unpooled account"
+        );
+    }
+
+    /// `resolve_owner_affine_account(None, None)` — no affinity signal, no pool scope — behaves
+    /// exactly like `resolve_control_account`'s own any-eligible fallback: it must not error, and
+    /// must return one of the genuinely eligible (in this case, either) accounts.
+    #[tokio::test]
+    async fn owner_affine_core_with_no_key_and_no_pool_picks_any_eligible() {
+        let state = build_state(Arc::new(RoundRobin)).await;
+        seed_pooled_account(&state.store, &state.cipher, "P", "tokP", "p").await;
+        seed_account(&state.store, &state.cipher, "U", "tokU").await;
+
+        let (_account, picked) = resolve_owner_affine_account(&state, None, None)
+            .await
+            .expect("must not error when unowned and unpooled, mirroring the wrapper's fallback");
+        assert!(
+            picked == AccountId::from("P") || picked == AccountId::from("U"),
+            "must pick one of the genuinely eligible accounts, got {picked:?}"
         );
     }
 }
