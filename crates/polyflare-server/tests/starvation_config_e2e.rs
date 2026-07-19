@@ -222,6 +222,19 @@ fn anthropic_account(id: &str, status: &str, sentinel_email: &str) -> polyflare_
     }
 }
 
+/// A `provider="codex"` account row carrying a seeded sentinel email — mirrors `anthropic_account`
+/// above but for the Codex-provider pool, used by the aliased-to-Codex Layer-2 e2e (B5-anthropic
+/// Task 4) below.
+fn codex_account_sentinel(
+    id: &str,
+    status: &str,
+    sentinel_email: &str,
+) -> polyflare_store::Account {
+    let mut a = account(id, status);
+    a.email = sentinel_email.to_string();
+    a
+}
+
 /// A minimal upstream that always returns a clean `response.completed` SSE stream — real-enough for
 /// the recovered-account leg of the e2e (the request never actually reaches it in the budget=0
 /// disable-lever test, since the account never recovers within the process's lifetime there).
@@ -287,6 +300,65 @@ async fn spawn_anthropic_stub_upstream(
     };
     let app = Router::new()
         .route("/v1/messages", post(respond))
+        .with_state(mock_state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// B5-anthropic Task 4: a minimal Codex `/responses` upstream serving a full scripted
+/// OpenAI-Responses turn — byte-identical in shape to
+/// `translate_stream.rs`'s `translates_full_turn_into_ordered_anthropic_sse_frames` fixture (the
+/// ALREADY-VERIFIED round trip: `response.created` → `output_item.added` → `content_part.added` →
+/// `output_text.delta` → `output_text.done` → `content_part.done` → `output_item.done` →
+/// `response.completed` translates into `message_start`, `content_block_start`,
+/// `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`). Embeds
+/// `sentinel_text` in the text delta/done/part fields — the aliased Layer-2 e2e's proof that the
+/// REAL recovered Codex stream (not a synthetic frame) reached the client, TRANSLATED. Also returns
+/// a shared hit counter so the budget-exceeded test can assert upstream was never actually reached.
+async fn spawn_codex_translated_stub_upstream(
+    sentinel_text: &str,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::extract::State;
+    use axum::routing::post;
+    use axum::Router;
+
+    #[derive(Clone)]
+    struct MockState {
+        text: String,
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn respond(State(s): State<MockState>) -> axum::response::Response {
+        s.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let body = format!(
+            "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_1\",\"status\":\"in_progress\",\"model\":\"gpt-5.6-sol\",\"usage\":null}}}}\n\n\
+             data: {{\"type\":\"response.output_item.added\",\"item\":{{\"id\":\"item_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}}}\n\n\
+             data: {{\"type\":\"response.content_part.added\",\"item_id\":\"item_1\",\"part\":{{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}}}\n\n\
+             data: {{\"type\":\"response.output_text.delta\",\"item_id\":\"item_1\",\"delta\":\"{text}\"}}\n\n\
+             data: {{\"type\":\"response.output_text.done\",\"item_id\":\"item_1\",\"text\":\"{text}\"}}\n\n\
+             data: {{\"type\":\"response.content_part.done\",\"item_id\":\"item_1\",\"part\":{{\"type\":\"output_text\",\"text\":\"{text}\",\"annotations\":[]}}}}\n\n\
+             data: {{\"type\":\"response.output_item.done\",\"item\":{{\"id\":\"item_1\",\"type\":\"message\",\"status\":\"completed\",\"content\":[]}}}}\n\n\
+             data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\",\"status\":\"completed\",\"model\":\"gpt-5.6-sol\",\"usage\":{{\"output_tokens\":2}}}}}}\n\n",
+            text = s.text
+        );
+        axum::response::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mock_state = MockState {
+        text: sentinel_text.to_string(),
+        hits: hits.clone(),
+    };
+    let app = Router::new()
+        .route("/responses", post(respond))
         .with_state(mock_state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -766,4 +838,288 @@ async fn native_anthropic_recovery_wait_budget_exceeded_emits_anthropic_error_fr
     let starvation_events: Vec<_> = backfill.iter().filter(|e| e.kind == "starvation").collect();
     assert_eq!(starvation_events.len(), 1, "got: {backfill:?}");
     assert_eq!(starvation_events[0].account.as_deref(), Some("anthropic-b"));
+}
+
+/// B5-anthropic Task 4 (THE CRUX, 5): the Codex-ALIASED `/v1/messages` empty-pool analogue of tests
+/// (1)/(3) above. A `claude-opus-...` model string aliases to Codex (`gpt-5.6-sol` @ high — see
+/// `polyflare_server::alias::lookup_alias`); a single `provider="codex"` account is briefly cooled
+/// down. The aliased handler's empty-pool branch must fall through Layer 1 → Layer 2 exactly like
+/// the native path, speaking `WaitClient::AnthropicTranslated`: `event: ping` keepalives (the
+/// make-or-break property — emitted OUTSIDE the translator, so they must survive the
+/// `TranslatingStream` comment-drop, never Codex's `: keepalive`), and — once the account
+/// recovers — the REAL Codex `/responses` SSE stream translated into genuine Anthropic-Messages SSE
+/// (`message_start`...`message_stop`), never the raw `response.*` shape the mock upstream actually
+/// emitted.
+#[tokio::test]
+async fn aliased_codex_recovery_wait_serves_ping_keepalives_then_translated_anthropic_stream() {
+    let (budget_secs, heartbeat_secs) = {
+        let _guard = starvation_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS", "6");
+            std::env::set_var("POLYFLARE_STARVATION_HEARTBEAT_SECS", "1");
+        }
+        let budget_secs = config::starvation_wait_budget_secs_from_env();
+        let heartbeat_secs = config::starvation_heartbeat_secs_from_env(budget_secs);
+        unsafe {
+            std::env::remove_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS");
+            std::env::remove_var("POLYFLARE_STARVATION_HEARTBEAT_SECS");
+        }
+        (budget_secs, heartbeat_secs)
+    };
+    assert_eq!(budget_secs, 6);
+    assert_eq!(heartbeat_secs, 1);
+
+    let (store, cipher, _dir) = spawn_store().await;
+    let sentinel_email = "sentinel-codex-aliased-user@example.test".to_string();
+    let sentinel_token = "sentinel-tok-ALIASED9F3Q".to_string();
+    let sentinel_text = "SENTINEL-ALIASED-RECOVERED-CONTENT-9F3Q";
+    let (codex_upstream, upstream_hits) = spawn_codex_translated_stub_upstream(sentinel_text).await;
+
+    let mut a = codex_account_sentinel("codex-aliased-a", "rate_limited", &sentinel_email);
+    a.reset_at = Some(now() + 3600); // far-future placeholder — re-anchored right before the request.
+    store
+        .accounts()
+        .insert(&a, &tokens(&sentinel_token), &cipher)
+        .await
+        .unwrap();
+
+    let state = build_state(
+        store,
+        cipher,
+        codex_upstream,
+        Duration::from_secs(budget_secs as u64),
+        Duration::from_secs(heartbeat_secs as u64),
+    );
+    let pf = spawn_app(state.clone()).await;
+
+    // Same anti-flake re-anchoring as tests (1)/(3): capture `fire_at` immediately before the
+    // request fires, after all setup I/O is done.
+    let fire_at = now();
+    state
+        .store
+        .accounts()
+        .update_status_and_reset("codex-aliased-a", "rate_limited", Some(fire_at + 4))
+        .await
+        .unwrap();
+
+    let resp = reqwest::Client::new()
+        .post(format!("{pf}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-opus-4-1-20250805",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the wait committed HTTP 200 immediately"
+    );
+    let body = drain(resp).await;
+
+    // (a) THE CRUX: the Anthropic `event: ping` keepalive must survive — it is emitted by the
+    // OUTER wait stream, never routed through the translator, so the `TranslatingStream`
+    // comment-drop (which would eat Codex's `: keepalive`) never sees it.
+    assert!(
+        body.contains("event: ping"),
+        "at least one Anthropic `event: ping` keepalive must fire during the ~4s wait: {body}"
+    );
+    assert!(
+        body.contains("data: {\"type\":\"ping\"}"),
+        "the ping frame must carry the fixed Anthropic ping payload: {body}"
+    );
+    assert!(
+        !body.contains(": keepalive"),
+        "the aliased path must never emit Codex's `: keepalive` comment frame: {body}"
+    );
+
+    // (b) the recovered CODEX stream must reach the client TRANSLATED into Anthropic SSE — real
+    // Anthropic event names present, raw Codex `response.*` event names absent.
+    assert!(
+        body.contains("event: message_start") && body.contains("event: message_stop"),
+        "the recovered Codex stream must be translated into Anthropic SSE: {body}"
+    );
+    assert!(
+        body.contains(sentinel_text),
+        "the REAL recovered upstream content (not a synthetic frame) must be spliced through, \
+         translated: {body}"
+    );
+    assert!(
+        !body.contains("response.output_text.delta")
+            && !body.contains("response.completed")
+            && !body.contains("response.created")
+            && !body.contains("response.output_item"),
+        "the client must never see the raw OpenAI-Responses event shape: {body}"
+    );
+    assert!(
+        !body.contains("event: response.failed"),
+        "a successful recovery must never emit the Codex-dialect in-band error frame: {body}"
+    );
+    assert_eq!(
+        upstream_hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one real upstream attempt after recovery"
+    );
+
+    assert_eq!(
+        state.starvation_metrics.total(),
+        1,
+        "exactly one Layer 2 wait terminal outcome recorded"
+    );
+    let (backfill, _rx) = state.log_bus.subscribe();
+    let starvation_events: Vec<_> = backfill.iter().filter(|e| e.kind == "starvation").collect();
+    assert_eq!(starvation_events.len(), 1, "got: {backfill:?}");
+    let ev = starvation_events[0];
+    assert_eq!(ev.account.as_deref(), Some("codex-aliased-a"));
+    assert!(ev.latency_ms.is_some_and(|ms| ms > 0));
+
+    // CONTENT-SAFETY: the seeded sentinel email/token never leak into the client-facing body OR
+    // the starvation signal.
+    let body_lc = body.to_lowercase();
+    let msg_lc = ev.message.to_lowercase();
+    for forbidden in [
+        sentinel_email.to_lowercase(),
+        sentinel_token.to_lowercase(),
+        "bearer".to_string(),
+    ] {
+        assert!(
+            !body_lc.contains(&forbidden),
+            "forbidden content `{forbidden}` leaked into the client-facing body: {body}"
+        );
+        assert!(
+            !msg_lc.contains(&forbidden),
+            "forbidden content `{forbidden}` leaked into the starvation signal: {}",
+            ev.message
+        );
+    }
+}
+
+/// B5-anthropic Task 4 (6): forces the BOUNDED-BUDGET terminal on the Codex-ALIASED path (never a
+/// genuine recovery — the account's `reset_at` sits far past the tiny budget), and asserts the
+/// client-facing terminal is the Anthropic `event: error` frame (never Codex's `response.failed`
+/// shape), carrying only the fixed content-free reason code — and that the seeded account
+/// email/token, and the sentinel upstream content, never reach the client, because the upstream is
+/// never actually called.
+#[tokio::test]
+async fn aliased_codex_recovery_wait_budget_exceeded_emits_anthropic_error_frame() {
+    let (budget_secs, heartbeat_secs) = {
+        let _guard = starvation_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS", "2");
+            std::env::set_var("POLYFLARE_STARVATION_HEARTBEAT_SECS", "1");
+        }
+        let budget_secs = config::starvation_wait_budget_secs_from_env();
+        let heartbeat_secs = config::starvation_heartbeat_secs_from_env(budget_secs);
+        unsafe {
+            std::env::remove_var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS");
+            std::env::remove_var("POLYFLARE_STARVATION_HEARTBEAT_SECS");
+        }
+        (budget_secs, heartbeat_secs)
+    };
+    assert_eq!(budget_secs, 2);
+    assert_eq!(heartbeat_secs, 1);
+
+    let (store, cipher, _dir) = spawn_store().await;
+    let sentinel_email = "sentinel-codex-budget-user@example.test".to_string();
+    let sentinel_token = "sentinel-tok-ALIASEDBUDGETXX".to_string();
+    let sentinel_text = "SENTINEL-ALIASED-SHOULD-NEVER-BE-SENT";
+    let (codex_upstream, upstream_hits) = spawn_codex_translated_stub_upstream(sentinel_text).await;
+
+    let mut a = codex_account_sentinel("codex-aliased-b", "rate_limited", &sentinel_email);
+    // Recovers 3600s from now — well past the 2s budget, so this MUST end in BudgetExceeded, never
+    // a genuine recovery, no matter how long the test process itself takes to run.
+    a.reset_at = Some(now() + 3600);
+    store
+        .accounts()
+        .insert(&a, &tokens(&sentinel_token), &cipher)
+        .await
+        .unwrap();
+
+    let state = build_state(
+        store,
+        cipher,
+        codex_upstream,
+        Duration::from_secs(budget_secs as u64),
+        Duration::from_secs(heartbeat_secs as u64),
+    );
+    let pf = spawn_app(state.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{pf}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-opus-4-1-20250805",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the wait committed HTTP 200 immediately, even though it ends in an in-band error"
+    );
+    let body = drain(resp).await;
+
+    assert!(
+        body.contains("event: ping"),
+        "at least one keepalive must fire during the bounded 2s wait: {body}"
+    );
+    assert!(
+        body.contains("event: error"),
+        "the budget-exceeded terminal must be an Anthropic `event: error` frame: {body}"
+    );
+    assert!(
+        body.contains("\"type\":\"overloaded_error\""),
+        "the fixed Anthropic error type: {body}"
+    );
+    assert!(
+        body.contains("starvation_wait_budget_exceeded"),
+        "the fixed, content-free reason code: {body}"
+    );
+    assert!(
+        !body.contains("event: response.failed"),
+        "must never emit the Codex-dialect frame on the aliased path: {body}"
+    );
+
+    // Upstream must NEVER have been reached — the wait gave up before any re-select/execute ran.
+    assert_eq!(
+        upstream_hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "budget exceeded ⇒ zero real upstream attempts"
+    );
+    assert!(
+        !body.contains(sentinel_text),
+        "no real upstream content can leak — upstream was never called: {body}"
+    );
+    let body_lc = body.to_lowercase();
+    assert!(
+        !body_lc.contains(&sentinel_email.to_lowercase()),
+        "the seeded account email must never leak into the client-facing frame: {body}"
+    );
+    assert!(
+        !body_lc.contains(&sentinel_token.to_lowercase()),
+        "the seeded account token must never leak into the client-facing frame: {body}"
+    );
+    assert!(
+        !body_lc.contains("bearer"),
+        "no bearer token material in the client-facing frame: {body}"
+    );
+
+    assert_eq!(
+        state.starvation_metrics.total(),
+        1,
+        "exactly one Layer 2 wait terminal outcome recorded"
+    );
+    let (backfill, _rx) = state.log_bus.subscribe();
+    let starvation_events: Vec<_> = backfill.iter().filter(|e| e.kind == "starvation").collect();
+    assert_eq!(starvation_events.len(), 1, "got: {backfill:?}");
+    assert_eq!(
+        starvation_events[0].account.as_deref(),
+        Some("codex-aliased-b")
+    );
 }
