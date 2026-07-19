@@ -65,12 +65,25 @@ const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 pub(crate) const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Max silence (per `recv_frame` call) before the socket is treated as stalled and poisoned
-/// (`self.closed = true` → [`WsConn::is_closed`] → evicted on next reuse). Set to codex's own
-/// `stream_idle_timeout` default (300s, = `polyflare-server`'s `DEFAULT_STREAM_IDLE_TIMEOUT`) so it
-/// fires ONLY on a genuinely dead socket, never on a slow-but-alive generation. Overridable per-call
-/// via [`WsConn::recv_frame_with_timeout`] (tests inject a short value); [`WsConn::recv_frame`] uses
-/// this.
-pub(crate) const WS_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// (`self.closed = true` → [`WsConn::is_closed`] → evicted on next reuse). Deliberately ~10s BELOW
+/// `polyflare-server`'s `DEFAULT_STREAM_IDLE_TIMEOUT` (300s, codex's own `stream_idle_timeout`
+/// default) so the WS layer poisons a stalled socket JUST BEFORE the ingress idle-watchdog cancels
+/// the stream — guaranteeing the dead socket is evicted on the FIRST stall rather than possibly only
+/// on a second (which would happen if this fired at or after the watchdog). Still ~codex's own
+/// minutes-long tolerance, and the keepalive pings [`WS_PING_INTERVAL`] keep a legit slow-but-alive
+/// turn warm, so this fires ONLY on a genuinely dead socket, never on a slow-but-alive generation.
+/// Overridable per-call via [`WsConn::recv_frame_with_timeout`] (tests inject a short value);
+/// [`WsConn::recv_frame`] uses this.
+pub(crate) const WS_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(290);
+
+/// Client keepalive ping cadence while a turn's read is silent. Mirrors codex-lb (which leaves the
+/// `websockets` lib default ~20s) — keeps the upstream socket alive through NAT/middlebox idle
+/// reaping during the minutes a codex turn can spend silently reasoning, and surfaces a dead peer
+/// fast (the ping send fails) instead of waiting out the full read-idle budget. We deliberately do
+/// NOT enforce a pong response (no pong-watchdog): the absolute read-idle deadline is the sole stall
+/// decision — same split codex-lb documents. Overridable per-call via
+/// [`WsConn::recv_frame_with_timeout`] (tests inject a short value); [`WsConn::recv_frame`] uses this.
+pub(crate) const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Substring marker on the `ExecError::Stream` a read-idle poison raises, so a consumer could
 /// classify "the socket went silent" apart from other stream errors — mirrors `turn.rs`'s
@@ -312,9 +325,17 @@ impl WsConn {
     /// Read the next frame's raw text off the socket, for the turn stream (Task 5, `ws::turn`) to
     /// parse and `classify`.
     ///
-    /// - Ground truth §2/§7.3: the client never initiates a `Ping`; `tungstenite` answers an
-    ///   inbound `Ping` with an automatic `Pong` internally (queued on the next write), so `Ping`/
-    ///   `Pong` frames observed here are simply skipped — never surfaced as a turn event.
+    /// - **Client keepalive pings (codex-lb parity, a deliberate divergence from real codex-rs):**
+    ///   during a silent read this DOES initiate a client `Ping` every [`WS_PING_INTERVAL`] (empty,
+    ///   content-free payload) so intermediaries keep seeing liveness through the minutes a codex
+    ///   turn can spend silently reasoning, and a dead peer surfaces fast (the ping send fails)
+    ///   rather than only after the full read-idle budget. Real codex-rs does NOT ping (ground truth
+    ///   §2/§7.3); this is an accepted reliability tradeoff matching codex-lb's proven choice
+    ///   (`proxy_websocket.py`: keep transport pings on, disable the pong-watchdog). We do NOT
+    ///   enforce a pong: inbound `Pong`s are ignored (no pong-watchdog — the absolute read-idle
+    ///   deadline is the sole stall decision), and inbound `Ping`s are still auto-`Pong`ed by
+    ///   `tungstenite` internally (queued on the next write) and simply skipped here — neither
+    ///   `Ping` nor `Pong` is ever surfaced as a turn event.
     /// - Ground truth §3 (`responses_websocket.rs:797-799`): an unexpected `Binary` frame is a
     ///   hard error.
     /// - Ground truth §3 (`:800-804`): a `Close` frame (no close-code inspection, per that same
@@ -323,33 +344,56 @@ impl WsConn {
     ///   turns that into the required `ExecError::Stream("websocket closed by server before
     ///   response.completed")`.
     pub(crate) async fn recv_frame(&mut self) -> Result<Option<String>, ExecError> {
-        self.recv_frame_with_timeout(WS_READ_IDLE_TIMEOUT).await
+        self.recv_frame_with_timeout(WS_READ_IDLE_TIMEOUT, WS_PING_INTERVAL)
+            .await
     }
 
-    /// [`recv_frame`] with the read-idle budget injected, so a test can pass a SHORT duration and
-    /// prove a stalled-but-alive socket poisons without sleeping the production 300s. Production
-    /// calls delegate here via [`recv_frame`] with [`WS_READ_IDLE_TIMEOUT`].
+    /// [`recv_frame`] with BOTH budgets injected, so a test can pass SHORT durations and prove the
+    /// keepalive-ping / poison behavior without sleeping the production 290s / 20s. Production calls
+    /// delegate here via [`recv_frame`] with [`WS_READ_IDLE_TIMEOUT`] / [`WS_PING_INTERVAL`].
     ///
-    /// The deadline is captured ONCE, before the loop, and enforced with `timeout_at` — NOT a fresh
-    /// per-iteration `timeout`. `recv_frame` is a `loop` that `continue`s on keepalive `Ping`/`Pong`
-    /// (and `Frame`); a per-iteration timeout would RESET on every inbound ping, so a socket that is
-    /// ping-alive but data-silent (the exact stall this guards against) would never fire. An
-    /// absolute deadline bounds total silence-since-entry regardless of intervening keepalives.
+    /// The absolute deadline is captured ONCE, before the loop, from `idle_timeout`. Each iteration
+    /// waits at most `ping_interval` (capped so it never runs past that deadline); when a wait
+    /// elapses with no frame, a keepalive `Ping` is sent and the loop `continue`s — the deadline is
+    /// re-checked at the top and is NOT reset by the ping. So a socket that is ping-alive but
+    /// data-silent (the exact stall this guards against) is still poisoned once cumulative
+    /// silence-since-entry crosses the deadline: keepalive pings keep the peer warm and detect a
+    /// dead one fast, but they never postpone the stall decision. Inbound keepalive `Ping`/`Pong`
+    /// (and `Frame`) likewise `continue` without resetting the deadline.
     pub(crate) async fn recv_frame_with_timeout(
         &mut self,
         idle_timeout: Duration,
+        ping_interval: Duration,
     ) -> Result<Option<String>, ExecError> {
         let deadline = tokio::time::Instant::now() + idle_timeout;
         loop {
-            match tokio::time::timeout_at(deadline, self.socket.next()).await {
-                // No frame within the idle budget: a stalled-but-alive socket (backend silent, TCP
-                // open). Poison it via the SAME `closed` flag the Close/error arms use, so Task 7's
-                // cache evicts it on the next reuse instead of re-stalling every turn.
+            let now = tokio::time::Instant::now();
+            // The absolute deadline is the SOLE stall decision (no pong-watchdog): total
+            // silence-since-entry is bounded regardless of how many keepalive pings were sent in
+            // between. Checked here (not via a single `timeout_at`) because each read waits only a
+            // ping interval, so a ping-alive-but-data-silent socket must still be poisoned once the
+            // cumulative deadline passes.
+            if now >= deadline {
+                self.closed = true;
+                return Err(ExecError::Stream(format!(
+                    "{WS_READ_IDLE_MARKER}: no frame within idle timeout"
+                )));
+            }
+            // Wait at most one ping interval, but never past the absolute deadline.
+            let wait = ping_interval.min(deadline - now);
+            match tokio::time::timeout(wait, self.socket.next()).await {
+                // Silent for a ping interval (and not yet at the absolute deadline): send one
+                // keepalive ping (codex-lb parity). It keeps intermediaries seeing liveness through
+                // a long silent reasoning turn; a DEAD peer makes this send fail, poisoning the
+                // socket fast instead of waiting out the whole idle budget. We do NOT enforce a pong
+                // (no pong-watchdog): an inbound `Pong` is ignored like any keepalive, and only the
+                // absolute deadline above decides a true stall. The payload is EMPTY — never content.
                 Err(_elapsed) => {
-                    self.closed = true;
-                    return Err(ExecError::Stream(format!(
-                        "{WS_READ_IDLE_MARKER}: no frame within idle timeout"
-                    )));
+                    if let Err(e) = self.socket.send(Message::Ping(Vec::new().into())).await {
+                        self.closed = true;
+                        return Err(ExecError::Stream(e.to_string()));
+                    }
+                    continue;
                 }
                 Ok(next) => match next {
                     Some(Ok(Message::Text(text))) => return Ok(Some(text.as_str().to_string())),
@@ -414,6 +458,7 @@ fn ws_url_for(base_url: &str) -> Result<String, ExecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use polyflare_testkit::{MockWsUpstream, ScriptedTurn};
@@ -520,9 +565,13 @@ mod tests {
             "a freshly connected socket is not closed"
         );
 
+        // ping_interval (30ms) is SHORTER than idle (120ms): the client keepalive pings fire
+        // repeatedly into the silent-but-open socket (which accepts them into its buffer without
+        // ever reading), proving the pings do NOT prevent the absolute read-idle deadline from
+        // still poisoning the socket — the no-pong-watchdog property. No 290s sleep.
         let start = std::time::Instant::now();
         let result = conn
-            .recv_frame_with_timeout(Duration::from_millis(50))
+            .recv_frame_with_timeout(Duration::from_millis(120), Duration::from_millis(30))
             .await;
         let elapsed = start.elapsed();
 
@@ -540,6 +589,90 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "must return within the injected 50ms budget (well under the 300s default), took {elapsed:?}"
+        );
+    }
+
+    /// A WS server that completes the handshake, then stays SILENT (sends no frame) while it keeps
+    /// reading the socket — counting every inbound `Ping` (and letting tungstenite auto-`Pong` it) —
+    /// until it has observed at least one keepalive ping, at which point it sends a single text
+    /// frame. This is the mirror image of `spawn_silent_ws_server`: it proves the client emits
+    /// keepalive pings during a silent read AND that a real frame still comes through afterward.
+    /// Returns the base URL and a shared ping counter. `Some(WebSocketConfig::default())` for the
+    /// same permessage-deflate reason the other helper servers document.
+    async fn spawn_ping_observing_then_frame_server(frame: String) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let ping_count = Arc::new(AtomicUsize::new(0));
+        let counter = ping_count.clone();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                if let Ok(mut ws) = tokio_tungstenite::accept_async_with_config(
+                    stream,
+                    Some(WebSocketConfig::default()),
+                )
+                .await
+                {
+                    // Read (never proactively send) so inbound keepalive pings are surfaced and
+                    // auto-ponged. A 2s safety deadline bounds the wait so a missing ping fails the
+                    // ping assertion rather than hanging the test.
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                    loop {
+                        match tokio::time::timeout_at(deadline, ws.next()).await {
+                            Ok(Some(Ok(Message::Ping(_)))) => {
+                                counter.fetch_add(1, Ordering::SeqCst);
+                                break; // saw a keepalive ping — now respond
+                            }
+                            // Any other inbound frame (e.g. a Pong) is ignored; keep reading.
+                            Ok(Some(Ok(_))) => continue,
+                            // Client went away, or the safety deadline elapsed: stop waiting and
+                            // fall through to send the frame anyway (the test's ping assert decides).
+                            Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+                        }
+                    }
+                    let _ = ws.send(Message::Text(frame.into())).await;
+                    // Hold the socket open briefly so the client can read the frame before EOF.
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(500),
+                        std::future::pending::<()>(),
+                    )
+                    .await;
+                }
+            }
+        });
+        (format!("http://{addr}"), ping_count)
+    }
+
+    /// codex-lb parity: during a silent read the client must send a keepalive `Ping` (~every
+    /// `WS_PING_INTERVAL` in production) so intermediaries see liveness through a long silent codex
+    /// reasoning turn — and a real frame arriving afterward is still returned undisturbed. A short
+    /// injected `ping_interval` (30ms) under a longer `idle_timeout` (1s) drives it without any 20s
+    /// sleep; the server proves the ping actually reached the wire by counting it.
+    #[tokio::test]
+    async fn recv_frame_sends_keepalive_ping_during_silence() {
+        let expected =
+            r#"{"type":"response.completed","response":{"id":"resp_probe"}}"#.to_string();
+        let (base, ping_count) = spawn_ping_observing_then_frame_server(expected.clone()).await;
+        let account = test_account(base);
+        let mut conn = WsConn::connect(&account, &[]).await.expect("connect");
+
+        let result = conn
+            .recv_frame_with_timeout(Duration::from_secs(1), Duration::from_millis(30))
+            .await;
+
+        assert!(
+            ping_count.load(Ordering::SeqCst) >= 1,
+            "the client must send at least one keepalive ping during the silent read"
+        );
+        assert_eq!(
+            result.expect("read must succeed, not poison"),
+            Some(expected),
+            "the frame that arrives after the keepalive pings must still be returned verbatim"
+        );
+        assert!(
+            !conn.is_closed(),
+            "a successful read (frame returned) must NOT poison the connection"
         );
     }
 
