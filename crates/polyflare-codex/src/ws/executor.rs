@@ -155,13 +155,34 @@ const DEFAULT_MAX_RECONNECT_RETRIES: u32 = 2;
 /// How long a 426 keeps WS disabled for OTHER sessions on the SAME account (the per-account
 /// dimension of the fallback-scope divergence documented in the module doc above).
 const DEFAULT_ACCOUNT_COOLDOWN: Duration = Duration::from_secs(30);
+/// How long a cached WS connection may sit idle — no dial AND no reuse — before
+/// [`CodexWsExecutor::reap_idle`] evicts it, bounding the otherwise-unbounded growth of the
+/// high-cardinality `conn_key` cache (`account:session:fingerprint:window`, one entry per abandoned
+/// session that is otherwise never looked up again). Chosen ~15 min: comfortably ABOVE any normal
+/// inter-turn gap — a live conversation refreshes its entry's `last_used` on every reuse, so its
+/// socket is NEVER reaped mid-session — yet BELOW the ~60-min upstream WS connection limit, so we
+/// never keep parking a socket the server has already dropped. Consequence to keep in mind: a
+/// reaped-then-redialed socket only ever happens after a FULL `WS_CONN_IDLE_TTL` of no use, never
+/// between two turns of an active conversation, so the just-merged incremental caching is untouched.
+const WS_CONN_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// One entry in the [`CodexWsExecutor::conns`] cache: the shared socket plus the last time it was
+/// dialed or reused. `last_used` exists ONLY for [`CodexWsExecutor::reap_idle`] to bound the cache's
+/// growth; it is refreshed on EVERY cache hit and on insert of a fresh socket, and never influences
+/// which socket a lookup returns nor the `is_closed()`-at-reuse liveness check.
+struct CachedConn {
+    conn: SharedWsConn,
+    last_used: Instant,
+}
 
 /// The WS `Executor` impl. See the module doc for the cache key, eviction rule, recovery bounds,
 /// and the fallback-scope divergence from codex.
 pub struct CodexWsExecutor {
     /// The per-session connection cache. `std::sync::Mutex` (not `tokio::sync::Mutex`): only ever
-    /// held for a plain map operation (get/insert/remove), never across an `.await` point.
-    conns: StdMutex<HashMap<String, SharedWsConn>>,
+    /// held for a plain map operation (get/insert/remove/retain), never across an `.await` point.
+    /// Values are [`CachedConn`] (socket + `last_used`); [`Self::reap_idle`] bounds this map's growth
+    /// by evicting entries idle longer than `WS_CONN_IDLE_TTL` (the abandoned-session leak).
+    conns: StdMutex<HashMap<String, CachedConn>>,
     /// Sessions permanently (for this process's lifetime) routed to `fallback` after a 426 —
     /// see the module doc's "Fallback scope" section.
     session_ws_disabled: StdMutex<HashSet<String>>,
@@ -298,11 +319,28 @@ impl CodexWsExecutor {
         forward_headers: &[(String, String)],
         conn_key: Option<&str>,
     ) -> ConnAttempt {
+        // Opportunistically bound the cache: reap idle-past-TTL (and any already-dead) entries
+        // before touching the map. This is deliberately piggy-backed on `connect_and_cache` rather
+        // than run from a background task — it is cheap (one StdMutex-guarded `retain`, no `.await`)
+        // and keeps the executor self-contained. Consequence: a genuinely-idle process that never
+        // connects again won't reap until its next connect — which is acceptable, because with no
+        // new connects the cache also never grows.
+        self.reap_idle(WS_CONN_IDLE_TTL);
+
         if let Some(key) = conn_key {
-            let cached = self.conns.lock().unwrap().get(key).cloned();
+            let cached = self.conns.lock().unwrap().get(key).map(|e| e.conn.clone());
             if let Some(shared) = cached {
                 let dead = shared.lock().await.is_closed();
                 if !dead {
+                    // Cache HIT: refresh `last_used` so an actively-reused socket is never reaped
+                    // mid-conversation. This changes NEITHER which socket is returned (still the
+                    // `shared` cloned above) NOR the `is_closed()`-at-reuse check that just ran — it
+                    // is purely a recency stamp for `reap_idle`. `get_mut` may miss if a concurrent
+                    // call evicted/replaced the entry in the meantime; then there is simply nothing
+                    // to refresh and we still return the live socket we already hold.
+                    if let Some(entry) = self.conns.lock().unwrap().get_mut(key) {
+                        entry.last_used = Instant::now();
+                    }
                     return ConnAttempt::Ready(shared);
                 }
                 self.conns.lock().unwrap().remove(key);
@@ -318,16 +356,46 @@ impl CodexWsExecutor {
                 fresh.client_ping_interval = self.client_ping;
                 let shared = shared_conn(*fresh);
                 if let Some(key) = conn_key {
-                    self.conns
-                        .lock()
-                        .unwrap()
-                        .insert(key.to_string(), shared.clone());
+                    self.conns.lock().unwrap().insert(
+                        key.to_string(),
+                        CachedConn {
+                            conn: shared.clone(),
+                            last_used: Instant::now(),
+                        },
+                    );
                 }
                 ConnAttempt::Ready(shared)
             }
             ConnectOutcome::UpgradeRequired => ConnAttempt::UpgradeRequired,
             ConnectOutcome::Failed(e) => ConnAttempt::Failed(e),
         }
+    }
+
+    /// Reap cache entries that are no longer worth keeping, bounding the map's growth (Task 2). An
+    /// entry is dropped when it is NOT currently in use (its socket lock is free) AND either its
+    /// socket is already dead (`is_closed()`) or it has sat idle — no dial, no reuse — for longer
+    /// than `ttl`. `ttl` is a parameter (not hard-wired to `WS_CONN_IDLE_TTL`) purely so tests can
+    /// inject a short value.
+    ///
+    /// **No `.await` under the `conns` StdMutex.** Liveness is probed with `tokio::sync::Mutex::try_lock`,
+    /// which is synchronous and NON-blocking: if the socket lock is held a turn is in flight on it,
+    /// so the entry is kept regardless of age (an active turn is never reaped out from under itself —
+    /// this is why the lock is checked BEFORE the age test), and try_lock never blocks, so the
+    /// StdMutex is never held across a suspension point and there is no deadlock with a concurrent
+    /// `drive_turn` that holds a socket lock while re-entering `connect_and_cache`.
+    fn reap_idle(&self, ttl: Duration) {
+        let now = Instant::now();
+        self.conns
+            .lock()
+            .unwrap()
+            .retain(|_key, entry| match entry.conn.try_lock() {
+                // Lock held elsewhere -> a turn is in flight on this socket -> keep it, whatever its age.
+                Err(_) => true,
+                // Free: drop it if the socket is dead or it has been idle past the TTL.
+                Ok(guard) => {
+                    !guard.is_closed() && now.saturating_duration_since(entry.last_used) <= ttl
+                }
+            });
     }
 
     /// Plan (Task 6) and build (Task 4) the envelope for the next attempt, reading ALL prior-turn
@@ -1887,5 +1955,126 @@ mod tests {
             crate::ws::conn::WS_READ_IDLE_MARKER
         ));
         assert_eq!(classify_recovery(&e), RecoveryAction::Reconnect);
+    }
+
+    // ---- WS hardening Task 2 (bounded cache growth): idle entries are reaped -------------------
+
+    /// Root cause this guards: `conns` had NO TTL/reap/cap — an abandoned session's cache entry
+    /// (its `conn_key` is high-cardinality: account:session:fingerprint:window) lived forever,
+    /// evicted only lazily on the next lookup of the SAME key, which for an abandoned session never
+    /// comes. `reap_idle` bounds that: an entry unused (no dial, no reuse) for longer than the
+    /// injected `ttl` is dropped; a still-recent one is kept. Injected short `ttl` + a settable
+    /// `last_used` aged with `Instant::now() - _` means NO real sleep.
+    #[tokio::test]
+    async fn idle_connections_are_reaped_after_ttl() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::normal(vec![]),
+        ]);
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
+        let account = test_account(base);
+
+        // Two distinct sessions -> two distinct conn_keys -> two independent cache entries.
+        for session in ["stale", "fresh"] {
+            let ctx = ctx_with_session(session);
+            let stream = executor
+                .execute(
+                    prepared(json!({"model": "m", "input": [item(0)]})),
+                    &account,
+                    &ctx,
+                )
+                .await
+                .expect("turn must succeed");
+            drain(stream).await;
+        }
+        assert_eq!(
+            executor.conns.lock().unwrap().len(),
+            2,
+            "two sessions must have cached two connection entries"
+        );
+
+        // Age exactly ONE entry well past the (short, injected) reap TTL; leave the other fresh.
+        // Aging via subtraction from `Instant::now()` needs no real sleep. The offset (10s) is
+        // tiny relative to any test host's monotonic-clock uptime, so it never underflows.
+        let stale_key = {
+            let mut map = executor.conns.lock().unwrap();
+            let key = map.keys().next().unwrap().clone();
+            map.get_mut(&key).unwrap().last_used = Instant::now() - Duration::from_secs(10);
+            key
+        };
+
+        executor.reap_idle(Duration::from_secs(5));
+
+        let map = executor.conns.lock().unwrap();
+        assert_eq!(
+            map.len(),
+            1,
+            "the idle-past-TTL entry must be reaped and the still-recent one kept"
+        );
+        assert!(
+            !map.contains_key(&stale_key),
+            "the reaped entry must be exactly the one aged past the TTL"
+        );
+    }
+
+    /// A cache HIT (a `connect_and_cache` reuse) must refresh `last_used`, so an actively-reused
+    /// socket is never reaped mid-conversation. Observed DIRECTLY via the stored timestamp: age the
+    /// sole entry a little (still well under the production `WS_CONN_IDLE_TTL`, so the reap at the
+    /// top of `connect_and_cache` keeps it), do a second same-session turn (a genuine hit — proven
+    /// by `handshake_count` staying 1), then assert `last_used` moved forward.
+    #[tokio::test]
+    async fn cache_hit_refreshes_last_used() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::normal(vec![]),
+        ]);
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
+        let account = test_account(base);
+        let ctx = ctx_with_session("refresh");
+
+        // Turn 1: dial + cache.
+        let s1 = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .expect("turn 1 must succeed");
+        drain(s1).await;
+
+        // Age the sole entry by 10s — under WS_CONN_IDLE_TTL, so the reap-at-top keeps it — and
+        // record that aged timestamp.
+        let (key, aged) = {
+            let mut map = executor.conns.lock().unwrap();
+            let key = map.keys().next().unwrap().clone();
+            let entry = map.get_mut(&key).unwrap();
+            entry.last_used = Instant::now() - Duration::from_secs(10);
+            (key, entry.last_used)
+        };
+
+        // Turn 2, SAME session: a cache HIT (reuse), which must refresh last_used to ~now.
+        let s2 = executor
+            .execute(
+                prepared(json!({"model": "m", "input": [item(0), item(1)]})),
+                &account,
+                &ctx,
+            )
+            .await
+            .expect("turn 2 must succeed");
+        drain(s2).await;
+        assert_eq!(
+            mock.handshake_count(),
+            1,
+            "turn 2 must REUSE the cached socket (a hit) — no new handshake"
+        );
+
+        let refreshed = executor.conns.lock().unwrap().get(&key).unwrap().last_used;
+        assert!(
+            refreshed > aged,
+            "a cache hit must refresh last_used forward (aged={aged:?}, refreshed={refreshed:?})"
+        );
     }
 }
