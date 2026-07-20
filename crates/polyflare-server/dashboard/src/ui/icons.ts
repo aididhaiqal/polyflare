@@ -36,6 +36,10 @@
 // Check/X/CircleAlert are the mutation-foundation Toast additions (ui/Toast.tsx): a success toast
 // gets `Check`, an error toast gets `CircleAlert`, and `X` is the toast's manual-dismiss control.
 // Same no-emoji rationale — a real lucide glyph, not a Unicode checkmark/cross.
+//
+// MoreVertical is the Task 6 addition for the shared `ActionMenu` primitive (ui/ActionMenu.tsx):
+// it's the kebab (⋯) trigger icon fronting the account-row action menu (Tasks 7/8 consume it).
+// `Check` (already exported above for Toast) is reused by `ActionMenu.CheckItem`'s checkmark.
 export {
   Activity,
   AlertTriangle,
@@ -61,6 +65,7 @@ export {
   Lock,
   LogIn,
   Moon,
+  MoreVertical,
   Pause,
   Pencil,
   Play,
