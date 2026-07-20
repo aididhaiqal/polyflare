@@ -28,8 +28,6 @@ pub(crate) const REDIAL_BACKOFF: std::time::Duration = std::time::Duration::from
 ///
 /// Content-free: never logs the account, headers, or any error — `dial_owner_upstream`'s `Err` is
 /// discarded outright, not even matched on.
-// A seam held for later tasks (reconnect-vs-move dials through this); not yet wired into the pump.
-#[allow(dead_code)]
 pub(crate) async fn redial_upstream(headers: &HeaderMap, account: &Account) -> Option<WsConn> {
     for attempt in 0..MAX_REDIAL_ATTEMPTS {
         if let Ok(conn) = dial_owner_upstream(headers, account).await {
