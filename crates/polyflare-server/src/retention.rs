@@ -247,6 +247,13 @@ mod tests {
             total_tokens: None,
             cached_tokens: None,
             subagent: None,
+            request_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: None,
+            latency_first_token_ms: None,
         }
     }
 

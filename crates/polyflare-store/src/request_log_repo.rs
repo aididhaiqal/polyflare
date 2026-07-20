@@ -29,7 +29,10 @@ const ERROR_STATUS_MIN: i64 = 400;
 /// A content-free request-outcome record to persist. Every field is a bounded enum-like string, a
 /// number, or an epoch timestamp — never request content. This is the insert input; the persisted
 /// row (with its surrogate id) is [`RequestLogRow`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Eq` (only `PartialEq`): `cost_usd: Option<f64>` (migration 0005) has no `Eq` impl, since
+/// `f64` doesn't implement it.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RequestLogRecord {
     /// Unix-epoch seconds at request completion.
     pub requested_at: i64,
@@ -66,11 +69,33 @@ pub struct RequestLogRecord {
     /// `memory_consolidation`/`collab_spawn`), or `None` for the main agent — a bounded role slug,
     /// never conversation content, same content-safety class as `model`/`transport`.
     pub subagent: Option<String>,
+    /// The upstream/client request-correlation id (migration 0005) — a content-free identifier,
+    /// never conversation content. Populated at insert time and used by
+    /// [`RequestLogRepo::update_usage`] to correlate the stream wrapper's post-completion usage
+    /// backfill to this row.
+    pub request_id: Option<String>,
+    /// Prompt/input token count (migration 0005), a content-free count. `None` until the stream
+    /// wrapper backfills it via [`RequestLogRepo::update_usage`].
+    pub input_tokens: Option<i64>,
+    /// Completion/output token count (migration 0005), a content-free count.
+    pub output_tokens: Option<i64>,
+    /// Cached tokens counted toward `input_tokens` (migration 0005), a content-free count.
+    pub cached_input_tokens: Option<i64>,
+    /// Reasoning token count (migration 0005), a content-free count.
+    pub reasoning_tokens: Option<i64>,
+    /// Computed request cost in USD (migration 0005).
+    pub cost_usd: Option<f64>,
+    /// Time-to-first-token in milliseconds (migration 0005). Distinct from `ttft_ms` (migration
+    /// 0007): that field is populated today by the observability path; this one is codex-lb's
+    /// import-shaped near-neighbor of the same concept, backfilled by the stream wrapper alongside
+    /// the other usage/cost columns (see 0005's migration comment).
+    pub latency_first_token_ms: Option<i64>,
 }
 
 /// A persisted request-log row: a [`RequestLogRecord`] plus its surrogate primary key. `status` is
-/// widened to `i64` because that is how SQLite stores it (the insert narrows from `u16`).
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+/// widened to `i64` because that is how SQLite stores it (the insert narrows from `u16`). Not `Eq`
+/// for the same reason as [`RequestLogRecord`] (`cost_usd: Option<f64>`).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct RequestLogRow {
     pub id: i64,
     pub requested_at: i64,
@@ -89,6 +114,13 @@ pub struct RequestLogRow {
     pub total_tokens: Option<i64>,
     pub cached_tokens: Option<i64>,
     pub subagent: Option<String>,
+    pub request_id: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
+    pub cost_usd: Option<f64>,
+    pub latency_first_token_ms: Option<i64>,
 }
 
 /// Dashboard filter set for [`RequestLogRepo::page`]. Every field is optional; an unset field
@@ -157,8 +189,10 @@ impl RequestLogRepo {
             "INSERT INTO request_log \
              (requested_at, provider, method, path, aliased, status, duration_ms, \
               account_id, model, reasoning_effort, service_tier, transport, ttft_ms, \
-              total_tokens, cached_tokens, subagent) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              total_tokens, cached_tokens, subagent, request_id, input_tokens, \
+              output_tokens, cached_input_tokens, reasoning_tokens, cost_usd, \
+              latency_first_token_ms) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.requested_at)
         .bind(&record.provider)
@@ -176,6 +210,47 @@ impl RequestLogRepo {
         .bind(record.total_tokens)
         .bind(record.cached_tokens)
         .bind(&record.subagent)
+        .bind(&record.request_id)
+        .bind(record.input_tokens)
+        .bind(record.output_tokens)
+        .bind(record.cached_input_tokens)
+        .bind(record.reasoning_tokens)
+        .bind(record.cost_usd)
+        .bind(record.latency_first_token_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Fill in the six 0005 usage/cost columns on an already-inserted row, correlated by
+    /// `request_id` — the stream wrapper's post-completion usage backfill (streaming responses
+    /// only know final token/cost counts once the stream ends, well after [`Self::insert`] already
+    /// wrote the row). Does NOT bump any store generation: `request_log` is a history table, not
+    /// the account cache the server re-reads on generation bumps. A no-op (still `Ok`) if no row
+    /// matches `request_id` — this is called fire-and-forget off the response path, same as
+    /// `insert`, so a miss must never surface as an error.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_usage(
+        &self,
+        request_id: &str,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
+        cached_input_tokens: Option<i64>,
+        reasoning_tokens: Option<i64>,
+        cost_usd: Option<f64>,
+        latency_first_token_ms: Option<i64>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE request_log SET input_tokens=?, output_tokens=?, cached_input_tokens=?, \
+             reasoning_tokens=?, cost_usd=?, latency_first_token_ms=? WHERE request_id=?",
+        )
+        .bind(input_tokens)
+        .bind(output_tokens)
+        .bind(cached_input_tokens)
+        .bind(reasoning_tokens)
+        .bind(cost_usd)
+        .bind(latency_first_token_ms)
+        .bind(request_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -186,7 +261,8 @@ impl RequestLogRepo {
         let rows = sqlx::query_as::<_, RequestLogRow>(
             "SELECT id, requested_at, provider, method, path, aliased, status, duration_ms, \
              account_id, model, reasoning_effort, service_tier, transport, ttft_ms, \
-             total_tokens, cached_tokens, subagent \
+             total_tokens, cached_tokens, subagent, request_id, input_tokens, output_tokens, \
+             cached_input_tokens, reasoning_tokens, cost_usd, latency_first_token_ms \
              FROM request_log \
              ORDER BY requested_at DESC, id DESC \
              LIMIT ? OFFSET ?",
@@ -219,7 +295,9 @@ impl RequestLogRepo {
         let mut select = QueryBuilder::<Sqlite>::new(
             "SELECT id, requested_at, provider, method, path, aliased, status, duration_ms, \
              account_id, model, reasoning_effort, service_tier, transport, ttft_ms, \
-             total_tokens, cached_tokens, subagent FROM request_log",
+             total_tokens, cached_tokens, subagent, request_id, input_tokens, output_tokens, \
+             cached_input_tokens, reasoning_tokens, cost_usd, latency_first_token_ms \
+             FROM request_log",
         );
         Self::push_where(&mut select, filter);
         select.push(" ORDER BY requested_at DESC, id DESC LIMIT ");
@@ -477,6 +555,13 @@ mod tests {
             total_tokens: Some(3204),
             cached_tokens: Some(1100),
             subagent: Some("review".into()),
+            request_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: None,
+            latency_first_token_ms: None,
         };
         repo.insert(&rec).await.unwrap();
 
@@ -530,6 +615,13 @@ mod tests {
             total_tokens: Some(500),
             cached_tokens: None,
             subagent: None,
+            request_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: None,
+            latency_first_token_ms: None,
         }
     }
 
@@ -610,6 +702,13 @@ mod tests {
             total_tokens,
             cached_tokens: None,
             subagent: None,
+            request_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: None,
+            latency_first_token_ms: None,
         }
     }
 
@@ -852,6 +951,79 @@ mod tests {
         assert_eq!(repo.count().await.unwrap(), 1);
         let remaining = repo.list(10, 0).await.unwrap();
         assert_eq!(remaining[0].requested_at, 1000);
+    }
+
+    /// `update_usage` fills the six 0005 usage/cost columns on an already-inserted row, correlated
+    /// by `request_id` — the stream wrapper's post-completion usage backfill. A no-op on an unknown
+    /// `request_id` still returns `Ok` (fire-and-forget from the response path).
+    #[tokio::test]
+    async fn update_usage_fills_row_by_request_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("s.db")).await.unwrap();
+        let repo = store.request_log();
+        let mut rec = sample_record();
+        rec.request_id = Some("req-xyz".into());
+        repo.insert(&rec).await.unwrap();
+        repo.update_usage(
+            "req-xyz",
+            Some(8380),
+            Some(120),
+            Some(6912),
+            Some(40),
+            Some(0.089),
+            Some(3510),
+        )
+        .await
+        .unwrap();
+        let row = repo
+            .list(10, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.request_id.as_deref() == Some("req-xyz"))
+            .unwrap();
+        assert_eq!(row.input_tokens, Some(8380));
+        assert_eq!(row.output_tokens, Some(120));
+        assert_eq!(row.cached_input_tokens, Some(6912));
+        assert_eq!(row.reasoning_tokens, Some(40));
+        assert_eq!(row.cost_usd, Some(0.089));
+        assert_eq!(row.latency_first_token_ms, Some(3510));
+        assert_eq!(row.request_id.as_deref(), Some("req-xyz"));
+
+        // no-op on unknown id returns Ok
+        repo.update_usage("nope", Some(1), None, None, None, None, None)
+            .await
+            .unwrap();
+    }
+
+    /// A full `RequestLogRecord` with every existing field populated and every new (usage) field
+    /// `None` — the shared base for tests that only care about a couple of fields on top.
+    fn sample_record() -> RequestLogRecord {
+        RequestLogRecord {
+            requested_at: 100,
+            provider: "codex".into(),
+            method: "POST".into(),
+            path: "/responses".into(),
+            aliased: false,
+            status: 200,
+            duration_ms: 1000,
+            account_id: Some("acct-1".into()),
+            model: Some("gpt-5.6-sol".into()),
+            reasoning_effort: None,
+            service_tier: None,
+            transport: Some("http".into()),
+            ttft_ms: Some(200),
+            total_tokens: Some(500),
+            cached_tokens: None,
+            subagent: None,
+            request_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: None,
+            latency_first_token_ms: None,
+        }
     }
 
     /// A cutoff in the future deletes every row; a cutoff before every row's timestamp deletes

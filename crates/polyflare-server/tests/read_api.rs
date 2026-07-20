@@ -101,6 +101,13 @@ async fn seed_store() -> Store {
             total_tokens: None,
             cached_tokens: None,
             subagent: None,
+            request_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: None,
+            latency_first_token_ms: None,
         })
         .await
         .unwrap();
@@ -288,6 +295,13 @@ async fn accounts_endpoint_carries_provider_pool_usage_token_health_and_request_
             total_tokens: None,
             cached_tokens: None,
             subagent: None,
+            request_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: None,
+            latency_first_token_ms: None,
         })
         .await
         .unwrap();
@@ -611,6 +625,13 @@ async fn seed_store_for_filters() -> Store {
         total_tokens: Some(3000),
         cached_tokens: Some(1000),
         subagent: Some("review".to_string()),
+        request_id: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        reasoning_tokens: None,
+        cost_usd: None,
+        latency_first_token_ms: None,
     })
     .await
     .unwrap();
@@ -631,6 +652,13 @@ async fn seed_store_for_filters() -> Store {
         total_tokens: None,
         cached_tokens: None,
         subagent: None,
+        request_id: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        reasoning_tokens: None,
+        cost_usd: None,
+        latency_first_token_ms: None,
     })
     .await
     .unwrap();
@@ -651,6 +679,13 @@ async fn seed_store_for_filters() -> Store {
         total_tokens: None,
         cached_tokens: None,
         subagent: None,
+        request_id: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        reasoning_tokens: None,
+        cost_usd: None,
+        latency_first_token_ms: None,
     })
     .await
     .unwrap();
@@ -730,6 +765,13 @@ fn req_row(status: u16, total_tokens: i64) -> RequestLogRecord {
         total_tokens: Some(total_tokens),
         cached_tokens: None,
         subagent: None,
+        request_id: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        reasoning_tokens: None,
+        cost_usd: None,
+        latency_first_token_ms: None,
     }
 }
 
@@ -839,6 +881,13 @@ fn req_row_at(requested_at: i64, status: u16, total_tokens: i64) -> RequestLogRe
         total_tokens: Some(total_tokens),
         cached_tokens: None,
         subagent: None,
+        request_id: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        reasoning_tokens: None,
+        cost_usd: None,
+        latency_first_token_ms: None,
     }
 }
 
