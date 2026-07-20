@@ -31,6 +31,7 @@ use crate::app::AppState;
 
 mod owner;
 mod pump;
+mod redial;
 mod session;
 mod signal;
 mod sniff;
