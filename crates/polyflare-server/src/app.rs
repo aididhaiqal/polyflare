@@ -324,6 +324,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             "/api/overview/series",
             get(crate::read_api::overview_series_handler),
         )
+        .route("/api/reports", get(crate::read_api::reports_handler))
         .route("/api/logs/stream", get(crate::sse::logs_stream_handler))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
