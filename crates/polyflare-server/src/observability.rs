@@ -105,6 +105,17 @@ impl RequestLog {
             total_tokens: self.total_tokens,
             cached_tokens: self.cached_tokens,
             subagent: self.subagent.clone(),
+            // `request_id` + the six 0005 usage/cost columns are not yet populated on this path —
+            // they are filled post-insert by `RequestLogRepo::update_usage`, wired by the (later)
+            // stream-wrapper task. `RequestLog` itself gains a `request_id` field when that task
+            // needs one to call `update_usage`.
+            request_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: None,
+            latency_first_token_ms: None,
         }
     }
 
