@@ -543,6 +543,7 @@ mod tests {
                         from,
                         fernet_key,
                         dry_run,
+                        refresh_existing: _,
                     },
             } => {
                 assert_eq!(from, std::path::PathBuf::from("/tmp/store.db"));
