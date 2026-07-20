@@ -35,13 +35,12 @@ const DEFAULT_TTL: Duration = Duration::from_secs(3600);
 pub struct UpstreamModel {
     pub slug: String,
     pub display_name: String,
-    /// Context window size in tokens, when the upstream entry advertises one. Task 3 renders this
-    /// into both `/models` response shapes (`CodexModelEntry.context_window` and the OpenAI item's
-    /// `metadata.context_window`) when present — see `catalog.rs`'s `CatalogModel`.
+    /// Context window size in tokens, when the upstream entry advertises one. Rendered into the
+    /// OpenAI item's `metadata.context_window` when present — see `catalog.rs`'s `CatalogModel`.
+    /// The Codex `models` array (Task 2) instead emits `raw` verbatim and does not use this field.
     pub context_window: Option<u64>,
-    /// Whether this model prefers the WebSocket transport, when upstream advertises it. Task 3
-    /// renders this the same way as `context_window` above (`CodexModelEntry.prefer_websockets` /
-    /// `metadata.prefer_websockets`).
+    /// Whether this model prefers the WebSocket transport, when upstream advertises it. Same
+    /// OpenAI-only rendering as `context_window` above (`metadata.prefer_websockets`).
     pub prefer_websockets: Option<bool>,
     /// The full upstream `/models` entry as received, preserved verbatim for the `/models`
     /// renderer.
