@@ -116,11 +116,13 @@ export interface TokenHealthView {
 export interface AccountView {
   id: string;
   email: string;
+  alias: string | null;
   pool: string | null;
   provider: string;
   status: string;
   plan_type: string;
   routing_policy: string;
+  security_work_authorized: boolean;
   reset_at: number | null;
   five_hour: WindowView | null;
   weekly: WindowView | null;
