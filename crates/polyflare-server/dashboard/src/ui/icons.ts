@@ -32,16 +32,22 @@
 // (`live-logs.html`): `Play` is the Resume affordance (paired with the existing `Pause`), the
 // mockup's own "auto-scroll" glyph isn't a real icon so `ArrowDownToLine` (scroll-to-bottom) is
 // its lucide replacement, and `EyeOff` fronts the flag-off disabled notice. See task-10-report.md.
+//
+// Check/X/CircleAlert are the mutation-foundation Toast additions (ui/Toast.tsx): a success toast
+// gets `Check`, an error toast gets `CircleAlert`, and `X` is the toast's manual-dismiss control.
+// Same no-emoji rationale — a real lucide glyph, not a Unicode checkmark/cross.
 export {
   Activity,
   AlertTriangle,
   ArrowDown,
   ArrowDownToLine,
   BarChart3,
+  Check,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  CircleAlert,
   Clock,
   Coins,
   Download,
@@ -66,6 +72,7 @@ export {
   Sun,
   Trash2,
   Users,
+  X,
   Zap,
   type LucideIcon,
 } from "lucide-react";

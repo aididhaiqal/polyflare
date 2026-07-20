@@ -420,6 +420,40 @@ export interface LogEvent {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Mutation client — write endpoints (queries.ts wraps these in useMutation). Content-free: every
+// body field is account metadata (pool/policy/status/alias), never a token or conversation content.
+// ---------------------------------------------------------------------------------------------
+
+/** Body for PATCH /api/accounts/{id}. Every field optional — an ABSENT key leaves that attribute
+ * unchanged. For `pool` and `alias` (double-option on the backend) an explicit `null` CLEARS and a
+ * string sets; `status` is "active"|"paused"; `routing_policy` is "normal"|"burn_first"|"preserve". */
+export interface AccountPatchBody {
+  pool?: string | null;
+  routing_policy?: string;
+  status?: string;
+  security_work_authorized?: boolean;
+  alias?: string | null;
+}
+
+/** `{ok:true}` envelope returned by the account PATCH/DELETE mutations. */
+export interface OkResponse {
+  ok: boolean;
+}
+
+export function patchAccount(id: string, body: AccountPatchBody): Promise<OkResponse> {
+  return fetchJson<OkResponse>(`/api/accounts/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export function deleteAccount(id: string, opts?: { deleteHistory?: boolean }): Promise<OkResponse> {
+  const qs = opts?.deleteHistory ? "?delete_history=true" : "";
+  return fetchJson<OkResponse>(`/api/accounts/${encodeURIComponent(id)}${qs}`, { method: "DELETE" });
+}
+
+// ---------------------------------------------------------------------------------------------
 // Thin per-endpoint helpers (queries.ts wraps these in useQuery).
 // ---------------------------------------------------------------------------------------------
 

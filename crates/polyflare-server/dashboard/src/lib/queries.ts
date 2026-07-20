@@ -2,11 +2,15 @@
 // query key + fetchJson call + a refetch policy. Pages consume these instead of calling fetchJson
 // directly, so the caching/refetch behavior lives in one place.
 
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
   api,
+  ApiError,
+  deleteAccount,
+  patchAccount,
   type AccountDetailView,
+  type AccountPatchBody,
   type AccountView,
   type CapabilitiesView,
   type OverviewSeriesView,
@@ -19,6 +23,7 @@ import {
   type SessionsView,
   type TrendsView,
 } from "./api";
+import { useToast } from "../ui/Toast";
 
 /** How often the landing-page/list views poll for fresh data while mounted. Per the task brief:
  * overview + the account/pool lists refetch every 30s; per-item detail views (account detail,
@@ -173,5 +178,49 @@ export function useCapabilities() {
     // Feature flags sourced from process env at server startup — effectively static for the life
     // of a running server, so never proactively refetch.
     staleTime: Infinity,
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Mutations — the frontend control-plane foundation (Task 5). Both hooks invalidate the account
+// queries on success and surface a toast either way; later tasks (kebab menu, action bar) call
+// these without touching react-query or the toast wiring directly.
+// ---------------------------------------------------------------------------------------------
+
+/** Extracts a human-readable message from a mutation failure: prefers `ApiError.body` when it's a
+ * string (the backend's `bad_request` message, e.g. "alias must be 1..=64 characters"), falls back
+ * to the HTTP status, then to a plain `Error.message`, then a generic string. */
+function mutationErrorText(e: unknown): string {
+  if (e instanceof ApiError) {
+    return typeof e.body === "string" && e.body.length > 0 ? e.body : `HTTP ${e.status}`;
+  }
+  return e instanceof Error ? e.message : "unknown error";
+}
+
+export function usePatchAccount() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (v: { id: string; body: AccountPatchBody }) => patchAccount(v.id, v.body),
+    onSuccess: (_r, v) => {
+      qc.invalidateQueries({ queryKey: queryKeys.accounts });
+      qc.invalidateQueries({ queryKey: queryKeys.account(v.id) });
+      toast({ title: "Account updated", variant: "success" });
+    },
+    onError: (e) => toast({ title: "Update failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+export function useDeleteAccount() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (v: { id: string; deleteHistory?: boolean }) =>
+      deleteAccount(v.id, { deleteHistory: v.deleteHistory }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.accounts });
+      toast({ title: "Account deleted", variant: "success" });
+    },
+    onError: (e) => toast({ title: "Delete failed", description: mutationErrorText(e), variant: "error" }),
   });
 }
