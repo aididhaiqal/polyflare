@@ -25,12 +25,10 @@ const NAV_ITEMS: NavItem[] = [
   { to: "/requests", label: "Requests", icon: List },
   { to: "/sessions", label: "Sessions", icon: Link2 },
   { to: "/logs", label: "Live Logs", icon: Activity, requiresLiveLogs: true },
+  { to: "/reports", label: "Analytics", icon: BarChart3 },
 ];
 
-const SOON_ITEMS: Array<{ label: string; icon: LucideIcon }> = [
-  { label: "Analytics", icon: BarChart3 },
-  { label: "Settings", icon: Settings },
-];
+const SOON_ITEMS: Array<{ label: string; icon: LucideIcon }> = [{ label: "Settings", icon: Settings }];
 
 /** Left nav: brand, primary nav (active state = accent-tinted background, per the mockups' `.pf-nav
  * a.on`), a divider, two permanently-disabled "soon" items, and a footer with the theme toggle +

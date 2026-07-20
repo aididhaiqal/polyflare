@@ -19,6 +19,7 @@ import {
   type PoolView,
   type RequestsQueryParams,
   type RequestsView,
+  type ReportsView,
   type SessionsQueryParams,
   type SessionsView,
   type TrendsView,
@@ -40,6 +41,7 @@ export const queryKeys = {
   pace: ["pace"] as const,
   requests: (params: RequestsQueryParams) => ["requests", params] as const,
   sessions: (params: SessionsQueryParams) => ["sessions", params] as const,
+  reports: (params: ReportsParams) => ["reports", params] as const,
   capabilities: ["capabilities"] as const,
 };
 
@@ -168,6 +170,39 @@ export function useSessions(params: SessionsQueryParams = {}) {
     queryFn: () => api.sessions(buildSessionsQueryString(params)),
     refetchInterval: LIST_REFETCH_MS,
     staleTime: LIST_REFETCH_MS,
+  });
+}
+
+/** `GET /api/reports` query params — mirrors `read_api.rs::ReportsQuery`'s `range`/`dimension`/
+ * `provider`, but `range`/`dimension` are required here (not optional, unlike the backend's own
+ * Option<String> fields) since the Reports page's control bar always has a selected value — there
+ * is no "absent" state to model client-side, the backend's absent-defaults-to-7d/model behavior is
+ * simply never exercised by this hook. */
+export interface ReportsParams {
+  range: string;
+  dimension: string;
+  provider?: string;
+}
+
+/** Serializes `ReportsParams` into a `?`-prefixed query string, omitting `provider` when unset.
+ * Field order matches `read_api.rs::ReportsQuery` (`range,dimension,provider`). */
+function buildReportsQueryString(params: ReportsParams): string {
+  const sp = new URLSearchParams();
+  sp.set("range", params.range);
+  sp.set("dimension", params.dimension);
+  if (params.provider !== undefined) sp.set("provider", params.provider);
+  return `?${sp.toString()}`;
+}
+
+/** `GET /api/reports` — the Reports page's composite analytics payload (time series + breakdown +
+ * totals). 60s stale/refetch, not the 30s lists' cadence — reports drift slowly (bucketed
+ * hourly/daily), so there's no value in polling as often as the live account/request lists do. */
+export function useReports(params: ReportsParams) {
+  return useQuery<ReportsView>({
+    queryKey: queryKeys.reports(params),
+    queryFn: () => api.reports(buildReportsQueryString(params)),
+    staleTime: 60_000,
+    refetchInterval: 60_000,
   });
 }
 
