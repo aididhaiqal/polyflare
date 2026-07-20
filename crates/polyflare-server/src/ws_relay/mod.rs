@@ -72,7 +72,9 @@ pub(crate) use session::ws_session_key;
 /// as transient costs nothing extra durability-wise while avoiding the cache-losing move. A
 /// longer/absent `retry_after` is durable and falls through to the existing bench -> resolve_owner
 /// -> move path, unchanged.
-const TRANSIENT_RETRY_MAX_SECS: i64 = 30;
+///
+/// Bound directly to the shared floor (not a duplicated literal) so the two can never drift.
+const TRANSIENT_RETRY_MAX_SECS: i64 = crate::runtime_state::RATE_LIMITED_MIN_COOLDOWN_SECS;
 
 /// Mirrors `control.rs`'s / `continuity.rs`'s own `unix_now` — a plain wall-clock read, no shared
 /// helper exists at the crate root so each site that needs "now, in seconds" defines its own trivial
