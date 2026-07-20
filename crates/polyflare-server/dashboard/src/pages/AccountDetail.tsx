@@ -5,19 +5,21 @@
 // (the reworked 3-column Actions panel — used verbatim per the task brief, which names it
 // explicitly over the master-detail mockup's flatter single-row Actions).
 //
-// PHASE 1 IS READ-ONLY. Every Configuration/Rate-limit-reset/Operations control in the Actions
-// panel is rendered with the real HTML `disabled` attribute and NO event handler — nothing here
-// ever calls `PATCH /api/accounts/{id}`. Two controls reflect real backend fields even while
-// disabled (routing policy, trusted access); the rest (limit warm-up, rate-limit reset credits)
-// have no backing field at all in this MVP schema, so they render as inert, clearly-labeled
-// placeholders rather than fabricated on/off state — see task-7-report.md for the full mapping
-// and reasoning.
+// PHASE 3 (this task) ENABLES the in-scope Actions-panel controls (routing policy, trusted access,
+// pool, alias, pause/resume, delete) via the shared `useAccountActions()` hook (Task 7,
+// `../lib/useAccountActions`) — each wired control calls `actions.patch.mutate({id, body})` directly
+// or opens one of the hook's confirmation dialogs. Controls with no backing field in this MVP schema
+// (limit warm-up, rate-limit reset credits, force probe, re-authenticate, export auth) remain plain
+// disabled placeholders — see task-7-report.md/task-8-report.md for the full mapping and reasoning.
 //
 // Field mapping (see read_api.rs::AccountDetailView / src/lib/api.ts's mirror):
-//   rail rows                 <- useAccounts() (AccountView[] — NO alias field; see task-6-report.md).
-//                                 The currently-open account's rail row borrows its alias from the
-//                                 detail query (identity.alias), since that's the one row where the
-//                                 richer name is already known.
+//   rail rows                 <- useAccounts() (AccountView[] — DOES have an `alias` field; Task 4b
+//                                 put it on the backend wire, Task 7 added it to the TS interface;
+//                                 see task-7-report.md). This page's rail still borrows the
+//                                 currently-open row's alias from the detail query (identity.alias)
+//                                 rather than reading it off the list row directly — a harmless
+//                                 pre-existing pattern, left as-is since this task's scope is the
+//                                 Actions panel, not the rail.
 //   header dot/name/pv/status  <- detail.status (via statusTone/StatusPill), detail.identity.alias
 //                                 ?? identity.id, identity.provider
 //   meta line                  <- identity.email/workspace_label/plan_type/pool/seat_type
@@ -33,15 +35,18 @@
 //                                 purple) point series — confirmed in polyflare-store's account.rs
 //                                 that `usage_history`'s "primary"/"secondary" window labels ARE the
 //                                 5h/weekly windows respectively. Fixed 0-100 y-axis, no plan line.
-//   Actions / Configuration      <- routing policy: detail.routing_policy (real, shown disabled);
-//                                 trusted access: detail.security_work_authorized (real, shown
-//                                 disabled); limit warm-up: NO backend field — rendered as a static
-//                                 "not tracked" chip instead of a fabricated switch state.
+//   Actions / Configuration      <- routing policy: detail.routing_policy, EDITABLE (all 3 options,
+//                                 PATCHes via actions.patch); trusted access: detail.
+//                                 security_work_authorized, EDITABLE (toggle switch); pool:
+//                                 identity.pool, EDITABLE (opens actions.openSetPool); limit
+//                                 warm-up: NO backend field — rendered as a static "not tracked"
+//                                 chip instead of a fabricated switch state.
 //                                 Rate-limit resets: NO backend concept at all (grepped the store —
 //                                 no reset-credit table/field exists) — rendered as an explanatory
 //                                 placeholder, no invented counts/expiries.
-//                                 Operations (Pause/Force probe/Re-authenticate/Export
-//                                 auth/Delete): plain disabled buttons, no data implied.
+//                                 Operations: Pause/Resume and Delete are EDITABLE (wired to
+//                                 actions.patch / actions.openDelete); Force probe/Re-authenticate/
+//                                 Export auth remain plain disabled buttons — no backend for them.
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
@@ -66,6 +71,7 @@ import {
 } from "../lib/api";
 import { compactNum, countdown, pct } from "../lib/format";
 import { useAccount, useAccountTrends, useAccounts } from "../lib/queries";
+import { useAccountActions, type AccountActionsApi } from "../lib/useAccountActions";
 import { Card } from "../ui/Card";
 import { Col, Grid } from "../ui/Grid";
 import {
@@ -75,9 +81,11 @@ import {
   Download,
   Flame,
   Key,
+  Layers,
   LogIn,
   Pause,
   Pencil,
+  Play,
   Route,
   RotateCcw,
   Search,
@@ -531,6 +539,8 @@ function DetailContent({
   const quotaRows = [...detail.quota_windows].sort(
     (a, b) => (WINDOW_ORDER[a.window] ?? 99) - (WINDOW_ORDER[b.window] ?? 99),
   );
+  const actions = useAccountActions();
+  const navigate = useNavigate();
 
   return (
     <div className="flex flex-col gap-3">
@@ -539,9 +549,9 @@ function DetailContent({
         <span className="text-[15px] font-bold text-fg">{displayName}</span>
         <button
           type="button"
-          disabled
-          title="Edit alias — Phase 3"
-          className="inline-flex shrink-0 cursor-not-allowed items-center text-fg opacity-30"
+          title="Edit alias"
+          onClick={() => actions.openRename({ id: identity.id, alias: identity.alias })}
+          className="inline-flex shrink-0 items-center text-fg opacity-60 hover:opacity-100"
         >
           <Pencil className="h-3.5 w-3.5" strokeWidth={1.8} />
         </button>
@@ -636,11 +646,19 @@ function DetailContent({
 
         <Col span={12}>
           <ActionsCard
+            id={identity.id}
+            alias={identity.alias}
+            status={detail.status}
             routingPolicy={detail.routing_policy}
             trustedAccess={detail.security_work_authorized}
+            pool={identity.pool}
+            actions={actions}
+            onDeleted={() => navigate("/accounts")}
           />
         </Col>
       </Grid>
+
+      {actions.dialogs}
     </div>
   );
 }
@@ -865,19 +883,35 @@ function LegendSwatch({ colorClass, label }: { colorClass: string; label: string
 }
 
 // ---------------------------------------------------------------------------------------------
-// Actions panel — Phase 3 layout, Phase 1 read-only. Reproduces `accounts-detail-v2.html`'s
-// reworked 3-column Actions exactly (per the task brief, which names that mockup specifically for
-// this panel over the master-detail mockup's flatter version). Every interactive-looking element
-// uses the real HTML `disabled` attribute and has NO event handler.
+// Actions panel — Phase 3: reproduces `accounts-detail-v2.html`'s reworked 3-column Actions layout
+// (per the task brief, which names that mockup specifically for this panel over the master-detail
+// mockup's flatter version), now with the in-scope controls (routing policy, trusted access, pool,
+// pause/resume, delete) live and wired to the shared `useAccountActions()` hook. Controls with no
+// backend field (limit warm-up, rate-limit resets, force probe, re-authenticate, export auth) stay
+// plain disabled placeholders — no event handler, real HTML `disabled` attribute.
 // ---------------------------------------------------------------------------------------------
 
 function ActionsCard({
+  id,
+  alias,
+  status,
   routingPolicy,
   trustedAccess,
+  pool,
+  actions,
+  onDeleted,
 }: {
+  id: string;
+  alias: string | null;
+  status: string;
   routingPolicy: string;
   trustedAccess: boolean;
+  pool: string | null;
+  actions: AccountActionsApi;
+  onDeleted: () => void;
 }) {
+  const paused = status === "paused";
+  const displayLabel = alias ?? id;
   return (
     <Card>
       <div className="flex items-center gap-2 text-[10px] uppercase tracking-wide text-fg opacity-60">
@@ -894,22 +928,31 @@ function ActionsCard({
 
           <ConfigRow icon={Route} label="Routing policy">
             <select
-              disabled
               value={routingPolicy}
-              className="cursor-not-allowed rounded border border-border bg-muted px-2 py-1 text-[10.5px] text-fg opacity-70"
+              onChange={(e) =>
+                actions.patch.mutate({ id, body: { routing_policy: e.target.value } })
+              }
+              className="rounded border border-border bg-bg px-2 py-1 text-[10.5px] text-fg hover:border-accent"
             >
-              <option value={routingPolicy}>{routingPolicy}</option>
+              <option value="normal">normal</option>
+              <option value="burn_first">burn_first</option>
+              <option value="preserve">preserve</option>
             </select>
           </ConfigRow>
 
           <ConfigRow icon={ShieldCheck} label="Trusted access" hint="cyber">
             <button
               type="button"
-              disabled
               role="switch"
               aria-checked={trustedAccess}
+              onClick={() =>
+                actions.patch.mutate({
+                  id,
+                  body: { security_work_authorized: !trustedAccess },
+                })
+              }
               className={clsx(
-                "relative h-[18px] w-[34px] shrink-0 cursor-not-allowed rounded-full",
+                "relative h-[18px] w-[34px] shrink-0 rounded-full",
                 trustedAccess ? "bg-success/35" : "bg-muted",
               )}
             >
@@ -919,6 +962,16 @@ function ActionsCard({
                   trustedAccess ? "right-[2px] bg-success" : "left-[2px] bg-fg opacity-50",
                 )}
               />
+            </button>
+          </ConfigRow>
+
+          <ConfigRow icon={Layers} label="Pool">
+            <button
+              type="button"
+              onClick={() => actions.openSetPool({ id, pool })}
+              className="rounded border border-border bg-bg px-2 py-1 text-[10.5px] text-fg hover:border-accent"
+            >
+              {pool ?? "unpooled"}
             </button>
           </ConfigRow>
 
@@ -951,7 +1004,13 @@ function ActionsCard({
         <div className="flex flex-col gap-2.5 border-t border-border pt-3 md:border-l md:border-t-0 md:pl-4 md:pt-0">
           <div className="text-[9px] uppercase tracking-wide text-fg opacity-50">Operations</div>
           <div className="grid grid-cols-2 gap-1.5">
-            <OpButton icon={Pause} label="Pause" />
+            <OpButton
+              icon={paused ? Play : Pause}
+              label={paused ? "Resume" : "Pause"}
+              onClick={() =>
+                actions.patch.mutate({ id, body: { status: paused ? "active" : "paused" } })
+              }
+            />
             <OpButton icon={Zap} label="Force probe" />
             <OpButton icon={LogIn} label="Re-authenticate" />
             <OpButton icon={Download} label="Export auth" />
@@ -959,7 +1018,12 @@ function ActionsCard({
           <div className="mt-1.5 text-[9px] font-semibold uppercase tracking-wide text-error opacity-80">
             Danger
           </div>
-          <OpButton icon={Trash2} label="Delete account" danger />
+          <OpButton
+            icon={Trash2}
+            label="Delete account"
+            danger
+            onClick={() => actions.openDelete({ id, label: displayLabel, onDeleted })}
+          />
         </div>
       </div>
     </Card>
@@ -993,20 +1057,26 @@ function OpButton({
   icon: Icon,
   label,
   danger,
+  onClick,
+  disabled = !onClick,
 }: {
   icon: LucideIcon;
   label: string;
   danger?: boolean;
+  onClick?: () => void;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
-      disabled
+      disabled={disabled}
+      onClick={onClick}
       className={clsx(
-        "flex cursor-not-allowed items-center justify-center gap-1.5 rounded border px-2.5 py-1.5 text-[10.5px]",
+        "flex items-center justify-center gap-1.5 rounded border px-2.5 py-1.5 text-[10.5px]",
+        disabled ? "cursor-not-allowed" : "hover:opacity-100 hover:border-accent",
         danger
-          ? "border-error/30 bg-error/10 text-error opacity-60"
-          : "border-border bg-muted text-fg opacity-50",
+          ? clsx("border-error/30 bg-error/10 text-error", disabled ? "opacity-60" : "opacity-90")
+          : clsx("border-border bg-muted text-fg", disabled ? "opacity-50" : "opacity-80"),
       )}
     >
       <Icon className="h-3 w-3 shrink-0" strokeWidth={1.9} />
