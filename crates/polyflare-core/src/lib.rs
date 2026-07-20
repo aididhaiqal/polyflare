@@ -3,6 +3,7 @@
 pub mod continuity;
 pub mod depletion;
 pub mod format;
+pub mod pricing;
 pub mod provider;
 pub mod select;
 pub mod traits;
