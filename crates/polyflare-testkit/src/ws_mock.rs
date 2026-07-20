@@ -19,7 +19,11 @@
 //! backend-issued identifier, not conversation content — and an item count, plus the replayed
 //! `x-codex-turn-state` — itself a content-free server-issued routing token, never conversation
 //! content), never the frame's `input` payload. Nothing here derives `Debug` over a full frame or
-//! request body.
+//! request body. The ONE exception is the OPT-IN raw-frame capture ([`MockWsUpstream::
+//! capturing_raw_frames`], OFF by default): the WS-downstream **relay** forwards the client's frame
+//! byte-for-byte, and its VERBATIM-fidelity test must assert the mock received those exact bytes
+//! (key order / whitespace preserved), so an explicitly opted-in test may stash the raw text of the
+//! synthetic frames it itself constructed. The default mock keeps the content-free discipline.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -190,6 +194,15 @@ pub struct MockWsUpstream {
     /// replay path end to end. `None` (the default) sends no such header. See
     /// [`Self::with_upgrade_turn_state`].
     upgrade_turn_state: Option<String>,
+    /// When set (opt-in, via [`Self::capturing_raw_frames`]), [`handle_socket`] stashes each received
+    /// frame's RAW text — byte-for-byte as it arrived on the wire — into [`Self::raw_frames`], so a
+    /// relay VERBATIM-fidelity test can assert the proxy forwarded the client's frame UNCHANGED (key
+    /// order / whitespace preserved, no serde reparse). OFF by default so the mock's content-free
+    /// `RecordedFrame`-only recording is the norm (see the module content-safety note). `false` here.
+    capture_raw_frames: bool,
+    /// The raw received-frame text buffer, populated only when [`Self::capture_raw_frames`] is on.
+    /// Read via [`Self::raw_frames`].
+    raw_frames: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockWsUpstream {
@@ -213,6 +226,8 @@ impl MockWsUpstream {
             id_counter: Arc::new(AtomicU32::new(0)),
             reject_handshake: false,
             upgrade_turn_state: None,
+            capture_raw_frames: false,
+            raw_frames: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -225,6 +240,24 @@ impl MockWsUpstream {
     pub fn with_upgrade_turn_state(mut self, token: impl Into<String>) -> Self {
         self.upgrade_turn_state = Some(token.into());
         self
+    }
+
+    /// Opt in to stashing every received frame's RAW text (byte-for-byte as it arrived on the wire)
+    /// so a WS-downstream **relay** test can prove VERBATIM fidelity: that the proxy forwarded the
+    /// client's frame UNCHANGED — same key order, same interior whitespace — with no serde reparse
+    /// (which would sort keys / drop formatting and break the codex wire fingerprint). OFF by default
+    /// (the mock's content-free `RecordedFrame`-only recording is the norm); a test opts in only to
+    /// assert on the synthetic frames it itself constructed. Read the buffer via [`Self::raw_frames`].
+    pub fn capturing_raw_frames(mut self) -> Self {
+        self.capture_raw_frames = true;
+        self
+    }
+
+    /// Every received frame's RAW text, in receipt order — populated only when
+    /// [`Self::capturing_raw_frames`] was set (empty otherwise). A verbatim test asserts this equals
+    /// exactly the bytes it sent.
+    pub fn raw_frames(&self) -> Vec<String> {
+        self.raw_frames.lock().unwrap().clone()
     }
 
     /// A mock that answers every WS upgrade attempt with a plain HTTP 426 (`Upgrade Required`)
@@ -360,6 +393,14 @@ async fn handle_socket(mut socket: WebSocket, mock: MockWsUpstream) {
             Message::Close(_) => return,
             _ => continue,
         };
+        // Opt-in VERBATIM proof: stash the raw wire bytes BEFORE any parse, so a relay test can
+        // assert the frame arrived byte-identical (key order / whitespace intact). Off by default.
+        if mock.capture_raw_frames {
+            mock.raw_frames
+                .lock()
+                .unwrap()
+                .push(text.as_str().to_owned());
+        }
         let body: Value = match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(_) => continue,

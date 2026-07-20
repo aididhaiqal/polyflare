@@ -24,6 +24,8 @@
 //! **Content-free (inviolable):** only the account **id** (a non-secret, as in ingress logs) is
 //! ever surfaced; the `session_key` value and the account bearer are never logged here.
 
+use axum::http::HeaderMap;
+use polyflare_codex::WsConn;
 use polyflare_core::{Account, SessionKey};
 
 use crate::app::AppState;
@@ -46,6 +48,13 @@ pub(crate) enum RelayError {
     /// path's generic `500`.
     #[error("internal error resolving the conversation owner")]
     Internal,
+    /// The upstream WS dial itself failed (handshake/transport) — surfaced from
+    /// [`polyflare_codex::ws::dial_upstream`]. Distinct from [`RelayError::NoEligibleAccount`] ("no
+    /// account to even try"): here an owner WAS resolved but its upstream WS could not be reached.
+    /// Carries the codex `ExecError` as the source; its value is a transport/status string, never a
+    /// frame body. Tasks 4-6 map this to a clean downstream close.
+    #[error("upstream WS dial failed")]
+    Upstream(#[source] polyflare_core::ExecError),
 }
 
 /// Resolve — and thereby pin, in memory, for this connection's life — the upstream Codex account
@@ -80,6 +89,31 @@ pub(crate) async fn resolve_owner(
             _ => Err(RelayError::Internal),
         },
     }
+}
+
+/// Task 4: dial the (already-resolved, pinned) `account`'s upstream Codex WS and hand back the open
+/// [`WsConn`] the relay pump (Task 6) drives via [`WsConn::send_text`] / [`WsConn::recv_text`].
+///
+/// The upstream forward headers are built from the DOWNSTREAM handshake `headers` by REUSING the
+/// SAME hop-by-hop drop-list the HTTP `/responses` path uses
+/// ([`crate::ingress::forward_headers_from_inbound`] — it drops `host`/`content-length`/`connection`/
+/// `transfer-encoding`/`authorization`); [`polyflare_codex::ws::dial_upstream`] then applies the
+/// codex-parity handshake on top (offers `permessage-deflate`, inserts `OpenAI-Beta`, overrides
+/// `Authorization`/`chatgpt-account-id` from `account`, and STRIPS `x-codex-turn-state`). The relay
+/// therefore NEVER re-synthesizes the handshake — the only bytes it originates are those normalized
+/// headers. **Content-free:** no frame is sent or logged here; the non-secret account id may be
+/// logged by callers, the bearer never is.
+// A seam held for Tasks 5-6 (the pump calls this after `resolve_owner`); covered by this module's
+// unit test now, wired into `responses_ws_handler` when the real pump replaces `relay_stub`.
+#[allow(dead_code)]
+pub(crate) async fn dial_owner_upstream(
+    headers: &HeaderMap,
+    account: &Account,
+) -> Result<WsConn, RelayError> {
+    let forward_headers = crate::ingress::forward_headers_from_inbound(headers);
+    polyflare_codex::ws::dial_upstream(account, &forward_headers)
+        .await
+        .map_err(RelayError::Upstream)
 }
 
 #[cfg(test)]
@@ -257,6 +291,68 @@ mod tests {
         assert_eq!(
             account.id, "A",
             "unpinned selection ran (RoundRobin's any-eligible tiebreak)"
+        );
+    }
+
+    /// Task 4: the relay dials the pinned owner's upstream WS, building the forward headers from the
+    /// DOWNSTREAM handshake headers via `crate::ingress::forward_headers_from_inbound` and reusing
+    /// polyflare-codex's codex-parity handshake. Proof of "builds forward headers": the downstream
+    /// headers include hop-by-hop `connection`/`host`/`authorization` — if any were forwarded RAW
+    /// into the WS handshake, the `connection` header would clobber tungstenite's `Connection:
+    /// Upgrade` and the upgrade would FAIL; a successful dial proves the drop-list ran. A live send
+    /// then confirms the returned socket is open end to end.
+    #[tokio::test]
+    async fn dial_owner_upstream_builds_forward_headers_and_connects() {
+        use axum::http::{HeaderMap, HeaderName, HeaderValue};
+        use polyflare_testkit::{MockWsUpstream, ScriptedTurn};
+
+        let mock = MockWsUpstream::new(ScriptedTurn::normal(vec![])).capturing_raw_frames();
+        let base = mock.clone().spawn().await; // ws://host:port
+        let account = Account {
+            id: "acct-relay".to_string(),
+            base_url: base,
+            bearer_token: "owner-bearer".to_string(),
+            chatgpt_account_id: Some("owner-cid".to_string()),
+        };
+
+        // A realistic downstream WS handshake header set: one codex identity header that SHOULD be
+        // forwarded, plus hop-by-hop `host`/`connection`/`authorization` that MUST be dropped (a raw
+        // forward of `connection` alone would break the upstream upgrade).
+        let mut headers = HeaderMap::new();
+        for (k, v) in [
+            ("session-id", "s-relay"),
+            ("host", "downstream.invalid"),
+            ("connection", "keep-alive"),
+            ("authorization", "Bearer client-token"),
+        ] {
+            headers.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+
+        let mut conn = dial_owner_upstream(&headers, &account)
+            .await
+            .expect("dial_owner_upstream must connect through the drop-list + codex handshake");
+        assert_eq!(
+            mock.handshake_count(),
+            1,
+            "exactly one upstream WS was established"
+        );
+
+        // The returned socket is genuinely open: a verbatim send reaches the mock unchanged.
+        let raw = r#"{"type":"response.create","input":[]}"#.to_string();
+        conn.send_text(raw.clone()).await.expect("send_text");
+        for _ in 0..50 {
+            if !mock.raw_frames().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            mock.raw_frames(),
+            vec![raw],
+            "socket is open, frame verbatim"
         );
     }
 

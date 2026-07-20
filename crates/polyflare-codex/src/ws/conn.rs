@@ -214,6 +214,32 @@ impl WsConn {
     }
 }
 
+/// **The PUBLIC WS-downstream relay entry point (Phase-1 Task 4).** Dial the conversation owner
+/// account's upstream WS and hand back an open [`WsConn`] the `polyflare-server` relay pump drives
+/// via [`WsConn::send_text`] / [`WsConn::recv_text`].
+///
+/// This is the ONE public door the relay needs: the entire codex-parity handshake — `permessage-
+/// deflate`, `OpenAI-Beta`, the `Authorization`/`chatgpt-account-id` override, and the ground-truth
+/// §7.1 `x-codex-turn-state` strip — lives in [`connect_detailed`] and is REUSED verbatim, never
+/// reimplemented in the relay. Collapses [`ConnectOutcome`] exactly as [`WsConn::connect`] does:
+/// `Connected → Ok(*conn)`, `UpgradeRequired`/`Failed → Err(ExecError)` (a `426` surfaces as
+/// `ExecError::Upstream`). `forward_headers` are the DOWNSTREAM handshake headers the relay already
+/// filtered through `ingress::forward_headers_from_inbound`; this fn forwards them through the same
+/// insert-not-append rules the HTTP executor uses (see [`connect_detailed`]). No frame is sent here
+/// and nothing is logged (the relay's content-free discipline).
+pub async fn dial_upstream(
+    account: &Account,
+    forward_headers: &[(String, String)],
+) -> Result<WsConn, ExecError> {
+    match connect_detailed(account, forward_headers).await {
+        ConnectOutcome::Connected(conn) => Ok(*conn),
+        ConnectOutcome::UpgradeRequired => Err(ExecError::Upstream(
+            "WS handshake rejected: HTTP 426 Upgrade Required".to_string(),
+        )),
+        ConnectOutcome::Failed(e) => Err(e),
+    }
+}
+
 /// The distinguished outcomes of one handshake attempt (M5a Task 7). Ground truth §5 is explicit
 /// that HTTP 426 Upgrade Required is the ONLY `FallbackToHttp` trigger codex itself recognizes —
 /// "No other status falls back". `ws::executor::CodexWsExecutor` needs to tell that ONE case apart
@@ -394,7 +420,21 @@ impl WsConn {
         let text = serde_json::to_string(envelope).map_err(|e| {
             ExecError::Upstream(format!("failed to serialize response.create: {e}"))
         })?;
-        match tokio::time::timeout(timeout, self.socket.send(Message::Text(text.into()))).await {
+        self.send_message_with_timeout(Message::Text(text.into()), timeout)
+            .await
+    }
+
+    /// The shared write path for every outbound message (frame-from-`Value` and raw-text alike): a
+    /// bounded [`WS_SEND_TIMEOUT`]-style send that poisons the socket (`self.closed = true`) on ANY
+    /// failure or elapse so it is evicted on reuse. Extracted so [`send_frame_with_timeout`]'s exact
+    /// behavior is preserved AND [`Self::send_text`] can reuse the identical bound/poison contract
+    /// without a second copy. Never logs the message (it may be conversation content).
+    async fn send_message_with_timeout(
+        &mut self,
+        message: Message,
+        timeout: Duration,
+    ) -> Result<(), ExecError> {
+        match tokio::time::timeout(timeout, self.socket.send(message)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
                 // A send failure means this socket can no longer be trusted for reuse — see
@@ -412,6 +452,18 @@ impl WsConn {
                 )))
             }
         }
+    }
+
+    /// **PUBLIC WS-downstream relay send (Task 4): forward a RAW text frame VERBATIM.** The `text`
+    /// bytes go on the wire UNCHANGED — this is the relay's fidelity crux. Unlike [`Self::send_frame`]
+    /// (which serializes a `Value`, RESHAPING key order and dropping the client's exact formatting),
+    /// this forwards the client's own frame byte-for-byte, so the codex wire fingerprint is preserved
+    /// — the relay MUST NOT parse-then-reserialize a relayed frame. Reuses the same
+    /// [`WS_SEND_TIMEOUT`] bound and poison-on-fail as [`Self::send_frame`]. **Content-free:** the raw
+    /// frame text IS conversation content and is NEVER logged here.
+    pub async fn send_text(&mut self, text: String) -> Result<(), ExecError> {
+        self.send_message_with_timeout(Message::Text(text.into()), WS_SEND_TIMEOUT)
+            .await
     }
 
     /// Read the next frame's raw text off the socket, for the turn stream (Task 5, `ws::turn`) to
@@ -442,6 +494,16 @@ impl WsConn {
     pub(crate) async fn recv_frame(&mut self) -> Result<Option<String>, ExecError> {
         self.recv_frame_with_timeout(WS_READ_IDLE_TIMEOUT, self.client_ping_interval)
             .await
+    }
+
+    /// **PUBLIC WS-downstream relay recv (Task 4): read the next RAW text frame VERBATIM** — the
+    /// public counterpart to [`Self::send_text`], for the relay pump to forward upstream frames back
+    /// to the client unchanged. A thin `pub` wrapper over [`Self::recv_frame`], inheriting its
+    /// read-idle timeout and codex-rs-faithful no-client-ping default exactly (behavior unchanged).
+    /// `Ok(None)` means the socket closed before a frame. **Content-free:** the returned text IS
+    /// conversation content and is NEVER logged here.
+    pub async fn recv_text(&mut self) -> Result<Option<String>, ExecError> {
+        self.recv_frame().await
     }
 
     /// [`recv_frame`] with BOTH budgets injected, so a test can pass SHORT durations and prove the
@@ -878,6 +940,58 @@ mod tests {
             "must poison at the injected 150ms deadline, well before the server's 2s fallback, \
              took {elapsed:?}"
         );
+    }
+
+    /// The PUBLIC relay API (Task 4): `dial_upstream` opens a codex-parity WS to the mock;
+    /// `send_text` forwards a frame BYTE-IDENTICAL (the verbatim crux — a deliberate key order +
+    /// interior whitespace must survive, which a serde reparse would destroy); `recv_text` reads a
+    /// scripted frame back. Exercises the exact seam `polyflare-server`'s relay dial calls.
+    #[tokio::test]
+    async fn dial_upstream_connects_to_the_mock() {
+        // Deliberately UNSORTED keys (`z_before_a`, `type` first) + doubled interior whitespace: a
+        // parse-then-reserialize would sort keys and collapse the spaces, so an exact-bytes match
+        // proves `send_text` never reparsed the frame.
+        let raw =
+            r#"{"type":"response.create",  "z_before_a":1,  "a_after_z":2,"input":[]}"#.to_string();
+        let mock = MockWsUpstream::new(ScriptedTurn::normal(vec![serde_json::json!(
+            {"type":"response.output_text.delta","delta":"hi"}
+        )
+        .to_string()]))
+        .capturing_raw_frames();
+        let base = mock.clone().spawn().await;
+        let account = test_account(base);
+
+        let mut conn = dial_upstream(&account, &[]).await.expect("dial_upstream");
+        assert_eq!(
+            mock.handshake_count(),
+            1,
+            "dial_upstream must establish exactly one upstream WS"
+        );
+
+        conn.send_text(raw.clone()).await.expect("send_text");
+
+        // The mock records on its server task, so poll briefly for the frame to land.
+        for _ in 0..50 {
+            if !mock.raw_frames().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            mock.raw_frames(),
+            vec![raw],
+            "the mock must receive the frame BYTE-IDENTICAL — verbatim, no key reorder / whitespace \
+             drift (a serde reparse would fail this)"
+        );
+
+        // `recv_text` reads the scripted delta frame back, verbatim.
+        let frame = conn
+            .recv_text()
+            .await
+            .expect("recv_text ok")
+            .expect("a frame, not a close");
+        let v: Value = serde_json::from_str(&frame).expect("valid json frame");
+        assert_eq!(v["type"], "response.output_text.delta");
     }
 
     #[tokio::test]

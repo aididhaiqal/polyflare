@@ -12,7 +12,7 @@ pub mod executor;
 pub mod turn;
 
 pub use codec::{build_response_create, classify, frame_to_sse, FrameClass};
-pub use conn::WsConn;
+pub use conn::{dial_upstream, WsConn};
 pub use delta::{
     item_hashes, non_input_fingerprint, plan_request, plan_request_for_conn, ItemHash, RequestPlan,
 };
