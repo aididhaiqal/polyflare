@@ -72,6 +72,7 @@ async fn spawn_with_catalog(model_catalog: Arc<ModelCatalogCache>) -> String {
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
         upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
+        relay_metrics: polyflare_server::observability::RelayMetrics::new(),
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: Duration::from_secs(300),
         soft_drain_enabled: true,

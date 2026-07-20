@@ -135,6 +135,7 @@ async fn no_anchor_request_on_ineligible_owner_fails_over_not_500() {
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
         upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
+        relay_metrics: polyflare_server::observability::RelayMetrics::new(),
         model_catalog: polyflare_server::model_catalog::floor_only_model_catalog(),
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),

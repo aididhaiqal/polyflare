@@ -276,6 +276,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
         upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
+        relay_metrics: polyflare_server::observability::RelayMetrics::new(),
         model_catalog,
     });
     // Runtime usage-refresh loop: keeps each Codex account's rate-limit windows (5h + weekly) and

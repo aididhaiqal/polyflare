@@ -71,6 +71,7 @@ async fn spawn(ws_downstream: bool) -> String {
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
         upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
+        relay_metrics: polyflare_server::observability::RelayMetrics::new(),
         model_catalog: polyflare_server::model_catalog::floor_only_model_catalog(),
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         stream_idle_timeout: std::time::Duration::from_secs(300),
@@ -257,6 +258,7 @@ mod relay_through {
             upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(
             ),
             rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
+            relay_metrics: polyflare_server::observability::RelayMetrics::new(),
             model_catalog: polyflare_server::model_catalog::floor_only_model_catalog(),
         });
 
@@ -373,6 +375,7 @@ mod relay_through {
             upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(
             ),
             rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
+            relay_metrics: polyflare_server::observability::RelayMetrics::new(),
             model_catalog: polyflare_server::model_catalog::floor_only_model_catalog(),
         });
 
@@ -565,6 +568,24 @@ mod relay_through {
             Some("acct-cap"),
             "the reconnect must stay on the SAME pinned account"
         );
+
+        // Task 5: the eager cap re-dial must have bumped the content-free
+        // `reconnect_same_account` counter (and never `move_cross_account`, since no move
+        // happened here).
+        let snapshot = state.relay_metrics.snapshot();
+        let reconnects = snapshot
+            .iter()
+            .find(|(k, _)| k == "reconnect_same_account")
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
+        assert!(
+            reconnects >= 1,
+            "expected reconnect_same_account >= 1 after the cap re-dial, got snapshot: {snapshot:?}"
+        );
+        assert!(
+            !snapshot.iter().any(|(k, _)| k == "move_cross_account"),
+            "a same-account cap reconnect must never bump move_cross_account, got: {snapshot:?}"
+        );
     }
 
     /// Phase 2, Task 3: an upstream drop mid-stream (network blip / idle close / anything short of
@@ -742,6 +763,104 @@ mod relay_through {
         assert!(
             owner == "acct-move-a" || owner == "acct-move-b",
             "owner must be one of the two seeded accounts, got {owner}"
+        );
+
+        // Task 5: the move must have bumped the content-free `move_cross_account` counter (and
+        // never `same_account_anchor_miss`, which is a different signal entirely).
+        let snapshot = state.relay_metrics.snapshot();
+        let moves = snapshot
+            .iter()
+            .find(|(k, _)| k == "move_cross_account")
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
+        assert!(
+            moves >= 1,
+            "expected move_cross_account >= 1 after the durable-error move, got snapshot: {snapshot:?}"
+        );
+        assert!(
+            !snapshot
+                .iter()
+                .any(|(k, _)| k == "same_account_anchor_miss"),
+            "a durable-error move must never bump same_account_anchor_miss, got: {snapshot:?}"
+        );
+    }
+
+    /// Phase 2/3 Task 5: a `previous_response_not_found` (anchor-miss) arriving while the pinned
+    /// account has NOT changed since the last completed turn is the ~31% residual non-resumption
+    /// this counter exists to measure. ONE account, no move — the mock scripts
+    /// `[normal(vec![]), previous_response_not_found("resp_1")]`: turn 1 completes normally (no
+    /// move, `account_changed_since_completed` stays `false`); turn 2's anchor-miss must reach the
+    /// client VERBATIM (unchanged from Task 3) AND bump `same_account_anchor_miss` — never
+    /// `move_cross_account` (no move ever happened).
+    #[tokio::test]
+    async fn same_account_anchor_miss_is_counted() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::previous_response_not_found("resp_1"),
+        ]);
+        let mock_base = mock.clone().spawn().await;
+
+        let (base, state) = spawn_with_pinned_account("acct-anchor-miss", &mock_base).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake must succeed");
+
+        // Turn 1: a normal completion — establishes `account_changed_since_completed == false`.
+        let frame1 = r#"{"type":"response.create","input":[]}"#.to_string();
+        ws.send(TMessage::Text(frame1.into())).await.unwrap();
+
+        let TMessage::Text(reply1) = ws.next().await.expect("a reply").expect("no ws error") else {
+            panic!("expected a text frame back from the relay");
+        };
+        let v1: serde_json::Value = serde_json::from_str(&reply1).unwrap();
+        assert_eq!(v1["type"], "response.completed");
+
+        // Turn 2: the mock replies with the wrapped `previous_response_not_found` envelope — a
+        // same-account anchor-miss (no move ever happened on this connection).
+        let frame2 =
+            r#"{"type":"response.create","input":[],"previous_response_id":"resp_1"}"#.to_string();
+        ws.send(TMessage::Text(frame2.into())).await.unwrap();
+
+        let TMessage::Text(reply2) = ws
+            .next()
+            .await
+            .expect("an anchor-miss frame")
+            .expect("no ws error")
+        else {
+            panic!("expected a text frame back from the relay");
+        };
+        let v2: serde_json::Value = serde_json::from_str(&reply2).unwrap();
+        assert_eq!(v2["type"], "error");
+        assert_eq!(
+            v2["error"]["code"], "previous_response_not_found",
+            "the anchor-miss frame must reach the client VERBATIM, unchanged from Task 3"
+        );
+
+        // The residual counter must be bumped; the move counter must NOT be (no move happened).
+        let mut snapshot = state.relay_metrics.snapshot();
+        for _ in 0..50 {
+            snapshot = state.relay_metrics.snapshot();
+            if snapshot
+                .iter()
+                .any(|(k, v)| k == "same_account_anchor_miss" && *v >= 1)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let residual = snapshot
+            .iter()
+            .find(|(k, _)| k == "same_account_anchor_miss")
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
+        assert!(
+            residual >= 1,
+            "expected same_account_anchor_miss >= 1, got snapshot: {snapshot:?}"
+        );
+        assert!(
+            !snapshot.iter().any(|(k, _)| k == "move_cross_account"),
+            "a same-account anchor-miss must never bump move_cross_account, got: {snapshot:?}"
         );
     }
 }
