@@ -1102,6 +1102,243 @@ pub async fn sessions_handler(
     })
 }
 
+/// `GET /api/reports`'s `range` query param resolves to a `(since_ts lookback, bucket_secs)` pair.
+/// `24h` buckets hourly (matching [`OVERVIEW_SERIES_BUCKET_SECS`]'s convention); `7d`/`30d` bucket
+/// daily — an hourly grid over 30 days would be 720 points, finer than a report chart needs.
+const REPORTS_RANGE_24H_LOOKBACK_SECS: i64 = 24 * 3600;
+const REPORTS_RANGE_7D_LOOKBACK_SECS: i64 = 7 * 24 * 3600;
+const REPORTS_RANGE_30D_LOOKBACK_SECS: i64 = 30 * 24 * 3600;
+const REPORTS_BUCKET_HOURLY_SECS: i64 = 3600;
+const REPORTS_BUCKET_DAILY_SECS: i64 = 24 * 3600;
+
+/// `GET /api/reports` query params. `range` ∈ {`24h`,`7d`,`30d`}: ABSENT defaults to `7d`; an
+/// explicit value outside that set is a `400` (see [`reports_handler`]), never silently
+/// defaulted. `dimension` ∈ {`account`,`model`,`provider`} follows the identical absent-defaults/
+/// explicit-invalid-400 rule, defaulting to `model`. `provider` (unvalidated — any string) narrows
+/// all three store calls to that provider, same as `/api/requests`' own `provider` filter.
+#[derive(Deserialize)]
+pub struct ReportsQuery {
+    range: Option<String>,
+    dimension: Option<String>,
+    provider: Option<String>,
+}
+
+/// One bucket of `ReportsView::time_series`. Mirrors [`SeriesBucketView`]'s flat-field style:
+/// every [`polyflare_store::ReportMetrics`] field is serialized directly on the bucket, never
+/// nested under a `metrics` key.
+#[derive(Serialize)]
+struct ReportBucketView {
+    ts: i64,
+    requests: i64,
+    errors: i64,
+    cost_usd: f64,
+    tokens: i64,
+    cached_tokens: i64,
+    reasoning_tokens: i64,
+    avg_duration_ms: f64,
+    avg_ttft_ms: f64,
+    ttft_sample_count: i64,
+}
+
+impl From<polyflare_store::ReportBucket> for ReportBucketView {
+    fn from(b: polyflare_store::ReportBucket) -> Self {
+        ReportBucketView {
+            ts: b.ts,
+            requests: b.metrics.requests,
+            errors: b.metrics.errors,
+            cost_usd: b.metrics.cost_usd,
+            tokens: b.metrics.tokens,
+            cached_tokens: b.metrics.cached_tokens,
+            reasoning_tokens: b.metrics.reasoning_tokens,
+            avg_duration_ms: b.metrics.avg_duration_ms,
+            avg_ttft_ms: b.metrics.avg_ttft_ms,
+            ttft_sample_count: b.metrics.ttft_sample_count,
+        }
+    }
+}
+
+/// One row of `ReportsView::breakdown`: [`polyflare_store::ReportMetrics`] scoped to one value of
+/// the requested `dimension` (flat-field style, same as [`ReportBucketView`]).
+#[derive(Serialize)]
+struct ReportBreakdownView {
+    key: String,
+    requests: i64,
+    errors: i64,
+    cost_usd: f64,
+    tokens: i64,
+    cached_tokens: i64,
+    reasoning_tokens: i64,
+    avg_duration_ms: f64,
+    avg_ttft_ms: f64,
+    ttft_sample_count: i64,
+}
+
+impl From<polyflare_store::ReportBreakdownRow> for ReportBreakdownView {
+    fn from(r: polyflare_store::ReportBreakdownRow) -> Self {
+        ReportBreakdownView {
+            key: r.key,
+            requests: r.metrics.requests,
+            errors: r.metrics.errors,
+            cost_usd: r.metrics.cost_usd,
+            tokens: r.metrics.tokens,
+            cached_tokens: r.metrics.cached_tokens,
+            reasoning_tokens: r.metrics.reasoning_tokens,
+            avg_duration_ms: r.metrics.avg_duration_ms,
+            avg_ttft_ms: r.metrics.avg_ttft_ms,
+            ttft_sample_count: r.metrics.ttft_sample_count,
+        }
+    }
+}
+
+/// `ReportsView::totals`: the same flat [`polyflare_store::ReportMetrics`] fields as
+/// [`ReportBucketView`]/[`ReportBreakdownView`], plus two derived ratios the dashboard's KPI tiles
+/// want directly rather than re-deriving client-side: `error_rate` (`errors / requests`, `0.0`
+/// when `requests == 0`) and `cache_hit_rate` (`cached_tokens / tokens`, `0.0` when `tokens == 0`)
+/// — both guarded against a 0/0 divide the same way `KpisView::success_rate` already is.
+#[derive(Serialize)]
+struct ReportTotalsView {
+    requests: i64,
+    errors: i64,
+    cost_usd: f64,
+    tokens: i64,
+    cached_tokens: i64,
+    reasoning_tokens: i64,
+    avg_duration_ms: f64,
+    avg_ttft_ms: f64,
+    ttft_sample_count: i64,
+    error_rate: f64,
+    cache_hit_rate: f64,
+}
+
+impl From<polyflare_store::ReportMetrics> for ReportTotalsView {
+    fn from(m: polyflare_store::ReportMetrics) -> Self {
+        let error_rate = if m.requests > 0 {
+            m.errors as f64 / m.requests as f64
+        } else {
+            0.0
+        };
+        let cache_hit_rate = if m.tokens > 0 {
+            m.cached_tokens as f64 / m.tokens as f64
+        } else {
+            0.0
+        };
+        ReportTotalsView {
+            requests: m.requests,
+            errors: m.errors,
+            cost_usd: m.cost_usd,
+            tokens: m.tokens,
+            cached_tokens: m.cached_tokens,
+            reasoning_tokens: m.reasoning_tokens,
+            avg_duration_ms: m.avg_duration_ms,
+            avg_ttft_ms: m.avg_ttft_ms,
+            ttft_sample_count: m.ttft_sample_count,
+            error_rate,
+            cache_hit_rate,
+        }
+    }
+}
+
+/// `GET /api/reports` response: the dashboard Reports page's composite payload — a zero-filled
+/// time series, a per-dimension breakdown, and top-line totals, all sourced from the SAME
+/// `since_ts`/`provider` window (see [`reports_handler`]).
+#[derive(Serialize)]
+struct ReportsView {
+    time_series: Vec<ReportBucketView>,
+    breakdown: Vec<ReportBreakdownView>,
+    totals: ReportTotalsView,
+}
+
+/// `GET /api/reports?range=&dimension=&provider=` — the dashboard Reports page's composite
+/// analytics endpoint: assembles [`polyflare_store::RequestLogRepo::reports_totals`]/
+/// `reports_series`/`reports_breakdown` into one payload over a shared `(since_ts, bucket_secs)`
+/// window resolved from `range`.
+///
+/// `range` ∈ {`24h`,`7d`,`30d`} (absent → `7d`) and `dimension` ∈ {`account`,`model`,`provider`}
+/// (absent → `model`); an EXPLICIT value outside those sets is a `400`, never silently defaulted
+/// (only absence defaults) — the same "unknown-but-present is a client error" posture as
+/// `/api/requests`' `status_class` would if it validated (it currently doesn't, but this endpoint
+/// does, per its own brief). `provider` is passed through unvalidated, same as elsewhere in this
+/// module.
+///
+/// `time_series` is ZERO-FILLED across the aligned `[since_ts, now]` grid at `bucket_secs` — the
+/// store's `reports_series` only emits buckets with >= 1 row, same contract `series_since` has;
+/// this handler fills the gaps, mirroring [`overview_series_handler`]'s zero-fill exactly (same
+/// aligned-grid-walk, same "remove-from-map-or-default" pattern).
+pub async fn reports_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ReportsQuery>,
+) -> axum::response::Response {
+    let now = unix_now();
+
+    let range = q.range.as_deref().unwrap_or("7d");
+    let (since_ts, bucket_secs) = match range {
+        "24h" => (
+            now - REPORTS_RANGE_24H_LOOKBACK_SECS,
+            REPORTS_BUCKET_HOURLY_SECS,
+        ),
+        "7d" => (
+            now - REPORTS_RANGE_7D_LOOKBACK_SECS,
+            REPORTS_BUCKET_DAILY_SECS,
+        ),
+        "30d" => (
+            now - REPORTS_RANGE_30D_LOOKBACK_SECS,
+            REPORTS_BUCKET_DAILY_SECS,
+        ),
+        _ => return (StatusCode::BAD_REQUEST, "invalid range").into_response(),
+    };
+
+    let dimension = q.dimension.as_deref().unwrap_or("model");
+    if !matches!(dimension, "account" | "model" | "provider") {
+        return (StatusCode::BAD_REQUEST, "invalid dimension").into_response();
+    }
+
+    let provider = q.provider.as_deref();
+    let repo = state.store.request_log();
+
+    let totals = match repo.reports_totals(since_ts, provider).await {
+        Ok(t) => t,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
+    };
+    let series_rows = match repo.reports_series(since_ts, bucket_secs, provider).await {
+        Ok(r) => r,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
+    };
+    let breakdown_rows = match repo.reports_breakdown(since_ts, dimension, provider).await {
+        Ok(r) => r,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
+    };
+
+    // Zero-fill the full grid from the aligned window start through the aligned "now" bucket —
+    // byte-for-byte the same walk `overview_series_handler` does, just over `ReportBucket`/
+    // `ReportMetrics` instead of `RequestBucket`.
+    let mut by_ts: std::collections::BTreeMap<i64, polyflare_store::ReportBucket> =
+        series_rows.into_iter().map(|b| (b.ts, b)).collect();
+    let aligned_start = (since_ts / bucket_secs) * bucket_secs;
+    let aligned_now = (now / bucket_secs) * bucket_secs;
+    let mut time_series = Vec::new();
+    let mut ts = aligned_start;
+    while ts <= aligned_now {
+        let bucket = by_ts.remove(&ts).unwrap_or(polyflare_store::ReportBucket {
+            ts,
+            metrics: polyflare_store::ReportMetrics::default(),
+        });
+        time_series.push(ReportBucketView::from(bucket));
+        ts += bucket_secs;
+    }
+
+    let breakdown = breakdown_rows
+        .into_iter()
+        .map(ReportBreakdownView::from)
+        .collect();
+
+    Json(ReportsView {
+        time_series,
+        breakdown,
+        totals: ReportTotalsView::from(totals),
+    })
+    .into_response()
+}
+
 /// A tiny JSON responder: `Ok(200, body)` or a content-safe `500` (the store error's own text is
 /// never surfaced — a read failure returns a generic body, like the ingress error paths).
 enum Response<T: Serialize> {

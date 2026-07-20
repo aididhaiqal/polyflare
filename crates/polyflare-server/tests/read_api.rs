@@ -1498,3 +1498,170 @@ async fn requests_endpoint_filters_by_status_class() {
     assert_eq!(rows[0]["status"], 500);
     assert_eq!(rows[0]["provider"], "anthropic");
 }
+
+/// A `RequestLogRecord` shaped for the `/api/reports` endpoint test: like `req_row_at` but carries
+/// a `model` + `cost_usd` so `dimension=model` has real per-model rows to break down, and
+/// `cached_tokens` so `totals.cache_hit_rate` has a non-trivial value to assert on.
+fn report_endpoint_row(
+    requested_at: i64,
+    model: &str,
+    status: u16,
+    total_tokens: i64,
+    cached_tokens: i64,
+    cost_usd: f64,
+) -> RequestLogRecord {
+    RequestLogRecord {
+        requested_at,
+        provider: "codex".to_string(),
+        method: "POST".to_string(),
+        path: "/responses".to_string(),
+        aliased: false,
+        status,
+        duration_ms: 100,
+        account_id: None,
+        model: Some(model.to_string()),
+        reasoning_effort: None,
+        service_tier: None,
+        transport: None,
+        ttft_ms: None,
+        total_tokens: Some(total_tokens),
+        cached_tokens: Some(cached_tokens),
+        subagent: None,
+        request_id: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        reasoning_tokens: None,
+        cost_usd: Some(cost_usd),
+        latency_first_token_ms: None,
+    }
+}
+
+/// `GET /api/reports?range=7d&dimension=model`: 200 with a zero-filled ascending `time_series`,
+/// a per-model `breakdown` (ordered by cost desc, matching `reports_breakdown`'s own order), and
+/// `totals` carrying the derived `error_rate`/`cache_hit_rate`. `?range=bogus` is a 400 (an
+/// explicit-but-unknown value, NOT defaulted); the endpoint sits behind the same admin gate as
+/// every other `/api/*` read, so a keyless request is a 401.
+#[tokio::test]
+async fn reports_endpoint_assembles_zero_filled_series_breakdown_and_totals() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let repo = store.request_log();
+
+    let insert_ts = now();
+    // 2x model-a (one error), 1x model-b — model-a costs more, so it must sort first in the
+    // cost-desc breakdown.
+    repo.insert(&report_endpoint_row(
+        insert_ts, "model-a", 200, 1000, 400, 1.5,
+    ))
+    .await
+    .unwrap();
+    repo.insert(&report_endpoint_row(
+        insert_ts, "model-a", 500, 2000, 800, 2.5,
+    ))
+    .await
+    .unwrap();
+    repo.insert(&report_endpoint_row(
+        insert_ts, "model-b", 200, 500, 250, 0.5,
+    ))
+    .await
+    .unwrap();
+    std::mem::forget(dir);
+
+    let pf = spawn(store).await;
+    let client = reqwest::Client::new();
+
+    // Keyless -> 401 (same admin gate as every other /api/* read).
+    let unauth = client
+        .get(format!("{pf}/api/reports?range=7d&dimension=model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Explicit-but-unknown range -> 400 (not silently defaulted).
+    let bad_range = client
+        .get(format!("{pf}/api/reports?range=bogus"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_range.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Explicit-but-unknown dimension -> 400.
+    let bad_dimension = client
+        .get(format!("{pf}/api/reports?dimension=bogus"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_dimension.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Happy path.
+    let v: serde_json::Value = client
+        .get(format!("{pf}/api/reports?range=7d&dimension=model"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // totals: 3 requests, 1 error (the 500), cost summed, tokens summed w/ derived rates.
+    assert_eq!(v["totals"]["requests"], 3);
+    assert_eq!(v["totals"]["errors"], 1);
+    assert_eq!(v["totals"]["tokens"], 3500);
+    assert_eq!(v["totals"]["cached_tokens"], 1450);
+    let cost = v["totals"]["cost_usd"].as_f64().unwrap();
+    assert!((cost - 4.5).abs() < 0.001, "cost_usd: {cost}");
+    let error_rate = v["totals"]["error_rate"].as_f64().unwrap();
+    assert!(
+        (error_rate - (1.0 / 3.0)).abs() < 0.001,
+        "error_rate: {error_rate}"
+    );
+    let cache_hit_rate = v["totals"]["cache_hit_rate"].as_f64().unwrap();
+    assert!(
+        (cache_hit_rate - (1450.0 / 3500.0)).abs() < 0.001,
+        "cache_hit_rate: {cache_hit_rate}"
+    );
+
+    // breakdown: per-model, ordered by summed cost_usd descending — model-a (4.0) before
+    // model-b (0.5).
+    let breakdown = v["breakdown"].as_array().unwrap();
+    assert_eq!(breakdown.len(), 2);
+    assert_eq!(breakdown[0]["key"], "model-a");
+    assert_eq!(breakdown[0]["requests"], 2);
+    assert_eq!(breakdown[0]["errors"], 1);
+    assert_eq!(breakdown[1]["key"], "model-b");
+    assert_eq!(breakdown[1]["requests"], 1);
+
+    // time_series: ascending by ts, zero-filled across the whole 7d/daily grid — including the
+    // bucket our 3 rows landed in (real rollup) and every other (empty) bucket.
+    let buckets = v["time_series"].as_array().unwrap();
+    assert!(
+        buckets.len() >= 7,
+        "daily buckets across (at least) a 7d window, got {}",
+        buckets.len()
+    );
+    let tss: Vec<i64> = buckets.iter().map(|b| b["ts"].as_i64().unwrap()).collect();
+    let mut sorted = tss.clone();
+    sorted.sort();
+    assert_eq!(tss, sorted, "time_series must be ascending by ts");
+
+    let bucket_secs = 24 * 3600;
+    let expected_bucket_ts = (insert_ts / bucket_secs) * bucket_secs;
+    let populated = buckets
+        .iter()
+        .find(|b| b["ts"] == expected_bucket_ts)
+        .expect("the bucket our rows landed in must be present");
+    assert_eq!(populated["requests"], 3);
+    assert_eq!(populated["errors"], 1);
+
+    let empty_buckets = buckets.iter().filter(|b| b["ts"] != expected_bucket_ts);
+    for b in empty_buckets {
+        assert_eq!(b["requests"], 0, "non-populated bucket must be zero-filled");
+        assert_eq!(b["errors"], 0);
+        assert_eq!(b["tokens"], 0);
+    }
+}

@@ -16,8 +16,8 @@ pub use continuity_repo::{ContinuityRepo, SessionRow};
 pub use crypto::TokenCipher;
 pub use import::{import_from_codex_lb, ImportSummary};
 pub use request_log_repo::{
-    RecentErrorRow, RequestAggregate, RequestBucket, RequestLogRecord, RequestLogRepo,
-    RequestLogRow, RequestsFilter,
+    RecentErrorRow, ReportBreakdownRow, ReportBucket, ReportMetrics, RequestAggregate,
+    RequestBucket, RequestLogRecord, RequestLogRepo, RequestLogRow, RequestsFilter,
 };
 pub use store::Store;
 
