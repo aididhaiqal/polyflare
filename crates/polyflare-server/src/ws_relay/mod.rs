@@ -25,6 +25,10 @@ use axum::response::Response;
 
 use crate::app::AppState;
 
+mod session;
+
+pub(crate) use session::ws_session_key;
+
 /// Accepts the codex CLI's downstream WebSocket upgrade on `/responses` (routed here only when
 /// `AppState::ws_downstream` is on — see `crate::app::build_app`). Returns the `101 Switching
 /// Protocols` upgrade response; the post-upgrade future runs [`relay_stub`].
@@ -38,8 +42,11 @@ pub async fn responses_ws_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    // Seams held for Tasks 3-6; the stub upgrade path uses neither yet.
-    let _ = (&state, &headers);
+    // Seams held for Tasks 3-6. The conversation's content-free owner-lookup key is derivable from
+    // the handshake headers ALONE (Phase-0: `session-id`/`thread-id`/`x-codex-window-id`), so it is
+    // computed here — later tasks resolve/pin the owning account on it. The stub drops it.
+    let _session_key = ws_session_key(&headers);
+    let _ = &state;
     ws.on_upgrade(relay_stub)
 }
 
