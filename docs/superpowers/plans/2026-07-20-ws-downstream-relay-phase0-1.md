@@ -111,9 +111,9 @@ Original spike steps (kept for record; superseded by the probe above):
 ### Task 7: Live-verify the MVP (controller-run)
 
 Not a code task. After Tasks 2-6:
-- [ ] Real `codex-polyflare exec` over `POLYFLARE_WS_DOWNSTREAM=1`, multi-turn, one conversation. Confirm: the relay round-trips; **caching works** (incremental over the relay, cached_tokens > 0 — expect ~72% like direct codex); ownership is recorded (the sniff wrote `response_id → owner`); a second concurrent conversation gets its own pinned account. Temp CONTENT-FREE instrumentation (frame `type` + cached_tokens only), reverted after.
-- [ ] Confirm no conversation content is logged/persisted anywhere (content-safety audit of the relay path).
-- [ ] Record results + open items for Phase 2 (reconnect/60-min) and Phase 3 (exhaustion-move/watchdog).
+- [x] Real `codex-polyflare exec` over `POLYFLARE_WS_DOWNSTREAM=1`, multi-turn, one conversation. Confirm: the relay round-trips; **caching works** (incremental over the relay, cached_tokens > 0 — expect ~72% like direct codex); ownership is recorded (the sniff wrote `response_id → owner`); a second concurrent conversation gets its own pinned account. Temp CONTENT-FREE instrumentation (frame `type` + cached_tokens only), reverted after. **RESULT (2026-07-20, real codex 0.144.4, gpt-5.6-sol, 2 real accounts): round-trip OK; caching ~82% (cached_tokens 6912/8380 on turn 2, beats the ~72% target); ownership rows written for 2 distinct conversations matching the dialed account; content-safety log audit clean (zero content/frame bodies); instrumentation reverted.**
+- [x] Confirm no conversation content is logged/persisted anywhere (content-safety audit of the relay path).
+- [x] Record results + open items for Phase 2 (reconnect/60-min) and Phase 3 (exhaustion-move/watchdog).
 
 ---
 
