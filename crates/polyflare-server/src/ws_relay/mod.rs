@@ -24,6 +24,12 @@
 //! `response.completed` re-homes ownership naturally via the existing `on_completed_id` callback,
 //! which the pump always calls with its CURRENT account (never the stale, pre-move one).
 //!
+//! **Phase 2/3 Task 5: reconnect/move/residual-anchor-miss counters.** [`relay`] threads
+//! `state.relay_metrics` (`crate::observability::RelayMetrics`) into [`pump::run_pump`], which bumps
+//! it at exactly its three same-account-reconnect, cross-account-move, and same-account-anchor-miss
+//! decision points — a content-free (three fixed labels only) signal for the deferred watchdog
+//! decision. See `pump::run_pump`'s own doc comment for the exact bump sites.
+//!
 //! **Content-free (inviolable, `design §8`):** no frame body is ever logged or persisted anywhere in
 //! this module or its submodules; the ONLY body inspection at all is [`sniff::sniff_completed_id`]
 //! reading `type` + `response.id`. This is PolyFlare's permanent limit.
@@ -178,6 +184,7 @@ async fn relay(
         account,
         on_completed_id,
         on_upstream_error,
+        state.relay_metrics.clone(),
     )
     .await;
 }

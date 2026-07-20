@@ -221,6 +221,12 @@ pub struct AppState {
     /// inside `crate::runtime_state::RuntimeStates::record_rate_limit`, the single 429 chokepoint.
     /// In-memory only; resets on restart.
     pub rate_limit_metrics: std::sync::Arc<crate::observability::RateLimitMetrics>,
+    /// WS-downstream relay Phase 2/3 Task 5: content-free counter of reconnect/move/residual-
+    /// anchor-miss events (see `crate::observability::RelayMetrics`), labeled by exactly three
+    /// fixed strings. Bumped from `crate::ws_relay::pump::run_pump`'s decision points (same-
+    /// account re-dial, cross-account move, same-account anchor-miss) via a handle threaded into
+    /// the pump from `crate::ws_relay::relay`. In-memory only; resets on restart.
+    pub relay_metrics: std::sync::Arc<crate::observability::RelayMetrics>,
     /// D15 Task 3: the live upstream Codex model-catalog cache (see `crate::model_catalog`),
     /// merged onto the static bootstrap floor with a TTL + single-flight, falling back airtight to
     /// the floor on disable/no-accounts/fetch-failure. Read on the `/models` hot path via the sync

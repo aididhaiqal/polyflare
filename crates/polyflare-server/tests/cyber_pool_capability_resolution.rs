@@ -191,6 +191,7 @@ async fn spawn_app(store: Store, cipher: TokenCipher, upstream_url: String) -> S
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
         upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
+        relay_metrics: polyflare_server::observability::RelayMetrics::new(),
         model_catalog: polyflare_server::model_catalog::floor_only_model_catalog(),
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),

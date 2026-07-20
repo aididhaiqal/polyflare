@@ -631,6 +631,44 @@ impl RateLimitMetrics {
     }
 }
 
+/// WS-downstream relay Phase 2/3 Task 5: a process-global, content-free counter of how often the
+/// relay pump reconnects the SAME account, moves to a DIFFERENT account, or hits a same-account
+/// anchor-miss — the residual non-resumption that gates the deferred watchdog decision (Design
+/// Note 4). Shaped exactly like [`RateLimitMetrics`] above (same `RwLock<HashMap<&'static str,
+/// u64>>`, same poison-tolerant `record`/`snapshot` pair) — deliberately not a new shape.
+///
+/// **Content-free by construction:** `record`'s `kind` is ALWAYS one of exactly three fixed
+/// `&'static str` labels the pump/mod pass — `"reconnect_same_account"`, `"move_cross_account"`,
+/// `"same_account_anchor_miss"` — never an account id, error code, retry-after, or any frame body.
+/// Cardinality is a constant 3. In memory only; resets on restart.
+#[derive(Default)]
+pub struct RelayMetrics {
+    inner: RwLock<HashMap<&'static str, u64>>,
+}
+
+impl RelayMetrics {
+    /// A fresh, empty map, `Arc`-wrapped to match `RateLimitMetrics::new`'s `AppState`-field shape.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Records one occurrence of `kind` (one of the three fixed labels documented above). Recovers
+    /// from a poisoned lock rather than panicking, exactly like `RateLimitMetrics::record`.
+    pub fn record(&self, kind: &'static str) {
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let entry = map.entry(kind).or_insert(0);
+        *entry += 1;
+    }
+
+    /// A cloned-out snapshot of every `(kind, count)` recorded so far (test/render read path).
+    pub fn snapshot(&self) -> Vec<(String, u64)> {
+        let map = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .map(|(kind, count)| (kind.to_string(), *count))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1257,6 +1295,33 @@ mod tests {
     #[test]
     fn rate_limit_metrics_empty_snapshot_is_empty_vec() {
         let m = RateLimitMetrics::new();
+        assert_eq!(m.snapshot(), Vec::<(String, u64)>::new());
+    }
+
+    // Phase 2/3 Task 5: `RelayMetrics` — the three fixed relay-observability labels.
+
+    #[test]
+    fn relay_metrics_records_the_three_fixed_labels_and_increments() {
+        let m = RelayMetrics::new();
+        m.record("reconnect_same_account");
+        m.record("move_cross_account");
+        m.record("same_account_anchor_miss");
+        m.record("reconnect_same_account");
+        let mut snapshot = m.snapshot();
+        snapshot.sort();
+        assert_eq!(
+            snapshot,
+            vec![
+                ("move_cross_account".to_string(), 1),
+                ("reconnect_same_account".to_string(), 2),
+                ("same_account_anchor_miss".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn relay_metrics_empty_snapshot_is_empty_vec() {
+        let m = RelayMetrics::new();
         assert_eq!(m.snapshot(), Vec::<(String, u64)>::new());
     }
 }

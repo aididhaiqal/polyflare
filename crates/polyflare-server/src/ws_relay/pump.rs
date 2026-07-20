@@ -57,12 +57,15 @@
 //! `eprintln!` anywhere in this module.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::http::HeaderMap;
 
 use polyflare_codex::WsConn;
 use polyflare_core::{Account, AccountId, FailureSignal};
+
+use crate::observability::RelayMetrics;
 
 use super::redial::redial_upstream;
 use super::signal::{classify_upstream_signal, UpstreamSignal};
@@ -97,6 +100,16 @@ const MAX_RECONNECTS_WITHOUT_PROGRESS: u32 = 5;
 ///
 /// `on_completed_id` and `on_upstream_error` are both `Fn`, not `FnOnce`, because a single socket can
 /// carry many turns (and possibly many moves) over its life — each call is fresh and independent.
+///
+/// **Task 5:** `relay_metrics` is a content-free counter handle (`crate::observability::
+/// RelayMetrics`) bumped at exactly three decision points — every same-account re-dial (the eager
+/// `ConnectionLimit` re-dial, `send_client_text`'s internal re-dial, and the retry-in-place branch
+/// of an `on_upstream_error` call), every cross-account move (the other branch of `on_upstream_
+/// error`), and every `AnchorMissing` frame that arrives while the pinned account has NOT changed
+/// since the last forwarded `response.completed` (the residual same-account non-resumption Design
+/// Note 4 calls out). `account_changed_since_completed` tracks exactly that: set `true` the moment
+/// `on_upstream_error` returns a DIFFERENT account, reset to `false` the moment a `response.
+/// completed` is forwarded. Never carries anything beyond the three fixed label strings.
 pub(crate) async fn run_pump<F, Fut, G, GFut>(
     mut downstream: WebSocket,
     upstream_conn: WsConn,
@@ -104,6 +117,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut>(
     account: Account,
     on_completed_id: F,
     on_upstream_error: G,
+    relay_metrics: Arc<RelayMetrics>,
 ) where
     F: Fn(AccountId, String) -> Fut,
     Fut: Future<Output = ()>,
@@ -113,6 +127,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut>(
     let mut account = account;
     let mut upstream: Option<WsConn> = Some(upstream_conn);
     let mut reconnects_since_progress: u32 = 0;
+    // Task 5: has the pinned account changed (a move) since the last forwarded
+    // `response.completed`? Starts `false` — a fresh connection hasn't moved yet.
+    let mut account_changed_since_completed = false;
     loop {
         tokio::select! {
             down = downstream.recv() => {
@@ -122,6 +139,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut>(
                         match redialed {
                             None => break, // upstream could not be (re-)established at all.
                             Some(true) => {
+                                relay_metrics.record("reconnect_same_account");
                                 reconnects_since_progress += 1;
                                 if reconnects_since_progress > MAX_RECONNECTS_WITHOUT_PROGRESS {
                                     break;
@@ -152,6 +170,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut>(
                                 // The 60-min server cap: INTERCEPT (never forward) and eagerly
                                 // re-dial the SAME account so the client never sees this boundary.
                                 upstream = redial_upstream(&headers, &account).await;
+                                relay_metrics.record("reconnect_same_account");
                                 reconnects_since_progress += 1;
                                 if upstream.is_none() || reconnects_since_progress > MAX_RECONNECTS_WITHOUT_PROGRESS {
                                     break;
@@ -164,8 +183,18 @@ pub(crate) async fn run_pump<F, Fut, G, GFut>(
                                 if downstream.send(Message::Text(text.clone().into())).await.is_err() {
                                     break;
                                 }
+                                let current_id = account.id.clone();
                                 match on_upstream_error(account.clone(), sig).await {
                                     Some((new_account, new_upstream)) => {
+                                        // Task 5: same account id back => a retry-in-place
+                                        // (reconnect); a DIFFERENT id => a genuine cross-account
+                                        // move. Compared BEFORE `account` is overwritten below.
+                                        if new_account.id == current_id {
+                                            relay_metrics.record("reconnect_same_account");
+                                        } else {
+                                            relay_metrics.record("move_cross_account");
+                                            account_changed_since_completed = true;
+                                        }
                                         account = new_account; // same account (retry) or a NEW one (moved).
                                         upstream = Some(new_upstream);
                                         reconnects_since_progress += 1;
@@ -177,8 +206,21 @@ pub(crate) async fn run_pump<F, Fut, G, GFut>(
                                     None => break,
                                 }
                             }
-                            // Normal / AnchorMissing: forward VERBATIM, then sniff for ownership.
-                            _ => {
+                            // Task 5: an anchor-miss forwarded verbatim (unchanged from Task 3) —
+                            // but if the pinned account has NOT changed since the last completed
+                            // turn, this is the residual same-account non-resumption the counter
+                            // exists to measure. A miss right after a move (the flag still `true`)
+                            // is the EXPECTED cross-account case and is deliberately NOT counted.
+                            UpstreamSignal::AnchorMissing => {
+                                if downstream.send(Message::Text(text.clone().into())).await.is_err() {
+                                    break;
+                                }
+                                if !account_changed_since_completed {
+                                    relay_metrics.record("same_account_anchor_miss");
+                                }
+                            }
+                            // Normal: forward VERBATIM, then sniff for ownership.
+                            UpstreamSignal::Normal => {
                                 if downstream.send(Message::Text(text.clone().into())).await.is_err() {
                                     break;
                                 }
@@ -187,8 +229,11 @@ pub(crate) async fn run_pump<F, Fut, G, GFut>(
                                     // a completed turn after a move must re-home to the account that
                                     // actually produced it, never the stale/benched original.
                                     on_completed_id(AccountId::from(account.id.as_str()), id).await;
-                                    // A completed turn is real progress: reset the no-progress bound.
+                                    // A completed turn is real progress: reset the no-progress bound
+                                    // and the move flag — a completed turn on the current account
+                                    // means any LATER anchor-miss is once again same-account.
                                     reconnects_since_progress = 0;
+                                    account_changed_since_completed = false;
                                 }
                             }
                         }
