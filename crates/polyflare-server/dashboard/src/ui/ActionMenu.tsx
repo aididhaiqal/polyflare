@@ -49,6 +49,11 @@ export function ActionMenu({ label, children, align }: ActionMenuProps) {
           type="button"
           aria-label={label}
           onClick={(e) => e.stopPropagation()}
+          // Also stop keydown bubbling so Enter/Space on a focused kebab inside a keyboard-
+          // navigable row (the table view's `<tr role="button" onKeyDown>`) opens the menu WITHOUT
+          // also triggering the row's navigate-to-detail. Radix's own toggle handler is on this same
+          // button, so stopping propagation to ancestors doesn't suppress opening the popover.
+          onKeyDown={(e) => e.stopPropagation()}
           className="flex h-6 w-6 shrink-0 items-center justify-center rounded border border-border bg-card text-fg hover:border-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
         >
           <MoreVertical className="h-4 w-4" />
