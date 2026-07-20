@@ -50,6 +50,11 @@ pub struct AccountPatch {
     /// Never a token/secret field — this is the only capability toggle the operator surface exposes.
     #[serde(default)]
     security_work_authorized: Option<bool>,
+    /// The account's human-readable alias. Absent means "leave unchanged"; a non-empty trimmed
+    /// value (<=64 chars) sets it; `null` or an empty/whitespace value clears it — mirrors `pool`'s
+    /// double-Option shape.
+    #[serde(default, deserialize_with = "double_option")]
+    alias: Option<Option<String>>,
 }
 
 fn bad_request(msg: &'static str) -> Response {
@@ -85,6 +90,14 @@ pub async fn patch_account_handler(
             return bad_request("status may only be set to active or paused");
         }
     }
+    // `alias`: present means set/clear. A non-empty trimmed value must be 1..=64 chars; an
+    // empty/whitespace value clears (normalized to None below).
+    if let Some(Some(a)) = &patch.alias {
+        let t = a.trim();
+        if !t.is_empty() && t.chars().count() > 64 {
+            return bad_request("alias must be 1..=64 characters");
+        }
+    }
 
     // Apply. Each helper bumps the store generation, so the account cache re-reads on next selection.
     if let Some(pool) = &patch.pool {
@@ -108,6 +121,13 @@ pub async fn patch_account_handler(
             .await
             .is_err()
         {
+            return internal_error();
+        }
+    }
+    if let Some(alias) = &patch.alias {
+        // present: set a trimmed non-empty value, else clear (empty/whitespace/null -> None).
+        let normalized = alias.as_deref().map(str::trim).filter(|t| !t.is_empty());
+        if repo.update_alias(&id, normalized).await.is_err() {
             return internal_error();
         }
     }
