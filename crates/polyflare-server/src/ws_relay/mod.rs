@@ -25,8 +25,12 @@ use axum::response::Response;
 
 use crate::app::AppState;
 
+mod owner;
 mod session;
 
+#[allow(unused_imports)]
+// wired into the relay pump by Tasks 4-6 (dial + reconnect + observe).
+pub(crate) use owner::{resolve_owner, RelayError};
 pub(crate) use session::ws_session_key;
 
 /// Accepts the codex CLI's downstream WebSocket upgrade on `/responses` (routed here only when
