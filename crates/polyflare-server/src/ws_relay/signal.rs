@@ -128,6 +128,17 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_parses_a_bare_json_number() {
+        // Real backends may send retry-after as a JSON number, not a string — the tolerant parse
+        // must handle both (the string form is covered above).
+        let f = r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"},"headers":{"retry-after":45}}"#;
+        match classify_upstream_signal(f) {
+            UpstreamSignal::Error(sig) => assert_eq!(sig.retry_after, Some(45)),
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
     fn malformed_or_non_error_is_normal() {
         assert!(matches!(
             classify_upstream_signal("not json"),
