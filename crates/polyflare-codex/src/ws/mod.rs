@@ -17,4 +17,7 @@ pub use delta::{
     item_hashes, non_input_fingerprint, plan_request, plan_request_for_conn, ItemHash, RequestPlan,
 };
 pub use executor::CodexWsExecutor;
-pub use turn::{shared_conn, turn_stream, SharedWsConn};
+pub use turn::{
+    shared_conn, turn_stream, SharedWsConn, ANCHOR_MISS_MARKER as WS_ANCHOR_MISS_CODE,
+    CONNECTION_LIMIT_MARKER as WS_CONNECTION_LIMIT_CODE,
+};
