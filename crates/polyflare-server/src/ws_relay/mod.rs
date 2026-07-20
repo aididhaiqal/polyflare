@@ -24,6 +24,14 @@
 //! `response.completed` re-homes ownership naturally via the existing `on_completed_id` callback,
 //! which the pump always calls with its CURRENT account (never the stale, pre-move one).
 //!
+//! **Relay-catalog-fixes Task 3: transient-429 retries in place.** Not every `UpstreamSignal::Error`
+//! is durable exhaustion — a 429 whose `Retry-After` is short ([`TRANSIENT_RETRY_MAX_SECS`] or
+//! under) is a transient throttle the SAME account will clear shortly. `on_upstream_error` checks
+//! this FIRST: it waits out the retry-after and redials the SAME account (skipping
+//! `bench_account_for_failure` and `resolve_owner` entirely), preserving the conversation's prompt
+//! cache instead of discarding it on a bench+move. Only a durable/long/absent retry-after falls
+//! through to the bench -> re-resolve -> move path described above, unchanged.
+//!
 //! **Phase 2/3 Task 5: reconnect/move/residual-anchor-miss counters.** [`relay`] threads
 //! `state.relay_metrics` (`crate::observability::RelayMetrics`) into [`pump::run_pump`], which bumps
 //! it at exactly its three same-account-reconnect, cross-account-move, and same-account-anchor-miss
@@ -55,6 +63,16 @@ mod sniff;
 pub(crate) use owner::{dial_owner_upstream, resolve_owner};
 use redial::redial_upstream;
 pub(crate) use session::ws_session_key;
+
+/// The boundary (inclusive) a 429's `Retry-After` must fall at-or-under to be treated as
+/// TRANSIENT — retried in place on the SAME account, waiting it out, rather than benched and
+/// moved. Deliberately mirrors `runtime_state::RATE_LIMITED_MIN_COOLDOWN_SECS` (the floor
+/// `bench_account_for_failure`'s cooldown clamps every rate-limit to): a `retry_after` at or
+/// under that floor would clamp to the SAME effective cooldown as a move anyway, so treating it
+/// as transient costs nothing extra durability-wise while avoiding the cache-losing move. A
+/// longer/absent `retry_after` is durable and falls through to the existing bench -> resolve_owner
+/// -> move path, unchanged.
+const TRANSIENT_RETRY_MAX_SECS: i64 = 30;
 
 /// Mirrors `control.rs`'s / `continuity.rs`'s own `unix_now` — a plain wall-clock read, no shared
 /// helper exists at the crate root so each site that needs "now, in seconds" defines its own trivial
@@ -142,17 +160,29 @@ async fn relay(
         }
     };
 
-    // Phase 3 Task 4: the exhaustion-move engine. Called by the pump on a durable upstream error
-    // (`UpstreamSignal::Error`) with the CURRENT account + the classified signal; benches that
-    // account, re-resolves the owner (skipping the just-benched one via the fresh cooldown overlay),
-    // and re-dials whatever was picked. Returns `None` (teardown) only if no account is eligible at
-    // all, or the winning candidate's upstream WS could not be reached even after
-    // `redial_upstream`'s bounded retries — both clean, expected exhaustion outcomes, never logged.
+    // Phase 3 Task 4 (extended by the relay-catalog-fixes plan's Task 3): the exhaustion-move
+    // engine. Called by the pump on a durable upstream error (`UpstreamSignal::Error`) with the
+    // CURRENT account + the classified signal.
+    //
+    // A TRANSIENT 429 — `retry_after` present and at-or-under `TRANSIENT_RETRY_MAX_SECS` — is
+    // retried IN PLACE on the SAME account: wait it out, then redial. This keeps the
+    // conversation's prompt cache (a bench+move discards it) for exactly the case where the
+    // upstream is asking for a short, bounded pause rather than signaling genuine exhaustion.
+    // Never logged (content-free): no frame/error/account is inspected beyond the two fields
+    // already on `sig`.
+    //
+    // Anything else (no `retry_after`, or a longer one) is DURABLE and falls through unchanged to
+    // the existing bench -> re-resolve -> re-dial path: benches that account, re-resolves the
+    // owner (skipping the just-benched one via the fresh cooldown overlay), and re-dials whatever
+    // was picked. Returns `None` (teardown) only if no account is eligible at all, or the winning
+    // candidate's upstream WS could not be reached even after `redial_upstream`'s bounded retries —
+    // both clean, expected exhaustion outcomes, never logged.
     //
     // Reuse, not reinvention (wedge-sacred): `bench_account_for_failure` is the SAME policy
     // `record_failure` applies on the HTTP path; `resolve_owner` is the SAME owner-affine resolution
     // Task 3 already built; `redial_upstream` is Task 2's bounded same-account-or-new-account dial
-    // helper. No new selection or dial logic is written here.
+    // helper (reused for BOTH the transient retry-in-place and the durable move). No new selection
+    // or dial logic is written here.
     let on_upstream_error = {
         let state = state.clone();
         let headers = headers.clone();
@@ -162,6 +192,20 @@ async fn relay(
             let headers = headers.clone();
             let session_key = session_key.clone();
             async move {
+                // Transient 429 (retry-after at/under the min-cooldown boundary): wait it out on
+                // the SAME account and retry in place — keeps the conversation's prompt cache
+                // instead of a cache-losing move. Only a durable/long/absent retry-after falls
+                // through to bench -> re-select -> move.
+                if sig.status == 429 {
+                    if let Some(n) = sig.retry_after {
+                        if (0..=TRANSIENT_RETRY_MAX_SECS).contains(&n) {
+                            tokio::time::sleep(std::time::Duration::from_secs(n as u64)).await;
+                            let up = redial_upstream(&headers, &current).await?;
+                            return Some((current, up)); // SAME account -> pump records reconnect_same_account, not a move
+                        }
+                    }
+                }
+
                 let now = unix_now();
                 crate::ingress::bench_account_for_failure(
                     &state,

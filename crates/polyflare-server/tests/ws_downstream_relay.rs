@@ -863,4 +863,125 @@ mod relay_through {
             "a same-account anchor-miss must never bump move_cross_account, got: {snapshot:?}"
         );
     }
+
+    /// Task 3 (relay-catalog-fixes plan): a TRANSIENT 429 — `retry_after` at/under
+    /// `TRANSIENT_RETRY_MAX_SECS` (30s) — must retry the SAME account (wait it out, redial in
+    /// place) rather than bench + move, so the conversation's prompt cache is preserved. Mirrors
+    /// `durable_error_moves_to_a_second_account` above but scripts a SHORT retry-after (5s, well
+    /// under the 30s boundary) instead of a durable one (300s), and asserts the OPPOSITE outcome:
+    /// no bench, no move, same owner.
+    ///
+    /// Two accounts are seeded, deliberately UNPINNED (`RoundRobin` ties to the lexicographically
+    /// smaller id, "acct-transient-a", for turn 1 — same tiebreak precedent as
+    /// `spawn_with_two_accounts`'s other callers). Both accounts' upstream dial lands on the SAME
+    /// mock, scripted `[rate_limited_429(5), normal(vec![])]`.
+    #[tokio::test]
+    async fn transient_429_retries_same_account_no_move() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::rate_limited_429(5),
+            ScriptedTurn::normal(vec![]),
+        ]);
+        let mock_base = mock.clone().spawn().await;
+
+        let (base, state) =
+            spawn_with_two_accounts("acct-transient-a", "acct-transient-b", &mock_base).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake must succeed");
+
+        // Turn 1: the selector picks one account (RoundRobin ties to "acct-transient-a"); the mock
+        // replies with the wrapped 429 error envelope (retry_after 5s, well under the 30s boundary).
+        let frame1 = r#"{"type":"response.create","input":[]}"#.to_string();
+        ws.send(TMessage::Text(frame1.into())).await.unwrap();
+
+        // The client MUST still receive the 429 error frame verbatim — forwarded first, exactly as
+        // the durable path does (Design Note 3 is unchanged by this task).
+        let TMessage::Text(err_frame) = ws
+            .next()
+            .await
+            .expect("an error frame")
+            .expect("no ws error")
+        else {
+            panic!("expected a text frame back from the relay");
+        };
+        let ev: serde_json::Value = serde_json::from_str(&err_frame).unwrap();
+        assert_eq!(ev["type"], "error");
+        assert_eq!(ev["error"]["code"], "rate_limit_exceeded");
+
+        // Neither account may be benched: a transient 429 skips `bench_account_for_failure`
+        // entirely — the opposite of the durable test, which asserts exactly one benched account.
+        let mut snaps = vec![
+            polyflare_core::AccountSnapshot::new("acct-transient-a"),
+            polyflare_core::AccountSnapshot::new("acct-transient-b"),
+        ];
+        state.runtime.overlay(&mut snaps, now());
+        let benched: Vec<String> = snaps
+            .iter()
+            .filter(|s| s.cooldown_until.is_some())
+            .map(|s| s.id.as_str().to_string())
+            .collect();
+        assert!(
+            benched.is_empty(),
+            "a transient 429 must NOT bench either account, got: {benched:?}"
+        );
+
+        // The relay waits out the ~5s retry-after in place, then redials the SAME account. Drive
+        // the follow-up turn now; a generous timeout means a regression (falling through to the
+        // durable bench->move path, which redials immediately) still passes quickly, while a hang
+        // (no redial at all) fails loudly instead of stalling the suite.
+        let frame2 = r#"{"type":"response.create","input":[],"previous_response_id":"whatever"}"#
+            .to_string();
+        ws.send(TMessage::Text(frame2.into())).await.unwrap();
+
+        let reply = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("the retry-in-place redial + reply must land within the timeout")
+            .expect("a reply")
+            .expect("no ws error");
+        let TMessage::Text(reply) = reply else {
+            panic!("expected a text frame back from the relay");
+        };
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(v["type"], "response.completed");
+        let resp_id = v["response"]["id"].as_str().unwrap().to_string();
+
+        // Ownership: the completed turn's owner must be the SAME account the conversation started
+        // on — "acct-transient-a" (RoundRobin's tiebreak, per this test's doc comment) — no move.
+        let mut owner = None;
+        for _ in 0..50 {
+            owner = state
+                .store
+                .continuity()
+                .get_anchor_owner(&resp_id)
+                .await
+                .unwrap();
+            if owner.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            owner.as_deref(),
+            Some("acct-transient-a"),
+            "a transient 429 must retry the SAME account, never move to the other one"
+        );
+
+        // The retry-in-place must bump `reconnect_same_account` and never `move_cross_account`.
+        let snapshot = state.relay_metrics.snapshot();
+        let reconnects = snapshot
+            .iter()
+            .find(|(k, _)| k == "reconnect_same_account")
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
+        assert!(
+            reconnects >= 1,
+            "expected reconnect_same_account >= 1 after the transient-429 retry, got snapshot: \
+             {snapshot:?}"
+        );
+        assert!(
+            !snapshot.iter().any(|(k, _)| k == "move_cross_account"),
+            "a transient-429 retry-in-place must never bump move_cross_account, got: {snapshot:?}"
+        );
+    }
 }
