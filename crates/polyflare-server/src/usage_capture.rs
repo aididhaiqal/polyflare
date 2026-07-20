@@ -85,10 +85,16 @@ pub fn parse_response_usage(frame_json: &str) -> Option<ResponseUsage> {
 /// observed (e.g. the client disconnected before completion, or the upstream never sent one).
 /// `ttft_ms` is `None` if the stream never yielded a single item (empty stream, or dropped before
 /// the first byte arrived).
+/// `duration_ms` is the end-to-end request duration measured from the SAME origin as `ttft_ms`
+/// (the `start: Instant` passed into [`UsageCapturingStream::new`] — the route's own clock, not
+/// the wrapper's construction time) to stream end (normal completion or drop). `None` only in the
+/// vacuous case where `fire_on_done` never runs (it always does, exactly once — see that fn's
+/// docs), so in practice this is always `Some` once `on_done` fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CapturedUsage {
     pub usage: Option<ResponseUsage>,
     pub ttft_ms: Option<i64>,
+    pub duration_ms: Option<i64>,
 }
 
 /// Byte-for-byte passthrough wrapper around an upstream SSE byte stream.
@@ -143,13 +149,24 @@ pub struct UsageCapturingStream<S> {
 const MAX_PENDING: usize = 1 << 20;
 
 impl<S> UsageCapturingStream<S> {
-    /// Wrap `inner`, starting the TTFT clock now. `on_done` is called exactly once — on normal
-    /// stream end or on drop — with the usage/TTFT captured so far (see struct docs).
-    pub fn new(inner: S, on_done: impl FnOnce(CapturedUsage) + Send + 'static) -> Self {
+    /// Wrap `inner`, measuring TTFT and the end-to-end `duration_ms` from `start`. `start` is the
+    /// CALLER's clock origin (in production, the route handler's own `Instant::now()`, captured
+    /// before any route/setup work) — NOT re-taken here — so that `ttft_ms` (this wrapper) and
+    /// `duration_ms` (this wrapper) and the route's own pre-existing duration measurement all share
+    /// one origin. Passing a stale/shared `start` is intentional and required for
+    /// `derive_tps(duration_ms, ttft_ms, tokens)` in `read_api.rs` to be meaningful: the two
+    /// values must be offsets from the SAME instant, or the derived tokens/sec is nonsense (the
+    /// bug this shared-origin design fixes). `on_done` is called exactly once — on normal stream
+    /// end or on drop — with the usage/TTFT/duration captured so far (see struct docs).
+    pub fn new(
+        inner: S,
+        start: Instant,
+        on_done: impl FnOnce(CapturedUsage) + Send + 'static,
+    ) -> Self {
         Self {
             inner,
             on_done: Some(Box::new(on_done)),
-            start: Instant::now(),
+            start,
             ttft_ms: None,
             usage: None,
             pending: Vec::new(),
@@ -215,6 +232,7 @@ impl<S> UsageCapturingStream<S> {
             on_done(CapturedUsage {
                 usage: self.usage,
                 ttft_ms: self.ttft_ms,
+                duration_ms: Some(self.start.elapsed().as_millis() as i64),
             });
         }
     }
@@ -284,7 +302,7 @@ mod tests {
         ];
         let captured = Arc::new(Mutex::new(None));
         let c2 = captured.clone();
-        let s = UsageCapturingStream::new(stream::iter(frames), move |cu| {
+        let s = UsageCapturingStream::new(stream::iter(frames), Instant::now(), move |cu| {
             *c2.lock().unwrap() = Some(cu)
         });
         let out: Vec<_> = s.map(|r| r.unwrap()).collect().await;
@@ -296,6 +314,35 @@ mod tests {
         let cu = captured.lock().unwrap().take().unwrap();
         assert_eq!(cu.usage.unwrap().input_tokens, Some(8380));
         assert!(cu.ttft_ms.is_some());
+    }
+
+    /// Live-row-tps-basis fix: `duration_ms` must be measured from the SAME `start` the caller
+    /// passes into `new` (the route's own clock origin), not from this wrapper's own construction
+    /// time — so it shares an origin with `ttft_ms` and `derive_tps` in `read_api.rs` gets a
+    /// sane (not inflated) result. This is the crux regression test for the bug: before the fix,
+    /// `duration_ms` didn't exist on `CapturedUsage` at all.
+    #[tokio::test]
+    async fn duration_ms_is_measured_from_the_passed_start() {
+        let frames = vec![Ok::<_, std::io::Error>(Bytes::from(
+            "data: {\"type\":\"response.created\"}\n\n",
+        ))];
+        let captured = Arc::new(Mutex::new(None));
+        let c2 = captured.clone();
+        let start = Instant::now();
+        let s = UsageCapturingStream::new(stream::iter(frames), start, move |cu| {
+            *c2.lock().unwrap() = Some(cu)
+        });
+        let _out: Vec<_> = s.map(|r| r.unwrap()).collect().await;
+        let cu = captured.lock().unwrap().take().unwrap();
+        assert!(
+            cu.duration_ms.is_some(),
+            "duration_ms must be recorded once the stream ends"
+        );
+        // Both `ttft_ms` and `duration_ms` are offsets from the SAME `start` and the stream can
+        // only end at or after its first (and only) item, so duration_ms must never be smaller
+        // than ttft_ms — a same-origin sanity check distinguishing this from the pre-fix bug
+        // (two different clock origins could put them in either order).
+        assert!(cu.duration_ms.unwrap() >= cu.ttft_ms.unwrap());
     }
 
     #[tokio::test]
@@ -310,7 +357,7 @@ mod tests {
         ];
         let captured = Arc::new(Mutex::new(None));
         let c2 = captured.clone();
-        let mut s = UsageCapturingStream::new(stream::iter(frames), move |cu| {
+        let mut s = UsageCapturingStream::new(stream::iter(frames), Instant::now(), move |cu| {
             *c2.lock().unwrap() = Some(cu)
         });
 
@@ -372,7 +419,7 @@ mod tests {
         ];
         let captured = Arc::new(Mutex::new(None));
         let c2 = captured.clone();
-        let s = UsageCapturingStream::new(stream::iter(frames), move |cu| {
+        let s = UsageCapturingStream::new(stream::iter(frames), Instant::now(), move |cu| {
             *c2.lock().unwrap() = Some(cu)
         });
         let out: Vec<_> = s.map(|r| r.unwrap()).collect().await;
