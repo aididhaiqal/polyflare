@@ -311,6 +311,39 @@ impl AccountRepo {
         Ok(())
     }
 
+    /// Delete an account. Returns `true` if a row was removed, `false` if `id` was absent.
+    ///
+    /// The account row's FKs do most of the work: `usage_history` is `ON DELETE CASCADE` (its
+    /// per-account samples always go with the account) and `continuity_sessions.owning_account_id`
+    /// is `ON DELETE SET NULL` (owned sessions detach and self-heal by re-resolving). `delete_history`
+    /// controls only the aggregate `request_log` rows, which have no FK to the account: `false`
+    /// detaches them (`account_id` -> NULL, kept for reporting), `true` purges them. Runs in one
+    /// transaction; bumps the generation on a successful delete.
+    pub async fn delete(&self, id: &str, delete_history: bool) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        if delete_history {
+            sqlx::query("DELETE FROM request_log WHERE account_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            sqlx::query("UPDATE request_log SET account_id = NULL WHERE account_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let res = sqlx::query("DELETE FROM accounts WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        let removed = res.rows_affected() > 0;
+        if removed {
+            self.bump_generation();
+        }
+        Ok(removed)
+    }
+
     /// Set (or clear) an account's `security_work_authorized` capability flag — the operator write
     /// path (dashboard PATCH / CLI). Previously this column was only ever set by `insert` and the
     /// codex-lb importer; this is the first setter that can flip it post-onboard. Bumps the
@@ -1110,6 +1143,121 @@ mod tests {
             store.accounts().get("acct-1").await.unwrap().unwrap().alias,
             None
         );
+    }
+
+    /// A content-free `request_log` row for the `delete` tests, mirroring the field list the
+    /// brief specifies.
+    fn seed_request_log_record(account_id: &str) -> crate::RequestLogRecord {
+        crate::RequestLogRecord {
+            account_id: Some(account_id.into()),
+            requested_at: 0,
+            provider: "codex".into(),
+            method: "POST".into(),
+            path: "/responses".into(),
+            aliased: false,
+            status: 200,
+            duration_ms: 1,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            transport: None,
+            ttft_ms: None,
+            total_tokens: None,
+            cached_tokens: None,
+            subagent: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_false_detaches_request_log_and_cascades_usage_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
+        let repo = store.accounts();
+        seed_account(&repo, &cipher, "acct-1").await;
+
+        insert_null_window_usage(&store, "acct-1", 42.0, 500).await;
+        store
+            .request_log()
+            .insert(&seed_request_log_record("acct-1"))
+            .await
+            .unwrap();
+
+        let g0 = store.account_generation();
+        let removed = repo.delete("acct-1", false).await.unwrap();
+        assert!(removed, "delete must report a row was removed");
+        let g1 = store.account_generation();
+        assert!(g1 > g0, "delete must bump the account generation");
+
+        assert!(
+            repo.get("acct-1").await.unwrap().is_none(),
+            "the account row itself must be gone"
+        );
+        assert!(
+            remaining_recorded_ats(&store, "acct-1").await.is_empty(),
+            "usage_history must be gone via ON DELETE CASCADE, regardless of delete_history"
+        );
+
+        let rows = store.request_log().list(100, 0).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "delete_history=false must not remove the request_log row"
+        );
+        assert_eq!(
+            rows[0].account_id, None,
+            "delete_history=false detaches (NULLs) the row instead of deleting it"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_true_purges_request_log_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
+        let repo = store.accounts();
+        seed_account(&repo, &cipher, "acct-2").await;
+
+        insert_null_window_usage(&store, "acct-2", 11.0, 700).await;
+        store
+            .request_log()
+            .insert(&seed_request_log_record("acct-2"))
+            .await
+            .unwrap();
+
+        let removed = repo.delete("acct-2", true).await.unwrap();
+        assert!(removed, "delete must report a row was removed");
+        assert!(
+            repo.get("acct-2").await.unwrap().is_none(),
+            "the account row itself must be gone"
+        );
+        assert!(
+            remaining_recorded_ats(&store, "acct-2").await.is_empty(),
+            "usage_history must be gone via ON DELETE CASCADE regardless of delete_history"
+        );
+
+        let rows = store.request_log().list(100, 0).await.unwrap();
+        assert!(
+            rows.iter()
+                .all(|r| r.account_id.as_deref() != Some("acct-2")),
+            "delete_history=true must purge the account's request_log rows: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_absent_id_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let repo = store.accounts();
+
+        let removed = repo.delete("nope", false).await.unwrap();
+        assert!(!removed, "deleting a nonexistent id must return false");
     }
 
     #[test]
