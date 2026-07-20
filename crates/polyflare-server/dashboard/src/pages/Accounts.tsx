@@ -1,14 +1,13 @@
 // The Accounts page: every account's live status/quota/token-health, in a Cards ⇄ List toggle —
-// `GET /api/accounts` (`useAccounts()`) is the ONLY endpoint this page consumes. Phase 1 is
-// READ-ONLY: the mockup (`accounts-page.html`) shows no action affordances for this page (that's
-// deferred to a later phase's account-detail work), so none are rendered here.
+// `GET /api/accounts` (`useAccounts()`) is the ONLY read endpoint this page consumes. Task 7 turns
+// it from read-only into a control surface: a per-row kebab (⋯) menu (pause/resume, routing
+// policy, security toggle, rename, set pool, delete) backed by the shared `useAccountActions` hook
+// (`../lib/useAccountActions`) — one instance per page, reused verbatim by Task 8's AccountDetail.
 //
 // Field mapping (see read_api.rs::AccountView / src/lib/api.ts's mirror):
 //   status dot + StatusPill  <- a.status (via ui/StatusPill's statusTone)
-//   name                     <- a.id (AccountView has NO `alias` field — only
-//                                AccountDetailView.identity does, task 7's endpoint. The mockup's
-//                                "name(alias||id)" is deferred to the detail page; see
-//                                task-6-report.md).
+//   name                     <- a.alias ?? a.id (Task 4b put `alias` on AccountView's wire; a.id
+//                                stays visible as a secondary muted detail alongside it)
 //   provider chip            <- a.provider (via ui/ProviderTag)
 //   email / plan / pool      <- a.email, a.plan_type, a.pool (null -> "unpooled")
 //   5-hour / weekly bars     <- a.five_hour / a.weekly (WindowView | null — Claude accounts have no
@@ -16,6 +15,8 @@
 //                                shape stays a stable 2-row grid across accounts)
 //   token-health footer      <- a.token_health {access_state, access_expires_at}
 //   24h request count        <- a.request_count_24h
+//   kebab menu               <- AccountRowMenu (pause/resume, routing_policy, security_work_
+//                                authorized, rename, set pool, delete — all via AccountActionsApi)
 //
 // Usage-bar coloring is RISK-based (ok/warn/error by used_percent), not provider-brand-colored —
 // same deliberate deviation from the mockup that task-5b's Overview account-health table already
@@ -31,8 +32,22 @@ import clsx from "clsx";
 import type { AccountView, TokenHealthView, WindowView } from "../lib/api";
 import { compactNum, countdown, pct } from "../lib/format";
 import { useAccounts } from "../lib/queries";
+import { useAccountActions, type AccountActionsApi } from "../lib/useAccountActions";
+import { ActionMenu } from "../ui/ActionMenu";
 import { Card } from "../ui/Card";
-import { AlertTriangle, ChevronDown, Key, LayoutGrid, List as ListIcon } from "../ui/icons";
+import {
+  AlertTriangle,
+  ChevronDown,
+  Key,
+  Layers,
+  LayoutGrid,
+  List as ListIcon,
+  Pause,
+  Pencil,
+  Play,
+  ShieldCheck,
+  Trash2,
+} from "../ui/icons";
 import { providerBrandKey, ProviderTag } from "../ui/ProviderTag";
 import { StatusPill, statusTone, type StatusTone } from "../ui/StatusPill";
 
@@ -92,6 +107,9 @@ function tokenHealthLabel(
 
 export function Accounts() {
   const { data, isLoading, isError, error, refetch } = useAccounts();
+  // One shared instance for the whole list — both the card grid and the table pass this down to
+  // their row-level `AccountRowMenu`, and its dialogs render exactly once below.
+  const actions = useAccountActions();
   const [searchParams, setSearchParams] = useSearchParams();
   const view: ViewMode = searchParams.get("view") === "list" ? "list" : "cards";
   const [providerFilter, setProviderFilter] = useState<ProviderFilter>("all");
@@ -234,13 +252,69 @@ export function Accounts() {
       ) : view === "cards" ? (
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
           {filtered.map((a) => (
-            <AccountCard key={a.id} account={a} nowMs={nowMs} />
+            <AccountCard key={a.id} account={a} nowMs={nowMs} actions={actions} />
           ))}
         </div>
       ) : (
-        <AccountsTable accounts={filtered} nowMs={nowMs} />
+        <AccountsTable accounts={filtered} nowMs={nowMs} actions={actions} />
       )}
+
+      {actions.dialogs}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Row kebab menu — shared by both the card and table views (Task 7). Discrete actions (pause/
+// resume, routing-policy pick, security toggle) fire the shared patch mutation directly; rename/
+// set-pool/delete open one of `useAccountActions`'s confirmation dialogs instead.
+// ---------------------------------------------------------------------------------------------
+
+function AccountRowMenu({ account: a, actions }: { account: AccountView; actions: AccountActionsApi }) {
+  const paused = a.status === "paused";
+  return (
+    <ActionMenu label={`Actions for ${a.alias ?? a.id}`}>
+      <ActionMenu.Item
+        icon={paused ? Play : Pause}
+        onSelect={() => actions.patch.mutate({ id: a.id, body: { status: paused ? "active" : "paused" } })}
+      >
+        {paused ? "Resume" : "Pause"}
+      </ActionMenu.Item>
+      <ActionMenu.Separator />
+      <ActionMenu.Label>Routing policy</ActionMenu.Label>
+      {(["normal", "burn_first", "preserve"] as const).map((p) => (
+        <ActionMenu.CheckItem
+          key={p}
+          checked={a.routing_policy === p}
+          onSelect={() => actions.patch.mutate({ id: a.id, body: { routing_policy: p } })}
+        >
+          {p}
+        </ActionMenu.CheckItem>
+      ))}
+      <ActionMenu.Separator />
+      <ActionMenu.Item
+        icon={ShieldCheck}
+        onSelect={() =>
+          actions.patch.mutate({ id: a.id, body: { security_work_authorized: !a.security_work_authorized } })
+        }
+      >
+        {a.security_work_authorized ? "Revoke trusted access" : "Grant trusted access"}
+      </ActionMenu.Item>
+      <ActionMenu.Item icon={Pencil} onSelect={() => actions.openRename({ id: a.id, alias: a.alias })}>
+        Rename…
+      </ActionMenu.Item>
+      <ActionMenu.Item icon={Layers} onSelect={() => actions.openSetPool({ id: a.id, pool: a.pool })}>
+        Set pool…
+      </ActionMenu.Item>
+      <ActionMenu.Separator />
+      <ActionMenu.Item
+        icon={Trash2}
+        danger
+        onSelect={() => actions.openDelete({ id: a.id, label: a.alias ?? a.id })}
+      >
+        Delete…
+      </ActionMenu.Item>
+    </ActionMenu>
   );
 }
 
@@ -348,44 +422,63 @@ function CardUsageRow({
   );
 }
 
-function AccountCard({ account: a, nowMs }: { account: AccountView; nowMs: number }) {
+function AccountCard({
+  account: a,
+  nowMs,
+  actions,
+}: {
+  account: AccountView;
+  nowMs: number;
+  actions: AccountActionsApi;
+}) {
   const tone = statusTone(a.status);
   const token = tokenHealthLabel(a.token_health, nowMs);
 
   return (
-    <Link to={`/accounts/${encodeURIComponent(a.id)}`} className="block no-underline">
-      <Card className="h-full gap-2 transition-colors hover:border-accent">
-        <div className="flex items-center gap-1.5">
-          <span className={clsx("h-[7px] w-[7px] shrink-0 rounded-full", TONE_BAR_CLASS[tone])} />
-          <span className="truncate text-[12.5px] font-semibold text-fg">{a.id}</span>
-          <ProviderTag provider={a.provider} />
-          <StatusPill status={a.status} className="ml-auto shrink-0" />
-        </div>
+    // The kebab is a SIBLING overlay, not nested inside the `<Link>` (an interactive control can't
+    // nest inside an `<a>`, and it would fight the card's own click-through navigation). `h-full` on
+    // both this wrapper and the `Link` keeps the stretch-to-row-height behavior the grid relied on
+    // before this wrapper existed.
+    <div className="relative h-full">
+      <Link to={`/accounts/${encodeURIComponent(a.id)}`} className="block h-full no-underline">
+        <Card className="h-full gap-2 transition-colors hover:border-accent">
+          {/* pr-7 keeps the StatusPill clear of the kebab overlaid at the card's top-right corner */}
+          <div className="flex items-center gap-1.5 pr-7">
+            <span className={clsx("h-[7px] w-[7px] shrink-0 rounded-full", TONE_BAR_CLASS[tone])} />
+            <span className="truncate text-[12.5px] font-semibold text-fg">{a.alias ?? a.id}</span>
+            <ProviderTag provider={a.provider} />
+            <StatusPill status={a.status} className="ml-auto shrink-0" />
+          </div>
 
-        <div className="truncate text-[10px] text-fg opacity-60">
-          {a.email} · <span className="font-medium text-fg opacity-90">{a.plan_type}</span> · pool{" "}
-          <span className="font-medium text-fg opacity-90">{a.pool ?? "unpooled"}</span>
-        </div>
+          <div className="truncate text-[10px] text-fg opacity-60">
+            {a.alias && <span className="opacity-60">{a.id} · </span>}
+            {a.email} · <span className="font-medium text-fg opacity-90">{a.plan_type}</span> · pool{" "}
+            <span className="font-medium text-fg opacity-90">{a.pool ?? "unpooled"}</span>
+          </div>
 
-        <div className="flex flex-col gap-1">
-          <CardUsageRow label="5-hour" window={a.five_hour} nowMs={nowMs} />
-          <CardUsageRow label="Weekly" window={a.weekly} nowMs={nowMs} />
-        </div>
+          <div className="flex flex-col gap-1">
+            <CardUsageRow label="5-hour" window={a.five_hour} nowMs={nowMs} />
+            <CardUsageRow label="Weekly" window={a.weekly} nowMs={nowMs} />
+          </div>
 
-        <div className="mt-auto flex items-center justify-between gap-2 border-t border-border pt-2 text-[9.5px]">
-          <span className={clsx("flex items-center gap-1 whitespace-nowrap", token.className)}>
-            <Key className="h-3 w-3 shrink-0" strokeWidth={2} />
-            {token.text}
-          </span>
-          <span className="whitespace-nowrap text-fg opacity-60">
-            <span className="font-semibold text-fg opacity-100">
-              {compactNum(a.request_count_24h)}
-            </span>{" "}
-            reqs 24h
-          </span>
-        </div>
-      </Card>
-    </Link>
+          <div className="mt-auto flex items-center justify-between gap-2 border-t border-border pt-2 text-[9.5px]">
+            <span className={clsx("flex items-center gap-1 whitespace-nowrap", token.className)}>
+              <Key className="h-3 w-3 shrink-0" strokeWidth={2} />
+              {token.text}
+            </span>
+            <span className="whitespace-nowrap text-fg opacity-60">
+              <span className="font-semibold text-fg opacity-100">
+                {compactNum(a.request_count_24h)}
+              </span>{" "}
+              reqs 24h
+            </span>
+          </div>
+        </Card>
+      </Link>
+      <div className="absolute right-2 top-2 z-10">
+        <AccountRowMenu account={a} actions={actions} />
+      </div>
+    </div>
   );
 }
 
@@ -412,7 +505,15 @@ function ListUsageCell({ window }: { window: WindowView | null }) {
 const TABLE_HEAD_CLASS =
   "px-2 py-1.5 text-left text-[9px] font-medium uppercase tracking-wide text-fg opacity-60";
 
-function AccountsTable({ accounts, nowMs }: { accounts: AccountView[]; nowMs: number }) {
+function AccountsTable({
+  accounts,
+  nowMs,
+  actions,
+}: {
+  accounts: AccountView[];
+  nowMs: number;
+  actions: AccountActionsApi;
+}) {
   const navigate = useNavigate();
   return (
     <Card>
@@ -429,6 +530,9 @@ function AccountsTable({ accounts, nowMs }: { accounts: AccountView[]; nowMs: nu
               <th className={TABLE_HEAD_CLASS}>Weekly</th>
               <th className={TABLE_HEAD_CLASS}>Token</th>
               <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>Reqs 24h</th>
+              <th className={TABLE_HEAD_CLASS}>
+                <span className="sr-only">Actions</span>
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -457,7 +561,8 @@ function AccountsTable({ accounts, nowMs }: { accounts: AccountView[]; nowMs: nu
                         TONE_BAR_CLASS[tone],
                       )}
                     />
-                    {a.id}
+                    {a.alias ?? a.id}
+                    {a.alias && <span className="ml-1.5 text-fg opacity-40">({a.id})</span>}
                   </td>
                   <td className="px-2 py-1.5">
                     <ProviderTag provider={a.provider} />
@@ -478,6 +583,9 @@ function AccountsTable({ accounts, nowMs }: { accounts: AccountView[]; nowMs: nu
                   </td>
                   <td className="px-2 py-1.5 text-right tabular-nums text-fg opacity-80">
                     {compactNum(a.request_count_24h)}
+                  </td>
+                  <td className="px-2 py-1.5 text-right">
+                    <AccountRowMenu account={a} actions={actions} />
                   </td>
                 </tr>
               );
