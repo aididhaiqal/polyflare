@@ -26,7 +26,15 @@
 
 ---
 
-## PHASE 0 — Gating spike (HARD GATE)
+## PHASE 0 — Gating spike (HARD GATE) — ✅ RESULT: **GO** (run 2026-07-20)
+
+**Outcome:** With `-c model_providers.polyflare.supports_websockets=true`, the real codex CLI **attempted a WebSocket-downstream upgrade** to PolyFlare's `GET /responses` (`upgrade=websocket`, `sec-websocket-*` present), then fell back to HTTP on the 426 and completed the turn. So the CLI **will** WS-downstream to a custom provider — the gate is GO.
+
+**Captured handshake headers (content-free — names + identity presence):** `host, connection, upgrade, sec-websocket-version, sec-websocket-key, sec-websocket-extensions, authorization, user-agent, originator, openai-beta, x-codex-turn-metadata, x-codex-beta-features, x-client-request-id, session-id, thread-id, x-codex-window-id`. Present: `session-id`, `thread-id`, `x-codex-window-id`. Absent: `x-codex-turn-state` (server-issued, correct).
+
+**Resolves spec §9:** Task 5's `session_key` = `sha256_hex` of (`session-id` + `thread-id` + `x-codex-window-id`) read from the **WS handshake headers** — no first-frame read needed. (Method used: the throwaway pass-through relay was NOT built; the cheaper "does the CLI attempt WS + what handshake does it send" probe answered both the gate and §9. The remaining Phase-0 residual — full relay round-trip + cache — is low-risk (upstream `ws::conn` is proven; relaying real codex frames is codex-lb's model) and folds into Phase 1 Task 7's live-verify.)
+
+Original spike steps (kept for record; superseded by the probe above):
 
 ### Task 1: Prove the codex CLI will WS-downstream to PolyFlare, via a trivial pass-through relay
 
