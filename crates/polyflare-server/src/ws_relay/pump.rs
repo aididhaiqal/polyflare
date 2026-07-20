@@ -240,6 +240,12 @@ pub(crate) async fn run_pump<F, Fut, G, GFut>(
                                         } else {
                                             relay_metrics.record("move_cross_account");
                                             account_changed_since_completed = true;
+                                            // The in-flight turn belonged to the OLD (now benched)
+                                            // account; the client resolves the cross-account
+                                            // anchor-miss by full-resending, which re-populates
+                                            // `in_flight`. Clear it so a drop on the NEW upstream
+                                            // (before that resend) can't replay the stale frame.
+                                            in_flight = None;
                                         }
                                         account = new_account; // same account (retry) or a NEW one (moved).
                                         upstream = Some(new_upstream);
