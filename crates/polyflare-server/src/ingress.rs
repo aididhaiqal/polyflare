@@ -15,8 +15,8 @@ use polyflare_anthropic::AnthropicToResponses;
 use polyflare_codex::oauth::{classify_failure, should_refresh, token_exp, OAuthError};
 use polyflare_core::{
     Account, AccountId, AccountSnapshot, BackoffKind, Continuity, ContinuityDirective,
-    NoopContinuity, Prepared, PreparedRequest, Provider, RecoveryPlan, RequestCtx, ResponseStream,
-    SelectionCtx, Selector, SessionKey, Tier, Translator, WatchdogArm,
+    FailureSignal, NoopContinuity, Prepared, PreparedRequest, Provider, RecoveryPlan, RequestCtx,
+    ResponseStream, SelectionCtx, Selector, SessionKey, Tier, Translator, WatchdogArm,
 };
 use polyflare_store::{PlainTokens, RequestLogRecord, RequestLogRepo};
 
@@ -109,7 +109,7 @@ fn no_authorized_account_for_security_work() -> Response {
         .into_response()
 }
 
-/// Classify a watchdog failure and write the routing-health signal for the account `id` that
+/// Classify a failure signal and write the routing-health signal for the account `id` that
 /// produced it, so the selector benches / cools it down on the NEXT request (via the runtime
 /// overlay). A 429 ⇒ rate-limit cooldown (honoring `Retry-After`); a 5xx or a transport / mid-stream
 /// drop ⇒ a transient error (the selector's error-backoff gate handles repeat offenders). Other 4xx
@@ -137,11 +137,22 @@ fn no_authorized_account_for_security_work() -> Response {
 /// `quota_exceeded` status. `failure_routing.rs` carries two regression tests proving a quota-shaped
 /// code that DOES somehow reach `error_code` still falls through to the ordinary status-keyed
 /// bucketing below (never to `record_quota_exceeded`).
-async fn record_failure(state: &AppState, id: &AccountId, err: &WatchdogError, now: i64) {
-    let WatchdogError::Upstream(signal) = err else {
-        return;
-    };
-    if let Some(sig) = signal {
+///
+/// WS-relay Phase 3 Task 4: this is the reusable CORE of `record_failure`'s policy, extracted
+/// verbatim so the WS-downstream relay's exhaustion-move (`ws_relay`'s `on_upstream_error`) benches
+/// an account with EXACTLY the same policy the HTTP path applies on a `WatchdogError::Upstream` —
+/// one policy, two callers, never a second copy that can drift. `sig` is `Option<&FailureSignal>`
+/// rather than `record_failure`'s `&WatchdogError`: the WS relay's `UpstreamSignal::Error`
+/// classification already IS a `FailureSignal` (see `ws_relay::signal`), with no `WatchdogError` in
+/// that path at all. `record_failure` below is now a thin caller: unwrap the `WatchdogError`, then
+/// delegate here.
+pub(crate) async fn bench_account_for_failure(
+    state: &AppState,
+    id: &AccountId,
+    sig: Option<&FailureSignal>,
+    now: i64,
+) {
+    if let Some(sig) = sig {
         if let Some(code) = &sig.error_code {
             if let Some(status) = classify_failure(code).status() {
                 let _ = state
@@ -153,7 +164,7 @@ async fn record_failure(state: &AppState, id: &AccountId, err: &WatchdogError, n
             }
         }
     }
-    let transition = match signal {
+    let transition = match sig {
         Some(sig) if sig.status == 429 => {
             state
                 .runtime
@@ -180,6 +191,18 @@ async fn record_failure(state: &AppState, id: &AccountId, err: &WatchdogError, n
             t.reason,
         );
     }
+}
+
+/// Thin `WatchdogError` unwrapper: a non-`Upstream` variant is not an account-health signal at all
+/// (returns immediately), otherwise delegates the actual classification/bookkeeping to
+/// [`bench_account_for_failure`] — the shared core the WS-downstream relay's exhaustion-move also
+/// calls. Behavior-preserving extraction (WS-relay Phase 3 Task 4): identical outcome to the
+/// pre-extraction body for every existing caller.
+async fn record_failure(state: &AppState, id: &AccountId, err: &WatchdogError, now: i64) {
+    let WatchdogError::Upstream(signal) = err else {
+        return;
+    };
+    bench_account_for_failure(state, id, signal.as_ref(), now).await;
 }
 
 /// M5 capture-fixture mechanism: if `state.capture_fingerprint_path` is set, append this
