@@ -127,7 +127,20 @@ pub struct UsageCapturingStream<S> {
     start: Instant,
     ttft_ms: Option<i64>,
     usage: Option<ResponseUsage>,
+    /// Side-buffer of raw SSE bytes accumulated ACROSS chunks, so a `data: {...}` line split by
+    /// the transport (real codex `response.completed` frames are ~20 KB, transport chunks are
+    /// ~8 KB) can still be reassembled into a complete line before parsing. Never handed to the
+    /// caller — `poll_next` always yields the original chunk `Bytes` unchanged; this is a
+    /// parse-side copy only. Bounded by [`MAX_PENDING`] against a malformed/unterminated stream
+    /// growing memory without limit.
+    pending: Vec<u8>,
 }
+
+/// Cap on `UsageCapturingStream::pending`: if this many bytes accumulate with no `\n` yet seen
+/// (i.e. a single "line" that never completes), the buffer is dropped rather than grown further.
+/// A well-formed `response.completed` frame is ~20 KB, so 1 MiB is generously above any real
+/// frame; this only guards against a pathological/malformed upstream stream.
+const MAX_PENDING: usize = 1 << 20;
 
 impl<S> UsageCapturingStream<S> {
     /// Wrap `inner`, starting the TTFT clock now. `on_done` is called exactly once — on normal
@@ -139,28 +152,65 @@ impl<S> UsageCapturingStream<S> {
             start: Instant::now(),
             ttft_ms: None,
             usage: None,
+            pending: Vec::new(),
         }
     }
 
     /// Scan one yielded chunk for a `response.completed` frame, updating `self.usage` on a
     /// successful parse. Read-only w.r.t. `bytes` — the passthrough copy handed to the caller in
     /// `poll_next` is the same original `Bytes` handle, never touched by this function.
+    ///
+    /// A real codex `response.completed` frame (~20 KB) can be split by the transport across
+    /// several `poll_next` chunks (~8 KB each), landing its `data: {...}` line's JSON in pieces
+    /// that are each individually invalid. So this buffers bytes ACROSS calls in `self.pending`
+    /// and only parses COMPLETE lines (terminated by `\n`), retaining any trailing incomplete
+    /// line for the next chunk.
     fn observe(&mut self, bytes: &Bytes) {
-        let Ok(text) = std::str::from_utf8(bytes) else {
+        self.pending.extend_from_slice(bytes);
+
+        // Drain every complete line (up to and including each `\n`) out of `pending`, parsing
+        // each; retain whatever trails the last `\n` (an incomplete line spanning into the next
+        // chunk) for next time.
+        while let Some(newline_at) = self.pending.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = self.pending.drain(..=newline_at).collect();
+            let line_bytes = &line_bytes[..line_bytes.len() - 1]; // drop the trailing `\n`
+            self.process_line(line_bytes);
+        }
+
+        // Bound `pending`: if a single line has grown past MAX_PENDING with no `\n` in sight,
+        // this is either a pathological/malformed stream or a frame far larger than any real
+        // `response.completed` — drop the buffer rather than let memory grow unbounded.
+        if self.pending.len() > MAX_PENDING {
+            self.pending.clear();
+        }
+    }
+
+    /// Decode one complete line (bytes up to, excluding, a `\n`) as UTF-8, strip an optional
+    /// `data: ` SSE prefix, and hand the payload to [`parse_response_usage`]. Buffering as bytes
+    /// and decoding per-line (rather than decoding the whole buffer as UTF-8 up front) means a
+    /// multi-byte UTF-8 character split across a chunk boundary can never corrupt a *complete*
+    /// reassembled line — only the still-pending incomplete tail is ever mid-character.
+    fn process_line(&mut self, line_bytes: &[u8]) {
+        let Ok(s) = std::str::from_utf8(line_bytes) else {
             return; // best-effort: not UTF-8, silently skip; the chunk still passes through
         };
-        for line in text.lines() {
-            let payload = line.strip_prefix("data: ").unwrap_or(line);
-            if let Some(usage) = parse_response_usage(payload) {
-                self.usage = Some(usage); // keep the LAST successful parse
-            }
+        let payload = s.strip_prefix("data: ").unwrap_or(s);
+        if let Some(usage) = parse_response_usage(payload) {
+            self.usage = Some(usage); // keep the LAST successful parse
         }
     }
 
     /// Fire `on_done` with the usage/TTFT captured so far, guarded by `Option::take` so it never
     /// double-fires regardless of whether this is called from `poll_next`'s `Ready(None)` arm or
     /// from `Drop::drop` (or, in principle, both).
+    ///
+    /// Best-effort: before reading `self.usage`, attempts to parse whatever remains in `pending`
+    /// as a final unterminated line — the last frame's `data: {...}` line may not end in `\n`.
     fn fire_on_done(&mut self) {
+        if !self.pending.is_empty() {
+            let remainder = std::mem::take(&mut self.pending);
+            self.process_line(&remainder);
+        }
         if let Some(on_done) = self.on_done.take() {
             on_done(CapturedUsage {
                 usage: self.usage,
@@ -179,9 +229,9 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // `UsageCapturingStream<S>` is Unpin whenever `S: Unpin` (every other field is a plain
         // Unpin type — `Box<dyn FnOnce(..) + Send>`, `Instant`, `Option<i64>`,
-        // `Option<ResponseUsage>` — mirroring `TranslatingStream`'s all-Unpin-fields idiom in
-        // `translate_stream.rs`), so plain `get_mut` + `Pin::new` is sufficient; no unsafe pin
-        // projection needed.
+        // `Option<ResponseUsage>`, `Vec<u8>` — mirroring `TranslatingStream`'s all-Unpin-fields
+        // idiom in `translate_stream.rs`), so plain `get_mut` + `Pin::new` is sufficient; no
+        // unsafe pin projection needed.
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => {
@@ -309,6 +359,37 @@ mod tests {
         assert!(
             parse_response_usage(r#"{"type":"response.completed","response":{"id":"r"}}"#)
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn captures_usage_from_a_completed_frame_split_across_chunks() {
+        let full = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":{\"input_tokens\":8380,\"output_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":6912},\"output_tokens_details\":{\"reasoning_tokens\":40}}}}\n";
+        let (a, b) = full.split_at(50); // split the single data: line mid-JSON across two chunks
+        let frames = vec![
+            Ok::<_, std::io::Error>(Bytes::from(a.to_owned())),
+            Ok(Bytes::from(b.to_owned())),
+        ];
+        let captured = Arc::new(Mutex::new(None));
+        let c2 = captured.clone();
+        let s = UsageCapturingStream::new(stream::iter(frames), move |cu| {
+            *c2.lock().unwrap() = Some(cu)
+        });
+        let out: Vec<_> = s.map(|r| r.unwrap()).collect().await;
+        // passthrough still byte-identical for BOTH split halves
+        assert_eq!(out[0], Bytes::from(a.to_owned()));
+        assert_eq!(out[1], Bytes::from(b.to_owned()));
+        // usage reassembled across the split
+        assert_eq!(
+            captured
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .usage
+                .unwrap()
+                .input_tokens,
+            Some(8380)
         );
     }
 }
