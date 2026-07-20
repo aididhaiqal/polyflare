@@ -15,6 +15,7 @@ import { Pools } from "./pages/Pools";
 import { Requests } from "./pages/Requests";
 import { Sessions } from "./pages/Sessions";
 import { Shell } from "./shell/Shell";
+import { ToastProvider } from "./ui/Toast";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -28,32 +29,34 @@ const queryClient = new QueryClient({
 export function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <BrowserRouter basename="/dashboard">
-        <AuthProvider>
-          <Routes>
-            <Route path="/login" element={<Login />} />
-            <Route
-              path="/"
-              element={
-                <RequireAuth>
-                  <CapabilitiesProvider>
-                    <Shell />
-                  </CapabilitiesProvider>
-                </RequireAuth>
-              }
-            >
-              <Route index element={<Overview />} />
-              <Route path="accounts" element={<Accounts />} />
-              <Route path="accounts/:id" element={<AccountDetail />} />
-              <Route path="pools" element={<Pools />} />
-              <Route path="requests" element={<Requests />} />
-              <Route path="sessions" element={<Sessions />} />
-              <Route path="logs" element={<LiveLogs />} />
-              <Route path="*" element={<Navigate to="/" replace />} />
-            </Route>
-          </Routes>
-        </AuthProvider>
-      </BrowserRouter>
+      <ToastProvider>
+        <BrowserRouter basename="/dashboard">
+          <AuthProvider>
+            <Routes>
+              <Route path="/login" element={<Login />} />
+              <Route
+                path="/"
+                element={
+                  <RequireAuth>
+                    <CapabilitiesProvider>
+                      <Shell />
+                    </CapabilitiesProvider>
+                  </RequireAuth>
+                }
+              >
+                <Route index element={<Overview />} />
+                <Route path="accounts" element={<Accounts />} />
+                <Route path="accounts/:id" element={<AccountDetail />} />
+                <Route path="pools" element={<Pools />} />
+                <Route path="requests" element={<Requests />} />
+                <Route path="sessions" element={<Sessions />} />
+                <Route path="logs" element={<LiveLogs />} />
+                <Route path="*" element={<Navigate to="/" replace />} />
+              </Route>
+            </Routes>
+          </AuthProvider>
+        </BrowserRouter>
+      </ToastProvider>
     </QueryClientProvider>
   );
 }
