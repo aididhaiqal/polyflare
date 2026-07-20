@@ -493,10 +493,15 @@ mod relay_through {
         );
     }
 
-    /// Phase 2, Task 3: a `websocket_connection_limit_reached` reply (the 60-minute server cap)
-    /// must be INTERCEPTED by the pump — never forwarded to the client — and the pump must eagerly
-    /// re-dial the SAME account so the client's downstream socket never closes and its next frame
-    /// is simply answered on the fresh connection.
+    /// Phase 2, Task 3 (updated by Task 4, relay-catalog-fixes plan): a
+    /// `websocket_connection_limit_reached` reply (the 60-minute server cap) must be INTERCEPTED by
+    /// the pump — never forwarded to the client — and the pump must eagerly re-dial the SAME account.
+    /// Since Task 4, the pump also REPLAYS the buffered in-flight frame on that fresh connection, so
+    /// turn 1 completes AUTOMATICALLY (no explicit client resend needed — that stale assumption is
+    /// exactly what `mid_turn_cap_replays_inflight_frame` exists to pin down in detail). This test's
+    /// remaining job: prove the reconnect stays on the SAME account across BOTH turn 1 (the replay)
+    /// and a genuine follow-up turn 2 sent by the client afterward — and that turn 2 does NOT trigger
+    /// yet another reconnect (the redialed socket is already live and reused).
     #[tokio::test]
     async fn reconnect_on_connection_limit_stays_same_account() {
         let mock = MockWsUpstream::scripted(vec![
@@ -511,17 +516,22 @@ mod relay_through {
             .await
             .expect("downstream WS handshake must succeed");
 
-        // Turn 1: the mock replies with the wrapped cap-error envelope.
+        // Turn 1: the mock replies with the wrapped cap-error envelope; the pump intercepts it,
+        // eagerly re-dials, and (Task 4) replays this SAME frame on the fresh socket — so the
+        // client's very next inbound frame is turn 1's own completion, not the cap error.
         let frame1 = r#"{"type":"response.create","input":[]}"#.to_string();
         ws.send(TMessage::Text(frame1.into())).await.unwrap();
 
-        // The client must receive NOTHING — the cap frame is intercepted, not forwarded, and the
-        // eager re-dial itself produces no client-visible frame.
-        let saw = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
-        assert!(
-            saw.is_err(),
-            "the client must never receive the intercepted cap frame (it was a timeout, got: {saw:?})"
+        let TMessage::Text(reply1) = ws.next().await.expect("a reply").expect("no ws error") else {
+            panic!("expected a text frame back from the relay");
+        };
+        let v1: serde_json::Value = serde_json::from_str(&reply1).unwrap();
+        assert_eq!(
+            v1["type"], "response.completed",
+            "the cap frame must never reach the client — the buffered turn must complete \
+             automatically via the Task 4 replay, got: {v1:?}"
         );
+        let resp_id_1 = v1["response"]["id"].as_str().unwrap().to_string();
 
         // The pump must have eagerly re-dialed the SAME account: a second handshake at the mock.
         let mut handshakes = mock.handshake_count();
@@ -537,25 +547,13 @@ mod relay_through {
             "the pump must eagerly re-dial after an intercepted cap frame (handshakes: {handshakes})"
         );
 
-        // Turn 2, on the re-dialed connection: answered `response.completed`; downstream still open.
-        let frame2 = r#"{"type":"response.create","input":[],"previous_response_id":"whatever"}"#
-            .to_string();
-        ws.send(TMessage::Text(frame2.into())).await.unwrap();
-
-        let TMessage::Text(reply) = ws.next().await.expect("a reply").expect("no ws error") else {
-            panic!("expected a text frame back from the relay");
-        };
-        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
-        assert_eq!(v["type"], "response.completed");
-        let resp_id = v["response"]["id"].as_str().unwrap().to_string();
-
         // Ownership stays pinned to the SAME account across the reconnect.
         let mut owner = None;
         for _ in 0..50 {
             owner = state
                 .store
                 .continuity()
-                .get_anchor_owner(&resp_id)
+                .get_anchor_owner(&resp_id_1)
                 .await
                 .unwrap();
             if owner.is_some() {
@@ -586,11 +584,57 @@ mod relay_through {
             !snapshot.iter().any(|(k, _)| k == "move_cross_account"),
             "a same-account cap reconnect must never bump move_cross_account, got: {snapshot:?}"
         );
+
+        // Turn 2, a genuine follow-up from the client on the ALREADY-reused connection: answered
+        // `response.completed` with a NEW id, and the reused socket means no THIRD handshake.
+        let frame2 = format!(
+            r#"{{"type":"response.create","input":[],"previous_response_id":"{resp_id_1}"}}"#
+        );
+        ws.send(TMessage::Text(frame2.into())).await.unwrap();
+
+        let TMessage::Text(reply2) = ws.next().await.expect("a reply").expect("no ws error") else {
+            panic!("expected a text frame back from the relay");
+        };
+        let v2: serde_json::Value = serde_json::from_str(&reply2).unwrap();
+        assert_eq!(v2["type"], "response.completed");
+        let resp_id_2 = v2["response"]["id"].as_str().unwrap().to_string();
+        assert_ne!(
+            resp_id_2, resp_id_1,
+            "turn 2 must be a genuinely new completion"
+        );
+
+        assert_eq!(
+            mock.handshake_count(),
+            handshakes,
+            "turn 2 must reuse the already-redialed socket, not trigger a THIRD handshake"
+        );
+
+        let mut owner2 = None;
+        for _ in 0..50 {
+            owner2 = state
+                .store
+                .continuity()
+                .get_anchor_owner(&resp_id_2)
+                .await
+                .unwrap();
+            if owner2.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            owner2.as_deref(),
+            Some("acct-cap"),
+            "turn 2 must still be owned by the SAME pinned account"
+        );
     }
 
-    /// Phase 2, Task 3: an upstream drop mid-stream (network blip / idle close / anything short of
-    /// the client closing) must NOT tear down the client's downstream socket. The next client frame
-    /// transparently re-dials the same account and is answered normally.
+    /// Phase 2, Task 3 (updated by Task 4, relay-catalog-fixes plan): an upstream drop mid-stream
+    /// (network blip / idle close / anything short of the client closing) must NOT tear down the
+    /// client's downstream socket. Since Task 4, a drop that catches a turn IN FLIGHT is no longer
+    /// silent: the pump eagerly re-dials the same account AND replays the buffered frame, so turn 1
+    /// completes automatically. This test's remaining job: the same-account reconnect proof, PLUS a
+    /// genuine follow-up turn 2 reusing that same redialed socket (no further handshake).
     #[tokio::test]
     async fn reconnect_on_upstream_drop_keeps_downstream_open() {
         let mock = MockWsUpstream::scripted(vec![
@@ -605,32 +649,33 @@ mod relay_through {
             .await
             .expect("downstream WS handshake must succeed");
 
-        // Turn 1: the mock accepts the frame, sends nothing, then closes its own socket.
+        // Turn 1: the mock accepts the frame, sends nothing, then closes its own socket mid-turn.
+        // Task 4: the pump eagerly re-dials AND replays this frame on the fresh socket, so turn 1
+        // completes automatically — no explicit client resend needed.
         let frame1 = r#"{"type":"response.create","input":[]}"#.to_string();
         ws.send(TMessage::Text(frame1.into())).await.unwrap();
 
-        // The downstream client must stay OPEN and see nothing (no forwarded close, no error) —
-        // the pump marks the upstream dead and parks on the client alone.
-        let saw = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
-        assert!(
-            saw.is_err(),
-            "the downstream must stay open and silent after an upstream drop, got: {saw:?}"
-        );
-
-        // Turn 2: the client's next frame transparently re-dials the SAME account.
-        let frame2 = r#"{"type":"response.create","input":[],"previous_response_id":"whatever"}"#
-            .to_string();
-        ws.send(TMessage::Text(frame2.into())).await.unwrap();
-
-        let TMessage::Text(reply) = ws.next().await.expect("a reply").expect("no ws error") else {
+        let TMessage::Text(reply1) = ws.next().await.expect("a reply").expect("no ws error") else {
             panic!("expected a text frame back from the relay");
         };
-        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
-        assert_eq!(v["type"], "response.completed");
-        let resp_id = v["response"]["id"].as_str().unwrap().to_string();
+        let v1: serde_json::Value = serde_json::from_str(&reply1).unwrap();
+        assert_eq!(
+            v1["type"], "response.completed",
+            "the buffered turn must complete automatically via the Task 4 eager redial + replay \
+             after a mid-turn upstream drop, got: {v1:?}"
+        );
+        let resp_id_1 = v1["response"]["id"].as_str().unwrap().to_string();
 
+        let mut handshakes = mock.handshake_count();
+        for _ in 0..50 {
+            handshakes = mock.handshake_count();
+            if handshakes >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(
-            mock.handshake_count() >= 2,
+            handshakes >= 2,
             "the relay must have re-dialed a second connection after the upstream drop"
         );
 
@@ -639,7 +684,7 @@ mod relay_through {
             owner = state
                 .store
                 .continuity()
-                .get_anchor_owner(&resp_id)
+                .get_anchor_owner(&resp_id_1)
                 .await
                 .unwrap();
             if owner.is_some() {
@@ -651,6 +696,48 @@ mod relay_through {
             owner.as_deref(),
             Some("acct-drop"),
             "the reconnect after an upstream drop must stay on the SAME pinned account"
+        );
+
+        // Turn 2, a genuine follow-up from the client on the ALREADY-reused connection.
+        let frame2 = format!(
+            r#"{{"type":"response.create","input":[],"previous_response_id":"{resp_id_1}"}}"#
+        );
+        ws.send(TMessage::Text(frame2.into())).await.unwrap();
+
+        let TMessage::Text(reply2) = ws.next().await.expect("a reply").expect("no ws error") else {
+            panic!("expected a text frame back from the relay");
+        };
+        let v2: serde_json::Value = serde_json::from_str(&reply2).unwrap();
+        assert_eq!(v2["type"], "response.completed");
+        let resp_id_2 = v2["response"]["id"].as_str().unwrap().to_string();
+        assert_ne!(
+            resp_id_2, resp_id_1,
+            "turn 2 must be a genuinely new completion"
+        );
+
+        assert_eq!(
+            mock.handshake_count(),
+            handshakes,
+            "turn 2 must reuse the already-redialed socket, not trigger a THIRD handshake"
+        );
+
+        let mut owner2 = None;
+        for _ in 0..50 {
+            owner2 = state
+                .store
+                .continuity()
+                .get_anchor_owner(&resp_id_2)
+                .await
+                .unwrap();
+            if owner2.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            owner2.as_deref(),
+            Some("acct-drop"),
+            "turn 2 must still be owned by the SAME pinned account"
         );
     }
 
@@ -861,6 +948,113 @@ mod relay_through {
         assert!(
             !snapshot.iter().any(|(k, _)| k == "move_cross_account"),
             "a same-account anchor-miss must never bump move_cross_account, got: {snapshot:?}"
+        );
+    }
+
+    /// Task 4 (relay-catalog-fixes plan): a mid-turn cap — the `websocket_connection_limit_reached`
+    /// envelope arriving BEFORE any `response.completed` for the turn — must not just intercept +
+    /// eagerly re-dial (Phase 2, Task 3 already does that) but REPLAY the client's buffered
+    /// in-flight frame on the fresh socket, so the interrupted turn resumes WITHOUT the client
+    /// resending. One account, scripted `[connection_limit_reached(409), normal(vec![])]`, with
+    /// `.capturing_raw_frames()` so `raw_frames()` can prove the SAME frame bytes were relayed
+    /// TWICE (once to socket 1, which caps; once REPLAYED to socket 2, which completes) — never a
+    /// second client send.
+    #[tokio::test]
+    async fn mid_turn_cap_replays_inflight_frame() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::connection_limit_reached(409),
+            ScriptedTurn::normal(vec![]),
+        ])
+        .capturing_raw_frames();
+        let mock_base = mock.clone().spawn().await;
+
+        let (base, state) = spawn_with_pinned_account("acct-mid-turn-cap", &mock_base).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake must succeed");
+
+        // ONE client frame — the in-flight turn. Socket 1 caps it; the pump must eagerly re-dial
+        // AND replay this exact frame on socket 2, with NO further send from the client.
+        let frame = r#"{"type":"response.create","input":[]}"#.to_string();
+        ws.send(TMessage::Text(frame.clone().into())).await.unwrap();
+
+        // The client must receive `response.completed` directly — the cap frame was intercepted,
+        // never forwarded, so the FIRST (and only) thing the client sees is the completion.
+        // Bounded by a generous timeout: without the replay fix, nothing is ever sent to the
+        // re-dialed socket, so the client would otherwise hang forever waiting for a reply.
+        let reply = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("the replayed turn must complete within the timeout, not hang")
+            .expect("a reply")
+            .expect("no ws error");
+        let TMessage::Text(reply) = reply else {
+            panic!("expected a text frame back from the relay");
+        };
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            v["type"], "response.completed",
+            "the client must never see the intercepted cap/error frame — the buffered frame must \
+             be replayed on the re-dialed socket so the turn completes transparently, got: {v:?}"
+        );
+        let resp_id = v["response"]["id"].as_str().unwrap().to_string();
+
+        // The eager re-dial happened: a second handshake at the mock.
+        assert!(
+            mock.handshake_count() >= 2,
+            "the pump must eagerly re-dial after the intercepted cap frame (handshakes: {})",
+            mock.handshake_count()
+        );
+
+        // The proof the REPLAY (not a client resend) is what reached socket 2: the mock's
+        // raw-frame log shows the client's ORIGINAL frame bytes TWICE — once on socket 1 (capped),
+        // once replayed verbatim on socket 2 (completed) — even though the client only ever sent
+        // it ONCE.
+        let mut raw = mock.raw_frames();
+        for _ in 0..50 {
+            raw = mock.raw_frames();
+            if raw.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            raw,
+            vec![frame.clone(), frame.clone()],
+            "the buffered in-flight frame must be replayed BYTE-VERBATIM on the re-dialed socket, \
+             proving a buffer replay rather than a client resend"
+        );
+
+        // Ownership: the completed turn is recorded against the same pinned account.
+        let mut owner = None;
+        for _ in 0..50 {
+            owner = state
+                .store
+                .continuity()
+                .get_anchor_owner(&resp_id)
+                .await
+                .unwrap();
+            if owner.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            owner.as_deref(),
+            Some("acct-mid-turn-cap"),
+            "the replayed turn must complete on the SAME pinned account"
+        );
+
+        let snapshot = state.relay_metrics.snapshot();
+        let reconnects = snapshot
+            .iter()
+            .find(|(k, _)| k == "reconnect_same_account")
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
+        assert!(
+            reconnects >= 1,
+            "expected reconnect_same_account >= 1 after the mid-turn cap replay, got snapshot: \
+             {snapshot:?}"
         );
     }
 
