@@ -20,9 +20,6 @@ use polyflare_core::FailureSignal;
 
 /// What a raw backend WS text frame means to the relay pump, classified without ever reading
 /// conversation content.
-// A seam held for Phase 2/3's later tasks: the pump's re-dial / re-select loop matches on this.
-// Not yet referenced from non-test code.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum UpstreamSignal {
     /// An ordinary response frame (or anything not a recognized error envelope) — forward
@@ -34,7 +31,10 @@ pub(crate) enum UpstreamSignal {
     /// `previous_response_not_found` — forward verbatim; the client (codex CLI) resolves this by
     /// stripping the anchor and resending, exactly as it does over HTTP-SSE.
     AnchorMissing,
-    /// Any other error envelope — bench the account and re-select (move-or-retry).
+    /// Any other error envelope — bench the account and re-select (move-or-retry). Phase-2's Task 3
+    /// forwards this exactly like `Normal` (the pump's `_ =>` arm); the inner `FailureSignal` is not
+    /// yet READ anywhere — Phase-3's Task 4 adds the bench+move logic that actually inspects it.
+    #[allow(dead_code)]
     Error(FailureSignal),
 }
 
@@ -45,9 +45,6 @@ pub(crate) enum UpstreamSignal {
 /// or number; missing/unparseable is `None`) and maps the code to the matching variant.
 ///
 /// Never reads `error.message` — see the module doc's content-free contract.
-// A seam held for Phase 2/3's later tasks (the pump calls this per received frame). Covered by
-// this module's unit tests now.
-#[allow(dead_code)]
 pub(crate) fn classify_upstream_signal(text: &str) -> UpstreamSignal {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
         return UpstreamSignal::Normal;

@@ -373,4 +373,147 @@ mod relay_through {
              proving the pump's sniff -> Continuity::observe wiring actually ran"
         );
     }
+
+    /// Phase 2, Task 3: a `websocket_connection_limit_reached` reply (the 60-minute server cap)
+    /// must be INTERCEPTED by the pump — never forwarded to the client — and the pump must eagerly
+    /// re-dial the SAME account so the client's downstream socket never closes and its next frame
+    /// is simply answered on the fresh connection.
+    #[tokio::test]
+    async fn reconnect_on_connection_limit_stays_same_account() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::connection_limit_reached(409),
+            ScriptedTurn::normal(vec![]),
+        ]);
+        let mock_base = mock.clone().spawn().await;
+
+        let (base, state) = spawn_with_pinned_account("acct-cap", &mock_base).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake must succeed");
+
+        // Turn 1: the mock replies with the wrapped cap-error envelope.
+        let frame1 = r#"{"type":"response.create","input":[]}"#.to_string();
+        ws.send(TMessage::Text(frame1.into())).await.unwrap();
+
+        // The client must receive NOTHING — the cap frame is intercepted, not forwarded, and the
+        // eager re-dial itself produces no client-visible frame.
+        let saw = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
+        assert!(
+            saw.is_err(),
+            "the client must never receive the intercepted cap frame (it was a timeout, got: {saw:?})"
+        );
+
+        // The pump must have eagerly re-dialed the SAME account: a second handshake at the mock.
+        let mut handshakes = mock.handshake_count();
+        for _ in 0..50 {
+            handshakes = mock.handshake_count();
+            if handshakes >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            handshakes >= 2,
+            "the pump must eagerly re-dial after an intercepted cap frame (handshakes: {handshakes})"
+        );
+
+        // Turn 2, on the re-dialed connection: answered `response.completed`; downstream still open.
+        let frame2 = r#"{"type":"response.create","input":[],"previous_response_id":"whatever"}"#
+            .to_string();
+        ws.send(TMessage::Text(frame2.into())).await.unwrap();
+
+        let TMessage::Text(reply) = ws.next().await.expect("a reply").expect("no ws error") else {
+            panic!("expected a text frame back from the relay");
+        };
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(v["type"], "response.completed");
+        let resp_id = v["response"]["id"].as_str().unwrap().to_string();
+
+        // Ownership stays pinned to the SAME account across the reconnect.
+        let mut owner = None;
+        for _ in 0..50 {
+            owner = state
+                .store
+                .continuity()
+                .get_anchor_owner(&resp_id)
+                .await
+                .unwrap();
+            if owner.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            owner.as_deref(),
+            Some("acct-cap"),
+            "the reconnect must stay on the SAME pinned account"
+        );
+    }
+
+    /// Phase 2, Task 3: an upstream drop mid-stream (network blip / idle close / anything short of
+    /// the client closing) must NOT tear down the client's downstream socket. The next client frame
+    /// transparently re-dials the same account and is answered normally.
+    #[tokio::test]
+    async fn reconnect_on_upstream_drop_keeps_downstream_open() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::close_mid_stream(vec![]),
+            ScriptedTurn::normal(vec![]),
+        ]);
+        let mock_base = mock.clone().spawn().await;
+
+        let (base, state) = spawn_with_pinned_account("acct-drop", &mock_base).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake must succeed");
+
+        // Turn 1: the mock accepts the frame, sends nothing, then closes its own socket.
+        let frame1 = r#"{"type":"response.create","input":[]}"#.to_string();
+        ws.send(TMessage::Text(frame1.into())).await.unwrap();
+
+        // The downstream client must stay OPEN and see nothing (no forwarded close, no error) —
+        // the pump marks the upstream dead and parks on the client alone.
+        let saw = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
+        assert!(
+            saw.is_err(),
+            "the downstream must stay open and silent after an upstream drop, got: {saw:?}"
+        );
+
+        // Turn 2: the client's next frame transparently re-dials the SAME account.
+        let frame2 = r#"{"type":"response.create","input":[],"previous_response_id":"whatever"}"#
+            .to_string();
+        ws.send(TMessage::Text(frame2.into())).await.unwrap();
+
+        let TMessage::Text(reply) = ws.next().await.expect("a reply").expect("no ws error") else {
+            panic!("expected a text frame back from the relay");
+        };
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(v["type"], "response.completed");
+        let resp_id = v["response"]["id"].as_str().unwrap().to_string();
+
+        assert!(
+            mock.handshake_count() >= 2,
+            "the relay must have re-dialed a second connection after the upstream drop"
+        );
+
+        let mut owner = None;
+        for _ in 0..50 {
+            owner = state
+                .store
+                .continuity()
+                .get_anchor_owner(&resp_id)
+                .await
+                .unwrap();
+            if owner.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            owner.as_deref(),
+            Some("acct-drop"),
+            "the reconnect after an upstream drop must stay on the SAME pinned account"
+        );
+    }
 }

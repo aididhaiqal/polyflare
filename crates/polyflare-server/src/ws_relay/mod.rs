@@ -107,5 +107,5 @@ async fn relay(
         }
     };
 
-    pump::run_pump(socket, upstream, on_completed_id).await;
+    pump::run_pump(socket, upstream, headers, account, on_completed_id).await;
 }
