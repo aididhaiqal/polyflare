@@ -162,6 +162,52 @@ pub struct RequestBucket {
     pub total_tokens: i64,
 }
 
+/// The shared metric set for the Reports/Analytics endpoints (`GET /api/reports*`), computed by
+/// [`RequestLogRepo::reports_totals`], [`RequestLogRepo::reports_series`], and
+/// [`RequestLogRepo::reports_breakdown`] via the SAME underlying SELECT list (see
+/// `RequestLogRepo::reports_metric_select_list`) — only the WHERE/GROUP BY differ between the
+/// three. A superset of [`RequestAggregate`]/[`RequestBucket`]'s fields (adds
+/// cost/cached/reasoning-token/TTFT metrics on top of the overview's request/error/latency/token
+/// set); content-free like every other read surface in this module: numbers only, never row
+/// content.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReportMetrics {
+    pub requests: i64,
+    pub errors: i64,
+    pub cost_usd: f64,
+    pub tokens: i64,
+    pub cached_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub avg_duration_ms: f64,
+    pub avg_ttft_ms: f64,
+    /// `COUNT` of rows with a non-NULL `latency_first_token_ms` — the denominator `AVG` silently
+    /// uses to compute `avg_ttft_ms` (SQL `AVG` skips NULLs rather than treating them as zero).
+    /// Exposed so a caller/chart can distinguish "no TTFT data in this window" (`0`) from "the
+    /// average really is 0ms".
+    pub ttft_sample_count: i64,
+}
+
+/// One time bucket of [`RequestLogRepo::reports_series`]: [`ReportMetrics`] scoped to a single
+/// `bucket_secs`-wide window. Same "SQL emits only non-empty buckets" contract as
+/// [`RequestBucket`]/[`RequestLogRepo::series_since`] — zero-filling the full `[since_ts, now]`
+/// grid is the caller's job, not this repo's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportBucket {
+    /// Bucket start, unix-epoch seconds (`(requested_at / bucket_secs) * bucket_secs`).
+    pub ts: i64,
+    pub metrics: ReportMetrics,
+}
+
+/// One row of [`RequestLogRepo::reports_breakdown`]: [`ReportMetrics`] scoped to one value of the
+/// requested dimension (account/model/provider). `key` is the dimension's raw value, or `""` for
+/// NULL — `account_id`/`model` are nullable columns (see [`RequestLogRecord`]); `provider` is
+/// `NOT NULL` so `""` never occurs for that dimension.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportBreakdownRow {
+    pub key: String,
+    pub metrics: ReportMetrics,
+}
+
 /// One row of [`RequestLogRepo::recent_errors`]: content-free error identification, never a body or
 /// upstream error message.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -411,6 +457,173 @@ impl RequestLogRepo {
                     total_tokens,
                 },
             )
+            .collect())
+    }
+
+    /// The nine-column metric SELECT list shared by [`Self::reports_totals`]/
+    /// [`Self::reports_series`]/[`Self::reports_breakdown`] — errors classified by the SAME
+    /// `ERROR_STATUS_MIN` rule as `aggregate_since`/`series_since`, and `tokens`/`cached_tokens`
+    /// falling back the SAME way (`total_tokens` -> `input_tokens + output_tokens`; `cached_tokens`
+    /// -> `cached_input_tokens`; never `+ reasoning_tokens`, which is a subset of `output_tokens`,
+    /// not a third count — same reasoning as `aggregate_since`'s `total_tokens` fallback). Column
+    /// order here MUST match the tuple type each caller destructures and
+    /// [`Self::report_metrics_from_row`].
+    fn reports_metric_select_list() -> String {
+        format!(
+            "COUNT(*), \
+             COALESCE(SUM(CASE WHEN status >= {min} THEN 1 ELSE 0 END), 0), \
+             COALESCE(SUM(cost_usd), 0.0), \
+             COALESCE(SUM(COALESCE(total_tokens, COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))), 0), \
+             COALESCE(SUM(COALESCE(cached_tokens, cached_input_tokens, 0)), 0), \
+             COALESCE(SUM(COALESCE(reasoning_tokens, 0)), 0), \
+             COALESCE(AVG(duration_ms), 0.0), \
+             COALESCE(AVG(latency_first_token_ms), 0.0), \
+             COUNT(latency_first_token_ms)",
+            min = ERROR_STATUS_MIN
+        )
+    }
+
+    /// Map one row of [`Self::reports_metric_select_list`]'s nine columns (in that exact order) to
+    /// [`ReportMetrics`] — the single place all three `reports_*` methods share this conversion, so
+    /// the column order only has to be kept in sync in one place.
+    fn report_metrics_from_row(
+        row: (i64, i64, f64, i64, i64, i64, f64, f64, i64),
+    ) -> ReportMetrics {
+        ReportMetrics {
+            requests: row.0,
+            errors: row.1,
+            cost_usd: row.2,
+            tokens: row.3,
+            cached_tokens: row.4,
+            reasoning_tokens: row.5,
+            avg_duration_ms: row.6,
+            avg_ttft_ms: row.7,
+            ttft_sample_count: row.8,
+        }
+    }
+
+    /// Content-free [`ReportMetrics`] rollup over `request_log` rows at/after `since_ts`,
+    /// optionally narrowed to one `provider` — the Reports/Analytics `GET /api/reports` composite
+    /// endpoint's top-line KPI tile. Same shared metric SELECT list as [`Self::reports_series`]/
+    /// [`Self::reports_breakdown`] (see [`Self::reports_metric_select_list`]); only the WHERE
+    /// differs. An empty window/filter still returns a zeroed [`ReportMetrics`] (every metric is
+    /// `COALESCE`'d), never an error — same "empty rolls up to zero, not null" contract as
+    /// [`Self::aggregate_since`].
+    pub async fn reports_totals(
+        &self,
+        since_ts: i64,
+        provider: Option<&str>,
+    ) -> Result<ReportMetrics, StoreError> {
+        let sql = format!(
+            "SELECT {} FROM request_log WHERE requested_at >= ?{}",
+            Self::reports_metric_select_list(),
+            if provider.is_some() {
+                " AND provider = ?"
+            } else {
+                ""
+            }
+        );
+        let mut query =
+            sqlx::query_as::<_, (i64, i64, f64, i64, i64, i64, f64, f64, i64)>(&sql).bind(since_ts);
+        if let Some(p) = provider {
+            query = query.bind(p);
+        }
+        let row = query.fetch_one(&self.pool).await?;
+        Ok(Self::report_metrics_from_row(row))
+    }
+
+    /// Content-free [`ReportBucket`] time series over `request_log` rows at/after `since_ts`,
+    /// bucketed by `bucket_secs` (same integer-division grouping as [`Self::series_since`];
+    /// clamped to a minimum of 1 to avoid a SQL divide-by-zero), optionally narrowed to one
+    /// `provider` — the Reports/Analytics endpoint's cost/token/latency-over-time chart. SQL only
+    /// emits buckets that have >= 1 matching row; zero-filling the `[since_ts, now]` grid is the
+    /// caller's job, same contract as [`Self::series_since`].
+    pub async fn reports_series(
+        &self,
+        since_ts: i64,
+        bucket_secs: i64,
+        provider: Option<&str>,
+    ) -> Result<Vec<ReportBucket>, StoreError> {
+        let bucket_secs = bucket_secs.max(1);
+        let sql = format!(
+            "SELECT (requested_at / ?) * ? AS bucket_ts, {} \
+             FROM request_log WHERE requested_at >= ?{} \
+             GROUP BY bucket_ts ORDER BY bucket_ts ASC",
+            Self::reports_metric_select_list(),
+            if provider.is_some() {
+                " AND provider = ?"
+            } else {
+                ""
+            }
+        );
+        let mut query =
+            sqlx::query_as::<_, (i64, i64, i64, f64, i64, i64, i64, f64, f64, i64)>(&sql)
+                .bind(bucket_secs)
+                .bind(bucket_secs)
+                .bind(since_ts);
+        if let Some(p) = provider {
+            query = query.bind(p);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ReportBucket {
+                ts: row.0,
+                metrics: Self::report_metrics_from_row((
+                    row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
+                )),
+            })
+            .collect())
+    }
+
+    /// Content-free [`ReportBreakdownRow`] rollup grouped by one dimension (`account`/`model`/
+    /// `provider`, mapping to the `account_id`/`model`/`provider` columns) over `request_log` rows
+    /// at/after `since_ts`, optionally narrowed to one `provider` — the Reports/Analytics
+    /// endpoint's per-account/per-model/per-provider cost breakdown table. Rows are ordered by
+    /// summed `cost_usd` descending (biggest spenders first). `dimension` values other than
+    /// `"account"`/`"model"`/`"provider"` default to `"model"`; the handler is expected to validate
+    /// `dimension` before calling this, so this fallback is defense-in-depth, not the primary
+    /// validation. NULL dimension values (`account_id`/`model` are nullable — see
+    /// [`RequestLogRecord`]) collapse into a single `""`-keyed row via `COALESCE(col, '')`;
+    /// `provider` is `NOT NULL` so this never applies to that dimension.
+    pub async fn reports_breakdown(
+        &self,
+        since_ts: i64,
+        dimension: &str,
+        provider: Option<&str>,
+    ) -> Result<Vec<ReportBreakdownRow>, StoreError> {
+        let column = match dimension {
+            "account" => "account_id",
+            "provider" => "provider",
+            _ => "model",
+        };
+        let sql = format!(
+            "SELECT COALESCE({col}, '') AS dim_key, {metrics} \
+             FROM request_log WHERE requested_at >= ?{provider_clause} \
+             GROUP BY {col} ORDER BY COALESCE(SUM(cost_usd), 0.0) DESC",
+            col = column,
+            metrics = Self::reports_metric_select_list(),
+            provider_clause = if provider.is_some() {
+                " AND provider = ?"
+            } else {
+                ""
+            }
+        );
+        let mut query =
+            sqlx::query_as::<_, (String, i64, i64, f64, i64, i64, i64, f64, f64, i64)>(&sql)
+                .bind(since_ts);
+        if let Some(p) = provider {
+            query = query.bind(p);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ReportBreakdownRow {
+                key: row.0,
+                metrics: Self::report_metrics_from_row((
+                    row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
+                )),
+            })
             .collect())
     }
 
@@ -942,6 +1155,313 @@ mod tests {
         );
         assert_eq!(buckets[0].ts, 10);
         assert_eq!(buckets[1].ts, 20);
+    }
+
+    /// A full `RequestLogRecord` shaped for the reports-aggregation tests: imported-shaped
+    /// (`total_tokens`/`cached_tokens` are always `None`, so `reports_totals`/`reports_series`/
+    /// `reports_breakdown` must fall back to `input_tokens+output_tokens` /
+    /// `cached_input_tokens`), with `cost_usd`/`latency_first_token_ms` exposed as parameters so
+    /// individual seed rows can leave them `None` per the brief ("some cost_usd, some
+    /// latency_first_token_ms NULL").
+    #[allow(clippy::too_many_arguments)]
+    fn report_row(
+        requested_at: i64,
+        provider: &str,
+        model: &str,
+        account_id: Option<&str>,
+        status: u16,
+        duration_ms: i64,
+        input_tokens: i64,
+        output_tokens: i64,
+        cached_input_tokens: i64,
+        reasoning_tokens: i64,
+        cost_usd: Option<f64>,
+        latency_first_token_ms: Option<i64>,
+    ) -> RequestLogRecord {
+        RequestLogRecord {
+            requested_at,
+            provider: provider.into(),
+            method: "POST".into(),
+            path: "/responses".into(),
+            aliased: false,
+            status,
+            duration_ms,
+            account_id: account_id.map(String::from),
+            model: Some(model.into()),
+            reasoning_effort: None,
+            service_tier: None,
+            transport: Some("http".into()),
+            ttft_ms: None,
+            total_tokens: None,
+            cached_tokens: None,
+            subagent: None,
+            request_id: None,
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            cached_input_tokens: Some(cached_input_tokens),
+            reasoning_tokens: Some(reasoning_tokens),
+            cost_usd,
+            latency_first_token_ms,
+        }
+    }
+
+    /// Seeds a fresh store with 4 rows spanning 2 buckets (`[0,100)` / `[100,200)`), 2 models
+    /// (`model-a`/`model-b`), and 2 providers (`codex`/`anthropic`), orthogonally: each bucket,
+    /// model, and provider has exactly 2 rows, so grouping/filtering by any one dimension is a
+    /// meaningful (non-degenerate) test. Row 3 has `account_id: None` (exercises the NULL -> `""`
+    /// breakdown key), and row 2 has `latency_first_token_ms: None` + row 3 has `cost_usd: None`
+    /// (exercises the "AVG/SUM skip NULLs, COALESCE only fills the all-NULL/no-rows case" rule).
+    /// Returns the `TempDir` alongside the repo so the backing SQLite file isn't dropped early.
+    async fn seed_reports_fixture() -> (tempfile::TempDir, RequestLogRepo) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        // Row 1: bucket [0,100), codex, model-a, acct-1, success.
+        repo.insert(&report_row(
+            10,
+            "codex",
+            "model-a",
+            Some("acct-1"),
+            200,
+            100,
+            100,
+            50,
+            20,
+            10,
+            Some(1.0),
+            Some(40),
+        ))
+        .await
+        .unwrap();
+        // Row 2: bucket [0,100), anthropic, model-b, acct-2, error (500), NULL ttft.
+        repo.insert(&report_row(
+            50,
+            "anthropic",
+            "model-b",
+            Some("acct-2"),
+            500,
+            300,
+            200,
+            100,
+            30,
+            20,
+            Some(2.0),
+            None,
+        ))
+        .await
+        .unwrap();
+        // Row 3: bucket [100,200), codex, model-b, NULL account_id, success, NULL cost_usd.
+        repo.insert(&report_row(
+            110,
+            "codex",
+            "model-b",
+            None,
+            200,
+            200,
+            300,
+            150,
+            40,
+            30,
+            None,
+            Some(60),
+        ))
+        .await
+        .unwrap();
+        // Row 4: bucket [100,200), anthropic, model-a, acct-1, error (404).
+        repo.insert(&report_row(
+            150,
+            "anthropic",
+            "model-a",
+            Some("acct-1"),
+            404,
+            400,
+            400,
+            200,
+            50,
+            40,
+            Some(4.0),
+            Some(80),
+        ))
+        .await
+        .unwrap();
+
+        (dir, repo)
+    }
+
+    /// `reports_totals` sums cost (`NULL` -> 0 via `COALESCE`), falls back tokens to
+    /// `input_tokens+output_tokens` (never `+reasoning_tokens`), classifies errors by `status >=
+    /// 400`, and computes `avg_ttft_ms`/`ttft_sample_count` over only the non-NULL
+    /// `latency_first_token_ms` rows (row 2's NULL must be excluded from both, not treated as 0).
+    /// Also asserts an empty window rolls up to a zeroed `ReportMetrics`, not null/error.
+    #[tokio::test]
+    async fn reports_totals_computes_cost_token_fallback_errors_and_ttft_over_the_window() {
+        let (_dir, repo) = seed_reports_fixture().await;
+
+        let totals = repo.reports_totals(0, None).await.unwrap();
+        assert_eq!(totals.requests, 4);
+        assert_eq!(totals.errors, 2, "row2 (500) and row4 (404) are >= 400");
+        assert_eq!(totals.cost_usd, 7.0, "1.0 + 2.0 + 0.0 (row3's NULL) + 4.0");
+        assert_eq!(
+            totals.tokens, 1500,
+            "each row's total_tokens is NULL -> input+output fallback: 150+300+450+600, \
+             NOT + reasoning_tokens"
+        );
+        assert_eq!(
+            totals.cached_tokens, 140,
+            "cached_tokens is NULL on every row -> cached_input_tokens fallback: 20+30+40+50"
+        );
+        assert_eq!(totals.reasoning_tokens, 100, "10+20+30+40");
+        assert_eq!(totals.avg_duration_ms, 250.0, "(100+300+200+400)/4");
+        assert_eq!(
+            totals.ttft_sample_count, 3,
+            "row2's NULL latency_first_token_ms must not count as a sample"
+        );
+        assert_eq!(
+            totals.avg_ttft_ms, 60.0,
+            "(40+60+80)/3 -- row2's NULL excluded from both the sum and the count"
+        );
+
+        let empty = repo.reports_totals(1_000_000, None).await.unwrap();
+        assert_eq!(
+            empty,
+            ReportMetrics::default(),
+            "an empty window rolls up to zero, not null"
+        );
+    }
+
+    /// The `provider` filter narrows `reports_totals` to only that provider's rows (row1+row3 for
+    /// `codex`), and the token/cost/ttft math still applies the same fallback/NULL-skip rules
+    /// within the narrowed set.
+    #[tokio::test]
+    async fn reports_totals_provider_filter_narrows_to_matching_rows_only() {
+        let (_dir, repo) = seed_reports_fixture().await;
+
+        let totals = repo.reports_totals(0, Some("codex")).await.unwrap();
+        assert_eq!(totals.requests, 2, "only row1 and row3 are provider=codex");
+        assert_eq!(totals.errors, 0);
+        assert_eq!(totals.cost_usd, 1.0, "row1's 1.0 + row3's NULL-as-0");
+        assert_eq!(totals.tokens, 600, "150 (row1) + 450 (row3)");
+        assert_eq!(totals.ttft_sample_count, 2);
+        assert_eq!(totals.avg_ttft_ms, 50.0, "(40+60)/2");
+    }
+
+    /// `reports_breakdown("model")` groups by `model`, with each group's `ReportMetrics` matching
+    /// what a manual sum over that group's rows would produce, ordered by summed `cost_usd`
+    /// descending (model-a's 5.0 > model-b's 2.0).
+    #[tokio::test]
+    async fn reports_breakdown_by_model_groups_metrics_and_orders_by_cost_desc() {
+        let (_dir, repo) = seed_reports_fixture().await;
+
+        let rows = repo.reports_breakdown(0, "model", None).await.unwrap();
+        assert_eq!(rows.len(), 2);
+
+        assert_eq!(
+            rows[0].key, "model-a",
+            "model-a's cost (1.0+4.0=5.0) > model-b's (2.0+0=2.0)"
+        );
+        assert_eq!(rows[0].metrics.requests, 2);
+        assert_eq!(rows[0].metrics.errors, 1, "row4 (404)");
+        assert_eq!(rows[0].metrics.cost_usd, 5.0);
+        assert_eq!(rows[0].metrics.tokens, 750, "150 (row1) + 600 (row4)");
+        assert_eq!(rows[0].metrics.avg_ttft_ms, 60.0, "(40+80)/2");
+        assert_eq!(rows[0].metrics.ttft_sample_count, 2);
+
+        assert_eq!(rows[1].key, "model-b");
+        assert_eq!(rows[1].metrics.requests, 2);
+        assert_eq!(rows[1].metrics.errors, 1, "row2 (500)");
+        assert_eq!(rows[1].metrics.cost_usd, 2.0);
+        assert_eq!(rows[1].metrics.tokens, 750, "300 (row2) + 450 (row3)");
+        assert_eq!(
+            rows[1].metrics.avg_ttft_ms, 60.0,
+            "row2's NULL ttft excluded -- only row3's 60 counts"
+        );
+        assert_eq!(rows[1].metrics.ttft_sample_count, 1);
+    }
+
+    /// `reports_breakdown("account")` collapses row3's `NULL` `account_id` into a single
+    /// `""`-keyed row via `COALESCE(account_id, '')`, alongside the two real account ids.
+    #[tokio::test]
+    async fn reports_breakdown_by_account_maps_null_account_id_to_empty_string_key() {
+        let (_dir, repo) = seed_reports_fixture().await;
+
+        let rows = repo.reports_breakdown(0, "account", None).await.unwrap();
+        let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+        assert!(keys.contains(&"acct-1"), "rows 1 and 4");
+        assert!(keys.contains(&"acct-2"), "row 2");
+        assert!(
+            keys.contains(&""),
+            "row3's NULL account_id must collapse to the empty-string key, not be dropped"
+        );
+
+        let empty_key_row = rows.iter().find(|r| r.key.is_empty()).unwrap();
+        assert_eq!(
+            empty_key_row.metrics.requests, 1,
+            "only row3 has a NULL account_id"
+        );
+        assert_eq!(empty_key_row.metrics.cost_usd, 0.0);
+    }
+
+    /// An unrecognized `dimension` value defaults to grouping by `model` (defense-in-depth; the
+    /// handler is expected to validate `dimension` before calling this).
+    #[tokio::test]
+    async fn reports_breakdown_unknown_dimension_defaults_to_model() {
+        let (_dir, repo) = seed_reports_fixture().await;
+
+        let by_model = repo.reports_breakdown(0, "model", None).await.unwrap();
+        let by_bogus = repo.reports_breakdown(0, "nonsense", None).await.unwrap();
+        assert_eq!(
+            by_bogus, by_model,
+            "an unrecognized dimension must default to grouping by model"
+        );
+    }
+
+    /// `reports_series` buckets rows the same way `series_since` does (integer-division grouping,
+    /// ascending by `ts`), but with the full `ReportMetrics` set per bucket instead of just
+    /// requests/errors/latency/tokens.
+    #[tokio::test]
+    async fn reports_series_buckets_ascending_with_per_bucket_metrics() {
+        let (_dir, repo) = seed_reports_fixture().await;
+
+        let buckets = repo.reports_series(0, 100, None).await.unwrap();
+        assert_eq!(buckets.len(), 2);
+
+        assert_eq!(buckets[0].ts, 0);
+        assert_eq!(buckets[0].metrics.requests, 2);
+        assert_eq!(buckets[0].metrics.errors, 1, "row2 (500)");
+        assert_eq!(buckets[0].metrics.cost_usd, 3.0, "row1's 1.0 + row2's 2.0");
+        assert_eq!(buckets[0].metrics.tokens, 450, "150 (row1) + 300 (row2)");
+        assert_eq!(
+            buckets[0].metrics.ttft_sample_count, 1,
+            "row2's NULL ttft excluded"
+        );
+        assert_eq!(buckets[0].metrics.avg_ttft_ms, 40.0);
+
+        assert_eq!(buckets[1].ts, 100);
+        assert_eq!(buckets[1].metrics.requests, 2);
+        assert_eq!(buckets[1].metrics.errors, 1, "row4 (404)");
+        assert_eq!(
+            buckets[1].metrics.cost_usd, 4.0,
+            "row3's NULL-as-0 + row4's 4.0"
+        );
+        assert_eq!(buckets[1].metrics.tokens, 1050, "450 (row3) + 600 (row4)");
+        assert_eq!(buckets[1].metrics.ttft_sample_count, 2);
+        assert_eq!(buckets[1].metrics.avg_ttft_ms, 70.0, "(60+80)/2");
+    }
+
+    /// The `provider` filter narrows `reports_series` per-bucket, same as it narrows
+    /// `reports_totals`: with `provider=codex`, each bucket keeps only its `codex` row (row1 in
+    /// bucket 0, row3 in bucket 100).
+    #[tokio::test]
+    async fn reports_series_provider_filter_narrows_bucket_contents() {
+        let (_dir, repo) = seed_reports_fixture().await;
+
+        let buckets = repo.reports_series(0, 100, Some("codex")).await.unwrap();
+        assert_eq!(buckets.len(), 2, "codex has exactly one row in each bucket");
+        assert_eq!(buckets[0].metrics.requests, 1);
+        assert_eq!(buckets[0].metrics.tokens, 150, "row1 only");
+        assert_eq!(buckets[1].metrics.requests, 1);
+        assert_eq!(buckets[1].metrics.tokens, 450, "row3 only");
     }
 
     /// `recent_errors` returns only `status >= 400` rows, newest first, and honors `limit`.
