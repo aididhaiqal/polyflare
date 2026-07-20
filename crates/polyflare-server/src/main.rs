@@ -62,6 +62,12 @@ enum AccountsCommands {
         /// Preview only: validate + report what would be imported, then roll back — writes nothing.
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// Also REFRESH already-present accounts: upsert their token columns (+ reset a stale
+        /// `reauth_required`/deactivated status to active) from codex-lb — the zero-re-auth way to
+        /// revive an account whose local token went stale. Pool/alias/routing are left untouched.
+        /// Without this flag, existing accounts are skipped (insert-new-only, the default).
+        #[arg(long = "refresh-existing")]
+        refresh_existing: bool,
     },
     /// Onboard a Codex account via native OAuth login (authorization_code + PKCE). Prints a URL to
     /// open; catches the loopback callback locally, or paste the redirected URL when headless.
@@ -139,7 +145,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 from,
                 fernet_key,
                 dry_run,
-            } => accounts_import(&from, &fernet_key, dry_run).await,
+                refresh_existing,
+            } => accounts_import(&from, &fernet_key, dry_run, refresh_existing).await,
             AccountsCommands::Login { open, pool } => accounts_login(open, pool).await,
             AccountsCommands::SetPool { id, pool } => accounts_set_pool(&id, pool).await,
             AccountsCommands::SetCapability { id, security_work } => {
@@ -300,6 +307,7 @@ async fn accounts_import(
     from: &Path,
     fernet_key: &Path,
     dry_run: bool,
+    refresh_existing: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = config::data_dir_from_env();
     let db_path = config::db_path(&data_dir);
@@ -307,7 +315,8 @@ async fn accounts_import(
 
     let store = Store::open(&db_path).await?;
     let cipher = TokenCipher::load_or_create(&key_path)?;
-    let summary = import_from_codex_lb(&store, from, fernet_key, &cipher, dry_run).await?;
+    let summary =
+        import_from_codex_lb(&store, from, fernet_key, &cipher, dry_run, refresh_existing).await?;
     let verb = if dry_run { "would import" } else { "imported" };
     println!(
         "{verb} {} account(s), {} usage row(s), and {} chat-log row(s){}",

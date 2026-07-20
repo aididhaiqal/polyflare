@@ -285,7 +285,7 @@ async fn imports_accounts_usage_and_tokens_roundtrip() {
     let store = Store::open(&pf_db).await.unwrap();
     let cipher = TokenCipher::load_or_create(&pf_key).unwrap();
 
-    let summary = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false)
+    let summary = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false, false)
         .await
         .unwrap();
     assert_eq!(summary.accounts_imported, 1);
@@ -439,13 +439,13 @@ async fn reimport_is_idempotent_for_request_logs() {
     let store = Store::open(&pf_db).await.unwrap();
     let cipher = TokenCipher::load_or_create(&pf_key).unwrap();
 
-    let first = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false)
+    let first = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false, false)
         .await
         .unwrap();
     assert_eq!(first.request_logs_imported, 1);
     assert_eq!(first.usage_rows_imported, 1);
 
-    let second = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false)
+    let second = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false, false)
         .await
         .unwrap();
     assert_eq!(
@@ -503,7 +503,7 @@ async fn mid_import_decrypt_failure_errors_and_rolls_back_leaving_store_empty() 
     let cipher = TokenCipher::load_or_create(&pf_key).unwrap();
 
     // (a) It returns Err (no panic) — an import error from the failed decrypt of acct-bad.
-    let result = import_from_codex_lb(&store, &src_db, &key_path, &cipher, false).await;
+    let result = import_from_codex_lb(&store, &src_db, &key_path, &cipher, false, false).await;
     assert!(
         matches!(result, Err(StoreError::Import(_))),
         "expected StoreError::Import on the undecryptable account, got {result:?}"
@@ -537,7 +537,7 @@ async fn dry_run_previews_counts_but_writes_nothing() {
     let cipher = TokenCipher::load_or_create(&pf_key).unwrap();
 
     // Dry run: accurate would-write counts.
-    let preview = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, true)
+    let preview = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, true, false)
         .await
         .unwrap();
     assert_eq!(preview.accounts_imported, 1);
@@ -563,7 +563,7 @@ async fn dry_run_previews_counts_but_writes_nothing() {
     );
 
     // A real run then actually writes them.
-    let real = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false)
+    let real = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false, false)
         .await
         .unwrap();
     assert_eq!(real.accounts_imported, 1);
@@ -577,4 +577,65 @@ async fn dry_run_previews_counts_but_writes_nothing() {
         1,
         "real run must persist the chat log"
     );
+}
+
+/// `--refresh-existing`: an account already present with a STALE token + `reauth_required` status is
+/// REVIVED by a re-import — its token columns are upserted from codex-lb and its status reset to
+/// active, zero re-auth. The default (insert-only) run leaves it untouched.
+#[tokio::test]
+async fn refresh_existing_upserts_stale_token_and_revives_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_db = dir.path().join("codex-lb-store.db");
+    let fernet_key_path = dir.path().join("encryption.key");
+    let pf_db = dir.path().join("polyflare-store.db");
+    let pf_key = dir.path().join("key");
+
+    let fernet_key = Fernet::generate_key();
+    std::fs::write(&fernet_key_path, &fernet_key).unwrap();
+    build_source_db(&src_db, &fernet_key).await;
+
+    let store = Store::open(&pf_db).await.unwrap();
+    let cipher = TokenCipher::load_or_create(&pf_key).unwrap();
+
+    // First import creates acct-1 (active, token ACCESS-plaintext).
+    import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false, false)
+        .await
+        .unwrap();
+
+    // Simulate the local token going stale: corrupt the encrypted access token + mark reauth.
+    sqlx::query(
+        "UPDATE accounts SET status = 'reauth_required', access_token_enc = X'00' WHERE id = 'acct-1'",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    // Default re-import (refresh_existing = false) SKIPS the existing account: it stays broken.
+    import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.accounts().get("acct-1").await.unwrap().unwrap().status,
+        "reauth_required",
+        "default import must NOT touch an existing account"
+    );
+
+    // refresh_existing = true: token re-written from codex-lb + status revived to active.
+    let summary = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false, true)
+        .await
+        .unwrap();
+    assert_eq!(summary.accounts_imported, 1, "the refreshed account is counted");
+    assert_eq!(
+        store.accounts().get("acct-1").await.unwrap().unwrap().status,
+        "active",
+        "reauth_required must be revived to active"
+    );
+    // The access token was actually re-written (X'00' garbage -> the codex-lb plaintext) and decrypts.
+    let tokens = store
+        .accounts()
+        .decrypt_tokens("acct-1", &cipher)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tokens.access_token, "ACCESS-plaintext");
 }

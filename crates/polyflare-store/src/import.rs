@@ -132,6 +132,7 @@ pub async fn import_from_codex_lb(
     fernet_key_path: &Path,
     cipher: &TokenCipher,
     dry_run: bool,
+    refresh_existing: bool,
 ) -> Result<ImportSummary, StoreError> {
     // Load the Fernet key (a base64url string, e.g. produced by Fernet.generate_key()).
     let key_text = fs::read_to_string(fernet_key_path)?;
@@ -196,17 +197,39 @@ pub async fn import_from_codex_lb(
             provider: "codex".to_string(),
             pool: None,
         };
-        // `OR IGNORE` makes the account insert idempotent: re-running after a fix skips ids
-        // already present instead of erroring on the `id` PRIMARY KEY.
-        let result = sqlx::query(
+        // Default (`OR IGNORE`) makes the account insert idempotent: re-running after a fix skips
+        // ids already present instead of erroring on the `id` PRIMARY KEY.
+        //
+        // `refresh_existing` (opt-in) instead UPSERTS: for an id already present it refreshes ONLY
+        // the token columns (+ `last_refresh`) and clears the not-usable states (`status`->active,
+        // `deactivation_reason`/`blocked_at`->NULL) — this is the "pull the latest token from
+        // codex-lb, zero re-auth" path for an account whose local token went stale (`reauth_required`
+        // etc.). It deliberately does NOT touch pool/alias/routing/security fields, which PolyFlare
+        // may have set independently of codex-lb.
+        let sql = if refresh_existing {
+            "INSERT INTO accounts (\
+                id, chatgpt_account_id, chatgpt_user_id, email, alias, \
+                workspace_id, workspace_label, seat_type, plan_type, routing_policy, \
+                access_token_enc, refresh_token_enc, id_token_enc, \
+                last_refresh, created_at, status, deactivation_reason, \
+                reset_at, blocked_at, security_work_authorized, provider\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            ON CONFLICT(id) DO UPDATE SET \
+                access_token_enc = excluded.access_token_enc, \
+                refresh_token_enc = excluded.refresh_token_enc, \
+                id_token_enc = excluded.id_token_enc, \
+                last_refresh = excluded.last_refresh, \
+                status = 'active', deactivation_reason = NULL, blocked_at = NULL"
+        } else {
             "INSERT OR IGNORE INTO accounts (\
                 id, chatgpt_account_id, chatgpt_user_id, email, alias, \
                 workspace_id, workspace_label, seat_type, plan_type, routing_policy, \
                 access_token_enc, refresh_token_enc, id_token_enc, \
                 last_refresh, created_at, status, deactivation_reason, \
                 reset_at, blocked_at, security_work_authorized, provider\
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        };
+        let result = sqlx::query(sql)
         .bind(account.id.as_str())
         .bind(account.chatgpt_account_id.as_deref())
         .bind(account.chatgpt_user_id.as_deref())
@@ -231,7 +254,8 @@ pub async fn import_from_codex_lb(
         .execute(&mut *tx)
         .await?;
         // `rows_affected()` is 0 when `OR IGNORE` skips an already-present id, 1 when a row is
-        // inserted — so a re-run into a populated store reports the true inserted count.
+        // inserted. With `refresh_existing`, an `ON CONFLICT DO UPDATE` also reports 1, so the count
+        // covers both newly-inserted and token-refreshed accounts.
         summary.accounts_imported += result.rows_affected() as usize;
     }
 
