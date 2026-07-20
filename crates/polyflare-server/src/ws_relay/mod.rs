@@ -3,18 +3,20 @@
 //! `GET /responses` (+ `/{pool}/responses`) routes here instead of to
 //! `crate::ingress::websocket_fallback_handler`'s `426`, and PolyFlare ACCEPTS the upgrade.
 //!
-//! **Task 2 scope (this module today): the accept SEAM only.** [`responses_ws_handler`] performs the
-//! WebSocket upgrade and then immediately drops the socket — closing it cleanly. The real
-//! bidirectional relay pump (account-pinning, upstream WS dial via `polyflare_codex::ws::WsConn`,
-//! verbatim frame forwarding, the content-free `response.id` ownership sniff, and transparent
-//! same-account reconnect) is Tasks 3-6. The handler's SIGNATURE is deliberately stable now — it
-//! already takes the handshake `HeaderMap` (Tasks 3-5 derive the conversation `session_key` from it,
-//! per `crate::session_key`) and the shared [`AppState`] (selection/ownership/dial seams) — so later
-//! tasks fill in the pump without re-plumbing the route.
+//! **Task 6 (this module now): the real relay.** [`responses_ws_handler`] accepts the upgrade; its
+//! post-upgrade future ([`relay`]) resolves the conversation's pinned owner account
+//! ([`resolve_owner`], Task 3), dials that account's upstream Codex WS ([`dial_owner_upstream`],
+//! Task 4), and drives the bidirectional verbatim pump ([`pump::run_pump`], Task 6) for the
+//! connection's life. Every `response.completed` frame's id is sniffed content-free
+//! ([`sniff::sniff_completed_id`]) and fed into the SAME continuity engine the HTTP path uses
+//! (`Continuity::observe` — see `polyflare_core::TurnOutcome::Completed`), so a later turn — HTTP or
+//! WS, same or reconnected socket — resolves the same owner. On either resolve/dial failure the
+//! downstream socket is simply dropped (a clean close); MVP has no re-select loop (a later phase's
+//! job).
 //!
-//! **Content-free (inviolable, `design §8`):** the stub reads no frame; even the real relay only ever
-//! touches the content-free response-id sniff + handshake-header normalization. No frame body is ever
-//! logged or persisted (PolyFlare's permanent limit).
+//! **Content-free (inviolable, `design §8`):** no frame body is ever logged or persisted anywhere in
+//! this module or its submodules; the ONLY body inspection at all is [`sniff::sniff_completed_id`]
+//! reading `type` + `response.id`. This is PolyFlare's permanent limit.
 
 use std::sync::Arc;
 
@@ -23,40 +25,85 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::Response;
 
+use polyflare_core::{AccountId, RequestCtx, SessionKey, TurnOutcome};
+
 use crate::app::AppState;
 
 mod owner;
+mod pump;
 mod session;
+mod sniff;
 
-#[allow(unused_imports)]
-// wired into the relay pump by Tasks 4-6 (dial + reconnect + observe).
-pub(crate) use owner::{dial_owner_upstream, resolve_owner, RelayError};
+pub(crate) use owner::{dial_owner_upstream, resolve_owner};
 pub(crate) use session::ws_session_key;
 
 /// Accepts the codex CLI's downstream WebSocket upgrade on `/responses` (routed here only when
 /// `AppState::ws_downstream` is on — see `crate::app::build_app`). Returns the `101 Switching
-/// Protocols` upgrade response; the post-upgrade future runs [`relay_stub`].
-///
-/// `state` and `headers` are bound now (not `_`-ignored) because Tasks 3-5 need them: `headers`
-/// carries the handshake identity the conversation `session_key` is derived from, and `state` is the
-/// entry to the selection/ownership engine and the upstream WS dial. Wiring them into the signature
-/// today keeps it stable for those tasks.
+/// Protocols` upgrade response; the post-upgrade future runs [`relay`].
 pub async fn responses_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    // Seams held for Tasks 3-6. The conversation's content-free owner-lookup key is derivable from
-    // the handshake headers ALONE (Phase-0: `session-id`/`thread-id`/`x-codex-window-id`), so it is
-    // computed here — later tasks resolve/pin the owning account on it. The stub drops it.
-    let _session_key = ws_session_key(&headers);
-    let _ = &state;
-    ws.on_upgrade(relay_stub)
+    // The conversation's content-free owner-lookup key is derivable from the handshake headers
+    // ALONE (Phase-0: `session-id`/`thread-id`/`x-codex-window-id`) — computed here, before the
+    // upgrade, so it moves into the post-upgrade future unchanged.
+    let session_key = ws_session_key(&headers);
+    ws.on_upgrade(move |socket| relay(socket, state, headers, session_key))
 }
 
-/// Task 2 stub post-upgrade future: accept then immediately drop the socket, which closes it
-/// cleanly. Reads nothing off the wire — content-free by construction. Tasks 3-6 replace this with
-/// the real bidirectional pump.
-async fn relay_stub(socket: WebSocket) {
-    let _ = socket;
+/// The real post-upgrade relay future (Task 6): resolve the conversation's owner, dial its upstream
+/// WS, then pump frames both ways for the connection's life.
+///
+/// Any resolve/dial failure closes the downstream socket cleanly (by simply dropping it — Rust's
+/// ordinary drop semantics close the connection, exactly as Task 2's original stub relied on) and
+/// returns without ever reading a frame. Never logs the failure: `RelayError`'s variants are
+/// generic-by-design (see `owner.rs`), but even so this path deliberately doesn't surface them
+/// anywhere — content-free.
+async fn relay(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    session_key: SessionKey,
+) {
+    let Ok(account) = resolve_owner(&state, &session_key).await else {
+        return;
+    };
+    let Ok(upstream) = dial_owner_upstream(&headers, &account).await else {
+        return;
+    };
+
+    // The ownership-recording callback the pump invokes on every sniffed `response.completed` id.
+    // `Fn`, not `FnOnce`: one socket can carry many turns over its life, so each captured handle is
+    // cloned fresh per call rather than consumed. Reuses the EXISTING continuity engine's `observe`
+    // (wedge-sacred: `watchdog.rs`/`continuity.rs`/`ObservingStream` are never touched) — this one
+    // call writes BOTH the session owner and the `response_id -> owner` anchor (it delegates to
+    // `record_completion` internally). A failed write must not tear the relay down, hence `let _ =`.
+    let continuity = state.continuity.clone();
+    let account_id = AccountId::from(account.id.as_str());
+    let on_completed_id = move |response_id: String| {
+        let continuity = continuity.clone();
+        let session_key = session_key.clone();
+        let account_id = account_id.clone();
+        async move {
+            let _ = continuity
+                .observe(
+                    TurnOutcome::Completed {
+                        session_key: Some(session_key),
+                        account: account_id,
+                        response_id: Some(response_id),
+                        // The relay is content-free by construction — it never parses input bodies,
+                        // so these stay empty/zero (see the task's decision log: the WS relay's
+                        // wedge-avoidance is account-pinning, not fingerprint comparison).
+                        input_fingerprint: String::new(),
+                        input_count: 0,
+                        reasoning: None,
+                    },
+                    &RequestCtx::default(),
+                )
+                .await;
+        }
+    };
+
+    pump::run_pump(socket, upstream, on_completed_id).await;
 }
