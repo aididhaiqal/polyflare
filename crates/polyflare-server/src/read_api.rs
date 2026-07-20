@@ -86,11 +86,13 @@ struct TokenHealthView {
 struct AccountView {
     id: String,
     email: String,
+    alias: Option<String>,
     pool: Option<String>,
     provider: String,
     status: String,
     plan_type: String,
     routing_policy: String,
+    security_work_authorized: bool,
     reset_at: Option<i64>,
     /// 5h window (may be null).
     five_hour: Option<WindowView>,
@@ -180,11 +182,13 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         views.push(AccountView {
             id: account.id,
             email: account.email,
+            alias: account.alias,
             pool: account.pool,
             provider: account.provider,
             status: account.status,
             plan_type: account.plan_type,
             routing_policy: account.routing_policy,
+            security_work_authorized: account.security_work_authorized,
             reset_at: account.reset_at,
             five_hour: resolved.five_hour.map(Into::into),
             weekly: resolved.weekly.map(Into::into),
