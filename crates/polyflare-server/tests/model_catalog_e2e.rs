@@ -60,6 +60,7 @@ async fn spawn_with_catalog(model_catalog: Arc<ModelCatalogCache>) -> String {
         runtime: Default::default(),
         admin_token: None,
         live_logs: false,
+        ws_downstream: false,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         max_account_attempts: 3,
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
