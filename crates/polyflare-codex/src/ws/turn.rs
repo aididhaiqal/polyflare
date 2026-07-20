@@ -79,8 +79,8 @@ use super::delta::{item_hashes, non_input_fingerprint};
 /// `classify_recovery`) so the two can never drift out of sync — a deliberate, documented choice
 /// over adding a `code` field to `ExecError`/`FailureSignal` (which would ripple into every other
 /// `Executor` impl and caller in the workspace for a need that is WS-only).
-pub(crate) const ANCHOR_MISS_MARKER: &str = "previous_response_not_found";
-pub(crate) const CONNECTION_LIMIT_MARKER: &str = "websocket_connection_limit_reached";
+pub const ANCHOR_MISS_MARKER: &str = "previous_response_not_found";
+pub const CONNECTION_LIMIT_MARKER: &str = "websocket_connection_limit_reached";
 pub(crate) const SOCKET_CLOSED_MARKER: &str = "closed by server before response.completed";
 
 /// A [`WsConn`] shared across turns: `Arc` so a caller (eventually Task 7's connection cache) can

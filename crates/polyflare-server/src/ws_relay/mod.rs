@@ -32,6 +32,7 @@ use crate::app::AppState;
 mod owner;
 mod pump;
 mod session;
+mod signal;
 mod sniff;
 
 pub(crate) use owner::{dial_owner_upstream, resolve_owner};
