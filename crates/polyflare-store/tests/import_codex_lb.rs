@@ -615,7 +615,13 @@ async fn refresh_existing_upserts_stale_token_and_revives_status() {
         .await
         .unwrap();
     assert_eq!(
-        store.accounts().get("acct-1").await.unwrap().unwrap().status,
+        store
+            .accounts()
+            .get("acct-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         "reauth_required",
         "default import must NOT touch an existing account"
     );
@@ -624,9 +630,18 @@ async fn refresh_existing_upserts_stale_token_and_revives_status() {
     let summary = import_from_codex_lb(&store, &src_db, &fernet_key_path, &cipher, false, true)
         .await
         .unwrap();
-    assert_eq!(summary.accounts_imported, 1, "the refreshed account is counted");
     assert_eq!(
-        store.accounts().get("acct-1").await.unwrap().unwrap().status,
+        summary.accounts_imported, 1,
+        "the refreshed account is counted"
+    );
+    assert_eq!(
+        store
+            .accounts()
+            .get("acct-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         "active",
         "reauth_required must be revived to active"
     );
