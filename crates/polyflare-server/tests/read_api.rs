@@ -244,8 +244,16 @@ async fn accounts_endpoint_carries_provider_pool_usage_token_health_and_request_
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
     let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
     let repo = store.accounts();
+    // Task 4b: /api/accounts (list) must ALSO carry `alias` + `security_work_authorized` — the
+    // per-account detail view already carries both, the list didn't. codex-c gets a non-null alias
+    // + security_work_authorized=true; codex-alias-null (below) keeps the account()-builder default
+    // (alias: None, security_work_authorized: false) to prove the null/false case round-trips too.
+    let mut acct_c = account("codex-c", "c@example.test", Some("team-c"));
+    acct_c.alias = Some("Casey".to_string());
+    acct_c.security_work_authorized = true;
+    repo.insert(&acct_c, &tokens(), &cipher).await.unwrap();
     repo.insert(
-        &account("codex-c", "c@example.test", Some("team-c")),
+        &account("codex-alias-null", "null@example.test", None),
         &tokens(),
         &cipher,
     )
@@ -328,6 +336,20 @@ async fn accounts_endpoint_carries_provider_pool_usage_token_health_and_request_
     assert!(token_health["access_expires_at"].is_null());
 
     assert_eq!(a["request_count_24h"], 1);
+
+    // Task 4b: alias + security_work_authorized on the LIST row.
+    assert_eq!(a["alias"], "Casey");
+    assert_eq!(a["security_work_authorized"], true);
+
+    let null_alias = arr
+        .iter()
+        .find(|a| a["id"] == "codex-alias-null")
+        .expect("codex-alias-null present");
+    assert!(
+        null_alias["alias"].is_null(),
+        "no alias seeded -> null, not omitted: {null_alias:?}"
+    );
+    assert_eq!(null_alias["security_work_authorized"], false);
 }
 
 #[tokio::test]
