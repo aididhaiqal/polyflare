@@ -15,13 +15,13 @@
 //! **Phase 2: transparent same-account reconnect.** The upstream is now `Option<WsConn>` rather
 //! than a bare `WsConn` — it goes `None` on ANY upstream drop (a network blip, an idle server-side
 //! close, or the 60-minute `websocket_connection_limit_reached` cap) and is re-dialed against the
-//! SAME pinned `account` on the next client `Text` frame (or eagerly, for the cap signal — see
-//! below). The client's downstream socket is NEVER closed by an upstream drop; only the client
-//! itself closing (`Close`/`None`/`Err` on `downstream.recv()`) is real teardown. When the upstream
-//! is `None`, the `select!` arm polling it is disabled via the `if upstream.is_some()` guard, so the
-//! loop parks purely on the client — the next client `Text` frame is what re-dials and repopulates
-//! `Some(upstream)`. This is the buffer-free flush point: nothing is queued while the upstream is
-//! down, the client simply doesn't hear back until it sends again.
+//! SAME pinned `account` on the next client `Text` frame (or eagerly, for the cap signal and for a
+//! mid-turn drop — see below). The client's downstream socket is NEVER closed by an upstream drop;
+//! only the client itself closing (`Close`/`None`/`Err` on `downstream.recv()`) is real teardown.
+//! When the upstream is `None`, the `select!` arm polling it is disabled via the `if upstream.
+//! is_some()` guard, so the loop parks purely on the client — the next client `Text` frame is what
+//! re-dials and repopulates `Some(upstream)`, UNLESS this task's eager mid-turn re-dial (below) has
+//! already done so first.
 //!
 //! - `UpstreamSignal::ConnectionLimit` (the 60-min cap) is INTERCEPTED — never forwarded to the
 //!   client — and triggers an EAGER re-dial of the same account (rather than waiting for the next
@@ -29,6 +29,18 @@
 //!   never even see.
 //! - `UpstreamSignal::Normal` / `AnchorMissing` are forward-only: the client resolves an anchor-miss
 //!   itself (a stripped-anchor resend), exactly as it does over HTTP-SSE.
+//!
+//! **Task 4 (mid-turn replay): buffered in-flight replay on a mid-turn cap/drop.** `in_flight: Option<String>` holds
+//! the raw client `response.create` frame of the CURRENT turn — set the moment it's forwarded
+//! upstream, cleared the moment `sniff_completed_id` sees that turn's `response.completed`. If the
+//! cap or a network drop fires WHILE a turn is in flight, the client's own socket stays open and its
+//! resend logic never fires (it's waiting on a reply, not re-sending) — so BOTH the `ConnectionLimit`
+//! arm and the upstream-drop arm (`Ok(None) | Err(_)`) now, after a successful same-account re-dial,
+//! replay the buffered frame verbatim on the fresh socket via `WsConn::send_text` (no reparse) so the
+//! interrupted turn resumes invisibly instead of stalling on the client's ~290s read-idle. Between
+//! turns `in_flight` is `None`, so both arms are a no-op beyond the existing reconnect behavior. This
+//! is same-account only: a cross-account move (`UpstreamSignal::Error`) never replays — the client
+//! full-resends there by design (unchanged). Held IN MEMORY ONLY, never logged.
 //!
 //! **Phase 3 Task 4 (this revision): exhaustion-move on `UpstreamSignal::Error`.** A durable upstream
 //! error (anything the classifier didn't recognize as the cap or an anchor-miss) is forwarded to the
@@ -45,10 +57,11 @@
 //! this to the stale, original account would silently re-home ownership onto a benched/wrong account.
 //!
 //! **Consecutive-reconnect bound (Task-3 review follow-up).** `reconnects_since_progress` is bumped
-//! on every re-dial (the eager cap re-dial, `send_client_text`'s internal re-dial, and the Task-4
-//! move) and reset to 0 whenever a `response.completed` is forwarded (real progress). Crossing
-//! [`MAX_RECONNECTS_WITHOUT_PROGRESS`] tears the connection down — bounding a pathological upstream
-//! that re-caps/re-errors on every fresh dial without ever completing a turn.
+//! on every re-dial (the eager cap re-dial, `send_client_text`'s internal re-dial, the exhaustion-move,
+//! and each of this task's in-flight replays) and reset to 0 whenever a `response.
+//! completed` is forwarded (real progress). Crossing [`MAX_RECONNECTS_WITHOUT_PROGRESS`] tears the
+//! connection down — bounding a pathological upstream that re-caps/re-errors/re-drops on every fresh
+//! dial without ever completing a turn, so a replay can never spin unboundedly.
 //!
 //! **Content-free:** no frame body is ever logged here. The ONLY body inspection is
 //! [`super::sniff::sniff_completed_id`] (reads `type` + `response.id`) and
@@ -71,10 +84,10 @@ use super::redial::redial_upstream;
 use super::signal::{classify_upstream_signal, UpstreamSignal};
 use super::sniff::sniff_completed_id;
 
-/// How many CONSECUTIVE re-dials (eager cap re-dial, client-send re-dial, or a Task-4 move) are
-/// tolerated without a single forwarded `response.completed` in between. Crossing this tears the
-/// connection down rather than spinning forever against a pathological upstream that re-caps or
-/// re-errors on every fresh dial.
+/// How many CONSECUTIVE re-dials (eager cap re-dial, client-send re-dial, an exhaustion-move, or
+/// this task's mid-turn in-flight replay) are tolerated without a single forwarded `response.completed` in
+/// between. Crossing this tears the connection down rather than spinning forever against a
+/// pathological upstream that re-caps, re-errors, or re-drops on every fresh dial.
 const MAX_RECONNECTS_WITHOUT_PROGRESS: u32 = 5;
 
 /// Drive the relay for one WS-downstream conversation until the CLIENT goes away (a `Close`, a
@@ -82,21 +95,28 @@ const MAX_RECONNECTS_WITHOUT_PROGRESS: u32 = 5;
 ///
 /// - **client → backend:** a `Text` frame is sent to the upstream VERBATIM via
 ///   [`send_client_text`], which re-dials the SAME `account` first if the upstream is currently
-///   dead (or after a send failure, once); an inbound `Ping` is auto-ponged back to the CLIENT
-///   inline (codex-rs fidelity: the relay never *initiates* a ping itself); `Pong`/`Binary` are
-///   ignored (codex WS is text-only, content-free — never logged); a `Close`, a closed socket
-///   (`None`), or a read error tears down both legs — this is the ONLY real teardown path.
+///   dead (or after a send failure, once); on success the frame is also stashed into `in_flight`
+///   (this task — this turn is now replayable until it completes); an inbound `Ping` is auto-ponged
+///   back to the CLIENT inline (codex-rs fidelity: the relay never *initiates* a ping itself);
+///   `Pong`/`Binary` are ignored (codex WS is text-only, content-free — never logged); a `Close`, a
+///   closed socket (`None`), or a read error tears down both legs — this is the ONLY real teardown
+///   path.
 /// - **backend → client:** a `Text` frame is classified via [`classify_upstream_signal`] first.
-///   `ConnectionLimit` is intercepted (never forwarded) and triggers an eager same-account re-dial;
+///   `ConnectionLimit` is intercepted (never forwarded) and triggers an eager same-account re-dial,
+///   THEN (this task) replays `in_flight` on the fresh socket if a turn was in flight;
 ///   `Normal`/`AnchorMissing` are forwarded VERBATIM then sniffed for a `response.completed` id — if
 ///   present, `on_completed_id` is awaited with the CURRENT account + the id (the caller records
-///   ownership via `Continuity::observe`), and the reconnect-without-progress bound resets to 0.
+///   ownership via `Continuity::observe`), the reconnect-without-progress bound resets to 0, and
+///   `in_flight` is cleared (this task — the turn finished, nothing left to replay).
 ///   `Error(sig)` is also forwarded VERBATIM FIRST, then `on_upstream_error` is awaited with the
 ///   CURRENT account and the signal — on `Some((new_account, new_upstream))` the pump's account/
 ///   upstream become whatever it returns (same account = retry, different = a genuine move); `None`
-///   tears the connection down. A closed upstream (`Ok(None)`) or a read error (`Err(_)`) marks the
-///   upstream dead WITHOUT tearing down the client — the loop simply stops polling it until the
-///   client's next frame re-dials.
+///   tears the connection down. A cross-account move never replays `in_flight` — the client full-
+///   resends there by design. A closed upstream (`Ok(None)`) or a read error (`Err(_)`) marks the
+///   upstream dead; if a turn was in flight (this task) the pump EAGERLY re-dials the same account and
+///   replays `in_flight` right here (the client is waiting, not going to resend on its own) —
+///   otherwise (between turns) it simply stops polling the upstream until the client's next frame
+///   re-dials via `send_client_text`.
 ///
 /// `on_completed_id` and `on_upstream_error` are both `Fn`, not `FnOnce`, because a single socket can
 /// carry many turns (and possibly many moves) over its life — each call is fresh and independent.
@@ -127,6 +147,11 @@ pub(crate) async fn run_pump<F, Fut, G, GFut>(
     let mut account = account;
     let mut upstream: Option<WsConn> = Some(upstream_conn);
     let mut reconnects_since_progress: u32 = 0;
+    // Task 4 (mid-turn replay): the raw client `response.create` frame of the CURRENT in-flight turn, held in memory
+    // ONLY (never logged/persisted) so it can be REPLAYED on a same-account re-dial after a mid-turn
+    // cap/drop — so the interrupted turn resumes without the client having to resend. Cleared on the
+    // turn's `response.completed`. One in-flight turn per socket (codex's model).
+    let mut in_flight: Option<String> = None;
     // Task 5: has the pinned account changed (a move) since the last forwarded
     // `response.completed`? Starts `false` — a fresh connection hasn't moved yet.
     let mut account_changed_since_completed = false;
@@ -135,17 +160,23 @@ pub(crate) async fn run_pump<F, Fut, G, GFut>(
             down = downstream.recv() => {
                 match down {
                     Some(Ok(Message::Text(t))) => {
-                        let redialed = send_client_text(&mut upstream, &headers, &account, t.to_string()).await;
+                        let frame = t.to_string();
+                        let redialed = send_client_text(&mut upstream, &headers, &account, frame.clone()).await;
                         match redialed {
                             None => break, // upstream could not be (re-)established at all.
-                            Some(true) => {
-                                relay_metrics.record("reconnect_same_account");
-                                reconnects_since_progress += 1;
-                                if reconnects_since_progress > MAX_RECONNECTS_WITHOUT_PROGRESS {
-                                    break;
+                            Some(redial) => {
+                                // This task: this turn is now in flight — replayable until it completes
+                                // (a same-account cap/drop mid-turn replays THIS frame, not a client
+                                // resend).
+                                in_flight = Some(frame);
+                                if redial {
+                                    relay_metrics.record("reconnect_same_account");
+                                    reconnects_since_progress += 1;
+                                    if reconnects_since_progress > MAX_RECONNECTS_WITHOUT_PROGRESS {
+                                        break;
+                                    }
                                 }
                             }
-                            Some(false) => {}
                         }
                     }
                     Some(Ok(Message::Ping(payload))) => {
@@ -176,6 +207,14 @@ pub(crate) async fn run_pump<F, Fut, G, GFut>(
                                 // over-count teardowns.
                                 if upstream.is_none() {
                                     break;
+                                }
+                                // This task: if a turn was in flight when the cap hit, replay it on the
+                                // fresh socket so the interrupted turn resumes (same account -> the
+                                // anchor resumes). No-op between turns.
+                                if let Some(frame) = in_flight.clone() {
+                                    if upstream.as_mut().unwrap().send_text(frame).await.is_err() {
+                                        break;
+                                    }
                                 }
                                 relay_metrics.record("reconnect_same_account");
                                 reconnects_since_progress += 1;
@@ -241,6 +280,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut>(
                                     // means any LATER anchor-miss is once again same-account.
                                     reconnects_since_progress = 0;
                                     account_changed_since_completed = false;
+                                    in_flight = None; // This task: the turn finished — nothing to replay.
                                 }
                             }
                         }
@@ -250,6 +290,26 @@ pub(crate) async fn run_pump<F, Fut, G, GFut>(
                     // the same account via `send_client_text`.
                     Ok(None) | Err(_) => {
                         upstream = None;
+                        // This task: a mid-turn drop (a turn is in flight) — the client is waiting and
+                        // won't resend on its own. Eagerly re-dial the SAME account and replay the
+                        // buffered frame so the turn resumes. Between turns (in_flight None) keep the
+                        // lazy behavior: the next client frame re-dials via `send_client_text`.
+                        if in_flight.is_some() {
+                            upstream = redial_upstream(&headers, &account).await;
+                            if upstream.is_none() {
+                                break;
+                            }
+                            if let Some(frame) = in_flight.clone() {
+                                if upstream.as_mut().unwrap().send_text(frame).await.is_err() {
+                                    break;
+                                }
+                            }
+                            relay_metrics.record("reconnect_same_account");
+                            reconnects_since_progress += 1;
+                            if reconnects_since_progress > MAX_RECONNECTS_WITHOUT_PROGRESS {
+                                break;
+                            }
+                        }
                     }
                 }
             }
