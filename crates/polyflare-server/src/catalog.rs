@@ -79,6 +79,7 @@ pub fn codex_bootstrap_floor() -> Vec<UpstreamModel> {
     codex_bootstrap()
         .into_iter()
         .map(|m| UpstreamModel {
+            raw: serde_json::json!({"slug": m.id.clone(), "display_name": m.display_name.clone()}),
             slug: m.id,
             display_name: m.display_name,
             context_window: m.context_window,
@@ -357,6 +358,7 @@ mod tests {
                 display_name: "GPT-5.5".to_string(),
                 context_window: None,
                 prefer_websockets: None,
+                raw: serde_json::json!({"slug": "gpt-5.5", "display_name": "GPT-5.5"}),
             },
             // Upstream-only slug the floor doesn't have.
             UpstreamModel {
@@ -364,6 +366,7 @@ mod tests {
                 display_name: "GPT-5.7 Nova".to_string(),
                 context_window: Some(300_000),
                 prefer_websockets: Some(true),
+                raw: serde_json::json!({"slug": "gpt-5.7-nova", "display_name": "GPT-5.7 Nova"}),
             },
             // Collides with a synthetic alias id — live/real wins, matching the pre-existing
             // real-wins-over-synthetic-alias contract.
@@ -372,6 +375,7 @@ mod tests {
                 display_name: "Real Upstream Wins".to_string(),
                 context_window: None,
                 prefer_websockets: None,
+                raw: serde_json::json!({"slug": "claude-opus-4-1", "display_name": "Real Upstream Wins"}),
             },
         ];
         let cat = build_catalog(&live);
@@ -402,6 +406,7 @@ mod tests {
             display_name: "GPT-5.7 Nova".to_string(),
             context_window: Some(400_000),
             prefer_websockets: Some(true),
+            raw: serde_json::json!({"slug": "gpt-5.7-nova", "display_name": "GPT-5.7 Nova"}),
         }];
         let cat = build_catalog(&live);
 

@@ -99,6 +99,7 @@ async fn models_endpoint_serves_merged_catalog_with_stub_upstream_slug() {
         display_name: "GPT-5.7 Nova".to_string(),
         context_window: Some(500_000),
         prefer_websockets: Some(true),
+        raw: serde_json::json!({"slug": "gpt-5.7-nova", "display_name": "GPT-5.7 Nova"}),
     }]);
     let cache = ModelCatalogCache::new(Box::new(stub), Duration::from_secs(3600), floor);
     // Warm it BEFORE serving — a fresh cache's sync `cached_or_fallback()` would still be the
@@ -198,6 +199,7 @@ async fn v1_models_with_client_version_also_serves_merged_catalog() {
         display_name: "GPT-5.7 Nova".to_string(),
         context_window: None,
         prefer_websockets: None,
+        raw: serde_json::json!({"slug": "gpt-5.7-nova", "display_name": "GPT-5.7 Nova"}),
     }]);
     let cache = ModelCatalogCache::new(Box::new(stub), Duration::from_secs(3600), floor);
     cache.get_or_refresh().await;

@@ -43,6 +43,9 @@ pub struct UpstreamModel {
     /// renders this the same way as `context_window` above (`CodexModelEntry.prefer_websockets` /
     /// `metadata.prefer_websockets`).
     pub prefer_websockets: Option<bool>,
+    /// The full upstream `/models` entry as received, preserved verbatim for the `/models`
+    /// renderer.
+    pub raw: serde_json::Value,
 }
 
 /// An async source of the upstream model catalog. Abstracted so the cache's TTL / single-flight /
@@ -256,6 +259,7 @@ fn parse_one_model(entry: &serde_json::Value) -> Option<UpstreamModel> {
         prefer_websockets: obj
             .get("prefer_websockets")
             .and_then(serde_json::Value::as_bool),
+        raw: entry.clone(),
     })
 }
 
@@ -421,6 +425,7 @@ mod tests {
             display_name: name.to_string(),
             context_window: None,
             prefer_websockets: None,
+            raw: serde_json::json!({"slug": slug, "display_name": name}),
         }
     }
 
@@ -456,12 +461,14 @@ mod tests {
             display_name: "GPT-5.5".to_string(),
             context_window: None,
             prefer_websockets: None,
+            raw: serde_json::json!({"slug": "gpt-5.5", "display_name": "GPT-5.5"}),
         }];
         let upstream = vec![UpstreamModel {
             slug: "gpt-5.5".to_string(),
             display_name: "GPT-5.5 (enriched)".to_string(),
             context_window: Some(128_000),
             prefer_websockets: Some(true),
+            raw: serde_json::json!({"slug": "gpt-5.5", "display_name": "GPT-5.5 (enriched)"}),
         }];
         let merged = merge_onto_floor(&upstream, &floor);
         assert_eq!(merged.len(), 1);
@@ -755,6 +762,23 @@ mod tests {
         );
         assert_eq!(nova.context_window, None);
         assert_eq!(nova.prefer_websockets, None);
+    }
+
+    #[test]
+    fn parse_models_preserves_raw_entry() {
+        let j = serde_json::json!({"models":[{
+            "slug":"gpt-5.6-sol","display_name":"Sol",
+            "supported_reasoning_levels":[],"visibility":"list","supported_in_api":true,"priority":1
+        }]});
+        let parsed = parse_models(&j);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].slug, "gpt-5.6-sol");
+        // the FULL entry is preserved, not just the 4 convenience fields:
+        assert_eq!(parsed[0].raw, j["models"][0]);
+        assert_eq!(
+            parsed[0].raw["supported_reasoning_levels"],
+            serde_json::json!([])
+        );
     }
 
     #[test]
