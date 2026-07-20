@@ -30,6 +30,7 @@ use crate::session_key::parse_inbound;
 use crate::snapshot::filter_by_provider_and_pool;
 use crate::starvation;
 use crate::translate_stream::wrap_translating_stream;
+use crate::usage_capture;
 use crate::watchdog::{
     apply_ownership, execute_recovery_tracked, execute_with_watchdog_tracked, signal_client_stream,
     CommitWitness, RouteDecision, WatchdogError,
@@ -1508,6 +1509,42 @@ pub async fn websocket_fallback_handler() -> Response {
         .into_response()
 }
 
+/// Compute cost from captured usage (via the pricing table) and fire the row's usage UPDATE.
+/// Content-free (numbers + model slug only). No-op if no usage was captured (e.g. the client
+/// disconnected before a `response.completed` frame arrived, or the upstream never sent one).
+///
+/// Fire-and-forget by construction: callers run this inside a detached `tokio::spawn` (see
+/// `responses_route`'s stream-wrapper `on_done`), and its own `update_usage` error is dropped
+/// (`let _ =`) — a slow or failing DB write must never delay or fail the client's request, and by
+/// the time this runs the client response has already been fully streamed.
+async fn apply_captured_usage(
+    repo: &RequestLogRepo,
+    request_id: &str,
+    model: Option<&str>,
+    captured: usage_capture::CapturedUsage,
+) {
+    let Some(u) = captured.usage else {
+        return;
+    };
+    let input = u.input_tokens.unwrap_or(0);
+    let output = u.output_tokens.unwrap_or(0);
+    let cached = u.cached_input_tokens.unwrap_or(0);
+    let cost = model
+        .and_then(polyflare_core::pricing::pricing_for_model)
+        .map(|p| polyflare_core::pricing::cost_usd(p, input, output, cached, None));
+    let _ = repo
+        .update_usage(
+            request_id,
+            Some(input),
+            Some(output),
+            Some(cached),
+            u.reasoning_tokens,
+            cost,
+            captured.ttft_ms,
+        )
+        .await;
+}
+
 /// Shared `/responses` route: thin timing + content-safe logging wrapper around
 /// [`responses_handler_impl`], parameterized by the optional account-pool slug. See
 /// `crate::observability` for the content-safety constraint on what may be logged.
@@ -1521,12 +1558,20 @@ async fn responses_route(
     maybe_capture_fingerprint(&state, "POST", "/responses", &headers);
     // Build the log repo BEFORE `state` moves into the impl (it owns a cheap pool clone).
     let log_repo = state.store.request_log();
+    // Live-usage-cost-capture Task 6: a SECOND repo handle, same reason (cheap pool clone) — this
+    // one is moved into the stream wrapper's `on_done` closure below to backfill usage/cost on
+    // this SAME row once the stream completes, well after `log_repo` above is already consumed by
+    // `spawn_persist_request_log`'s insert.
+    let usage_repo = state.store.request_log();
     // Same reason: `state` moves into the impl below, so grab the log-bus handle first.
     let log_bus = state.log_bus.clone();
     // C11b Task 2: same reason — grab the content-free `upstream_requests` counter handle before
     // `state` moves into the impl below.
     let upstream_request_metrics = state.upstream_request_metrics.clone();
     let (response, outcome) = responses_handler_impl(state, pool.as_deref(), headers, body).await;
+    // Live-usage-cost-capture Task 6: clone the model slug for pricing BEFORE it's moved into
+    // `RequestLog` below (`model: outcome.model` takes ownership of the original).
+    let model_for_cost = outcome.model.clone();
     // Live-usage-cost-capture Task 4: a fresh per-request correlation id — content-free (128
     // random bits, never derived from request/response data) — so the (later) stream-wrapper task
     // can call `RequestLogRepo::update_usage` against the SAME row this request inserts.
@@ -1564,7 +1609,25 @@ async fn responses_route(
     // here).
     upstream_request_metrics.record(log.account_id.as_deref(), log.status.as_u16());
     spawn_persist_request_log(log_repo, log.record(unix_now()));
-    response
+    // Live-usage-cost-capture Task 6 (THE CRUX): wrap the final Response body in a
+    // `UsageCapturingStream` — byte-for-byte passthrough (see that type's docs) that observes the
+    // Codex SSE stream for a trailing `response.completed` frame's `usage` object + TTFT. This is
+    // the SAME body `stream_response` built from `Body::from_stream(stream)` (or an error path's
+    // non-streaming body — `into_data_stream` handles either uniformly), so re-wrapping it here
+    // observes the identical bytes the client receives; nothing is altered, buffered, or delayed.
+    // `on_done` only `tokio::spawn`s the persist — it never blocks the stream, and its own error
+    // is dropped inside `apply_captured_usage` (fire-and-forget, same as `spawn_persist_request_log`).
+    let (parts, body) = response.into_parts();
+    let stream = body.into_data_stream(); // Stream<Item = Result<Bytes, axum::Error>>
+    let wrapped = usage_capture::UsageCapturingStream::new(Box::pin(stream), move |captured| {
+        let repo = usage_repo;
+        let request_id = request_id;
+        let model = model_for_cost;
+        tokio::spawn(async move {
+            apply_captured_usage(&repo, &request_id, model.as_deref(), captured).await;
+        });
+    });
+    Response::from_parts(parts, Body::from_stream(wrapped))
 }
 
 /// B4/B5 Task 5: the production entrypoint reads the bounded failover loop's attempt cap from
@@ -2683,6 +2746,119 @@ mod tests {
                 jittered, 1_005_000,
                 "within budget room, the full jitter is applied"
             );
+        }
+    }
+
+    // Live-usage-cost-capture Task 6 (THE CRUX) — `apply_captured_usage`'s persistence logic,
+    // exercised at the helper level (an `insert` + a captured usage + a re-`list`), independent of
+    // the stream-wrapper plumbing in `responses_route` itself.
+    mod apply_captured_usage_tests {
+        use super::super::apply_captured_usage;
+        use crate::usage_capture::{CapturedUsage, ResponseUsage};
+        use polyflare_store::{RequestLogRecord, Store};
+
+        fn sample_record(request_id: &str) -> RequestLogRecord {
+            RequestLogRecord {
+                requested_at: 100,
+                provider: "codex".into(),
+                method: "POST".into(),
+                path: "/responses".into(),
+                aliased: false,
+                status: 200,
+                duration_ms: 1000,
+                account_id: Some("acct-1".into()),
+                model: Some("gpt-5.6-sol".into()),
+                reasoning_effort: None,
+                service_tier: None,
+                transport: Some("http".into()),
+                ttft_ms: None,
+                total_tokens: None,
+                cached_tokens: None,
+                subagent: None,
+                request_id: Some(request_id.into()),
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                reasoning_tokens: None,
+                cost_usd: None,
+                latency_first_token_ms: None,
+            }
+        }
+
+        /// The crux assertion: a known `CapturedUsage` (100k in / 10k out / 20k cached, gpt-5.6-sol
+        /// default tier) fires an `update_usage` that lands `input_tokens`, a cost of ~0.71 USD (the
+        /// SAME figure `polyflare_core::pricing`'s `cost_default_tier_gpt56_sol` test pins), and the
+        /// TTFT — on the SAME row `insert` created, correlated purely by `request_id`.
+        #[tokio::test]
+        async fn fills_usage_cost_and_ttft_on_the_matching_row() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("s.db")).await.unwrap();
+            let repo = store.request_log();
+            repo.insert(&sample_record("rq")).await.unwrap();
+
+            let captured = CapturedUsage {
+                usage: Some(ResponseUsage {
+                    input_tokens: Some(100_000),
+                    output_tokens: Some(10_000),
+                    cached_input_tokens: Some(20_000),
+                    reasoning_tokens: Some(500),
+                }),
+                ttft_ms: Some(1200),
+            };
+            apply_captured_usage(&repo, "rq", Some("gpt-5.6-sol"), captured).await;
+
+            let row = repo
+                .list(10, 0)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.request_id.as_deref() == Some("rq"))
+                .unwrap();
+            assert_eq!(row.input_tokens, Some(100_000));
+            assert_eq!(row.output_tokens, Some(10_000));
+            assert_eq!(row.cached_input_tokens, Some(20_000));
+            assert_eq!(row.reasoning_tokens, Some(500));
+            let cost = row
+                .cost_usd
+                .expect("cost must be computed for a known model");
+            assert!(
+                (cost - 0.71).abs() < 1e-9,
+                "expected ~0.71 (80_000/1e6*5.0 + 20_000/1e6*0.5 + 10_000/1e6*30.0), got {cost}"
+            );
+            assert_eq!(row.latency_first_token_ms, Some(1200));
+        }
+
+        /// `captured.usage = None` (e.g. the client disconnected before a `response.completed`
+        /// frame arrived) must be a no-op — the row's usage columns stay `None`, never zeroed out.
+        #[tokio::test]
+        async fn no_usage_captured_leaves_the_row_untouched() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("s.db")).await.unwrap();
+            let repo = store.request_log();
+            repo.insert(&sample_record("rq2")).await.unwrap();
+
+            apply_captured_usage(
+                &repo,
+                "rq2",
+                Some("gpt-5.6-sol"),
+                CapturedUsage {
+                    usage: None,
+                    ttft_ms: Some(500),
+                },
+            )
+            .await;
+
+            let row = repo
+                .list(10, 0)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.request_id.as_deref() == Some("rq2"))
+                .unwrap();
+            assert_eq!(row.input_tokens, None);
+            assert_eq!(row.output_tokens, None);
+            assert_eq!(row.cost_usd, None);
+            assert_eq!(row.latency_first_token_ms, None);
         }
     }
 }
