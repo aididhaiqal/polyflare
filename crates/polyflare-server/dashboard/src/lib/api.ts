@@ -327,6 +327,52 @@ export interface SessionsQueryParams {
   offset?: number;
 }
 
+/** `read_api.rs::ReportBucketView`/`ReportBreakdownView`/`ReportTotalsView` share this same flat
+ * set of `polyflare_store::ReportMetrics` fields — never nested under a `metrics` key, same
+ * flat-field convention as `SeriesBucketView`. Not itself a wire type (the backend doesn't emit a
+ * `ReportMetricsView` struct), just the shared TS shape the three view interfaces below extend. */
+export interface ReportMetricsView {
+  requests: number;
+  errors: number;
+  cost_usd: number;
+  tokens: number;
+  cached_tokens: number;
+  reasoning_tokens: number;
+  avg_duration_ms: number;
+  avg_ttft_ms: number;
+  ttft_sample_count: number;
+}
+
+/** `read_api.rs::ReportBucketView` — one entry of `ReportsView.time_series`. `ts` is the bucket
+ * start (unix-epoch seconds); zero-filled across the aligned `[since_ts, now]` grid, same
+ * zero-fill contract as `SeriesBucketView`. */
+export interface ReportBucketView extends ReportMetricsView {
+  ts: number;
+}
+
+/** `read_api.rs::ReportBreakdownView` — one row of `ReportsView.breakdown`: metrics scoped to one
+ * value of the requested `dimension` (`account`/`model`/`provider`). */
+export interface ReportBreakdownView extends ReportMetricsView {
+  key: string;
+}
+
+/** `read_api.rs::ReportTotalsView` — `ReportsView.totals`: the same flat metrics fields plus two
+ * derived ratios (`error_rate = errors/requests`, `cache_hit_rate = cached_tokens/tokens`, both
+ * `0.0` on a 0/0 divide — the same guard `KpisView.success_rate` uses). */
+export interface ReportTotalsView extends ReportMetricsView {
+  error_rate: number;
+  cache_hit_rate: number;
+}
+
+/** `read_api.rs::ReportsView` — `GET /api/reports` response: a zero-filled time series, a
+ * per-dimension breakdown, and top-line totals, all sourced from the same `(since_ts, provider)`
+ * window. */
+export interface ReportsView {
+  time_series: ReportBucketView[];
+  breakdown: ReportBreakdownView[];
+  totals: ReportTotalsView;
+}
+
 /** `read_api.rs::KpisView` — `OverviewView.kpis`. */
 export interface KpisView {
   requests: number;
@@ -470,6 +516,7 @@ export const api = {
   pace: () => fetchJson<PaceResponse>("/api/pace"),
   requests: (qs: string) => fetchJson<RequestsView>(`/api/requests${qs}`),
   sessions: (qs: string) => fetchJson<SessionsView>(`/api/sessions${qs}`),
+  reports: (qs: string) => fetchJson<ReportsView>(`/api/reports${qs}`),
   capabilities: () => fetchJson<CapabilitiesView>("/api/capabilities"),
   whoami: () => fetchJson<WhoamiView>("/api/whoami"),
 };
