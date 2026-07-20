@@ -229,6 +229,14 @@ impl RequestLogRepo {
     /// the account cache the server re-reads on generation bumps. A no-op (still `Ok`) if no row
     /// matches `request_id` — this is called fire-and-forget off the response path, same as
     /// `insert`, so a miss must never surface as an error.
+    ///
+    /// `duration_ms` (live-row-tps-basis fix): the stream wrapper's true end-to-end duration,
+    /// measured from the SAME clock origin as `latency_first_token_ms` (the route's own
+    /// `Instant`). This OVERWRITES the row's `duration_ms` (set at insert time to the much
+    /// smaller route+setup-only duration, measured before the body streamed) with the true
+    /// total — the two must share an origin for `derive_tps` in `read_api.rs` to be meaningful.
+    /// `COALESCE`'d against the existing value: `None` (e.g. no usage was ever captured) leaves
+    /// the insert's original `duration_ms` untouched rather than nulling it out.
     #[allow(clippy::too_many_arguments)]
     pub async fn update_usage(
         &self,
@@ -239,10 +247,12 @@ impl RequestLogRepo {
         reasoning_tokens: Option<i64>,
         cost_usd: Option<f64>,
         latency_first_token_ms: Option<i64>,
+        duration_ms: Option<i64>,
     ) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE request_log SET input_tokens=?, output_tokens=?, cached_input_tokens=?, \
-             reasoning_tokens=?, cost_usd=?, latency_first_token_ms=? WHERE request_id=?",
+             reasoning_tokens=?, cost_usd=?, latency_first_token_ms=?, \
+             duration_ms = COALESCE(?, duration_ms) WHERE request_id=?",
         )
         .bind(input_tokens)
         .bind(output_tokens)
@@ -250,6 +260,7 @@ impl RequestLogRepo {
         .bind(reasoning_tokens)
         .bind(cost_usd)
         .bind(latency_first_token_ms)
+        .bind(duration_ms)
         .bind(request_id)
         .execute(&self.pool)
         .await?;
@@ -1015,6 +1026,11 @@ mod tests {
     /// `update_usage` fills the six 0005 usage/cost columns on an already-inserted row, correlated
     /// by `request_id` — the stream wrapper's post-completion usage backfill. A no-op on an unknown
     /// `request_id` still returns `Ok` (fire-and-forget from the response path).
+    ///
+    /// Live-row-tps-basis fix: also asserts `duration_ms` is OVERWRITTEN by `update_usage`'s
+    /// trailing param — the insert's original `duration_ms` (1000, from `sample_record`) must be
+    /// replaced by the stream wrapper's true end-to-end value (9000), not left at the smaller
+    /// route+setup-only figure.
     #[tokio::test]
     async fn update_usage_fills_row_by_request_id() {
         let dir = tempfile::tempdir().unwrap();
@@ -1022,6 +1038,7 @@ mod tests {
         let repo = store.request_log();
         let mut rec = sample_record();
         rec.request_id = Some("req-xyz".into());
+        assert_eq!(rec.duration_ms, 1000, "insert-time baseline duration_ms");
         repo.insert(&rec).await.unwrap();
         repo.update_usage(
             "req-xyz",
@@ -1031,6 +1048,7 @@ mod tests {
             Some(40),
             Some(0.089),
             Some(3510),
+            Some(9000),
         )
         .await
         .unwrap();
@@ -1048,11 +1066,31 @@ mod tests {
         assert_eq!(row.cost_usd, Some(0.089));
         assert_eq!(row.latency_first_token_ms, Some(3510));
         assert_eq!(row.request_id.as_deref(), Some("req-xyz"));
+        assert_eq!(
+            row.duration_ms, 9000,
+            "duration_ms must be overwritten to the stream wrapper's true end-to-end value"
+        );
 
         // no-op on unknown id returns Ok
-        repo.update_usage("nope", Some(1), None, None, None, None, None)
+        repo.update_usage("nope", Some(1), None, None, None, None, None, None)
             .await
             .unwrap();
+
+        // duration_ms: None must leave the existing value untouched (COALESCE), not null it out.
+        repo.update_usage("req-xyz", None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let row = repo
+            .list(10, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.request_id.as_deref() == Some("req-xyz"))
+            .unwrap();
+        assert_eq!(
+            row.duration_ms, 9000,
+            "duration_ms: None must COALESCE to the existing value, not overwrite it"
+        );
     }
 
     /// A full `RequestLogRecord` with every existing field populated and every new (usage) field

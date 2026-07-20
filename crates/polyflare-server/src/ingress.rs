@@ -1541,6 +1541,7 @@ async fn apply_captured_usage(
             u.reasoning_tokens,
             cost,
             captured.ttft_ms,
+            captured.duration_ms,
         )
         .await;
 }
@@ -1619,14 +1620,22 @@ async fn responses_route(
     // is dropped inside `apply_captured_usage` (fire-and-forget, same as `spawn_persist_request_log`).
     let (parts, body) = response.into_parts();
     let stream = body.into_data_stream(); // Stream<Item = Result<Bytes, axum::Error>>
-    let wrapped = usage_capture::UsageCapturingStream::new(Box::pin(stream), move |captured| {
-        let repo = usage_repo;
-        let request_id = request_id;
-        let model = model_for_cost;
-        tokio::spawn(async move {
-            apply_captured_usage(&repo, &request_id, model.as_deref(), captured).await;
+
+    // live-row-tps-basis fix: pass the SAME route `start` captured above (it's `Instant`, hence
+    // `Copy` — already used at `start.elapsed()` in the `RequestLog` build above, and reused here
+    // by value) as the wrapper's clock origin, instead of letting the wrapper take its own
+    // `Instant::now()`. This makes `ttft_ms` and the wrapper's `duration_ms` share an origin with
+    // each other (and with the route's own timing), which is what `derive_tps` in `read_api.rs`
+    // requires to compute a sane tokens/sec for live rows.
+    let wrapped =
+        usage_capture::UsageCapturingStream::new(Box::pin(stream), start, move |captured| {
+            let repo = usage_repo;
+            let request_id = request_id;
+            let model = model_for_cost;
+            tokio::spawn(async move {
+                apply_captured_usage(&repo, &request_id, model.as_deref(), captured).await;
+            });
         });
-    });
     Response::from_parts(parts, Body::from_stream(wrapped))
 }
 
@@ -2789,6 +2798,15 @@ mod tests {
         /// default tier) fires an `update_usage` that lands `input_tokens`, a cost of ~0.71 USD (the
         /// SAME figure `polyflare_core::pricing`'s `cost_default_tier_gpt56_sol` test pins), and the
         /// TTFT — on the SAME row `insert` created, correlated purely by `request_id`.
+        ///
+        /// Live-row-tps-basis fix: ALSO asserts `duration_ms` is overwritten from the insert's
+        /// baseline (1000, `sample_record`'s route+setup-only figure) to the captured end-to-end
+        /// value (9000), and that the row's numbers now derive a SANE tokens/sec — mirroring
+        /// `read_api::derive_tps`'s `total_tokens / ((duration_ms - ttft_ms) / 1000.0)` formula
+        /// (that fn is private to `read_api.rs`, so this inlines the identical arithmetic) — rather
+        /// than the pre-fix bug where `duration_ms` (route+setup only, e.g. ~50ms) could be SMALLER
+        /// than a wrapper-origin `ttft_ms`, driving `derive_tps` to `None`/nonsense or an inflated
+        /// value depending on which side of zero the subtraction landed.
         #[tokio::test]
         async fn fills_usage_cost_and_ttft_on_the_matching_row() {
             let dir = tempfile::tempdir().unwrap();
@@ -2804,6 +2822,7 @@ mod tests {
                     reasoning_tokens: Some(500),
                 }),
                 ttft_ms: Some(1200),
+                duration_ms: Some(9000),
             };
             apply_captured_usage(&repo, "rq", Some("gpt-5.6-sol"), captured).await;
 
@@ -2826,10 +2845,36 @@ mod tests {
                 "expected ~0.71 (80_000/1e6*5.0 + 20_000/1e6*0.5 + 10_000/1e6*30.0), got {cost}"
             );
             assert_eq!(row.latency_first_token_ms, Some(1200));
+            assert_eq!(
+                row.duration_ms, 9000,
+                "duration_ms must be overwritten to the captured end-to-end value, not left at \
+                 the insert's route+setup-only baseline (1000)"
+            );
+
+            // Same-origin sanity: total_tokens falls back to input+output (110_000, matching
+            // `read_api::requests_handler`'s fallback since this row's `total_tokens` column is
+            // never set by `update_usage`), and `derive_tps`'s formula on the now-consistent
+            // duration_ms/ttft_ms pair must be a finite, positive number — not the inflated or
+            // nonsensical value the pre-fix two-clock-origins bug produced.
+            let total_tokens = 100_000_i64 + 10_000_i64;
+            let window_ms = row.duration_ms - row.latency_first_token_ms.unwrap();
+            assert!(
+                window_ms > 0,
+                "post-TTFT generation window must be positive"
+            );
+            let tps = total_tokens as f64 / (window_ms as f64 / 1000.0);
+            assert!(
+                tps.is_finite() && tps > 0.0,
+                "expected a sane finite tps, got {tps}"
+            );
         }
 
         /// `captured.usage = None` (e.g. the client disconnected before a `response.completed`
         /// frame arrived) must be a no-op — the row's usage columns stay `None`, never zeroed out.
+        /// `apply_captured_usage` returns early in this branch (never calls `update_usage` at
+        /// all), so `duration_ms` also stays at `sample_record`'s insert-time baseline (1000)
+        /// despite `captured.duration_ms` being `Some(4000)` — the same-origin `duration_ms` fix
+        /// only ever overwrites a row when usage was actually captured.
         #[tokio::test]
         async fn no_usage_captured_leaves_the_row_untouched() {
             let dir = tempfile::tempdir().unwrap();
@@ -2844,6 +2889,7 @@ mod tests {
                 CapturedUsage {
                     usage: None,
                     ttft_ms: Some(500),
+                    duration_ms: Some(4000),
                 },
             )
             .await;
@@ -2859,6 +2905,10 @@ mod tests {
             assert_eq!(row.output_tokens, None);
             assert_eq!(row.cost_usd, None);
             assert_eq!(row.latency_first_token_ms, None);
+            assert_eq!(
+                row.duration_ms, 1000,
+                "no update_usage call at all in this branch — duration_ms stays at insert baseline"
+            );
         }
     }
 }
