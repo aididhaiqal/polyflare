@@ -1038,6 +1038,167 @@ async fn account_detail_returns_identity_status_quota_and_token_status_and_404s_
     assert_eq!(missing.status(), 404);
 }
 
+/// Task 7: `total_tokens` is NULL on every imported/backfilled row (only the 0005
+/// `input_tokens`/`output_tokens` columns are populated) — `request_totals.total_tokens` must fall
+/// back to `input_tokens + output_tokens` per row so the lifetime total isn't just 0.
+/// `reasoning_tokens` is set on the imported-shaped row (to a value that would double-count the
+/// total if wrongly added) so a wrong implementation shows up as a wrong sum, not a
+/// coincidentally-passing test.
+#[tokio::test]
+async fn account_detail_request_totals_fall_back_to_input_plus_output_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
+    store
+        .accounts()
+        .insert(
+            &account("acct-1", "acct1@example.test", None),
+            &tokens(),
+            &cipher,
+        )
+        .await
+        .unwrap();
+
+    let log = store.request_log();
+    // A native row: total_tokens already populated — must not be disturbed by the fallback.
+    log.insert(&RequestLogRecord {
+        requested_at: now(),
+        provider: "codex".to_string(),
+        method: "POST".to_string(),
+        path: "/responses".to_string(),
+        aliased: false,
+        status: 200,
+        duration_ms: 100,
+        account_id: Some("acct-1".to_string()),
+        model: None,
+        reasoning_effort: None,
+        service_tier: None,
+        transport: None,
+        ttft_ms: None,
+        total_tokens: Some(1000),
+        cached_tokens: None,
+        subagent: None,
+        request_id: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        reasoning_tokens: None,
+        cost_usd: None,
+        latency_first_token_ms: None,
+    })
+    .await
+    .unwrap();
+    // An imported-shaped row: total_tokens is NULL, only the 0005 input/output columns are set.
+    log.insert(&RequestLogRecord {
+        requested_at: now(),
+        provider: "codex".to_string(),
+        method: "POST".to_string(),
+        path: "/responses".to_string(),
+        aliased: false,
+        status: 200,
+        duration_ms: 100,
+        account_id: Some("acct-1".to_string()),
+        model: None,
+        reasoning_effort: None,
+        service_tier: None,
+        transport: None,
+        ttft_ms: None,
+        total_tokens: None,
+        cached_tokens: None,
+        subagent: None,
+        request_id: None,
+        input_tokens: Some(1200),
+        output_tokens: Some(300),
+        cached_input_tokens: None,
+        reasoning_tokens: Some(150),
+        cost_usd: None,
+        latency_first_token_ms: None,
+    })
+    .await
+    .unwrap();
+    std::mem::forget(dir);
+
+    let pf = spawn(store).await;
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["request_totals"]["request_count"], 2);
+    assert_eq!(
+        body["request_totals"]["total_tokens"], 2500,
+        "1000 (native) + (1200 input + 300 output), NOT + the imported row's reasoning_tokens"
+    );
+}
+
+/// Task 7: same fallback, but for `/api/requests`' per-row `total_tokens`/`tps` — an
+/// imported-shaped row (native `total_tokens`/`ttft_ms` absent, 0005 columns present) must still
+/// surface a real `total_tokens` and a derived `tps`, via `input_tokens + output_tokens` and
+/// `ttft_ms.or(latency_first_token_ms)` respectively. The row's raw `ttft_ms` column itself stays
+/// `None` in the response — only used internally to derive `tps`.
+#[tokio::test]
+async fn requests_endpoint_falls_back_to_input_output_tokens_and_latency_first_token_ms() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let repo = store.request_log();
+    repo.insert(&RequestLogRecord {
+        requested_at: now(),
+        provider: "codex".to_string(),
+        method: "POST".to_string(),
+        path: "/responses".to_string(),
+        aliased: false,
+        status: 200,
+        duration_ms: 1300,
+        account_id: Some("acct-1".to_string()),
+        model: None,
+        reasoning_effort: None,
+        service_tier: None,
+        transport: None,
+        ttft_ms: None,
+        total_tokens: None,
+        cached_tokens: None,
+        subagent: None,
+        request_id: None,
+        input_tokens: Some(1500),
+        output_tokens: Some(500),
+        cached_input_tokens: None,
+        reasoning_tokens: Some(200), // subset of output_tokens — must NOT be added to the total
+        cost_usd: None,
+        latency_first_token_ms: Some(300),
+    })
+    .await
+    .unwrap();
+    std::mem::forget(dir);
+
+    let pf = spawn(store).await;
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/requests?limit=10"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["total_tokens"], 2000,
+        "1500 input + 500 output, NOT + reasoning_tokens(200)"
+    );
+    // duration_ms(1300) - latency_first_token_ms(300) = 1000ms = 1.0s → tps = 2000 / 1.0 = 2000.0.
+    assert_eq!(rows[0]["tps"], 2000.0);
+    assert!(
+        rows[0]["ttft_ms"].is_null(),
+        "the raw ttft_ms column is not itself backfilled from latency_first_token_ms"
+    );
+}
+
 #[tokio::test]
 async fn account_trends_returns_seeded_history_split_by_window() {
     // Task 9: GET /api/accounts/{id}/trends — a 7-day per-window usage series derived from

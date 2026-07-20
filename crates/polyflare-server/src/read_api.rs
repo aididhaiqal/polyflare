@@ -218,10 +218,13 @@ struct AccountIdentityView {
 
 /// `AccountDetailView::request_totals`: how many requests this account has served (all-time) and
 /// their summed token count. Derived from `RequestLogRepo::page` filtered to this account: `total`
-/// is the filtered row count (accurate regardless of page size); `total_tokens` sums the returned
-/// rows' `total_tokens`, so the query fetches with an effectively unbounded limit rather than the
-/// dashboard's page-sized default (see `account_detail_handler`) — this is a per-account detail read,
-/// not the hot path, same tradeoff `accounts_handler` already makes for `request_count_24h`.
+/// is the filtered row count (accurate regardless of page size); `total_tokens` sums each returned
+/// row's `total_tokens`, falling back per row to `input_tokens + output_tokens` (Task 7: `0005`
+/// import/backfill rows never populate `total_tokens` itself; a missing sub-count coalesces to 0,
+/// and `reasoning_tokens` is never added — it's a subset of `output_tokens`, not a third count).
+/// The query fetches with an effectively unbounded limit rather than the dashboard's page-sized
+/// default (see `account_detail_handler`) — this is a per-account detail read, not the hot path,
+/// same tradeoff `accounts_handler` already makes for `request_count_24h`.
 #[derive(Serialize)]
 struct RequestTotalsView {
     request_count: i64,
@@ -322,7 +325,13 @@ pub async fn account_detail_handler(
         .unwrap_or_default();
     let request_totals = RequestTotalsView {
         request_count: total as i64,
-        total_tokens: rows.iter().filter_map(|r| r.total_tokens).sum(),
+        total_tokens: rows
+            .iter()
+            .map(|r| {
+                r.total_tokens
+                    .unwrap_or_else(|| r.input_tokens.unwrap_or(0) + r.output_tokens.unwrap_or(0))
+            })
+            .sum(),
     };
 
     Json(AccountDetailView {
@@ -591,9 +600,14 @@ struct PaceView {
 
 /// One request-log row for the dashboard: content-free by construction (the same audited field set
 /// the tracing event carries — method/path/provider/status/latency plus the content-free per-request
-/// metrics — never a body or identity). `tps` is derived, not stored: `total_tokens` over the
-/// generation window (`duration_ms - ttft_ms`, seconds), present only when both source fields are
-/// present and the window is positive.
+/// metrics — never a body or identity). `total_tokens` falls back to `input_tokens + output_tokens`
+/// when `total_tokens` itself is null (Task 7: `0005` import/backfill rows never populate it; a
+/// missing sub-count coalesces to 0, and `reasoning_tokens` is never added — it's a subset of
+/// `output_tokens`). `tps` is derived, not stored: that (fallback) `total_tokens` over the
+/// generation window (`duration_ms - ttft_ms`, seconds — `ttft_ms` itself falling back to
+/// `latency_first_token_ms` for the same import/backfill rows), present only when both source
+/// fields are present and the window is positive. The row's own serialized `ttft_ms` field is
+/// NOT backfilled this way — only used internally to derive `tps`.
 #[derive(Serialize)]
 struct RequestRowView {
     id: i64,
@@ -678,25 +692,37 @@ pub async fn requests_handler(
     };
     let rows = rows
         .into_iter()
-        .map(|r| RequestRowView {
-            id: r.id,
-            requested_at: r.requested_at,
-            provider: r.provider,
-            method: r.method,
-            path: r.path,
-            aliased: r.aliased,
-            status: r.status,
-            duration_ms: r.duration_ms,
-            tps: derive_tps(r.duration_ms, r.ttft_ms, r.total_tokens),
-            account_id: r.account_id,
-            model: r.model,
-            reasoning_effort: r.reasoning_effort,
-            service_tier: r.service_tier,
-            transport: r.transport,
-            ttft_ms: r.ttft_ms,
-            total_tokens: r.total_tokens,
-            cached_tokens: r.cached_tokens,
-            subagent: r.subagent,
+        .map(|r| {
+            // Task 7: fall back to input+output when total_tokens itself is null (never add
+            // reasoning_tokens — it's a subset of output_tokens, not a third count), and to
+            // latency_first_token_ms when ttft_ms is null, purely for the tps derivation below.
+            let total_tokens = r
+                .total_tokens
+                .or_else(|| match (r.input_tokens, r.output_tokens) {
+                    (None, None) => None,
+                    (i, o) => Some(i.unwrap_or(0) + o.unwrap_or(0)),
+                });
+            let tps_ttft_ms = r.ttft_ms.or(r.latency_first_token_ms);
+            RequestRowView {
+                id: r.id,
+                requested_at: r.requested_at,
+                provider: r.provider,
+                method: r.method,
+                path: r.path,
+                aliased: r.aliased,
+                status: r.status,
+                duration_ms: r.duration_ms,
+                tps: derive_tps(r.duration_ms, tps_ttft_ms, total_tokens),
+                account_id: r.account_id,
+                model: r.model,
+                reasoning_effort: r.reasoning_effort,
+                service_tier: r.service_tier,
+                transport: r.transport,
+                ttft_ms: r.ttft_ms,
+                total_tokens,
+                cached_tokens: r.cached_tokens,
+                subagent: r.subagent,
+            }
         })
         .collect();
     Response::ok(RequestsView {
