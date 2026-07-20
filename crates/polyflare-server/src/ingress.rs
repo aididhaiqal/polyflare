@@ -1527,6 +1527,10 @@ async fn responses_route(
     // `state` moves into the impl below.
     let upstream_request_metrics = state.upstream_request_metrics.clone();
     let (response, outcome) = responses_handler_impl(state, pool.as_deref(), headers, body).await;
+    // Live-usage-cost-capture Task 4: a fresh per-request correlation id — content-free (128
+    // random bits, never derived from request/response data) — so the (later) stream-wrapper task
+    // can call `RequestLogRepo::update_usage` against the SAME row this request inserts.
+    let request_id = format!("{:032x}", rand::random::<u128>());
     let log = RequestLog {
         method: "POST",
         path: "/responses",
@@ -1550,6 +1554,7 @@ async fn responses_route(
         total_tokens: None,
         cached_tokens: None,
         subagent: outcome.subagent,
+        request_id: Some(request_id.clone()),
     };
     log.emit();
     log_bus.publish(log.to_log_event());
@@ -2171,6 +2176,10 @@ async fn messages_route(
         _ => messages_handler_native(state, pool.as_deref(), body, model).await,
     };
 
+    // Live-usage-cost-capture Task 4: a fresh per-request correlation id — content-free (128
+    // random bits, never derived from request/response data) — so the (later) stream-wrapper task
+    // can call `RequestLogRepo::update_usage` against the SAME row this request inserts.
+    let request_id = format!("{:032x}", rand::random::<u128>());
     let log = RequestLog {
         method: "POST",
         path: "/v1/messages",
@@ -2189,6 +2198,7 @@ async fn messages_route(
         total_tokens: None,
         cached_tokens: None,
         subagent: outcome.subagent,
+        request_id: Some(request_id.clone()),
     };
     log.emit();
     log_bus.publish(log.to_log_event());

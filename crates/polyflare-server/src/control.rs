@@ -243,6 +243,10 @@ async fn control_route(
         }
     };
 
+    // Live-usage-cost-capture Task 4: a fresh per-request correlation id — content-free (128
+    // random bits, never derived from request/response data) — so the (later) stream-wrapper task
+    // can call `RequestLogRepo::update_usage` against the SAME row this request inserts.
+    let request_id = format!("{:032x}", rand::random::<u128>());
     let log = RequestLog {
         method: method_label,
         path: log_label,
@@ -261,6 +265,7 @@ async fn control_route(
         // Not derived for control endpoints (Task 3's `RequestCtx.subagent` wiring covers only
         // the `/responses`/`/v1/messages` set-sites); left `None` here.
         subagent: None,
+        request_id: Some(request_id.clone()),
     };
     log.emit();
     log_bus.publish(log.to_log_event());
@@ -446,6 +451,10 @@ async fn compact_route(
         }
     };
 
+    // Live-usage-cost-capture Task 4: a fresh per-request correlation id — content-free (128
+    // random bits, never derived from request/response data) — so the (later) stream-wrapper task
+    // can call `RequestLogRepo::update_usage` against the SAME row this request inserts.
+    let request_id = format!("{:032x}", rand::random::<u128>());
     let log = RequestLog {
         method: "POST",
         path: "responses_compact",
@@ -465,6 +474,7 @@ async fn compact_route(
         // (when the caller sends `x-openai-subagent`) is available on `facts.ctx` — carry it, unlike
         // the bodyless `control_route` set-site which genuinely has no facts to derive it from.
         subagent,
+        request_id: Some(request_id.clone()),
     };
     log.emit();
     log_bus.publish(log.to_log_event());
