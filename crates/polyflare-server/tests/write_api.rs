@@ -258,6 +258,87 @@ async fn patch_toggles_security_work_authorized_and_leaves_it_alone_when_absent(
 }
 
 #[tokio::test]
+async fn patch_sets_clears_and_validates_alias() {
+    // Task 2: `alias` mirrors `pool`'s double-Option shape (absent = unchanged, `null`/whitespace =
+    // clear, non-empty <=64 chars = set). Verified via the store (not the `/api/accounts` list
+    // view), same pattern as routing_policy/security_work_authorized above — `alias` only appears
+    // in the per-account detail view, not the list view.
+    let store = store_with_one().await;
+    let repo = store.accounts();
+    let pf = spawn_with(store).await;
+    let client = reqwest::Client::new();
+
+    // Set a value.
+    let resp = client
+        .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "alias": "prod-1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        repo.get("acct-1").await.unwrap().unwrap().alias.as_deref(),
+        Some("prod-1")
+    );
+
+    // Explicit null clears it.
+    let resp = client
+        .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "alias": null }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(repo.get("acct-1").await.unwrap().unwrap().alias, None);
+
+    // Whitespace-only also clears (normalized).
+    repo.update_alias("acct-1", Some("prod-1")).await.unwrap();
+    let resp = client
+        .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "alias": "   " }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(repo.get("acct-1").await.unwrap().unwrap().alias, None);
+
+    // A 65-char alias is rejected, and the existing value is left untouched (validate-before-apply).
+    repo.update_alias("acct-1", Some("prod-1")).await.unwrap();
+    let too_long = "a".repeat(65);
+    let resp = client
+        .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "alias": too_long }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert_eq!(
+        repo.get("acct-1").await.unwrap().unwrap().alias.as_deref(),
+        Some("prod-1"),
+        "a rejected patch must not apply the alias change"
+    );
+
+    // Absent alias leaves it unchanged.
+    let resp = client
+        .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "status": "paused" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        repo.get("acct-1").await.unwrap().unwrap().alias.as_deref(),
+        Some("prod-1"),
+        "a patch omitting alias must not clear it"
+    );
+}
+
+#[tokio::test]
 async fn patch_validation_fails_closed() {
     let pf = spawn_with(store_with_one().await).await;
     let client = reqwest::Client::new();
