@@ -278,7 +278,15 @@ mod relay_through {
     /// wired all the way to `Continuity::observe`, not just invoked in isolation.
     #[tokio::test]
     async fn forwards_verbatim_and_records_ownership_on_completion() {
-        let mock = MockWsUpstream::new(ScriptedTurn::normal(vec![])).capturing_raw_frames();
+        // The scripted turn streams ONE deliberately non-canonical event frame (keys out of
+        // alphabetical order + doubled interior whitespace) before its auto `response.completed`.
+        // A parse-then-reserialize on the backend->client leg would sort the keys and collapse the
+        // whitespace, so a byte-exact match at the CLIENT proves that leg forwards verbatim too
+        // (the client->backend leg is proven separately below via `mock.raw_frames()`).
+        let weird_event =
+            r#"{"type":"response.output_text.delta",  "z_field":1,  "a_field":2}"#.to_string();
+        let mock = MockWsUpstream::new(ScriptedTurn::normal(vec![weird_event.clone()]))
+            .capturing_raw_frames();
         let mock_base = mock.clone().spawn().await;
 
         let (base, state) = spawn_with_pinned_account("acct-relay", &mock_base).await;
@@ -321,8 +329,20 @@ mod relay_through {
             "the relay must forward the client's frame to the upstream mock BYTE-VERBATIM"
         );
 
-        // `ScriptedTurn::normal(vec![])` auto-replies with `response.completed` (id `resp_1`) and
-        // nothing else — the client must receive that verbatim, unmodified by the relay.
+        // First frame back is the scripted non-canonical event, which the relay must forward to the
+        // client BYTE-VERBATIM (a reparse would sort `a_field` before `z_field` and collapse the
+        // doubled whitespace, changing these exact bytes) — the backend->client verbatim proof.
+        let TMessage::Text(event) = ws.next().await.expect("an event").expect("no ws error") else {
+            panic!("expected a text frame back from the relay");
+        };
+        assert_eq!(
+            event.as_str(),
+            weird_event,
+            "the relay must forward the backend's frame to the client BYTE-VERBATIM"
+        );
+
+        // Then `ScriptedTurn::normal` auto-replies `response.completed` (id `resp_1`); the client
+        // must receive it verbatim, and its id is what the ownership sniff records below.
         let TMessage::Text(reply) = ws.next().await.expect("a reply").expect("no ws error") else {
             panic!("expected a text frame back from the relay");
         };
