@@ -377,3 +377,71 @@ async fn patch_validation_fails_closed() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 }
+
+// Task 4: `DELETE /api/accounts/{id}` — remove an account, optionally purging its `request_log`
+// rows via `?delete_history=true`. Consumes `AccountRepo::delete` (Task 3, already unit-tested for
+// the FK-cascade/detach side effects) — at the endpoint level we only assert the account itself is
+// gone.
+
+#[tokio::test]
+async fn delete_removes_the_account() {
+    let store = store_with_one().await;
+    let repo = store.accounts();
+    let pf = spawn_with(store).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .delete(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body, serde_json::json!({ "ok": true }));
+    assert!(repo.get("acct-1").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn delete_with_delete_history_true_removes_the_account() {
+    let store = store_with_one().await;
+    let repo = store.accounts();
+    let pf = spawn_with(store).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .delete(format!("{pf}/api/accounts/acct-1?delete_history=true"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(repo.get("acct-1").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn delete_unknown_id_is_404() {
+    let pf = spawn_with(store_with_one().await).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .delete(format!("{pf}/api/accounts/nope"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn delete_without_admin_token_is_401() {
+    let pf = spawn_with(store_with_one().await).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .delete(format!("{pf}/api/accounts/acct-1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}

@@ -309,7 +309,8 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route(
             "/api/accounts/{id}",
             get(crate::read_api::account_detail_handler)
-                .patch(crate::write_api::patch_account_handler),
+                .patch(crate::write_api::patch_account_handler)
+                .delete(crate::write_api::delete_account_handler),
         )
         .route(
             "/api/accounts/{id}/trends",

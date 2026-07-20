@@ -134,3 +134,25 @@ pub async fn patch_account_handler(
 
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
 }
+
+#[derive(Deserialize)]
+pub struct DeleteQuery {
+    #[serde(default)]
+    delete_history: bool,
+}
+
+/// `DELETE /api/accounts/{id}` — remove an account. `?delete_history=true` purges its `request_log`
+/// rows; otherwise those rows are detached (`account_id` set NULL) and kept for reporting. Either way
+/// the account's `usage_history` FK-cascades away and its `continuity` sessions FK-detach (see
+/// `AccountRepo::delete`).
+pub async fn delete_account_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<DeleteQuery>,
+) -> Response {
+    match state.store.accounts().delete(&id, q.delete_history).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such account").into_response(),
+        Err(_) => internal_error(),
+    }
+}
