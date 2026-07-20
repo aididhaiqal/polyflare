@@ -299,6 +299,18 @@ impl AccountRepo {
         Ok(())
     }
 
+    /// Set (or clear) an account's human-readable alias. `Some(name)` sets it; `None` clears it to
+    /// SQL NULL. Bumps the generation so the account cache re-reads on the next selection.
+    pub async fn update_alias(&self, id: &str, alias: Option<&str>) -> Result<(), StoreError> {
+        sqlx::query("UPDATE accounts SET alias = ? WHERE id = ?")
+            .bind(alias)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        self.bump_generation();
+        Ok(())
+    }
+
     /// Set (or clear) an account's `security_work_authorized` capability flag — the operator write
     /// path (dashboard PATCH / CLI). Previously this column was only ever set by `insert` and the
     /// codex-lb importer; this is the first setter that can flip it post-onboard. Bumps the
@@ -1046,6 +1058,58 @@ mod tests {
             0
         );
         assert_eq!(remaining_recorded_ats(&store, "acct-1").await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn update_alias_sets_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
+        let repo = store.accounts();
+        let account = Account {
+            id: "acct-1".to_string(),
+            chatgpt_account_id: None,
+            chatgpt_user_id: None,
+            email: "a@example.test".to_string(),
+            alias: None,
+            workspace_id: None,
+            workspace_label: None,
+            seat_type: None,
+            plan_type: "pro".to_string(),
+            routing_policy: "normal".to_string(),
+            last_refresh: 0,
+            created_at: 0,
+            status: "active".to_string(),
+            deactivation_reason: None,
+            reset_at: None,
+            blocked_at: None,
+            security_work_authorized: false,
+            provider: "codex".to_string(),
+            pool: None,
+        };
+        let tokens = PlainTokens {
+            access_token: "a".to_string(),
+            refresh_token: "b".to_string(),
+            id_token: "c".to_string(),
+        };
+        repo.insert(&account, &tokens, &cipher).await.unwrap();
+
+        let g0 = store.account_generation();
+        repo.update_alias("acct-1", Some("prod-1")).await.unwrap();
+        let g1 = store.account_generation();
+        assert_eq!(
+            store.accounts().get("acct-1").await.unwrap().unwrap().alias,
+            Some("prod-1".to_string())
+        );
+        assert!(g1 > g0, "update_alias must bump the account generation");
+
+        repo.update_alias("acct-1", None).await.unwrap();
+        assert_eq!(
+            store.accounts().get("acct-1").await.unwrap().unwrap().alias,
+            None
+        );
     }
 
     #[test]
