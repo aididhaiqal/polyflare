@@ -44,6 +44,17 @@ pub struct ServeConfig {
     /// "HTTP-SSE remains the fallback on every path"). Consumed by
     /// `crate::app::build_codex_executor`.
     pub ws_upstream: bool,
+    /// WS-downstream relay plan Task 2: selects the DOWNSTREAM (client-facing) WebSocket transport
+    /// (`POLYFLARE_WS_DOWNSTREAM=1|true`). **Default OFF** — off means the WS-handshake `GET
+    /// /responses` (and `/{pool}/responses`) still answers `426 Upgrade Required`
+    /// (`crate::ingress::websocket_fallback_handler`), byte-identical to before this flag existed
+    /// (see `docs/superpowers/specs/2026-07-20-ws-downstream-relay-design.md` §8: "Flag-gated
+    /// (`POLYFLARE_WS_DOWNSTREAM`, default off); additive; HTTP-SSE and translation paths
+    /// byte-unchanged"). Only an explicit `1`/`true` routes that GET to `crate::ws_relay`'s upgrade
+    /// handler instead. Same fail-safe-default convention as `ws_upstream` above: any
+    /// unset/empty/unrecognized value is treated as OFF, never a startup error. Consumed by
+    /// `crate::app::build_app` (via `AppState::ws_downstream`) to shape the router.
+    pub ws_downstream: bool,
     /// Opt-in client-initiated WS keepalive pings (`POLYFLARE_WS_CLIENT_PING=1|true`). **Default
     /// OFF = codex-rs-faithful**: real codex-rs NEVER initiates a client ping (it only auto-pongs
     /// inbound server pings and bounds reads with an idle timeout — `docs/WS-GROUND-TRUTH-CODEX.md`
@@ -627,6 +638,14 @@ impl ServeConfig {
             std::env::var("POLYFLARE_WS_UPSTREAM").as_deref(),
             Ok("1") | Ok("true")
         );
+        // WS-downstream relay plan Task 2: same fail-safe-default convention as `ws_upstream` above —
+        // any unset/empty/unrecognized value is OFF (never a startup error), so a malformed env var
+        // degrades to today's `426`-on-the-WS-GET behavior rather than failing to boot. Only an
+        // explicit `1`/`true` engages the WS-relay accept path (`crate::ws_relay`).
+        let ws_downstream = matches!(
+            std::env::var("POLYFLARE_WS_DOWNSTREAM").as_deref(),
+            Ok("1") | Ok("true")
+        );
         // Opt-in client keepalive pings. Same fail-safe-default convention as `ws_upstream` above:
         // any unset/empty/unrecognized value is OFF, which is the codex-rs-faithful default (no
         // client-initiated ping). Only an explicit `1`/`true` opts into the codex-lb-style keepalive
@@ -671,6 +690,7 @@ impl ServeConfig {
             admin_token,
             live_logs,
             ws_upstream,
+            ws_downstream,
             ws_client_ping,
             max_account_attempts,
             starvation_wait_budget,

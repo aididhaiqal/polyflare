@@ -193,6 +193,7 @@ fn build_state(
         token_cache: Default::default(),
         admin_token: None,
         live_logs: false,
+        ws_downstream: false,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         runtime: Default::default(),
         max_account_attempts,

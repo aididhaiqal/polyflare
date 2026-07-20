@@ -124,6 +124,7 @@ async fn spawn(enforce_client_keys: bool) -> (String, Arc<AppState>) {
         runtime: Default::default(),
         admin_token: Some("admin-secret".to_string()),
         live_logs: true,
+        ws_downstream: false,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         max_account_attempts: 3,
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),

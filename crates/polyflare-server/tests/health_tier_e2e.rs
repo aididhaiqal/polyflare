@@ -60,6 +60,7 @@ async fn state(soft_drain_enabled: bool) -> Arc<AppState> {
         runtime: Default::default(),
         admin_token: None,
         live_logs: true,
+        ws_downstream: false,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         max_account_attempts: 3,
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),

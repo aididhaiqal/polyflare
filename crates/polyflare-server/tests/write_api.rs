@@ -79,6 +79,7 @@ async fn spawn_with(store: Store) -> String {
         token_cache: Default::default(),
         admin_token: Some("secret".to_string()),
         live_logs: true,
+        ws_downstream: false,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         max_account_attempts: 3,
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),

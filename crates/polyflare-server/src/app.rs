@@ -85,6 +85,16 @@ pub struct AppState {
     /// Enables the live log stream (`POLYFLARE_LIVE_LOGS`). Consumed by a later task
     /// (`/api/logs/stream`); present now so `AppState` construction doesn't churn again then.
     pub live_logs: bool,
+    /// WS-downstream relay plan Task 2: selects the DOWNSTREAM (client-facing) WebSocket transport
+    /// (`POLYFLARE_WS_DOWNSTREAM`, resolved ONCE at startup by `crate::config::ServeConfig::from_env`
+    /// — never read per-request). Read only in `build_app` below to shape the router: when `true`,
+    /// the WS-handshake `GET /responses` (+ `/{pool}/responses`) routes to
+    /// `crate::ws_relay::responses_ws_handler` (which ACCEPTS the upgrade); when `false` (the
+    /// default), it keeps answering `426` via `crate::ingress::websocket_fallback_handler`,
+    /// byte-identical to before this flag existed. Defaults to `false` in every test/dev harness that
+    /// builds `AppState` directly (mirrors `enforce_client_keys`/`live_logs`), preserving the 426
+    /// default. See `docs/superpowers/specs/2026-07-20-ws-downstream-relay-design.md` §8.
+    pub ws_downstream: bool,
     /// Content-free live-log bus (see `crate::log_bus`): a broadcast channel + ring buffer fed
     /// from the `RequestLog` content-safety chokepoint (`crate::ingress`'s route wrappers). A
     /// later task exposes this over `/api/logs/stream`; present now so publishing starts
@@ -389,26 +399,38 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             crate::auth::require_admin,
         ));
 
+    // `GET` on these two Codex-native proxy paths is a WebSocket-handshake attempt from a
+    // WS-capable Codex client, never a real request — Codex only ever POSTs `/responses`.
+    //
+    // WS-downstream relay Task 2 (`POLYFLARE_WS_DOWNSTREAM` → `state.ws_downstream`): when ON, that
+    // WS handshake is ACCEPTED — the GET routes to `crate::ws_relay::responses_ws_handler`, which
+    // completes the upgrade (`101`) and relays to an upstream WS (Tasks 3-6). When OFF (the
+    // default), the GET keeps answering `426 Upgrade Required` via
+    // `crate::ingress::websocket_fallback_handler` — a correctness shim so a `supports_websockets`
+    // client degrades to HTTP-SSE (codex-rs's SOLE WS→HTTP fallback trigger) instead of hard-failing
+    // on axum's default 405. Both `get(_)` branches produce the SAME `MethodRouter<Arc<AppState>>`
+    // type (the handler is type-erased inside), so a single flag-selected value serves both paths.
+    // Default-off is byte-identical to before this flag existed. `/v1/messages` is the
+    // Anthropic-format path — Codex never opens a WS there, so it's deliberately left without a GET.
+    //
+    // D18 Task 4: this GET route is registered here, on the TOP-LEVEL (unlayered) router, NOT
+    // inside `proxy` above — a keyless WS-handshake probe must always degrade to 426 (or, with the
+    // relay on, upgrade), never be rejected with 401, regardless of whether client-key enforcement
+    // is on. `Router::merge` combines a GET-only `MethodRouter` for a path with a POST-only one for
+    // the same path (axum's `MethodRouter::merge_for_path` only panics on an actual method OVERLAP,
+    // e.g. two GETs for the same path — disjoint methods merge cleanly), so splitting GET and POST
+    // across the unlayered top-level router and the conditionally-layered `proxy` sub-router below
+    // is safe and is exactly axum's supported pattern for "some methods on this path are gated,
+    // others aren't."
+    let responses_ws_get = if state.ws_downstream {
+        get(crate::ws_relay::responses_ws_handler)
+    } else {
+        get(websocket_fallback_handler)
+    };
+
     Router::new()
-        // `GET` on these two Codex-native proxy paths is a WebSocket-handshake attempt from a
-        // WS-capable Codex client, never a real request — Codex only ever POSTs `/responses`.
-        // Answering it with `426 Upgrade Required` (rather than falling through to axum's default
-        // 405) is a temporary correctness shim so such a client degrades to HTTP-SSE instead of
-        // hard-failing; see `crate::ingress::websocket_fallback_handler`'s doc for the full
-        // rationale. `/v1/messages` is the Anthropic-format path — Codex never opens a WS there,
-        // so it's deliberately left without this GET handler.
-        //
-        // D18 Task 4: this GET route is registered here, on the TOP-LEVEL (unlayered) router, NOT
-        // inside `proxy` above — a keyless WS-handshake probe must always degrade to 426, never be
-        // rejected with 401, regardless of whether client-key enforcement is on. `Router::merge`
-        // combines a GET-only `MethodRouter` for a path with a POST-only one for the same path
-        // (axum's `MethodRouter::merge_for_path` only panics on an actual method OVERLAP, e.g. two
-        // GETs for the same path — disjoint methods merge cleanly), so splitting GET and POST
-        // across the unlayered top-level router and the conditionally-layered `proxy` sub-router
-        // below is safe and is exactly axum's supported pattern for "some methods on this path are
-        // gated, others aren't."
-        .route("/responses", get(websocket_fallback_handler))
-        .route("/{pool}/responses", get(websocket_fallback_handler))
+        .route("/responses", responses_ws_get.clone())
+        .route("/{pool}/responses", responses_ws_get)
         .merge(proxy)
         // Model catalog (read-only GETs): real Codex models (bootstrap floor for now) merged with
         // PolyFlare's synthetic aliases. Routing is by method+path, so these never conflict with

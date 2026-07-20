@@ -258,6 +258,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         runtime: Default::default(),
         admin_token: config.admin_token,
         live_logs: config.live_logs,
+        ws_downstream: config.ws_downstream,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         max_account_attempts: config.max_account_attempts,
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
