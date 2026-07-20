@@ -321,14 +321,17 @@ impl RequestLogRepo {
     /// status-class rule as [`RequestsFilter::status_class`] (`success` = `status < 300`, `error` =
     /// `status >= 400`; the gap between them, e.g. 3xx redirects, counts toward `total` only).
     /// `avg_latency_ms`/`total_tokens` default to `0.0`/`0` (via `COALESCE`) when no row matches,
-    /// so an empty window renders as zeroed KPIs rather than nulls.
+    /// so an empty window renders as zeroed KPIs rather than nulls. `total_tokens` itself falls
+    /// back per row to `input_tokens + output_tokens` (Task 7: `0005` import/backfill rows never
+    /// populate `total_tokens`; a missing sub-count coalesces to 0, and `reasoning_tokens` is
+    /// never added — it's a subset of `output_tokens`, not a third count).
     pub async fn aggregate_since(&self, since_ts: i64) -> Result<RequestAggregate, StoreError> {
         let row: (i64, i64, i64, f64, i64) = sqlx::query_as(&format!(
             "SELECT COUNT(*), \
                     COALESCE(SUM(CASE WHEN status < 300 THEN 1 ELSE 0 END), 0), \
                     COALESCE(SUM(CASE WHEN status >= {} THEN 1 ELSE 0 END), 0), \
                     COALESCE(AVG(duration_ms), 0.0), \
-                    COALESCE(SUM(total_tokens), 0) \
+                    COALESCE(SUM(COALESCE(total_tokens, COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))), 0) \
              FROM request_log WHERE requested_at >= ?",
             ERROR_STATUS_MIN
         ))
@@ -350,7 +353,8 @@ impl RequestLogRepo {
     /// (`(requested_at / bucket_secs) * bucket_secs`), not by fetching rows into Rust. `errors`
     /// classifies by the SAME rule [`Self::aggregate_since`] uses (`status >= 400`); `avg_latency_ms`
     /// / `total_tokens` are per-bucket `AVG`/`SUM`, never null (a bucket only exists here because it
-    /// has >= 1 row).
+    /// has >= 1 row). `total_tokens` falls back per row the same way [`Self::aggregate_since`]'s does
+    /// (`input_tokens + output_tokens` when `total_tokens` itself is null; never `reasoning_tokens`).
     ///
     /// # `bucket_secs` guard
     /// Clamped to a minimum of 1 so the SQL integer division can never divide by zero. There is no
@@ -374,7 +378,7 @@ impl RequestLogRepo {
                     COUNT(*), \
                     COALESCE(SUM(CASE WHEN status >= {} THEN 1 ELSE 0 END), 0), \
                     COALESCE(AVG(duration_ms), 0.0), \
-                    COALESCE(SUM(total_tokens), 0) \
+                    COALESCE(SUM(COALESCE(total_tokens, COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))), 0) \
              FROM request_log WHERE requested_at >= ? \
              GROUP BY bucket_ts ORDER BY bucket_ts ASC",
             ERROR_STATUS_MIN
@@ -712,6 +716,45 @@ mod tests {
         }
     }
 
+    /// Like [`row_at`], but shaped like an imported/backfilled row: `total_tokens` is `None` and
+    /// only the 0005 `input_tokens`/`output_tokens` columns are populated — the case
+    /// `aggregate_since`/`series_since` must fall back on (Task 7). `reasoning_tokens` is also set
+    /// (to a value that would double-count the total if wrongly added) so a wrong implementation
+    /// that adds it in shows up as a wrong sum, not a coincidentally-passing test.
+    fn row_at_split_tokens(
+        requested_at: i64,
+        status: u16,
+        duration_ms: i64,
+        input_tokens: i64,
+        output_tokens: i64,
+    ) -> RequestLogRecord {
+        RequestLogRecord {
+            requested_at,
+            provider: "codex".into(),
+            method: "POST".into(),
+            path: "/responses".into(),
+            aliased: false,
+            status,
+            duration_ms,
+            account_id: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            transport: None,
+            ttft_ms: None,
+            total_tokens: None,
+            cached_tokens: None,
+            subagent: None,
+            request_id: None,
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            cached_input_tokens: None,
+            reasoning_tokens: Some(50), // subset of output_tokens — must NOT be added to the sum
+            cost_usd: None,
+            latency_first_token_ms: None,
+        }
+    }
+
     /// `aggregate_since` rolls up ONLY rows at/after `since_ts`, classifying by the same
     /// status-class rule `page`'s `status_class` filter uses, and defaults an empty window's
     /// latency/tokens to zero (not null).
@@ -728,13 +771,21 @@ mod tests {
         repo.insert(&row_at(210, 500, Some(2000), 300))
             .await
             .unwrap();
+        // Task 7: an imported-shaped row (total_tokens=None, input/output set) within the window —
+        // duration_ms=200 keeps avg_latency_ms's numerator/denominator arithmetic unchanged below.
+        repo.insert(&row_at_split_tokens(205, 200, 200, 400, 100))
+            .await
+            .unwrap();
 
         let agg = repo.aggregate_since(200).await.unwrap();
-        assert_eq!(agg.total, 2, "the ts=50 row is outside the window");
-        assert_eq!(agg.success, 1);
+        assert_eq!(agg.total, 3, "the ts=50 row is outside the window");
+        assert_eq!(agg.success, 2);
         assert_eq!(agg.error, 1);
-        assert_eq!(agg.total_tokens, 3000);
-        assert_eq!(agg.avg_latency_ms, 200.0, "(100 + 300) / 2");
+        assert_eq!(
+            agg.total_tokens, 3500,
+            "1000 + 2000 + (400 input + 100 output), NOT + the row's reasoning_tokens"
+        );
+        assert_eq!(agg.avg_latency_ms, 200.0, "(100 + 300 + 200) / 3");
 
         let empty = repo.aggregate_since(1_000_000).await.unwrap();
         assert_eq!(empty.total, 0);
@@ -758,11 +809,16 @@ mod tests {
         // bucket_secs = 100 → buckets start at multiples of 100.
         // Bucket [0, 100): one row at ts=50.
         repo.insert(&row_at(50, 200, Some(500), 100)).await.unwrap();
-        // Bucket [100, 200): two rows, one success one error, at ts=120 and ts=150.
+        // Bucket [100, 200): two rows, one success one error, at ts=120 and ts=150, plus a third
+        // (Task 7) imported-shaped row at ts=180: total_tokens=None, input/output set —
+        // duration_ms=200 keeps avg_latency_ms's arithmetic unchanged below.
         repo.insert(&row_at(120, 200, Some(1000), 100))
             .await
             .unwrap();
         repo.insert(&row_at(150, 500, Some(2000), 300))
+            .await
+            .unwrap();
+        repo.insert(&row_at_split_tokens(180, 200, 200, 700, 300))
             .await
             .unwrap();
 
@@ -776,10 +832,13 @@ mod tests {
         assert_eq!(buckets[0].avg_latency_ms, 100.0);
 
         assert_eq!(buckets[1].ts, 100);
-        assert_eq!(buckets[1].requests, 2);
+        assert_eq!(buckets[1].requests, 3);
         assert_eq!(buckets[1].errors, 1);
-        assert_eq!(buckets[1].total_tokens, 3000);
-        assert_eq!(buckets[1].avg_latency_ms, 200.0, "(100 + 300) / 2");
+        assert_eq!(
+            buckets[1].total_tokens, 4000,
+            "1000 + 2000 + (700 input + 300 output), NOT + the row's reasoning_tokens"
+        );
+        assert_eq!(buckets[1].avg_latency_ms, 200.0, "(100 + 300 + 200) / 3");
     }
 
     /// Buckets come back ascending by `ts` regardless of insertion order.
