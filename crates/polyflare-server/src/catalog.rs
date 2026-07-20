@@ -43,6 +43,13 @@ struct CatalogModel {
     /// Extra fields surfaced under `metadata` in the OpenAI shape (e.g. the alias target,
     /// `context_window`, `prefer_websockets` — see `to_openai_items`).
     metadata: serde_json::Map<String, serde_json::Value>,
+    /// The full upstream `ModelInfo` entry (verbatim, from [`UpstreamModel::raw`]) — or, for a
+    /// synthetic alias, a clone of its target model's `raw` with `slug`/`display_name`/`metadata`
+    /// overridden (see `build_catalog`). Emitted byte-for-byte into the Codex `models` array by
+    /// `to_codex_response` when it's a full `ModelInfo` (carries the `supported_reasoning_levels`
+    /// marker); a minimal/partial value (the static floor, or an alias whose target isn't in the
+    /// live set) is omitted from `models` but never affects the OpenAI `data` shape.
+    raw: serde_json::Value,
 }
 
 /// The bootstrap floor of real Codex model slugs — the static list served when the live upstream
@@ -66,6 +73,7 @@ fn codex_bootstrap() -> Vec<CatalogModel> {
             context_window: None,
             prefer_websockets: None,
             metadata: serde_json::Map::new(),
+            raw: serde_json::json!({"slug": *slug, "display_name": *name}),
         })
         .collect()
 }
@@ -79,11 +87,11 @@ pub fn codex_bootstrap_floor() -> Vec<UpstreamModel> {
     codex_bootstrap()
         .into_iter()
         .map(|m| UpstreamModel {
-            raw: serde_json::json!({"slug": m.id.clone(), "display_name": m.display_name.clone()}),
             slug: m.id,
             display_name: m.display_name,
             context_window: m.context_window,
             prefer_websockets: m.prefer_websockets,
+            raw: m.raw,
         })
         .collect()
 }
@@ -96,6 +104,7 @@ fn catalog_model_from_upstream(u: &UpstreamModel) -> CatalogModel {
         context_window: u.context_window,
         prefer_websockets: u.prefer_websockets,
         metadata: serde_json::Map::new(),
+        raw: u.raw.clone(),
     }
 }
 
@@ -125,6 +134,33 @@ fn build_catalog(live_models: &[UpstreamModel]) -> Vec<CatalogModel> {
                 serde_json::Value::String(effort.clone()),
             );
         }
+        // Build the alias's `raw` ModelInfo: clone the live target's full entry (if present) and
+        // override `slug`/`display_name`/`metadata` — a valid full `ModelInfo`, so codex parses
+        // it. If the target isn't in the live set, fall back to a minimal placeholder; it
+        // deliberately lacks the `supported_reasoning_levels` marker, so `to_codex_response` omits
+        // it from the codex-parseable `models` array (a partial entry would break the parse)
+        // while it still appears in the OpenAI `data` array via this same `metadata`.
+        let raw = match live_models.iter().find(|u| u.slug == s.alias.target_model) {
+            Some(target) => {
+                let mut cloned = target.raw.clone();
+                if let Some(obj) = cloned.as_object_mut() {
+                    obj.insert(
+                        "slug".to_string(),
+                        serde_json::Value::String(s.id.to_string()),
+                    );
+                    obj.insert(
+                        "display_name".to_string(),
+                        serde_json::Value::String(s.display_name.to_string()),
+                    );
+                    obj.insert(
+                        "metadata".to_string(),
+                        serde_json::Value::Object(metadata.clone()),
+                    );
+                }
+                cloned
+            }
+            None => serde_json::json!({"slug": s.id, "display_name": s.display_name}),
+        };
         models.push(CatalogModel {
             id: s.id.to_string(),
             display_name: s.display_name.to_string(),
@@ -132,6 +168,7 @@ fn build_catalog(live_models: &[UpstreamModel]) -> Vec<CatalogModel> {
             context_window: None,
             prefer_websockets: None,
             metadata,
+            raw,
         });
     }
     models
@@ -156,29 +193,17 @@ struct OpenAiModelList {
     data: Vec<OpenAiModel>,
 }
 
-/// One model in the Codex `/models` catalog shape.
-#[derive(Serialize)]
-struct CodexModelEntry {
-    slug: String,
-    display_name: String,
-    /// `list` (advertised) — bootstrap/hidden rows would use `hide`.
-    visibility: &'static str,
-    /// Context window in tokens, when the live upstream fetch supplied one. Omitted entirely
-    /// (rather than rendered as `null`) when unknown — matches `metadata`'s
-    /// `skip_serializing_if` convention on the OpenAI shape below.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    context_window: Option<u64>,
-    /// Whether this model prefers the WebSocket transport, when known. Same omit-if-unknown
-    /// convention as `context_window` above.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prefer_websockets: Option<bool>,
-}
-
 #[derive(Serialize)]
 struct CodexModelsResponse {
     object: &'static str,
-    models: Vec<CodexModelEntry>,
-    /// Mirror of `models` in OpenAI-item form, for clients that read `data`.
+    /// The real, codex-parseable `ModelInfo` entries — each `CatalogModel.raw` emitted
+    /// byte-for-byte (verbatim, no reparse into a lossy struct). A `CatalogModel` whose `raw`
+    /// isn't a full `ModelInfo` (missing the `supported_reasoning_levels` marker — the static
+    /// floor, or a synthetic alias whose target isn't in the live set) is OMITTED here: a partial
+    /// entry would fail codex's parse. See `to_codex_response`.
+    models: Vec<serde_json::Value>,
+    /// Mirror of `models` in OpenAI-item form, for clients that read `data`. Includes EVERY
+    /// catalog row (real + synthetic), regardless of whether it made it into `models` above.
     data: Vec<OpenAiModel>,
 }
 
@@ -216,15 +241,13 @@ fn to_openai_list(models: &[CatalogModel]) -> OpenAiModelList {
 }
 
 fn to_codex_response(models: &[CatalogModel]) -> CodexModelsResponse {
-    let entries = models
+    let entries: Vec<serde_json::Value> = models
         .iter()
-        .map(|m| CodexModelEntry {
-            slug: m.id.clone(),
-            display_name: m.display_name.clone(),
-            visibility: "list",
-            context_window: m.context_window,
-            prefer_websockets: m.prefer_websockets,
-        })
+        // The `supported_reasoning_levels` marker is present iff `raw` is a full `ModelInfo`
+        // (a real upstream entry, or a synthetic alias cloned from one) — absent for the static
+        // floor's minimal placeholders and for an alias whose target isn't in the live set.
+        .filter(|m| m.raw.get("supported_reasoning_levels").is_some())
+        .map(|m| m.raw.clone())
         .collect();
     CodexModelsResponse {
         object: "list",
@@ -333,17 +356,16 @@ mod tests {
         let resp = to_codex_response(&floor_only_catalog());
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["object"], "list");
-        assert!(v["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["slug"] == "gpt-5.6-sol"));
         assert!(v["data"]
             .as_array()
             .unwrap()
             .iter()
             .any(|m| m["id"] == "gpt-5.6-sol"));
-        assert_eq!(v["models"][0]["visibility"], "list");
+        // Task 2: the static floor's `raw` entries are minimal placeholders (no
+        // `supported_reasoning_levels` marker), so they're correctly OMITTED from the
+        // codex-parseable `models` array — a partial `ModelInfo` would break codex's parse.
+        // `data` (OpenAI shape) is unaffected and still lists every row.
+        assert!(v["models"].as_array().unwrap().is_empty());
     }
 
     // --- D15 Task 3 (d): the synthetic-alias merge still applies OVER a live/cached upstream set,
@@ -400,7 +422,11 @@ mod tests {
     }
 
     #[test]
-    fn context_window_and_prefer_websockets_render_in_both_response_shapes_when_present() {
+    fn context_window_and_prefer_websockets_render_in_openai_shape_when_present() {
+        // Task 2: the Codex `models` array now emits raw `ModelInfo` verbatim — PolyFlare's own
+        // `context_window`/`prefer_websockets` convenience fields aren't synthesized into it
+        // (a real `ModelInfo` carries its own equivalent data, if any). The OpenAI `data` shape's
+        // rendering is unaffected and still carries them under `metadata`.
         let live = vec![UpstreamModel {
             slug: "gpt-5.7-nova".to_string(),
             display_name: "GPT-5.7 Nova".to_string(),
@@ -409,16 +435,6 @@ mod tests {
             raw: serde_json::json!({"slug": "gpt-5.7-nova", "display_name": "GPT-5.7 Nova"}),
         }];
         let cat = build_catalog(&live);
-
-        let codex_v = serde_json::to_value(to_codex_response(&cat)).unwrap();
-        let nova = codex_v["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|m| m["slug"] == "gpt-5.7-nova")
-            .unwrap();
-        assert_eq!(nova["context_window"], 400_000);
-        assert_eq!(nova["prefer_websockets"], true);
 
         let openai_v = serde_json::to_value(to_openai_list(&cat)).unwrap();
         let nova = openai_v["data"]
@@ -432,18 +448,113 @@ mod tests {
     }
 
     #[test]
-    fn context_window_and_prefer_websockets_are_omitted_when_unknown() {
-        // The static floor doesn't know either field — both must be ABSENT (not `null`) in the
-        // Codex shape, matching the `skip_serializing_if` convention.
+    fn context_window_and_prefer_websockets_are_omitted_from_openai_metadata_when_unknown() {
+        // The static floor doesn't know either field — both must be ABSENT (not `null`) from
+        // `metadata` in the OpenAI shape, matching the `skip_serializing_if` convention.
         let cat = floor_only_catalog();
-        let codex_v = serde_json::to_value(to_codex_response(&cat)).unwrap();
-        let sol = codex_v["models"]
+        let openai_v = serde_json::to_value(to_openai_list(&cat)).unwrap();
+        let sol = openai_v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "gpt-5.6-sol")
+            .unwrap();
+        assert!(sol["metadata"].get("context_window").is_none());
+        assert!(sol["metadata"].get("prefer_websockets").is_none());
+    }
+
+    // --- Task 2: emit raw `ModelInfo` verbatim in the Codex `/models` response ---
+
+    fn full_raw_model_info(slug: &str, display_name: &str, effort: &str) -> serde_json::Value {
+        serde_json::json!({
+            "slug": slug,
+            "display_name": display_name,
+            "supported_reasoning_levels": [{"effort": effort, "description": "x"}],
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 1,
+        })
+    }
+
+    #[test]
+    fn codex_response_emits_raw_verbatim() {
+        let raw = full_raw_model_info("gpt-5.6-sol", "Sol", "low");
+        let live = vec![UpstreamModel {
+            slug: "gpt-5.6-sol".to_string(),
+            display_name: "Sol".to_string(),
+            context_window: None,
+            prefer_websockets: None,
+            raw: raw.clone(),
+        }];
+        let resp = to_codex_response(&build_catalog(&live));
+        let v = serde_json::to_value(resp).unwrap();
+        let entry = v["models"]
             .as_array()
             .unwrap()
             .iter()
             .find(|m| m["slug"] == "gpt-5.6-sol")
-            .unwrap();
-        assert!(sol.get("context_window").is_none());
-        assert!(sol.get("prefer_websockets").is_none());
+            .expect("gpt-5.6-sol present in the codex models array");
+        assert_eq!(
+            entry, &raw,
+            "raw ModelInfo must be emitted byte-for-byte, unmodified"
+        );
+    }
+
+    #[test]
+    fn alias_cloned_from_target() {
+        let raw = full_raw_model_info("gpt-5.6-sol", "Sol", "high");
+        let live = vec![UpstreamModel {
+            slug: "gpt-5.6-sol".to_string(),
+            display_name: "Sol".to_string(),
+            context_window: None,
+            prefer_websockets: None,
+            raw: raw.clone(),
+        }];
+        let resp = to_codex_response(&build_catalog(&live));
+        let v = serde_json::to_value(resp).unwrap();
+        let opus = v["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["slug"] == "claude-opus-4-1")
+            .expect("claude-opus-4-1 alias present in the codex models array");
+        assert_eq!(opus["slug"], "claude-opus-4-1");
+        assert_eq!(
+            opus["display_name"],
+            "Claude Opus 4.1 (via Codex gpt-5.6-sol)"
+        );
+        assert_eq!(opus["metadata"]["aliased_to"], "gpt-5.6-sol");
+        assert_eq!(opus["metadata"]["reasoning_effort"], "high");
+        // The clone carried the target's required ModelInfo fields verbatim.
+        assert_eq!(
+            opus["supported_reasoning_levels"],
+            raw["supported_reasoning_levels"]
+        );
+        assert_eq!(opus["visibility"], raw["visibility"]);
+        assert_eq!(opus["supported_in_api"], raw["supported_in_api"]);
+    }
+
+    #[test]
+    fn alias_omitted_from_models_when_target_absent() {
+        // Empty live set: no model to clone `claude-opus-4-1`'s target (`gpt-5.6-sol`) from.
+        let resp = to_codex_response(&build_catalog(&[]));
+        let v = serde_json::to_value(resp).unwrap();
+        assert!(
+            !v["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["slug"] == "claude-opus-4-1"),
+            "an alias with no live target must be omitted from the codex models array \
+             (a partial entry would break codex's parse)"
+        );
+        assert!(
+            v["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "claude-opus-4-1"),
+            "the alias must still be present in the OpenAI data array"
+        );
     }
 }
