@@ -170,9 +170,16 @@ pub(crate) async fn run_pump<F, Fut, G, GFut>(
                                 // The 60-min server cap: INTERCEPT (never forward) and eagerly
                                 // re-dial the SAME account so the client never sees this boundary.
                                 upstream = redial_upstream(&headers, &account).await;
+                                // Only a SUCCESSFUL re-dial is a reconnect — a failed one tears the
+                                // connection down and records nothing, matching the send-path
+                                // (`send_client_text` → `None` → `break`) so the counter can't
+                                // over-count teardowns.
+                                if upstream.is_none() {
+                                    break;
+                                }
                                 relay_metrics.record("reconnect_same_account");
                                 reconnects_since_progress += 1;
-                                if upstream.is_none() || reconnects_since_progress > MAX_RECONNECTS_WITHOUT_PROGRESS {
+                                if reconnects_since_progress > MAX_RECONNECTS_WITHOUT_PROGRESS {
                                     break;
                                 }
                             }
