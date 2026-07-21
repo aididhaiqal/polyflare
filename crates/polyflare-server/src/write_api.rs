@@ -7,6 +7,7 @@
 //! the running server's account cache picks the change up on the next selection without a restart.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -15,6 +16,15 @@ use axum::Json;
 use serde::{Deserialize, Deserializer};
 
 use crate::app::AppState;
+use crate::read_api::{live_field_kind, FieldKind, LIVE_KEYS_ORDER};
+use crate::runtime_settings::SettingValue;
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Deserialize a field so absent, `null`, and a value are three DISTINCT outcomes: absent →
 /// `None` (via `#[serde(default)]`, this fn isn't called), `null` → `Some(None)`, value →
@@ -155,4 +165,80 @@ pub async fn delete_account_handler(
         Ok(false) => (StatusCode::NOT_FOUND, "no such account").into_response(),
         Err(_) => internal_error(),
     }
+}
+
+/// `PATCH /api/settings` — live-edit one or more of the 10 live-editable `RuntimeSettings` fields
+/// (Settings subsystem Task 5). Body is a bare JSON object `{ <key>: <value> }`; each `key` must be
+/// one of `crate::read_api::LIVE_KEYS_ORDER` (else `400`, and no key in the body is applied — same
+/// validate-BEFORE-apply, fail-closed posture as `patch_account_handler` above), and each `value`
+/// must coerce to that field's kind per `crate::read_api::live_field_kind` (a JSON number for a
+/// `U64`/`F64` field, a JSON bool for a `Bool` field — wrong JSON type is also a `400`, never a
+/// silent coercion).
+///
+/// Applied in `LIVE_KEYS_ORDER` — a FIXED order with `starvation_wait_budget` before
+/// `starvation_heartbeat` — never the JSON object's own (arbitrary/insertion) key order, so a
+/// single PATCH containing both clamps the heartbeat against the INCOMING budget (see
+/// `crate::runtime_settings`'s module doc's Ordering note). Each applied key persists the CLAMPED
+/// CANONICAL value `RuntimeSettings::set` returns (never the raw request value — a clamped
+/// `50.0` round-trips through `f64::to_string`/`str::parse` on reboot, an unclamped `99.0` would
+/// not re-clamp until the next live write) to `store.settings()`, so a later restart's startup
+/// overlay picks up exactly what is live right now.
+///
+/// Content-free: only the 10 known config keys are ever read from the body; no key/value here is
+/// ever a token/secret (the settings PATCH surface has no access to any).
+pub async fn patch_settings_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let Some(obj) = body.as_object() else {
+        return bad_request("request body must be a JSON object");
+    };
+
+    // Validate first (fail closed, all-or-nothing): every key present must be one of the 10 live
+    // keys, and every value must coerce to that field's kind. Collected in the FIXED canonical
+    // order (budget before heartbeat) — see this fn's doc.
+    let mut to_apply: Vec<(&'static str, SettingValue)> = Vec::new();
+    for key in LIVE_KEYS_ORDER {
+        let Some(raw) = obj.get(*key) else {
+            continue;
+        };
+        let kind = match live_field_kind(key) {
+            Some(k) => k,
+            None => return bad_request("unknown or non-live setting key"),
+        };
+        let value = match kind {
+            FieldKind::U64 => match raw.as_u64() {
+                Some(n) => SettingValue::U64(n),
+                None => return bad_request("value must be a non-negative integer"),
+            },
+            FieldKind::F64 => match raw.as_f64() {
+                Some(n) => SettingValue::F64(n),
+                None => return bad_request("value must be a number"),
+            },
+            FieldKind::Bool => match raw.as_bool() {
+                Some(b) => SettingValue::Bool(b),
+                None => return bad_request("value must be a boolean"),
+            },
+        };
+        to_apply.push((*key, value));
+    }
+    // Any key in the body that isn't one of the 10 live keys never reaches `set` — reject the
+    // whole PATCH instead of silently ignoring it.
+    if obj.len() != to_apply.len() {
+        return bad_request("unknown or non-live setting key");
+    }
+
+    // Apply + persist, in the same canonical order just validated.
+    let now = unix_now();
+    for (key, value) in to_apply {
+        let stored = match state.runtime_settings.set(key, value) {
+            Ok(s) => s,
+            Err(_) => return bad_request("invalid setting value"),
+        };
+        if state.store.settings().set(key, &stored, now).await.is_err() {
+            return internal_error();
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
 }

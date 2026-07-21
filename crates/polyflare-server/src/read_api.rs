@@ -1339,6 +1339,421 @@ pub async fn reports_handler(
     .into_response()
 }
 
+// --- Settings subsystem Task 5: `GET /api/settings` (+ the shared field-metadata table
+// `PATCH /api/settings`, in `crate::write_api`, also validates against) ---
+
+/// The JSON-value family a live setting's PATCH value must coerce to, matching
+/// [`crate::runtime_settings::SettingValue`]'s three variants exactly. Distinct from
+/// [`SettingFieldView::kind`] — a wider display string that also covers the restart-only/fixed
+/// fields, which have no coercion (a `None` `coercion` in [`FieldSpec`]).
+#[derive(Clone, Copy)]
+pub(crate) enum FieldKind {
+    U64,
+    F64,
+    Bool,
+}
+
+/// One config field's static metadata (key → class/kind/bounds/default). `min`/`max` are the
+/// clamp bounds a live field's PATCH is validated against; `starvation_heartbeat`'s `max` here is
+/// a placeholder (`None`) — [`settings_handler`] overrides it with the CURRENT
+/// `starvation_wait_budget` at response time, since that bound is cross-field/dynamic (see
+/// `crate::runtime_settings`'s module doc), not a fixed constant like every other bound.
+struct FieldSpec {
+    key: &'static str,
+    class: &'static str,
+    kind: &'static str,
+    coercion: Option<FieldKind>,
+    min: Option<f64>,
+    max: Option<f64>,
+    default: &'static str,
+}
+
+/// Every `ServeConfig` field, live or not. Bounds/defaults are copied verbatim from the
+/// `clamp_<field>`/`*_from_env` doc comments in `crate::config` (single source of truth for the
+/// bound logic itself; this table only mirrors the CONSTANTS for display/validation, never
+/// reimplements the clamp). The 10 `class: "live"` rows are the only ones with `coercion: Some(_)`
+/// — a non-live key can never reach [`crate::runtime_settings::RuntimeSettings::set`] from a PATCH
+/// (see `crate::write_api::patch_settings_handler`). The restart-only/fixed rows mirror
+/// `docs/superpowers/specs/2026-07-21-dashboard-settings-design.md`'s "Deferred / read-only"
+/// section exactly.
+const FIELD_SPECS: &[FieldSpec] = &[
+    // --- live (10) ---
+    FieldSpec {
+        key: "max_account_attempts",
+        class: "live",
+        kind: "u32",
+        coercion: Some(FieldKind::U64),
+        min: Some(1.0),
+        max: None,
+        default: "3",
+    },
+    FieldSpec {
+        key: "starvation_wait_budget",
+        class: "live",
+        kind: "secs",
+        coercion: Some(FieldKind::U64),
+        min: Some(0.0),
+        max: Some(300.0),
+        default: "60",
+    },
+    FieldSpec {
+        key: "starvation_heartbeat",
+        class: "live",
+        kind: "secs",
+        coercion: Some(FieldKind::U64),
+        min: Some(1.0),
+        max: None, // dynamic: the current starvation_wait_budget — see settings_handler.
+        default: "10",
+    },
+    FieldSpec {
+        key: "wake_jitter_ms",
+        class: "live",
+        kind: "u32",
+        coercion: Some(FieldKind::U64),
+        min: Some(0.0),
+        max: Some(30_000.0),
+        default: "0",
+    },
+    FieldSpec {
+        key: "stream_idle_timeout",
+        class: "live",
+        kind: "secs",
+        coercion: Some(FieldKind::U64),
+        min: Some(0.0),
+        max: Some(3600.0),
+        default: "300",
+    },
+    FieldSpec {
+        key: "inflight_penalty_pct",
+        class: "live",
+        kind: "f64",
+        coercion: Some(FieldKind::F64),
+        min: Some(0.0),
+        max: Some(50.0),
+        default: "2.5",
+    },
+    FieldSpec {
+        key: "soft_drain_enabled",
+        class: "live",
+        kind: "bool",
+        coercion: Some(FieldKind::Bool),
+        min: None,
+        max: None,
+        default: "true",
+    },
+    FieldSpec {
+        key: "request_log_retention_days",
+        class: "live",
+        kind: "u32",
+        coercion: Some(FieldKind::U64),
+        min: Some(0.0),
+        max: Some(3650.0),
+        default: "0",
+    },
+    FieldSpec {
+        key: "usage_history_retention_days",
+        class: "live",
+        kind: "u32",
+        coercion: Some(FieldKind::U64),
+        min: Some(0.0),
+        max: Some(3650.0),
+        default: "0",
+    },
+    FieldSpec {
+        key: "live_logs",
+        class: "live",
+        kind: "bool",
+        coercion: Some(FieldKind::Bool),
+        min: None,
+        max: None,
+        default: "false",
+    },
+    // --- restart-only (8) ---
+    FieldSpec {
+        key: "routing_strategy",
+        class: "restart-only",
+        kind: "string",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "capacity_weighted",
+    },
+    FieldSpec {
+        key: "pool_strategies",
+        class: "restart-only",
+        kind: "string",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "",
+    },
+    FieldSpec {
+        key: "model_catalog_ttl_secs",
+        class: "restart-only",
+        kind: "secs",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "3600",
+    },
+    FieldSpec {
+        key: "model_catalog_enabled",
+        class: "restart-only",
+        kind: "bool",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "true",
+    },
+    FieldSpec {
+        key: "ws_downstream",
+        class: "restart-only",
+        kind: "bool",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "false",
+    },
+    FieldSpec {
+        key: "ws_upstream",
+        class: "restart-only",
+        kind: "bool",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "false",
+    },
+    FieldSpec {
+        key: "ws_client_ping",
+        class: "restart-only",
+        kind: "bool",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "false",
+    },
+    FieldSpec {
+        key: "continuity_watchdog",
+        class: "restart-only",
+        kind: "secs",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "30",
+    },
+    // --- fixed (9) ---
+    FieldSpec {
+        key: "bind_addr",
+        class: "fixed",
+        kind: "string",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "127.0.0.1:8080",
+    },
+    FieldSpec {
+        key: "db_path",
+        class: "fixed",
+        kind: "string",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "~/.polyflare/store.db",
+    },
+    FieldSpec {
+        key: "key_path",
+        class: "fixed",
+        kind: "string",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "~/.polyflare/key",
+    },
+    FieldSpec {
+        key: "upstream_base_url",
+        class: "fixed",
+        kind: "string",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "https://chatgpt.com/backend-api/codex",
+    },
+    FieldSpec {
+        key: "anthropic_upstream_base_url",
+        class: "fixed",
+        kind: "string",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "https://api.anthropic.com",
+    },
+    FieldSpec {
+        key: "auth_base_url",
+        class: "fixed",
+        kind: "string",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "https://auth.openai.com",
+    },
+    FieldSpec {
+        // NEVER returned/persisted as a value — see restart_or_fixed_value below. Presence-only:
+        // if the caller could reach this handler at all, `require_admin` already proved
+        // `admin_token` is set (an unset token 503s the whole `/api/*` surface — see `auth.rs`).
+        key: "admin_token",
+        class: "fixed",
+        kind: "string",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "",
+    },
+    FieldSpec {
+        key: "capture_fingerprint_path",
+        class: "fixed",
+        kind: "string",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "",
+    },
+    FieldSpec {
+        key: "allow_unauthenticated_remote",
+        class: "fixed",
+        kind: "bool",
+        coercion: None,
+        min: None,
+        max: None,
+        default: "false",
+    },
+];
+
+/// `crate::write_api::patch_settings_handler`'s key→kind lookup: `Some(_)` only for one of the 10
+/// live keys (never a restart-only/fixed one), so a non-live key can never be coerced/applied —
+/// the caller treats `None` as "reject with 400", never as "skip".
+pub(crate) fn live_field_kind(key: &str) -> Option<FieldKind> {
+    FIELD_SPECS
+        .iter()
+        .find(|s| s.key == key)
+        .and_then(|s| s.coercion)
+}
+
+/// The 10 live keys in a FIXED canonical order that places `starvation_wait_budget` BEFORE
+/// `starvation_heartbeat` — `crate::write_api::patch_settings_handler` applies a multi-key PATCH
+/// in this order (never the JSON object's own arbitrary key order), so a PATCH containing both
+/// clamps the heartbeat against the INCOMING budget, not the stale pre-PATCH one (see
+/// `crate::runtime_settings`'s module doc's Ordering note).
+pub(crate) const LIVE_KEYS_ORDER: &[&str] = &[
+    "max_account_attempts",
+    "starvation_wait_budget",
+    "starvation_heartbeat",
+    "wake_jitter_ms",
+    "stream_idle_timeout",
+    "inflight_penalty_pct",
+    "soft_drain_enabled",
+    "request_log_retention_days",
+    "usage_history_retention_days",
+    "live_logs",
+];
+
+/// A live field's current value, stringified. Durations emit the whole-seconds number (e.g.
+/// `starvation_wait_budget().as_secs()`), matching what `RuntimeSettings::set` itself returns/
+/// persists — so a value round-trips identically whether it was just read here or just PATCHed.
+fn live_value(rs: &crate::runtime_settings::RuntimeSettings, key: &str) -> String {
+    match key {
+        "max_account_attempts" => rs.max_account_attempts().to_string(),
+        "starvation_wait_budget" => rs.starvation_wait_budget().as_secs().to_string(),
+        "starvation_heartbeat" => rs.starvation_heartbeat().as_secs().to_string(),
+        "wake_jitter_ms" => rs.wake_jitter_ms().to_string(),
+        "stream_idle_timeout" => rs.stream_idle_timeout().as_secs().to_string(),
+        "inflight_penalty_pct" => rs.inflight_penalty_pct().to_string(),
+        "soft_drain_enabled" => rs.soft_drain_enabled().to_string(),
+        "request_log_retention_days" => rs.request_log_retention_days().to_string(),
+        "usage_history_retention_days" => rs.usage_history_retention_days().to_string(),
+        "live_logs" => rs.live_logs().to_string(),
+        _ => unreachable!("live_value called with a non-live key: {key}"),
+    }
+}
+
+/// A restart-only/fixed field's current value, where `AppState` happens to still hold it (frozen
+/// at boot). Every other restart-only/fixed key — and `admin_token` ALWAYS, regardless — returns
+/// `None`: these fields are informational only (see `FIELD_SPECS`'s doc), and `AppState` does not
+/// retain the raw `ServeConfig` those keys came from (only the individual fields later code reads
+/// live). Content-safety: `admin_token` is hardcoded to `None` here, never read off
+/// `state.admin_token` — the token string must never leave this process as a value, only its
+/// (implied) presence.
+fn restart_or_fixed_value(state: &AppState, key: &str) -> Option<String> {
+    match key {
+        "upstream_base_url" => Some(state.upstream_base_url.clone()),
+        "anthropic_upstream_base_url" => Some(state.anthropic_upstream_base_url.clone()),
+        "ws_downstream" => Some(state.ws_downstream.to_string()),
+        "model_catalog_ttl_secs" => {
+            Some(state.model_catalog.refresh_interval().as_secs().to_string())
+        }
+        "capture_fingerprint_path" => state
+            .capture_fingerprint_path
+            .as_ref()
+            .map(|p| p.display().to_string()),
+        "admin_token" => None,
+        _ => None,
+    }
+}
+
+/// One config field as the Settings page consumes it. The 10 `class: "live"` fields carry their
+/// current `RuntimeSettings` value + clamp bounds; the rest are informational (see `FIELD_SPECS`'s
+/// doc). `admin_token`'s `value` is always `None` (never the token string — presence only).
+#[derive(Serialize)]
+pub struct SettingFieldView {
+    pub key: &'static str,
+    pub value: Option<String>,
+    pub default: String,
+    pub class: &'static str,
+    pub kind: &'static str,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+/// `GET /api/settings` response: every `ServeConfig` field, live-editable or not.
+#[derive(Serialize)]
+pub struct SettingsView {
+    pub fields: Vec<SettingFieldView>,
+}
+
+/// `GET /api/settings` — the full running config, for the dashboard Settings page: the 10
+/// live-editable fields with their CURRENT `RuntimeSettings` value + clamp bounds, plus every
+/// restart-only/fixed field as an informational row (see `FIELD_SPECS`). Content-free:
+/// `admin_token` never carries a value, and this handler returns config shape only — never a
+/// token, request, or conversation content.
+pub async fn settings_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let rs = &state.runtime_settings;
+    let fields = FIELD_SPECS
+        .iter()
+        .map(|spec| {
+            let value = if spec.class == "live" {
+                Some(live_value(rs, spec.key))
+            } else {
+                restart_or_fixed_value(&state, spec.key)
+            };
+            // starvation_heartbeat's max is cross-field/dynamic — see FieldSpec's doc.
+            let max = if spec.key == "starvation_heartbeat" {
+                Some(rs.starvation_wait_budget().as_secs() as f64)
+            } else {
+                spec.max
+            };
+            SettingFieldView {
+                key: spec.key,
+                value,
+                default: spec.default.to_string(),
+                class: spec.class,
+                kind: spec.kind,
+                min: spec.min,
+                max,
+            }
+        })
+        .collect();
+    Json(SettingsView { fields })
+}
+
 /// A tiny JSON responder: `Ok(200, body)` or a content-safe `500` (the store error's own text is
 /// never surfaced — a read failure returns a generic body, like the ingress error paths).
 enum Response<T: Serialize> {
