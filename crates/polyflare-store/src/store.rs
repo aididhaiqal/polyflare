@@ -13,6 +13,7 @@ use crate::account::AccountRepo;
 use crate::api_key_repo::ApiKeyRepo;
 use crate::continuity_repo::ContinuityRepo;
 use crate::request_log_repo::RequestLogRepo;
+use crate::settings_repo::SettingsRepo;
 use crate::StoreError;
 
 /// Owns the SQLite connection pool. The pool is reference-counted, so cloning it is cheap.
@@ -120,5 +121,12 @@ impl Store {
     /// indexed `get_by_hash` per request, not a cached snapshot.
     pub fn api_keys(&self) -> ApiKeyRepo {
         ApiKeyRepo::new(self.pool.clone())
+    }
+
+    /// The settings repository over this store's pool (Settings-subsystem Task 3). No
+    /// generation-bump wiring: nothing in-process caches `settings` rows today, so there is
+    /// nothing here for a generation counter to invalidate.
+    pub fn settings(&self) -> SettingsRepo {
+        SettingsRepo::new(self.pool.clone())
     }
 }
