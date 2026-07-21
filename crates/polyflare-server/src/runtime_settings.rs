@@ -291,8 +291,21 @@ pub fn parse_setting_value(key: &str, s: &str) -> Option<SettingValue> {
 /// divergence between the two). Content-free: only the key name is ever logged, never the value —
 /// mirrors every other content-safety chokepoint in this crate, even though these particular
 /// values are non-secret config knobs, not conversation content.
+///
+/// Applied in `read_api::LIVE_KEYS_ORDER` — the SAME fixed canonical order (with
+/// `starvation_wait_budget` before `starvation_heartbeat`) `write_api::patch_settings_handler`
+/// uses for a live PATCH — never `overlay`'s own `HashMap` iteration order, which is
+/// nondeterministic across runs. Without this, a persisted budget+heartbeat pair applied
+/// heartbeat-first would clamp against the still-seeded default budget rather than the
+/// about-to-be-applied persisted one, settling on a different (wrong) heartbeat depending on
+/// hash-iteration luck — see `crate::runtime_settings`'s module doc's Ordering note. A key in
+/// `overlay` that isn't one of the 10 live keys is never visited (there is no persisted row for
+/// it to skip past), matching `parse_setting_value`'s `None` for an unknown key.
 pub fn overlay_persisted_settings(rs: &RuntimeSettings, overlay: &HashMap<String, String>) {
-    for (key, raw) in overlay {
+    for key in crate::read_api::LIVE_KEYS_ORDER {
+        let Some(raw) = overlay.get(*key) else {
+            continue;
+        };
         match parse_setting_value(key, raw) {
             Some(v) => {
                 let _ = rs.set(key, v);
@@ -675,6 +688,34 @@ mod tests {
         overlay.insert("not_a_real_setting".to_string(), "whatever".to_string());
         overlay_persisted_settings(&rs, &overlay);
         assert_eq!(rs.max_account_attempts(), 7);
+    }
+
+    #[test]
+    fn overlay_persisted_settings_applies_budget_before_heartbeat_regardless_of_hashmap_insertion_order(
+    ) {
+        // test_config seeds starvation_wait_budget = 120s, starvation_heartbeat = 15s. The
+        // persisted overlay below carries budget=20/heartbeat=80: a heartbeat-first apply would
+        // clamp 80 against the still-seeded 120s budget (settling at 80, which then exceeds the
+        // budget once it lands at 20 -- wrong and dependent on the HashMap's nondeterministic
+        // iteration order). Inserted heartbeat-before-budget here (the "wrong" order) to prove
+        // the fixed `read_api::LIVE_KEYS_ORDER` application order is what governs, not insertion
+        // order or hash iteration order.
+        let rs = RuntimeSettings::new(&test_config());
+        let mut overlay = HashMap::new();
+        overlay.insert("starvation_heartbeat".to_string(), "80".to_string());
+        overlay.insert("starvation_wait_budget".to_string(), "20".to_string());
+
+        overlay_persisted_settings(&rs, &overlay);
+
+        assert_eq!(rs.starvation_wait_budget(), Duration::from_secs(20));
+        assert!(
+            rs.starvation_heartbeat() <= rs.starvation_wait_budget(),
+            "heartbeat ({:?}) must be clamped to the persisted budget ({:?}), not the seeded \
+             default budget (120s)",
+            rs.starvation_heartbeat(),
+            rs.starvation_wait_budget()
+        );
+        assert_eq!(rs.starvation_heartbeat(), Duration::from_secs(20));
     }
 
     #[test]
