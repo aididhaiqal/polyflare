@@ -17,6 +17,7 @@ use polyflare_server::continuity::CodexContinuity;
 use polyflare_server::model_catalog::{
     floor_only_cache, HttpModelSource, ModelCatalogCache, ModelSource,
 };
+use polyflare_server::runtime_settings::{overlay_persisted_settings, RuntimeSettings};
 use polyflare_store::{import_from_codex_lb, Account, PlainTokens, Store, TokenCipher};
 
 #[derive(Parser)]
@@ -165,6 +166,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServeConfig::from_env()?;
     let store = Store::open(&config.db_path).await?;
+    // Live-editable Settings subsystem Task 4: seed the atomic holder from the already-clamped
+    // `ServeConfig` — BEFORE any field of `config` below is partially moved out of it
+    // (`RuntimeSettings::new` needs a whole-struct borrow, which the borrow checker forbids once a
+    // single field has been moved), then overlay any persisted `settings` table rows on top (DB
+    // overrides beat the env/file defaults `ServeConfig::from_env` already resolved). A persisted
+    // row that fails to parse (unknown key, or a value of the wrong shape for its field) is
+    // skipped — see `overlay_persisted_settings`'s doc.
+    let runtime_settings = Arc::new(RuntimeSettings::new(&config));
+    let settings_overlay = store.settings().get_all().await?;
+    overlay_persisted_settings(&runtime_settings, &settings_overlay);
     // D18 Task 4: the bind-address-aware posture — resolved ONCE here, BEFORE `AppState`/`build_app`,
     // using only already-available inputs (does any key exist yet; the configured bind; the
     // explicit override env var). See `polyflare_server::posture` for the full decision table and
@@ -264,22 +275,13 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         token_cache: Arc::new(polyflare_server::token_cache::TokenCache::new()),
         runtime: Default::default(),
         admin_token: config.admin_token,
-        live_logs: config.live_logs,
+        runtime_settings,
         ws_downstream: config.ws_downstream,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
-        max_account_attempts: config.max_account_attempts,
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
-        starvation_wait_budget: config.starvation_wait_budget,
-        starvation_heartbeat: config.starvation_heartbeat,
-        wake_jitter_ms: config.wake_jitter_ms,
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         enforce_client_keys,
-        stream_idle_timeout: config.stream_idle_timeout,
-        soft_drain_enabled: config.soft_drain_enabled,
-        request_log_retention_days: config.request_log_retention_days,
-        usage_history_retention_days: config.usage_history_retention_days,
-        inflight_penalty_pct: config.inflight_penalty_pct,
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
         upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),

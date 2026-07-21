@@ -16,6 +16,7 @@ use polyflare_codex::CodexExecutor;
 use polyflare_core::{CapacityWeighted, Continuity};
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::continuity::CodexContinuity;
+use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
 use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
 use polyflare_testkit::MockUpstream;
 
@@ -100,16 +101,22 @@ async fn spawn_polyflare(upstream: String, idle: Duration) -> String {
         token_cache: Default::default(),
         runtime: Default::default(),
         admin_token: None,
-        live_logs: false,
+        runtime_settings: Arc::new(RuntimeSettings::new_from_fields(RuntimeSettingsFields {
+            max_account_attempts: 3,
+            starvation_wait_budget: Duration::from_secs(60),
+            starvation_heartbeat: Duration::from_secs(10),
+            wake_jitter_ms: 0,
+            stream_idle_timeout: idle,
+            inflight_penalty_pct: 2.5,
+            soft_drain_enabled: true,
+            request_log_retention_days: 0,
+            usage_history_retention_days: 0,
+            live_logs: false,
+        })),
         ws_downstream: false,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
-        max_account_attempts: 3,
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
-        starvation_wait_budget: Duration::from_secs(60),
-        starvation_heartbeat: Duration::from_secs(10),
-        wake_jitter_ms: 0,
-        inflight_penalty_pct: 2.5,
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
         upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
@@ -119,10 +126,6 @@ async fn spawn_polyflare(upstream: String, idle: Duration) -> String {
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         // The field under test: everything else here is boilerplate identical to every other
         // e2e harness in this crate (see `tests/e2e_passthrough.rs`).
-        stream_idle_timeout: idle,
-        soft_drain_enabled: true,
-        request_log_retention_days: 0,
-        usage_history_retention_days: 0,
     });
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -133,14 +136,24 @@ async fn spawn_polyflare(upstream: String, idle: Duration) -> String {
     format!("http://{addr}")
 }
 
-/// A SHORT configured idle (200ms) against a byte-then-stall upstream: the client must receive its
+/// A SHORT configured idle (1s) against a byte-then-stall upstream: the client must receive its
 /// byte, then a BOUNDED terminal — never a hang — within roughly the configured window. Bounded by
 /// an outer `tokio::time::timeout(5s, ...)` so a regression (the field silently not reaching
 /// `ObservingStream`, i.e. still using the old 300s `DEFAULT_STREAM_IDLE_TIMEOUT` placeholder)
 /// fails fast as "Elapsed", never as an actual CI hang.
+///
+/// Live-editable Settings subsystem Task 4: `idle` now round-trips through
+/// `AppState.runtime_settings` (`crate::runtime_settings::RuntimeSettings`), which — like
+/// `POLYFLARE_STREAM_IDLE_TIMEOUT_SECS`'s own whole-seconds contract — stores this field at
+/// SECOND granularity (`Duration::as_secs()`/`Duration::from_secs()`; see that module's doc). A
+/// sub-second value (the ORIGINAL 200ms this test used, back when `AppState.stream_idle_timeout`
+/// was a plain full-precision `Duration` field) truncates to `0` on that round-trip — which reads
+/// as the documented "disabled" lever, not "very short" — so this now uses the shortest value that
+/// still round-trips exactly: 1 whole second. No real config path can ever produce a sub-second
+/// value anyway (the env var is seconds-only), so this is not a loss of any behavior under test.
 #[tokio::test]
 async fn configured_idle_timeout_terminates_a_stalled_upstream_within_the_bound() {
-    let idle = Duration::from_millis(200);
+    let idle = Duration::from_secs(1);
     let mock = MockUpstream::stall_after_first(
         r#"{"type":"response.output_text.delta","delta":"first-byte"}"#,
     );

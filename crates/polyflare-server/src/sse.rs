@@ -21,7 +21,7 @@ use crate::log_bus::LogEvent;
 /// Streams the content-free log bus as SSE frames: the current backfill snapshot first (oldest
 /// first), then live events as they're published. `404`s when `AppState::live_logs` is off.
 pub async fn logs_stream_handler(State(s): State<Arc<AppState>>) -> Response {
-    if !s.live_logs {
+    if !s.runtime_settings.live_logs() {
         return (StatusCode::NOT_FOUND, "live logs disabled").into_response();
     }
     let (backfill, rx) = s.log_bus.subscribe();

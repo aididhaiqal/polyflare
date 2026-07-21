@@ -19,6 +19,7 @@ use polyflare_core::{Continuity, Executor, RoundRobin};
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::continuity::CodexContinuity;
 use polyflare_server::keys::sha256_hex;
+use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
 use polyflare_server::session_key::header_session_key;
 use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
 use polyflare_testkit::MockControlUpstream;
@@ -105,16 +106,22 @@ async fn spawn_app(enforce_client_keys: bool, mock_base: &str) -> (String, Arc<A
         token_cache: Default::default(),
         runtime: Default::default(),
         admin_token: None,
-        live_logs: false,
+        runtime_settings: Arc::new(RuntimeSettings::new_from_fields(RuntimeSettingsFields {
+            max_account_attempts: 3,
+            starvation_wait_budget: Duration::from_secs(60),
+            starvation_heartbeat: Duration::from_secs(10),
+            wake_jitter_ms: 0,
+            stream_idle_timeout: Duration::from_secs(300),
+            inflight_penalty_pct: 2.5,
+            soft_drain_enabled: true,
+            request_log_retention_days: 0,
+            usage_history_retention_days: 0,
+            live_logs: false,
+        })),
         ws_downstream: false,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
-        max_account_attempts: 3,
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
-        starvation_wait_budget: Duration::from_secs(60),
-        starvation_heartbeat: Duration::from_secs(10),
-        wake_jitter_ms: 0,
-        inflight_penalty_pct: 2.5,
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
         upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
@@ -122,10 +129,6 @@ async fn spawn_app(enforce_client_keys: bool, mock_base: &str) -> (String, Arc<A
         model_catalog: polyflare_server::model_catalog::floor_only_model_catalog(),
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
-        stream_idle_timeout: Duration::from_secs(300),
-        soft_drain_enabled: true,
-        request_log_retention_days: 0,
-        usage_history_retention_days: 0,
         enforce_client_keys,
     });
 

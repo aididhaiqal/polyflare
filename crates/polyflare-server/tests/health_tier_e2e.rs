@@ -24,6 +24,7 @@ use polyflare_core::{AccountId, AccountSnapshot, CapacityWeighted, Continuity, S
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::continuity::CodexContinuity;
 use polyflare_server::observability::emit_health_tier_signal;
+use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
 use polyflare_store::{Store, TokenCipher};
 
 /// A real `AppState` (no HTTP upstream needed — this exercises the in-memory selection path only),
@@ -59,16 +60,22 @@ async fn state(soft_drain_enabled: bool) -> Arc<AppState> {
         token_cache: Default::default(),
         runtime: Default::default(),
         admin_token: None,
-        live_logs: true,
+        runtime_settings: Arc::new(RuntimeSettings::new_from_fields(RuntimeSettingsFields {
+            max_account_attempts: 3,
+            starvation_wait_budget: Duration::from_secs(60),
+            starvation_heartbeat: Duration::from_secs(10),
+            wake_jitter_ms: 0,
+            stream_idle_timeout: Duration::from_secs(300),
+            inflight_penalty_pct: 2.5,
+            soft_drain_enabled,
+            request_log_retention_days: 0,
+            usage_history_retention_days: 0,
+            live_logs: true,
+        })),
         ws_downstream: false,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
-        max_account_attempts: 3,
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
-        starvation_wait_budget: Duration::from_secs(60),
-        starvation_heartbeat: Duration::from_secs(10),
-        wake_jitter_ms: 0,
-        inflight_penalty_pct: 2.5,
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
         upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
@@ -76,10 +83,6 @@ async fn state(soft_drain_enabled: bool) -> Arc<AppState> {
         model_catalog: polyflare_server::model_catalog::floor_only_model_catalog(),
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
-        stream_idle_timeout: Duration::from_secs(300),
-        soft_drain_enabled,
-        request_log_retention_days: 0,
-        usage_history_retention_days: 0,
     });
     // Prove the router still builds with the new field present (no route churn).
     let _app = build_app(state.clone());
@@ -161,7 +164,7 @@ async fn draining_account_is_depreferred_in_live_selection() {
 #[tokio::test]
 async fn disable_lever_resets_tier_and_unskews_selection() {
     let state = state(false).await;
-    assert!(!state.soft_drain_enabled);
+    assert!(!state.runtime_settings.soft_drain_enabled());
     let now = 2_000_000;
     let a = AccountId::from("acct-a");
 
@@ -179,7 +182,14 @@ async fn disable_lever_resets_tier_and_unskews_selection() {
     // `disabled_reset` transition — the codex-lb disable path, end-to-end.
     let reset = state
         .runtime
-        .evaluate_with_usage(&a, Some(10.0), None, false, state.soft_drain_enabled, now)
+        .evaluate_with_usage(
+            &a,
+            Some(10.0),
+            None,
+            false,
+            state.runtime_settings.soft_drain_enabled(),
+            now,
+        )
         .expect("the poller reset from DRAINING→HEALTHY is a real transition");
     assert_eq!(
         (reset.from, reset.to, reset.reason),

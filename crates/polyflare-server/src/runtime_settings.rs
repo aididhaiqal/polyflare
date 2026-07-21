@@ -13,6 +13,7 @@
 //! budget is visible at that instant, and a later budget edit does not retroactively re-validate
 //! an already-stored heartbeat.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -71,6 +72,22 @@ pub struct RuntimeSettings {
     live_logs: AtomicBool,
 }
 
+/// Named-field seed for [`RuntimeSettings::new_from_fields`] — see that fn's doc. Field names/
+/// types mirror `ServeConfig`'s (and the former `AppState`'s) 10 live-editable fields exactly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RuntimeSettingsFields {
+    pub max_account_attempts: u32,
+    pub starvation_wait_budget: Duration,
+    pub starvation_heartbeat: Duration,
+    pub wake_jitter_ms: u64,
+    pub stream_idle_timeout: Duration,
+    pub inflight_penalty_pct: f64,
+    pub soft_drain_enabled: bool,
+    pub request_log_retention_days: u32,
+    pub usage_history_retention_days: u32,
+    pub live_logs: bool,
+}
+
 /// Narrow a `u64` submitted via `SettingValue::U64` into the `u32` an atomic field actually
 /// stores. A value above `u32::MAX` saturates rather than truncates — an absurd input (e.g.
 /// `u32::MAX + 2`) must saturate to the largest representable count and then hit the field's own
@@ -96,6 +113,29 @@ impl RuntimeSettings {
             request_log_retention_days: AtomicU32::new(cfg.request_log_retention_days),
             usage_history_retention_days: AtomicU32::new(cfg.usage_history_retention_days),
             live_logs: AtomicBool::new(cfg.live_logs),
+        }
+    }
+
+    /// Task 4 test seam: build directly from the 10 field values, bypassing `ServeConfig` — for
+    /// the many test harnesses across the crate that construct `AppState` by hand (rather than
+    /// through `ServeConfig::from_env`/`serve`) and therefore have no `ServeConfig` to pass to
+    /// [`RuntimeSettings::new`]. Named-field input (`RuntimeSettingsFields`), not positional
+    /// args, so a large mechanical call-site migration can't silently transpose two same-typed
+    /// fields (e.g. the two `Duration`s or the two retention `u32`s). Does not itself clamp —
+    /// mirrors `new`'s contract: callers pass already-in-range values, exactly as those same call
+    /// sites already did as bare `AppState` field literals before this task.
+    pub fn new_from_fields(f: RuntimeSettingsFields) -> Self {
+        Self {
+            max_account_attempts: AtomicU32::new(f.max_account_attempts),
+            starvation_wait_budget: AtomicU32::new(f.starvation_wait_budget.as_secs() as u32),
+            starvation_heartbeat: AtomicU32::new(f.starvation_heartbeat.as_secs() as u32),
+            wake_jitter_ms: AtomicU64::new(f.wake_jitter_ms),
+            stream_idle_timeout: AtomicU64::new(f.stream_idle_timeout.as_secs()),
+            inflight_penalty_pct: AtomicU64::new(f.inflight_penalty_pct.to_bits()),
+            soft_drain_enabled: AtomicBool::new(f.soft_drain_enabled),
+            request_log_retention_days: AtomicU32::new(f.request_log_retention_days),
+            usage_history_retention_days: AtomicU32::new(f.usage_history_retention_days),
+            live_logs: AtomicBool::new(f.live_logs),
         }
     }
 
@@ -211,6 +251,55 @@ impl RuntimeSettings {
                 Ok(b.to_string())
             }
             _ => Err(SettingsError::UnknownKey(key.to_string())),
+        }
+    }
+}
+
+/// Task 4 (wiring): parse a persisted `settings` table row's string `value` into the
+/// [`SettingValue`] variant [`RuntimeSettings::set`] expects for `key`, per that field's kind
+/// (see `SettingValue`'s doc for the three families). Pure and total: an unknown `key` (not one of
+/// the 10 live-editable fields) or a `value` that fails to parse as that field's kind both yield
+/// `None` — the caller ([`overlay_persisted_settings`]) treats `None` as "skip this row," never a
+/// panic, and never a partial/best-guess apply. A row that PARSES but is out of range (e.g.
+/// `max_account_attempts=99999`) is NOT this function's concern — it returns `Some`, and `set`'s
+/// own `clamp_<field>` re-validation (already the single source of truth for every bound) handles
+/// that at apply time, exactly as it does for a live PATCH.
+pub fn parse_setting_value(key: &str, s: &str) -> Option<SettingValue> {
+    match key {
+        "soft_drain_enabled" | "live_logs" => s.parse::<bool>().ok().map(SettingValue::Bool),
+        "inflight_penalty_pct" => s.parse::<f64>().ok().map(SettingValue::F64),
+        "max_account_attempts"
+        | "starvation_wait_budget"
+        | "starvation_heartbeat"
+        | "wake_jitter_ms"
+        | "stream_idle_timeout"
+        | "request_log_retention_days"
+        | "usage_history_retention_days" => s.parse::<u64>().ok().map(SettingValue::U64),
+        _ => None,
+    }
+}
+
+/// Task 4 (wiring): the startup overlay — apply every persisted `settings` row in `overlay` onto
+/// `rs`, layering DB overrides (from a prior live PATCH, a later task) on top of the env/file-
+/// resolved defaults `rs` was already seeded with ([`RuntimeSettings::new`]). Each row is parsed
+/// via [`parse_setting_value`] and, if it parses, applied via `rs.set` (re-validated/clamped
+/// exactly like a live PATCH — never a second, divergent bound). A row that fails to parse
+/// (unknown key, or a value of the wrong shape for its field) is skipped — `set`'s own `Result` is
+/// also ignored here (a `WrongKind`/`UnknownKey` from `set` can't actually occur once
+/// `parse_setting_value` has already matched `key` to the right `SettingValue` variant, but
+/// discarding it rather than `unwrap`ing keeps this function infallible against any future
+/// divergence between the two). Content-free: only the key name is ever logged, never the value —
+/// mirrors every other content-safety chokepoint in this crate, even though these particular
+/// values are non-secret config knobs, not conversation content.
+pub fn overlay_persisted_settings(rs: &RuntimeSettings, overlay: &HashMap<String, String>) {
+    for (key, raw) in overlay {
+        match parse_setting_value(key, raw) {
+            Some(v) => {
+                let _ = rs.set(key, v);
+            }
+            None => {
+                tracing::warn!(key = %key, "settings overlay: skipping unparseable persisted row");
+            }
         }
     }
 }
@@ -505,5 +594,96 @@ mod tests {
             .set("wake_jitter_ms", SettingValue::F64(1.0))
             .unwrap_err();
         assert_eq!(err, SettingsError::WrongKind("wake_jitter_ms".to_string()));
+    }
+
+    // --- Task 4 (wiring): `parse_setting_value` / `overlay_persisted_settings` ---
+
+    #[test]
+    fn parse_setting_value_parses_each_kind_family() {
+        assert_eq!(
+            parse_setting_value("max_account_attempts", "7"),
+            Some(SettingValue::U64(7))
+        );
+        assert_eq!(
+            parse_setting_value("live_logs", "true"),
+            Some(SettingValue::Bool(true))
+        );
+        assert_eq!(
+            parse_setting_value("soft_drain_enabled", "false"),
+            Some(SettingValue::Bool(false))
+        );
+        assert_eq!(
+            parse_setting_value("inflight_penalty_pct", "12.5"),
+            Some(SettingValue::F64(12.5))
+        );
+    }
+
+    #[test]
+    fn parse_setting_value_unknown_key_is_none() {
+        assert_eq!(parse_setting_value("not_a_real_setting", "1"), None);
+    }
+
+    #[test]
+    fn parse_setting_value_unparseable_value_is_none() {
+        assert_eq!(
+            parse_setting_value("max_account_attempts", "notanint"),
+            None
+        );
+        assert_eq!(parse_setting_value("live_logs", "notabool"), None);
+        assert_eq!(
+            parse_setting_value("inflight_penalty_pct", "notafloat"),
+            None
+        );
+    }
+
+    #[test]
+    fn overlay_persisted_settings_applies_a_known_row_beating_the_seeded_default() {
+        let rs = RuntimeSettings::new(&test_config()); // seeds max_account_attempts = 5
+        let mut overlay = HashMap::new();
+        overlay.insert("max_account_attempts".to_string(), "7".to_string());
+        overlay_persisted_settings(&rs, &overlay);
+        assert_eq!(rs.max_account_attempts(), 7);
+    }
+
+    #[test]
+    fn overlay_persisted_settings_flips_a_bool_key() {
+        let rs = RuntimeSettings::new(&test_config()); // seeds live_logs = false
+        let mut overlay = HashMap::new();
+        overlay.insert("live_logs".to_string(), "true".to_string());
+        overlay_persisted_settings(&rs, &overlay);
+        assert!(rs.live_logs());
+    }
+
+    #[test]
+    fn overlay_persisted_settings_skips_an_invalid_row_leaving_the_seeded_default() {
+        let rs = RuntimeSettings::new(&test_config()); // seeds max_account_attempts = 5
+        let mut overlay = HashMap::new();
+        overlay.insert("max_account_attempts".to_string(), "notanint".to_string());
+        overlay_persisted_settings(&rs, &overlay);
+        assert_eq!(
+            rs.max_account_attempts(),
+            5,
+            "an unparseable persisted row is skipped, not applied or defaulted to 0"
+        );
+    }
+
+    #[test]
+    fn overlay_persisted_settings_skips_an_unknown_key_without_affecting_known_ones() {
+        let rs = RuntimeSettings::new(&test_config());
+        let mut overlay = HashMap::new();
+        overlay.insert("max_account_attempts".to_string(), "7".to_string());
+        overlay.insert("not_a_real_setting".to_string(), "whatever".to_string());
+        overlay_persisted_settings(&rs, &overlay);
+        assert_eq!(rs.max_account_attempts(), 7);
+    }
+
+    #[test]
+    fn overlay_persisted_settings_on_empty_overlay_leaves_every_seeded_default() {
+        let cfg = test_config();
+        let rs = RuntimeSettings::new(&cfg);
+        overlay_persisted_settings(&rs, &HashMap::new());
+        assert_eq!(rs.max_account_attempts(), 5);
+        assert_eq!(rs.starvation_wait_budget(), Duration::from_secs(120));
+        assert!(!rs.live_logs());
     }
 }
