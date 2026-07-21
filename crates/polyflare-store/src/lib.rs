@@ -8,6 +8,7 @@ pub mod continuity_repo;
 pub mod crypto;
 pub mod import;
 pub mod request_log_repo;
+pub mod settings_repo;
 pub mod store;
 
 pub use account::{Account, AccountRepo, EncryptedTokens, PlainTokens, UsageSnapshot, WindowUsage};
@@ -19,6 +20,7 @@ pub use request_log_repo::{
     RecentErrorRow, ReportBreakdownRow, ReportBucket, ReportMetrics, RequestAggregate,
     RequestBucket, RequestLogRecord, RequestLogRepo, RequestLogRow, RequestsFilter,
 };
+pub use settings_repo::SettingsRepo;
 pub use store::Store;
 
 /// Errors surfaced by the store, crypto, and importer.
