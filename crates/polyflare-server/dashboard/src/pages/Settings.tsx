@@ -282,7 +282,7 @@ function LiveFieldRow({
       return;
     }
     const n = Number(raw);
-    if (Number.isNaN(n)) return;
+    if (raw.trim() === "" || Number.isNaN(n)) return;
     onSave(field.key, n);
   }
 
