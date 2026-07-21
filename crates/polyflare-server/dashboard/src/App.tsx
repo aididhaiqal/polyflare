@@ -15,6 +15,7 @@ import { Pools } from "./pages/Pools";
 import { Reports } from "./pages/Reports";
 import { Requests } from "./pages/Requests";
 import { Sessions } from "./pages/Sessions";
+import { Settings } from "./pages/Settings";
 import { Shell } from "./shell/Shell";
 import { ToastProvider } from "./ui/Toast";
 
@@ -52,6 +53,7 @@ export function App() {
                 <Route path="requests" element={<Requests />} />
                 <Route path="sessions" element={<Sessions />} />
                 <Route path="reports" element={<Reports />} />
+                <Route path="settings" element={<Settings />} />
                 <Route path="logs" element={<LiveLogs />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
               </Route>
