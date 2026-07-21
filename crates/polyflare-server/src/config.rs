@@ -304,11 +304,23 @@ pub fn max_account_attempts_from_env() -> u32 {
     const DEFAULT: u32 = 3;
     match std::env::var("POLYFLARE_MAX_ACCOUNT_ATTEMPTS") {
         Ok(raw) => match raw.trim().parse::<u32>() {
-            Ok(0) => 1,
-            Ok(n) => n,
+            Ok(n) => clamp_max_account_attempts(n),
             Err(_) => DEFAULT,
         },
         Err(_) => DEFAULT,
+    }
+}
+
+/// The pure bound [`max_account_attempts_from_env`] applies to an already-parsed value: an
+/// explicit, well-formed `0` floors UP to `1` (a failover loop always needs at least one attempt —
+/// see that function's doc); every other value passes through unchanged (no upper bound). Extracted
+/// so the (later) settings PATCH handler validates a live update against the exact same bound the
+/// boot path uses — one source of truth, not two copies that can drift.
+pub fn clamp_max_account_attempts(raw: u32) -> u32 {
+    if raw == 0 {
+        1
+    } else {
+        raw
     }
 }
 
@@ -344,15 +356,26 @@ pub fn max_account_attempts_from_env() -> u32 {
 ///   on immediately.
 pub fn starvation_wait_budget_secs_from_env() -> u32 {
     const DEFAULT: u32 = 60;
-    const MAX: u32 = 300;
     match std::env::var("POLYFLARE_STARVATION_WAIT_BUDGET_SECS") {
         Ok(raw) => match raw.trim().parse::<u32>() {
-            Ok(0) => 0,
-            Ok(n) if n > MAX => MAX,
-            Ok(n) => n,
+            Ok(n) => clamp_starvation_wait_budget_secs(n),
             Err(_) => DEFAULT,
         },
         Err(_) => DEFAULT,
+    }
+}
+
+/// The pure bound [`starvation_wait_budget_secs_from_env`] applies to an already-parsed value:
+/// `0` is the documented DISABLE LEVER and passes through as-is (not a clamp target — see that
+/// function's doc); any other value clamps to `[.., 300]` (codex-lb's `MAX=300s`; there is no
+/// explicit floor here besides `0` itself, since `0` is a distinct, meaningful branch). Extracted
+/// for the same one-source-of-truth reason as [`clamp_max_account_attempts`].
+pub fn clamp_starvation_wait_budget_secs(raw: u32) -> u32 {
+    const MAX: u32 = 300;
+    match raw {
+        0 => 0,
+        n if n > MAX => MAX,
+        n => n,
     }
 }
 
@@ -373,6 +396,16 @@ pub fn starvation_heartbeat_secs_from_env(budget_secs: u32) -> u32 {
         Ok(s) => s.trim().parse::<u32>().unwrap_or(DEFAULT),
         Err(_) => DEFAULT,
     };
+    clamp_starvation_heartbeat_secs(raw, budget_secs)
+}
+
+/// The pure bound [`starvation_heartbeat_secs_from_env`] applies to an already-parsed value:
+/// `[1, budget_secs.max(1)]` — the heartbeat can never be `0` (no sane reading of its own) and
+/// can never exceed the (already-resolved) wait budget it ticks within. Cross-field: takes
+/// `budget_secs` as a second argument rather than reading it from env, so callers (boot AND the
+/// later settings PATCH handler) must resolve/validate the budget first, mirroring
+/// [`starvation_heartbeat_secs_from_env`]'s own "call this AFTER the budget" contract.
+pub fn clamp_starvation_heartbeat_secs(raw: u32, budget_secs: u32) -> u32 {
     raw.clamp(1, budget_secs.max(1))
 }
 
@@ -402,15 +435,26 @@ pub fn starvation_heartbeat_secs_from_env(budget_secs: u32) -> u32 {
 /// silently accepted as-is, never treated as malformed.
 pub fn stream_idle_timeout_secs_from_env() -> u64 {
     let default = crate::ingress::DEFAULT_STREAM_IDLE_TIMEOUT.as_secs();
-    const MAX: u64 = 3600;
     match std::env::var("POLYFLARE_STREAM_IDLE_TIMEOUT_SECS") {
         Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(0) => 0,
-            Ok(n) if n > MAX => MAX,
-            Ok(n) => n,
+            Ok(n) => clamp_stream_idle_timeout_secs(n),
             Err(_) => default,
         },
         Err(_) => default,
+    }
+}
+
+/// The pure bound [`stream_idle_timeout_secs_from_env`] applies to an already-parsed value: `0` is
+/// the documented DISABLE LEVER and passes through as-is (not a clamp target — see that function's
+/// doc); any other value clamps to `[.., 3600]` (1h — an absurd upper bound no genuine upstream
+/// response should ever legitimately need to stay silent for). Extracted for the same
+/// one-source-of-truth reason as [`clamp_max_account_attempts`].
+pub fn clamp_stream_idle_timeout_secs(raw: u64) -> u64 {
+    const MAX: u64 = 3600;
+    match raw {
+        0 => 0,
+        n if n > MAX => MAX,
+        n => n,
     }
 }
 
@@ -428,15 +472,23 @@ pub fn stream_idle_timeout_secs_from_env() -> u64 {
 /// every other malformed-input decision in this module.
 pub fn wake_jitter_ms_from_env() -> u64 {
     const DEFAULT: u64 = 0;
-    const MAX: u64 = 30_000;
     match std::env::var("POLYFLARE_STARVATION_WAKE_JITTER_MS") {
         Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(n) if n > MAX => MAX,
-            Ok(n) => n,
+            Ok(n) => clamp_wake_jitter_ms(n),
             Err(_) => DEFAULT,
         },
         Err(_) => DEFAULT,
     }
+}
+
+/// The pure bound [`wake_jitter_ms_from_env`] applies to an already-parsed value: clamps to
+/// `[.., 30_000]`ms (an absolute ceiling so a hostile/huge value can't blow the B5 wait budget);
+/// `0` has no special case here — unlike the other knobs' `0`, it's naturally the value that falls
+/// out of "no jitter", not a distinct disable branch. Extracted for the same one-source-of-truth
+/// reason as [`clamp_max_account_attempts`].
+pub fn clamp_wake_jitter_ms(raw: u64) -> u64 {
+    const MAX: u64 = 30_000;
+    raw.min(MAX)
 }
 
 /// B8 Task 3: `POLYFLARE_SOFT_DRAIN_ENABLED` — the codex-lb `soft_drain_enabled` disable lever for
@@ -490,16 +542,33 @@ pub fn soft_drain_enabled_from_env() -> bool {
 /// folded into the weight).
 pub fn inflight_penalty_pct_from_env() -> f64 {
     const DEFAULT: f64 = 2.5;
-    const MAX: f64 = 50.0;
     match std::env::var("POLYFLARE_INFLIGHT_PENALTY_PCT") {
         Ok(raw) => match raw.trim().parse::<f64>() {
-            Ok(n) if n.is_nan() => DEFAULT,
-            Ok(n) if n < 0.0 => 0.0,
-            Ok(n) if n > MAX => MAX,
-            Ok(n) => n,
+            Ok(n) => clamp_inflight_penalty_pct(n),
             Err(_) => DEFAULT,
         },
         Err(_) => DEFAULT,
+    }
+}
+
+/// The pure bound [`inflight_penalty_pct_from_env`] applies to an already-parsed value: `NaN` (a
+/// value that parses successfully as a float — e.g. the literal string `"NaN"` — but is not a
+/// number) maps to the SAME `2.5` default as a parse failure, since NaN comparisons are never
+/// meaningfully "in range" (this is why the NaN check must live IN the clamp, not the caller's
+/// `Err(_)` arm — NaN is an `Ok(n)`, not an `Err`); a negative value floors to `0.0`; a value above
+/// `MAX` (`50.0` — an absolute ceiling so a hostile/huge value can't single-handedly clamp every
+/// account's `eff_used` to 100 off a single in-flight request) clamps down to `MAX`; everything
+/// else passes through unchanged, including the explicit `0.0` disable lever. Extracted for the
+/// same one-source-of-truth reason as [`clamp_max_account_attempts`].
+pub fn clamp_inflight_penalty_pct(raw: f64) -> f64 {
+    const DEFAULT: f64 = 2.5;
+    const MAX: f64 = 50.0;
+    if raw.is_nan() {
+        DEFAULT
+    } else {
+        // Safe to `.clamp()` here — the NaN case (the only input `clamp` itself would mishandle)
+        // is already routed to `DEFAULT` above, and `0.0 <= MAX` is a fixed, valid range.
+        raw.clamp(0.0, MAX)
     }
 }
 
@@ -533,17 +602,40 @@ pub fn usage_history_retention_days_from_env() -> u32 {
 }
 
 /// Shared parse/clamp for the two C12 retention-days knobs (see the two `pub fn`s above): unset or
-/// malformed ⇒ `0` (disabled, fail-safe); a well-formed value clamps to `[0, 3650]`.
+/// malformed ⇒ `0` (disabled, fail-safe); a well-formed value clamps via [`clamp_retention_days`].
 fn retention_days_from_env(var: &str) -> u32 {
-    const MAX: u32 = 3650;
     match std::env::var(var) {
         Ok(raw) => match raw.trim().parse::<u32>() {
-            Ok(n) if n > MAX => MAX,
-            Ok(n) => n,
+            Ok(n) => clamp_retention_days(n),
             Err(_) => 0,
         },
         Err(_) => 0,
     }
+}
+
+/// The shared pure bound both C12 retention-days knobs apply to an already-parsed value: clamps to
+/// `[0, 3650]` (10 years — an absolute ceiling; the field is `u32` and days-since-epoch multiplied
+/// by 86400 must stay a sane `i64`, but the real reason for the cap is that any larger number is not
+/// a meaningful "retention window" for an append-only log table). `0` has no special case — it's
+/// already the floor, so it just passes through. Private: [`clamp_request_log_retention_days`]/
+/// [`clamp_usage_history_retention_days`] below are the public, field-named entry points the (later)
+/// settings PATCH handler validates against — same bound, two names, matching the two `*_from_env`
+/// knobs above.
+fn clamp_retention_days(raw: u32) -> u32 {
+    const MAX: u32 = 3650;
+    raw.min(MAX)
+}
+
+/// Field-named public entry point for [`request_log_retention_days_from_env`]'s bound — see
+/// [`clamp_retention_days`] for the shared logic both retention-days knobs apply.
+pub fn clamp_request_log_retention_days(raw: u32) -> u32 {
+    clamp_retention_days(raw)
+}
+
+/// Field-named public entry point for [`usage_history_retention_days_from_env`]'s bound — see
+/// [`clamp_retention_days`] for the shared logic both retention-days knobs apply.
+pub fn clamp_usage_history_retention_days(raw: u32) -> u32 {
+    clamp_retention_days(raw)
 }
 
 /// D15 Task 3: `POLYFLARE_MODEL_CATALOG_TTL_SECS` — the live upstream model-catalog cache's
@@ -1650,5 +1742,164 @@ mod tests {
         unsafe {
             std::env::remove_var("POLYFLARE_MODEL_CATALOG_ENABLED");
         }
+    }
+
+    // ---- Task 1 (live-editable settings): pure clamp_<field> fns ----
+    // Each expected value here is copied VERBATIM from the corresponding *_from_env edge-case test
+    // above (see that test for the bound's full rationale). These fns are pure — no env var, no
+    // lock needed.
+
+    #[test]
+    fn clamp_max_account_attempts_bounds() {
+        assert_eq!(clamp_max_account_attempts(0), 1, "0 floors to 1");
+        assert_eq!(
+            clamp_max_account_attempts(7),
+            7,
+            "well-formed passes through unchanged"
+        );
+        assert_eq!(clamp_max_account_attempts(1), 1);
+    }
+
+    #[test]
+    fn clamp_starvation_wait_budget_secs_bounds() {
+        assert_eq!(
+            clamp_starvation_wait_budget_secs(0),
+            0,
+            "0 is the disable lever, not a clamp target"
+        );
+        assert_eq!(clamp_starvation_wait_budget_secs(120), 120);
+        assert_eq!(
+            clamp_starvation_wait_budget_secs(500),
+            300,
+            "clamps down to MAX=300"
+        );
+        assert_eq!(
+            clamp_starvation_wait_budget_secs(300),
+            300,
+            "at the MAX boundary"
+        );
+    }
+
+    #[test]
+    fn clamp_starvation_heartbeat_secs_bounds() {
+        assert_eq!(clamp_starvation_heartbeat_secs(10, 60), 10, "within range");
+        assert_eq!(
+            clamp_starvation_heartbeat_secs(50, 5),
+            5,
+            "clamps down to the budget"
+        );
+        assert_eq!(
+            clamp_starvation_heartbeat_secs(0, 60),
+            1,
+            "0 floors to 1, unlike the wait budget's 0"
+        );
+        assert_eq!(
+            clamp_starvation_heartbeat_secs(999, 60),
+            60,
+            "brief's representative edge"
+        );
+        assert_eq!(
+            clamp_starvation_heartbeat_secs(10, 0),
+            1,
+            "budget_secs=0 → ceiling floors to budget_secs.max(1), never panics"
+        );
+    }
+
+    #[test]
+    fn clamp_stream_idle_timeout_secs_bounds() {
+        assert_eq!(
+            clamp_stream_idle_timeout_secs(0),
+            0,
+            "0 is the disable lever, not a clamp target"
+        );
+        assert_eq!(clamp_stream_idle_timeout_secs(30), 30);
+        assert_eq!(
+            clamp_stream_idle_timeout_secs(999_999),
+            3600,
+            "clamps down to MAX=3600 (1h)"
+        );
+        assert_eq!(
+            clamp_stream_idle_timeout_secs(3600),
+            3600,
+            "at the MAX boundary"
+        );
+    }
+
+    #[test]
+    fn clamp_wake_jitter_ms_bounds() {
+        assert_eq!(clamp_wake_jitter_ms(0), 0, "0 is both default and disable");
+        assert_eq!(clamp_wake_jitter_ms(250), 250);
+        assert_eq!(
+            clamp_wake_jitter_ms(999_999),
+            30_000,
+            "clamps down to MAX=30_000ms"
+        );
+        assert_eq!(clamp_wake_jitter_ms(30_000), 30_000, "at the MAX boundary");
+    }
+
+    #[test]
+    fn clamp_inflight_penalty_pct_bounds() {
+        assert_eq!(
+            clamp_inflight_penalty_pct(f64::NAN),
+            2.5,
+            "NaN → the 2.5 default, not passed through"
+        );
+        assert_eq!(
+            clamp_inflight_penalty_pct(-5.0),
+            0.0,
+            "negative floors to 0.0"
+        );
+        assert_eq!(
+            clamp_inflight_penalty_pct(999_999.0),
+            50.0,
+            "clamps down to MAX=50.0"
+        );
+        assert_eq!(
+            clamp_inflight_penalty_pct(5.5),
+            5.5,
+            "well-formed passes through unchanged"
+        );
+        assert_eq!(
+            clamp_inflight_penalty_pct(0.0),
+            0.0,
+            "explicit 0.0 disable lever passes through, distinct from NaN"
+        );
+        assert_eq!(
+            clamp_inflight_penalty_pct(50.0),
+            50.0,
+            "at the MAX boundary"
+        );
+    }
+
+    #[test]
+    fn clamp_request_log_retention_days_bounds() {
+        assert_eq!(clamp_request_log_retention_days(0), 0, "0 is disabled");
+        assert_eq!(clamp_request_log_retention_days(30), 30);
+        assert_eq!(
+            clamp_request_log_retention_days(99_999),
+            3650,
+            "clamps down to MAX=3650 (10y)"
+        );
+        assert_eq!(
+            clamp_request_log_retention_days(3650),
+            3650,
+            "at the MAX boundary"
+        );
+    }
+
+    #[test]
+    fn clamp_usage_history_retention_days_bounds() {
+        assert_eq!(clamp_usage_history_retention_days(0), 0, "0 is disabled");
+        assert_eq!(clamp_usage_history_retention_days(45), 45);
+        assert_eq!(
+            clamp_usage_history_retention_days(99_999),
+            3650,
+            "clamps down to MAX=3650 (10y)"
+        );
+        assert_eq!(
+            clamp_usage_history_retention_days(3650),
+            3650,
+            "at the MAX boundary"
+        );
     }
 }
