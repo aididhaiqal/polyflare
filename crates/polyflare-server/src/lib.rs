@@ -21,6 +21,7 @@ pub mod posture;
 pub mod read_api;
 pub mod refresh_locks;
 pub mod retention;
+pub mod runtime_settings;
 pub mod runtime_state;
 pub mod session_key;
 pub mod snapshot;
