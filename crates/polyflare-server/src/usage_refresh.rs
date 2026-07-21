@@ -299,7 +299,7 @@ pub fn spawn_usage_refresh(state: Arc<AppState>) {
                     &state.upstream_base_url,
                     account,
                     &state.runtime,
-                    state.soft_drain_enabled,
+                    state.runtime_settings.soft_drain_enabled(),
                     &state.log_bus,
                     &state.health_tier_metrics,
                 )
@@ -318,7 +318,7 @@ pub fn spawn_usage_refresh(state: Arc<AppState>) {
                 let transition = evaluate_non_codex_health_tier(
                     &state.runtime,
                     account,
-                    state.soft_drain_enabled,
+                    state.runtime_settings.soft_drain_enabled(),
                     unix_now(),
                 );
                 if let Some(t) = transition {

@@ -63,9 +63,11 @@ const PERSIST_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 /// Stream-idle-timeout plan (`docs/superpowers/plans/2026-07-18-stream-idle-timeout.md`) Task 2:
 /// the DEFAULT source for the mid-stream idle deadline — matches codex's own `stream_idle_timeout`
 /// default (`model-provider-info/src/lib.rs:26`, 300000ms). Every `execute_with_watchdog*`/
-/// `execute_recovery*` call site below now threads `state.stream_idle_timeout` (the real,
-/// config-resolved `Duration` on `AppState` — see `crate::config::stream_idle_timeout_secs_from_env`
-/// and `ServeConfig::from_env`, resolved ONCE at startup, never per-request). This constant is no
+/// `execute_recovery*` call site below now threads `state.runtime_settings.stream_idle_timeout()`
+/// (the real, config-resolved `Duration` seeded onto `AppState.runtime_settings` — see
+/// `crate::config::stream_idle_timeout_secs_from_env`, `ServeConfig::from_env`, and
+/// `crate::runtime_settings::RuntimeSettings`, resolved ONCE at startup and live-overridable
+/// thereafter, never a per-request read of its own). This constant is no
 /// longer read on the per-request path; it survives as `crate::config`'s single-source-of-truth
 /// default (referenced directly by `stream_idle_timeout_secs_from_env`'s unset-env case) so the
 /// "300s matches codex" fact lives in exactly one place.
@@ -674,7 +676,7 @@ async fn try_layer1_serve_now(
         ctx,
         session_key,
         state.runtime.clone(),
-        state.stream_idle_timeout,
+        state.runtime_settings.stream_idle_timeout(),
         CommitWitness::new(),
         Some(in_flight),
     )
@@ -983,7 +985,7 @@ fn layer2_wait_stream(
         // this function's "Global Constraint — HERD DAMPING" doc above. `wake_jitter_ms == 0` (the
         // default) makes this byte-for-byte today's pre-B10 `target_ms`.
         let request_key = layer2_wait_request_key(&session_key);
-        let jitter_ms = wake_jitter_offset_ms(&request_key, state.wake_jitter_ms);
+        let jitter_ms = wake_jitter_offset_ms(&request_key, state.runtime_settings.wake_jitter_ms());
         let jittered_target_ms = jittered_wake_target_ms(target_ms, jitter_ms, budget_deadline_ms);
 
         loop {
@@ -1087,7 +1089,7 @@ fn layer2_wait_stream(
             ctx,
             session_key,
             state.runtime.clone(),
-            state.stream_idle_timeout,
+            state.runtime_settings.stream_idle_timeout(),
             CommitWitness::new(),
             Some(in_flight),
         )
@@ -1204,7 +1206,7 @@ async fn reroute_cyber_rejection(
         ctx,
         session_key,
         state.runtime.clone(),
-        state.stream_idle_timeout,
+        state.runtime_settings.stream_idle_timeout(),
         CommitWitness::new(),
         Some(in_flight),
     )
@@ -1435,7 +1437,7 @@ async fn run_failover_loop(
             ctx.clone(),
             session_key.clone(),
             state.runtime.clone(),
-            state.stream_idle_timeout,
+            state.runtime_settings.stream_idle_timeout(),
             commit.clone(),
             Some(in_flight),
         )
@@ -1658,9 +1660,9 @@ async fn responses_handler_impl(
     headers: HeaderMap,
     raw: Bytes,
 ) -> (Response, RouteOutcome) {
-    let max_attempts = state.max_account_attempts;
-    let starvation_wait_budget = state.starvation_wait_budget;
-    let starvation_heartbeat = state.starvation_heartbeat;
+    let max_attempts = state.runtime_settings.max_account_attempts();
+    let starvation_wait_budget = state.runtime_settings.starvation_wait_budget();
+    let starvation_heartbeat = state.runtime_settings.starvation_heartbeat();
     responses_handler_impl_with_max_attempts(
         state,
         pool,
@@ -1829,7 +1831,7 @@ async fn responses_handler_impl_with_max_attempts(
         tier,
         // C9 Task 3: startup-resolved (`AppState.inflight_penalty_pct`), never a per-request env
         // read — mirrors every other config-derived field on `sel_ctx`.
-        inflight_penalty_pct: state.inflight_penalty_pct,
+        inflight_penalty_pct: state.runtime_settings.inflight_penalty_pct(),
     };
     let session_key = prepared.directive.session_key.clone();
 
@@ -1885,7 +1887,7 @@ async fn responses_handler_impl_with_max_attempts(
                     id,
                     ctx.clone(),
                     state.runtime.clone(),
-                    state.stream_idle_timeout,
+                    state.runtime_settings.stream_idle_timeout(),
                     commit.clone(),
                     Some(in_flight),
                 )
@@ -2012,7 +2014,7 @@ async fn responses_handler_impl_with_max_attempts(
                             ctx,
                             session_key,
                             state.runtime.clone(),
-                            state.stream_idle_timeout,
+                            state.runtime_settings.stream_idle_timeout(),
                             CommitWitness::new(),
                             Some(in_flight),
                         )
@@ -2085,7 +2087,7 @@ async fn responses_handler_impl_with_max_attempts(
                                     fresh,
                                     ctx,
                                     state.runtime.clone(),
-                                    state.stream_idle_timeout,
+                                    state.runtime_settings.stream_idle_timeout(),
                                     CommitWitness::new(),
                                     Some(in_flight),
                                 )
@@ -2338,7 +2340,7 @@ async fn messages_handler_native(
         // Codex-pool concern, so leave it unset here.
         tier: None,
         // C9 Task 3: startup-resolved, never a per-request env read.
-        inflight_penalty_pct: state.inflight_penalty_pct,
+        inflight_penalty_pct: state.runtime_settings.inflight_penalty_pct(),
     };
     let picked = match selector.pick(&snapshots, &sel_ctx) {
         Some(id) => id,
@@ -2381,8 +2383,8 @@ async fn messages_handler_native(
                     ctx,
                     None,
                     now,
-                    state.starvation_wait_budget,
-                    state.starvation_heartbeat,
+                    state.runtime_settings.starvation_wait_budget(),
+                    state.runtime_settings.starvation_heartbeat(),
                     &mut outcome,
                     WaitClient::Anthropic,
                 )
@@ -2411,7 +2413,7 @@ async fn messages_handler_native(
         picked,
         ctx,
         state.runtime.clone(),
-        state.stream_idle_timeout,
+        state.runtime_settings.stream_idle_timeout(),
         CommitWitness::new(),
         Some(in_flight),
     )
@@ -2517,7 +2519,7 @@ async fn messages_handler_codex_aliased(
         // The subagent tier IS the alias's reasoning effort (opus→high, sonnet→medium, haiku→low).
         tier: tier_from_effort(model_alias.reasoning_effort.as_deref()),
         // C9 Task 3: startup-resolved, never a per-request env read.
-        inflight_penalty_pct: state.inflight_penalty_pct,
+        inflight_penalty_pct: state.runtime_settings.inflight_penalty_pct(),
     };
     let picked = match selector.pick(&snapshots, &sel_ctx) {
         Some(id) => id,
@@ -2561,8 +2563,8 @@ async fn messages_handler_codex_aliased(
                     ctx,
                     None,
                     now,
-                    state.starvation_wait_budget,
-                    state.starvation_heartbeat,
+                    state.runtime_settings.starvation_wait_budget(),
+                    state.runtime_settings.starvation_heartbeat(),
                     &mut outcome,
                     client,
                 )
@@ -2593,7 +2595,7 @@ async fn messages_handler_codex_aliased(
         picked,
         ctx,
         state.runtime.clone(),
-        state.stream_idle_timeout,
+        state.runtime_settings.stream_idle_timeout(),
         CommitWitness::new(),
         Some(in_flight),
     )

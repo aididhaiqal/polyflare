@@ -50,8 +50,9 @@ fn unix_now() -> i64 {
 pub async fn run_retention_pass(state: &AppState) {
     let now = unix_now();
 
-    if state.request_log_retention_days > 0 {
-        let cutoff = now - (state.request_log_retention_days as i64) * 86400;
+    let request_log_retention_days = state.runtime_settings.request_log_retention_days();
+    if request_log_retention_days > 0 {
+        let cutoff = now - (request_log_retention_days as i64) * 86400;
         match state
             .store
             .request_log()
@@ -68,8 +69,9 @@ pub async fn run_retention_pass(state: &AppState) {
         }
     }
 
-    if state.usage_history_retention_days > 0 {
-        let cutoff = now - (state.usage_history_retention_days as i64) * 86400;
+    let usage_history_retention_days = state.runtime_settings.usage_history_retention_days();
+    if usage_history_retention_days > 0 {
+        let cutoff = now - (usage_history_retention_days as i64) * 86400;
         match state
             .store
             .accounts()
@@ -114,6 +116,7 @@ mod tests {
     use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
 
     use crate::continuity::CodexContinuity;
+    use crate::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
 
     fn account(id: &str) -> Account {
         Account {
@@ -190,22 +193,24 @@ mod tests {
             account_cache: Arc::new(crate::account_cache::AccountCache::new()),
             token_cache: Default::default(),
             admin_token: None,
-            live_logs: false,
+            runtime_settings: Arc::new(RuntimeSettings::new_from_fields(RuntimeSettingsFields {
+                max_account_attempts: 3,
+                starvation_wait_budget: StdDuration::from_secs(60),
+                starvation_heartbeat: StdDuration::from_secs(10),
+                wake_jitter_ms: 0,
+                stream_idle_timeout: StdDuration::from_secs(300),
+                inflight_penalty_pct: 2.5,
+                soft_drain_enabled: true,
+                request_log_retention_days,
+                usage_history_retention_days,
+                live_logs: false,
+            })),
             ws_downstream: false,
             log_bus: crate::log_bus::LogBus::new(1000),
-            max_account_attempts: 3,
             failover_metrics: crate::observability::FailoverMetrics::new(),
             health_tier_metrics: crate::observability::HealthTierMetrics::new(),
-            starvation_wait_budget: StdDuration::from_secs(60),
-            starvation_heartbeat: StdDuration::from_secs(10),
-            wake_jitter_ms: 0,
             starvation_metrics: crate::observability::StarvationMetrics::new(),
-            stream_idle_timeout: StdDuration::from_secs(300),
-            soft_drain_enabled: true,
-            request_log_retention_days,
-            usage_history_retention_days,
             runtime: Default::default(),
-            inflight_penalty_pct: 2.5,
             lease_metrics: crate::observability::LeaseMetrics::new(),
             upstream_request_metrics: crate::observability::UpstreamRequestMetrics::new(),
             rate_limit_metrics: crate::observability::RateLimitMetrics::new(),

@@ -18,6 +18,7 @@ use polyflare_codex::CodexExecutor;
 use polyflare_core::{CapacityWeighted, Continuity, Executor};
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::continuity::CodexContinuity;
+use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
 use polyflare_store::{Store, TokenCipher};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Error as WsError;
@@ -58,26 +59,28 @@ async fn spawn(ws_downstream: bool) -> String {
         account_cache: std::sync::Arc::new(polyflare_server::account_cache::AccountCache::new()),
         token_cache: Default::default(),
         admin_token: None,
-        live_logs: false,
+        runtime_settings: Arc::new(RuntimeSettings::new_from_fields(RuntimeSettingsFields {
+            max_account_attempts: 3,
+            starvation_wait_budget: std::time::Duration::from_secs(60),
+            starvation_heartbeat: std::time::Duration::from_secs(10),
+            wake_jitter_ms: 0,
+            stream_idle_timeout: std::time::Duration::from_secs(300),
+            inflight_penalty_pct: 2.5,
+            soft_drain_enabled: true,
+            request_log_retention_days: 0,
+            usage_history_retention_days: 0,
+            live_logs: false,
+        })),
         ws_downstream,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
-        max_account_attempts: 3,
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
-        starvation_wait_budget: std::time::Duration::from_secs(60),
-        starvation_heartbeat: std::time::Duration::from_secs(10),
-        wake_jitter_ms: 0,
-        inflight_penalty_pct: 2.5,
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
         upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
         relay_metrics: polyflare_server::observability::RelayMetrics::new(),
         model_catalog: polyflare_server::model_catalog::floor_only_model_catalog(),
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
-        stream_idle_timeout: std::time::Duration::from_secs(300),
-        soft_drain_enabled: true,
-        request_log_retention_days: 0,
-        usage_history_retention_days: 0,
         runtime: Default::default(),
     });
     let app = build_app(state);
@@ -148,6 +151,7 @@ mod relay_through {
     use polyflare_core::{Continuity, RoundRobin};
     use polyflare_server::app::{build_app, AppState};
     use polyflare_server::continuity::CodexContinuity;
+    use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
     use polyflare_store::{Account as StoreAccount, PlainTokens, Store, TokenCipher};
     use polyflare_testkit::{MockWsUpstream, ScriptedTurn};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -238,22 +242,24 @@ mod relay_through {
             account_cache: Arc::new(polyflare_server::account_cache::AccountCache::new()),
             token_cache: Default::default(),
             admin_token: None,
-            live_logs: false,
+            runtime_settings: Arc::new(RuntimeSettings::new_from_fields(RuntimeSettingsFields {
+                max_account_attempts: 3,
+                starvation_wait_budget: Duration::from_secs(60),
+                starvation_heartbeat: Duration::from_secs(10),
+                wake_jitter_ms: 0,
+                stream_idle_timeout: Duration::from_secs(300),
+                inflight_penalty_pct: 2.5,
+                soft_drain_enabled: true,
+                request_log_retention_days: 0,
+                usage_history_retention_days: 0,
+                live_logs: false,
+            })),
             ws_downstream: true,
             log_bus: polyflare_server::log_bus::LogBus::new(1000),
-            max_account_attempts: 3,
             failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
             health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
-            starvation_wait_budget: Duration::from_secs(60),
-            starvation_heartbeat: Duration::from_secs(10),
-            wake_jitter_ms: 0,
             starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
-            stream_idle_timeout: Duration::from_secs(300),
-            soft_drain_enabled: true,
-            request_log_retention_days: 0,
-            usage_history_retention_days: 0,
             runtime: Default::default(),
-            inflight_penalty_pct: 2.5,
             lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
             upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(
             ),
@@ -355,22 +361,24 @@ mod relay_through {
             account_cache: Arc::new(polyflare_server::account_cache::AccountCache::new()),
             token_cache: Default::default(),
             admin_token: None,
-            live_logs: false,
+            runtime_settings: Arc::new(RuntimeSettings::new_from_fields(RuntimeSettingsFields {
+                max_account_attempts: 3,
+                starvation_wait_budget: Duration::from_secs(60),
+                starvation_heartbeat: Duration::from_secs(10),
+                wake_jitter_ms: 0,
+                stream_idle_timeout: Duration::from_secs(300),
+                inflight_penalty_pct: 2.5,
+                soft_drain_enabled: true,
+                request_log_retention_days: 0,
+                usage_history_retention_days: 0,
+                live_logs: false,
+            })),
             ws_downstream: true,
             log_bus: polyflare_server::log_bus::LogBus::new(1000),
-            max_account_attempts: 3,
             failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
             health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
-            starvation_wait_budget: Duration::from_secs(60),
-            starvation_heartbeat: Duration::from_secs(10),
-            wake_jitter_ms: 0,
             starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
-            stream_idle_timeout: Duration::from_secs(300),
-            soft_drain_enabled: true,
-            request_log_retention_days: 0,
-            usage_history_retention_days: 0,
             runtime: Default::default(),
-            inflight_penalty_pct: 2.5,
             lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
             upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(
             ),

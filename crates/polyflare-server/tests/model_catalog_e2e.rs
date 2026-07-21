@@ -15,6 +15,7 @@ use polyflare_server::continuity::CodexContinuity;
 use polyflare_server::model_catalog::{
     floor_only_model_catalog, ModelCatalogCache, ModelSource, UpstreamModel,
 };
+use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
 use polyflare_store::{Store, TokenCipher};
 
 /// A [`ModelSource`] that always returns a fixed, pre-scripted upstream catalog — the external
@@ -59,25 +60,27 @@ async fn spawn_with_catalog(model_catalog: Arc<ModelCatalogCache>) -> String {
         token_cache: Default::default(),
         runtime: Default::default(),
         admin_token: None,
-        live_logs: false,
+        runtime_settings: Arc::new(RuntimeSettings::new_from_fields(RuntimeSettingsFields {
+            max_account_attempts: 3,
+            starvation_wait_budget: Duration::from_secs(60),
+            starvation_heartbeat: Duration::from_secs(10),
+            wake_jitter_ms: 0,
+            stream_idle_timeout: Duration::from_secs(300),
+            inflight_penalty_pct: 2.5,
+            soft_drain_enabled: true,
+            request_log_retention_days: 0,
+            usage_history_retention_days: 0,
+            live_logs: false,
+        })),
         ws_downstream: false,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
-        max_account_attempts: 3,
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
-        starvation_wait_budget: Duration::from_secs(60),
-        starvation_heartbeat: Duration::from_secs(10),
-        wake_jitter_ms: 0,
-        inflight_penalty_pct: 2.5,
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
         upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
         relay_metrics: polyflare_server::observability::RelayMetrics::new(),
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
-        stream_idle_timeout: Duration::from_secs(300),
-        soft_drain_enabled: true,
-        request_log_retention_days: 0,
-        usage_history_retention_days: 0,
         model_catalog,
     });
     let app = build_app(state);

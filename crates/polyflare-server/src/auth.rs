@@ -47,7 +47,7 @@ pub async fn whoami_handler() -> impl IntoResponse {
 /// `GET /api/capabilities` — feature flags the dashboard SPA gates UI on. Currently just
 /// `live_logs` (from `POLYFLARE_LIVE_LOGS`); grows as later tasks add capabilities.
 pub async fn capabilities_handler(State(s): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(serde_json::json!({ "live_logs": s.live_logs }))
+    Json(serde_json::json!({ "live_logs": s.runtime_settings.live_logs() }))
 }
 
 /// D18 Task 3: client API-key auth for the proxy surface (`/responses`, `/v1/messages`,

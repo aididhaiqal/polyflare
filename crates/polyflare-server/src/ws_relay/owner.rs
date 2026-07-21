@@ -129,6 +129,7 @@ mod tests {
     use polyflare_store::{Account as StoreAccount, PlainTokens, Store, TokenCipher};
 
     use crate::continuity::CodexContinuity;
+    use crate::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
 
     fn now() -> i64 {
         SystemTime::now()
@@ -232,22 +233,24 @@ mod tests {
             account_cache: Arc::new(crate::account_cache::AccountCache::new()),
             token_cache: Default::default(),
             admin_token: None,
-            live_logs: false,
+            runtime_settings: Arc::new(RuntimeSettings::new_from_fields(RuntimeSettingsFields {
+                max_account_attempts: 3,
+                starvation_wait_budget: Duration::from_secs(60),
+                starvation_heartbeat: Duration::from_secs(10),
+                wake_jitter_ms: 0,
+                stream_idle_timeout: Duration::from_secs(300),
+                inflight_penalty_pct: 2.5,
+                soft_drain_enabled: true,
+                request_log_retention_days: 0,
+                usage_history_retention_days: 0,
+                live_logs: false,
+            })),
             ws_downstream: true,
             log_bus: crate::log_bus::LogBus::new(1000),
-            max_account_attempts: 3,
             failover_metrics: crate::observability::FailoverMetrics::new(),
             health_tier_metrics: crate::observability::HealthTierMetrics::new(),
-            starvation_wait_budget: Duration::from_secs(60),
-            starvation_heartbeat: Duration::from_secs(10),
-            wake_jitter_ms: 0,
             starvation_metrics: crate::observability::StarvationMetrics::new(),
-            stream_idle_timeout: Duration::from_secs(300),
-            soft_drain_enabled: true,
-            request_log_retention_days: 0,
-            usage_history_retention_days: 0,
             runtime: Default::default(),
-            inflight_penalty_pct: 2.5,
             lease_metrics: crate::observability::LeaseMetrics::new(),
             upstream_request_metrics: crate::observability::UpstreamRequestMetrics::new(),
             rate_limit_metrics: crate::observability::RateLimitMetrics::new(),

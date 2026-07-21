@@ -24,6 +24,7 @@ use polyflare_core::{CapacityWeighted, Continuity};
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::config;
 use polyflare_server::continuity::CodexContinuity;
+use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
 use polyflare_store::{PlainTokens, Store, TokenCipher};
 
 fn now() -> i64 {
@@ -106,16 +107,22 @@ fn build_state(
         account_cache: Arc::new(polyflare_server::account_cache::AccountCache::new()),
         token_cache: Default::default(),
         admin_token: None,
-        live_logs: false,
+        runtime_settings: Arc::new(RuntimeSettings::new_from_fields(RuntimeSettingsFields {
+            max_account_attempts: 3,
+            starvation_wait_budget,
+            starvation_heartbeat,
+            wake_jitter_ms: 0,
+            stream_idle_timeout: std::time::Duration::from_secs(300),
+            inflight_penalty_pct: 2.5,
+            soft_drain_enabled: true,
+            request_log_retention_days: 0,
+            usage_history_retention_days: 0,
+            live_logs: false,
+        })),
         ws_downstream: false,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
-        max_account_attempts: 3,
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
-        starvation_wait_budget,
-        starvation_heartbeat,
-        wake_jitter_ms: 0,
-        inflight_penalty_pct: 2.5,
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
         upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
@@ -123,10 +130,6 @@ fn build_state(
         model_catalog: polyflare_server::model_catalog::floor_only_model_catalog(),
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
-        stream_idle_timeout: std::time::Duration::from_secs(300),
-        soft_drain_enabled: true,
-        request_log_retention_days: 0,
-        usage_history_retention_days: 0,
         runtime: Default::default(),
     })
 }
@@ -174,16 +177,22 @@ fn build_state_native_anthropic(
         account_cache: Arc::new(polyflare_server::account_cache::AccountCache::new()),
         token_cache: Default::default(),
         admin_token: None,
-        live_logs: false,
+        runtime_settings: Arc::new(RuntimeSettings::new_from_fields(RuntimeSettingsFields {
+            max_account_attempts: 3,
+            starvation_wait_budget,
+            starvation_heartbeat,
+            wake_jitter_ms: 0,
+            stream_idle_timeout: std::time::Duration::from_secs(300),
+            inflight_penalty_pct: 2.5,
+            soft_drain_enabled: true,
+            request_log_retention_days: 0,
+            usage_history_retention_days: 0,
+            live_logs: false,
+        })),
         ws_downstream: false,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
-        max_account_attempts: 3,
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
-        starvation_wait_budget,
-        starvation_heartbeat,
-        wake_jitter_ms: 0,
-        inflight_penalty_pct: 2.5,
         lease_metrics: polyflare_server::observability::LeaseMetrics::new(),
         upstream_request_metrics: polyflare_server::observability::UpstreamRequestMetrics::new(),
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
@@ -191,10 +200,6 @@ fn build_state_native_anthropic(
         model_catalog: polyflare_server::model_catalog::floor_only_model_catalog(),
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
-        stream_idle_timeout: std::time::Duration::from_secs(300),
-        soft_drain_enabled: true,
-        request_log_retention_days: 0,
-        usage_history_retention_days: 0,
         runtime: Default::default(),
     })
 }

@@ -12,6 +12,7 @@ use polyflare_codex::{CodexExecutor, CodexVersionCache, CodexWsExecutor};
 use polyflare_core::{Continuity, ExecError, Executor, Provider, Selector};
 
 use crate::account_cache::AccountCache;
+use crate::runtime_settings::RuntimeSettings;
 use polyflare_store::{Store, TokenCipher};
 
 use crate::ingress::{
@@ -82,9 +83,19 @@ pub struct AppState {
     /// Admin token gating every `/api/*` dashboard route (see `crate::auth::require_admin`), from
     /// `POLYFLARE_ADMIN_TOKEN`. `None` ⇒ the dashboard API is disabled (503), not silently open.
     pub admin_token: Option<String>,
-    /// Enables the live log stream (`POLYFLARE_LIVE_LOGS`). Consumed by a later task
-    /// (`/api/logs/stream`); present now so `AppState` construction doesn't churn again then.
-    pub live_logs: bool,
+    /// Live-editable Settings subsystem Task 4: the atomic holder for the 10 formerly-static
+    /// `AppState` fields this task REMOVES from this struct — `max_account_attempts`,
+    /// `starvation_wait_budget`, `starvation_heartbeat`, `wake_jitter_ms`, `stream_idle_timeout`,
+    /// `inflight_penalty_pct`, `soft_drain_enabled`, `request_log_retention_days`,
+    /// `usage_history_retention_days`, `live_logs`. Seeded once at startup from `ServeConfig`
+    /// (`RuntimeSettings::new`), then overlaid with any persisted `settings` table rows
+    /// (`crate::runtime_settings::overlay_persisted_settings`) before this `AppState` is built —
+    /// see `main.rs::serve`. Every hot-path read that used to be `state.<field>` is now
+    /// `state.runtime_settings.<field>()` (an `Ordering::Relaxed` atomic load, negligible cost —
+    /// see `crate::runtime_settings`'s module doc). Live-mutable after startup via the (later)
+    /// settings PATCH endpoint's `RuntimeSettings::set`, which re-validates through the SAME
+    /// `clamp_<field>` fns the boot path uses.
+    pub runtime_settings: Arc<RuntimeSettings>,
     /// WS-downstream relay plan Task 2: selects the DOWNSTREAM (client-facing) WebSocket transport
     /// (`POLYFLARE_WS_DOWNSTREAM`, resolved ONCE at startup by `crate::config::ServeConfig::from_env`
     /// — never read per-request). Read only in `build_app` below to shape the router: when `true`,
@@ -100,12 +111,6 @@ pub struct AppState {
     /// later task exposes this over `/api/logs/stream`; present now so publishing starts
     /// immediately at the chokepoint instead of only once the SSE endpoint lands.
     pub log_bus: std::sync::Arc<crate::log_bus::LogBus>,
-    /// B4/B5 Task 5: the bounded cross-account failover loop's total upstream-attempt cap
-    /// (`POLYFLARE_MAX_ACCOUNT_ATTEMPTS`, resolved ONCE at startup by
-    /// `crate::config::max_account_attempts_from_env` — never read per-request). The production
-    /// `/responses` entrypoint (`crate::ingress::responses_handler_impl`) reads this field; the
-    /// `responses_handler_impl_for_test` seam still takes an explicit override for tests.
-    pub max_account_attempts: u32,
     /// B4/B5 Task 5: content-free counter of cross-account failover events (see
     /// `crate::observability::FailoverMetrics`) — incremented from
     /// `crate::ingress::run_failover_loop` at the same site that emits the
@@ -119,29 +124,6 @@ pub struct AppState {
     /// mid-stream watchdog-funnel transitions — see `HealthTierMetrics`'s doc for that known,
     /// accepted scope gap. In-memory only; resets on restart.
     pub health_tier_metrics: std::sync::Arc<crate::observability::HealthTierMetrics>,
-    /// B5 Task 5: the Layer 2 keepalive recovery-wait's bounded wait budget
-    /// (`POLYFLARE_STARVATION_WAIT_BUDGET_SECS`, resolved ONCE at startup by
-    /// `crate::config::starvation_wait_budget_secs_from_env` — never read per-request). The
-    /// production `/responses` entrypoint (`crate::ingress::responses_handler_impl`) reads this
-    /// field instead of `crate::starvation::DEFAULT_WAIT_BUDGET`. `Duration::ZERO` ⇒ Layer 2 is
-    /// DISABLED (the documented `=0` disable lever — see that config function's doc):
-    /// `crate::ingress::try_layer2_recovery_wait` returns `None` immediately, falling straight
-    /// through to today's pre-response fast 503/502.
-    pub starvation_wait_budget: std::time::Duration,
-    /// B5 Task 5: the Layer 2 keepalive tick interval (`POLYFLARE_STARVATION_HEARTBEAT_SECS`,
-    /// resolved ONCE at startup by `crate::config::starvation_heartbeat_secs_from_env`, clamped
-    /// against `starvation_wait_budget` above). The production entrypoint reads this field instead
-    /// of `crate::starvation::DEFAULT_HEARTBEAT`.
-    pub starvation_heartbeat: std::time::Duration,
-    /// B10 Task 1 (THE CRUX): the per-waiter wake-jitter window
-    /// (`POLYFLARE_STARVATION_WAKE_JITTER_MS`, resolved ONCE at startup by
-    /// `crate::config::wake_jitter_ms_from_env` — never read per-request). Read directly by
-    /// `crate::ingress::layer2_wait_stream` at wait entry to compute this waiter's own
-    /// `jittered_wake_target_ms`, desynchronizing concurrent waiters on the same recovering
-    /// account. `0` (the default) ⇒ zero offset ⇒ byte-for-byte today's pre-B10 behavior; it never
-    /// touches `select.rs`, the account's stored `recover_at`/`cooldown_until`/`backoff_secs`, or
-    /// which account is waited on.
-    pub wake_jitter_ms: u64,
     /// B5 Task 5: content-free counter of Layer 2 keepalive-wait terminal outcomes (see
     /// `crate::observability::StarvationMetrics`) — incremented from
     /// `crate::ingress::layer2_wait_stream` at the same site that emits the
@@ -155,39 +137,6 @@ pub struct AppState {
     /// the correct default for every existing test/dev harness that builds `AppState` directly
     /// without going through `resolve_proxy_enforcement` (a loopback-bind, no-keys posture).
     pub enforce_client_keys: bool,
-    /// Stream-idle-timeout plan Task 2: the per-response mid-stream idle deadline
-    /// (`POLYFLARE_STREAM_IDLE_TIMEOUT_SECS`, resolved ONCE at startup by
-    /// `crate::config::stream_idle_timeout_secs_from_env` — never read per-request). Threaded
-    /// into every `execute_with_watchdog*`/`execute_recovery*` call site in `crate::ingress`,
-    /// which passes it through to `crate::watchdog::wrap_stream` → `ObservingStream`'s
-    /// `IdleDeadline` (Task 1's mechanism). `Duration::ZERO` ⇒ disabled (today's pre-fix
-    /// behavior — the documented `=0` rollback lever).
-    pub stream_idle_timeout: std::time::Duration,
-    /// B8 Task 3: the codex-lb `soft_drain_enabled` disable lever
-    /// (`POLYFLARE_SOFT_DRAIN_ENABLED`, resolved ONCE at startup by
-    /// `crate::config::soft_drain_enabled_from_env` — never read per-request). Read by
-    /// `crate::usage_refresh`'s poller loop (which owns the only usage-driven health-tier
-    /// evaluation site — and, since the B8-review Finding 1 fix, the disjoint non-codex
-    /// error-driven pass in the same loop) and threaded into `RuntimeStates::evaluate_with_usage`
-    /// on every refresh cycle for BOTH the codex and non-codex passes. `false` forces every
-    /// account's health tier to HEALTHY with cleared aux state (codex-lb's disable path,
-    /// `load_balancer.py:2245-2249`) — the documented clean-rollback lever, matching today's exact
-    /// pre-B8 behavior (`select.rs`'s `health_tier_pool` becomes a no-op single bucket) **in steady
-    /// state**: the flag is honored only by the poller, so the per-request funnel (not flag-gated)
-    /// can still transiently drive an account into DRAINING from errors between poller cycles
-    /// (bounded to ≤600s, the poller's `REFRESH_INTERVAL`, before the next tick resets it — see
-    /// `crate::config::soft_drain_enabled_from_env`'s doc for the same caveat). Defaults to `true`
-    /// in every test/dev harness that builds `AppState` directly, matching
-    /// `POLYFLARE_SOFT_DRAIN_ENABLED`'s unset-default (mirrors `enforce_client_keys`'s doc above for
-    /// why test harnesses hardcode a value here).
-    pub soft_drain_enabled: bool,
-    /// C9 Task 3: the in-flight soft-penalty pct (`POLYFLARE_INFLIGHT_PENALTY_PCT`, resolved ONCE
-    /// at startup by `crate::config::inflight_penalty_pct_from_env` — never read per-request).
-    /// Copied onto each per-request `SelectionCtx.inflight_penalty_pct` at the selection sites in
-    /// `crate::ingress`/`crate::control`, which `polyflare_core::select`'s `eligibility()` folds
-    /// into `eff_used`/`eff_secondary_used` as `in_flight * inflight_penalty_pct`. `0.0` ⇒ the
-    /// disable lever (in_flight still tracked, never folded into the weight).
-    pub inflight_penalty_pct: f64,
     /// C9 Task 4: content-free counter of in-flight lease acquire/release events (see
     /// `crate::observability::LeaseMetrics`) — bumped from `crate::runtime_state::RuntimeStates::
     /// acquire_in_flight` (acquired) and `crate::runtime_state::InFlightGuard`'s `Drop` (released),
@@ -197,20 +146,6 @@ pub struct AppState {
     /// release guarantee Task 1-2 already established for `in_flight` itself. In-memory only (like
     /// `FailoverMetrics`/`StarvationMetrics`/`HealthTierMetrics`); resets on restart.
     pub lease_metrics: std::sync::Arc<crate::observability::LeaseMetrics>,
-    /// C12 Task 3: `request_log` age-retention, in days (`POLYFLARE_REQUEST_LOG_RETENTION_DAYS`,
-    /// resolved ONCE at startup by `crate::config::request_log_retention_days_from_env` — never
-    /// read per-request). Read only by `crate::retention::run_retention_pass`, once per tick.
-    /// `0` (the default) ⇒ disabled — the pruner no-ops for this table, today's unbounded-growth
-    /// behavior.
-    pub request_log_retention_days: u32,
-    /// C12 Task 3: `usage_history` age-retention, in days
-    /// (`POLYFLARE_USAGE_HISTORY_RETENTION_DAYS`, resolved ONCE at startup by
-    /// `crate::config::usage_history_retention_days_from_env`). Read only by
-    /// `crate::retention::run_retention_pass`. `0` (the default) ⇒ disabled. Pruning always
-    /// protects the latest row per `(account_id, window)` regardless of age (see
-    /// `AccountRepo::prune_usage_history_older_than`) — this field only gates whether pruning
-    /// happens at all.
-    pub usage_history_retention_days: u32,
     /// C11b Task 1: content-free counter of completed proxied requests, labeled by
     /// `(account_id, status)` (see `crate::observability::UpstreamRequestMetrics`). Bumped once
     /// per client request at each of the 3 request-completion wrapper sites (`control_route`/
