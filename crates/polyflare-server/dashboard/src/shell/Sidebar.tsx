@@ -26,13 +26,16 @@ const NAV_ITEMS: NavItem[] = [
   { to: "/sessions", label: "Sessions", icon: Link2 },
   { to: "/logs", label: "Live Logs", icon: Activity, requiresLiveLogs: true },
   { to: "/reports", label: "Analytics", icon: BarChart3 },
+  { to: "/settings", label: "Settings", icon: Settings },
 ];
 
-const SOON_ITEMS: Array<{ label: string; icon: LucideIcon }> = [{ label: "Settings", icon: Settings }];
+const SOON_ITEMS: Array<{ label: string; icon: LucideIcon }> = [];
 
 /** Left nav: brand, primary nav (active state = accent-tinted background, per the mockups' `.pf-nav
- * a.on`), a divider, two permanently-disabled "soon" items, and a footer with the theme toggle +
- * sign-out. Matches `overview-ccflare-v2.html` / `requests-page-v2.html`'s `.pf-side`. */
+ * a.on`), an optional divider + permanently-disabled "soon" items (hidden entirely, divider
+ * included, whenever `SOON_ITEMS` is empty — as it is now that "Settings" has shipped), and a
+ * footer with the theme toggle + sign-out. Matches `overview-ccflare-v2.html` /
+ * `requests-page-v2.html`'s `.pf-side`. */
 export function Sidebar() {
   const { liveLogs } = useCapabilityFlags();
   const { signOut } = useAuth();
@@ -63,17 +66,20 @@ export function Sidebar() {
           </NavLink>
         ))}
 
-        <div className="my-2 h-px bg-border" />
-
-        {SOON_ITEMS.map((item) => (
-          <div
-            key={item.label}
-            className="flex items-center gap-2.5 rounded px-2.5 py-1.5 text-[11.5px] text-fg opacity-30"
-          >
-            <item.icon className="h-3.5 w-3.5" strokeWidth={1.8} />
-            {item.label}
-          </div>
-        ))}
+        {SOON_ITEMS.length > 0 && (
+          <>
+            <div className="my-2 h-px bg-border" />
+            {SOON_ITEMS.map((item) => (
+              <div
+                key={item.label}
+                className="flex items-center gap-2.5 rounded px-2.5 py-1.5 text-[11.5px] text-fg opacity-30"
+              >
+                <item.icon className="h-3.5 w-3.5" strokeWidth={1.8} />
+                {item.label}
+              </div>
+            ))}
+          </>
+        )}
       </nav>
 
       <div className="mt-auto flex items-center justify-between border-t border-border pt-3">

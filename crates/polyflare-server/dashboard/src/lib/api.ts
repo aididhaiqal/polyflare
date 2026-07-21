@@ -467,6 +467,28 @@ export interface LogEvent {
   message: string;
 }
 
+/** `read_api.rs::SettingFieldView` — one config field as `GET /api/settings` returns it. The 10
+ * `class: "live"` fields carry their CURRENT `RuntimeSettings` value + clamp bounds (`min`/`max`);
+ * restart-only/fixed fields are informational only — many have `value: null` (only `default` is
+ * known). `admin_token`'s `value` is ALWAYS `null` (presence only — never render an input for it).
+ * `kind` selects the control: `"bool"` -> a switch, everything else (`u32`/`secs`/`f64`/`string`)
+ * -> a number/text input. */
+export interface SettingFieldView {
+  key: string;
+  value: string | null;
+  default: string;
+  class: "live" | "restart-only" | "fixed";
+  kind: "u32" | "secs" | "bool" | "f64" | "string";
+  min: number | null;
+  max: number | null;
+}
+
+/** `read_api.rs::SettingsView` — `GET /api/settings` response: every `ServeConfig` field (27
+ * total — 10 live + 8 restart-only + 9 fixed), for the Settings page. */
+export interface SettingsView {
+  fields: SettingFieldView[];
+}
+
 // ---------------------------------------------------------------------------------------------
 // Mutation client — write endpoints (queries.ts wraps these in useMutation). Content-free: every
 // body field is account metadata (pool/policy/status/alias), never a token or conversation content.
@@ -501,6 +523,19 @@ export function deleteAccount(id: string, opts?: { deleteHistory?: boolean }): P
   return fetchJson<OkResponse>(`/api/accounts/${encodeURIComponent(id)}${qs}`, { method: "DELETE" });
 }
 
+/** Body for `PATCH /api/settings`: one or more of the 10 live setting keys, each value typed per
+ * that field's `kind` (see `SettingFieldView`) — a JSON number for `u32`/`secs`/`f64` kinds, a
+ * JSON boolean for `bool` kinds. Never a string for these — the backend 400s on a wrong JSON type
+ * (`write_api.rs::patch_settings_handler`). Validated all-or-nothing server-side: an unknown key
+ * or a wrong-typed value rejects the WHOLE patch, no partial apply. */
+export function patchSettings(body: Record<string, number | boolean>): Promise<OkResponse> {
+  return fetchJson<OkResponse>("/api/settings", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Thin per-endpoint helpers (queries.ts wraps these in useQuery).
 // ---------------------------------------------------------------------------------------------
@@ -517,6 +552,7 @@ export const api = {
   requests: (qs: string) => fetchJson<RequestsView>(`/api/requests${qs}`),
   sessions: (qs: string) => fetchJson<SessionsView>(`/api/sessions${qs}`),
   reports: (qs: string) => fetchJson<ReportsView>(`/api/reports${qs}`),
+  settings: () => fetchJson<SettingsView>("/api/settings"),
   capabilities: () => fetchJson<CapabilitiesView>("/api/capabilities"),
   whoami: () => fetchJson<WhoamiView>("/api/whoami"),
 };
