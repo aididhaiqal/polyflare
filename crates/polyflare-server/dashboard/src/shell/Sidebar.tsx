@@ -3,7 +3,18 @@ import clsx from "clsx";
 
 import { useAuth } from "../auth/AuthProvider";
 import { useCapabilityFlags } from "../capabilities/CapabilitiesProvider";
-import { Activity, BarChart3, Layers, LayoutGrid, Link2, List, Settings, Users, type LucideIcon } from "../ui/icons";
+import {
+  Activity,
+  BarChart3,
+  KeyRound,
+  Layers,
+  LayoutGrid,
+  Link2,
+  List,
+  Settings,
+  Users,
+  type LucideIcon,
+} from "../ui/icons";
 import { ThemeToggle } from "./ThemeToggle";
 
 interface NavItem {
@@ -27,6 +38,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: "/logs", label: "Live Logs", icon: Activity, requiresLiveLogs: true },
   { to: "/reports", label: "Analytics", icon: BarChart3 },
   { to: "/settings", label: "Settings", icon: Settings },
+  { to: "/keys", label: "API Keys", icon: KeyRound },
 ];
 
 const SOON_ITEMS: Array<{ label: string; icon: LucideIcon }> = [];

@@ -489,6 +489,34 @@ export interface SettingsView {
   fields: SettingFieldView[];
 }
 
+/** `read_api.rs::ApiKeyView` — one `api_keys` row for `GET /api/keys`, redacted: NEVER a `key_hash`
+ * or the raw key (that row type doesn't even carry one — see the backend doc). `created_at`/
+ * `last_used_at` are unix-epoch seconds (`i64` on the wire), `last_used_at` is `null` until the key
+ * authenticates its first request. */
+export interface ApiKeyView {
+  id: string;
+  key_prefix: string;
+  label: string | null;
+  enabled: boolean;
+  created_at: number;
+  last_used_at: number | null;
+}
+
+/** `read_api.rs::ApiKeysView` — `GET /api/keys` response envelope. */
+export interface ApiKeysView {
+  keys: ApiKeyView[];
+}
+
+/** `write_api.rs::create_key_handler`'s `201` response: `key` is the raw plaintext, returned this
+ * ONE time only — never retrievable again, never present in `ApiKeyView`/`GET /api/keys`. Callers
+ * must hold this only in transient state for a show-once modal, never in the `["keys"]` query
+ * cache (which only ever holds refetched, redacted `ApiKeyView[]` data). */
+export interface CreatedApiKey {
+  id: string;
+  key_prefix: string;
+  key: string;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Mutation client — write endpoints (queries.ts wraps these in useMutation). Content-free: every
 // body field is account metadata (pool/policy/status/alias), never a token or conversation content.
@@ -536,6 +564,28 @@ export function patchSettings(body: Record<string, number | boolean>): Promise<O
   });
 }
 
+/** `POST /api/keys` — mint a new client proxy API key (`write_api.rs::create_key_handler`).
+ * `label` omitted/undefined ⇒ no label. Returns the raw `key` plaintext exactly once; the caller
+ * (`useCreateKey`) hands it straight to the page for a show-once modal — it must never be written
+ * into the `["keys"]` query cache. */
+export function createKey(label?: string): Promise<CreatedApiKey> {
+  return fetchJson<CreatedApiKey>("/api/keys", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ label }),
+  });
+}
+
+/** `PATCH /api/keys/{id}` — enable/disable a client proxy API key
+ * (`write_api.rs::patch_key_handler`). Unknown id → `404` (surfaces as an `ApiError`). */
+export function patchKey(id: string, body: { enabled: boolean }): Promise<OkResponse> {
+  return fetchJson<OkResponse>(`/api/keys/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Thin per-endpoint helpers (queries.ts wraps these in useQuery).
 // ---------------------------------------------------------------------------------------------
@@ -553,6 +603,7 @@ export const api = {
   sessions: (qs: string) => fetchJson<SessionsView>(`/api/sessions${qs}`),
   reports: (qs: string) => fetchJson<ReportsView>(`/api/reports${qs}`),
   settings: () => fetchJson<SettingsView>("/api/settings"),
+  keys: () => fetchJson<ApiKeysView>("/api/keys"),
   capabilities: () => fetchJson<CapabilitiesView>("/api/capabilities"),
   whoami: () => fetchJson<WhoamiView>("/api/whoami"),
 };
