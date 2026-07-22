@@ -347,6 +347,12 @@ pub struct AnthropicToResponses {
     /// `content_part.done`, `function_call_arguments.done`, `reasoning_summary_text.done`,
     /// `output_item.done`) that all collapse into a single Anthropic `content_block_stop`.
     blocks: HashMap<String, BlockState>,
+    /// Whether this turn opened at least one `function_call` (tool_use) block. Drives the terminal
+    /// `stop_reason`: a completed turn that called a tool is Anthropic `tool_use`, not `end_turn`.
+    /// OpenAI-Responses carries no explicit "ended to call a tool" status, so we infer it from the
+    /// items actually emitted (live-confirmed 2026-07-22: a tool-call turn completes with status
+    /// `completed` + a `function_call` output item, no distinguishing status field).
+    saw_function_call: bool,
 }
 
 impl AnthropicToResponses {
@@ -427,6 +433,7 @@ impl AnthropicToResponses {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                self.saw_function_call = true;
                 let index = self.open_block(item_id);
                 vec![json!({
                     "type": "content_block_start",
@@ -578,8 +585,11 @@ impl AnthropicToResponses {
             .get("status")
             .and_then(|v| v.as_str())
             .unwrap_or("completed");
+        // Precedence: a hard token cutoff (`incomplete`) is `max_tokens` regardless; otherwise a
+        // turn that emitted a tool call is `tool_use`; a plain completion is `end_turn`.
         let stop_reason = match status {
             "incomplete" => "max_tokens",
+            _ if self.saw_function_call => "tool_use",
             _ => "end_turn",
         };
         let usage = response
@@ -1321,6 +1331,48 @@ mod tests {
                 "id": "resp_1", "status": "incomplete", "model": "claude-opus-4-1-20250805",
                 "incomplete_details": {"reason": "max_output_tokens"},
                 "usage": {"output_tokens": 5}
+            }
+        }));
+        assert_eq!(events[0]["delta"]["stop_reason"], json!("max_tokens"));
+    }
+
+    #[test]
+    fn completed_turn_that_called_a_tool_maps_to_tool_use_stop_reason() {
+        // A turn that opened a `function_call` item and then completed is an Anthropic `tool_use`
+        // stop, not `end_turn` (live-confirmed 2026-07-22).
+        let mut t = AnthropicToResponses::new();
+        t.translate_response_event(response_created("claude-opus-4-1-20250805"));
+        t.translate_response_event(json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": "item_fc", "type": "function_call", "call_id": "call_1", "name": "get_weather"}
+        }));
+        let events = t.translate_response_event(json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1", "status": "completed", "model": "claude-opus-4-1-20250805",
+                "output": [], "usage": {"output_tokens": 4}
+            }
+        }));
+        assert_eq!(events[0]["type"], json!("message_delta"));
+        assert_eq!(events[0]["delta"]["stop_reason"], json!("tool_use"));
+    }
+
+    #[test]
+    fn incomplete_takes_precedence_over_tool_use_stop_reason() {
+        // A hard token cutoff is `max_tokens` even if a tool call had opened this turn.
+        let mut t = AnthropicToResponses::new();
+        t.translate_response_event(response_created("claude-opus-4-1-20250805"));
+        t.translate_response_event(json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": "item_fc", "type": "function_call", "call_id": "call_1", "name": "get_weather"}
+        }));
+        let events = t.translate_response_event(json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_1", "status": "incomplete", "model": "claude-opus-4-1-20250805",
+                "usage": {"output_tokens": 4}
             }
         }));
         assert_eq!(events[0]["delta"]["stop_reason"], json!("max_tokens"));
