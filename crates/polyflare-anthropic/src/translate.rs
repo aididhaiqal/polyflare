@@ -782,7 +782,11 @@ mod tests {
         let out = map_request(body);
         assert_eq!(out["model"], json!("claude-opus-4-1-20250805"));
         assert_eq!(out["store"], json!(false));
-        assert_eq!(out["stream"], json!(true), "stream is forced true regardless of client");
+        assert_eq!(
+            out["stream"],
+            json!(true),
+            "stream is forced true regardless of client"
+        );
         assert!(
             out.get("max_output_tokens").is_none(),
             "max_output_tokens must never be sent (Codex rejects it)"
