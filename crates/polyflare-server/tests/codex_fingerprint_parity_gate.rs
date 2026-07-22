@@ -31,8 +31,10 @@
 //! - Does NOT check header ORDER: `capture_request_fingerprint` sorts headers alphabetically
 //!   because `axum`'s `HeaderMap` does not preserve wire receipt order (see
 //!   `polyflare_server::fingerprint_capture` module docs, "Header-order fidelity").
-//! - Does NOT check exact id VALUES (only presence/shape). The codex-rs release version string
-//!   (`polyflare_codex::codex_headers::CODEX_CLI_VERSION`) is now capture-verified to `0.144.4`.
+//! - Does NOT check exact id VALUES (only presence/shape), and MASKS the UA version segment to
+//!   `<ver>`, so it is version-agnostic. The `CODEX_CLI_VERSION`
+//!   (`polyflare_codex::codex_headers::CODEX_CLI_VERSION`) floor is `0.145.0` (byte-capture-verified
+//!   through 0.144.4; 0.145.0 source-verified — see that const's doc).
 //!
 //! This test must FAIL before the executor sets these headers and PASS after.
 
