@@ -174,8 +174,8 @@ function EmptyState() {
         </span>
         <p className="text-fg opacity-55">
           The proxy currently accepts requests from loopback with no key required. Creating your
-          first key switches enforcement on — every subsequent request must present a valid,
-          enabled key.
+          first key switches enforcement on after you restart the proxy — every subsequent request
+          must then present a valid, enabled key.
         </p>
       </div>
     </Card>
