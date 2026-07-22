@@ -2545,6 +2545,15 @@ async fn messages_handler_codex_aliased(
     let picked = match selector.pick(&snapshots, &sel_ctx) {
         Some(id) => id,
         None => {
+            // KNOWN LIMITATION (M4 non-streaming, 2026-07-22): this pool-STARVATION recovery-wait
+            // fallback always returns SSE (via `try_layer1/2` → `stream_response`), even for a
+            // `stream:false` client that the immediate-pick success path below would answer with a
+            // buffered JSON `Message`. Buffering here would mean refactoring the shared
+            // `try_layer1_serve_now`/`try_layer2_recovery_wait` helpers (also used by `/responses`)
+            // to hand back the stream rather than a built Response — out of this slice's scope. A
+            // non-streaming client that hits starvation therefore still receives Anthropic SSE
+            // (rare edge; follow-up). The immediate-pick path (below) is fully non-streaming-aware.
+            //
             // B5-anthropic Task 4: the Codex-aliased `/v1/messages` mirror of
             // `messages_handler_native`'s Layer 1 → Layer 2 → `no_eligible` empty-pool fallthrough
             // (T3), but waiting ON the Codex pool (`pool_provider = Provider::Codex`, the SAME
