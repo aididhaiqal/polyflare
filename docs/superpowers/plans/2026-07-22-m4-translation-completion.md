@@ -6,7 +6,7 @@
 
 **Acceptance (observable, live-verified against the real Codex backend):**
 - A `stream:true` `/v1/messages` request still returns Anthropic SSE, unchanged from today (no regression).
-- A `stream:false`/`stream`-absent request returns a single `application/json` Anthropic `Message` (not SSE) with assembled `content[]`, correct `stop_reason`, and `usage`.
+- A `stream:false`/`stream`-absent request returns a single `application/json` Anthropic `Message` (not SSE) with assembled `content[]`, correct `stop_reason`, and `usage`. **Scoped limitation (documented in code + follow-up):** this holds on the immediate-pick success path; the pool-STARVATION recovery-wait fallback still returns SSE for a non-streaming client (buffering it needs a refactor of the shared `try_layer1/2` helpers used by `/responses` too) — a rare edge, deferred.
 - A turn that calls a tool reports `stop_reason: "tool_use"` (not `end_turn`), in both streaming (`message_delta`) and non-streaming (final `Message`) forms.
 - `tool_choice` is forwarded and honored (or, if Codex rejects it like `max_output_tokens`, deliberately dropped with a recorded reason — decided by live probe, not assumption).
 - All touched crates: `cargo test` green, `clippy -D warnings --all-targets` clean, `fmt` clean. Wedge-sacred files untouched.
