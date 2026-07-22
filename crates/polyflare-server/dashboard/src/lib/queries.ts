@@ -7,13 +7,17 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   api,
   ApiError,
+  createKey,
   deleteAccount,
   patchAccount,
+  patchKey,
   patchSettings,
   type AccountDetailView,
   type AccountPatchBody,
   type AccountView,
+  type ApiKeysView,
   type CapabilitiesView,
+  type CreatedApiKey,
   type OverviewSeriesView,
   type OverviewView,
   type PaceResponse,
@@ -45,6 +49,7 @@ export const queryKeys = {
   sessions: (params: SessionsQueryParams) => ["sessions", params] as const,
   reports: (params: ReportsParams) => ["reports", params] as const,
   settings: ["settings"] as const,
+  keys: ["keys"] as const,
   capabilities: ["capabilities"] as const,
 };
 
@@ -223,6 +228,20 @@ export function useSettings() {
   });
 }
 
+/** `GET /api/keys` — the API-Keys page's list of client proxy keys, redacted (never a hash or raw
+ * key — see `ApiKeyView`). Same 60s stale/refetch cadence as `useSettings`: this list only changes
+ * on an admin create/enable/disable (which invalidates `["keys"]` directly, see `useCreateKey`/
+ * `useUpdateKey`) or another admin's edit landing, so there's no value polling it as often as the
+ * live account/request lists. */
+export function useKeys() {
+  return useQuery<ApiKeysView>({
+    queryKey: queryKeys.keys,
+    queryFn: api.keys,
+    staleTime: 60_000,
+    refetchInterval: 60_000,
+  });
+}
+
 export function useCapabilities() {
   return useQuery<CapabilitiesView>({
     queryKey: queryKeys.capabilities,
@@ -294,5 +313,41 @@ export function useUpdateSettings() {
     },
     onError: (e) =>
       toast({ title: "Update failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+/** `POST /api/keys` — mint a new client proxy API key (API-Keys page's "Create key" action). On
+ * success, invalidates `["keys"]` (so the list picks up the new redacted row) and fires a success
+ * toast, same as every other mutation here — but does NOT write the mutation's own result into any
+ * query cache. `CreatedApiKey.key` is the raw plaintext, returned this one time only; the caller
+ * (`Keys.tsx`) reads it off `mutate`'s `onSuccess` callback / the returned promise to open a
+ * show-once modal, holding it in its own transient React state — it never touches `["keys"]`, which
+ * only ever holds refetched, redacted `ApiKeyView[]` data. */
+export function useCreateKey() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation<CreatedApiKey, Error, string | undefined>({
+    mutationFn: (label?: string) => createKey(label),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.keys });
+      toast({ title: "Key created", variant: "success" });
+    },
+    onError: (e) => toast({ title: "Create failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+/** `PATCH /api/keys/{id}` — enable/disable a client proxy API key (per-row toggle). Same
+ * mutation shape as `usePatchAccount`: invalidate `["keys"]` + success toast on success, the
+ * backend's message via `mutationErrorText` on error (e.g. an unknown id's `404`). */
+export function useUpdateKey() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (v: { id: string; enabled: boolean }) => patchKey(v.id, { enabled: v.enabled }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.keys });
+      toast({ title: "Key updated", variant: "success" });
+    },
+    onError: (e) => toast({ title: "Update failed", description: mutationErrorText(e), variant: "error" }),
   });
 }

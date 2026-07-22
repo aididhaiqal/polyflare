@@ -40,6 +40,12 @@
 // MoreVertical is the Task 6 addition for the shared `ActionMenu` primitive (ui/ActionMenu.tsx):
 // it's the kebab (⋯) trigger icon fronting the account-row action menu (Tasks 7/8 consume it).
 // `Check` (already exported above for Toast) is reused by `ActionMenu.CheckItem`'s checkmark.
+//
+// KeyRound/Copy/Plus are the dashboard API-Keys subsystem's (Outcome 2) additions: `KeyRound`
+// fronts the `/keys` sidebar nav entry and the empty-state note (distinct from the plain `Key`
+// glyph already used for account token-health, so the two read as different concepts at a
+// glance); `Copy` is the show-once create-key modal's copy-to-clipboard affordance; `Plus` fronts
+// the page's "Create key" action.
 export {
   Activity,
   AlertTriangle,
@@ -54,10 +60,12 @@ export {
   CircleAlert,
   Clock,
   Coins,
+  Copy,
   Download,
   EyeOff,
   Flame,
   Key,
+  KeyRound,
   Layers,
   Link2,
   List,
@@ -69,6 +77,7 @@ export {
   Pause,
   Pencil,
   Play,
+  Plus,
   RotateCcw,
   Route,
   Search,

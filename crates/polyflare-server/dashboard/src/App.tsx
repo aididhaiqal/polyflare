@@ -8,6 +8,7 @@ import { AuthProvider, RequireAuth } from "./auth/AuthProvider";
 import { CapabilitiesProvider } from "./capabilities/CapabilitiesProvider";
 import { AccountDetail } from "./pages/AccountDetail";
 import { Accounts } from "./pages/Accounts";
+import { Keys } from "./pages/Keys";
 import { LiveLogs } from "./pages/LiveLogs";
 import { Login } from "./pages/Login";
 import { Overview } from "./pages/Overview";
@@ -54,6 +55,7 @@ export function App() {
                 <Route path="sessions" element={<Sessions />} />
                 <Route path="reports" element={<Reports />} />
                 <Route path="settings" element={<Settings />} />
+                <Route path="keys" element={<Keys />} />
                 <Route path="logs" element={<LiveLogs />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
               </Route>
