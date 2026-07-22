@@ -242,3 +242,75 @@ pub async fn patch_settings_handler(
 
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
 }
+
+// --- Dashboard API-keys subsystem Outcome 1: `POST /api/keys` (create-show-once) + `PATCH
+// /api/keys/{id}` (enable/disable). `GET /api/keys` is in `crate::read_api`. ---
+
+/// `POST /api/keys` body: an optional human-readable label (e.g. "laptop", "ci"). Absent/`null` ⇒
+/// no label — mirrors `crate::keys::create_key`'s own `Option<&str>` parameter.
+#[derive(Deserialize)]
+pub struct CreateKeyRequest {
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// `POST /api/keys` — mint a new client proxy API key. Delegates to `crate::keys::create_key`
+/// (the ONLY place a raw key is ever produced — see its doc), which stores the key's hash +
+/// prefix and hands back the plaintext for this ONE response only.
+///
+/// **Content-safety (inviolable):** `created.raw` is placed directly into the JSON response body
+/// below and NOWHERE else — this function contains no `tracing::`/`println!`/`eprintln!` call of
+/// any kind, and this route is a dashboard `/api/*` handler, not the proxied-request path, so no
+/// `RequestLog` row is ever built from it. The raw key is unrecoverable after this response: only
+/// `created.key_hash` (never returned to any caller) persists.
+pub async fn create_key_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateKeyRequest>,
+) -> Response {
+    let now = unix_now();
+    let created = match crate::keys::create_key(&state.store, body.label.as_deref(), now).await {
+        Ok(c) => c,
+        Err(_) => return internal_error(),
+    };
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": created.id,
+            "key_prefix": created.key_prefix,
+            "key": created.raw,
+        })),
+    )
+        .into_response()
+}
+
+/// `PATCH /api/keys/{id}` body: enable or disable the key. Unlike `AccountPatch`'s optional
+/// fields, this patch only ever does one thing today, so `enabled` is required.
+#[derive(Deserialize)]
+pub struct PatchKeyRequest {
+    enabled: bool,
+}
+
+/// `PATCH /api/keys/{id}` — enable/disable a client proxy API key (`ApiKeyRepo::set_enabled`).
+/// Unknown `id` → `404`. `set_enabled` itself has no rows-affected signal to distinguish "updated"
+/// from "no such row" (unlike `AccountRepo::delete`'s `bool` return), so existence is checked via
+/// a `list()` scan first — cheap at this table's expected size, and the same
+/// check-before-apply shape `patch_account_handler` already uses above.
+pub async fn patch_key_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(patch): Json<PatchKeyRequest>,
+) -> Response {
+    let repo = state.store.api_keys();
+    let rows = match repo.list().await {
+        Ok(r) => r,
+        Err(_) => return internal_error(),
+    };
+    if !rows.iter().any(|r| r.id == id) {
+        return (StatusCode::NOT_FOUND, "no such key").into_response();
+    }
+    if repo.set_enabled(&id, patch.enabled).await.is_err() {
+        return internal_error();
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+}

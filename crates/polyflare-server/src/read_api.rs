@@ -19,7 +19,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use polyflare_codex::oauth::token_exp;
-use polyflare_store::RequestsFilter;
+use polyflare_store::{ApiKeyRow, RequestsFilter};
 
 use crate::app::AppState;
 use crate::usage_windows::{resolve, ResolvedWindow};
@@ -1337,6 +1337,56 @@ pub async fn reports_handler(
         totals: ReportTotalsView::from(totals),
     })
     .into_response()
+}
+
+// --- Dashboard API-keys subsystem (D18-follow-on) Outcome 1: `GET /api/keys` (+ `POST`/`PATCH
+// /api/keys{/{id}}`, in `crate::write_api`) ---
+
+/// One `api_keys` row for the dashboard listing. Mirrors `polyflare_store::ApiKeyRow` field-for-
+/// field. That row type already carries no `key_hash`/raw-key field at all (see its doc — callers
+/// look a key up BY hash via `ApiKeyRepo::get_by_hash`, never the other way around), so this view
+/// is content-safe BY CONSTRUCTION: there is no field here a caller could even attempt to leak.
+#[derive(Serialize)]
+struct ApiKeyView {
+    id: String,
+    key_prefix: String,
+    label: Option<String>,
+    enabled: bool,
+    created_at: i64,
+    last_used_at: Option<i64>,
+}
+
+impl From<ApiKeyRow> for ApiKeyView {
+    fn from(r: ApiKeyRow) -> Self {
+        ApiKeyView {
+            id: r.id,
+            key_prefix: r.key_prefix,
+            label: r.label,
+            enabled: r.enabled,
+            created_at: r.created_at,
+            last_used_at: r.last_used_at,
+        }
+    }
+}
+
+/// `GET /api/keys` response: every client API key, redacted.
+#[derive(Serialize)]
+struct ApiKeysView {
+    keys: Vec<ApiKeyView>,
+}
+
+/// `GET /api/keys` — every client proxy API key (Outcome 1), redacted: `id, key_prefix, label,
+/// enabled, created_at, last_used_at` — NEVER the `key_hash` or a raw key. `crate::write_api::
+/// create_key_handler` is the only place a raw key is ever returned (exactly once, at creation);
+/// this read path never has access to one at all.
+pub async fn keys_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let rows = match state.store.api_keys().list().await {
+        Ok(r) => r,
+        Err(_) => return Response::error(),
+    };
+    Response::ok(ApiKeysView {
+        keys: rows.into_iter().map(ApiKeyView::from).collect(),
+    })
 }
 
 // --- Settings subsystem Task 5: `GET /api/settings` (+ the shared field-metadata table
