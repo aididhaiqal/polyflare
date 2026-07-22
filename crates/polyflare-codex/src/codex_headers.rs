@@ -2,12 +2,15 @@
 //! egress-parity half of the fingerprint-parity gate (see `executor.rs` and
 //! `polyflare-server/tests/codex_fingerprint_parity_gate.rs`).
 //!
-//! # Status: CAPTURE-VERIFIED (codex-cli 0.144.4, 2026-07-15)
+//! # Status: CAPTURE-VERIFIED (codex-cli 0.144.4, 2026-07-15); floor now 0.145.0 (source-verified)
 //! Originally built from a local `openai/codex` source read, this synthesis has since been
 //! diffed against a live wire capture of the real Codex CLI (`codex-cli 0.144.4`, obtained by
 //! routing a `scripts/codex-polyflare` run through `POLYFLARE_CAPTURE_FINGERPRINT`). The capture
 //! CONFIRMED the base identity-header set, the `x-codex-turn-metadata` field-key set, and the UA
-//! format below. It also revealed two headers this module deliberately does NOT synthesize, both
+//! format below. The [`CODEX_CLI_VERSION`] floor was later bumped 0.144.4 → 0.145.0 after a
+//! SOURCE-level diff of openai/codex (0f44bca → 37eef7bac) showed no change to this synthesized
+//! structure — only the embedded UA version moved (a byte-level re-capture at 0.145.0 is still
+//! recommended; see the const doc). It also revealed two headers this module deliberately does NOT synthesize, both
 //! of which represent OPTIONAL codex states (so omitting them is itself a valid codex fingerprint):
 //! - `x-codex-beta-features` — a comma-separated list of the session's enabled experimental
 //!   feature keys (`core/src/session/mod.rs::build_model_client_beta_features_header`). Absent
@@ -61,13 +64,18 @@
 
 use sha2::{Digest, Sha256};
 
-/// The `codex-rs` CLI release version embedded in its User-Agent. Capture-verified against live
-/// `codex-cli` runs (2026-07-15); update in lockstep with the codex-rs release PolyFlare mirrors on
-/// egress (a stale version here is a fingerprint tell against a newer real codex). Re-capturing
-/// across the 0.144.x line (0.144.1 → 0.144.4) showed the egress fingerprint is patch-stable — the
-/// header set, turn-metadata key set, and UA FORMAT are identical; only this version string moves —
-/// so a patch bump only requires updating this const, not the synthesis.
-pub const CODEX_CLI_VERSION: &str = "0.144.4";
+/// The `codex-rs` CLI release version embedded in its User-Agent. Byte-capture-verified against
+/// live `codex-cli` runs through 0.144.4 (2026-07-15); update in lockstep with the codex-rs release
+/// PolyFlare mirrors on egress (a stale version here is a fingerprint tell against a newer real
+/// codex). Re-capturing across the 0.144.x line (0.144.1 → 0.144.4) showed the egress fingerprint is
+/// patch-stable — the header set, turn-metadata key set, and UA FORMAT are identical; only this
+/// version string moves. The 0.144.4 → 0.145.0 bump was verified at the SOURCE level (openai/codex
+/// 0f44bca → 37eef7bac): no request-header, UA-format, or turn-metadata-key change — only the
+/// embedded version and three models' `context_window` (372k → 272k, carried live via the model
+/// catalog, never hardcoded here). A byte-level golden re-capture (`POLYFLARE_CAPTURE_FINGERPRINT`)
+/// against a real 0.145.0 client is still recommended to promote 0.145.0 from source-verified to
+/// capture-verified.
+pub const CODEX_CLI_VERSION: &str = "0.145.0";
 
 /// codex-rs's default `originator` (`login/src/auth/default_client.rs::DEFAULT_ORIGINATOR`).
 const ORIGINATOR: &str = "codex_cli_rs";
@@ -356,7 +364,7 @@ mod tests {
     #[test]
     fn codex_user_agent_matches_captured_codex_rs_shape() {
         let ua = codex_user_agent(CODEX_CLI_VERSION);
-        // Capture-verified prefix: `codex_cli_rs/0.144.4 (`.
+        // Capture-verified prefix shape: `codex_cli_rs/<ver> (` (byte-captured at 0.144.4; floor now 0.145.0).
         assert!(
             ua.starts_with(&format!("{ORIGINATOR}/{CODEX_CLI_VERSION} (")),
             "unexpected UA prefix: {ua}"
