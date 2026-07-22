@@ -31,7 +31,8 @@ use serde_json::{json, Value};
 /// Map an Anthropic Messages request body to an OpenAI-Responses request body.
 ///
 /// **Envelope** (top-level fields): `model` passthrough (alias remap happens later, in the core
-/// outgoing rewrite — SPEC-M4 U2), `system`→`instructions`. The Codex `backend-api/responses`
+/// outgoing rewrite — SPEC-M4 U2), `system`→`instructions`, `tool_choice` mapped to the Responses
+/// shape (`map_tool_choice`), `stop_sequences` dropped (Codex rejects `stop`). The Codex `backend-api/responses`
 /// contract is enforced here (verified live, not the generic OpenAI schema): `store:false` +
 /// `stream:true` are always set, and the client's `max_tokens` is dropped (Codex rejects
 /// `max_output_tokens`). See `map_request`'s body for the exact upstream-400 messages that pin each.
@@ -113,7 +114,30 @@ fn map_request(body: Value) -> Value {
     if let Some(t) = tools {
         map.insert("tools".to_string(), map_tools(&t));
     }
+    if let Some(tc) = body.get("tool_choice") {
+        map.insert("tool_choice".to_string(), map_tool_choice(tc));
+    }
+    // `stop_sequences` is intentionally NOT forwarded: Codex `/responses` rejects a `stop` parameter
+    // with `400` (live-probed 2026-07-22, same class as `max_output_tokens`), and offers no accepted
+    // equivalent — so an Anthropic client's stop sequences are dropped rather than sent and 400'd.
     out
+}
+
+/// Map an Anthropic `tool_choice` to the OpenAI-Responses shape:
+/// `{"type":"auto"}`→`"auto"`, `{"type":"any"}`→`"required"`, `{"type":"none"}`→`"none"`,
+/// `{"type":"tool","name":N}`→`{"type":"function","name":N}`. An unrecognized shape passes through
+/// unchanged (fail-open: let the backend reject a genuinely malformed value rather than guess).
+fn map_tool_choice(tc: &Value) -> Value {
+    match tc.get("type").and_then(|v| v.as_str()) {
+        Some("auto") => json!("auto"),
+        Some("any") => json!("required"),
+        Some("none") => json!("none"),
+        Some("tool") => {
+            let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            json!({"type": "function", "name": name})
+        }
+        _ => tc.clone(),
+    }
 }
 
 /// Map Anthropic `messages` to an OpenAI-Responses `input` array, flattening `tool_use`/
@@ -998,6 +1022,24 @@ mod tests {
         let out = map_request(body);
         assert_eq!(out["stream"], json!(true));
         assert_eq!(out["store"], json!(false));
+    }
+
+    #[test]
+    fn maps_tool_choice_variants_to_responses_shape() {
+        let mk = |tc: Value| {
+            map_request(json!({"model": "m", "messages": [], "tool_choice": tc}))["tool_choice"]
+                .clone()
+        };
+        assert_eq!(mk(json!({"type": "auto"})), json!("auto"));
+        assert_eq!(mk(json!({"type": "any"})), json!("required"));
+        assert_eq!(mk(json!({"type": "none"})), json!("none"));
+        assert_eq!(
+            mk(json!({"type": "tool", "name": "get_weather"})),
+            json!({"type": "function", "name": "get_weather"})
+        );
+        // absent tool_choice → key omitted entirely
+        let out = map_request(json!({"model": "m", "messages": []}));
+        assert!(out.get("tool_choice").is_none());
     }
 
     #[test]
