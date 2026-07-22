@@ -369,6 +369,9 @@ fn request_translation_does_not_remap_model_alias() {
     // translator must never guess at it.
     assert_eq!(out["model"], json!("claude-opus-4-1-20250805"));
     assert_eq!(out["instructions"], json!("Be concise."));
-    assert_eq!(out["max_output_tokens"], json!(512));
+    // Codex backend-api/responses contract (live-verified): store:false + stream:true always, and
+    // the client's max_tokens is dropped (Codex rejects max_output_tokens).
+    assert_eq!(out["store"], json!(false));
     assert_eq!(out["stream"], json!(true));
+    assert!(out.get("max_output_tokens").is_none());
 }
