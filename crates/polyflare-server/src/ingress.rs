@@ -22,6 +22,7 @@ use polyflare_store::{PlainTokens, RequestLogRecord, RequestLogRepo};
 
 use crate::alias::{self, ModelAlias};
 use crate::app::AppState;
+use crate::collect_message::collect_anthropic_message;
 use crate::config;
 use crate::failover::{exclude_tried, failover_reason_code, failover_verdict, FailoverVerdict};
 use crate::fingerprint_capture::{append_fingerprint_capture, capture_request_fingerprint};
@@ -357,6 +358,19 @@ fn stream_response(stream: ResponseStream) -> Response {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .body(Body::from_stream(stream))
+        .expect("valid response")
+}
+
+/// Outcome 3's non-streaming `/v1/messages` success response: a single buffered Anthropic
+/// `Message`, `application/json` (not SSE) — the mirror of `stream_response` for a `stream:false`
+/// client. `message` is already the fully-assembled `serde_json::Value` from
+/// `collect_anthropic_message`; this just serializes and wraps it.
+fn json_message_response(message: serde_json::Value) -> Response {
+    let body = serde_json::to_vec(&message).unwrap_or_else(|_| b"{}".to_vec());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
         .expect("valid response")
 }
 
@@ -2456,6 +2470,13 @@ async fn messages_handler_codex_aliased(
         reasoning_effort: model_alias.reasoning_effort.clone(),
         subagent: None,
     };
+    // Outcome 3: the client's stream preference, read BEFORE `body` moves into
+    // `translate_request` below. Anthropic's Messages API defaults `stream:false` — absent means
+    // non-streaming, same as a real Anthropic client would treat it.
+    let client_wants_stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let mut translator = AnthropicToResponses::new();
     let mut translated_body = translator.translate_request(body);
     translated_body["model"] = serde_json::Value::String(model_alias.target_model.clone());
@@ -2604,7 +2625,19 @@ async fn messages_handler_codex_aliased(
         Ok(stream) => {
             let translated_stream =
                 wrap_translating_stream(stream, Box::new(translator) as Box<dyn Translator>);
-            stream_response(translated_stream)
+            if client_wants_stream {
+                stream_response(translated_stream)
+            } else {
+                // Outcome 3: a non-streaming client gets one buffered `application/json` Message,
+                // never SSE. `collect_anthropic_message` consumes the SAME already-translated
+                // Anthropic frames the streaming branch would have relayed byte-for-byte — no
+                // second translation. A mid-stream error propagates as the same generic,
+                // content-safe response the streaming Err arm below uses; never a partial Message.
+                match collect_anthropic_message(translated_stream).await {
+                    Ok(message) => json_message_response(message),
+                    Err(_) => (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
+                }
+            }
         }
         Err(e) => {
             record_failure(&state, &health_id, &e, unix_now()).await;

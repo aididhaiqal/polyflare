@@ -5,6 +5,7 @@ pub mod alias;
 pub mod app;
 pub mod auth;
 pub mod catalog;
+pub mod collect_message;
 pub mod config;
 pub mod continuity;
 pub mod control;

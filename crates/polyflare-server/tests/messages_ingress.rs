@@ -210,6 +210,11 @@ async fn messages_returns_503_when_pool_has_no_anthropic_account() {
 /// the upstream Codex mock received the remapped `model` + injected `reasoning.effort`, and (b)
 /// the client-facing body is genuine Anthropic-Messages SSE (`message_start`/`content_block_*`/
 /// `message_stop`), not the raw OpenAI-Responses shape the mock actually emitted.
+///
+/// M4 Outcome 3: this client explicitly sends `"stream": true`, so the streaming path must stay
+/// byte-identical to before Outcome 3 existed — see
+/// `messages_aliased_to_codex_buffers_a_json_message_when_client_does_not_stream` below for the
+/// (now-default) non-streaming buffered-Message path.
 #[tokio::test]
 async fn messages_aliases_opus_to_codex_and_relays_translated_anthropic_sse() {
     let dir = tempfile::tempdir().unwrap();
@@ -240,12 +245,17 @@ async fn messages_aliases_opus_to_codex_and_relays_translated_anthropic_sse() {
         .post(format!("{pf}/v1/messages"))
         .json(&serde_json::json!({
             "model": "claude-opus-4-1-20250805",
-            "messages": [{"role": "user", "content": "hi"}]
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
         }))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get(reqwest::header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
 
     // (a) the Codex upstream received the remapped model + injected reasoning effort.
     let sent = handle.last_body().unwrap();
@@ -264,6 +274,60 @@ async fn messages_aliases_opus_to_codex_and_relays_translated_anthropic_sse() {
     assert!(
         !body.contains("response.output_text.delta"),
         "client must never see the raw OpenAI-Responses event shape: {body}"
+    );
+}
+
+/// M4 Outcome 3: Anthropic's Messages API defaults `stream:false` — a client that omits `stream`
+/// entirely (as here) must get back exactly ONE buffered `application/json` Anthropic `Message`,
+/// not SSE. Same scripted Codex turn as the `stream:true` test above, folded into a Message
+/// instead of relayed as frames.
+#[tokio::test]
+async fn messages_aliased_to_codex_buffers_a_json_message_when_client_does_not_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[21u8; 32]).unwrap();
+    store
+        .accounts()
+        .insert(&codex_account("codex-2"), &tokens(), &cipher)
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+
+    let mock = MockUpstream::new(vec![
+        r#"{"type":"response.created","response":{"id":"resp_2","status":"in_progress","model":"gpt-5.6-sol","usage":null}}"#.to_string(),
+        r#"{"type":"response.output_item.added","item":{"id":"item_1","type":"message","role":"assistant","content":[]}}"#.to_string(),
+        r#"{"type":"response.content_part.added","item_id":"item_1","part":{"type":"output_text","text":"","annotations":[]}}"#.to_string(),
+        r#"{"type":"response.output_text.delta","item_id":"item_1","delta":"hi"}"#.to_string(),
+        r#"{"type":"response.output_text.done","item_id":"item_1","text":"hi"}"#.to_string(),
+        r#"{"type":"response.completed","response":{"id":"resp_2","status":"completed","model":"gpt-5.6-sol","usage":{"output_tokens":1}}}"#.to_string(),
+    ]);
+    let codex_upstream = mock.spawn().await;
+    let pf = spawn_polyflare_full(store, codex_upstream, "http://127.0.0.1:9".to_string()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{pf}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-opus-4-1-20250805",
+            "messages": [{"role": "user", "content": "hi"}]
+            // No "stream" field -- Anthropic's own default (stream:false).
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get(reqwest::header::CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+
+    let message: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(message["type"], "message");
+    assert_eq!(message["role"], "assistant");
+    assert_eq!(message["stop_reason"], "end_turn");
+    assert_eq!(
+        message["content"],
+        serde_json::json!([{"type": "text", "text": "hi"}])
     );
 }
 
