@@ -65,7 +65,11 @@ impl Continuity for CodexContinuity {
         // The session row is ALSO where TA6(b) Task 3's sticky-cyber stamp lives, so fetch it
         // unconditionally (not just on an owner-resolution miss) — a turn whose owner resolved via
         // the anchor map must still pick up the sticky requirement for this turn's selection.
-        let mut owner: Option<AccountId> = None;
+        //
+        // S3(a) invariant (2026-07-22 incident): the session row is AFFINITY, not ownership — it
+        // fills in only when no anchor resolves, and a disagreement is NEVER an error (the anchor
+        // owner wins; the stale row is overwritten by the next record_completion/record_recovery).
+        let mut anchor_owner: Option<AccountId> = None;
         if let Some(rid) = anchor.as_deref() {
             if let Some(acc) = self
                 .repo
@@ -73,9 +77,10 @@ impl Continuity for CodexContinuity {
                 .await
                 .map_err(box_store_err)?
             {
-                owner = Some(AccountId::from(acc));
+                anchor_owner = Some(AccountId::from(acc));
             }
         }
+        let mut session_owner: Option<AccountId> = None;
         let mut require_security_work_authorized = false;
         if let Some(sk) = session_key.as_ref() {
             if let Some(row) = self
@@ -84,12 +89,30 @@ impl Continuity for CodexContinuity {
                 .await
                 .map_err(box_store_err)?
             {
-                if owner.is_none() {
-                    owner = row.owning_account_id.clone().map(AccountId::from);
-                }
+                session_owner = row.owning_account_id.clone().map(AccountId::from);
                 require_security_work_authorized = row.has_capability(SECURITY_WORK_CAPABILITY);
             }
         }
+        let (owner, source) = match (&anchor_owner, &session_owner) {
+            (Some(a), _) => (Some(a.clone()), "anchor_map"),
+            (None, Some(s)) => (Some(s.clone()), "session_row"),
+            (None, None) => (None, "none"),
+        };
+        // S3(a) directive 4: one content-free resolution line per selection — which sources spoke,
+        // what each said, which won. `stale_affinity` flags the incident shape (both sources
+        // present + disagreeing); `session` is already a sha256 key, ids are account ids — no
+        // content. This line is what made the codex-lb incident diagnosable in minutes.
+        tracing::info!(
+            target: "continuity_owner_resolution",
+            session = session_key.as_ref().map(|k| k.value.as_str()).unwrap_or("-"),
+            anchor_present = anchor.is_some(),
+            anchor_owner = anchor_owner.as_ref().map(|a| a.as_str()).unwrap_or("-"),
+            session_owner = session_owner.as_ref().map(|a| a.as_str()).unwrap_or("-"),
+            resolved = owner.as_ref().map(|a| a.as_str()).unwrap_or("-"),
+            source,
+            stale_affinity = matches!((&anchor_owner, &session_owner), (Some(a), Some(s)) if a != s),
+            "owner resolution"
+        );
 
         // Ensure a session row exists (Fresh on miss); mark reattaching when an anchor is in flight.
         // The anchored case does both in ONE UPSERT (`ensure_session_reattaching`) instead of
@@ -543,6 +566,112 @@ mod tests {
             .await
             .unwrap();
         assert!(!p.directive.require_security_work_authorized);
+    }
+
+    // ---- S3(a): affinity is never ownership (2026-07-22 codex-lb owner-conflict incident) ------
+
+    /// The exact incident resolution state: the anchor map says the conversation is owned by A,
+    /// but the session row's `owning_account_id` (the affinity hint) points at B — stale, because
+    /// affinity rows can drift (in codex-lb: TTL-less sticky rows + capacity-routed first turns).
+    /// The anchor map MUST win, silently: pin A, no error, the affinity hint structurally unable
+    /// to veto. (codex-lb turned this same state into a terminal 503 loop.)
+    #[tokio::test]
+    async fn anchor_owner_beats_stale_session_owner_without_error() {
+        let (store, cont) = make().await;
+        for id in ["A", "B"] {
+            sqlx::query(
+                "INSERT INTO accounts (id, email, access_token_enc, refresh_token_enc, id_token_enc, created_at) \
+                 VALUES (?, 'e@x', X'00', X'00', X'00', 0)",
+            )
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        // Turn 1 completed on A → anchor map resp_1→A, session row owner A.
+        cont.repo.ensure_session("skS", "soft", 1).await.unwrap();
+        cont.repo
+            .record_completion("skS", "soft", "A", "resp_1", "fp", 2, 1)
+            .await
+            .unwrap();
+        // Inject the stale-affinity drift: the session row now claims B.
+        sqlx::query("UPDATE continuity_sessions SET owning_account_id = 'B' WHERE session_key = 'skS'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let ctx = RequestCtx {
+            session_key: Some(polyflare_core::SessionKey {
+                value: "skS".into(),
+                strength: KeyStrength::Soft,
+            }),
+            client_previous_response_id: Some("resp_1".into()),
+            is_full_resend: true,
+            ..Default::default()
+        };
+        let body =
+            serde_json::json!({"previous_response_id": "resp_1", "input": [{"a":1},{"b":2}]});
+        let p = cont.prepare(req(body), &ctx).await.unwrap();
+        assert_eq!(
+            p.directive.pin_account,
+            Some(AccountId::from("A")),
+            "the anchor map's owner wins over the stale session-row affinity — no conflict error"
+        );
+    }
+
+    /// The stale affinity entry is CORRECTED, not honored: after the disagreeing turn completes on
+    /// the true owner, the session row's `owning_account_id` reads the owner again.
+    #[tokio::test]
+    async fn completion_overwrites_stale_session_owner() {
+        let (store, cont) = make().await;
+        for id in ["A", "B"] {
+            sqlx::query(
+                "INSERT INTO accounts (id, email, access_token_enc, refresh_token_enc, id_token_enc, created_at) \
+                 VALUES (?, 'e@x', X'00', X'00', X'00', 0)",
+            )
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        cont.repo.ensure_session("skT", "soft", 1).await.unwrap();
+        cont.repo
+            .record_completion("skT", "soft", "A", "resp_1", "fp", 2, 1)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE continuity_sessions SET owning_account_id = 'B' WHERE session_key = 'skT'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        // The next turn completes on the true owner A (as the anchor-map pin routed it).
+        cont.observe(
+            TurnOutcome::Completed {
+                session_key: Some(polyflare_core::SessionKey {
+                    value: "skT".into(),
+                    strength: KeyStrength::Soft,
+                }),
+                account: AccountId::from("A"),
+                response_id: Some("resp_2".into()),
+                input_fingerprint: "fp".into(),
+                input_count: 3,
+                reasoning: None,
+            },
+            &RequestCtx::default(),
+        )
+        .await
+        .unwrap();
+        let row = store
+            .continuity()
+            .get_session("skT")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.owning_account_id.as_deref(),
+            Some("A"),
+            "the stale affinity entry is overwritten by the completion"
+        );
     }
 
     #[tokio::test]
