@@ -3,12 +3,17 @@
 //! SQLite DB does not grow unbounded. Mirrors `crate::usage_refresh::spawn_usage_refresh`'s
 //! `tokio::spawn(async move { loop { ...; sleep(INTERVAL).await } })` shape exactly.
 //!
-//! # Global Constraints (see `docs/superpowers/plans/2026-07-18-c12-retention-pruning.md`)
-//! - **Prune ONLY `request_log` + `usage_history`.** This module is structurally incapable of
-//!   touching `accounts`/`api_keys`/`continuity_*` — it calls exactly two repo methods, each
-//!   scoped to one of the two log tables, and nothing else.
-//! - **Disabled by default.** Both `request_log_retention_days`/`usage_history_retention_days`
-//!   default to `0` (see `crate::config`); `0` ⇒ that table is skipped entirely (no-op).
+//! # Global Constraints (see `docs/superpowers/plans/2026-07-18-c12-retention-pruning.md`,
+//! extended by `docs/superpowers/plans/2026-07-22-continuity-owner-conflict-hardening.md`)
+//! - **Prune ONLY `request_log` + `usage_history` + the two continuity tables.** This module is
+//!   structurally incapable of touching `accounts`/`api_keys` — it calls exactly four repo
+//!   methods, each scoped to one prunable table, and nothing else. The continuity tables joined
+//!   under S3(a) directive 3 (the 2026-07-22 codex-lb incident): affinity state without a TTL
+//!   becomes false ownership evidence over time.
+//! - **The log tables are disabled by default.** Both `request_log_retention_days`/
+//!   `usage_history_retention_days` default to `0` (see `crate::config`); `0` ⇒ that table is
+//!   skipped entirely (no-op). The continuity TTL is ALWAYS ON by design — a disabled-by-default
+//!   knob would recreate codex-lb's no-TTL trap (see [`CONTINUITY_TTL_DAYS`]).
 //! - **Content-free.** Only row COUNTS are ever logged (`tracing::info!(deleted = n, table = ..)`)
 //!   — never row content, never a usage value, never a request field.
 //! - **A failed prune must never crash the task.** Each table's prune is independently
@@ -32,6 +37,17 @@ const RETENTION_INTERVAL: Duration = Duration::from_secs(3600);
 /// this many rows per `DELETE` until a batch affects fewer than `PRUNE_BATCH_SIZE` rows).
 const PRUNE_BATCH_SIZE: i64 = 10_000;
 
+/// S3(a) directive 3 (2026-07-22 incident): the fixed, always-on TTL for continuity affinity
+/// state — `continuity_sessions` idle past this (by `last_activity_at`, bumped every turn) and
+/// `continuity_anchors` older than this (by `created_at`; every completed turn inserts a fresh
+/// row, so a live conversation's resolvable anchor is always young). Deliberately a constant,
+/// NOT a runtime setting: deletion is proven safe at any moment (see
+/// `tests/continuity_owner_conflict.rs`), so the exact value is uncritical — and codex-lb's
+/// incident came precisely from affinity rows that could live forever. A >30-day-idle
+/// conversation that resumes degrades to an unowned pick + armed-watchdog recovery, never a
+/// wedge.
+const CONTINUITY_TTL_DAYS: i64 = 30;
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -39,12 +55,13 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// The testable per-tick body: prunes `request_log` (if `state.request_log_retention_days > 0`)
-/// then `usage_history` (if `state.usage_history_retention_days > 0`), independently. Either or
-/// both tables no-op when their retention-days knob is `0` (the disabled default) — this function
-/// never reads any OTHER table, and never issues an unbounded delete (both repo methods batch
+/// The testable per-tick body: prunes `request_log` (if `state.request_log_retention_days > 0`),
+/// then `usage_history` (if `state.usage_history_retention_days > 0`), then the two continuity
+/// tables at the fixed always-on [`CONTINUITY_TTL_DAYS`] — each independently. The two log tables
+/// no-op when their retention-days knob is `0` (the disabled default) — this function never reads
+/// any OTHER table, and never issues an unbounded delete (all four repo methods batch
 /// internally). A prune `Err` is logged via `tracing::warn!` (table name + error only — content-
-/// free) and does NOT prevent the other table's prune from running, and does NOT panic or
+/// free) and does NOT prevent the other tables' prunes from running, and does NOT panic or
 /// propagate: the caller (`spawn_retention_prune`'s loop) can call this every tick forever without
 /// the task ever dying from a transient store error.
 pub async fn run_retention_pass(state: &AppState) {
@@ -85,6 +102,39 @@ pub async fn run_retention_pass(state: &AppState) {
             Err(e) => {
                 tracing::warn!(error = %e, table = "usage_history", "retention prune failed");
             }
+        }
+    }
+
+    // S3(a) directive 3: the always-on continuity-affinity TTL. Sessions first — its CASCADE
+    // takes each pruned session's anchors with it — then the anchor sweep catches old anchors of
+    // still-live sessions (superseded turns). Same independent warn-and-continue isolation.
+    let cutoff = now - CONTINUITY_TTL_DAYS * 86400;
+    match state
+        .store
+        .continuity()
+        .prune_sessions_older_than(cutoff, PRUNE_BATCH_SIZE)
+        .await
+    {
+        Ok(0) => {}
+        Ok(deleted) => {
+            tracing::info!(deleted, table = "continuity_sessions", "retention prune");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, table = "continuity_sessions", "retention prune failed");
+        }
+    }
+    match state
+        .store
+        .continuity()
+        .prune_anchors_older_than(cutoff, PRUNE_BATCH_SIZE)
+        .await
+    {
+        Ok(0) => {}
+        Ok(deleted) => {
+            tracing::info!(deleted, table = "continuity_anchors", "retention prune");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, table = "continuity_anchors", "retention prune failed");
         }
     }
 }
@@ -428,6 +478,47 @@ mod tests {
                 .len(),
             2,
             "usage_history's own knob is 0 ⇒ both rows survive, even the non-latest one"
+        );
+    }
+
+    /// S3(a) directive 3: the continuity-affinity TTL is ALWAYS ON — even with both log-table
+    /// knobs at `0`, one pass prunes a `> CONTINUITY_TTL_DAYS`-idle session (its anchor CASCADEs
+    /// away) while an active session and its anchor survive untouched.
+    #[tokio::test]
+    async fn run_retention_pass_always_prunes_idle_continuity_state() {
+        let now = unix_now();
+        let state = build_state(0, 0).await;
+        seed_account(&state.store, &state.cipher, "acct-1").await;
+        let repo = state.store.continuity();
+
+        let idle_ts = now - (CONTINUITY_TTL_DAYS + 1) * 86400;
+        repo.ensure_session("idle", "soft", idle_ts).await.unwrap();
+        repo.record_completion("idle", "soft", "acct-1", "resp_idle", "fp", 1, idle_ts)
+            .await
+            .unwrap();
+        repo.ensure_session("active", "soft", now - 10).await.unwrap();
+        repo.record_completion("active", "soft", "acct-1", "resp_active", "fp", 1, now - 10)
+            .await
+            .unwrap();
+
+        run_retention_pass(&state).await;
+
+        assert!(
+            repo.get_session("idle").await.unwrap().is_none(),
+            "a TTL-expired affinity row is pruned even with both log knobs disabled"
+        );
+        assert!(
+            repo.get_anchor_owner("resp_idle").await.unwrap().is_none(),
+            "the idle session's anchor cascaded away"
+        );
+        assert!(repo.get_session("active").await.unwrap().is_some());
+        assert_eq!(
+            repo.get_anchor_owner("resp_active")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("acct-1"),
+            "the active conversation's ownership evidence is untouched"
         );
     }
 }

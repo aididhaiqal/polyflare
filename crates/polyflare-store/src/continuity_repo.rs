@@ -298,6 +298,72 @@ impl ContinuityRepo {
         Ok(())
     }
 
+    /// S3(a) directive 3 (2026-07-22 incident): age-delete `continuity_sessions` rows whose
+    /// `last_activity_at < cutoff`. Session rows are AFFINITY state, not ownership evidence —
+    /// deletable at any moment without breaking a conversation (the anchor map carries ownership;
+    /// a live conversation bumps `last_activity_at` every turn, so only long-idle rows age out).
+    /// Batched-subselect shape + `batch_size <= 0` no-op guard mirror
+    /// `RequestLogRepo::prune_older_than` (see its doc for the SQLite `LIMIT` rationale).
+    pub async fn prune_sessions_older_than(
+        &self,
+        cutoff: i64,
+        batch_size: i64,
+    ) -> Result<u64, StoreError> {
+        self.prune_table_older_than(
+            "DELETE FROM continuity_sessions WHERE rowid IN \
+             (SELECT rowid FROM continuity_sessions WHERE last_activity_at < ?1 LIMIT ?2)",
+            cutoff,
+            batch_size,
+        )
+        .await
+    }
+
+    /// S3(a) directive 3: age-delete `continuity_anchors` rows whose `created_at < cutoff`. Every
+    /// completed turn inserts a FRESH anchor row, so an active conversation's resolvable anchor is
+    /// always young — only superseded/abandoned anchors age out. A client resuming a >TTL-idle
+    /// conversation degrades to an unowned pick + the armed-watchdog recovery path (never a wedge,
+    /// never a terminal error loop).
+    pub async fn prune_anchors_older_than(
+        &self,
+        cutoff: i64,
+        batch_size: i64,
+    ) -> Result<u64, StoreError> {
+        self.prune_table_older_than(
+            "DELETE FROM continuity_anchors WHERE rowid IN \
+             (SELECT rowid FROM continuity_anchors WHERE created_at < ?1 LIMIT ?2)",
+            cutoff,
+            batch_size,
+        )
+        .await
+    }
+
+    /// The shared batched age-delete loop behind the two prunes above. `sql` must bind
+    /// `?1 = cutoff`, `?2 = batch limit`.
+    async fn prune_table_older_than(
+        &self,
+        sql: &str,
+        cutoff: i64,
+        batch_size: i64,
+    ) -> Result<u64, StoreError> {
+        if batch_size <= 0 {
+            return Ok(0);
+        }
+        let mut total: u64 = 0;
+        loop {
+            let result = sqlx::query(sql)
+                .bind(cutoff)
+                .bind(batch_size)
+                .execute(&self.pool)
+                .await?;
+            let affected = result.rows_affected();
+            total += affected;
+            if affected < batch_size as u64 {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
     /// TA6(b) Task 3: stamp `capability` into the session's sticky capability SET (union, not
     /// overwrite — a no-op if already present). Called once, right when a cyber-rejected turn is
     /// successfully rerouted onto a capability-holding account
@@ -541,6 +607,91 @@ mod tests {
         assert_eq!(rows[1].owning_account_id, None);
         assert_eq!(rows[1].owner_email, None);
         assert_eq!(rows[1].state, "fresh");
+    }
+
+    // ---- S3(a) directive 3: the affinity TTL prunes ---------------------------------------------
+
+    /// `prune_sessions_older_than` deletes ONLY rows with `last_activity_at` strictly before the
+    /// cutoff; rows at/after survive — and each pruned session's anchors CASCADE away with it
+    /// while a surviving session's anchors stay resolvable.
+    #[tokio::test]
+    async fn prune_sessions_is_strictly_before_cutoff_and_cascades_anchors() {
+        let s = store().await;
+        seed_account(&s, "A").await;
+        let repo = s.continuity();
+
+        // old: last_activity_at 100 (< cutoff 200) — pruned, its anchor cascaded.
+        repo.ensure_session("old", "soft", 1).await.unwrap();
+        repo.record_completion("old", "soft", "A", "resp_old", "fp", 1, 100)
+            .await
+            .unwrap();
+        // edge: last_activity_at exactly the cutoff — survives (strict `<`).
+        repo.ensure_session("edge", "soft", 200).await.unwrap();
+        // live: last_activity_at 300 — survives, anchor still resolvable.
+        repo.ensure_session("live", "soft", 1).await.unwrap();
+        repo.record_completion("live", "soft", "A", "resp_live", "fp", 1, 300)
+            .await
+            .unwrap();
+
+        let deleted = repo.prune_sessions_older_than(200, 10).await.unwrap();
+        assert_eq!(deleted, 1, "only the strictly-older row pruned");
+        assert!(repo.get_session("old").await.unwrap().is_none());
+        assert!(repo.get_session("edge").await.unwrap().is_some());
+        assert!(repo.get_session("live").await.unwrap().is_some());
+        assert!(
+            repo.get_anchor_owner("resp_old").await.unwrap().is_none(),
+            "pruned session's anchor cascaded away"
+        );
+        assert_eq!(
+            repo.get_anchor_owner("resp_live").await.unwrap().as_deref(),
+            Some("A"),
+            "surviving session's anchor still resolves"
+        );
+    }
+
+    /// `prune_anchors_older_than` deletes ONLY anchors created strictly before the cutoff — a
+    /// live session keeps its young anchor while its superseded old anchors age out.
+    #[tokio::test]
+    async fn prune_anchors_ages_out_superseded_anchors_only() {
+        let s = store().await;
+        seed_account(&s, "A").await;
+        let repo = s.continuity();
+        repo.ensure_session("sk", "soft", 1).await.unwrap();
+        // Two completed turns: the old anchor (created 100) is superseded by the young one (300).
+        repo.record_completion("sk", "soft", "A", "resp_1", "fp", 1, 100)
+            .await
+            .unwrap();
+        repo.record_completion("sk", "soft", "A", "resp_2", "fp", 2, 300)
+            .await
+            .unwrap();
+
+        let deleted = repo.prune_anchors_older_than(200, 10).await.unwrap();
+        assert_eq!(deleted, 1);
+        assert!(repo.get_anchor_owner("resp_1").await.unwrap().is_none());
+        assert_eq!(
+            repo.get_anchor_owner("resp_2").await.unwrap().as_deref(),
+            Some("A"),
+            "the conversation's current anchor survives"
+        );
+        assert!(
+            repo.get_session("sk").await.unwrap().is_some(),
+            "anchor pruning never touches the session row"
+        );
+    }
+
+    /// A non-positive batch size is a defensive no-op for both prunes (same rationale as
+    /// `RequestLogRepo::prune_older_than`).
+    #[tokio::test]
+    async fn prune_non_positive_batch_is_a_noop() {
+        let s = store().await;
+        let repo = s.continuity();
+        repo.ensure_session("sk", "soft", 1).await.unwrap();
+        assert_eq!(repo.prune_sessions_older_than(i64::MAX, 0).await.unwrap(), 0);
+        assert_eq!(
+            repo.prune_anchors_older_than(i64::MAX, -1).await.unwrap(),
+            0
+        );
+        assert!(repo.get_session("sk").await.unwrap().is_some());
     }
 
     #[tokio::test]
