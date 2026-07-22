@@ -30,8 +30,11 @@ use serde_json::{json, Value};
 
 /// Map an Anthropic Messages request body to an OpenAI-Responses request body.
 ///
-/// **Envelope** (top-level field renames): `model` passthrough (no alias remap — SPEC-M4 U2),
-/// `system`→`instructions`, `stream` passthrough, `max_tokens`→`max_output_tokens`.
+/// **Envelope** (top-level fields): `model` passthrough (alias remap happens later, in the core
+/// outgoing rewrite — SPEC-M4 U2), `system`→`instructions`. The Codex `backend-api/responses`
+/// contract is enforced here (verified live, not the generic OpenAI schema): `store:false` +
+/// `stream:true` are always set, and the client's `max_tokens` is dropped (Codex rejects
+/// `max_output_tokens`). See `map_request`'s body for the exact upstream-400 messages that pin each.
 ///
 /// **Content/tool-shape transform** (T5 — closes the gap this doc comment used to flag): `messages`
 /// and `tools` are no longer copied verbatim; both are reshaped into their doc-verified
@@ -59,10 +62,11 @@ use serde_json::{json, Value};
 ///     defaults to `{}` when `input_schema` is absent. The spec's `FunctionTool.required` also lists
 ///     `strict` (nullable), which this mapping does not emit — out of scope per the task directive.
 ///
-/// ⚠️ **Real-capture end-to-end validation still pending (U4).** Several shape choices above were
-/// resolved against the *documented* schema where the doc itself is ambiguous or internally
-/// inconsistent, and need confirming against a real Responses backend before the runtime
-/// Anthropic→Codex path (M4b-wiring) depends on them:
+/// ⚠️ **Partial live validation (U4).** The request ENVELOPE is now verified end-to-end against the
+/// real Codex backend (2026-07-22): the `store:false`/`stream:true`/no-`max_output_tokens` contract,
+/// plus a text turn, a system prompt, multi-turn history, and a tool call all round-trip 200 through
+/// the aliased `/v1/messages`→Codex path. The following per-block *shape* choices were still resolved
+/// against the *documented* (ambiguous/inconsistent) schema and remain unconfirmed at that level:
 ///   - an `assistant`-role history message built from `output_text` parts (no `id`/`status`) matches
 ///     neither sub-schema exactly: the strict `Item`→`OutputMessage` variant requires `id` + `status`
 ///     (which we omit), while the lenient `EasyInputMessage` variant allows omitting them but expects
@@ -85,21 +89,26 @@ fn map_request(body: Value) -> Value {
         .get("messages")
         .cloned()
         .unwrap_or_else(|| Value::Array(vec![]));
-    let stream = body.get("stream").cloned().unwrap_or(Value::Bool(false));
-    let max_tokens = body.get("max_tokens").cloned();
     let tools = body.get("tools").cloned();
 
+    // The Codex `backend-api/responses` contract (verified LIVE against the real backend, 2026-07-22
+    // — NOT the generic OpenAI Responses schema this mapper was first built to). The backend hard-
+    // rejects a non-conforming body with a `400 {"detail": "..."}`:
+    //   - `store` MUST be `false`  ("Store must be set to false"),
+    //   - `stream` MUST be `true`  ("Stream must be set to true"),
+    //   - `max_output_tokens` is UNSUPPORTED ("Unsupported parameter: max_output_tokens").
+    // So the client's `stream`/`max_tokens` are deliberately NOT forwarded: PolyFlare always streams
+    // upstream (and only ever speaks SSE to the client — see `ingress`), and the Anthropic token cap
+    // has no Codex equivalent, so it is dropped rather than sent as the rejected `max_output_tokens`.
     let mut out = json!({
         "model": model,
         "input": map_messages(&messages),
-        "stream": stream,
+        "store": false,
+        "stream": true,
     });
     let map = out.as_object_mut().expect("json! object literal");
     if let Some(sys) = system {
         map.insert("instructions".to_string(), sys);
-    }
-    if let Some(mt) = max_tokens {
-        map.insert("max_output_tokens".to_string(), mt);
     }
     if let Some(t) = tools {
         map.insert("tools".to_string(), map_tools(&t));
@@ -726,17 +735,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maps_model_messages_stream_and_max_tokens() {
+    fn enforces_codex_contract_store_false_stream_true_no_max_output_tokens() {
+        // The Codex backend-api/responses contract (live-verified): a translated body ALWAYS carries
+        // `store:false` + `stream:true`, and NEVER `max_output_tokens` — even when the client sent a
+        // `max_tokens`, since Codex hard-rejects that parameter. `model` passes through (aliased later).
         let body = json!({
             "model": "claude-opus-4-1-20250805",
             "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
-            "stream": true,
+            "stream": false,
             "max_tokens": 1024
         });
         let out = map_request(body);
         assert_eq!(out["model"], json!("claude-opus-4-1-20250805"));
-        assert_eq!(out["stream"], json!(true));
-        assert_eq!(out["max_output_tokens"], json!(1024));
+        assert_eq!(out["store"], json!(false));
+        assert_eq!(out["stream"], json!(true), "stream is forced true regardless of client");
+        assert!(
+            out.get("max_output_tokens").is_none(),
+            "max_output_tokens must never be sent (Codex rejects it)"
+        );
         // Content blocks are transformed, not copied verbatim (T5): a `text` block on a `user`
         // message becomes an `input_text` part inside a Responses `message` input item.
         assert_eq!(
@@ -965,10 +981,13 @@ mod tests {
     }
 
     #[test]
-    fn defaults_stream_false_when_absent() {
+    fn always_streams_upstream_even_when_client_omits_stream() {
+        // Codex requires `stream:true`; PolyFlare only ever speaks SSE to the client anyway, so the
+        // client's stream preference (here: absent) never suppresses upstream streaming.
         let body = json!({"model": "claude-opus-4-1-20250805", "messages": []});
         let out = map_request(body);
-        assert_eq!(out["stream"], json!(false));
+        assert_eq!(out["stream"], json!(true));
+        assert_eq!(out["store"], json!(false));
     }
 
     #[test]
