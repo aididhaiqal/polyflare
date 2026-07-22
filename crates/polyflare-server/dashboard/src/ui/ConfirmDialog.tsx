@@ -3,10 +3,11 @@
 // implemented directly here. Used for destructive confirmations (e.g. deleting an account) by the
 // Accounts-list kebab (Task 7) and the AccountDetail action panel (Task 8) — no consumer lives in
 // this task; it's exercised only by the build.
-import { useEffect, useRef, type ReactNode } from "react";
+import { useRef, type ReactNode } from "react";
 import clsx from "clsx";
 
 import { AlertTriangle } from "./icons";
+import { useDialogA11y } from "./useDialogA11y";
 
 export interface ConfirmDialogProps {
   open: boolean;
@@ -44,19 +45,12 @@ export function ConfirmDialog({
   onConfirm,
   children,
 }: ConfirmDialogProps) {
+  const dialogRef = useRef<HTMLDivElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
 
-  useEffect(() => {
-    if (!open) return;
-    // Focus the Cancel button on open — the safer default for a destructive dialog.
-    cancelRef.current?.focus();
-
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") onOpenChange(false);
-    }
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [open, onOpenChange]);
+  // Escape-to-close + Tab focus-trap (shared with the API-key show-once modal); initial focus on
+  // Cancel — the safer default for a destructive dialog.
+  useDialogA11y(open, () => onOpenChange(false), dialogRef, cancelRef);
 
   if (!open) return null;
 
@@ -66,11 +60,13 @@ export function ConfirmDialog({
       onClick={() => onOpenChange(false)}
     >
       <div
+        ref={dialogRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-label={title}
         onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-sm rounded-lg border border-border bg-card p-4 text-fg shadow-xl"
+        className="w-full max-w-sm rounded-lg border border-border bg-card p-4 text-fg shadow-xl outline-none"
       >
         <div className="flex items-center gap-2 text-sm font-semibold">
           {danger && <AlertTriangle className="h-4 w-4 shrink-0 text-error" />}

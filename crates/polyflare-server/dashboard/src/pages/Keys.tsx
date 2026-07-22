@@ -27,6 +27,7 @@ import {
 } from "../ui/icons";
 import { Switch } from "../ui/Switch";
 import { useToast } from "../ui/Toast";
+import { useDialogA11y } from "../ui/useDialogA11y";
 
 export function Keys() {
   const { data, isLoading, isError, error, refetch } = useKeys();
@@ -278,20 +279,15 @@ function ShowOnceKeyModal({
   onClose: () => void;
 }) {
   const { toast } = useToast();
+  const dialogRef = useRef<HTMLDivElement>(null);
   const doneRef = useRef<HTMLButtonElement>(null);
   const [copied, setCopied] = useState(false);
 
+  // Escape-to-close + Tab focus-trap (shared with ConfirmDialog); initial focus on the Done button.
+  useDialogA11y(!!created, onClose, dialogRef, doneRef);
+  // Reset the copied affordance each time the modal (re)opens for a freshly-created key.
   useEffect(() => {
-    if (!created) return;
-    setCopied(false);
-    doneRef.current?.focus();
-
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
-    }
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (created) setCopied(false);
   }, [created]);
 
   if (!created) return null;
@@ -316,11 +312,13 @@ function ShowOnceKeyModal({
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-label="API key created"
         onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-md rounded-lg border border-border bg-card p-4 text-fg shadow-xl"
+        className="w-full max-w-md rounded-lg border border-border bg-card p-4 text-fg shadow-xl outline-none"
       >
         <div className="flex items-center gap-2 text-sm font-semibold">
           <KeyRound className="h-4 w-4 shrink-0 text-accent" strokeWidth={1.9} />
