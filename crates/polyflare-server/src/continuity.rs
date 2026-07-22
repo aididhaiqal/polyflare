@@ -595,10 +595,12 @@ mod tests {
             .await
             .unwrap();
         // Inject the stale-affinity drift: the session row now claims B.
-        sqlx::query("UPDATE continuity_sessions SET owning_account_id = 'B' WHERE session_key = 'skS'")
-            .execute(store.pool())
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE continuity_sessions SET owning_account_id = 'B' WHERE session_key = 'skS'",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
 
         let ctx = RequestCtx {
             session_key: Some(polyflare_core::SessionKey {
@@ -639,10 +641,12 @@ mod tests {
             .record_completion("skT", "soft", "A", "resp_1", "fp", 2, 1)
             .await
             .unwrap();
-        sqlx::query("UPDATE continuity_sessions SET owning_account_id = 'B' WHERE session_key = 'skT'")
-            .execute(store.pool())
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE continuity_sessions SET owning_account_id = 'B' WHERE session_key = 'skT'",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
 
         // The next turn completes on the true owner A (as the anchor-map pin routed it).
         cont.observe(

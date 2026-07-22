@@ -686,7 +686,10 @@ mod tests {
         let s = store().await;
         let repo = s.continuity();
         repo.ensure_session("sk", "soft", 1).await.unwrap();
-        assert_eq!(repo.prune_sessions_older_than(i64::MAX, 0).await.unwrap(), 0);
+        assert_eq!(
+            repo.prune_sessions_older_than(i64::MAX, 0).await.unwrap(),
+            0
+        );
         assert_eq!(
             repo.prune_anchors_older_than(i64::MAX, -1).await.unwrap(),
             0

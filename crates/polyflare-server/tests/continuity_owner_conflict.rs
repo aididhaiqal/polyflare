@@ -37,10 +37,8 @@ fn now() -> i64 {
 struct PreferB;
 impl Selector for PreferB {
     fn pick(&self, candidates: &[AccountSnapshot], _ctx: &SelectionCtx) -> Option<AccountId> {
-        let eligible: Vec<&AccountSnapshot> = candidates
-            .iter()
-            .filter(|s| s.status == "active")
-            .collect();
+        let eligible: Vec<&AccountSnapshot> =
+            candidates.iter().filter(|s| s.status == "active").collect();
         if let Some(b) = eligible.iter().find(|s| s.id.as_str() == "B") {
             return Some(b.id.clone());
         }
@@ -258,7 +256,10 @@ async fn stale_affinity_never_overrides_anchor_owner_and_is_corrected() {
 
     // Follow-up 1: anchor map (A) beats stale affinity (B) AND the PreferB unpinned choice.
     let (status, body) = drain(follow_up(&client, &pf).send().await.unwrap()).await;
-    assert_eq!(status, 200, "the disagreement is not a client-visible error");
+    assert_eq!(
+        status, 200,
+        "the disagreement is not a client-visible error"
+    );
     assert!(body.contains("response.completed"));
     assert_eq!(
         handle.last_authorization().as_deref(),
@@ -281,7 +282,10 @@ async fn stale_affinity_never_overrides_anchor_owner_and_is_corrected() {
     // The client's blind retry of the SAME logical turn: must succeed again (the codex-lb
     // signature was the same error twice in a row — assert the strictly stronger property).
     let (status2, body2) = drain(follow_up(&client, &pf).send().await.unwrap()).await;
-    assert_eq!(status2, 200, "identical follow-up converges, never error-loops");
+    assert_eq!(
+        status2, 200,
+        "identical follow-up converges, never error-loops"
+    );
     assert!(body2.contains("response.completed"));
     assert_eq!(handle.last_authorization().as_deref(), Some("Bearer tokA"));
 }
@@ -314,7 +318,10 @@ async fn blocked_owner_with_stale_affinity_recovers_and_converges() {
     // Follow-up 1: pinned owner ineligible ⇒ Recover — anchorless full resend lands on B.
     let before = handle.request_count();
     let (status, body) = drain(follow_up(&client, &pf).send().await.unwrap()).await;
-    assert_eq!(status, 200, "blocked-owner disagreement recovers, never 5xx-loops");
+    assert_eq!(
+        status, 200,
+        "blocked-owner disagreement recovers, never 5xx-loops"
+    );
     assert!(body.contains("response.completed"));
     assert_eq!(
         handle.last_authorization().as_deref(),
@@ -401,17 +408,21 @@ async fn conversation_survives_full_continuity_wipe() {
         .await
         .unwrap()
         .rows_affected();
-    assert_eq!(deleted, 1, "the whole affinity store wiped mid-conversation");
+    assert_eq!(
+        deleted, 1,
+        "the whole affinity store wiped mid-conversation"
+    );
 
-    let (status, body) = tokio::time::timeout(
-        Duration::from_secs(5),
-        async { drain(follow_up(&client, &pf).send().await.unwrap()).await },
-    )
+    let (status, body) = tokio::time::timeout(Duration::from_secs(5), async {
+        drain(follow_up(&client, &pf).send().await.unwrap()).await
+    })
     .await
     .expect("follow-up completes within bound (no wedge after a full wipe)");
     assert_eq!(status, 200);
     assert!(body.contains("response.completed"));
-    let last = handle.last_body().expect("upstream saw the recovery resend");
+    let last = handle
+        .last_body()
+        .expect("upstream saw the recovery resend");
     assert!(
         last.get("previous_response_id").is_none(),
         "recovery stripped the unresumable anchor"

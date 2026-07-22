@@ -496,7 +496,9 @@ mod tests {
         repo.record_completion("idle", "soft", "acct-1", "resp_idle", "fp", 1, idle_ts)
             .await
             .unwrap();
-        repo.ensure_session("active", "soft", now - 10).await.unwrap();
+        repo.ensure_session("active", "soft", now - 10)
+            .await
+            .unwrap();
         repo.record_completion("active", "soft", "acct-1", "resp_active", "fp", 1, now - 10)
             .await
             .unwrap();
