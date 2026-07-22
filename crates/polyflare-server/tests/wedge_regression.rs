@@ -174,6 +174,74 @@ async fn anchor_bearing_request_to_silent_upstream_does_not_wedge() {
     assert_eq!(bodies[1]["input"], input, "R1: full-resend not trimmed");
 }
 
+/// The 2026-07-22 codex-lb hang signature, replayed against PolyFlare: the client's blind
+/// retry of the SAME anchored full resend against an upstream that goes silent on anchors.
+/// codex-lb wedged indefinitely here (no holder watchdog + recovery re-sent the anchored
+/// frame); PolyFlare must recover BOTH attempts — watchdog fires, the anchor is stripped,
+/// the full input goes out, and neither client-visible response is an error. Never the
+/// same failure twice in a row; in fact never a failure at all.
+#[tokio::test]
+async fn repeated_identical_anchored_full_resend_recovers_every_time() {
+    let mock = MockUpstream::silent_on_anchor(vec![
+        r#"{"type":"response.output_text.delta","delta":"ok"}"#.to_string(),
+    ]);
+    let handle = mock.clone();
+    let upstream = mock.spawn().await;
+    let pf = spawn_polyflare(upstream).await;
+
+    let client = reqwest::Client::new();
+    let input = serde_json::json!([
+        {"role": "user", "content": "turn one"},
+        {"role": "assistant", "content": "reply one"},
+        {"role": "user", "content": "turn two"}
+    ]);
+    let body = serde_json::json!({"model": "gpt-5.6-sol", "previous_response_id": "resp_dead", "input": input});
+
+    for attempt in 1..=2u32 {
+        let body = body.clone();
+        let request = client.post(format!("{pf}/responses")).json(&body).send();
+        let text = tokio::time::timeout(Duration::from_secs(5), async {
+            let resp = request.await.unwrap();
+            assert_eq!(
+                resp.status(),
+                200,
+                "attempt {attempt} must not surface an error"
+            );
+            let mut text = String::new();
+            let mut s = resp.bytes_stream();
+            while let Some(chunk) = s.next().await {
+                text.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            }
+            text
+        })
+        .await
+        .unwrap_or_else(|_| panic!("attempt {attempt} must complete within bound (no wedge)"));
+        assert!(
+            text.contains("response.completed"),
+            "attempt {attempt} completes"
+        );
+    }
+
+    // Each client attempt = one silent anchored try + one anchor-stripped full-resend recovery.
+    assert_eq!(
+        handle.request_count(),
+        4,
+        "2 attempts x (silent try + recovery)"
+    );
+    let bodies = handle.bodies();
+    for (i, upstream_body) in bodies.iter().enumerate() {
+        let anchored = upstream_body.get("previous_response_id").is_some();
+        assert_eq!(
+            anchored,
+            i % 2 == 0,
+            "even sends carry the client's anchor, every recovery strips it"
+        );
+        if !anchored {
+            assert_eq!(upstream_body["input"], input, "R1: recovery never trims");
+        }
+    }
+}
+
 #[tokio::test]
 async fn client_disconnect_mid_race_is_clean() {
     let mock = MockUpstream::silent_on_anchor(vec![
