@@ -31,17 +31,9 @@ pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 100 * 1024 * 1024;
 pub struct AppState {
     pub codex_executor: Arc<dyn Executor>,
     pub anthropic_executor: Arc<dyn Executor>,
-    /// D17 Task 2: a shared `reqwest::Client` for the codex CONTROL-endpoint unary forward
-    /// (`polyflare_codex::control_forward`), which takes `&reqwest::Client` as its first
-    /// parameter rather than building its own. Built via `polyflare_codex::build_client()` — the
-    /// SAME rustls/aws-lc-rs-pinned builder `CodexExecutor` uses for `/responses` — so this is a
-    /// second `Client` *instance* sharing the identical TLS/fingerprint configuration, never an
-    /// independently-configured (and therefore potentially divergent) one. `reqwest::Client` is
-    /// `Arc`-backed internally, so holding a second instance here (rather than threading a
-    /// concrete `CodexExecutor` accessor through the `Arc<dyn Executor>` trait object) is cheap
-    /// and avoids a downcast. Control resolution itself (`crate::control::resolve_control_account`)
-    /// does not use this field — it exists so Task 3's route handlers have a client to call
-    /// `control_forward` with, without re-deriving the builder decision then.
+    /// Shared `reqwest::Client` for Codex control forwarding and ChatGPT backend passthrough.
+    /// Production startup clones this same Arc-backed client into `CodexExecutor`, so all three
+    /// paths share its connection pool and restricted Cloudflare affinity-cookie store.
     pub control_client: reqwest::Client,
     /// The DEFAULT (global) routing selector — used for the bare paths and for any pool without an
     /// explicit override in `pool_selectors`.
@@ -222,7 +214,23 @@ pub fn build_codex_executor(
     http_requests_use_upstream_websocket: bool,
     http_upstream_websocket_ping: bool,
 ) -> Result<Arc<dyn Executor>, ExecError> {
-    let http = CodexExecutor::new()?;
+    build_codex_executor_with_client(
+        polyflare_codex::build_client()?,
+        http_requests_use_upstream_websocket,
+        http_upstream_websocket_ping,
+    )
+}
+
+/// Construct the Codex executor around a caller-owned shared HTTP client.
+///
+/// `serve` uses this form so the HTTP-SSE executor and `AppState::control_client` are cheap clones
+/// of one reqwest client rather than independently pooled clients.
+pub fn build_codex_executor_with_client(
+    client: reqwest::Client,
+    http_requests_use_upstream_websocket: bool,
+    http_upstream_websocket_ping: bool,
+) -> Result<Arc<dyn Executor>, ExecError> {
+    let http = CodexExecutor::from_client(client);
     if http_requests_use_upstream_websocket {
         Ok(Arc::new(CodexWsExecutor::new(
             Arc::new(http),
@@ -281,6 +289,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route(
             "/api/providers/{id}/models",
             post(crate::provider_api::create_model),
+        )
+        .route(
+            "/api/providers/{id}/models/sync",
+            post(crate::provider_api::sync_models),
         )
         .route(
             "/api/provider-models/{id}",

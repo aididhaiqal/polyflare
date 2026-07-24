@@ -1,13 +1,20 @@
-import { useState, type FormEvent } from "react";
+import {
+  useState,
+  type Dispatch,
+  type FormEvent,
+  type SetStateAction,
+} from "react";
 
-import type { CreateProviderModelBody } from "../lib/api";
+import type { CreateProviderModelBody, ProviderModelView } from "../lib/api";
 import {
   useAddProviderCredential,
   useAddProviderModel,
   useCreateProviderBundle,
   useProviderAction,
   useProviders,
+  useSyncProviderModels,
   useTestProvider,
+  useUpdateProviderModel,
 } from "../lib/queries";
 import { Card } from "../ui/Card";
 import { AlertTriangle, KeyRound, Plus, Route, Trash2 } from "../ui/icons";
@@ -22,10 +29,13 @@ export function Providers() {
   const addModel = useAddProviderModel();
   const action = useProviderAction();
   const testConnection = useTestProvider();
+  const syncModels = useSyncProviderModels();
+  const updateModel = useUpdateProviderModel();
   const [open, setOpen] = useState(false);
   const [addTarget, setAddTarget] = useState<{
     providerId: string;
     kind: "credential" | "model";
+    model?: ProviderModelView;
   } | null>(null);
 
   return (
@@ -204,13 +214,23 @@ export function Providers() {
                     <span className="text-[9px] font-bold uppercase tracking-wide text-fg opacity-55">
                       Models
                     </span>
-                    <button
-                      type="button"
-                      onClick={() => setAddTarget({ providerId: provider.id, kind: "model" })}
-                      className="text-[9px] font-semibold text-accent"
-                    >
-                      + model
-                    </button>
+                    <span className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={syncModels.isPending || !provider.credentials.length}
+                        onClick={() => syncModels.mutate(provider.id)}
+                        className="text-[9px] font-semibold text-signal disabled:opacity-35"
+                      >
+                        Sync
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setAddTarget({ providerId: provider.id, kind: "model" })}
+                        className="text-[9px] font-semibold text-accent"
+                      >
+                        + model
+                      </button>
+                    </span>
                   </div>
                   <div className="flex flex-col gap-2">
                     {provider.models.map((model) => (
@@ -223,6 +243,19 @@ export function Providers() {
                             {model.context_window
                               ? `${Math.round(model.context_window / 1000)}k ctx`
                               : "context unknown"}
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setAddTarget({
+                                  providerId: provider.id,
+                                  kind: "model",
+                                  model,
+                                })
+                              }
+                              className="text-accent opacity-100"
+                            >
+                              edit
+                            </button>
                             <button
                               type="button"
                               onClick={() =>
@@ -255,6 +288,13 @@ export function Providers() {
                             upstream: {model.upstream_model}
                           </div>
                         )}
+                        <div className="mt-1 text-[8px] text-fg opacity-45">
+                          Effort{" "}
+                          {model.reasoning_levels.length
+                            ? model.reasoning_levels.join(" · ")
+                            : "not advertised"}
+                          {model.supports_reasoning_summaries ? " · summaries" : ""}
+                        </div>
                         <div className="mt-1 flex items-center gap-1">
                           <span className="mr-1 text-[8px] uppercase tracking-wide text-fg opacity-35">
                             Discoverable
@@ -319,13 +359,34 @@ export function Providers() {
               )}
               {addTarget?.providerId === provider.id && addTarget.kind === "model" && (
                 <ModelForm
-                  pending={addModel.isPending}
+                  initial={addTarget.model}
+                  pending={addModel.isPending || updateModel.isPending}
                   onCancel={() => setAddTarget(null)}
                   onSubmit={(model) =>
-                    addModel.mutate(
-                      { providerId: provider.id, model },
-                      { onSuccess: () => setAddTarget(null) },
-                    )
+                    addTarget.model
+                      ? updateModel.mutate(
+                          {
+                            id: addTarget.model.id,
+                            patch: {
+                              upstream_model: model.upstream_model,
+                              display_name: model.display_name,
+                              context_window: model.context_window,
+                              supports_tools: model.supports_tools,
+                              supports_vision: model.supports_vision,
+                              supports_parallel_tool_calls: model.supports_parallel_tool_calls,
+                              supports_web_search: model.supports_web_search,
+                              supports_reasoning_summaries: model.supports_reasoning_summaries,
+                              reasoning_levels: model.reasoning_levels,
+                              visible_in_codex: model.visible_in_codex,
+                              visible_in_openai: model.visible_in_openai,
+                            },
+                          },
+                          { onSuccess: () => setAddTarget(null) },
+                        )
+                      : addModel.mutate(
+                          { providerId: provider.id, model },
+                          { onSuccess: () => setAddTarget(null) },
+                        )
                   }
                 />
               )}
@@ -408,20 +469,40 @@ function CredentialForm({
 }
 
 function ModelForm({
+  initial,
   pending,
   onSubmit,
   onCancel,
 }: {
+  initial?: ProviderModelView;
   pending: boolean;
   onSubmit: (model: CreateProviderModelBody) => void;
   onCancel: () => void;
 }) {
-  const [publicModel, setPublicModel] = useState("");
-  const [upstreamModel, setUpstreamModel] = useState("");
-  const [displayName, setDisplayName] = useState("");
-  const [contextWindow, setContextWindow] = useState("");
-  const [visibleInCodex, setVisibleInCodex] = useState(true);
-  const [visibleInOpenAi, setVisibleInOpenAi] = useState(true);
+  const [publicModel, setPublicModel] = useState(initial?.public_model ?? "");
+  const [upstreamModel, setUpstreamModel] = useState(initial?.upstream_model ?? "");
+  const [displayName, setDisplayName] = useState(initial?.display_name ?? "");
+  const [contextWindow, setContextWindow] = useState(
+    initial?.context_window?.toString() ?? "",
+  );
+  const [reasoningLevels, setReasoningLevels] = useState(
+    initial?.reasoning_levels.join(",") ?? "",
+  );
+  const [supportsTools, setSupportsTools] = useState(initial?.supports_tools ?? true);
+  const [supportsVision, setSupportsVision] = useState(initial?.supports_vision ?? false);
+  const [supportsParallel, setSupportsParallel] = useState(
+    initial?.supports_parallel_tool_calls ?? true,
+  );
+  const [supportsSearch, setSupportsSearch] = useState(
+    initial?.supports_web_search ?? false,
+  );
+  const [supportsSummaries, setSupportsSummaries] = useState(
+    initial?.supports_reasoning_summaries ?? false,
+  );
+  const [visibleInCodex, setVisibleInCodex] = useState(initial?.visible_in_codex ?? true);
+  const [visibleInOpenAi, setVisibleInOpenAi] = useState(
+    initial?.visible_in_openai ?? true,
+  );
   return (
     <form
       className="grid gap-2 rounded-lg border border-accent/25 bg-accent/[0.04] p-3 sm:grid-cols-2"
@@ -432,8 +513,15 @@ function ModelForm({
           upstream_model: upstreamModel,
           display_name: displayName,
           context_window: contextWindow ? Number(contextWindow) : undefined,
-          supports_tools: true,
-          supports_parallel_tool_calls: true,
+          supports_tools: supportsTools,
+          supports_vision: supportsVision,
+          supports_parallel_tool_calls: supportsParallel,
+          supports_web_search: supportsSearch,
+          supports_reasoning_summaries: supportsSummaries,
+          reasoning_levels: reasoningLevels
+            .split(",")
+            .map((level) => level.trim())
+            .filter(Boolean),
           visible_in_codex: visibleInCodex,
           visible_in_openai: visibleInOpenAi,
         });
@@ -443,6 +531,7 @@ function ModelForm({
         className={INPUT}
         value={publicModel}
         required
+        disabled={Boolean(initial)}
         placeholder="Public model slug"
         onChange={(event) => setPublicModel(event.target.value)}
       />
@@ -474,13 +563,43 @@ function ModelForm({
           disabled={pending}
           className="rounded-lg bg-accent px-3 text-[10px] font-semibold text-white disabled:opacity-45"
         >
-          Add
+          {initial ? "Save" : "Add"}
         </button>
         <button type="button" onClick={onCancel} className="px-2 text-[10px] text-fg opacity-55">
           Cancel
         </button>
       </div>
+      <input
+        className={INPUT}
+        value={reasoningLevels}
+        placeholder="Reasoning efforts: high,xhigh,max"
+        aria-label="Reasoning efforts"
+        onChange={(event) => setReasoningLevels(event.target.value)}
+      />
       <div className="flex flex-wrap gap-3 sm:col-span-2">
+        {[
+          ["Tools", supportsTools, setSupportsTools],
+          ["Vision", supportsVision, setSupportsVision],
+          ["Parallel tools", supportsParallel, setSupportsParallel],
+          ["Web search", supportsSearch, setSupportsSearch],
+          ["Reasoning summaries", supportsSummaries, setSupportsSummaries],
+        ].map(([label, checked, setChecked]) => (
+          <label
+            key={label as string}
+            className="flex items-center gap-2 text-[9px] text-fg opacity-70"
+          >
+            <input
+              type="checkbox"
+              checked={checked as boolean}
+              onChange={(event) =>
+                (setChecked as Dispatch<SetStateAction<boolean>>)(
+                  event.target.checked,
+                )
+              }
+            />
+            {label as string}
+          </label>
+        ))}
         <label className="flex items-center gap-2 text-[9px] text-fg opacity-70">
           <input
             type="checkbox"

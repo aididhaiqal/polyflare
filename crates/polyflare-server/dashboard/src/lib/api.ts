@@ -689,6 +689,19 @@ export interface CreateProviderModelBody {
   visible_in_openai?: boolean;
 }
 
+export type UpdateProviderModelBody = Partial<
+  Omit<CreateProviderModelBody, "public_model" | "input_per_million" | "cached_input_per_million" | "output_per_million">
+> & {
+  enabled?: boolean;
+};
+
+export interface ProviderModelSyncResult {
+  discovered: number;
+  imported: number;
+  skipped_existing: number;
+  skipped_conflicts: number;
+}
+
 export interface ProviderTestResult {
   ok: boolean;
   upstream_status: number;
@@ -842,6 +855,13 @@ export function createProviderModel(
   });
 }
 
+export function syncProviderModels(id: string): Promise<ProviderModelSyncResult> {
+  return fetchJson<ProviderModelSyncResult>(
+    `/api/providers/${encodeURIComponent(id)}/models/sync`,
+    { method: "POST" },
+  );
+}
+
 export function patchProviderEnabled(id: string, enabled: boolean): Promise<OkResponse> {
   return fetchJson<OkResponse>(`/api/providers/${encodeURIComponent(id)}`, {
     method: "PATCH",
@@ -879,11 +899,7 @@ export function deleteProviderCredential(id: string): Promise<OkResponse> {
 
 export function patchProviderModel(
   id: string,
-  patch: {
-    enabled?: boolean;
-    visible_in_codex?: boolean;
-    visible_in_openai?: boolean;
-  },
+  patch: UpdateProviderModelBody,
 ): Promise<OkResponse> {
   return fetchJson<OkResponse>(`/api/provider-models/${encodeURIComponent(id)}`, {
     method: "PATCH",

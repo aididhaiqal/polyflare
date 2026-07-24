@@ -11,7 +11,7 @@ polyflare-core = { path = "../polyflare-core" }
 # store. `default-tls` stays enabled too (workspace default), so the Codex client must force the
 # backend explicitly via `.use_rustls_tls()` (see executor.rs); other executors are unaffected
 # since they never opt into rustls.
-reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
+reqwest = { workspace = true, features = ["rustls-tls-native-roots", "cookies"] }
 rustls = { workspace = true }
 # Pinned only for exact version parity with codex-rs's resolved dependency graph (M5-Q1); not
 # called directly — `rustls::crypto::aws_lc_rs` (gated by rustls's `aws_lc_rs` feature) wraps it.

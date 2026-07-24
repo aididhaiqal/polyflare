@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 use polyflare_store::{NewCustomProvider, NewProviderModel};
 
@@ -55,6 +55,189 @@ async fn retryable_failure_handler(
         body: serde_json::from_slice(&body).unwrap(),
     });
     (StatusCode::TOO_MANY_REQUESTS, "provider exhausted")
+}
+
+async fn models_handler(headers: HeaderMap) -> (StatusCode, axum::Json<serde_json::Value>) {
+    assert_eq!(
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer secret-fish")
+    );
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "fugu", "object": "model", "owned_by": "sakana"},
+                {"id": "fugu-ultra", "object": "model", "owned_by": "sakana"},
+                {"id": "fugu-cyber", "object": "model", "owned_by": "sakana"},
+                {"id": "not valid/slug", "object": "model"}
+            ]
+        })),
+    )
+}
+
+#[tokio::test]
+async fn model_sync_imports_openai_ids_without_overwriting_manual_models() {
+    let upstream = Router::new().route("/v1/models", get(models_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let (base, state) = support::spawn("http://127.0.0.1:9".into()).await;
+    let now = 100;
+    state
+        .store
+        .providers()
+        .create_provider(&NewCustomProvider {
+            id: "provider-discovery".into(),
+            slug: "sakana-discovery".into(),
+            display_name: "Sakana Discovery".into(),
+            base_url: format!("http://{upstream_addr}/v1"),
+            wire_api: "responses".into(),
+            enabled: true,
+            stateless_responses: true,
+            allow_private_hosts: true,
+            connect_timeout_ms: 1_000,
+            stream_idle_timeout_ms: 10_000,
+            request_max_retries: 1,
+            max_concurrency: Some(4),
+            created_at: now,
+        })
+        .await
+        .unwrap();
+    state
+        .store
+        .providers()
+        .create_credential(
+            "credential-discovery",
+            "provider-discovery",
+            "primary",
+            "secret-fish",
+            1.0,
+            Some(2),
+            now,
+            &state.cipher,
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .providers()
+        .create_model(&NewProviderModel {
+            id: "model-manual-ultra".into(),
+            provider_id: "provider-discovery".into(),
+            public_model: "fugu-ultra".into(),
+            upstream_model: "fugu-ultra-v1.1".into(),
+            display_name: "My Fugu Ultra".into(),
+            context_window: Some(1_000_000),
+            max_output_tokens: None,
+            supports_tools: true,
+            supports_vision: true,
+            supports_parallel_tool_calls: true,
+            supports_web_search: true,
+            supports_reasoning_summaries: true,
+            reasoning_levels_json: r#"["high","xhigh","max"]"#.into(),
+            model_info_json: None,
+            input_per_million: None,
+            cached_input_per_million: None,
+            output_per_million: None,
+            visible_in_codex: true,
+            visible_in_openai: true,
+            enabled: true,
+            created_at: now,
+        })
+        .await
+        .unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{base}/api/providers/provider-discovery/models/sync"
+        ))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(result["discovered"], 3);
+    assert_eq!(result["imported"], 2);
+    assert_eq!(result["skipped_existing"], 1);
+
+    let models = state
+        .store
+        .providers()
+        .list_models("provider-discovery")
+        .await
+        .unwrap();
+    assert_eq!(models.len(), 3);
+    let manual = models
+        .iter()
+        .find(|model| model.public_model == "fugu-ultra")
+        .unwrap();
+    assert_eq!(manual.upstream_model, "fugu-ultra-v1.1");
+    assert_eq!(manual.display_name, "My Fugu Ultra");
+    assert_eq!(manual.reasoning_levels_json, r#"["high","xhigh","max"]"#);
+    assert!(models.iter().any(|model| model.public_model == "fugu"));
+    assert!(models
+        .iter()
+        .any(|model| model.public_model == "fugu-cyber"));
+
+    let fugu = models
+        .iter()
+        .find(|model| model.public_model == "fugu")
+        .unwrap();
+    let response = reqwest::Client::new()
+        .patch(format!("{base}/api/provider-models/{}", fugu.id))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({
+            "display_name": "Fugu",
+            "supports_reasoning_summaries": false,
+            "reasoning_levels": ["high", "xhigh"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let duplicate_efforts = reqwest::Client::new()
+        .patch(format!("{base}/api/provider-models/{}", fugu.id))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({
+            "reasoning_levels": ["high", "high"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate_efforts.status(), StatusCode::BAD_REQUEST);
+
+    let catalog: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/models"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fugu = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["slug"] == "fugu")
+        .expect("edited imported model should be in the rich catalog");
+    assert_eq!(fugu["default_reasoning_level"], "high");
+    assert_eq!(
+        fugu["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|level| level["effort"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["high", "xhigh"]
+    );
 }
 
 #[tokio::test]

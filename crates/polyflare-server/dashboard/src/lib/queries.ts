@@ -24,6 +24,7 @@ import {
   patchProviderModel,
   patchSettings,
   startCodexOnboarding,
+  syncProviderModels,
   testProvider,
   type AccountDetailView,
   type AccountPatchBody,
@@ -34,6 +35,7 @@ import {
   type CreateProviderBody,
   type CreateProviderModelBody,
   type CustomProviderView,
+  type UpdateProviderModelBody,
   type OverviewSeriesView,
   type OverviewView,
   type PaceResponse,
@@ -334,6 +336,39 @@ export function useAddProviderModel() {
     },
     onError: (e) =>
       toast({ title: "Model failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+export function useUpdateProviderModel() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (input: { id: string; patch: UpdateProviderModelBody }) =>
+      patchProviderModel(input.id, input.patch),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.providers });
+      toast({ title: "Model updated", variant: "success" });
+    },
+    onError: (e) =>
+      toast({ title: "Model update failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+export function useSyncProviderModels() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (id: string) => syncProviderModels(id),
+    onSuccess: (result) => {
+      qc.invalidateQueries({ queryKey: queryKeys.providers });
+      toast({
+        title: `${result.imported} model${result.imported === 1 ? "" : "s"} imported`,
+        description: `${result.discovered} discovered · ${result.skipped_existing} already configured · ${result.skipped_conflicts} conflicts`,
+        variant: "success",
+      });
+    },
+    onError: (e) =>
+      toast({ title: "Model discovery failed", description: mutationErrorText(e), variant: "error" }),
   });
 }
 
