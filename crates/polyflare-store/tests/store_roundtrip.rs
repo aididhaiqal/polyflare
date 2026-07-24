@@ -1,6 +1,7 @@
 //! Round-trip: open a temp-file DB, run migrations, assert the schema exists.
 
 use polyflare_store::Store;
+use sqlx::Row;
 
 type UsageClassificationRow = (
     Option<i64>,
@@ -38,6 +39,43 @@ async fn open_is_idempotent() {
     // Opening twice must not error: migrations already applied are skipped.
     let _first = Store::open(&db_path).await.unwrap();
     let _second = Store::open(&db_path).await.unwrap();
+}
+
+#[tokio::test]
+async fn migration_0022_defaults_existing_models_to_noop_profiles() {
+    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE provider_models (id TEXT PRIMARY KEY); \
+         INSERT INTO provider_models (id) VALUES ('legacy-model'); \
+         CREATE TABLE request_log (id INTEGER PRIMARY KEY);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(include_str!("../migrations/0022_custom_model_profiles.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let row = sqlx::query(
+        "SELECT instruction_mode, instruction_text, request_overrides_json \
+         FROM provider_models WHERE id = 'legacy-model'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("instruction_mode"), "none");
+    assert_eq!(row.get::<String, _>("instruction_text"), "");
+    assert_eq!(row.get::<String, _>("request_overrides_json"), "{}");
+
+    let columns = sqlx::query("PRAGMA table_info(request_log)")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(columns
+        .iter()
+        .any(|column| column.get::<String, _>("name") == "profile_revision"));
 }
 
 #[tokio::test]

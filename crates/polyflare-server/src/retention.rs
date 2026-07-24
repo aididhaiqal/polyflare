@@ -300,6 +300,7 @@ mod tests {
             model: Some("gpt-5.6-sol".into()),
             upstream_model: None,
             upstream_transport: Some("http_sse".into()),
+            profile_revision: None,
             reasoning_effort: None,
             service_tier: None,
             transport: Some("http".into()),

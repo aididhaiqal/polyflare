@@ -242,6 +242,7 @@ impl WsTurnTelemetry {
             model: self.model,
             upstream_model: None,
             upstream_transport: Some("codex_ws".to_string()),
+            profile_revision: None,
             reasoning_effort: self.reasoning_effort,
             service_tier: self.service_tier,
             transport: Some("ws".to_string()),

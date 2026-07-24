@@ -46,9 +46,15 @@ pub struct RequestUsageUpdate {
 #[derive(Debug)]
 enum BackgroundWrite {
     InsertRequestLog(Box<RequestLogRecord>),
-    UpdateRequestUsage(RequestUsageUpdate),
-    TouchApiKey { id: String, now: i64 },
-    Flush(oneshot::Sender<()>),
+    UpdateRequestUsage {
+        update: Box<RequestUsageUpdate>,
+        completed: Option<oneshot::Sender<bool>>,
+    },
+    TouchApiKey {
+        id: String,
+        now: i64,
+    },
+    Flush(oneshot::Sender<Result<(), StoreError>>),
 }
 
 #[derive(Clone)]
@@ -76,18 +82,21 @@ impl BackgroundWriter {
             .send(BackgroundWrite::Flush(done_tx))
             .await
             .map_err(|_| StoreError::BackgroundQueueClosed)?;
-        done_rx.await.map_err(|_| StoreError::BackgroundQueueClosed)
+        done_rx
+            .await
+            .map_err(|_| StoreError::BackgroundQueueClosed)?
     }
 }
 
 async fn run_background_writer(pool: SqlitePool, mut rx: mpsc::Receiver<BackgroundWrite>) {
     let request_log = RequestLogRepo::new(pool.clone());
     let api_keys = ApiKeyRepo::new(pool);
+    let mut pending_error = None;
     while let Some(write) = rx.recv().await {
         let result = match write {
             BackgroundWrite::InsertRequestLog(record) => request_log.insert(&record).await,
-            BackgroundWrite::UpdateRequestUsage(update) => {
-                request_log
+            BackgroundWrite::UpdateRequestUsage { update, completed } => {
+                let result = request_log
                     .update_usage(
                         &update.request_id,
                         update.input_tokens,
@@ -104,16 +113,24 @@ async fn run_background_writer(pool: SqlitePool, mut rx: mpsc::Receiver<Backgrou
                         update.duration_ms,
                         Some(update.protocol_outcome),
                     )
-                    .await
+                    .await;
+                if let Some(completed) = completed {
+                    let _ = completed.send(result.is_ok());
+                }
+                result
             }
             BackgroundWrite::TouchApiKey { id, now } => api_keys.touch_last_used(&id, now).await,
             BackgroundWrite::Flush(done) => {
-                let _ = done.send(());
+                let result = pending_error.take().map_or(Ok(()), Err);
+                let _ = done.send(result);
                 continue;
             }
         };
         if let Err(error) = result {
             tracing::warn!(%error, "background persistence failed");
+            if pending_error.is_none() {
+                pending_error = Some(error);
+            }
         }
     }
 }
@@ -264,7 +281,26 @@ impl Store {
     /// preserves that ordering, so the UPDATE cannot race ahead of the INSERT for a request.
     pub fn enqueue_request_usage(&self, update: RequestUsageUpdate) -> Result<(), StoreError> {
         self.background_writer
-            .try_send(BackgroundWrite::UpdateRequestUsage(update))
+            .try_send(BackgroundWrite::UpdateRequestUsage {
+                update: Box::new(update),
+                completed: None,
+            })
+    }
+
+    /// Queue a stream-end usage update and return a receipt resolved only after SQLite has
+    /// attempted it. The boolean is `true` on durable success. This lets SSE consumers invalidate
+    /// their read model after—not before—the asynchronous update.
+    pub fn enqueue_request_usage_with_receipt(
+        &self,
+        update: RequestUsageUpdate,
+    ) -> Result<oneshot::Receiver<bool>, StoreError> {
+        let (completed_tx, completed_rx) = oneshot::channel();
+        self.background_writer
+            .try_send(BackgroundWrite::UpdateRequestUsage {
+                update: Box::new(update),
+                completed: Some(completed_tx),
+            })?;
+        Ok(completed_rx)
     }
 
     /// Queue the best-effort API-key last-used audit timestamp. Carries only the generated key id,
@@ -301,6 +337,7 @@ mod tests {
             model: Some("gpt-5.6-sol".into()),
             upstream_model: None,
             upstream_transport: None,
+            profile_revision: None,
             reasoning_effort: None,
             service_tier: None,
             transport: Some("http".into()),
@@ -363,6 +400,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_update_receipt_fires_only_after_the_durable_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        store
+            .enqueue_request_log(sample_record("rq-receipt"))
+            .unwrap();
+        let receipt = store
+            .enqueue_request_usage_with_receipt(RequestUsageUpdate {
+                request_id: "rq-receipt".into(),
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cached_input_tokens: None,
+                cache_write_input_tokens: None,
+                reasoning_tokens: None,
+                reported_total_tokens: Some(15),
+                orchestration_input_tokens: None,
+                orchestration_output_tokens: None,
+                orchestration_cached_input_tokens: None,
+                cost_usd: None,
+                latency_first_token_ms: Some(7),
+                duration_ms: Some(20),
+                protocol_outcome: RequestProtocolOutcome::Completed,
+            })
+            .unwrap();
+
+        assert!(receipt.await.unwrap(), "the durable update should succeed");
+        let row = store.request_log().list(1, 0).await.unwrap().remove(0);
+        assert_eq!(row.request_id.as_deref(), Some("rq-receipt"));
+        assert_eq!(row.reported_total_tokens, Some(15));
+        assert_eq!(row.duration_ms, 20);
+    }
+
+    #[tokio::test]
     async fn flush_drains_api_key_audit_touch() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("store.db")).await.unwrap();
@@ -377,5 +447,26 @@ mod tests {
 
         let row = store.api_keys().get_by_hash("hash").await.unwrap().unwrap();
         assert_eq!(row.last_used_at, Some(55));
+    }
+
+    #[tokio::test]
+    async fn flush_reports_background_write_failures_instead_of_claiming_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_request_log_insert \
+             BEFORE INSERT ON request_log \
+             BEGIN SELECT RAISE(ABORT, 'forced background failure'); END",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        store.enqueue_request_log(sample_record("rq-fail")).unwrap();
+
+        assert!(
+            store.flush_background_writes().await.is_err(),
+            "a flush barrier must surface failures from writes queued before it"
+        );
     }
 }

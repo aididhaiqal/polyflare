@@ -295,6 +295,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             post(crate::provider_api::sync_models),
         )
         .route(
+            "/api/providers/{id}/models/discover",
+            post(crate::provider_api::discover_models),
+        )
+        .route(
             "/api/provider-models/{id}",
             patch(crate::provider_api::patch_model).delete(crate::provider_api::delete_model),
         )

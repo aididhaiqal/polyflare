@@ -348,6 +348,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             "shutdown drain timed out; closing remaining connections"
         );
     }
+    polyflare_server::usage_refresh::flush_cooldown_persistence(&state).await?;
     let flush_result = state.store.flush_background_writes().await;
     flush_result?;
     Ok(())

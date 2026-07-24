@@ -18,6 +18,10 @@ use polyflare_store::{
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
+use crate::custom_provider::ProfileRequestOverrides;
+
+const MAX_INSTRUCTION_PROFILE_BYTES: usize = 32 * 1024;
+const MAX_PROFILE_OUTPUT_TOKENS: i64 = 2_000_000;
 
 fn now() -> i64 {
     SystemTime::now()
@@ -42,6 +46,14 @@ fn valid_slug(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+fn valid_model_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 192
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':' | b'~')
+        })
+}
+
 fn valid_label(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 128
 }
@@ -55,6 +67,13 @@ fn valid_reasoning_levels(levels: &[String]) -> bool {
             )
         })
         && levels.iter().collect::<HashSet<_>>().len() == levels.len()
+}
+
+fn valid_reasoning_effort(value: &str) -> bool {
+    matches!(
+        value,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    )
 }
 
 fn validate_base_url(base_url: &str, allow_private_hosts: bool) -> bool {
@@ -115,6 +134,9 @@ pub struct ModelView {
     supports_web_search: bool,
     supports_reasoning_summaries: bool,
     reasoning_levels: Vec<String>,
+    instruction_mode: String,
+    instruction_text: String,
+    request_overrides: ProfileRequestOverrides,
     input_per_million: Option<f64>,
     cached_input_per_million: Option<f64>,
     output_per_million: Option<f64>,
@@ -156,6 +178,10 @@ impl From<ProviderModel> for ModelView {
             supports_reasoning_summaries: value.supports_reasoning_summaries,
             reasoning_levels: serde_json::from_str(&value.reasoning_levels_json)
                 .unwrap_or_default(),
+            instruction_mode: value.instruction_mode,
+            instruction_text: value.instruction_text,
+            request_overrides: serde_json::from_str(&value.request_overrides_json)
+                .unwrap_or_default(),
             input_per_million: value.input_per_million,
             cached_input_per_million: value.cached_input_per_million,
             output_per_million: value.output_per_million,
@@ -164,6 +190,33 @@ impl From<ProviderModel> for ModelView {
             enabled: value.enabled,
         }
     }
+}
+
+fn valid_profile(
+    instruction_mode: &str,
+    instruction_text: &str,
+    overrides: &ProfileRequestOverrides,
+    model_max_output_tokens: Option<i64>,
+    reasoning_levels: &[String],
+) -> bool {
+    let valid_instructions = match instruction_mode {
+        "none" => instruction_text.is_empty(),
+        "append" | "replace" => {
+            !instruction_text.trim().is_empty()
+                && instruction_text.len() <= MAX_INSTRUCTION_PROFILE_BYTES
+        }
+        _ => false,
+    };
+    let valid_effort = overrides.reasoning_effort.as_deref().is_none_or(|effort| {
+        valid_reasoning_effort(effort)
+            && (reasoning_levels.is_empty() || reasoning_levels.iter().any(|level| level == effort))
+    });
+    let valid_max_output = overrides.max_output_tokens.is_none_or(|value| {
+        value > 0
+            && value <= MAX_PROFILE_OUTPUT_TOKENS
+            && model_max_output_tokens.is_none_or(|model_max| value <= model_max)
+    });
+    valid_instructions && valid_effort && valid_max_output
 }
 
 async fn view(state: &AppState, provider: CustomProvider) -> Result<ProviderView, Response> {
@@ -305,7 +358,10 @@ pub async fn patch_provider(
         .set_provider_enabled(&id, input.enabled, now())
         .await
     {
-        Ok(true) => ok(),
+        Ok(true) => {
+            crate::custom_provider::evict_provider_client(&id);
+            ok()
+        }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -316,7 +372,10 @@ pub async fn delete_provider(
     Path(id): Path<String>,
 ) -> Response {
     match state.store.providers().delete_provider(&id).await {
-        Ok(true) => ok(),
+        Ok(true) => {
+            crate::custom_provider::evict_provider_client(&id);
+            ok()
+        }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -379,7 +438,54 @@ pub async fn test_provider(State(state): State<Arc<AppState>>, Path(id): Path<St
     }
 }
 
-pub async fn sync_models(
+fn suggested_public_model(provider: &CustomProvider, upstream_model: &str) -> String {
+    let provider_prefix = format!("{}/", provider.slug);
+    if !upstream_model.contains('/') || upstream_model.starts_with(&provider_prefix) {
+        upstream_model.to_string()
+    } else {
+        format!("{}/{}", provider.slug, upstream_model)
+    }
+}
+
+fn model_is_configured(
+    existing: &[ProviderModel],
+    upstream_model: &str,
+    suggested_public_model: &str,
+) -> bool {
+    existing.iter().any(|model| {
+        model.public_model == upstream_model || model.public_model == suggested_public_model
+    })
+}
+
+async fn configured_public_models(state: &AppState) -> Result<HashSet<String>, Response> {
+    let providers = state
+        .store
+        .providers()
+        .list_providers()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+    let mut public_models = HashSet::new();
+    for provider in providers {
+        let models = state
+            .store
+            .providers()
+            .list_models(&provider.id)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+        public_models.extend(models.into_iter().map(|model| model.public_model));
+    }
+    Ok(public_models)
+}
+
+#[derive(Serialize)]
+struct DiscoveredModelView {
+    #[serde(flatten)]
+    model: crate::custom_provider::DiscoveredProviderModel,
+    suggested_public_model: String,
+    state: &'static str,
+}
+
+pub async fn discover_models(
     State(state): State<Arc<AppState>>,
     Path(provider_id): Path<String>,
 ) -> Response {
@@ -403,27 +509,121 @@ pub async fn sync_models(
         Ok(existing) => existing,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let existing_slugs = existing
+    let configured_public_models = match configured_public_models(&state).await {
+        Ok(models) => models,
+        Err(response) => return response,
+    };
+    let models = discovered
         .into_iter()
-        .map(|model| model.public_model)
-        .collect::<std::collections::HashSet<_>>();
+        .map(|model| {
+            let suggested_public_model = suggested_public_model(&provider, &model.upstream_model);
+            let state =
+                if model_is_configured(&existing, &model.upstream_model, &suggested_public_model) {
+                    "configured"
+                } else if !valid_model_identifier(&suggested_public_model)
+                    || configured_public_models.contains(&suggested_public_model)
+                    || crate::catalog::model_slug_is_reserved(&state, &suggested_public_model)
+                {
+                    "conflict"
+                } else {
+                    "available"
+                };
+            DiscoveredModelView {
+                model,
+                suggested_public_model,
+                state,
+            }
+        })
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({
+        "discovered": models.len(),
+        "models": models,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SyncModelsInput {
+    model_ids: Vec<String>,
+}
+
+pub async fn sync_models(
+    State(state): State<Arc<AppState>>,
+    Path(provider_id): Path<String>,
+    Json(input): Json<SyncModelsInput>,
+) -> Response {
+    if input.model_ids.is_empty()
+        || input.model_ids.len() > 1_000
+        || input
+            .model_ids
+            .iter()
+            .any(|model_id| !valid_model_identifier(model_id))
+    {
+        return (StatusCode::BAD_REQUEST, "invalid or empty model selection").into_response();
+    }
+    let selected: HashSet<String> = input.model_ids.into_iter().collect();
+    let Some(provider) = state
+        .store
+        .providers()
+        .get_provider(&provider_id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let discovered =
+        match crate::custom_provider::discover_models(&state.store, &state.cipher, &provider).await
+        {
+            Ok(discovered) => discovered,
+            Err(message) => return (StatusCode::BAD_GATEWAY, message).into_response(),
+        };
+    let discovered_ids = discovered
+        .iter()
+        .map(|model| model.upstream_model.as_str())
+        .collect::<HashSet<_>>();
+    if selected
+        .iter()
+        .any(|model_id| !discovered_ids.contains(model_id.as_str()))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "selected model is not in provider discovery",
+        )
+            .into_response();
+    }
+    let existing = match state.store.providers().list_models(&provider_id).await {
+        Ok(existing) => existing,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let configured_public_models = match configured_public_models(&state).await {
+        Ok(models) => models,
+        Err(response) => return response,
+    };
     let timestamp = now();
     let mut imported = 0usize;
     let mut skipped_existing = 0usize;
     let mut skipped_conflicts = 0usize;
-    for discovered_model in &discovered {
-        if existing_slugs.contains(&discovered_model.upstream_model) {
+    for discovered_model in discovered
+        .iter()
+        .filter(|model| selected.contains(&model.upstream_model))
+    {
+        let public_model = suggested_public_model(&provider, &discovered_model.upstream_model);
+        if model_is_configured(&existing, &discovered_model.upstream_model, &public_model) {
             skipped_existing += 1;
             continue;
         }
-        if crate::catalog::model_slug_is_reserved(&state, &discovered_model.upstream_model) {
+        if !valid_model_identifier(&public_model)
+            || configured_public_models.contains(&public_model)
+            || crate::catalog::model_slug_is_reserved(&state, &public_model)
+        {
             skipped_conflicts += 1;
             continue;
         }
         let model = NewProviderModel {
             id: id("model"),
             provider_id: provider.id.clone(),
-            public_model: discovered_model.upstream_model.clone(),
+            public_model,
             upstream_model: discovered_model.upstream_model.clone(),
             display_name: discovered_model.display_name.clone(),
             context_window: discovered_model.context_window,
@@ -439,9 +639,12 @@ pub async fn sync_models(
                 .model_info
                 .as_ref()
                 .map(serde_json::Value::to_string),
-            input_per_million: None,
-            cached_input_per_million: None,
-            output_per_million: None,
+            instruction_mode: "none".into(),
+            instruction_text: String::new(),
+            request_overrides_json: "{}".into(),
+            input_per_million: discovered_model.input_per_million,
+            cached_input_per_million: discovered_model.cached_input_per_million,
+            output_per_million: discovered_model.output_per_million,
             visible_in_codex: true,
             visible_in_openai: true,
             enabled: true,
@@ -454,6 +657,7 @@ pub async fn sync_models(
     }
     Json(serde_json::json!({
         "discovered": discovered.len(),
+        "selected": selected.len(),
         "imported": imported,
         "skipped_existing": skipped_existing,
         "skipped_conflicts": skipped_conflicts,
@@ -573,6 +777,12 @@ pub struct CreateModel {
     #[serde(default)]
     reasoning_levels: Vec<String>,
     model_info: Option<serde_json::Value>,
+    #[serde(default = "default_instruction_mode")]
+    instruction_mode: String,
+    #[serde(default)]
+    instruction_text: String,
+    #[serde(default)]
+    request_overrides: ProfileRequestOverrides,
     input_per_million: Option<f64>,
     cached_input_per_million: Option<f64>,
     output_per_million: Option<f64>,
@@ -584,6 +794,10 @@ pub struct CreateModel {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_instruction_mode() -> String {
+    "none".into()
 }
 
 pub async fn create_model(
@@ -599,13 +813,20 @@ pub async fn create_model(
     .into_iter()
     .flatten()
     .all(|price| price.is_finite() && price >= 0.0);
-    if !valid_slug(&input.public_model)
-        || !valid_slug(&input.upstream_model)
+    if !valid_model_identifier(&input.public_model)
+        || !valid_model_identifier(&input.upstream_model)
         || !valid_label(&input.display_name)
         || input.context_window.is_some_and(|value| value <= 0)
         || input.max_output_tokens.is_some_and(|value| value <= 0)
         || !valid_prices
         || !valid_reasoning_levels(&input.reasoning_levels)
+        || !valid_profile(
+            &input.instruction_mode,
+            &input.instruction_text,
+            &input.request_overrides,
+            input.max_output_tokens,
+            &input.reasoning_levels,
+        )
         || input.model_info.as_ref().is_some_and(|value| {
             value.to_string().len() > 64 * 1024
                 || !crate::catalog::safe_codex_model_info_extensions(value)
@@ -637,6 +858,10 @@ pub async fn create_model(
         reasoning_levels_json: serde_json::to_string(&input.reasoning_levels)
             .unwrap_or_else(|_| "[]".into()),
         model_info_json: input.model_info.map(|value| value.to_string()),
+        instruction_mode: input.instruction_mode,
+        instruction_text: input.instruction_text,
+        request_overrides_json: serde_json::to_string(&input.request_overrides)
+            .unwrap_or_else(|_| "{}".into()),
         input_per_million: input.input_per_million,
         cached_input_per_million: input.cached_input_per_million,
         output_per_million: input.output_per_million,
@@ -678,6 +903,9 @@ pub struct ModelPatch {
     supports_web_search: Option<bool>,
     supports_reasoning_summaries: Option<bool>,
     reasoning_levels: Option<Vec<String>>,
+    instruction_mode: Option<String>,
+    instruction_text: Option<String>,
+    request_overrides: Option<ProfileRequestOverrides>,
 }
 
 pub async fn patch_model(
@@ -698,13 +926,43 @@ pub async fn patch_model(
         && input.supports_web_search.is_none()
         && input.supports_reasoning_summaries.is_none()
         && input.reasoning_levels.is_none()
+        && input.instruction_mode.is_none()
+        && input.instruction_text.is_none()
+        && input.request_overrides.is_none()
     {
         return (StatusCode::BAD_REQUEST, "empty model patch").into_response();
     }
+    let existing = match state.store.providers().get_model(&id).await {
+        Ok(Some(model)) => model,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let effective_instruction_mode = input
+        .instruction_mode
+        .as_deref()
+        .unwrap_or(&existing.instruction_mode);
+    let effective_instruction_text = input
+        .instruction_text
+        .as_deref()
+        .unwrap_or(&existing.instruction_text);
+    let existing_overrides =
+        serde_json::from_str::<ProfileRequestOverrides>(&existing.request_overrides_json)
+            .unwrap_or_default();
+    let effective_overrides = input
+        .request_overrides
+        .as_ref()
+        .unwrap_or(&existing_overrides);
+    let effective_max_output_tokens = input.max_output_tokens.or(existing.max_output_tokens);
+    let existing_reasoning_levels =
+        serde_json::from_str::<Vec<String>>(&existing.reasoning_levels_json).unwrap_or_default();
+    let effective_reasoning_levels = input
+        .reasoning_levels
+        .as_ref()
+        .unwrap_or(&existing_reasoning_levels);
     if input
         .upstream_model
         .as_deref()
-        .is_some_and(|value| !valid_slug(value))
+        .is_some_and(|value| !valid_model_identifier(value))
         || input
             .display_name
             .as_deref()
@@ -715,6 +973,13 @@ pub async fn patch_model(
             .reasoning_levels
             .as_ref()
             .is_some_and(|levels| !valid_reasoning_levels(levels))
+        || !valid_profile(
+            effective_instruction_mode,
+            effective_instruction_text,
+            effective_overrides,
+            effective_max_output_tokens,
+            effective_reasoning_levels,
+        )
     {
         return (StatusCode::BAD_REQUEST, "invalid model patch").into_response();
     }
@@ -731,6 +996,11 @@ pub async fn patch_model(
         reasoning_levels_json: input
             .reasoning_levels
             .map(|levels| serde_json::to_string(&levels).unwrap_or_else(|_| "[]".into())),
+        instruction_mode: input.instruction_mode,
+        instruction_text: input.instruction_text,
+        request_overrides_json: input
+            .request_overrides
+            .map(|overrides| serde_json::to_string(&overrides).unwrap_or_else(|_| "{}".into())),
         visible_in_codex: input.visible_in_codex,
         visible_in_openai: input.visible_in_openai,
         enabled: input.enabled,

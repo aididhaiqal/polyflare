@@ -50,13 +50,24 @@ pub async fn require_admin(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    // Constant-time-ish compare is unnecessary for a single local operator token, but avoid
-    // early-exit length leak.
-    if presented == Some(expected) {
+    if presented
+        .is_some_and(|presented| constant_time_eq(presented.as_bytes(), expected.as_bytes()))
+    {
         next.run(req).await
     } else {
         (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
     }
+}
+
+fn constant_time_eq(presented: &[u8], expected: &[u8]) -> bool {
+    let compared_len = presented.len().max(expected.len());
+    let mut difference = presented.len() ^ expected.len();
+    for index in 0..compared_len {
+        let left = presented.get(index).copied().unwrap_or(0);
+        let right = expected.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left ^ right);
+    }
+    difference == 0
 }
 
 /// `GET /api/whoami` — proves a presented token is valid. No identity beyond that today (a single
@@ -112,6 +123,18 @@ pub async fn require_client_key(
     req: Request,
     next: Next,
 ) -> Response {
+    if authenticate_client_key(&s, &headers).await {
+        next.run(req).await
+    } else {
+        unauthorized_response()
+    }
+}
+
+/// Validate and audit one client key without coupling the caller to Axum middleware composition.
+///
+/// Synthetic ChatGPT usage is intentionally not part of the model proxy router, but remote
+/// deployments still need the same key boundary before exposing aggregate fleet capacity.
+pub(crate) async fn authenticate_client_key(s: &AppState, headers: &HeaderMap) -> bool {
     let presented = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -119,7 +142,7 @@ pub async fn require_client_key(
         .filter(|raw| !raw.is_empty());
 
     let Some(raw) = presented else {
-        return unauthorized_response();
+        return false;
     };
 
     let hash = crate::keys::sha256_hex(raw);
@@ -128,12 +151,12 @@ pub async fn require_client_key(
             // Best-effort bounded audit write. Carries only the generated row id, never the raw
             // presented key or its hash, and never creates a task per request.
             let _ = s.store.enqueue_api_key_touch(row.id, unix_now());
-            next.run(req).await
+            true
         }
         // Unknown hash, a revoked (`enabled == false`) row, or a store error while looking it up —
         // all fail closed to the same generic 401. See the doc comment's "Repo-error handling"
         // note for why a DB error is folded into "invalid" rather than a distinct 5xx.
-        _ => unauthorized_response(),
+        _ => false,
     }
 }
 
@@ -151,7 +174,7 @@ fn unix_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::local_dashboard_access;
+    use super::{constant_time_eq, local_dashboard_access};
 
     #[test]
     fn tokenless_dashboard_opens_only_on_parsed_loopback_binds() {
@@ -166,5 +189,13 @@ mod tests {
     #[test]
     fn configured_token_always_disables_local_bypass() {
         assert!(!local_dashboard_access(Some("secret"), "127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn admin_token_comparison_requires_exact_bytes_and_length() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secrex", b"secret"));
+        assert!(!constant_time_eq(b"secret-extra", b"secret"));
+        assert!(!constant_time_eq(b"", b"secret"));
     }
 }

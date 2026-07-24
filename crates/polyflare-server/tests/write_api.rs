@@ -379,6 +379,47 @@ async fn patch_sets_clears_and_validates_alias() {
 }
 
 #[tokio::test]
+async fn patch_rolls_back_every_field_when_a_late_write_fails() {
+    let store = store_with_one().await;
+    let repo = store.accounts();
+    sqlx::query(
+        "CREATE TRIGGER reject_alias_update \
+         BEFORE UPDATE OF alias ON accounts \
+         BEGIN SELECT RAISE(ABORT, 'forced late write failure'); END",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let pf = spawn_with(store).await;
+
+    let response = reqwest::Client::new()
+        .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({
+            "pools": ["team-a", "overflow"],
+            "routing_policy": "burn_first",
+            "status": "paused",
+            "security_work_authorized": true,
+            "alias": "must-fail"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 500);
+    let row = repo.get("acct-1").await.unwrap().unwrap();
+    assert!(
+        repo.list_pools("acct-1").await.unwrap().is_empty(),
+        "pool membership must roll back with the failed patch"
+    );
+    assert_eq!(row.pool, None);
+    assert_eq!(row.routing_policy, "normal");
+    assert_eq!(row.status, "active");
+    assert!(!row.security_work_authorized);
+    assert_eq!(row.alias, None);
+}
+
+#[tokio::test]
 async fn patch_validation_fails_closed() {
     let pf = spawn_with(store_with_one().await).await;
     let client = reqwest::Client::new();

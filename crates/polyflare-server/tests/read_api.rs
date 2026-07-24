@@ -99,6 +99,7 @@ async fn seed_store() -> Store {
             model: None,
             upstream_model: None,
             upstream_transport: None,
+            profile_revision: None,
             reasoning_effort: None,
             service_tier: None,
             transport: None,
@@ -305,6 +306,7 @@ async fn accounts_endpoint_carries_provider_pool_usage_token_health_and_request_
             model: None,
             upstream_model: None,
             upstream_transport: None,
+            profile_revision: None,
             reasoning_effort: None,
             service_tier: None,
             transport: None,
@@ -806,8 +808,47 @@ async fn requests_endpoint_preserves_imported_outcome_when_http_status_is_unknow
     assert_eq!(reports["totals"]["errors"], 2);
 }
 
-/// Seeds 3 rows (2 codex/200 with metrics, 1 anthropic/500) so filters + the content-free metric
-/// columns + the derived `tps` can be exercised end to end, unauthenticated (auth lands later).
+fn backend_filter_row(provider: &str, path: &str) -> RequestLogRecord {
+    RequestLogRecord {
+        requested_at: now(),
+        provider: provider.to_string(),
+        method: "GET".to_string(),
+        path: path.to_string(),
+        aliased: false,
+        status: 200,
+        duration_ms: 10,
+        account_id: None,
+        target_kind: None,
+        provider_credential_id: None,
+        model: None,
+        upstream_model: None,
+        upstream_transport: Some("http".to_string()),
+        profile_revision: None,
+        reasoning_effort: None,
+        service_tier: None,
+        transport: Some("http".to_string()),
+        ttft_ms: None,
+        total_tokens: None,
+        cached_tokens: None,
+        subagent: None,
+        request_id: None,
+        session_key: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        reasoning_tokens: None,
+        orchestration_input_tokens: None,
+        orchestration_output_tokens: None,
+        orchestration_cached_input_tokens: None,
+        cost_usd: None,
+        latency_first_token_ms: None,
+        protocol_outcome: None,
+    }
+}
+
+/// Seeds 5 rows (2 codex model responses, 1 anthropic model response, and 2 backend operations)
+/// so provider classification, multi-selection, content-free metrics, and derived TPS can be
+/// exercised end to end. One backend row intentionally uses the historical `codex` provider.
 async fn seed_store_for_filters() -> Store {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
@@ -826,6 +867,7 @@ async fn seed_store_for_filters() -> Store {
         model: Some("gpt-5.6-sol".to_string()),
         upstream_model: None,
         upstream_transport: None,
+        profile_revision: None,
         reasoning_effort: Some("high".to_string()),
         service_tier: Some("priority".to_string()),
         transport: Some("http".to_string()),
@@ -862,6 +904,7 @@ async fn seed_store_for_filters() -> Store {
         model: Some("gpt-5.6-sol".to_string()),
         upstream_model: None,
         upstream_transport: None,
+        profile_revision: None,
         reasoning_effort: None,
         service_tier: None,
         transport: Some("http".to_string()),
@@ -898,6 +941,7 @@ async fn seed_store_for_filters() -> Store {
         model: Some("claude-x".to_string()),
         upstream_model: None,
         upstream_transport: None,
+        profile_revision: None,
         reasoning_effort: None,
         service_tier: None,
         transport: Some("sse".to_string()),
@@ -918,6 +962,18 @@ async fn seed_store_for_filters() -> Store {
         latency_first_token_ms: None,
         protocol_outcome: None,
     })
+    .await
+    .unwrap();
+    repo.insert(&backend_filter_row(
+        "codex",
+        "chatgpt_backend_synthetic_wham/usage",
+    ))
+    .await
+    .unwrap();
+    repo.insert(&backend_filter_row(
+        "chatgpt_backend",
+        "chatgpt_backend_passthrough_wham/settings/user",
+    ))
     .await
     .unwrap();
     std::mem::forget(dir);
@@ -973,6 +1029,51 @@ async fn requests_endpoint_filters_by_provider_and_carries_content_free_metrics(
         partial["subagent"].is_null(),
         "the main agent (no x-openai-subagent header) round-trips as null, not a placeholder"
     );
+
+    let models: serde_json::Value = client
+        .get(format!("{pf}/api/requests?provider=model&limit=10"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(models["total"], 3);
+    assert!(models["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| !row["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("chatgpt_backend_")));
+
+    let backend: serde_json::Value = client
+        .get(format!(
+            "{pf}/api/requests?provider=chatgpt_backend&limit=10"
+        ))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(backend["total"], 2);
+
+    let multi: serde_json::Value = client
+        .get(format!(
+            "{pf}/api/requests?provider=codex,anthropic&limit=10"
+        ))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(multi["total"], 3);
 }
 
 /// A minimal content-free `request_log` row for the overview KPI test: only the fields the
@@ -994,6 +1095,7 @@ fn req_row(status: u16, total_tokens: i64) -> RequestLogRecord {
         model: None,
         upstream_model: None,
         upstream_transport: None,
+        profile_revision: None,
         reasoning_effort: None,
         service_tier: None,
         transport: None,
@@ -1127,6 +1229,7 @@ fn req_row_at(requested_at: i64, status: u16, total_tokens: i64) -> RequestLogRe
         model: None,
         upstream_model: None,
         upstream_transport: None,
+        profile_revision: None,
         reasoning_effort: None,
         service_tier: None,
         transport: None,
@@ -1333,6 +1436,7 @@ async fn account_detail_request_totals_fall_back_to_input_plus_output_tokens() {
         model: None,
         upstream_model: None,
         upstream_transport: None,
+        profile_revision: None,
         reasoning_effort: None,
         service_tier: None,
         transport: None,
@@ -1370,6 +1474,7 @@ async fn account_detail_request_totals_fall_back_to_input_plus_output_tokens() {
         model: None,
         upstream_model: None,
         upstream_transport: None,
+        profile_revision: None,
         reasoning_effort: None,
         service_tier: None,
         transport: None,
@@ -1435,6 +1540,7 @@ async fn requests_endpoint_falls_back_to_input_output_tokens_and_latency_first_t
         model: None,
         upstream_model: None,
         upstream_transport: None,
+        profile_revision: None,
         reasoning_effort: None,
         service_tier: None,
         transport: None,
@@ -1877,6 +1983,7 @@ fn report_endpoint_row(
         model: Some(model.to_string()),
         upstream_model: None,
         upstream_transport: None,
+        profile_revision: None,
         reasoning_effort: None,
         service_tier: None,
         transport: None,
