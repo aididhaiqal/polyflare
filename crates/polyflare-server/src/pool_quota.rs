@@ -62,6 +62,55 @@ pub(crate) fn synthesize(
     Some(SyntheticPoolQuota { primary, secondary })
 }
 
+/// The latest real member reset for one synthesized window.
+///
+/// A pool whose accounts reset at different times has no single upstream reset timestamp. The
+/// transport quota events intentionally omit one in that case. WHAM's account-usage schema,
+/// however, requires a reset for every reported window. The latest real member reset is the
+/// conservative moment by which the whole included pool has replenished; it is derived only when
+/// every included account has fresh evidence and a real reset, never from a fabricated clock.
+pub(crate) fn conservative_reset_at(
+    snapshots: &[AccountSnapshot],
+    provider: Provider,
+    pool: Option<&str>,
+    require_security_work_authorized: bool,
+    window_minutes: i64,
+) -> Option<i64> {
+    let included: Vec<&AccountSnapshot> = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.provider == provider)
+        .filter(|snapshot| {
+            pool.is_none_or(|slug| snapshot.pools.iter().any(|membership| membership == slug))
+        })
+        .filter(|snapshot| !require_security_work_authorized || snapshot.security_work_authorized)
+        .filter(|snapshot| {
+            !matches!(
+                snapshot.status.as_str(),
+                "paused" | "reauth_required" | "deactivated"
+            )
+        })
+        .collect();
+    if included.is_empty() {
+        return None;
+    }
+
+    included
+        .into_iter()
+        .map(|snapshot| match window_minutes {
+            FIVE_HOUR_MINUTES => snapshot.five_hour_quota.as_ref(),
+            WEEKLY_MINUTES => snapshot.weekly_quota.as_ref(),
+            _ => None,
+        })
+        .map(|window| {
+            let window = window?;
+            (!window.stale && window.window_minutes == Some(window_minutes))
+                .then_some(window.reset_at)
+                .flatten()
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(|resets| resets.into_iter().max())
+}
+
 pub(crate) fn apply_http_headers(headers: &mut HeaderMap, quota: &SyntheticPoolQuota) -> bool {
     let has_selected_quota = headers.contains_key("x-codex-primary-used-percent")
         || headers.contains_key("x-codex-secondary-used-percent");
@@ -351,6 +400,36 @@ mod tests {
 
         assert_eq!(quota.secondary.used_percent, 50.0);
         assert_eq!(quota.secondary.reset_at, None);
+    }
+
+    #[test]
+    fn conservative_reset_uses_latest_real_member_reset_and_requires_complete_evidence() {
+        let first = account("first", "plus", 20.0);
+        let mut second = account("second", "pro", 40.0);
+        second.weekly_quota.as_mut().unwrap().reset_at = Some(3_000_000);
+
+        assert_eq!(
+            conservative_reset_at(
+                &[first.clone(), second.clone()],
+                Provider::Codex,
+                None,
+                false,
+                WEEKLY_MINUTES
+            ),
+            Some(3_000_000)
+        );
+
+        second.weekly_quota.as_mut().unwrap().reset_at = None;
+        assert_eq!(
+            conservative_reset_at(
+                &[first, second],
+                Provider::Codex,
+                None,
+                false,
+                WEEKLY_MINUTES
+            ),
+            None
+        );
     }
 
     #[test]

@@ -33,7 +33,9 @@ use axum::http::StatusCode;
 /// strings sourced from the request itself).
 pub struct RequestLog {
     pub method: &'static str,
-    pub path: &'static str,
+    /// Content-safe route label. Most callers use a static endpoint; the ChatGPT backend gateway
+    /// uses a bounded normalized route that never contains query values or dynamic identifiers.
+    pub path: String,
     /// Actual upstream provider slug (`codex`, `anthropic`, or an operator-configured provider).
     pub provider: String,
     pub aliased: bool,
@@ -815,7 +817,7 @@ mod tests {
         tracing::dispatcher::with_default(&dispatch, || {
             RequestLog {
                 method: "POST",
-                path: "/responses",
+                path: "/responses".to_string(),
                 provider: "codex".to_string(),
                 aliased: false,
                 status: StatusCode::OK,
@@ -890,7 +892,7 @@ mod tests {
     fn record_and_to_log_event_carry_subagent_like_model_and_account_id() {
         let log = RequestLog {
             method: "POST",
-            path: "/responses",
+            path: "/responses".to_string(),
             provider: "codex".to_string(),
             aliased: false,
             status: StatusCode::OK,
@@ -943,7 +945,7 @@ mod tests {
     fn record_and_to_log_event_carry_none_subagent_for_the_main_agent() {
         let log = RequestLog {
             method: "POST",
-            path: "/responses",
+            path: "/responses".to_string(),
             provider: "codex".to_string(),
             aliased: false,
             status: StatusCode::OK,
@@ -976,7 +978,7 @@ mod tests {
     fn record_carries_request_id_through_to_the_persisted_record() {
         let log = RequestLog {
             method: "POST",
-            path: "/responses",
+            path: "/responses".to_string(),
             provider: "codex".to_string(),
             aliased: false,
             status: StatusCode::OK,

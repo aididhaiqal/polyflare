@@ -569,7 +569,7 @@ async fn control_route(
     let request_id = format!("{:032x}", rand::random::<u128>());
     let log = RequestLog {
         method: method_label,
-        path: log_label,
+        path: log_label.to_string(),
         provider: Provider::Codex.to_string(),
         aliased: false,
         status: response.status(),
@@ -955,7 +955,7 @@ async fn compact_route(
     let request_id = format!("{:032x}", rand::random::<u128>());
     let log = RequestLog {
         method: "POST",
-        path: "responses_compact",
+        path: "responses_compact".to_string(),
         provider: Provider::Codex.to_string(),
         aliased: false,
         status: response.status(),
