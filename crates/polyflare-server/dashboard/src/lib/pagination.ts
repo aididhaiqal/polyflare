@@ -1,3 +1,12 @@
+export function clampPageOffset(offset: number, total: number, pageSize: number): number {
+  if (!Number.isFinite(offset) || !Number.isFinite(total) || pageSize <= 0) return 0;
+  const safeOffset = Math.max(0, Math.floor(offset));
+  const safeTotal = Math.max(0, Math.floor(total));
+  if (safeTotal === 0) return 0;
+  const lastPageOffset = Math.floor((safeTotal - 1) / pageSize) * pageSize;
+  return Math.min(safeOffset, lastPageOffset);
+}
+
 export function paginationWindow(
   currentPage: number,
   totalPages: number,

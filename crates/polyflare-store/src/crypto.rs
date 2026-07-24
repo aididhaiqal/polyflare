@@ -2,7 +2,7 @@
 //! a raw 32-byte file (chmod 0600 on Unix). Plaintext is never logged.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
@@ -29,25 +29,37 @@ impl TokenCipher {
     /// Load a raw 32-byte key from `path`, or generate one and persist it (chmod 0600 on Unix)
     /// if the file does not exist. The parent directory is created if needed.
     pub fn load_or_create(path: &Path) -> Result<Self, StoreError> {
-        let key_bytes = if path.exists() {
-            let bytes = fs::read(path)?;
-            if bytes.len() != KEY_LEN {
-                return Err(StoreError::Crypto(format!(
-                    "key file must be {KEY_LEN} raw bytes, found {}",
-                    bytes.len()
-                )));
-            }
-            bytes
-        } else {
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    fs::create_dir_all(parent)?;
+        let key_bytes = loop {
+            match read_key_file(path) {
+                Ok(bytes) => break bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(parent) = path.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            fs::create_dir_all(parent)?;
+                        }
+                    }
+                    let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+                    match write_key_file(path, key.as_slice()) {
+                        Ok(()) => break key.to_vec(),
+                        // Another process won the create race. Read and validate that key instead
+                        // of truncating it or proceeding with a different in-memory key.
+                        Err(StoreError::Io(error))
+                            if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                        {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
+                Err(error) => return Err(error.into()),
             }
-            let key = XChaCha20Poly1305::generate_key(&mut OsRng);
-            write_key_file(path, key.as_slice())?;
-            key.to_vec()
         };
+        if key_bytes.len() != KEY_LEN {
+            return Err(StoreError::Crypto(format!(
+                "key file must be {KEY_LEN} raw bytes, found {}",
+                key_bytes.len()
+            )));
+        }
         Self::from_key_bytes(&key_bytes)
     }
 
@@ -92,18 +104,63 @@ fn write_key_file(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)?;
     file.write_all(bytes)?;
+    file.sync_all()?;
     Ok(())
 }
 
 #[cfg(not(unix))]
 fn write_key_file(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    fs::write(path, bytes)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn read_key_file(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    // Keep validation, permission tightening, and reading bound to one descriptor. O_NOFOLLOW
+    // rejects a symlink in the final path component, while O_NONBLOCK prevents a malicious FIFO
+    // or device path from wedging startup before fstat can reject it.
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "key path is not a regular file",
+        ));
+    }
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    let mut bytes = Vec::with_capacity(KEY_LEN);
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_key_file(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    let mut file = fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "key path is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(KEY_LEN);
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -170,5 +227,61 @@ mod tests {
             let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "key file must be 0600");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_existing_key_tightens_overly_broad_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("key");
+        fs::write(&key_path, [7u8; KEY_LEN]).unwrap();
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        TokenCipher::load_or_create(&key_path).unwrap();
+
+        let mode = fs::metadata(&key_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "loaded key file must be 0600");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_existing_key_rejects_symlinks_without_chmodding_the_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("target");
+        let key_path = dir.path().join("key");
+        fs::write(&target_path, [7u8; KEY_LEN]).unwrap();
+        fs::set_permissions(&target_path, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&target_path, &key_path).unwrap();
+
+        assert!(
+            TokenCipher::load_or_create(&key_path).is_err(),
+            "the encryption-key path must never follow a symlink"
+        );
+
+        let target_mode = fs::metadata(&target_path).unwrap().permissions().mode();
+        assert_eq!(
+            target_mode & 0o777,
+            0o644,
+            "rejecting a symlink must not mutate its target"
+        );
+    }
+
+    #[test]
+    fn key_creation_never_overwrites_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("key");
+        let first = [1u8; KEY_LEN];
+        let second = [2u8; KEY_LEN];
+
+        write_key_file(&key_path, &first).unwrap();
+        assert!(
+            write_key_file(&key_path, &second).is_err(),
+            "a concurrent creator's key must never be truncated"
+        );
+        assert_eq!(fs::read(key_path).unwrap(), first);
     }
 }

@@ -9,6 +9,8 @@
 //! feature at a time (see `migrations/0004_request_log.sql`); any request-derived string (raw model,
 //! client IP, User-Agent, upstream error text) is gated on an explicit content-safety decision.
 
+use std::collections::HashMap;
+
 use sqlx::sqlite::SqlitePool;
 use sqlx::{QueryBuilder, Sqlite};
 
@@ -29,6 +31,13 @@ const ERROR_SQL: &str = "(protocol_outcome IN \
     ('failed', 'incomplete', 'cancelled', 'transport_lost') OR \
     (protocol_outcome IS NULL AND (status >= 400 OR \
     (status = 0 AND outcome = 'error'))))";
+
+/// Logical backend traffic includes current rows with the dedicated provider plus historical
+/// gateway rows that predate that provider identity but already carry a normalized backend path.
+/// Provider filters use this expression so selecting Codex never leaks legacy backend operations.
+const BACKEND_REQUEST_SQL: &str = "(provider = 'chatgpt_backend' OR \
+    path GLOB 'chatgpt_backend_synthetic_*' OR \
+    path GLOB 'chatgpt_backend_passthrough_*')";
 
 /// Upstream Responses total when observed, then the legacy compatibility total, then a complete
 /// input+output pair. Cached input and reasoning output are subsets and are never added again.
@@ -161,6 +170,8 @@ pub struct RequestLogRecord {
     /// Upstream transport used behind PolyFlare (`codex_ws`, `http_sse`, ...), distinct from the
     /// downstream/client-facing `transport`.
     pub upstream_transport: Option<String>,
+    /// Content-free SHA-256 prefix of the normalized custom model profile configuration.
+    pub profile_revision: Option<String>,
     /// The requested reasoning effort (e.g. `"high"`), if applicable to the provider/model.
     pub reasoning_effort: Option<String>,
     /// The resolved service tier (e.g. `"priority"`), if applicable.
@@ -231,6 +242,7 @@ pub struct RequestLogRow {
     pub model: Option<String>,
     pub upstream_model: Option<String>,
     pub upstream_transport: Option<String>,
+    pub profile_revision: Option<String>,
     pub reasoning_effort: Option<String>,
     pub service_tier: Option<String>,
     pub transport: Option<String>,
@@ -313,7 +325,9 @@ impl RequestLogRow {
 /// Dashboard filter set for [`RequestLogRepo::page`]. Every field is optional; an unset field
 /// applies no filter. `status_class` is not a raw column value: native rows classify by HTTP
 /// status, imported `status = 0` rows by their bounded `outcome`, and any other value (including
-/// `"all"` or unset) applies no status filter.
+/// `"all"` or unset) applies no status filter. `provider` accepts comma-separated values; `model`
+/// selects every logical non-backend provider, and backend classification includes historical
+/// normalized backend paths whose stored provider predates `chatgpt_backend`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RequestsFilter {
     pub request_id: Option<String>,
@@ -339,6 +353,13 @@ pub struct RequestAggregate {
     pub cache_write_input_tokens: i64,
     pub orchestration_tokens: i64,
     pub orchestration_cached_tokens: i64,
+}
+
+/// Lifetime content-free request totals for one built-in account.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountRequestTotals {
+    pub request_count: i64,
+    pub total_tokens: i64,
 }
 
 /// One time bucket of [`RequestLogRepo::series_since`]: a content-free request-volume rollup for a
@@ -440,13 +461,13 @@ impl RequestLogRepo {
             "INSERT INTO request_log \
              (requested_at, provider, method, path, aliased, status, duration_ms, \
               account_id, target_kind, provider_credential_id, model, upstream_model, \
-              upstream_transport, reasoning_effort, service_tier, transport, ttft_ms, \
+              upstream_transport, profile_revision, reasoning_effort, service_tier, transport, ttft_ms, \
               total_tokens, cached_tokens, subagent, request_id, session_key, input_tokens, \
               output_tokens, cached_input_tokens, reasoning_tokens, orchestration_input_tokens, \
               orchestration_output_tokens, orchestration_cached_input_tokens, cost_usd, \
               latency_first_token_ms, protocol_outcome) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                     ?, ?, ?, ?, ?, ?, ?, ?)",
+                     ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.requested_at)
         .bind(&record.provider)
@@ -461,6 +482,7 @@ impl RequestLogRepo {
         .bind(&record.model)
         .bind(&record.upstream_model)
         .bind(&record.upstream_transport)
+        .bind(&record.profile_revision)
         .bind(&record.reasoning_effort)
         .bind(&record.service_tier)
         .bind(&record.transport)
@@ -565,7 +587,7 @@ impl RequestLogRepo {
         let rows = sqlx::query_as::<_, RequestLogRow>(
             "SELECT id, requested_at, provider, method, path, aliased, status, duration_ms, \
              account_id, target_kind, provider_credential_id, model, upstream_model, \
-             upstream_transport, reasoning_effort, service_tier, transport, ttft_ms, \
+             upstream_transport, profile_revision, reasoning_effort, service_tier, transport, ttft_ms, \
              total_tokens, cached_tokens, subagent, request_id, session_key, input_tokens, output_tokens, \
              cached_input_tokens, cache_write_input_tokens, reasoning_tokens, \
              reported_total_tokens, usage_schema, usage_source, usage_status, orchestration_input_tokens, \
@@ -590,6 +612,42 @@ impl RequestLogRepo {
         Ok(n)
     }
 
+    /// Aggregate one account's lifetime request count and API-token total entirely in SQLite.
+    /// This avoids materializing an unbounded request history for the account-detail dashboard.
+    pub async fn account_totals(
+        &self,
+        account_id: &str,
+    ) -> Result<AccountRequestTotals, StoreError> {
+        let row: (i64, i64) = sqlx::query_as(&format!(
+            "SELECT COUNT(*), COALESCE(SUM({API_TOTAL_SQL}), 0) \
+             FROM request_log WHERE account_id = ?"
+        ))
+        .bind(account_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(AccountRequestTotals {
+            request_count: row.0,
+            total_tokens: row.1,
+        })
+    }
+
+    /// Request counts per account at/after `since_ts`, returned in one grouped query.
+    pub async fn account_counts_since(
+        &self,
+        since_ts: i64,
+    ) -> Result<HashMap<String, i64>, StoreError> {
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            "SELECT account_id, COUNT(*) \
+             FROM request_log \
+             WHERE account_id IS NOT NULL AND requested_at >= ? \
+             GROUP BY account_id",
+        )
+        .bind(since_ts)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// The dashboard's filtered, paginated request-log query: a `limit`-sized page (newest first)
     /// matching `filter`, plus the FILTERED total (not the whole table's row count) so the client's
     /// page count matches what's actually being shown. The `WHERE` is built dynamically — only the
@@ -603,7 +661,7 @@ impl RequestLogRepo {
         let mut select = QueryBuilder::<Sqlite>::new(
             "SELECT id, requested_at, provider, method, path, aliased, status, duration_ms, \
              account_id, target_kind, provider_credential_id, model, upstream_model, \
-             upstream_transport, reasoning_effort, service_tier, transport, ttft_ms, \
+             upstream_transport, profile_revision, reasoning_effort, service_tier, transport, ttft_ms, \
              total_tokens, cached_tokens, subagent, request_id, session_key, input_tokens, output_tokens, \
              cached_input_tokens, cache_write_input_tokens, reasoning_tokens, \
              reported_total_tokens, usage_schema, usage_source, usage_status, orchestration_input_tokens, \
@@ -1029,9 +1087,46 @@ impl RequestLogRepo {
             qb.push(")");
         }
         if let Some(v) = &filter.provider {
-            sep(qb, &mut first);
-            qb.push("provider = ");
-            qb.push_bind(v.clone());
+            let providers: Vec<&str> = v
+                .split(',')
+                .map(str::trim)
+                .filter(|provider| !provider.is_empty())
+                .collect();
+            let includes_all = providers.contains(&"all")
+                || (providers.contains(&"model") && providers.contains(&"chatgpt_backend"));
+            if !providers.is_empty() && !includes_all {
+                sep(qb, &mut first);
+                qb.push("(");
+                for (index, provider) in providers.iter().enumerate() {
+                    if index > 0 {
+                        qb.push(" OR ");
+                    }
+                    match *provider {
+                        "model" => {
+                            qb.push("NOT ");
+                            qb.push(BACKEND_REQUEST_SQL);
+                        }
+                        "chatgpt_backend" | "backend" => {
+                            qb.push(BACKEND_REQUEST_SQL);
+                        }
+                        "none" => {
+                            qb.push("0 = 1");
+                        }
+                        provider => {
+                            qb.push("(provider = ");
+                            qb.push_bind(if provider == "claude" {
+                                "anthropic".to_string()
+                            } else {
+                                provider.to_string()
+                            });
+                            qb.push(" AND NOT ");
+                            qb.push(BACKEND_REQUEST_SQL);
+                            qb.push(")");
+                        }
+                    }
+                }
+                qb.push(")");
+            }
         }
         match filter.status_class.as_deref() {
             Some("success") => {
@@ -1091,6 +1186,7 @@ mod tests {
             model: Some("gpt-5.6-sol".into()),
             upstream_model: None,
             upstream_transport: None,
+            profile_revision: None,
             reasoning_effort: Some("high".into()),
             service_tier: Some("priority".into()),
             transport: Some("http".into()),
@@ -1173,6 +1269,7 @@ mod tests {
             model: model.map(String::from),
             upstream_model: None,
             upstream_transport: None,
+            profile_revision: None,
             reasoning_effort: None,
             service_tier: None,
             transport: Some("http".into()),
@@ -1247,6 +1344,91 @@ mod tests {
         let (rows, total) = repo.page(&RequestsFilter::default(), 1, 1).await.unwrap();
         assert_eq!(total, 3);
         assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn page_provider_filter_is_multi_select_and_classifies_legacy_backend_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        repo.insert(&rec("codex", "/responses", 200, Some("gpt-5.6-sol")))
+            .await
+            .unwrap();
+        repo.insert(&rec("anthropic", "/v1/messages", 200, Some("claude")))
+            .await
+            .unwrap();
+        let mut legacy_backend = rec("codex", "chatgpt_backend_synthetic_wham/usage", 200, None);
+        legacy_backend.account_id = None;
+        repo.insert(&legacy_backend).await.unwrap();
+        let mut current_backend = rec(
+            "chatgpt_backend",
+            "chatgpt_backend_passthrough_wham/remote/control/server",
+            101,
+            None,
+        );
+        current_backend.account_id = None;
+        repo.insert(&current_backend).await.unwrap();
+
+        let (model_rows, model_total) = repo
+            .page(
+                &RequestsFilter {
+                    provider: Some("model".into()),
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(model_total, 2);
+        assert!(model_rows
+            .iter()
+            .all(|row| !row.path.starts_with("chatgpt_backend_")));
+
+        let (codex_rows, codex_total) = repo
+            .page(
+                &RequestsFilter {
+                    provider: Some("codex".into()),
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(codex_total, 1);
+        assert_eq!(codex_rows[0].path, "/responses");
+
+        let (backend_rows, backend_total) = repo
+            .page(
+                &RequestsFilter {
+                    provider: Some("chatgpt_backend".into()),
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(backend_total, 2);
+        assert!(backend_rows
+            .iter()
+            .all(|row| row.path.starts_with("chatgpt_backend_")));
+
+        let (multi_rows, multi_total) = repo
+            .page(
+                &RequestsFilter {
+                    provider: Some("codex,anthropic".into()),
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(multi_total, 2);
+        assert_eq!(multi_rows.len(), 2);
     }
 
     #[tokio::test]
@@ -1346,6 +1528,7 @@ mod tests {
             model: None,
             upstream_model: None,
             upstream_transport: None,
+            profile_revision: None,
             reasoning_effort: None,
             service_tier: None,
             transport: None,
@@ -1394,6 +1577,7 @@ mod tests {
             model: None,
             upstream_model: None,
             upstream_transport: None,
+            profile_revision: None,
             reasoning_effort: None,
             service_tier: None,
             transport: None,
@@ -1629,6 +1813,7 @@ mod tests {
             model: Some(model.into()),
             upstream_model: None,
             upstream_transport: None,
+            profile_revision: None,
             reasoning_effort: None,
             service_tier: None,
             transport: Some("http".into()),
@@ -2377,6 +2562,7 @@ mod tests {
             model: Some("gpt-5.6-sol".into()),
             upstream_model: None,
             upstream_transport: None,
+            profile_revision: None,
             reasoning_effort: None,
             service_tier: None,
             transport: Some("http".into()),

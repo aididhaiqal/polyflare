@@ -69,7 +69,13 @@ import clsx from "clsx";
 import type { AccountView, RequestRowView, RequestsQueryParams } from "../lib/api";
 import { accountDisplayLabel } from "../lib/accountDisplay";
 import { compactNum, latency, relTime, tpsFmt } from "../lib/format";
-import { paginationWindow } from "../lib/pagination";
+import { clampPageOffset, paginationWindow } from "../lib/pagination";
+import {
+  BACKEND_TRAFFIC_PROVIDER,
+  MODEL_TRAFFIC_PROVIDER,
+  resolveProviderSelection,
+  serializeProviderSelection,
+} from "../lib/providerSelection";
 import { backendRequestDisplay } from "../lib/requestClassification";
 import { useAccounts, useProviders, useRequests } from "../lib/queries";
 import {
@@ -92,6 +98,7 @@ import {
 import { Card } from "../ui/Card";
 import { Col, Grid } from "../ui/Grid";
 import { AlertTriangle, ChevronDown, ChevronLeft, ChevronRight, Search } from "../ui/icons";
+import { ProviderMultiFilter } from "../ui/ProviderMultiFilter";
 import { ProviderTag } from "../ui/ProviderTag";
 import { RequestDetailPanel } from "../ui/RequestDetails";
 import { ServiceTierBadge } from "../ui/ServiceTierBadge";
@@ -286,7 +293,7 @@ export function Requests() {
 
   const range: RangeKey = isRangeKey(searchParams.get("range")) ? (searchParams.get("range") as RangeKey) : "24h";
   const accountFilter = searchParams.get("account") ?? ALL;
-  const providerFilter = searchParams.get("provider") ?? ALL;
+  const providerFilter = searchParams.get("provider") ?? MODEL_TRAFFIC_PROVIDER;
   const statusFilter = searchParams.get("status") ?? ALL;
   const modelFilter = searchParams.get("model") ?? ALL;
   const transportFilter = searchParams.get("transport") ?? ALL;
@@ -312,7 +319,7 @@ export function Requests() {
   const PARAM_DEFAULT: Record<string, string> = {
     range: "24h",
     account: ALL,
-    provider: ALL,
+    provider: MODEL_TRAFFIC_PROVIDER,
     status: ALL,
     model: ALL,
     transport: ALL,
@@ -346,8 +353,7 @@ export function Requests() {
     offset,
     request_id: requestIdFilter || undefined,
     account: accountFilter !== ALL ? accountFilter : undefined,
-    provider:
-      providerFilter !== ALL ? (providerFilter === "claude" ? "anthropic" : providerFilter) : undefined,
+    provider: providerFilter,
     status_class: statusFilter !== ALL ? statusFilter : undefined,
     model: modelFilter !== ALL ? modelFilter : undefined,
     transport: transportFilter !== ALL ? transportFilter : undefined,
@@ -371,6 +377,16 @@ export function Requests() {
   }, [latestRequestKey, refetch, requestStream.connected]);
 
   const [expandedId, setExpandedId] = useState<number | null>(null);
+  useEffect(() => {
+    if (!data) return;
+    const clampedOffset = clampPageOffset(offset, data.total, PAGE_SIZE);
+    if (clampedOffset === offset) return;
+    const params = new URLSearchParams(searchParams);
+    if (clampedOffset === 0) params.delete("offset");
+    else params.set("offset", String(clampedOffset));
+    setSearchParams(params, { replace: true });
+    setExpandedId(null);
+  }, [data, offset, searchParams, setSearchParams]);
 
   if (isLoading) return <RequestsSkeleton />;
 
@@ -404,7 +420,7 @@ export function Requests() {
 
   const filtersActive =
     accountFilter !== ALL ||
-    providerFilter !== ALL ||
+    providerFilter !== MODEL_TRAFFIC_PROVIDER ||
     statusFilter !== ALL ||
     modelFilter !== ALL ||
     transportFilter !== ALL ||
@@ -449,14 +465,36 @@ export function Requests() {
     ),
   ];
   const providerOptions = [
-    { value: ALL, label: "all" },
     { value: "codex", label: "codex" },
-    { value: "claude", label: "claude" },
-    { value: "chatgpt_backend", label: "backend" },
+    { value: "anthropic", label: "claude" },
     ...(providersQuery.data ?? [])
-      .filter((provider) => provider.slug !== "codex" && provider.slug !== "anthropic")
+      .filter(
+        (provider) =>
+          provider.slug !== "codex" &&
+          provider.slug !== "anthropic" &&
+          provider.slug !== BACKEND_TRAFFIC_PROVIDER,
+      )
       .map((provider) => ({ value: provider.slug, label: provider.display_name })),
+    { value: BACKEND_TRAFFIC_PROVIDER, label: "backend" },
   ];
+  const allProviderValues = providerOptions.map((option) => option.value);
+  const modelProviderValues = allProviderValues.filter(
+    (provider) => provider !== BACKEND_TRAFFIC_PROVIDER,
+  );
+  const selectedProviders = resolveProviderSelection(
+    searchParams.get("provider"),
+    modelProviderValues,
+    allProviderValues,
+  );
+
+  function setSelectedProviders(selected: string[]) {
+    const serialized = serializeProviderSelection(
+      selected,
+      modelProviderValues,
+      allProviderValues,
+    );
+    setParam("provider", serialized ?? MODEL_TRAFFIC_PROVIDER);
+  }
 
   const pageStart = data.total > 0 ? offset + 1 : 0;
   const pageEnd = offset + rows.length;
@@ -515,11 +553,11 @@ export function Requests() {
           onChange={(v) => setParam("account", v)}
           options={targetOptions}
         />
-        <FilterSelect
-          label="Provider"
-          value={providerFilter}
-          onChange={(v) => setParam("provider", v)}
+        <ProviderMultiFilter
           options={providerOptions}
+          selected={selectedProviders}
+          modelProviders={modelProviderValues}
+          onChange={setSelectedProviders}
         />
         <FilterSelect
           label="Status"

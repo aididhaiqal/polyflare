@@ -13,7 +13,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::ws::{Message as DownstreamMessage, WebSocket, WebSocketUpgrade};
@@ -33,6 +33,15 @@ const WEEKLY_MINUTES: i64 = 10_080;
 const FIVE_HOUR_MINUTES: i64 = 300;
 const SYNTHETIC_USAGE_LOG_PATH: &str = "chatgpt_backend_synthetic_wham/usage";
 const BACKEND_PROVIDER: &str = "chatgpt_backend";
+const BACKEND_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+type RemoteControlUpstream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type RemoteControlHandshake = (
+    RemoteControlUpstream,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
+);
 
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
@@ -76,6 +85,7 @@ fn record_gateway_request(
         model: None,
         upstream_model: None,
         upstream_transport: Some(transport.to_string()),
+        profile_revision: None,
         reasoning_effort: None,
         service_tier: None,
         transport: Some(transport.to_string()),
@@ -171,7 +181,12 @@ fn wham_usage_payload(
 async fn usage_route(state: Arc<AppState>, pool: Option<String>, headers: HeaderMap) -> Response {
     let started = Instant::now();
     let method = "GET";
-    let response = if !is_authenticated(&headers) {
+    let authenticated = if state.enforce_client_keys {
+        crate::auth::authenticate_client_key(&state, &headers).await
+    } else {
+        is_authenticated(&headers)
+    };
+    let response = if !authenticated {
         error_response(StatusCode::UNAUTHORIZED, "chatgpt_auth_required")
     } else {
         match state.account_cache.snapshots(&state.store).await {
@@ -346,12 +361,7 @@ fn to_downstream_message(message: UpstreamMessage) -> Option<DownstreamMessage> 
     }
 }
 
-async fn relay_remote_control(
-    downstream: WebSocket,
-    upstream: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-) {
+async fn relay_remote_control(downstream: WebSocket, upstream: RemoteControlUpstream) {
     let (mut downstream_tx, mut downstream_rx) = downstream.split();
     let (mut upstream_tx, mut upstream_rx) = upstream.split();
     loop {
@@ -383,6 +393,15 @@ async fn relay_remote_control(
             }
         }
     }
+}
+
+async fn connect_remote_control_with_timeout(
+    request: axum::http::Request<()>,
+    timeout: Duration,
+) -> Option<Result<RemoteControlHandshake, tokio_tungstenite::tungstenite::Error>> {
+    tokio::time::timeout(timeout, tokio_tungstenite::connect_async(request))
+        .await
+        .ok()
 }
 
 async fn remote_control_ws_route(
@@ -419,15 +438,20 @@ async fn remote_control_ws_route(
             request.headers_mut().append(name, value);
         }
     }
-    let (upstream, upstream_response) = match tokio_tungstenite::connect_async(request).await {
-        Ok(result) => result,
-        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+    let (upstream, upstream_response) = match connect_remote_control_with_timeout(
+        request,
+        REMOTE_CONTROL_HANDSHAKE_TIMEOUT,
+    )
+    .await
+    {
+        Some(Ok(result)) => result,
+        Some(Err(tokio_tungstenite::tungstenite::Error::Http(response))) => {
             let status = response.status();
             let response = error_response(status, "backend_forward_failed");
             record_gateway_request(&state, "WS", log_path, response.status(), started);
             return response;
         }
-        Err(_) => {
+        Some(Err(_)) | None => {
             let response = error_response(StatusCode::BAD_GATEWAY, "backend_forward_failed");
             record_gateway_request(&state, "WS", log_path, response.status(), started);
             return response;
@@ -539,6 +563,13 @@ fn normalized_route(path: &str) -> String {
     format!("chatgpt_backend_passthrough_{normalized}")
 }
 
+async fn send_with_header_timeout(
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+) -> Option<Result<reqwest::Response, reqwest::Error>> {
+    tokio::time::timeout(timeout, request.send()).await.ok()
+}
+
 async fn passthrough_route(state: Arc<AppState>, path: String, request: Request<Body>) -> Response {
     let started = Instant::now();
     let method = request.method().clone();
@@ -559,16 +590,18 @@ async fn passthrough_route(state: Arc<AppState>, path: String, request: Request<
         }
     };
     let (parts, body) = request.into_parts();
-    let upstream = state
-        .control_client
-        .request(method, target)
-        .headers(end_to_end_headers(&parts.headers))
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
-        .send()
-        .await;
+    let upstream = send_with_header_timeout(
+        state
+            .control_client
+            .request(method, target)
+            .headers(end_to_end_headers(&parts.headers))
+            .body(reqwest::Body::wrap_stream(body.into_data_stream())),
+        BACKEND_RESPONSE_HEADER_TIMEOUT,
+    )
+    .await;
     let response = match upstream {
-        Err(_) => error_response(StatusCode::BAD_GATEWAY, "backend_forward_failed"),
-        Ok(upstream) => {
+        None | Some(Err(_)) => error_response(StatusCode::BAD_GATEWAY, "backend_forward_failed"),
+        Some(Ok(upstream)) => {
             let status = upstream.status();
             let headers = end_to_end_headers(upstream.headers());
             let body = Body::from_stream(
@@ -658,5 +691,45 @@ mod tests {
             None
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn backend_http_header_wait_is_bounded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stalled = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let request = reqwest::Client::new().get(format!("http://{address}/stalled"));
+
+        let result = send_with_header_timeout(request, Duration::from_millis(50)).await;
+
+        assert!(
+            result.is_none(),
+            "stalled headers must hit the explicit bound"
+        );
+        stalled.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_control_websocket_handshake_is_bounded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stalled = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let request = format!("ws://{address}/stalled")
+            .into_client_request()
+            .unwrap();
+
+        let result = connect_remote_control_with_timeout(request, Duration::from_millis(50)).await;
+
+        assert!(
+            result.is_none(),
+            "stalled WebSocket handshakes must hit the explicit bound"
+        );
+        stalled.abort();
     }
 }

@@ -48,11 +48,19 @@ import { Link } from "react-router-dom";
 import type { LogEvent, LogLevel } from "../lib/api";
 import { useCapabilityFlags } from "../capabilities/CapabilitiesProvider";
 import { accountDisplayLabel } from "../lib/accountDisplay";
+import { logEventKey, logEventMatchesProviders } from "../lib/liveLogFiltering";
+import {
+  BACKEND_TRAFFIC_PROVIDER,
+  MODEL_TRAFFIC_PROVIDER,
+  resolveProviderSelection,
+  serializeProviderSelection,
+} from "../lib/providerSelection";
 import { useAccounts, useProviders } from "../lib/queries";
 import { useLogStream } from "../lib/useLogStream";
 import { ShieldedAccount } from "../privacy/ScreenShield";
 import { Card } from "../ui/Card";
 import { Col, Grid } from "../ui/Grid";
+import { ProviderMultiFilter } from "../ui/ProviderMultiFilter";
 import {
   ArrowDownToLine,
   Clock as ClockIcon,
@@ -121,51 +129,6 @@ function formatLogTs(tsMs: number): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
 }
 
-/** Mitigates a duplicate-on-reconnect gap in `useLogStream` (Task 2 — not modified here per the
- * brief's "use it, don't rewrite it"): `sse.rs::logs_stream_handler` sends the *entire current ring
- * buffer* as backfill on every fresh subscription, and `useLogStream.connect()` calls
- * `LogBus::subscribe()` again on EVERY reconnect (an explicit `resume()` after `pause()`, or its own
- * network-drop auto-reconnect) — but only ever appends to `lines`, never resets it first. Live-
- * verified: 3 events → Pause → 2 more published server-side while paused → Resume → the buffer held
- * 8 lines (the original 3 duplicated, plus the 5 real ones from the fresh backfill). This is a
- * genuine correctness gap in the hook, not a quirk of this page, but the brief scopes
- * `useLogStream.ts` out of this task — so instead of touching it, every render here first collapses
- * `stream.lines` down to one entry per distinct event. The key is every real content-free field
- * (never anything invented): two entries are "the same event" only if ts_ms/level/kind/message/
- * status/latency_ms/account/provider/model/subagent/request_id all match, which is true for a byte-for-byte
- * repeat backfill replay and false for any two genuinely different events (even ones a millisecond
- * apart). First occurrence wins, so chronological order is preserved. */
-function logEventKey(ev: LogEvent): string {
-  return [
-    ev.ts_ms,
-    ev.level,
-    ev.kind,
-    ev.message,
-    ev.status,
-    ev.latency_ms,
-    ev.account,
-    ev.target_kind,
-    ev.target_id,
-    ev.provider,
-    ev.model,
-    ev.subagent,
-    ev.request_id,
-    ev.session_key,
-  ].join("|");
-}
-
-function dedupeLogEvents(lines: LogEvent[]): LogEvent[] {
-  const seen = new Set<string>();
-  const out: LogEvent[] = [];
-  for (const ev of lines) {
-    const key = logEventKey(ev);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(ev);
-  }
-  return out;
-}
-
 /** Case-insensitive substring match over every real, renderable text-ish field on the event — the
  * page's one client-side "search" affordance. Not URL-synced (this is a live in-memory buffer, not
  * a server query — there is nothing to deep-link to). */
@@ -199,6 +162,7 @@ export function LiveLogs() {
 
   const [levelFilter, setLevelFilter] = useState<LevelFilter>("all");
   const [textFilter, setTextFilter] = useState("");
+  const [providerFilter, setProviderFilter] = useState(MODEL_TRAFFIC_PROVIDER);
   const [autoScroll, setAutoScroll] = useState(true);
   /** Tracks the user's own Pause/Resume choice — distinct from `stream.connected` (a paused stream
    * is also disconnected, but "paused" and "dropped mid-stream" must read differently to the user;
@@ -210,13 +174,35 @@ export function LiveLogs() {
   // Disabled state must agree in both directions — see the file-header comment.
   const disabled = !liveLogs || stream.disabled;
 
-  // De-duplicate first (see `dedupeLogEvents`'s doc comment — a `useLogStream` reconnect gap, not
-  // this page's own bug), THEN apply level/text filters on top of the deduplicated set.
+  // The shared stream hook removes reconnect-backfill replays before exposing `lines`, so every
+  // consumer sees the same bounded event history.
   const accountById = new Map(accounts.map((account) => [account.id, account]));
   const credentialLabelById = new Map(
     providers.flatMap((provider) =>
       provider.credentials.map((credential) => [credential.id, credential.label] as const),
     ),
+  );
+  const providerOptions = [
+    { value: "codex", label: "codex" },
+    { value: "anthropic", label: "claude" },
+    ...providers
+      .filter(
+        (provider) =>
+          provider.slug !== "codex" &&
+          provider.slug !== "anthropic" &&
+          provider.slug !== BACKEND_TRAFFIC_PROVIDER,
+      )
+      .map((provider) => ({ value: provider.slug, label: provider.display_name })),
+    { value: BACKEND_TRAFFIC_PROVIDER, label: "backend" },
+  ];
+  const allProviderValues = providerOptions.map((option) => option.value);
+  const modelProviderValues = allProviderValues.filter(
+    (provider) => provider !== BACKEND_TRAFFIC_PROVIDER,
+  );
+  const selectedProviders = resolveProviderSelection(
+    providerFilter,
+    modelProviderValues,
+    allProviderValues,
   );
   const targetLabel = (ev: LogEvent): string | undefined => {
     const targetId = ev.target_id ?? ev.account;
@@ -224,10 +210,11 @@ export function LiveLogs() {
     if (ev.target_kind === "credential") return credentialLabelById.get(targetId) ?? targetId;
     return accountDisplayLabel(accountById.get(targetId), targetId);
   };
-  const dedupedLines = dedupeLogEvents(stream.lines);
-  const visibleLines = dedupedLines.filter(
+  const displayLines = stream.lines.filter((ev) => ev.kind !== "request_finalized");
+  const visibleLines = displayLines.filter(
     (ev) =>
       (levelFilter === "all" || ev.level === levelFilter) &&
+      logEventMatchesProviders(ev, selectedProviders) &&
       matchesTextFilter(
         ev,
         textFilter,
@@ -303,6 +290,18 @@ export function LiveLogs() {
           {paused ? "Resume" : "Pause"}
         </button>
 
+        <ProviderMultiFilter
+          options={providerOptions}
+          selected={selectedProviders}
+          modelProviders={modelProviderValues}
+          onChange={(selected) =>
+            setProviderFilter(
+              serializeProviderSelection(selected, modelProviderValues, allProviderValues) ??
+                MODEL_TRAFFIC_PROVIDER,
+            )
+          }
+        />
+
         <button
           type="button"
           onClick={() => stream.clear()}
@@ -346,7 +345,7 @@ export function LiveLogs() {
             >
               {visibleLines.length === 0 ? (
                 <p className="px-3.5 py-2 text-fg opacity-50">
-                  {dedupedLines.length === 0
+                  {displayLines.length === 0
                     ? "Waiting for log events…"
                     : "No lines match the current filters."}
                 </p>
@@ -366,7 +365,7 @@ export function LiveLogs() {
         </Col>
       </Grid>
 
-      <Footer shown={visibleLines.length} total={dedupedLines.length} />
+      <Footer shown={visibleLines.length} total={displayLines.length} />
     </div>
   );
 }

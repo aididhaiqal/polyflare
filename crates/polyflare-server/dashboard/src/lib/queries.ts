@@ -17,6 +17,7 @@ import {
   deleteProvider,
   deleteProviderCredential,
   deleteProviderModel,
+  discoverProviderModels,
   patchAccount,
   patchKey,
   patchProviderCredentialEnabled,
@@ -360,17 +361,31 @@ export function useSyncProviderModels() {
   const qc = useQueryClient();
   const { toast } = useToast();
   return useMutation({
-    mutationFn: (id: string) => syncProviderModels(id),
+    mutationFn: (input: { providerId: string; modelIds: string[] }) =>
+      syncProviderModels(input.providerId, input.modelIds),
     onSuccess: (result) => {
       qc.invalidateQueries({ queryKey: queryKeys.providers });
       toast({
         title: `${result.imported} model${result.imported === 1 ? "" : "s"} imported`,
-        description: `${result.discovered} discovered · ${result.skipped_existing} already configured · ${result.skipped_conflicts} conflicts`,
+        description: `${result.selected} selected · ${result.skipped_existing} already configured · ${result.skipped_conflicts} conflicts`,
         variant: "success",
       });
     },
     onError: (e) =>
-      toast({ title: "Model discovery failed", description: mutationErrorText(e), variant: "error" }),
+      toast({ title: "Model import failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+export function useDiscoverProviderModels() {
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (id: string) => discoverProviderModels(id),
+    onError: (e) =>
+      toast({
+        title: "Model discovery failed",
+        description: mutationErrorText(e),
+        variant: "error",
+      }),
   });
 }
 

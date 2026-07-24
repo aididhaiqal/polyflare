@@ -204,18 +204,25 @@ concurrency limits, enabled state, health, and cooldown. Pre-stream `429` and `5
 rotate to another credential within the configured retry bound. Authentication failures mark the
 credential as requiring attention.
 
+The dashboard's initial **Add provider and credential** flow is two API operations with
+best-effort browser-side rollback: if credential creation fails, the dashboard attempts to delete
+the provider it just created. It is convenient for interactive onboarding, but it is not one
+server-side database transaction. Confirm the provider card after a network interruption before
+retrying setup.
+
 Each model maps a stable public model slug to an upstream model slug and can declare context size,
 output limit, tool/vision/search/reasoning capabilities, pricing, and whether it appears in Codex
 or generic OpenAI model discovery. Catalog visibility does not disable an explicitly addressed
 route.
 
-After adding at least one credential, **Sync** asks the provider's authenticated
+After adding at least one credential, **Discover** asks the provider's authenticated
 `GET {base_url}/models` endpoint for its current catalog. PolyFlare accepts both the OpenAI
-`data[].id` shape and the richer Codex `models[].slug` shape, imports only model slugs that are not
-already configured or reserved, and then merges the imported rows into PolyFlare's own `/models`
-and `/v1/models` responses. This is an operator-triggered snapshot, not a pass-through request on
-every client catalog read. Existing manual mappings always win and are never overwritten by a
-later sync.
+`data[].id` shape and the richer Codex `models[].slug` shape, then presents a searchable preview
+without changing the database. Select the models you want and press **Import**; an empty or omitted
+selection never imports the whole catalog. PolyFlare revalidates the selected IDs against a fresh
+provider response, imports only selected models that are not already configured or reserved, and
+then merges those rows into PolyFlare's own `/models` and `/v1/models` responses. Existing manual
+mappings always win and are never overwritten, deleted, or disabled by discovery.
 
 Rich Codex catalogs can supply context, capability, and reasoning metadata directly. A thin
 OpenAI catalog normally supplies only IDs, so PolyFlare uses conservative defaults and the model's
@@ -250,7 +257,8 @@ Add a credential using the Sakana API key, then add a model:
 | Display name | `Fugu Ultra` |
 | Context window | `1000000` |
 
-Alternatively, press **Sync** to import the models returned by Sakana's `/v1/models` endpoint.
+Alternatively, press **Discover**, select the models you need, and import them from Sakana's
+`/v1/models` endpoint.
 PolyFlare knows the documented Fugu effort profiles even when Sakana returns the thin OpenAI model
 list:
 
@@ -264,8 +272,55 @@ list:
 You can edit any imported row afterward. This Fugu convenience does not constrain other providers:
 unknown models remain importable and use metadata supplied by their catalog or your dashboard
 configuration. Use the provider's current documentation as the authority for the upstream model
-slug and capabilities. After saving or syncing, use **Test** on the provider card. A client can
+slug and capabilities. After saving or importing, use **Test** on the provider card. A client can
 then request `model = "fugu-ultra"` through the normal root `/responses` endpoint.
+
+### Example: OpenRouter
+
+Use the **OpenRouter preset** in **Dashboard → Providers → Add provider**, or enter:
+
+| Field | Value |
+|---|---|
+| Slug | `openrouter` |
+| Display name | `OpenRouter` |
+| Base URL | `https://openrouter.ai/api/v1` |
+| Stateless Responses | enabled |
+
+Add an OpenRouter API key, then press **Discover**. OpenRouter publishes hundreds of models, so
+PolyFlare never imports that catalog automatically. Search or filter by tools, vision, reasoning,
+or free variants; select only the models you intend to route and import that explicit selection.
+
+OpenRouter upstream IDs remain exact, including vendor paths and routing suffixes such as
+`anthropic/claude-sonnet-5` and `deepseek/deepseek-r1:free`. To prevent collisions with another
+provider, PolyFlare exposes a discovered vendor model under a provider-qualified public ID such as
+`openrouter/anthropic/claude-sonnet-5`, while forwarding the original upstream ID to OpenRouter.
+OpenRouter's catalog metadata supplies display name, context and output limits, tools, vision,
+reasoning efforts, and snapshot token pricing when those fields are present.
+
+OpenRouter's `/responses` API is currently beta and stateless. That matches PolyFlare's custom
+provider transport: PolyFlare materializes the request and removes `previous_response_id` before
+forwarding it. Validate each imported model with **Test** before depending on it for agentic tool
+work because OpenRouter model capabilities vary.
+
+### Model profiles
+
+A custom-provider model can have multiple PolyFlare-facing profiles that all route to the same
+upstream model. On the provider card, press **profile** beside a configured model, choose a new
+public name such as `openrouter/anthropic/claude-sonnet-5~reviewer`, and configure:
+
+- **None** leaves the client's instructions unchanged.
+- **Append** preserves the client's instructions and adds the profile overlay after a deterministic
+  separator. This is the recommended mode.
+- **Replace** discards the client's instructions and sends only the profile text. This is advanced:
+  replacing Codex's operating prompt can break tools, subagents, compaction, and protocol behavior.
+- Optional reasoning-effort and maximum-output overrides replace those request fields when the
+  profile is selected.
+
+The public profile name and exact upstream model are logged separately. Profiled requests also
+carry a short content-free revision hash so requests remain distinguishable after a profile edit;
+the instruction text itself is never written to request logs, live logs, metrics, or error bodies.
+Profiles guide model behavior but are not a security boundary. Enforce tool permissions, data
+access, and policy restrictions in code rather than relying on instructions.
 
 ## Model discovery
 
@@ -403,7 +458,9 @@ requires_openai_auth = true
 
 `chatgpt_base_url` is how stock codex-rs reads the Usage screen and `/status`; it is independent of
 the model-provider base URL. PolyFlare returns its capacity-weighted pool as the canonical Codex
-quota at `/backend-api/wham/usage`. Every other `/backend-api/*` request uses the client's existing
+quota at `/backend-api/wham/usage`. Synthetic usage is not a public status endpoint: it requires a
+valid PolyFlare client key when client-key enforcement is active, and otherwise requires an
+authenticated client request. Every other `/backend-api/*` request uses the client's existing
 ChatGPT authorization when **Settings → ChatGPT backend passthrough** is enabled. Passthrough is
 enabled by default; the setting is a live rollback control that can disable it without restarting
 PolyFlare. These requests go directly to the fixed ChatGPT backend without account selection or
@@ -614,7 +671,20 @@ cooldowns, client-key hashes, and request telemetry.
 OAuth tokens and custom-provider API keys are encrypted with XChaCha20-Poly1305 using a random
 nonce per value. Decrypted secret wrappers are zeroized on drop. The local encryption key is
 created once in the data directory and must be protected with the same care as the upstream
-credentials.
+credentials. On Unix, PolyFlare creates or tightens the key file to mode `0600`, opens it without
+following a final-component symlink, and rejects non-regular key paths.
+
+Custom-provider URLs use HTTPS unless the operator explicitly allows private hosts. With private
+hosts disabled, PolyFlare rejects loopback, private, link-local, and other non-public destinations
+both lexically and after DNS resolution. The validated address is pinned into the provider HTTP
+client, redirects are disabled, and the client is rebuilt and DNS is revalidated after five
+minutes. This limits DNS-rebinding exposure while still allowing legitimate provider address
+rotation. Enabling private hosts deliberately permits HTTP and internal destinations; use it only
+for infrastructure you control.
+
+Provider catalog responses, the number of discovered models, waits for upstream response headers,
+and captured upstream error bodies are bounded. Free-form upstream error text is not returned or
+recorded as operational telemetry.
 
 Conversation content is not written to the request log, continuity tables, metrics, or live log
 stream. Requests and streamed responses necessarily pass through process memory while being

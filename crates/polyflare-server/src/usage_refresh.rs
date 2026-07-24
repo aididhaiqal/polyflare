@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 
 use polyflare_core::AccountId;
-use polyflare_store::{Account, AccountRepo, PlainTokens, TokenCipher};
+use polyflare_store::{Account, AccountRepo, PlainTokens, StoreError, TokenCipher};
 
 use crate::app::AppState;
 use crate::runtime_state::RuntimeStates;
@@ -190,8 +190,31 @@ async fn refresh_account(
     if !resp.status().is_success() {
         return Ok(());
     }
-    let payload: UsagePayload = resp.json().await.unwrap_or_default();
-    let rl = payload.rate_limit.unwrap_or_default();
+    let payload: UsagePayload = resp.json().await?;
+    let rl = payload.rate_limit.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "usage response missing rate_limit",
+        )
+    })?;
+    if rl.primary_window.is_none() && rl.secondary_window.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "usage response contains no quota windows",
+        )
+        .into());
+    }
+    if [&rl.primary_window, &rl.secondary_window]
+        .into_iter()
+        .flatten()
+        .any(|window| window.used_percent.is_none())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "usage quota window missing used_percent",
+        )
+        .into());
+    }
     let now = unix_now();
 
     for (window, w) in [
@@ -289,6 +312,37 @@ fn evaluate_non_codex_health_tier(
     )
 }
 
+async fn flush_pending_cooldowns(
+    repo: &AccountRepo,
+    runtime: &RuntimeStates,
+) -> Result<(), StoreError> {
+    loop {
+        let pending = runtime.pending_cooldowns();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        for write in pending {
+            repo.record_routing_cooldown(
+                write.account_id.as_str(),
+                write.cooldown_until,
+                write.reason,
+                write.updated_at,
+            )
+            .await?;
+            runtime.finish_cooldown_persist(&write);
+        }
+    }
+}
+
+/// Persist every cooldown still coalesced in memory after the HTTP server has drained.
+///
+/// The regular worker remains the fast path during service. This explicit shutdown barrier closes
+/// the small window between a request recording a cooldown and its detached worker committing the
+/// SQLite upsert. Exact-snapshot completion preserves a newer value if one raced with the flush.
+pub async fn flush_cooldown_persistence(state: &AppState) -> Result<(), StoreError> {
+    flush_pending_cooldowns(&state.store.accounts(), &state.runtime).await
+}
+
 /// Spawn the background usage-refresh loop: every [`REFRESH_INTERVAL`], poll each Codex account.
 pub fn spawn_usage_refresh(state: Arc<AppState>) {
     let http = match reqwest::Client::builder()
@@ -301,13 +355,18 @@ pub fn spawn_usage_refresh(state: Arc<AppState>) {
             return;
         }
     };
-    let (cooldown_tx, mut cooldown_rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::runtime_state::RoutingCooldownWrite>();
-    state.runtime.register_cooldown_persistence(cooldown_tx);
+    let (cooldown_tx, mut cooldown_rx) = tokio::sync::mpsc::unbounded_channel::<AccountId>();
+    state
+        .runtime
+        .register_cooldown_persistence(cooldown_tx.clone());
     let cooldown_store = state.store.clone();
+    let cooldown_runtime = state.runtime.clone();
     tokio::spawn(async move {
-        while let Some(write) = cooldown_rx.recv().await {
-            if let Err(error) = cooldown_store
+        while let Some(account_id) = cooldown_rx.recv().await {
+            let Some(write) = cooldown_runtime.pending_cooldown(&account_id) else {
+                continue;
+            };
+            match cooldown_store
                 .accounts()
                 .record_routing_cooldown(
                     write.account_id.as_str(),
@@ -317,11 +376,24 @@ pub fn spawn_usage_refresh(state: Arc<AppState>) {
                 )
                 .await
             {
-                tracing::warn!(
-                    account_id = %write.account_id,
-                    error = %error,
-                    "could not persist restart-safe routing cooldown"
-                );
+                Ok(()) => {
+                    if cooldown_runtime.finish_cooldown_persist(&write)
+                        && cooldown_tx.send(account_id).is_err()
+                    {
+                        tracing::warn!("routing cooldown persistence worker is unavailable");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        account_id = %write.account_id,
+                        error = %error,
+                        "could not persist restart-safe routing cooldown; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    if cooldown_tx.send(account_id).is_err() {
+                        tracing::warn!("routing cooldown persistence worker is unavailable");
+                    }
+                }
             }
         }
     });
@@ -568,6 +640,65 @@ mod tests {
         assert_eq!(s.limit_window_seconds, Some(604800));
     }
 
+    #[tokio::test]
+    async fn successful_response_without_rate_limit_never_clears_an_existing_gate() {
+        async fn incomplete_usage() -> axum::Json<serde_json::Value> {
+            axum::Json(serde_json::json!({"plan_type": "pro"}))
+        }
+
+        let app = axum::Router::new().route(
+            "/backend-api/wham/usage",
+            axum::routing::get(incomplete_usage),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = polyflare_store::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[21u8; 32]).unwrap();
+        let repo = store.accounts();
+        let gated = account("codex-gated", "codex", "quota_exceeded");
+        repo.insert(
+            &gated,
+            &PlainTokens {
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                id_token: "id".into(),
+            },
+            &cipher,
+        )
+        .await
+        .unwrap();
+
+        let result = refresh_account(
+            &repo,
+            &cipher,
+            &reqwest::Client::new(),
+            &format!("http://{address}/backend-api/codex"),
+            &gated,
+            &RuntimeStates::new(),
+            true,
+            &crate::log_bus::LogBus::new(8),
+            &crate::observability::HealthTierMetrics::new(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a structurally incomplete 200 response must be rejected"
+        );
+        assert_eq!(
+            repo.get("codex-gated").await.unwrap().unwrap().status,
+            "quota_exceeded",
+            "missing quota evidence must not reactivate the account"
+        );
+    }
+
     // --- B8 review Finding 1: non-codex accounts must not be stranded in DRAINING ---
 
     fn account(id: &str, provider: &str, status: &str) -> Account {
@@ -592,6 +723,45 @@ mod tests {
             provider: provider.to_string(),
             pool: None,
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_flush_persists_a_queued_cooldown_before_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = polyflare_store::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let repo = store.accounts();
+        let cipher = TokenCipher::from_key_bytes(&[31u8; 32]).unwrap();
+        repo.insert(
+            &account("acct-cooldown", "codex", "active"),
+            &PlainTokens {
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                id_token: "id".into(),
+            },
+            &cipher,
+        )
+        .await
+        .unwrap();
+
+        let runtime = RuntimeStates::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.register_cooldown_persistence(tx);
+        runtime.record_quota_exceeded(&AccountId::from("acct-cooldown"), 1_000);
+
+        flush_pending_cooldowns(&repo, &runtime).await.unwrap();
+
+        assert_eq!(
+            repo.routing_cooldown("acct-cooldown").await.unwrap(),
+            Some(1_000 + crate::runtime_state::QUOTA_EXCEEDED_COOLDOWN_SECS)
+        );
+        assert!(
+            runtime
+                .pending_cooldown(&AccountId::from("acct-cooldown"))
+                .is_none(),
+            "a successful shutdown flush must clear the exact pending snapshot"
+        );
     }
 
     /// THE regression this finding fixes: a non-codex account driven to DRAINING purely by the

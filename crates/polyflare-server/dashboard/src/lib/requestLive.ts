@@ -22,7 +22,7 @@ export function requestLiveLabel({
 export function latestRequestEventKey(lines: LogEvent[]): string | null {
   for (let i = lines.length - 1; i >= 0; i -= 1) {
     const event = lines[i];
-    if (event.kind !== "request") continue;
+    if (event.kind !== "request" && event.kind !== "request_finalized") continue;
     return [
       event.request_id ?? "",
       event.session_key ?? "",

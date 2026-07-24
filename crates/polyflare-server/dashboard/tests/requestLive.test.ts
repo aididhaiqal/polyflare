@@ -29,3 +29,18 @@ test("latest request event ignores unrelated operational log events", () => {
     null,
   );
 });
+
+test("durable request-finalization events trigger a second SSE refresh", () => {
+  assert.equal(
+    latestRequestEventKey([
+      {
+        ts_ms: 12,
+        level: "info",
+        kind: "request_finalized",
+        message: "request telemetry finalized",
+        request_id: "req-final",
+      },
+    ]),
+    "req-final||12|||",
+  );
+});

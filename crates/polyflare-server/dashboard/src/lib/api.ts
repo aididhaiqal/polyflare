@@ -278,6 +278,7 @@ export interface RequestRowView {
   model: string | null;
   upstream_model: string | null;
   upstream_transport: string | null;
+  profile_revision: string | null;
   reasoning_effort: string | null;
   service_tier: string | null;
   transport: string | null;
@@ -634,6 +635,12 @@ export interface ProviderModelView {
   supports_web_search: boolean;
   supports_reasoning_summaries: boolean;
   reasoning_levels: string[];
+  instruction_mode: "none" | "append" | "replace";
+  instruction_text: string;
+  request_overrides: {
+    reasoning_effort?: string;
+    max_output_tokens?: number;
+  };
   input_per_million: number | null;
   cached_input_per_million: number | null;
   output_per_million: number | null;
@@ -676,12 +683,19 @@ export interface CreateProviderModelBody {
   upstream_model: string;
   display_name: string;
   context_window?: number;
+  max_output_tokens?: number;
   supports_tools?: boolean;
   supports_vision?: boolean;
   supports_parallel_tool_calls?: boolean;
   supports_web_search?: boolean;
   supports_reasoning_summaries?: boolean;
   reasoning_levels?: string[];
+  instruction_mode?: "none" | "append" | "replace";
+  instruction_text?: string;
+  request_overrides?: {
+    reasoning_effort?: string;
+    max_output_tokens?: number;
+  };
   input_per_million?: number;
   cached_input_per_million?: number;
   output_per_million?: number;
@@ -697,9 +711,34 @@ export type UpdateProviderModelBody = Partial<
 
 export interface ProviderModelSyncResult {
   discovered: number;
+  selected: number;
   imported: number;
   skipped_existing: number;
   skipped_conflicts: number;
+}
+
+export interface ProviderDiscoveredModelView {
+  upstream_model: string;
+  suggested_public_model: string;
+  display_name: string;
+  context_window: number | null;
+  max_output_tokens: number | null;
+  supports_tools: boolean;
+  supports_vision: boolean;
+  supports_parallel_tool_calls: boolean;
+  supports_web_search: boolean;
+  supports_reasoning: boolean;
+  supports_reasoning_summaries: boolean;
+  reasoning_levels: string[];
+  input_per_million: number | null;
+  cached_input_per_million: number | null;
+  output_per_million: number | null;
+  state: "available" | "configured" | "conflict";
+}
+
+export interface ProviderModelDiscoveryResult {
+  discovered: number;
+  models: ProviderDiscoveredModelView[];
 }
 
 export interface ProviderTestResult {
@@ -855,10 +894,24 @@ export function createProviderModel(
   });
 }
 
-export function syncProviderModels(id: string): Promise<ProviderModelSyncResult> {
+export function discoverProviderModels(id: string): Promise<ProviderModelDiscoveryResult> {
+  return fetchJson<ProviderModelDiscoveryResult>(
+    `/api/providers/${encodeURIComponent(id)}/models/discover`,
+    { method: "POST" },
+  );
+}
+
+export function syncProviderModels(
+  id: string,
+  modelIds: string[],
+): Promise<ProviderModelSyncResult> {
   return fetchJson<ProviderModelSyncResult>(
     `/api/providers/${encodeURIComponent(id)}/models/sync`,
-    { method: "POST" },
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model_ids: modelIds }),
+    },
   );
 }
 

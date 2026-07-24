@@ -13,7 +13,10 @@ pub mod request_log_repo;
 pub mod settings_repo;
 pub mod store;
 
-pub use account::{Account, AccountRepo, EncryptedTokens, PlainTokens, UsageSnapshot, WindowUsage};
+pub use account::{
+    Account, AccountRepo, AccountSettingsUpdate, EncryptedTokens, PlainTokens, UsageSnapshot,
+    WindowUsage,
+};
 pub use api_key_repo::{ApiKeyRepo, ApiKeyRow};
 pub use continuity_repo::{ContinuityRepo, SessionRow};
 pub use crypto::TokenCipher;

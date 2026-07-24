@@ -1,0 +1,2 @@
+# Vite preserves intentional whitespace inside dependency template literals in generated bundles.
+crates/polyflare-server/dashboard/dist/assets/*.js whitespace=-trailing-space

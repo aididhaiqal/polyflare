@@ -1,6 +1,7 @@
 //! Account model + repository. Durable metadata lives in `Account`; the three OAuth tokens are
 //! stored ONLY as XChaCha20-Poly1305 ciphertext and decrypted on demand.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -97,6 +98,43 @@ pub struct WindowUsage {
 pub struct UsageSnapshot {
     pub primary: Option<WindowUsage>,
     pub secondary: Option<WindowUsage>,
+}
+
+/// One decrypted access token for short-lived inspection. Its bytes are wiped on drop and its
+/// debug representation is always redacted.
+#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+pub struct PlainAccessToken(String);
+
+impl PlainAccessToken {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PlainAccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PlainAccessToken(***)")
+    }
+}
+
+/// One encrypted access-token blob returned by the batched dashboard query.
+pub struct EncryptedAccessToken(Vec<u8>);
+
+impl EncryptedAccessToken {
+    pub fn decrypt(&self, cipher: &TokenCipher) -> Result<PlainAccessToken, StoreError> {
+        cipher.decrypt(&self.0).map(PlainAccessToken)
+    }
+}
+
+/// Complete set of optional, non-secret account settings accepted by one dashboard PATCH.
+/// `pools: Some([])` clears every membership; `alias: Some(None)` clears the alias.
+#[derive(Debug, Default)]
+pub struct AccountSettingsUpdate {
+    pub pools: Option<Vec<String>>,
+    pub routing_policy: Option<String>,
+    pub status: Option<String>,
+    pub security_work_authorized: Option<bool>,
+    pub alias: Option<Option<String>>,
 }
 
 /// Full column list for `SELECT`ing an `Account` (must match the `FromRow` field order/names).
@@ -403,6 +441,20 @@ impl AccountRepo {
         .await?)
     }
 
+    /// All account-pool memberships in one bounded query, grouped by account id.
+    pub async fn list_all_pools(&self) -> Result<HashMap<String, Vec<String>>, StoreError> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT account_id, pool FROM account_pool_memberships ORDER BY account_id, pool",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut pools = HashMap::<String, Vec<String>>::new();
+        for (account_id, pool) in rows {
+            pools.entry(account_id).or_default().push(pool);
+        }
+        Ok(pools)
+    }
+
     /// Persist a restart-safe capacity cooldown. The later deadline wins so a stale/short signal
     /// can never shorten a stronger gate already recorded for the account.
     pub async fn record_routing_cooldown(
@@ -496,6 +548,79 @@ impl AccountRepo {
         tx.commit().await?;
         self.bump_generation();
         Ok(())
+    }
+
+    /// Apply every field from one dashboard account PATCH in a single transaction. A failure in a
+    /// later field rolls back earlier pool/policy/status/capability changes, and the account-cache
+    /// generation advances only after the complete patch commits.
+    pub async fn update_settings_atomic(
+        &self,
+        id: &str,
+        update: AccountSettingsUpdate,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let exists =
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?)")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !exists {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        if let Some(pools) = update.pools {
+            sqlx::query("UPDATE accounts SET pool = ? WHERE id = ?")
+                .bind(pools.first().map(String::as_str))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM account_pool_memberships WHERE account_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            for pool in pools {
+                sqlx::query(
+                    "INSERT INTO account_pool_memberships (account_id, pool) VALUES (?, ?)",
+                )
+                .bind(id)
+                .bind(pool)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        if let Some(routing_policy) = update.routing_policy {
+            sqlx::query("UPDATE accounts SET routing_policy = ? WHERE id = ?")
+                .bind(routing_policy)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let Some(status) = update.status {
+            sqlx::query("UPDATE accounts SET status = ? WHERE id = ?")
+                .bind(status)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let Some(authorized) = update.security_work_authorized {
+            sqlx::query("UPDATE accounts SET security_work_authorized = ? WHERE id = ?")
+                .bind(authorized)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let Some(alias) = update.alias {
+            sqlx::query("UPDATE accounts SET alias = ? WHERE id = ?")
+                .bind(alias)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        self.bump_generation();
+        Ok(true)
     }
 
     /// Assign one routing-group slug to all requested accounts in a single transaction. Returns
@@ -767,12 +892,64 @@ impl AccountRepo {
         }
     }
 
+    /// Fetch every account's encrypted access-token blob in one SELECT for the dashboard's
+    /// token-expiry view. Refresh and ID tokens are deliberately not selected; callers decrypt
+    /// and zeroize one account at a time rather than retaining a fleet of plaintext tokens.
+    pub async fn list_encrypted_access_tokens(
+        &self,
+    ) -> Result<HashMap<String, EncryptedAccessToken>, StoreError> {
+        let rows = sqlx::query_as::<_, (String, Vec<u8>)>(
+            "SELECT id, access_token_enc FROM accounts ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, encrypted)| (id, EncryptedAccessToken(encrypted)))
+            .collect())
+    }
+
     /// The most-recent `usage_history` row for each window ("primary"/"secondary") of an account.
     pub async fn latest_usage(&self, account_id: &str) -> Result<UsageSnapshot, StoreError> {
         Ok(UsageSnapshot {
             primary: self.latest_window_usage(account_id, "primary").await?,
             secondary: self.latest_window_usage(account_id, "secondary").await?,
         })
+    }
+
+    /// Latest primary/secondary usage for every account in one query.
+    pub async fn latest_usage_all(&self) -> Result<HashMap<String, UsageSnapshot>, StoreError> {
+        let rows = sqlx::query_as::<_, (String, String, f64, Option<i64>, Option<i64>, i64)>(
+            "SELECT account_id, \"window\", used_percent, reset_at, window_minutes, recorded_at \
+             FROM ( \
+               SELECT account_id, \"window\", used_percent, reset_at, window_minutes, recorded_at, \
+                      ROW_NUMBER() OVER ( \
+                        PARTITION BY account_id, \"window\" \
+                        ORDER BY recorded_at DESC, rowid DESC \
+                      ) AS rank \
+               FROM usage_history \
+               WHERE \"window\" IN ('primary', 'secondary') \
+             ) WHERE rank = 1 \
+             ORDER BY account_id, \"window\"",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut snapshots = HashMap::<String, UsageSnapshot>::new();
+        for (account_id, window, used_percent, reset_at, window_minutes, recorded_at) in rows {
+            let usage = WindowUsage {
+                used_percent,
+                reset_at,
+                window_minutes,
+                recorded_at,
+            };
+            let snapshot = snapshots.entry(account_id).or_default();
+            match window.as_str() {
+                "primary" => snapshot.primary = Some(usage),
+                "secondary" => snapshot.secondary = Some(usage),
+                _ => {}
+            }
+        }
+        Ok(snapshots)
     }
 
     /// The most-recent usage row for a single window, or `None` if the account has none.
@@ -1404,6 +1581,7 @@ mod tests {
             model: None,
             upstream_model: None,
             upstream_transport: None,
+            profile_revision: None,
             reasoning_effort: None,
             service_tier: None,
             transport: None,

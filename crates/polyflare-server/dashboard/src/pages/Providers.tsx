@@ -1,15 +1,30 @@
 import {
+  useEffect,
   useState,
   type Dispatch,
   type FormEvent,
   type SetStateAction,
 } from "react";
 
-import type { CreateProviderModelBody, ProviderModelView } from "../lib/api";
+import type {
+  CreateProviderModelBody,
+  ProviderModelDiscoveryResult,
+  ProviderModelView,
+} from "../lib/api";
+import {
+  filterDiscoveredModels,
+  selectableDiscoveredModelIds,
+  type DiscoveryCapabilityFilter,
+} from "../lib/providerDiscovery";
+import {
+  isProviderModelProfile,
+  providerProfileTemplate,
+} from "../lib/providerProfiles";
 import {
   useAddProviderCredential,
   useAddProviderModel,
   useCreateProviderBundle,
+  useDiscoverProviderModels,
   useProviderAction,
   useProviders,
   useSyncProviderModels,
@@ -17,7 +32,7 @@ import {
   useUpdateProviderModel,
 } from "../lib/queries";
 import { Card } from "../ui/Card";
-import { AlertTriangle, KeyRound, Plus, Route, Trash2 } from "../ui/icons";
+import { AlertTriangle, Check, KeyRound, Plus, Route, Search, Trash2, X } from "../ui/icons";
 
 const INPUT =
   "h-9 w-full rounded-lg border border-border bg-bg/65 px-3 text-[11px] text-fg outline-none transition focus:border-accent/60";
@@ -29,6 +44,7 @@ export function Providers() {
   const addModel = useAddProviderModel();
   const action = useProviderAction();
   const testConnection = useTestProvider();
+  const discoverModels = useDiscoverProviderModels();
   const syncModels = useSyncProviderModels();
   const updateModel = useUpdateProviderModel();
   const [open, setOpen] = useState(false);
@@ -36,6 +52,12 @@ export function Providers() {
     providerId: string;
     kind: "credential" | "model";
     model?: ProviderModelView;
+    template?: ProviderModelView;
+  } | null>(null);
+  const [discoveryTarget, setDiscoveryTarget] = useState<{
+    providerId: string;
+    providerName: string;
+    result: ProviderModelDiscoveryResult;
   } | null>(null);
 
   return (
@@ -217,11 +239,20 @@ export function Providers() {
                     <span className="flex items-center gap-2">
                       <button
                         type="button"
-                        disabled={syncModels.isPending || !provider.credentials.length}
-                        onClick={() => syncModels.mutate(provider.id)}
+                        disabled={discoverModels.isPending || !provider.credentials.length}
+                        onClick={() =>
+                          discoverModels.mutate(provider.id, {
+                            onSuccess: (result) =>
+                              setDiscoveryTarget({
+                                providerId: provider.id,
+                                providerName: provider.display_name,
+                                result,
+                              }),
+                          })
+                        }
                         className="text-[9px] font-semibold text-signal disabled:opacity-35"
                       >
-                        Sync
+                        {discoverModels.isPending ? "Discovering…" : "Discover"}
                       </button>
                       <button
                         type="button"
@@ -243,6 +274,19 @@ export function Providers() {
                             {model.context_window
                               ? `${Math.round(model.context_window / 1000)}k ctx`
                               : "context unknown"}
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setAddTarget({
+                                  providerId: provider.id,
+                                  kind: "model",
+                                  template: model,
+                                })
+                              }
+                              className="text-signal opacity-100"
+                            >
+                              profile
+                            </button>
                             <button
                               type="button"
                               onClick={() =>
@@ -295,6 +339,11 @@ export function Providers() {
                             : "not advertised"}
                           {model.supports_reasoning_summaries ? " · summaries" : ""}
                         </div>
+                        {isProviderModelProfile(model) && (
+                          <div className="mt-1 inline-flex rounded border border-signal/25 bg-signal/[0.07] px-1.5 py-0.5 text-[8px] font-semibold text-signal">
+                            profile · {model.instruction_mode}
+                          </div>
+                        )}
                         <div className="mt-1 flex items-center gap-1">
                           <span className="mr-1 text-[8px] uppercase tracking-wide text-fg opacity-35">
                             Discoverable
@@ -345,6 +394,31 @@ export function Providers() {
                   </div>
                 </section>
               </div>
+              {discoveryTarget?.providerId === provider.id && (
+                <ModelDiscoveryPanel
+                  key={`${provider.id}-${discoveryTarget.result.discovered}`}
+                  providerName={discoveryTarget.providerName}
+                  result={discoveryTarget.result}
+                  importing={syncModels.isPending}
+                  onClose={() => setDiscoveryTarget(null)}
+                  onRefresh={() =>
+                    discoverModels.mutate(provider.id, {
+                      onSuccess: (result) =>
+                        setDiscoveryTarget({
+                          providerId: provider.id,
+                          providerName: provider.display_name,
+                          result,
+                        }),
+                    })
+                  }
+                  onImport={(modelIds) =>
+                    syncModels.mutate(
+                      { providerId: provider.id, modelIds },
+                      { onSuccess: () => setDiscoveryTarget(null) },
+                    )
+                  }
+                />
+              )}
               {addTarget?.providerId === provider.id && addTarget.kind === "credential" && (
                 <CredentialForm
                   pending={addCredential.isPending}
@@ -359,7 +433,9 @@ export function Providers() {
               )}
               {addTarget?.providerId === provider.id && addTarget.kind === "model" && (
                 <ModelForm
+                  key={`${addTarget.model?.id ?? "new"}-${addTarget.template?.id ?? "blank"}`}
                   initial={addTarget.model}
+                  template={addTarget.template}
                   pending={addModel.isPending || updateModel.isPending}
                   onCancel={() => setAddTarget(null)}
                   onSubmit={(model) =>
@@ -371,12 +447,16 @@ export function Providers() {
                               upstream_model: model.upstream_model,
                               display_name: model.display_name,
                               context_window: model.context_window,
+                              max_output_tokens: model.max_output_tokens,
                               supports_tools: model.supports_tools,
                               supports_vision: model.supports_vision,
                               supports_parallel_tool_calls: model.supports_parallel_tool_calls,
                               supports_web_search: model.supports_web_search,
                               supports_reasoning_summaries: model.supports_reasoning_summaries,
                               reasoning_levels: model.reasoning_levels,
+                              instruction_mode: model.instruction_mode,
+                              instruction_text: model.instruction_text,
+                              request_overrides: model.request_overrides,
                               visible_in_codex: model.visible_in_codex,
                               visible_in_openai: model.visible_in_openai,
                             },
@@ -403,6 +483,232 @@ export function Providers() {
         </Card>
       )}
     </div>
+  );
+}
+
+const DISCOVERY_FILTERS: Array<{
+  value: DiscoveryCapabilityFilter;
+  label: string;
+}> = [
+  { value: "all", label: "All" },
+  { value: "tools", label: "Tools" },
+  { value: "vision", label: "Vision" },
+  { value: "reasoning", label: "Reasoning" },
+  { value: "free", label: "Free" },
+];
+
+function ModelDiscoveryPanel({
+  providerName,
+  result,
+  importing,
+  onClose,
+  onRefresh,
+  onImport,
+}: {
+  providerName: string;
+  result: ProviderModelDiscoveryResult;
+  importing: boolean;
+  onClose: () => void;
+  onRefresh: () => void;
+  onImport: (modelIds: string[]) => void;
+}) {
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState<DiscoveryCapabilityFilter>("all");
+  const [selected, setSelected] = useState<string[]>([]);
+  useEffect(() => setSelected([]), [result]);
+  const selectedSet = new Set(selected);
+  const visible = filterDiscoveredModels(result.models, search, filter);
+  const selectableVisible = selectableDiscoveredModelIds(visible);
+  const allVisibleSelected =
+    selectableVisible.length > 0 &&
+    selectableVisible.every((modelId) => selectedSet.has(modelId));
+
+  function toggle(modelId: string) {
+    setSelected((current) =>
+      current.includes(modelId)
+        ? current.filter((value) => value !== modelId)
+        : [...current, modelId],
+    );
+  }
+
+  return (
+    <section className="rounded-xl border border-signal/30 bg-bg/55 p-3.5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-[11px] font-semibold text-fg">Discover from {providerName}</div>
+          <p className="mt-0.5 text-[9.5px] text-fg opacity-50">
+            Preview only · nothing is added until you import an explicit selection
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onRefresh}
+            className="text-[9px] font-semibold text-signal"
+          >
+            Refresh
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close model discovery"
+            className="text-fg opacity-45 hover:opacity-80"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </div>
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <label className="flex min-w-[210px] flex-1 items-center gap-2 rounded-lg border border-border bg-card px-2.5">
+          <Search className="h-3.5 w-3.5 shrink-0 text-fg opacity-40" />
+          <input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Search model or vendor"
+            className="h-8 min-w-0 flex-1 bg-transparent text-[10.5px] text-fg outline-none"
+          />
+        </label>
+        <div className="flex overflow-hidden rounded-lg border border-border bg-card">
+          {DISCOVERY_FILTERS.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              onClick={() => setFilter(option.value)}
+              className={`px-2.5 py-2 text-[9px] font-semibold ${
+                filter === option.value
+                  ? "bg-signal/15 text-signal"
+                  : "text-fg opacity-50 hover:opacity-80"
+              }`}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[9px] text-fg opacity-55">
+        <span>
+          {visible.length} shown · {result.discovered} discovered · {selected.length} selected
+        </span>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            disabled={selectableVisible.length === 0}
+            onClick={() =>
+              setSelected((current) => {
+                if (allVisibleSelected) {
+                  const visibleSet = new Set(selectableVisible);
+                  return current.filter((modelId) => !visibleSet.has(modelId));
+                }
+                return [...new Set([...current, ...selectableVisible])];
+              })
+            }
+            className="font-semibold text-accent disabled:opacity-30"
+          >
+            {allVisibleSelected ? "Clear visible" : "Select visible"}
+          </button>
+          {selected.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setSelected([])}
+              className="font-semibold text-fg opacity-70"
+            >
+              Clear all
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-2 max-h-[360px] overflow-y-auto rounded-lg border border-border/70 bg-card/60">
+        {visible.map((model) => {
+          const selectable = model.state === "available";
+          const checked = selectedSet.has(model.upstream_model);
+          return (
+            <button
+              key={model.upstream_model}
+              type="button"
+              disabled={!selectable}
+              onClick={() => toggle(model.upstream_model)}
+              className="flex w-full items-start gap-2.5 border-b border-border/45 px-3 py-2.5 text-left last:border-0 hover:bg-muted/45 disabled:cursor-default"
+            >
+              <span
+                className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border ${
+                  checked ? "border-accent bg-accent text-white" : "border-border"
+                } ${selectable ? "" : "opacity-25"}`}
+              >
+                {checked && <Check className="h-3 w-3" strokeWidth={2.5} />}
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="flex flex-wrap items-center gap-1.5">
+                  <span className="truncate font-mono text-[10px] text-fg">
+                    {model.upstream_model}
+                  </span>
+                  <span
+                    className={`rounded px-1.5 py-0.5 text-[7.5px] font-bold uppercase ${
+                      model.state === "available"
+                        ? "bg-success/12 text-success"
+                        : model.state === "configured"
+                          ? "bg-accent/12 text-accent"
+                          : "bg-warn/12 text-warn"
+                    }`}
+                  >
+                    {model.state}
+                  </span>
+                </span>
+                <span className="mt-0.5 block truncate text-[9px] text-fg opacity-55">
+                  {model.display_name}
+                </span>
+                <span className="mt-1 flex flex-wrap gap-1 text-[7.5px] text-fg opacity-45">
+                  {model.context_window && (
+                    <span>{Math.round(model.context_window / 1000)}k context</span>
+                  )}
+                  {model.supports_tools && <span>· tools</span>}
+                  {model.supports_vision && <span>· vision</span>}
+                  {model.supports_reasoning && (
+                    <span>
+                      ·{" "}
+                      {model.reasoning_levels.length > 0
+                        ? model.reasoning_levels.join("/")
+                        : "reasoning"}
+                    </span>
+                  )}
+                  {model.input_per_million !== null && (
+                    <span>· ${model.input_per_million.toFixed(2)}/M input</span>
+                  )}
+                </span>
+                {model.suggested_public_model !== model.upstream_model && (
+                  <span className="mt-1 block truncate font-mono text-[7.5px] text-fg opacity-35">
+                    Polyflare model: {model.suggested_public_model}
+                  </span>
+                )}
+              </span>
+            </button>
+          );
+        })}
+        {visible.length === 0 && (
+          <div className="px-3 py-8 text-center text-[10px] text-fg opacity-40">
+            No discovered models match these filters.
+          </div>
+        )}
+      </div>
+
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+        <p className="text-[8.5px] text-fg opacity-45">
+          Configured and conflicting models are never included in bulk selection.
+        </p>
+        <button
+          type="button"
+          disabled={selected.length === 0 || importing}
+          onClick={() => onImport(selected)}
+          className="rounded-lg bg-accent px-3 py-2 text-[10px] font-semibold text-white disabled:opacity-35"
+        >
+          {importing
+            ? "Importing…"
+            : `Import ${selected.length} model${selected.length === 1 ? "" : "s"}`}
+        </button>
+      </div>
+    </section>
   );
 }
 
@@ -470,39 +776,63 @@ function CredentialForm({
 
 function ModelForm({
   initial,
+  template,
   pending,
   onSubmit,
   onCancel,
 }: {
   initial?: ProviderModelView;
+  template?: ProviderModelView;
   pending: boolean;
   onSubmit: (model: CreateProviderModelBody) => void;
   onCancel: () => void;
 }) {
-  const [publicModel, setPublicModel] = useState(initial?.public_model ?? "");
-  const [upstreamModel, setUpstreamModel] = useState(initial?.upstream_model ?? "");
-  const [displayName, setDisplayName] = useState(initial?.display_name ?? "");
+  const source = initial ?? template;
+  const templateDefaults = template ? providerProfileTemplate(template) : null;
+  const [publicModel, setPublicModel] = useState(
+    initial?.public_model ?? templateDefaults?.publicModel ?? "",
+  );
+  const [upstreamModel, setUpstreamModel] = useState(source?.upstream_model ?? "");
+  const [displayName, setDisplayName] = useState(
+    initial?.display_name ?? templateDefaults?.displayName ?? "",
+  );
   const [contextWindow, setContextWindow] = useState(
-    initial?.context_window?.toString() ?? "",
+    source?.context_window?.toString() ?? "",
+  );
+  const [maxOutputTokens, setMaxOutputTokens] = useState(
+    source?.max_output_tokens?.toString() ?? "",
   );
   const [reasoningLevels, setReasoningLevels] = useState(
-    initial?.reasoning_levels.join(",") ?? "",
+    source?.reasoning_levels.join(",") ?? "",
   );
-  const [supportsTools, setSupportsTools] = useState(initial?.supports_tools ?? true);
-  const [supportsVision, setSupportsVision] = useState(initial?.supports_vision ?? false);
+  const [supportsTools, setSupportsTools] = useState(source?.supports_tools ?? true);
+  const [supportsVision, setSupportsVision] = useState(source?.supports_vision ?? false);
   const [supportsParallel, setSupportsParallel] = useState(
-    initial?.supports_parallel_tool_calls ?? true,
+    source?.supports_parallel_tool_calls ?? true,
   );
   const [supportsSearch, setSupportsSearch] = useState(
-    initial?.supports_web_search ?? false,
+    source?.supports_web_search ?? false,
   );
   const [supportsSummaries, setSupportsSummaries] = useState(
-    initial?.supports_reasoning_summaries ?? false,
+    source?.supports_reasoning_summaries ?? false,
   );
-  const [visibleInCodex, setVisibleInCodex] = useState(initial?.visible_in_codex ?? true);
+  const [instructionMode, setInstructionMode] = useState<"none" | "append" | "replace">(
+    initial?.instruction_mode ?? templateDefaults?.instructionMode ?? "none",
+  );
+  const [instructionText, setInstructionText] = useState(initial?.instruction_text ?? "");
+  const [overrideEffort, setOverrideEffort] = useState(
+    initial?.request_overrides.reasoning_effort ?? "",
+  );
+  const [overrideMaxOutput, setOverrideMaxOutput] = useState(
+    initial?.request_overrides.max_output_tokens?.toString() ?? "",
+  );
+  const [visibleInCodex, setVisibleInCodex] = useState(source?.visible_in_codex ?? true);
   const [visibleInOpenAi, setVisibleInOpenAi] = useState(
-    initial?.visible_in_openai ?? true,
+    source?.visible_in_openai ?? true,
   );
+  const profileEffortOptions = source?.reasoning_levels.length
+    ? source.reasoning_levels
+    : ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
   return (
     <form
       className="grid gap-2 rounded-lg border border-accent/25 bg-accent/[0.04] p-3 sm:grid-cols-2"
@@ -513,6 +843,7 @@ function ModelForm({
           upstream_model: upstreamModel,
           display_name: displayName,
           context_window: contextWindow ? Number(contextWindow) : undefined,
+          max_output_tokens: maxOutputTokens ? Number(maxOutputTokens) : undefined,
           supports_tools: supportsTools,
           supports_vision: supportsVision,
           supports_parallel_tool_calls: supportsParallel,
@@ -522,6 +853,17 @@ function ModelForm({
             .split(",")
             .map((level) => level.trim())
             .filter(Boolean),
+          instruction_mode: instructionMode,
+          instruction_text: instructionMode === "none" ? "" : instructionText,
+          request_overrides: {
+            ...(overrideEffort ? { reasoning_effort: overrideEffort } : {}),
+            ...(overrideMaxOutput
+              ? { max_output_tokens: Number(overrideMaxOutput) }
+              : {}),
+          },
+          input_per_million: source?.input_per_million ?? undefined,
+          cached_input_per_million: source?.cached_input_per_million ?? undefined,
+          output_per_million: source?.output_per_million ?? undefined,
           visible_in_codex: visibleInCodex,
           visible_in_openai: visibleInOpenAi,
         });
@@ -571,11 +913,86 @@ function ModelForm({
       </div>
       <input
         className={INPUT}
+        value={maxOutputTokens}
+        type="number"
+        min="1"
+        placeholder="Model max output tokens"
+        onChange={(event) => setMaxOutputTokens(event.target.value)}
+      />
+      <input
+        className={INPUT}
         value={reasoningLevels}
         placeholder="Reasoning efforts: high,xhigh,max"
         aria-label="Reasoning efforts"
         onChange={(event) => setReasoningLevels(event.target.value)}
       />
+      <div className="grid gap-2 rounded-lg border border-signal/20 bg-signal/[0.04] p-2.5 sm:col-span-2 sm:grid-cols-2">
+        <label className="text-[9px] font-semibold text-fg">
+          Instruction mode
+          <select
+            className={`${INPUT} mt-1`}
+            value={instructionMode}
+            onChange={(event) =>
+              setInstructionMode(event.target.value as "none" | "append" | "replace")
+            }
+          >
+            <option value="none">None · leave client instructions unchanged</option>
+            <option value="append">Append · preserve client instructions</option>
+            <option value="replace">Replace · advanced</option>
+          </select>
+        </label>
+        <div className="grid grid-cols-2 gap-2">
+          <label className="text-[9px] font-semibold text-fg">
+            Reasoning override
+            <select
+              className={`${INPUT} mt-1`}
+              value={overrideEffort}
+              onChange={(event) => setOverrideEffort(event.target.value)}
+            >
+              <option value="">Client value</option>
+              {profileEffortOptions.map((effort) => (
+                <option key={effort} value={effort}>
+                  {effort}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="text-[9px] font-semibold text-fg">
+            Output override
+            <input
+              className={`${INPUT} mt-1`}
+              type="number"
+              min="1"
+              max={maxOutputTokens || undefined}
+              value={overrideMaxOutput}
+              placeholder="Client value"
+              onChange={(event) => setOverrideMaxOutput(event.target.value)}
+            />
+          </label>
+        </div>
+        {instructionMode !== "none" && (
+          <label className="text-[9px] font-semibold text-fg sm:col-span-2">
+            Instruction overlay
+            <textarea
+              className="mt-1 min-h-28 w-full rounded-lg border border-border bg-bg/65 px-3 py-2 text-[10px] text-fg outline-none transition focus:border-accent/60"
+              value={instructionText}
+              required
+              maxLength={32768}
+              placeholder="Instructions applied by PolyFlare before the request reaches the provider."
+              onChange={(event) => setInstructionText(event.target.value)}
+            />
+          </label>
+        )}
+        {instructionMode === "replace" && (
+          <p className="text-[8.5px] text-warn sm:col-span-2">
+            Replace removes Codex&apos;s operating and tool instructions. Use only with a complete
+            replacement prompt.
+          </p>
+        )}
+        <p className="text-[8.5px] text-fg opacity-45 sm:col-span-2">
+          Profiles guide model behavior; they do not enforce security or tool permissions.
+        </p>
+      </div>
       <div className="flex flex-wrap gap-3 sm:col-span-2">
         {[
           ["Tools", supportsTools, setSupportsTools],
@@ -671,9 +1088,39 @@ function ProviderForm({
       <div>
         <div className="text-[12px] font-semibold text-fg">Provider onboarding</div>
         <p className="mt-1 text-[10px] text-fg opacity-48">
-          Add the provider and its first encrypted credential, then use Sync to discover models.
+          Add the provider and its first encrypted credential, then discover and select models.
           The API key is never returned by PolyFlare.
         </p>
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          <button
+            type="button"
+            onClick={() =>
+              setForm({
+                providerName: "OpenRouter",
+                providerSlug: "openrouter",
+                baseUrl: "https://openrouter.ai/api/v1",
+                apiKey: form.apiKey,
+              })
+            }
+            className="rounded border border-signal/30 px-2 py-1 text-[8.5px] font-semibold text-signal"
+          >
+            Use OpenRouter preset
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              setForm({
+                providerName: "Sakana",
+                providerSlug: "sakana",
+                baseUrl: "https://api.sakana.ai/v1",
+                apiKey: form.apiKey,
+              })
+            }
+            className="rounded border border-border px-2 py-1 text-[8.5px] font-semibold text-fg opacity-60"
+          >
+            Use Sakana preset
+          </button>
+        </div>
       </div>
       <form onSubmit={submit} className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
         {field("providerName", "Provider name")}

@@ -87,6 +87,9 @@ pub struct ProviderModel {
     pub supports_reasoning_summaries: bool,
     pub reasoning_levels_json: String,
     pub model_info_json: Option<String>,
+    pub instruction_mode: String,
+    pub instruction_text: String,
+    pub request_overrides_json: String,
     pub input_per_million: Option<f64>,
     pub cached_input_per_million: Option<f64>,
     pub output_per_million: Option<f64>,
@@ -113,6 +116,9 @@ pub struct NewProviderModel {
     pub supports_reasoning_summaries: bool,
     pub reasoning_levels_json: String,
     pub model_info_json: Option<String>,
+    pub instruction_mode: String,
+    pub instruction_text: String,
+    pub request_overrides_json: String,
     pub input_per_million: Option<f64>,
     pub cached_input_per_million: Option<f64>,
     pub output_per_million: Option<f64>,
@@ -134,6 +140,9 @@ pub struct ProviderModelPatch {
     pub supports_web_search: Option<bool>,
     pub supports_reasoning_summaries: Option<bool>,
     pub reasoning_levels_json: Option<String>,
+    pub instruction_mode: Option<String>,
+    pub instruction_text: Option<String>,
+    pub request_overrides_json: Option<String>,
     pub visible_in_codex: Option<bool>,
     pub visible_in_openai: Option<bool>,
     pub enabled: Option<bool>,
@@ -286,6 +295,15 @@ impl ProviderRepo {
         .await?)
     }
 
+    /// Every currently configured credential id, for pruning process-local metric labels.
+    pub async fn list_credential_ids(&self) -> Result<Vec<String>, StoreError> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT id FROM provider_credentials ORDER BY id")
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
     pub async fn set_credential_enabled(
         &self,
         id: &str,
@@ -415,9 +433,10 @@ impl ProviderRepo {
              (id, provider_id, public_model, upstream_model, display_name, context_window, \
               max_output_tokens, supports_tools, supports_vision, supports_parallel_tool_calls, \
               supports_web_search, supports_reasoning_summaries, reasoning_levels_json, \
-              model_info_json, input_per_million, cached_input_per_million, output_per_million, \
+              model_info_json, instruction_mode, instruction_text, request_overrides_json, \
+              input_per_million, cached_input_per_million, output_per_million, \
               visible_in_codex, visible_in_openai, enabled, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&model.id)
         .bind(&model.provider_id)
@@ -433,6 +452,9 @@ impl ProviderRepo {
         .bind(model.supports_reasoning_summaries)
         .bind(&model.reasoning_levels_json)
         .bind(&model.model_info_json)
+        .bind(&model.instruction_mode)
+        .bind(&model.instruction_text)
+        .bind(&model.request_overrides_json)
         .bind(model.input_per_million)
         .bind(model.cached_input_per_million)
         .bind(model.output_per_million)
@@ -452,12 +474,28 @@ impl ProviderRepo {
             "SELECT id, provider_id, public_model, upstream_model, display_name, context_window, \
              max_output_tokens, supports_tools, supports_vision, supports_parallel_tool_calls, \
              supports_web_search, supports_reasoning_summaries, reasoning_levels_json, \
-             model_info_json, input_per_million, cached_input_per_million, output_per_million, \
+             model_info_json, instruction_mode, instruction_text, request_overrides_json, \
+             input_per_million, cached_input_per_million, output_per_million, \
              visible_in_codex, visible_in_openai, enabled, created_at, updated_at FROM provider_models \
              WHERE provider_id = ? ORDER BY display_name, id",
         )
         .bind(provider_id)
         .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn get_model(&self, id: &str) -> Result<Option<ProviderModel>, StoreError> {
+        Ok(sqlx::query_as::<_, ProviderModel>(
+            "SELECT id, provider_id, public_model, upstream_model, display_name, context_window, \
+             max_output_tokens, supports_tools, supports_vision, supports_parallel_tool_calls, \
+             supports_web_search, supports_reasoning_summaries, reasoning_levels_json, \
+             model_info_json, instruction_mode, instruction_text, request_overrides_json, \
+             input_per_million, cached_input_per_million, output_per_million, \
+             visible_in_codex, visible_in_openai, enabled, created_at, updated_at \
+             FROM provider_models WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
         .await?)
     }
 
@@ -530,6 +568,9 @@ impl ProviderRepo {
              supports_web_search = COALESCE(?, supports_web_search), \
              supports_reasoning_summaries = COALESCE(?, supports_reasoning_summaries), \
              reasoning_levels_json = COALESCE(?, reasoning_levels_json), \
+             instruction_mode = COALESCE(?, instruction_mode), \
+             instruction_text = COALESCE(?, instruction_text), \
+             request_overrides_json = COALESCE(?, request_overrides_json), \
              visible_in_codex = COALESCE(?, visible_in_codex), \
              visible_in_openai = COALESCE(?, visible_in_openai), \
              enabled = COALESCE(?, enabled), \
@@ -545,6 +586,9 @@ impl ProviderRepo {
         .bind(patch.supports_web_search)
         .bind(patch.supports_reasoning_summaries)
         .bind(&patch.reasoning_levels_json)
+        .bind(&patch.instruction_mode)
+        .bind(&patch.instruction_text)
+        .bind(&patch.request_overrides_json)
         .bind(patch.visible_in_codex)
         .bind(patch.visible_in_openai)
         .bind(patch.enabled)
@@ -597,7 +641,8 @@ impl ProviderRepo {
             "SELECT id, provider_id, public_model, upstream_model, display_name, context_window, \
              max_output_tokens, supports_tools, supports_vision, supports_parallel_tool_calls, \
              supports_web_search, supports_reasoning_summaries, reasoning_levels_json, \
-             model_info_json, input_per_million, cached_input_per_million, output_per_million, \
+             model_info_json, instruction_mode, instruction_text, request_overrides_json, \
+             input_per_million, cached_input_per_million, output_per_million, \
              visible_in_codex, visible_in_openai, enabled, created_at, updated_at \
              FROM provider_models WHERE public_model = ?",
         )
@@ -665,6 +710,9 @@ mod tests {
             supports_reasoning_summaries: true,
             reasoning_levels_json: r#"["high","xhigh","max"]"#.into(),
             model_info_json: None,
+            instruction_mode: "none".into(),
+            instruction_text: String::new(),
+            request_overrides_json: "{}".into(),
             input_per_million: Some(1.0),
             cached_input_per_million: Some(0.5),
             output_per_million: Some(4.0),
@@ -711,6 +759,9 @@ mod tests {
             repo.resolve_model("fugu-ultra").await.unwrap().unwrap();
         assert_eq!(resolved_provider.slug, "sakana");
         assert_eq!(resolved_model.upstream_model, "fugu-ultra-v1.1");
+        assert_eq!(resolved_model.instruction_mode, "none");
+        assert!(resolved_model.instruction_text.is_empty());
+        assert_eq!(resolved_model.request_overrides_json, "{}");
         assert!(resolved_model.visible_in_codex);
         assert!(resolved_model.visible_in_openai);
 

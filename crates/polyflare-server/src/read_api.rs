@@ -119,11 +119,30 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         Err(_) => return Response::error(),
     };
     let now = unix_now();
+    let mut usage_by_account = match repo.latest_usage_all().await {
+        Ok(usage) => usage,
+        Err(_) => return Response::error(),
+    };
+    let mut access_tokens = match repo.list_encrypted_access_tokens().await {
+        Ok(tokens) => tokens,
+        Err(_) => return Response::error(),
+    };
+    let mut pools_by_account = match repo.list_all_pools().await {
+        Ok(pools) => pools,
+        Err(_) => return Response::error(),
+    };
+    let request_counts = match state
+        .store
+        .request_log()
+        .account_counts_since(now - ACCOUNT_REQUEST_COUNT_WINDOW_SECS)
+        .await
+    {
+        Ok(counts) => counts,
+        Err(_) => return Response::error(),
+    };
     let mut views = Vec::with_capacity(accounts.len());
     for account in accounts {
-        // Per-account latest usage (small N; a dashboard read, never the hot path), resolved by
-        // duration + freshness so the right window shows under the right heading.
-        let usage = repo.latest_usage(&account.id).await.unwrap_or_default();
+        let usage = usage_by_account.remove(&account.id).unwrap_or_default();
         let resolved = resolve(&usage, now);
         let mut usage_windows = Vec::with_capacity(2);
         if let Some(w) = &resolved.five_hour {
@@ -146,8 +165,11 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         // Token health: derived ONLY from the access token's own unverified JWT `exp` — the token
         // itself never leaves `get_with_tokens`'s scope here. A decrypt failure or missing account
         // (shouldn't happen — we just listed it) collapses to "missing", same as no token at all.
-        let token_health = match repo.get_with_tokens(&account.id, &state.cipher).await {
-            Ok(Some((_, tokens))) => match token_exp(&tokens.access_token) {
+        let token_health = match access_tokens
+            .remove(&account.id)
+            .map(|encrypted| encrypted.decrypt(&state.cipher))
+        {
+            Some(Ok(token)) => match token_exp(token.as_str()) {
                 Some(exp) if exp < now => TokenHealthView {
                     access_state: "expired",
                     access_expires_at: Some(exp),
@@ -161,32 +183,15 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
                     access_expires_at: None,
                 },
             },
-            _ => TokenHealthView {
+            Some(Err(_)) => return Response::error(),
+            None => TokenHealthView {
                 access_state: "missing",
                 access_expires_at: None,
             },
         };
 
-        let request_count_24h = state
-            .store
-            .request_log()
-            .page(
-                &RequestsFilter {
-                    account: Some(account.id.clone()),
-                    since_ts: Some(now - ACCOUNT_REQUEST_COUNT_WINDOW_SECS),
-                    ..Default::default()
-                },
-                1,
-                0,
-            )
-            .await
-            .map(|(_, total)| total as i64)
-            .unwrap_or(0);
-
-        let pools = match repo.list_pools(&account.id).await {
-            Ok(pools) => pools,
-            Err(_) => return Response::error(),
-        };
+        let request_count_24h = request_counts.get(&account.id).copied().unwrap_or(0);
+        let pools = pools_by_account.remove(&account.id).unwrap_or_default();
         views.push(AccountView {
             pools,
             id: account.id,
@@ -227,13 +232,8 @@ struct AccountIdentityView {
 }
 
 /// `AccountDetailView::request_totals`: how many requests this account has served (all-time) and
-/// their summed token count. Derived from `RequestLogRepo::page` filtered to this account: `total`
-/// is the filtered row count (accurate regardless of page size); `total_tokens` sums each returned
-/// row's upstream-reported total, then its compatibility total, then a complete input/output pair.
-/// Cached input and reasoning output are subsets and are never added again.
-/// The query fetches with an effectively unbounded limit rather than the dashboard's page-sized
-/// default (see `account_detail_handler`) — this is a per-account detail read, not the hot path,
-/// same tradeoff `accounts_handler` already makes for `request_count_24h`.
+/// their summed token count. Computed by a bounded-result SQL aggregate using the same token
+/// evidence precedence as request reports; no history rows are materialized in the server.
 #[derive(Serialize)]
 struct RequestTotalsView {
     request_count: i64,
@@ -255,11 +255,6 @@ struct AccountDetailView {
     request_totals: RequestTotalsView,
 }
 
-/// Upper bound on rows fetched from `request_log` when summing an account's lifetime
-/// `total_tokens` (see `RequestTotalsView`). Large enough that no real account's history is
-/// truncated at MVP scale; revisit with a dedicated per-account aggregate query if that changes.
-const ACCOUNT_REQUEST_TOTALS_LIMIT: i64 = i64::MAX;
-
 /// `GET /api/accounts/{id}` — the dashboard's per-account detail view: identity, status, adaptive
 /// quota-window usage, secret-safe token status, routing policy, `security_work_authorized`, and
 /// lifetime request totals. `404` when `id` doesn't name an existing account.
@@ -277,7 +272,10 @@ pub async fn account_detail_handler(
     let now = unix_now();
 
     // Quota windows: identical derivation to `accounts_handler`'s `usage` field.
-    let usage = repo.latest_usage(&id).await.unwrap_or_default();
+    let usage = match repo.latest_usage(&id).await {
+        Ok(usage) => usage,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
+    };
     let resolved = resolve(&usage, now);
     let mut quota_windows = Vec::with_capacity(2);
     if let Some(w) = &resolved.five_hour {
@@ -314,32 +312,22 @@ pub async fn account_detail_handler(
                 access_expires_at: None,
             },
         },
-        _ => TokenHealthView {
+        Ok(None) => TokenHealthView {
             access_state: "missing",
             access_expires_at: None,
         },
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
     };
 
-    // Lifetime request totals for this account (see `RequestTotalsView`'s docs on the tradeoff).
-    let (rows, total) = state
-        .store
-        .request_log()
-        .page(
-            &RequestsFilter {
-                account: Some(id.clone()),
-                ..Default::default()
-            },
-            ACCOUNT_REQUEST_TOTALS_LIMIT,
-            0,
-        )
-        .await
-        .unwrap_or_default();
+    // Lifetime request totals stay inside SQLite; the response size remains constant regardless
+    // of how much history this account has accumulated.
+    let totals = match state.store.request_log().account_totals(&id).await {
+        Ok(totals) => totals,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
+    };
     let request_totals = RequestTotalsView {
-        request_count: total as i64,
-        total_tokens: rows
-            .iter()
-            .filter_map(polyflare_store::RequestLogRow::api_total_tokens)
-            .sum(),
+        request_count: totals.request_count,
+        total_tokens: totals.total_tokens,
     };
 
     let pools = match repo.list_pools(&id).await {
@@ -646,6 +634,7 @@ struct RequestRowView {
     model: Option<String>,
     upstream_model: Option<String>,
     upstream_transport: Option<String>,
+    profile_revision: Option<String>,
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
     transport: Option<String>,
@@ -754,7 +743,9 @@ fn canonical_imported_error_code(
 /// `GET /api/requests` filters + pagination. `limit` is clamped to [1, MAX_LIMIT]; `offset`
 /// defaults to 0. `status_class` is `"success"`/`"error"` using native HTTP status or an imported
 /// codex-lb outcome when `status == 0`; anything else / unset applies no status filter. All filters
-/// are content-free identifiers, never request/response text.
+/// are content-free identifiers, never request/response text. `provider` accepts one value or a
+/// comma-separated multi-selection. The reserved `model` value means every non-backend provider;
+/// backend classification also recognizes historical normalized paths stored as `provider=codex`.
 #[derive(Deserialize)]
 pub struct RequestsQuery {
     limit: Option<i64>,
@@ -840,6 +831,7 @@ pub async fn requests_handler(
                 model: r.model,
                 upstream_model: r.upstream_model,
                 upstream_transport: r.upstream_transport,
+                profile_revision: r.profile_revision,
                 reasoning_effort: r.reasoning_effort,
                 service_tier: r.service_tier,
                 transport: r.transport,

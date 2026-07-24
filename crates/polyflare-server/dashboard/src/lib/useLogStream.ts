@@ -24,6 +24,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { getToken, notifyUnauthorized, type LogEvent } from "./api";
+import { appendUniqueLogEvent } from "./liveLogFiltering";
 
 /** Ring-buffer cap on the client side, matching the brief's "last 1000" requirement (independent
  * of the server's own ring-buffer cap in log_bus.rs — the two need not match). */
@@ -124,11 +125,7 @@ export function useLogStream({ enabled }: UseLogStreamOptions): UseLogStreamResu
   }, []);
 
   const appendEvent = useCallback((event: LogEvent) => {
-    setLines((prev) => {
-      const next = prev.length >= MAX_LINES ? prev.slice(prev.length - MAX_LINES + 1) : prev.slice();
-      next.push(event);
-      return next;
-    });
+    setLines((prev) => appendUniqueLogEvent(prev, event, MAX_LINES));
   }, []);
 
   const scheduleReconnect = useCallback(

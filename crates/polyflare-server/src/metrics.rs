@@ -11,6 +11,7 @@
 //! family (not once per sample) — repeating HELP/TYPE per-account line would be invalid exposition
 //! text. Label values are escaped per the format's rules (`\` → `\\`, `"` → `\"`, newline → `\n`).
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -477,7 +478,17 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
             health_tier: snap.health_tier,
             cooldown_active: snap.cooldown_until.is_some_and(|c| now < c),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let account_ids = accounts
+        .iter()
+        .map(|account| account.account_id.clone())
+        .collect::<HashSet<_>>();
+    let credential_ids = match state.store.providers().list_credential_ids().await {
+        Ok(ids) => ids.into_iter().collect::<HashSet<_>>(),
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
 
     let snapshot = MetricsSnapshot {
         failover_total: state.failover_metrics.total(),
@@ -488,7 +499,9 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
         admission: state.runtime.admission_metrics_snapshot(),
         pressure_calibration: state.runtime.pressure_calibration_snapshot(),
         accounts,
-        upstream_requests: state.upstream_request_metrics.snapshot(),
+        upstream_requests: state
+            .upstream_request_metrics
+            .snapshot_for_active_targets(&account_ids, &credential_ids),
         rate_limit_hits: state.rate_limit_metrics.snapshot(),
         relay_events: state.relay_metrics.snapshot(),
     };

@@ -388,6 +388,7 @@ struct RouteOutcome {
     provider_credential_id: Option<String>,
     upstream_model: Option<String>,
     upstream_transport: Option<String>,
+    profile_revision: Option<String>,
     custom_pricing: Option<(f64, f64, f64)>,
     /// The requested (native path) or resolved target (translated/aliased path) model string.
     model: Option<String>,
@@ -1777,7 +1778,7 @@ fn apply_captured_usage(
     model: Option<&str>,
     custom_pricing: Option<(f64, f64, f64)>,
     captured: usage_capture::CapturedUsage,
-) {
+) -> Option<tokio::sync::oneshot::Receiver<bool>> {
     let u = captured.usage.unwrap_or_default();
     let cost = if let Some((input_price, cached_price, output_price)) = custom_pricing {
         u.input_tokens.zip(u.output_tokens).map(|(input, output)| {
@@ -1813,7 +1814,7 @@ fn apply_captured_usage(
                 )
             })
     };
-    if let Err(e) = store.enqueue_request_usage(polyflare_store::RequestUsageUpdate {
+    match store.enqueue_request_usage_with_receipt(polyflare_store::RequestUsageUpdate {
         request_id: request_id.to_string(),
         input_tokens: u.input_tokens,
         output_tokens: u.output_tokens,
@@ -1829,11 +1830,15 @@ fn apply_captured_usage(
         duration_ms: captured.duration_ms,
         protocol_outcome: captured.protocol_outcome,
     }) {
-        tracing::warn!(
-            target: "polyflare_server::request",
-            error = %e,
-            "request usage queue failed"
-        );
+        Ok(receipt) => Some(receipt),
+        Err(e) => {
+            tracing::warn!(
+                target: "polyflare_server::request",
+                error = %e,
+                "request usage queue failed"
+            );
+            None
+        }
     }
 }
 
@@ -1961,6 +1966,7 @@ async fn responses_route_with_transport(
         upstream_transport: outcome
             .upstream_transport
             .or_else(|| Some("http_sse".to_string())),
+        profile_revision: outcome.profile_revision,
         reasoning_effort: outcome.reasoning_effort,
         // Not yet known at this chokepoint (SPEC-M4a has no per-account subscription-tier read
         // wired here today).
@@ -1980,6 +1986,10 @@ async fn responses_route_with_transport(
     };
     log.emit();
     log_bus.publish(log.to_log_event());
+    let mut finalized_event = log.to_log_event();
+    finalized_event.kind = "request_finalized".to_string();
+    finalized_event.message = "request telemetry finalized".to_string();
+    let finalized_log_bus = log_bus.clone();
     // C11b Task 2: the content-free `upstream_requests` counter, keyed by the SAME
     // `(account_id, status)` pair `log` already carries — bumped exactly once per client request
     // (the final outcome only; per-attempt retries are `FailoverMetrics`, never double-counted
@@ -2023,13 +2033,22 @@ async fn responses_route_with_transport(
             {
                 pressure_runtime.record_actual_pressure(estimated_tokens, actual_tokens);
             }
-            apply_captured_usage(
+            let receipt = apply_captured_usage(
                 &store,
                 &request_id,
                 model.as_deref(),
                 custom_pricing,
                 captured,
             );
+            if let Some(receipt) = receipt {
+                finalized_event.ts_ms = crate::log_bus::now_ms();
+                finalized_event.latency_ms = captured.duration_ms;
+                tokio::spawn(async move {
+                    if matches!(receipt.await, Ok(true)) {
+                        finalized_log_bus.publish(finalized_event);
+                    }
+                });
+            }
         },
     );
     Response::from_parts(parts, Body::from_stream(wrapped))
@@ -2168,6 +2187,7 @@ async fn execute_custom_model(
     outcome.provider_credential_id = custom.credential_id;
     outcome.upstream_model = Some(custom.upstream_model);
     outcome.upstream_transport = Some(custom.upstream_transport);
+    outcome.profile_revision = custom.profile_revision;
     outcome.custom_pricing = match (
         custom.input_per_million,
         custom.cached_input_per_million,
@@ -2914,6 +2934,7 @@ async fn messages_route(
         model: outcome.model,
         upstream_model: None,
         upstream_transport: Some("http_sse".to_string()),
+        profile_revision: None,
         reasoning_effort: outcome.reasoning_effort,
         // Not yet known at this chokepoint.
         service_tier: None,
@@ -3574,6 +3595,7 @@ mod tests {
                 model: Some("gpt-5.6-sol".into()),
                 upstream_model: None,
                 upstream_transport: Some("http_sse".into()),
+                profile_revision: None,
                 reasoning_effort: None,
                 service_tier: None,
                 transport: Some("http".into()),

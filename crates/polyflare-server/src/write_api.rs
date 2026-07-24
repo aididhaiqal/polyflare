@@ -13,6 +13,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use polyflare_store::AccountSettingsUpdate;
 use serde::{Deserialize, Deserializer};
 
 use crate::app::AppState;
@@ -146,45 +147,29 @@ pub async fn patch_account_handler(
         }
     }
 
-    // Apply. Each helper bumps the store generation, so the account cache re-reads on next selection.
-    if let Some(pool) = &patch.pool {
-        if repo.update_pool(&id, pool.as_deref()).await.is_err() {
-            return internal_error();
-        }
+    let pools = match (patch.pool, patch.pools) {
+        (Some(pool), None) => Some(pool.into_iter().collect()),
+        (None, pools) => pools,
+        (Some(_), Some(_)) => unreachable!("pool/pools conflict validated above"),
+    };
+    let alias = patch.alias.map(|alias| {
+        alias.and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+    });
+    let update = AccountSettingsUpdate {
+        pools,
+        routing_policy: patch.routing_policy,
+        status: patch.status,
+        security_work_authorized: patch.security_work_authorized,
+        alias,
+    };
+    match repo.update_settings_atomic(&id, update).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such account").into_response(),
+        Err(_) => internal_error(),
     }
-    if let Some(pools) = &patch.pools {
-        if repo.replace_pools(&id, pools).await.is_err() {
-            return internal_error();
-        }
-    }
-    if let Some(rp) = &patch.routing_policy {
-        if repo.update_routing_policy(&id, rp).await.is_err() {
-            return internal_error();
-        }
-    }
-    if let Some(st) = &patch.status {
-        if repo.update_status(&id, st).await.is_err() {
-            return internal_error();
-        }
-    }
-    if let Some(authorized) = patch.security_work_authorized {
-        if repo
-            .update_security_work_authorized(&id, authorized)
-            .await
-            .is_err()
-        {
-            return internal_error();
-        }
-    }
-    if let Some(alias) = &patch.alias {
-        // present: set a trimmed non-empty value, else clear (empty/whitespace/null -> None).
-        let normalized = alias.as_deref().map(str::trim).filter(|t| !t.is_empty());
-        if repo.update_alias(&id, normalized).await.is_err() {
-            return internal_error();
-        }
-    }
-
-    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
 }
 
 #[derive(Deserialize)]
