@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{get, patch, post};
+use axum::routing::{any, get, patch, post};
 use axum::Router;
 
 use polyflare_codex::oauth::OAuthClient;
@@ -475,6 +475,26 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route(
             "/backend-api/codex/models",
             get(crate::catalog::codex_models_handler),
+        )
+        // Stock codex-rs reads account usage from the global `chatgpt_base_url`, independently of
+        // its model provider. The exact usage routes synthesize PolyFlare's aggregate pool meter;
+        // the catch-alls keep every unrelated ChatGPT backend feature on a direct, client-auth
+        // passthrough while recording only normalized route telemetry.
+        .route(
+            "/backend-api/wham/usage",
+            get(crate::chatgpt_backend::usage_handler),
+        )
+        .route(
+            "/{pool}/backend-api/wham/usage",
+            get(crate::chatgpt_backend::pooled_usage_handler),
+        )
+        .route(
+            "/backend-api/{*path}",
+            any(crate::chatgpt_backend::passthrough_handler),
+        )
+        .route(
+            "/{pool}/backend-api/{*path}",
+            any(crate::chatgpt_backend::pooled_passthrough_handler),
         )
         .route("/v1/models", get(crate::catalog::v1_models_handler))
         // Auth-gated dashboard API (see `api` above): pools/accounts/requests/overview reads,

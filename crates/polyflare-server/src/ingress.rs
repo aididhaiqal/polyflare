@@ -1934,7 +1934,7 @@ async fn responses_route_with_transport(
     let request_id = format!("{:032x}", rand::random::<u128>());
     let log = RequestLog {
         method: "POST",
-        path: "/responses",
+        path: "/responses".to_string(),
         // M4a: `/responses` may only ever route to a Codex-provider account — see this fn's
         // `filter_by_provider(&snapshots, Provider::Codex)` call below. The provider is
         // structurally fixed regardless of which branch produced the response (including the
@@ -2903,7 +2903,7 @@ async fn messages_route(
     let request_id = format!("{:032x}", rand::random::<u128>());
     let log = RequestLog {
         method: "POST",
-        path: "/v1/messages",
+        path: "/v1/messages".to_string(),
         provider: provider.to_string(),
         aliased: aliased_to_codex,
         status: response.status(),

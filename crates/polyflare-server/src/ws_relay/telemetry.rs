@@ -231,7 +231,7 @@ impl WsTurnTelemetry {
         let request_id = format!("{:032x}", rand::random::<u128>());
         let log = RequestLog {
             method: "WS",
-            path: "/responses",
+            path: "/responses".to_string(),
             provider: Provider::Codex.to_string(),
             aliased: false,
             status: terminal.status,

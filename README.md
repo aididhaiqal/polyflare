@@ -359,22 +359,43 @@ A Responses-compatible client should use the PolyFlare origin as its base URL, w
 
 ```toml
 model_provider = "polyflare"
+# Codex account usage, status, plugins, connectors, and other ChatGPT backend calls use this
+# separate global base. PolyFlare synthesizes only /wham/usage and transparently forwards the rest.
+chatgpt_base_url = "http://127.0.0.1:8080/backend-api"
 
 [model_providers.polyflare]
-name = "PolyFlare"
+name = "openai"
 base_url = "http://127.0.0.1:8080"
 wire_api = "responses"
-experimental_bearer_token = "local-placeholder"
+supports_websockets = true
+requires_openai_auth = true
 ```
 
-On the default keyless loopback setup, the placeholder is accepted because caller-key enforcement
-is off. Once a PolyFlare client API key exists, use the generated raw key instead.
+`chatgpt_base_url` is how stock codex-rs reads the Usage screen and `/status`; it is independent of
+the model-provider base URL. PolyFlare returns its capacity-weighted pool as the canonical Codex
+quota at `/backend-api/wham/usage`. Every other `/backend-api/*` request uses the client's existing
+ChatGPT authorization and is forwarded directly to the fixed ChatGPT backend without account
+selection or token decryption. Requests records these operations under normalized
+`chatgpt_backend_synthetic_*` or `chatgpt_backend_passthrough_*` paths so new Codex backend usage is
+visible without logging credentials, query values, dynamic resource IDs, or bodies.
 
 To target a pool, include the pool in the provider base URL:
 
 ```toml
+model_provider = "polyflare"
+chatgpt_base_url = "http://127.0.0.1:8080/work/backend-api"
+
+[model_providers.polyflare]
+name = "openai"
 base_url = "http://127.0.0.1:8080/work"
+wire_api = "responses"
+supports_websockets = true
+requires_openai_auth = true
 ```
+
+Because `chatgpt_base_url` is a top-level Codex setting, it appears before the provider table. A
+pool-scoped usage URL reports only that pool; unchanged ChatGPT backend calls still pass through
+with the client's own identity.
 
 The repository also includes `scripts/codex-polyflare`, which creates an isolated client
 configuration for local development:
