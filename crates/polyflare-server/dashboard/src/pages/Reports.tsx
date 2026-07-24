@@ -9,7 +9,7 @@
 // CONTENT-SAFETY: `ReportsView` is sourced from the same content-free `request_log` aggregates the
 // rest of the dashboard already exposes (counts, cost, token COUNTS, timing) — never a body,
 // prompt, response, or key.
-import { useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import clsx from "clsx";
 import {
   Area,
@@ -23,8 +23,8 @@ import {
 } from "recharts";
 
 import type { ReportBreakdownView, ReportBucketView, ReportsView } from "../lib/api";
-import { compactNum, latency, pct } from "../lib/format";
-import { useReports, type ReportsParams } from "../lib/queries";
+import { compactNum, latency, pct, ratePct } from "../lib/format";
+import { useProviders, useReports, type ReportsParams } from "../lib/queries";
 import { Card } from "../ui/Card";
 import { Col, Grid } from "../ui/Grid";
 import { Activity, AlertTriangle, BarChart3, Clock, Coins, Layers, Zap } from "../ui/icons";
@@ -40,7 +40,7 @@ const RANGE_OPTIONS: Array<{ value: RangeKey; label: string }> = [
 
 type DimensionKey = "account" | "model" | "provider";
 const DIMENSION_OPTIONS: Array<{ value: DimensionKey; label: string }> = [
-  { value: "account", label: "Account" },
+  { value: "account", label: "Target" },
   { value: "model", label: "Model" },
   { value: "provider", label: "Provider" },
 ];
@@ -49,7 +49,7 @@ const DIMENSION_OPTIONS: Array<{ value: DimensionKey; label: string }> = [
  * `Requests.tsx`'s provider filter uses. `ALL` means "omit the param entirely", not a literal
  * `provider=all` sent to the backend. */
 const ALL = "all";
-const PROVIDER_OPTIONS: Array<{ value: string; label: string }> = [
+const BUILT_IN_PROVIDER_OPTIONS: Array<{ value: string; label: string }> = [
   { value: ALL, label: "all providers" },
   { value: "codex", label: "codex" },
   { value: "anthropic", label: "claude" },
@@ -58,10 +58,47 @@ const PROVIDER_OPTIONS: Array<{ value: string; label: string }> = [
 const SELECT_CLASS =
   "shrink-0 rounded border border-border bg-card px-2.5 py-1 text-[10.5px] text-fg opacity-80 outline-none hover:opacity-100 focus:opacity-100";
 
+function parseRange(value: string | null): RangeKey {
+  return value === "24h" || value === "30d" ? value : "7d";
+}
+
+function parseDimension(value: string | null): DimensionKey {
+  return value === "account" || value === "provider" ? value : "model";
+}
+
+function parseProvider(value: string | null): string {
+  if (value === "claude") return "anthropic";
+  return value?.trim() || ALL;
+}
+
 export function Reports() {
-  const [range, setRange] = useState<RangeKey>("7d");
-  const [dimension, setDimension] = useState<DimensionKey>("model");
-  const [provider, setProvider] = useState<string>(ALL);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const range = parseRange(searchParams.get("range"));
+  const dimension = parseDimension(searchParams.get("dimension"));
+  const provider = parseProvider(searchParams.get("provider"));
+  const providersQuery = useProviders();
+  const providerOptions = [
+    ...BUILT_IN_PROVIDER_OPTIONS,
+    ...(providersQuery.data ?? [])
+      .filter(
+        (configured) =>
+          !BUILT_IN_PROVIDER_OPTIONS.some((option) => option.value === configured.slug),
+      )
+      .map((configured) => ({ value: configured.slug, label: configured.display_name })),
+  ];
+
+  function setReportParam(key: "range" | "dimension" | "provider", value: string) {
+    const defaults = { range: "7d", dimension: "model", provider: ALL };
+    setSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        if (value === defaults[key]) next.delete(key);
+        else next.set(key, value);
+        return next;
+      },
+      { replace: true },
+    );
+  }
 
   const params: ReportsParams = {
     range,
@@ -85,7 +122,7 @@ export function Reports() {
             <button
               key={o.value}
               type="button"
-              onClick={() => setRange(o.value)}
+              onClick={() => setReportParam("range", o.value)}
               className={clsx(
                 "px-2.5 py-1",
                 range === o.value
@@ -100,7 +137,7 @@ export function Reports() {
 
         <select
           value={dimension}
-          onChange={(e) => setDimension(e.target.value as DimensionKey)}
+          onChange={(e) => setReportParam("dimension", e.target.value)}
           className={SELECT_CLASS}
           aria-label="Breakdown dimension"
         >
@@ -113,11 +150,11 @@ export function Reports() {
 
         <select
           value={provider}
-          onChange={(e) => setProvider(e.target.value)}
+          onChange={(e) => setReportParam("provider", e.target.value)}
           className={SELECT_CLASS}
           aria-label="Provider filter"
         >
-          {PROVIDER_OPTIONS.map((o) => (
+          {providerOptions.map((o) => (
             <option key={o.value} value={o.value}>
               {o.label}
             </option>
@@ -282,6 +319,11 @@ const USAGE_COLUMNS: ReportSectionColumn[] = [
     render: (row: ReportBreakdownView) => compactNum(row.cached_tokens),
   },
   {
+    header: "Orchestration",
+    align: "right",
+    render: (row: ReportBreakdownView) => compactNum(row.orchestration_tokens),
+  },
+  {
     header: "Requests",
     align: "right",
     render: (row: ReportBreakdownView) => compactNum(row.requests),
@@ -294,17 +336,25 @@ function UsageSection({ data, dimensionLabel }: { data: ReportsView; dimensionLa
       title="Usage"
       kpis={
         <>
-          <Col span={4}>
+          <Col span={3}>
             <MetricCard icon={Layers} title="Total tokens" value={compactNum(data.totals.tokens)} />
           </Col>
-          <Col span={4}>
+          <Col span={3}>
+            <MetricCard
+              icon={Zap}
+              title="Orchestration"
+              value={compactNum(data.totals.orchestration_tokens)}
+              meta={`${compactNum(data.totals.orchestration_cached_tokens)} cached`}
+            />
+          </Col>
+          <Col span={3}>
             <MetricCard
               icon={Activity}
               title="Cache-hit rate"
               value={pct(data.totals.cache_hit_rate * 100)}
             />
           </Col>
-          <Col span={4}>
+          <Col span={3}>
             <MetricCard icon={BarChart3} title="Requests" value={compactNum(data.totals.requests)} />
           </Col>
         </>
@@ -316,6 +366,10 @@ function UsageSection({ data, dimensionLabel }: { data: ReportsView; dimensionLa
               <linearGradient id="tokens-trend" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stopColor="hsl(var(--claude))" stopOpacity={0.32} />
                 <stop offset="100%" stopColor="hsl(var(--claude))" stopOpacity={0} />
+              </linearGradient>
+              <linearGradient id="orchestration-trend" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="hsl(var(--accent))" stopOpacity={0.24} />
+                <stop offset="100%" stopColor="hsl(var(--accent))" stopOpacity={0} />
               </linearGradient>
             </defs>
             <CartesianGrid vertical={false} stroke="hsl(var(--border))" strokeDasharray="3 3" />
@@ -333,6 +387,15 @@ function UsageSection({ data, dimensionLabel }: { data: ReportsView; dimensionLa
               stroke="hsl(var(--claude))"
               strokeWidth={1.7}
               fill="url(#tokens-trend)"
+              isAnimationActive={false}
+              dot={false}
+            />
+            <Area
+              type="monotone"
+              dataKey="orchestration_tokens"
+              stroke="hsl(var(--accent))"
+              strokeWidth={1.5}
+              fill="url(#orchestration-trend)"
               isAnimationActive={false}
               dot={false}
             />
@@ -420,7 +483,7 @@ function PerformanceSection({
             <MetricCard
               icon={AlertTriangle}
               title="Error rate"
-              value={pct(data.totals.error_rate * 100)}
+              value={ratePct(data.totals.error_rate * 100)}
             />
           </Col>
         </>

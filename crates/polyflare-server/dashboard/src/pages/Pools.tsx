@@ -32,10 +32,13 @@ import clsx from "clsx";
 
 import type { PoolView } from "../lib/api";
 import { pct, relTime } from "../lib/format";
-import { usePools } from "../lib/queries";
+import { quotaDisplayLabel, quotaDisplayPercent } from "../lib/quotaDisplay";
+import { useAccounts, usePools } from "../lib/queries";
+import { useQuotaDisplayPreference } from "../preferences/QuotaDisplayPreference";
 import { Card } from "../ui/Card";
 import { Col, Grid } from "../ui/Grid";
-import { AlertTriangle } from "../ui/icons";
+import { AlertTriangle, Plus } from "../ui/icons";
+import { CreatePoolDialog } from "../ui/CreatePoolDialog";
 import type { StatusTone } from "../ui/StatusPill";
 
 /** Risk-tone thresholds for the aggregate usage bar. Duplicated (not shared) per the convention
@@ -58,6 +61,8 @@ const TABLE_HEAD_CLASS =
 
 export function Pools() {
   const { data, isLoading, isError, error, refetch, dataUpdatedAt } = usePools();
+  const { data: accounts = [] } = useAccounts();
+  const [createOpen, setCreateOpen] = useState(false);
 
   // Ticks the header's "updated Xs ago" text between usePools()'s 30s polls — same pattern
   // Overview.tsx/Accounts.tsx already use for their own header/countdown text.
@@ -125,13 +130,13 @@ export function Pools() {
             </>
           ) : undefined
         }
+        actions={<button type="button" disabled={accounts.length === 0} onClick={() => setCreateOpen(true)} className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-[11px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40"><Plus className="h-3.5 w-3.5" />Create routing group</button>}
       />
 
       {pools.length === 0 ? (
         <Card>
           <p className="text-[11px] text-fg opacity-50">
-            No pools configured yet. Accounts (and pool assignments) are managed via the CLI —
-            they&apos;ll appear here once configured.
+            No routing groups yet. Create one by assigning at least one existing account.
           </p>
         </Card>
       ) : (
@@ -141,20 +146,23 @@ export function Pools() {
           </Col>
         </Grid>
       )}
+      <CreatePoolDialog open={createOpen} onOpenChange={setCreateOpen} accounts={accounts} />
     </div>
   );
 }
 
-function PageHeader({ subtitle }: { subtitle?: ReactNode }) {
+function PageHeader({ subtitle, actions }: { subtitle?: ReactNode; actions?: ReactNode }) {
   return (
-    <div>
-      <h1 className="text-lg font-semibold text-fg">Pools</h1>
-      {subtitle && <p className="mt-0.5 text-[11px] text-fg opacity-60">{subtitle}</p>}
+    <div className="flex flex-wrap items-center justify-between gap-3">
+      <div><h1 className="text-lg font-semibold text-fg">Pools</h1>
+      {subtitle && <p className="mt-0.5 text-[11px] text-fg opacity-60">{subtitle}</p>}</div>
+      {actions}
     </div>
   );
 }
 
 function PoolsTable({ pools }: { pools: PoolView[] }) {
+  const { mode } = useQuotaDisplayPreference();
   return (
     <Card>
       <div className="overflow-x-auto">
@@ -163,7 +171,7 @@ function PoolsTable({ pools }: { pools: PoolView[] }) {
             <tr className="border-b border-border">
               <th className={TABLE_HEAD_CLASS}>Pool</th>
               <th className={TABLE_HEAD_CLASS}>Accounts</th>
-              <th className={TABLE_HEAD_CLASS}>Usage</th>
+              <th className={TABLE_HEAD_CLASS}>Quota {quotaDisplayLabel(mode)}</th>
               <th className={TABLE_HEAD_CLASS}>Strategy</th>
             </tr>
           </thead>
@@ -179,9 +187,11 @@ function PoolsTable({ pools }: { pools: PoolView[] }) {
 }
 
 function PoolRow({ pool: p }: { pool: PoolView }) {
+  const { mode } = useQuotaDisplayPreference();
   const isUnpooled = p.pool === null;
   const label = p.pool ?? "unpooled";
   const clampedUsage = Math.max(0, Math.min(100, p.usage_percent));
+  const displayedUsage = quotaDisplayPercent(clampedUsage, mode);
   const tone = usageRiskTone(clampedUsage);
 
   return (
@@ -190,9 +200,9 @@ function PoolRow({ pool: p }: { pool: PoolView }) {
         <span className="font-semibold text-fg">{label}</span>
         {isUnpooled && (
           <div className="mt-0.5 max-w-[220px] text-[9px] leading-snug text-fg opacity-50">
-            Reachable only via the bare{" "}
-            <code className="rounded bg-muted px-1 py-0.5 font-mono">/responses</code> route, not
-            a pool-scoped path.
+            Available to the global router via the bare{" "}
+            <code className="rounded bg-muted px-1 py-0.5 font-mono">/responses</code> route; assign
+            a routing group to also enable a scoped path.
           </div>
         )}
       </td>
@@ -210,10 +220,10 @@ function PoolRow({ pool: p }: { pool: PoolView }) {
           <div className="h-1.5 w-24 shrink-0 overflow-hidden rounded-full bg-muted">
             <div
               className={clsx("h-full rounded-full", TONE_BAR_CLASS[tone])}
-              style={{ width: `${clampedUsage}%` }}
+              style={{ width: `${displayedUsage}%` }}
             />
           </div>
-          <span className="tabular-nums text-fg opacity-70">{pct(clampedUsage)}</span>
+          <span className="tabular-nums text-fg opacity-70">{pct(displayedUsage)}</span>
         </div>
       </td>
       <td className="px-2 py-2 align-top">

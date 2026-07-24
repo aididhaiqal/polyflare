@@ -34,6 +34,28 @@ export function pct(n: number | null | undefined): string {
   return `${Math.round(n)}%`;
 }
 
+/** Outcome/reliability percentage with enough precision to avoid contradicting non-zero counts.
+ * Quota displays should keep using `pct`; this is for rates where 0.5% must not render as 0% and
+ * 99.5% must not render as 100%. */
+export function ratePct(n: number | null | undefined): string {
+  if (n === null || n === undefined || !Number.isFinite(n)) return "—";
+  const absolute = Math.abs(n);
+  if (absolute > 0 && absolute < 0.1) return `${n < 0 ? "-" : ""}<0.1%`;
+  if (n > 99 && n < 100) {
+    const rounded = n.toFixed(1);
+    return Number(rounded) >= 100 ? "<100%" : `${rounded}%`;
+  }
+  if (absolute > 0 && absolute < 10) {
+    return `${n.toFixed(1)}%`;
+  }
+  return `${Math.round(n)}%`;
+}
+// @check ratePct(0.493) === "0.5%"
+// @check ratePct(99.507) === "99.5%"
+// @check ratePct(99.95) === "<100%"
+// @check ratePct(99.99) === "<100%"
+// @check ratePct(0) === "0%"
+
 /** Relative-time string for an absolute unix-epoch-seconds timestamp, e.g. `"3m ago"`. `nowMs`
  * defaults to `Date.now()` for call-site convenience but can be overridden for deterministic
  * testing. */

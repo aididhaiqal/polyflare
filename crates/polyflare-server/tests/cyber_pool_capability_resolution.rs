@@ -192,6 +192,7 @@ async fn spawn_app(store: Store, cipher: TokenCipher, upstream_url: String) -> S
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -385,8 +386,15 @@ async fn sticky_session_still_requires_capability_in_a_non_cyber_pool() {
         .unwrap();
 
     let session_header = "sess-sticky-general";
-    let session_key =
-        polyflare_server::session_key::sha256_hex(format!("session:{session_header}").as_bytes());
+    let mut identity_headers = HeaderMap::new();
+    identity_headers.insert("session_id", session_header.parse().unwrap());
+    let session_key = polyflare_server::session_key::header_session_key_scoped(
+        &identity_headers,
+        None,
+        Some("general"),
+    )
+    .expect("session header derives a pool-scoped continuity key")
+    .value;
     // Simulate Task 2's stamp: a PRIOR turn on this session already moved to a capable account.
     store
         .continuity()

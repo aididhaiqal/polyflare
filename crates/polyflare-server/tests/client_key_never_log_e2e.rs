@@ -12,7 +12,7 @@
 //!   2. publishes a `LogEvent` onto `crate::log_bus::LogBus` (backfill + the `/api/logs/stream`
 //!      SSE feed `crate::sse::logs_stream_handler` drains),
 //!   3. persists a `polyflare_store::RequestLogRecord` row to the `request_log` table
-//!      (fire-and-forget via `tokio::spawn` — see `ingress.rs::spawn_persist_request_log`).
+//!      (queued through the Store's bounded background writer).
 //!
 //! `RequestLog`/`RequestLogRecord`/`LogEvent` are all structurally content-free (no header/body
 //! field exists on any of them to leak into) — this suite's job is to prove that INVARIANT holds
@@ -137,6 +137,7 @@ async fn spawn(enforce_client_keys: bool) -> (String, Arc<AppState>) {
             live_logs: true,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -226,7 +227,7 @@ async fn never_logs_the_client_key_end_to_end() {
     insert_key_for_raw(&state.store, &raw, "sentinel").await;
 
     // Capture EVERY tracing event for the lifetime of this request — middleware AND handler AND
-    // the fire-and-forget request_log persist task all run on this same current-thread runtime's
+    // the background request_log writer all run on this same current-thread runtime's
     // single OS thread (see the comment on `require_client_key_middleware.rs`'s analogous test),
     // so a thread-local `set_default` here sees all of it.
     let buf = BufWriter::default();
@@ -259,8 +260,8 @@ async fn never_logs_the_client_key_end_to_end() {
         "the client-facing response body must never echo the presented key"
     );
 
-    // The request_log persist is fire-and-forget (`tokio::spawn` — see
-    // `ingress.rs::spawn_persist_request_log`); poll with a bounded, generous timeout instead of
+    // The request_log persist is queued through the Store's background writer; poll with a
+    // bounded, generous timeout instead of
     // assuming it landed the instant the HTTP response finished draining.
     let mut rows = Vec::new();
     for _ in 0..50 {

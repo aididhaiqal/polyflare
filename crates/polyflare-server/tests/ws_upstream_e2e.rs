@@ -123,6 +123,7 @@ async fn spawn_state(
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),

@@ -70,15 +70,26 @@ import {
   type UsageWindowView,
 } from "../lib/api";
 import { compactNum, countdown, pct } from "../lib/format";
+import {
+  quotaDisplayLabel,
+  quotaDisplayPercent,
+  quotaWindowIsPresent,
+} from "../lib/quotaDisplay";
 import { useAccount, useAccountTrends, useAccounts } from "../lib/queries";
 import { useAccountActions, type AccountActionsApi } from "../lib/useAccountActions";
+import { useQuotaDisplayPreference } from "../preferences/QuotaDisplayPreference";
+import {
+  routePseudonym,
+  ShieldedAccount,
+  useScreenShield,
+} from "../privacy/ScreenShield";
 import { Card } from "../ui/Card";
+import { CodexOnboardingDialog } from "../ui/CodexOnboardingDialog";
 import { Col, Grid } from "../ui/Grid";
 import {
   AlertTriangle,
   ChevronLeft,
   ChevronRight,
-  Download,
   Flame,
   Key,
   Layers,
@@ -87,11 +98,9 @@ import {
   Pencil,
   Play,
   Route,
-  RotateCcw,
   Search,
   ShieldCheck,
   Trash2,
-  Zap,
   type LucideIcon,
 } from "../ui/icons";
 import { providerBrandKey, ProviderTag } from "../ui/ProviderTag";
@@ -210,7 +219,7 @@ export function AccountDetail() {
   const detail = detailQuery.data;
 
   return (
-    <div className="flex flex-1 items-start gap-4">
+    <div className="flex flex-1 flex-col items-stretch gap-4 lg:flex-row lg:items-start">
       <AccountRail
         accounts={accounts}
         isLoading={accountsQuery.isLoading}
@@ -287,7 +296,7 @@ function AccountRail({
   const groups = groupByPool(orderAccounts(filtered));
 
   return (
-    <div className="flex w-[220px] shrink-0 flex-col gap-2 self-start rounded border border-border bg-card p-2.5">
+    <div className="flex w-full shrink-0 flex-col gap-2 self-start rounded-xl border border-border/80 bg-card/90 p-3 shadow-[0_12px_32px_hsl(var(--surface-shadow)/0.12)] lg:w-[232px]">
       <Link
         to="/accounts"
         className="px-0.5 text-[11.5px] font-semibold text-fg no-underline hover:text-accent"
@@ -305,7 +314,7 @@ function AccountRail({
         />
       </div>
 
-      <div className="flex max-h-[480px] flex-col gap-0.5 overflow-y-auto">
+      <div className="flex max-h-[220px] flex-col gap-0.5 overflow-y-auto lg:max-h-[560px]">
         {isLoading ? (
           <RailSkeleton />
         ) : isError ? (
@@ -359,13 +368,17 @@ function RailRow({
 }) {
   const tone = statusTone(account.status);
   const worst = worstUsedPercent(account);
+  const { active } = useScreenShield();
+  const { mode: quotaMode } = useQuotaDisplayPreference();
   // The mockup's rail meta line shows "id · provider" for the one row whose name is an alias (so
   // the real id is still visible somewhere), and "provider · status" for every plain-id row (no
   // point repeating the id right below itself).
   const isAliasName = displayName !== account.id;
-  const meta = isAliasName
-    ? `${account.id} · ${providerBrandKey(account.provider)}`
-    : `${providerBrandKey(account.provider)} · ${account.status.replace(/_/g, " ")}`;
+  const meta = active
+    ? `${providerBrandKey(account.provider)} · identity shielded`
+    : isAliasName
+      ? `${account.id} · ${providerBrandKey(account.provider)}`
+      : `${providerBrandKey(account.provider)} · ${account.status.replace(/_/g, " ")}`;
 
   return (
     <Link
@@ -378,14 +391,18 @@ function RailRow({
       {isSelected && <span className="absolute inset-y-1 left-0 w-[3px] rounded-full bg-accent" />}
       <span className={clsx("h-[7px] w-[7px] shrink-0 rounded-full", DOT_CLASS[tone])} />
       <span className="min-w-0 flex-1">
-        <span className="block truncate text-[11px] font-medium text-fg">{displayName}</span>
+        <ShieldedAccount
+          id={account.id}
+          label={displayName}
+          className="block truncate text-[11px] font-medium text-fg"
+        />
         <span className="block truncate text-[9px] text-fg opacity-55">{meta}</span>
       </span>
       <div className="h-[4px] w-8 shrink-0 overflow-hidden rounded-full bg-muted">
         {worst !== null && (
           <div
             className={clsx("h-full rounded-full", DOT_CLASS[usageRiskTone(worst)])}
-            style={{ width: `${Math.max(0, Math.min(100, worst))}%` }}
+            style={{ width: `${quotaDisplayPercent(worst, quotaMode)}%` }}
           />
         )}
       </div>
@@ -415,7 +432,11 @@ function NotFoundPanel({ id }: { id: string }) {
           <AlertTriangle className="h-4 w-4 shrink-0 text-warn" strokeWidth={1.9} />
           {id ? (
             <>
-              No account named <b className="font-mono">{id}</b> was found.
+              No account named{" "}
+              <b className="font-mono">
+                <ShieldedAccount id={id} label={id} />
+              </b>{" "}
+              was found.
             </>
           ) : (
             "No account selected."
@@ -536,67 +557,88 @@ function DetailContent({
   const displayName = identity.alias ?? identity.id;
   const tone = statusTone(detail.status);
   const token = tokenStatusText(detail.token_status, nowMs);
-  const quotaRows = [...detail.quota_windows].sort(
-    (a, b) => (WINDOW_ORDER[a.window] ?? 99) - (WINDOW_ORDER[b.window] ?? 99),
-  );
+  const quotaRows = detail.quota_windows
+    .filter((row) => row.window !== "five_hour" || quotaWindowIsPresent(row))
+    .sort((a, b) => (WINDOW_ORDER[a.window] ?? 99) - (WINDOW_ORDER[b.window] ?? 99));
+  const hasFiveHourWindow = quotaRows.some((row) => row.window === "five_hour");
   const actions = useAccountActions();
   const navigate = useNavigate();
+  const { active } = useScreenShield();
+  const { mode: quotaMode } = useQuotaDisplayPreference();
+  const [reauthOpen, setReauthOpen] = useState(false);
+  const weekly = quotaRows.find((row) => row.window === "weekly") ?? quotaRows[0] ?? null;
+  const weeklyDisplay = weekly ? quotaDisplayPercent(weekly.used_percent, quotaMode) : null;
 
   return (
-    <div className="flex flex-col gap-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className={clsx("h-[9px] w-[9px] shrink-0 rounded-full", DOT_CLASS[tone])} />
-        <span className="text-[15px] font-bold text-fg">{displayName}</span>
-        <button
-          type="button"
-          title="Edit alias"
-          onClick={() => actions.openRename({ id: identity.id, alias: identity.alias })}
-          className="inline-flex shrink-0 items-center text-fg opacity-60 hover:opacity-100"
-        >
-          <Pencil className="h-3.5 w-3.5" strokeWidth={1.8} />
-        </button>
-        <ProviderTag provider={identity.provider} />
-        <StatusPill status={detail.status} />
-
-        {cycleLabel && (
-          <div className="ml-auto flex shrink-0 items-center gap-1.5 text-[10.5px] text-fg opacity-60">
-            <span>{cycleLabel}</span>
-            <button
-              type="button"
-              onClick={onPrev}
-              disabled={!canCycle}
-              aria-label="Previous account"
-              className="flex h-[22px] w-[22px] items-center justify-center rounded border border-border bg-card text-fg opacity-70 hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30"
-            >
-              <ChevronLeft className="h-3.5 w-3.5" strokeWidth={2} />
-            </button>
-            <button
-              type="button"
-              onClick={onNext}
-              disabled={!canCycle}
-              aria-label="Next account"
-              className="flex h-[22px] w-[22px] items-center justify-center rounded border border-border bg-card text-fg opacity-70 hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30"
-            >
-              <ChevronRight className="h-3.5 w-3.5" strokeWidth={2} />
-            </button>
+    <div className="flex flex-col gap-4">
+      <Card className="gap-4 bg-gradient-to-br from-card via-card to-accent/[0.035]">
+        <div className="flex flex-wrap items-start gap-3">
+          <div className="flex min-w-0 flex-1 items-start gap-3">
+            <span
+              className={clsx(
+                "mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full ring-4 ring-muted",
+                DOT_CLASS[tone],
+              )}
+            />
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <ShieldedAccount
+                  id={identity.id}
+                  label={displayName}
+                  className="truncate text-[17px] font-bold tracking-tight text-fg"
+                />
+                <button
+                  type="button"
+                  title={active ? "Show identities to edit alias" : "Edit alias"}
+                  disabled={active}
+                  onClick={() => actions.openRename({ id: identity.id, alias: identity.alias })}
+                  className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-transparent text-fg opacity-55 hover:border-border hover:bg-muted hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-25"
+                >
+                  <Pencil className="h-3.5 w-3.5" strokeWidth={1.8} />
+                </button>
+                <ProviderTag provider={identity.provider} />
+                <StatusPill status={detail.status} />
+              </div>
+              <p className="mt-1.5 text-[11px] leading-relaxed text-fg opacity-60">
+                {active ? (
+                  "Identity and workspace shielded"
+                ) : (
+                  <>
+                    {identity.email}
+                    {identity.workspace_label && <> · {identity.workspace_label}</>}
+                  </>
+                )}
+                {" · "}
+                <span className="font-semibold text-fg opacity-90">{identity.plan_type}</span> plan
+                {" · "}
+                <span className="font-semibold text-fg opacity-90">
+                  {identity.pools.length > 0 ? identity.pools.join(", ") : "unpooled"}
+                </span>
+                {identity.seat_type && <> · {identity.seat_type} seat</>}
+              </p>
+            </div>
           </div>
-        )}
-      </div>
 
-      <p className="text-[10.5px] text-fg opacity-60">
-        {identity.email}
-        {identity.workspace_label && <> · {identity.workspace_label}</>}
-        {" · "}
-        <span className="font-medium text-fg opacity-90">{identity.plan_type}</span> plan
-        {" · pool "}
-        <span className="font-medium text-fg opacity-90">{identity.pool ?? "unpooled"}</span>
-        {identity.seat_type && (
-          <>
-            {" · seat "}
-            <span className="font-medium text-fg opacity-90">{identity.seat_type}</span>
-          </>
-        )}
-      </p>
+          {cycleLabel && (
+            <div className="flex shrink-0 items-center gap-1.5 rounded-lg border border-border bg-bg/55 p-1 text-[10.5px] text-fg">
+              <span className="px-1.5 opacity-55">{cycleLabel}</span>
+              <button type="button" onClick={onPrev} disabled={!canCycle} aria-label="Previous account" className="flex h-7 w-7 items-center justify-center rounded-md text-fg opacity-65 hover:bg-muted hover:opacity-100 disabled:opacity-30">
+                <ChevronLeft className="h-3.5 w-3.5" strokeWidth={2} />
+              </button>
+              <button type="button" onClick={onNext} disabled={!canCycle} aria-label="Next account" className="flex h-7 w-7 items-center justify-center rounded-md text-fg opacity-65 hover:bg-muted hover:opacity-100 disabled:opacity-30">
+                <ChevronRight className="h-3.5 w-3.5" strokeWidth={2} />
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className="grid grid-cols-2 gap-2 border-t border-border/70 pt-3 xl:grid-cols-4">
+          <HealthMetric label={`Weekly ${quotaDisplayLabel(quotaMode)}`} value={weeklyDisplay === null ? "—" : pct(weeklyDisplay)} hint={weekly ? `resets ${countdown(weekly.reset_at, nowMs)}` : "no quota reported"} tone={weekly ? usageRiskTone(weekly.used_percent) : undefined} />
+          <HealthMetric label="Token" value={token.text} hint="access credential" tone={detail.token_status.access_state === "valid" ? "ok" : detail.token_status.access_state === "expired" ? "error" : "warn"} />
+          <HealthMetric label="Requests" value={compactNum(detail.request_totals.request_count)} hint="all time" />
+          <HealthMetric label="Tokens routed" value={compactNum(detail.request_totals.total_tokens)} hint="all time" />
+        </div>
+      </Card>
 
       <Grid>
         <Col span={5}>
@@ -641,6 +683,7 @@ function DetailContent({
             primary={primary}
             secondary={secondary}
             forecast={forecast}
+            hasFiveHourWindow={hasFiveHourWindow}
           />
         </Col>
 
@@ -651,14 +694,40 @@ function DetailContent({
             status={detail.status}
             routingPolicy={detail.routing_policy}
             trustedAccess={detail.security_work_authorized}
-            pool={identity.pool}
+            pools={identity.pools}
             actions={actions}
+            onReauthenticate={() => setReauthOpen(true)}
             onDeleted={() => navigate("/accounts")}
           />
         </Col>
       </Grid>
 
       {actions.dialogs}
+      <CodexOnboardingDialog open={reauthOpen} onOpenChange={setReauthOpen} />
+    </div>
+  );
+}
+
+function HealthMetric({
+  label,
+  value,
+  hint,
+  tone,
+}: {
+  label: string;
+  value: string;
+  hint: string;
+  tone?: StatusTone;
+}) {
+  return (
+    <div className="rounded-lg border border-border/70 bg-bg/45 px-3 py-2.5">
+      <div className="text-[9px] font-semibold uppercase tracking-[0.08em] text-fg opacity-45">
+        {label}
+      </div>
+      <div className={clsx("mt-1 truncate text-[13px] font-bold text-fg", tone && TEXT_TONE_CLASS[tone])}>
+        {value}
+      </div>
+      <div className="mt-0.5 text-[9.5px] text-fg opacity-45">{hint}</div>
     </div>
   );
 }
@@ -666,16 +735,20 @@ function DetailContent({
 function QuotaRow({ row, nowMs }: { row: UsageWindowView; nowMs: number }) {
   const clamped = Math.max(0, Math.min(100, row.used_percent));
   const tone = usageRiskTone(clamped);
+  const { mode } = useQuotaDisplayPreference();
+  const displayed = quotaDisplayPercent(clamped, mode);
   return (
     <div className="mt-2 first:mt-0">
       <div className="flex items-center justify-between text-[10.5px]">
-        <span className="text-fg opacity-70">{labelForWindow(row.window)}</span>
-        <b className={TEXT_TONE_CLASS[tone]}>{pct(clamped)}</b>
+        <span className="text-fg opacity-70">
+          {labelForWindow(row.window)} {quotaDisplayLabel(mode)}
+        </span>
+        <b className={TEXT_TONE_CLASS[tone]}>{pct(displayed)}</b>
       </div>
       <div className="mt-1 h-[6px] overflow-hidden rounded-full bg-muted">
         <div
           className={clsx("h-full rounded-full", DOT_CLASS[tone])}
-          style={{ width: `${clamped}%` }}
+          style={{ width: `${displayed}%` }}
         />
       </div>
       <div className="mt-0.5 text-[9px] text-fg opacity-50">Reset {countdown(row.reset_at, nowMs)}</div>
@@ -765,6 +838,7 @@ function TrendCard({
   primary,
   secondary,
   forecast,
+  hasFiveHourWindow,
 }: {
   isLoading: boolean;
   isError: boolean;
@@ -772,12 +846,15 @@ function TrendCard({
   primary: Point[];
   secondary: Point[];
   forecast: DepletionForecast | null;
+  hasFiveHourWindow: boolean;
 }) {
+  const { mode } = useQuotaDisplayPreference();
+  const trendLabel = `7-day ${quotaDisplayLabel(mode)} trend`;
   if (isLoading) {
     return (
       <Card>
         <div className="text-[10px] uppercase tracking-wide text-fg opacity-60">
-          7-day usage trend
+          {trendLabel}
         </div>
         <div className="mt-2 h-52 animate-pulse rounded bg-muted" />
       </Card>
@@ -787,7 +864,7 @@ function TrendCard({
     return (
       <Card>
         <div className="text-[10px] uppercase tracking-wide text-fg opacity-60">
-          7-day usage trend
+          {trendLabel}
         </div>
         <div className="mt-2 flex flex-1 flex-col items-start justify-center gap-1.5 text-[11px] text-error">
           <span className="flex items-center gap-1.5">
@@ -806,17 +883,22 @@ function TrendCard({
     );
   }
 
-  const hasData = primary.length > 0 || secondary.length > 0;
-  const merged = mergeTrend(primary, secondary);
+  const visiblePrimary = hasFiveHourWindow ? primary : [];
+  const hasData = visiblePrimary.length > 0 || secondary.length > 0;
+  const merged = mergeTrend(visiblePrimary, secondary).map((row) => ({
+    ...row,
+    primary: row.primary === null ? null : quotaDisplayPercent(row.primary, mode),
+    secondary: row.secondary === null ? null : quotaDisplayPercent(row.secondary, mode),
+  }));
 
   return (
     <Card>
       <div className="flex items-center justify-between text-[10px] uppercase tracking-wide text-fg opacity-60">
-        <span>7-day usage trend</span>
+        <span>{trendLabel}</span>
         <span className="flex items-center gap-2">
           {forecast && <DepletionRiskBadge forecast={forecast} />}
           <span className="flex items-center gap-3 normal-case tracking-normal text-[9px] opacity-80">
-            <LegendSwatch colorClass="bg-codex" label="5h" />
+            {hasFiveHourWindow && <LegendSwatch colorClass="bg-codex" label="5h" />}
             <LegendSwatch colorClass="bg-claude" label="Weekly" />
           </span>
         </span>
@@ -828,10 +910,12 @@ function TrendCard({
           <ResponsiveContainer width="100%" height="100%">
             <AreaChart data={merged} margin={{ top: 4, right: 6, bottom: 0, left: -18 }}>
               <defs>
-                <linearGradient id="trend-5h" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="hsl(var(--codex))" stopOpacity={0.32} />
-                  <stop offset="100%" stopColor="hsl(var(--codex))" stopOpacity={0} />
-                </linearGradient>
+                {hasFiveHourWindow && (
+                  <linearGradient id="trend-5h" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="hsl(var(--codex))" stopOpacity={0.32} />
+                    <stop offset="100%" stopColor="hsl(var(--codex))" stopOpacity={0} />
+                  </linearGradient>
+                )}
                 <linearGradient id="trend-weekly" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0%" stopColor="hsl(var(--claude))" stopOpacity={0.22} />
                   <stop offset="100%" stopColor="hsl(var(--claude))" stopOpacity={0} />
@@ -856,15 +940,17 @@ function TrendCard({
                 isAnimationActive={false}
                 dot={false}
               />
-              <Area
-                type="monotone"
-                dataKey="primary"
-                stroke="hsl(var(--codex))"
-                strokeWidth={1.7}
-                fill="url(#trend-5h)"
-                isAnimationActive={false}
-                dot={false}
-              />
+              {hasFiveHourWindow && (
+                <Area
+                  type="monotone"
+                  dataKey="primary"
+                  stroke="hsl(var(--codex))"
+                  strokeWidth={1.7}
+                  fill="url(#trend-5h)"
+                  isAnimationActive={false}
+                  dot={false}
+                />
+              )}
             </AreaChart>
           </ResponsiveContainer>
         </div>
@@ -897,8 +983,9 @@ function ActionsCard({
   status,
   routingPolicy,
   trustedAccess,
-  pool,
+  pools,
   actions,
+  onReauthenticate,
   onDeleted,
 }: {
   id: string;
@@ -906,25 +993,36 @@ function ActionsCard({
   status: string;
   routingPolicy: string;
   trustedAccess: boolean;
-  pool: string | null;
+  pools: string[];
   actions: AccountActionsApi;
+  onReauthenticate: () => void;
   onDeleted: () => void;
 }) {
   const paused = status === "paused";
-  const displayLabel = alias ?? id;
+  const { active } = useScreenShield();
+  const displayLabel = active ? routePseudonym(id) : alias ?? id;
   return (
     <Card>
-      <div className="flex items-center gap-2 text-[10px] uppercase tracking-wide text-fg opacity-60">
-        <span>Actions</span>
-        <span className="rounded bg-accent/[0.14] px-1.5 py-0.5 text-[8px] font-bold normal-case tracking-normal text-accent">
-          admin · phase 3
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-fg opacity-65">
+            Account controls
+          </div>
+          <p className="mt-1 text-[10px] text-fg opacity-45">
+            Routing changes apply to the next eligible selection.
+          </p>
+        </div>
+        <span className={clsx("rounded-full px-2 py-1 text-[9px] font-semibold", paused ? "bg-warn/10 text-warn" : "bg-success/10 text-success")}>
+          {paused ? "Manually paused" : "Ready for routing"}
         </span>
       </div>
 
-      <div className="mt-2.5 grid grid-cols-1 gap-4 md:grid-cols-3">
+      <div className="mt-4 grid grid-cols-1 gap-5 lg:grid-cols-2">
         {/* Configuration */}
-        <div className="flex flex-col gap-2.5">
-          <div className="text-[9px] uppercase tracking-wide text-fg opacity-50">Configuration</div>
+        <div className="flex flex-col gap-3 rounded-lg border border-border/70 bg-bg/35 p-3">
+          <div className="text-[9px] font-semibold uppercase tracking-wide text-fg opacity-50">
+            Routing &amp; access
+          </div>
 
           <ConfigRow icon={Route} label="Routing policy">
             <select
@@ -965,45 +1063,29 @@ function ActionsCard({
             </button>
           </ConfigRow>
 
-          <ConfigRow icon={Layers} label="Pool">
+          <ConfigRow icon={Layers} label="Routing groups">
             <button
               type="button"
-              onClick={() => actions.openSetPool({ id, pool })}
-              className="rounded border border-border bg-bg px-2 py-1 text-[10.5px] text-fg hover:border-accent"
+              onClick={() => actions.openSetPool({ id, pools })}
+              className="max-w-[220px] truncate rounded border border-border bg-bg px-2 py-1 text-[10.5px] text-fg hover:border-accent"
             >
-              {pool ?? "unpooled"}
+              {pools.length > 0 ? pools.join(", ") : "unpooled"}
             </button>
           </ConfigRow>
 
-          <ConfigRow icon={Flame} label="Limit warm-up">
-            <span className="rounded bg-muted px-1.5 py-0.5 text-[9px] text-fg opacity-50">
-              not tracked
+          <ConfigRow icon={Flame} label="Warm-up policy">
+            <span className="rounded bg-muted px-2 py-1 text-[9px] text-fg opacity-50">
+              server default
             </span>
           </ConfigRow>
         </div>
 
-        {/* Rate-limit resets */}
-        <div className="flex flex-col gap-2 border-t border-border pt-3 md:border-l md:border-t-0 md:pl-4 md:pt-0">
-          <div className="text-[9px] uppercase tracking-wide text-fg opacity-50">
-            Rate-limit resets
-          </div>
-          <p className="text-[10px] text-fg opacity-50">
-            Reset-credit tracking isn&apos;t available yet — this MVP has no backend field for it.
-          </p>
-          <button
-            type="button"
-            disabled
-            className="inline-flex w-fit cursor-not-allowed items-center gap-1.5 rounded border border-border bg-muted px-2.5 py-1 text-[10px] text-fg opacity-40"
-          >
-            <RotateCcw className="h-3 w-3" strokeWidth={2} />
-            Redeem soonest
-          </button>
-        </div>
-
         {/* Operations + Danger */}
-        <div className="flex flex-col gap-2.5 border-t border-border pt-3 md:border-l md:border-t-0 md:pl-4 md:pt-0">
-          <div className="text-[9px] uppercase tracking-wide text-fg opacity-50">Operations</div>
-          <div className="grid grid-cols-2 gap-1.5">
+        <div className="flex flex-col gap-3 rounded-lg border border-border/70 bg-bg/35 p-3">
+          <div className="text-[9px] font-semibold uppercase tracking-wide text-fg opacity-50">
+            Lifecycle
+          </div>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
             <OpButton
               icon={paused ? Play : Pause}
               label={paused ? "Resume" : "Pause"}
@@ -1011,19 +1093,25 @@ function ActionsCard({
                 actions.patch.mutate({ id, body: { status: paused ? "active" : "paused" } })
               }
             />
-            <OpButton icon={Zap} label="Force probe" />
-            <OpButton icon={LogIn} label="Re-authenticate" />
-            <OpButton icon={Download} label="Export auth" />
+            <OpButton icon={LogIn} label="Re-authenticate" onClick={onReauthenticate} />
           </div>
-          <div className="mt-1.5 text-[9px] font-semibold uppercase tracking-wide text-error opacity-80">
-            Danger
+          <div className="rounded-md border border-border/60 bg-muted/35 px-3 py-2 text-[9.5px] leading-relaxed text-fg opacity-50">
+            Force probe and credential export stay unavailable until PolyFlare has explicit,
+            audited backend operations for them.
           </div>
-          <OpButton
-            icon={Trash2}
-            label="Delete account"
-            danger
-            onClick={() => actions.openDelete({ id, label: displayLabel, onDeleted })}
-          />
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/70 pt-3">
+            <span className="text-[9px] font-semibold uppercase tracking-wide text-error opacity-75">
+              Danger zone
+            </span>
+            <button
+              type="button"
+              onClick={() => actions.openDelete({ id, label: displayLabel, onDeleted })}
+              className="flex items-center gap-1.5 rounded-md border border-error/35 bg-error/10 px-3 py-1.5 text-[10.5px] font-semibold text-error hover:bg-error/15"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              Delete account
+            </button>
+          </div>
         </div>
       </div>
     </Card>

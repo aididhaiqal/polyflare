@@ -51,6 +51,7 @@ fn core_account(base_url: String) -> polyflare_core::Account {
         base_url,
         bearer_token: "tok".into(),
         chatgpt_account_id: None,
+        is_fedramp: false,
     }
 }
 

@@ -63,12 +63,25 @@ pub enum ScriptedTurn {
     /// A normal turn: emit `events` verbatim as WS text frames, then a terminal
     /// `response.completed` carrying a freshly generated `resp_N` id.
     Turn { events: Vec<String> },
+    /// A normal turn whose terminal `response.completed` includes the numeric usage object emitted
+    /// by the real Codex WS API. Kept separate from `Turn` so existing relay tests retain their
+    /// minimal historical fixture while telemetry tests can exercise the complete wire shape.
+    TurnWithUsage {
+        events: Vec<String>,
+        input_tokens: i64,
+        output_tokens: i64,
+        cached_input_tokens: i64,
+        reasoning_tokens: i64,
+    },
     /// A terminal `response.failed` carrying `error.code` / `error.message` — no preceding
     /// `events`. This is a genuine terminal-failure shape (ground truth §3: `ContextWindowExceeded`
     /// / `QuotaExceeded` / etc.) — NOT what a dead anchor emits; see
     /// [`ScriptedTurn::previous_response_not_found`] for that (it is a wrapped error envelope, not
     /// this variant).
     Failed { code: String, message: String },
+    /// A terminal `response.incomplete`. The socket remains open for later turns, matching the
+    /// reusable upstream connection contract.
+    Incomplete { reason: String },
     /// The WS-only wrapped error envelope (ground truth §3):
     /// `{"type":"error","status":u16,"error":{"code","message",..error_extra},"headers":{...}}`.
     ErrorEnvelope {
@@ -81,9 +94,21 @@ pub enum ScriptedTurn {
         error_extra: Vec<(String, String)>,
         headers: Vec<(String, String)>,
     },
+    /// Emit ordinary response events before a wrapped error envelope. This models an error after
+    /// client-visible progress, where a proxy must not retry or replay the turn.
+    ErrorAfterEvents {
+        events: Vec<String>,
+        status: u16,
+        code: String,
+        message: String,
+    },
     /// Emit `events_before_close` (non-terminal — no `response.completed`/`.failed`), then close
     /// the socket. Models "close mid-stream, before any terminal frame".
     CloseMidStream { events_before_close: Vec<String> },
+    /// A COMPLETE normal turn (events + terminal `response.completed`), after which the server
+    /// closes the socket — a between-turns upstream death (idle reap / server-side teardown while
+    /// parked), as opposed to [`ScriptedTurn::CloseMidStream`]'s in-turn drop.
+    TurnThenClose { events: Vec<String> },
     /// Accept the frame (it IS recorded) and never send anything back. Models a stall past the
     /// client's idle timeout.
     Stall,
@@ -94,6 +119,30 @@ impl ScriptedTurn {
     /// generated id.
     pub fn normal(events: Vec<String>) -> Self {
         ScriptedTurn::Turn { events }
+    }
+
+    /// A normal, COMPLETED turn after which the server closes the socket — a between-turns
+    /// upstream death. Lets a test prove the relay's honest-close mirror: the downstream must
+    /// close too, instead of hiding a dead anchor behind a still-open client socket.
+    pub fn normal_then_close(events: Vec<String>) -> Self {
+        ScriptedTurn::TurnThenClose { events }
+    }
+
+    /// A successful turn with final token accounting in `response.completed`.
+    pub fn normal_with_usage(
+        events: Vec<String>,
+        input_tokens: i64,
+        output_tokens: i64,
+        cached_input_tokens: i64,
+        reasoning_tokens: i64,
+    ) -> Self {
+        ScriptedTurn::TurnWithUsage {
+            events,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            reasoning_tokens,
+        }
     }
 
     /// The wrapped error envelope a dead `previous_response_id` actually gets, per the
@@ -168,6 +217,12 @@ impl ScriptedTurn {
         }
     }
 
+    pub fn incomplete(reason: impl Into<String>) -> Self {
+        ScriptedTurn::Incomplete {
+            reason: reason.into(),
+        }
+    }
+
     /// Accept the frame (recorded) and never respond.
     pub fn stall() -> Self {
         ScriptedTurn::Stall
@@ -182,7 +237,9 @@ impl ScriptedTurn {
 pub struct MockWsUpstream {
     script: Arc<Mutex<Vec<ScriptedTurn>>>,
     handshake_count: Arc<AtomicUsize>,
+    handshake_attempt: Arc<AtomicUsize>,
     frames: Arc<Mutex<Vec<RecordedFrame>>>,
+    handshake_authorizations: Arc<Mutex<Vec<Option<String>>>>,
     id_counter: Arc<AtomicU32>,
     /// When set, every upgrade attempt is answered with a plain HTTP 426 instead of upgrading —
     /// see [`Self::rejecting_handshake`].
@@ -194,6 +251,14 @@ pub struct MockWsUpstream {
     /// replay path end to end. `None` (the default) sends no such header. See
     /// [`Self::with_upgrade_turn_state`].
     upgrade_turn_state: Option<String>,
+    /// Optional per-handshake upgrade-response headers. The final entry repeats after the
+    /// sequence is exhausted, matching the scripted-turn behavior. This is test-only support for
+    /// proving that a transparent proxy reconnect does not hide a changed upstream handshake
+    /// contract from its already-upgraded downstream client.
+    upgrade_response_headers: Arc<Vec<Vec<(String, String)>>>,
+    /// Optional authorization requirement per handshake attempt. `None` accepts any bearer; a
+    /// `Some` value rejects mismatches with HTTP 401 before upgrading. The final entry repeats.
+    handshake_required_authorizations: Arc<Vec<Option<String>>>,
     /// When set (opt-in, via [`Self::capturing_raw_frames`]), [`handle_socket`] stashes each received
     /// frame's RAW text — byte-for-byte as it arrived on the wire — into [`Self::raw_frames`], so a
     /// relay VERBATIM-fidelity test can assert the proxy forwarded the client's frame UNCHANGED (key
@@ -203,6 +268,10 @@ pub struct MockWsUpstream {
     /// The raw received-frame text buffer, populated only when [`Self::capture_raw_frames`] is on.
     /// Read via [`Self::raw_frames`].
     raw_frames: Arc<Mutex<Vec<String>>>,
+    /// Count of WS protocol `Ping` frames received across every socket this mock has served —
+    /// read via [`Self::ping_count`]. Lets a keepalive test prove the relay actually pings a
+    /// parked upstream (axum auto-pongs; the mock only needs to observe).
+    ping_count: Arc<AtomicUsize>,
 }
 
 impl MockWsUpstream {
@@ -222,13 +291,23 @@ impl MockWsUpstream {
         Self {
             script: Arc::new(Mutex::new(script)),
             handshake_count: Arc::new(AtomicUsize::new(0)),
+            handshake_attempt: Arc::new(AtomicUsize::new(0)),
             frames: Arc::new(Mutex::new(Vec::new())),
+            handshake_authorizations: Arc::new(Mutex::new(Vec::new())),
             id_counter: Arc::new(AtomicU32::new(0)),
             reject_handshake: false,
             upgrade_turn_state: None,
+            upgrade_response_headers: Arc::new(Vec::new()),
+            handshake_required_authorizations: Arc::new(Vec::new()),
             capture_raw_frames: false,
             raw_frames: Arc::new(Mutex::new(Vec::new())),
+            ping_count: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// How many WS protocol `Ping` frames have arrived across every socket served so far.
+    pub fn ping_count(&self) -> usize {
+        self.ping_count.load(Ordering::SeqCst)
     }
 
     /// Answer every WS UPGRADE with `x-codex-turn-state: {token}` on the 101 response header — the
@@ -239,6 +318,27 @@ impl MockWsUpstream {
     /// from every later turn's frame on the same reused socket. Content-free routing token.
     pub fn with_upgrade_turn_state(mut self, token: impl Into<String>) -> Self {
         self.upgrade_turn_state = Some(token.into());
+        self
+    }
+
+    /// Configure allowlisted upgrade-response metadata per accepted handshake. When more
+    /// handshakes occur than entries, the last entry repeats.
+    pub fn with_upgrade_response_headers(mut self, sequence: Vec<Vec<(String, String)>>) -> Self {
+        assert!(
+            !sequence.is_empty(),
+            "upgrade-response header sequence must not be empty"
+        );
+        self.upgrade_response_headers = Arc::new(sequence);
+        self
+    }
+
+    /// Configure accepted Authorization values by handshake attempt. The final entry repeats.
+    pub fn with_handshake_authorizations(mut self, sequence: Vec<Option<String>>) -> Self {
+        assert!(
+            !sequence.is_empty(),
+            "handshake authorization sequence must not be empty"
+        );
+        self.handshake_required_authorizations = Arc::new(sequence);
         self
     }
 
@@ -282,6 +382,11 @@ impl MockWsUpstream {
     /// Every recorded `response.create` frame, in receipt order.
     pub fn frames(&self) -> Vec<RecordedFrame> {
         self.frames.lock().unwrap().clone()
+    }
+
+    /// Authorization header observed on each accepted handshake, in attempt order.
+    pub fn handshake_authorizations(&self) -> Vec<Option<String>> {
+        self.handshake_authorizations.lock().unwrap().clone()
     }
 
     /// The most recently received frame's `input` array length, if any frame has been recorded.
@@ -353,6 +458,7 @@ impl MockWsUpstream {
 async fn ws_handler(
     State(mock): State<MockWsUpstream>,
     ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     if mock.reject_handshake {
         // Ground truth §5: `FallbackToHttp`'s ONLY trigger is HTTP 426 at handshake time, checked
@@ -360,6 +466,33 @@ async fn ws_handler(
         // established for this connection attempt.
         return (StatusCode::UPGRADE_REQUIRED, "Upgrade Required").into_response();
     }
+    let attempt = mock.handshake_attempt.fetch_add(1, Ordering::SeqCst);
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    mock.handshake_authorizations
+        .lock()
+        .unwrap()
+        .push(authorization.clone());
+    let required_authorization = mock
+        .handshake_required_authorizations
+        .get(attempt)
+        .or_else(|| mock.handshake_required_authorizations.last())
+        .cloned()
+        .flatten();
+    if required_authorization
+        .as_ref()
+        .is_some_and(|required| authorization.as_ref() != Some(required))
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let upgrade_response_headers = mock
+        .upgrade_response_headers
+        .get(attempt)
+        .or_else(|| mock.upgrade_response_headers.last())
+        .cloned()
+        .unwrap_or_default();
     let upgrade_turn_state = mock.upgrade_turn_state.clone();
     let mut response = ws
         .on_upgrade(move |socket| handle_socket(socket, mock))
@@ -373,6 +506,14 @@ async fn ws_handler(
             response
                 .headers_mut()
                 .insert(HeaderName::from_static("x-codex-turn-state"), value);
+        }
+    }
+    for (name, value) in upgrade_response_headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            response.headers_mut().insert(name, value);
         }
     }
     response
@@ -391,6 +532,11 @@ async fn handle_socket(mut socket: WebSocket, mock: MockWsUpstream) {
         let text = match msg {
             Message::Text(t) => t,
             Message::Close(_) => return,
+            Message::Ping(_) => {
+                // Observed for keepalive tests (axum already auto-pongs at the protocol layer).
+                mock.ping_count.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
             _ => continue,
         };
         // Opt-in VERBATIM proof: stash the raw wire bytes BEFORE any parse, so a relay test can
@@ -424,6 +570,52 @@ async fn handle_socket(mut socket: WebSocket, mock: MockWsUpstream) {
                 // Loop back around: the socket stays open for a POSSIBLE next turn (the whole
                 // point of the connection-reuse proof) instead of closing after one exchange.
             }
+            ScriptedTurn::TurnThenClose { events } => {
+                for e in &events {
+                    if socket.send(Message::Text(e.clone().into())).await.is_err() {
+                        return;
+                    }
+                }
+                let n = mock.id_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let id = format!("resp_{n}");
+                let completed =
+                    json!({"type":"response.completed","response":{"id": id}}).to_string();
+                let _ = socket.send(Message::Text(completed.into())).await;
+                // Between-turns server-side death: the turn completed cleanly, THEN the server
+                // closes. `return` drops the socket (axum sends the close handshake).
+                return;
+            }
+            ScriptedTurn::TurnWithUsage {
+                events,
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                reasoning_tokens,
+            } => {
+                for e in &events {
+                    if socket.send(Message::Text(e.clone().into())).await.is_err() {
+                        return;
+                    }
+                }
+                let n = mock.id_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let id = format!("resp_{n}");
+                let completed = json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": id,
+                        "usage": {
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "input_tokens_details": {"cached_tokens": cached_input_tokens},
+                            "output_tokens_details": {"reasoning_tokens": reasoning_tokens}
+                        }
+                    }
+                })
+                .to_string();
+                if socket.send(Message::Text(completed.into())).await.is_err() {
+                    return;
+                }
+            }
             // `Failed` and `ErrorEnvelope` both deliberately leave the socket OPEN afterward (the
             // loop falls through, no `return`): this mock only ever models client-driven reconnect
             // — ground truth §2's "ordinary reconnect" — never server-side termination. A caller
@@ -432,6 +624,17 @@ async fn handle_socket(mut socket: WebSocket, mock: MockWsUpstream) {
                 let frame = json!({
                     "type": "response.failed",
                     "response": {"error": {"code": code, "message": message}},
+                })
+                .to_string();
+                let _ = socket.send(Message::Text(frame.into())).await;
+            }
+            ScriptedTurn::Incomplete { reason } => {
+                let frame = json!({
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp_incomplete",
+                        "incomplete_details": {"reason": reason}
+                    },
                 })
                 .to_string();
                 let _ = socket.send(Message::Text(frame.into())).await;
@@ -458,6 +661,26 @@ async fn handle_socket(mut socket: WebSocket, mock: MockWsUpstream) {
                     "status": status,
                     "error": error_obj,
                     "headers": headers_obj,
+                })
+                .to_string();
+                let _ = socket.send(Message::Text(frame.into())).await;
+            }
+            ScriptedTurn::ErrorAfterEvents {
+                events,
+                status,
+                code,
+                message,
+            } => {
+                for event in events {
+                    if socket.send(Message::Text(event.into())).await.is_err() {
+                        return;
+                    }
+                }
+                let frame = json!({
+                    "type": "error",
+                    "status": status,
+                    "error": {"code": code, "message": message},
+                    "headers": {},
                 })
                 .to_string();
                 let _ = socket.send(Message::Text(frame.into())).await;

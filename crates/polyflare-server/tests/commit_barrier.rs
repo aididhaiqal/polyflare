@@ -39,6 +39,7 @@ fn core_account(base_url: String) -> Account {
         base_url,
         bearer_token: "tok".into(),
         chatgpt_account_id: None,
+        is_fedramp: false,
     }
 }
 
@@ -127,7 +128,7 @@ impl Executor for ErrorFirstExecutor {
         _ctx: &RequestCtx,
     ) -> Result<ResponseStream, ExecError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::pin(stream::once(async {
+        Ok(ResponseStream::new(stream::once(async {
             Err(ExecError::Stream("connection reset".into()))
         })))
     }
@@ -151,7 +152,7 @@ impl Executor for ByteThenErrorExecutor {
             b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
         ));
         let drop = Err(ExecError::Stream("mid-stream drop".into()));
-        Ok(Box::pin(stream::iter(vec![first, drop])))
+        Ok(ResponseStream::new(stream::iter(vec![first, drop])))
     }
 }
 
@@ -174,6 +175,7 @@ async fn executor_err_before_any_stream_is_not_committed() {
         RequestCtx::default(),
         Default::default(),
         Duration::ZERO, // idle_timeout: disabled, not under test here
+        3,
         commit.clone(),
         None, // C9 Task 2: no in-flight lease under test here — commit-barrier only.
     )
@@ -215,6 +217,7 @@ async fn first_frame_reject_before_relay_is_not_committed() {
             RequestCtx::default(),
             Default::default(),
             Duration::ZERO, // idle_timeout: disabled, not under test here
+            3,
             commit.clone(),
             None, // C9 Task 2: no in-flight lease under test here — commit-barrier only.
         ),
@@ -258,6 +261,7 @@ async fn mid_stream_failure_after_a_relayed_byte_is_committed() {
         RequestCtx::default(),
         Default::default(),
         Duration::ZERO, // idle_timeout: disabled, not under test here
+        3,
         commit.clone(),
         None, // C9 Task 2: no in-flight lease under test here — commit-barrier only.
     )
@@ -317,6 +321,7 @@ async fn clean_completion_still_observes_and_the_flag_does_not_interfere() {
         RequestCtx::default(),
         Default::default(),
         Duration::ZERO, // idle_timeout: disabled, not under test here
+        3,
         commit.clone(),
         None, // C9 Task 2: no in-flight lease under test here — commit-barrier only.
     )

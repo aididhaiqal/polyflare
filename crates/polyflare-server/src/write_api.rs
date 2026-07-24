@@ -16,7 +16,9 @@ use axum::Json;
 use serde::{Deserialize, Deserializer};
 
 use crate::app::AppState;
-use crate::read_api::{live_field_kind, FieldKind, LIVE_KEYS_ORDER};
+use crate::read_api::{
+    live_field_kind, restart_field_kind, FieldKind, LIVE_KEYS_ORDER, RESTART_KEYS_ORDER,
+};
 use crate::runtime_settings::SettingValue;
 
 fn unix_now() -> i64 {
@@ -45,6 +47,17 @@ const ROUTING_POLICIES: &[&str] = &["normal", "burn_first", "preserve"];
 /// alone (it only moves accounts already in a usage-controlled status).
 const SETTABLE_STATUSES: &[&str] = &["active", "paused"];
 
+/// Canonical routing-group tag: lowercase ASCII, 1..=48 characters, beginning with an
+/// alphanumeric and containing only alphanumerics, `_`, or `-` thereafter.
+pub fn valid_pool_slug(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=48).contains(&bytes.len())
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_' || *b == b'-')
+}
+
 /// A partial account-settings update. Each field is optional: absent means "leave unchanged". For
 /// `pool`, an explicit `null` means "clear (unpool)" and a string means "assign/create" — hence the
 /// double option (absent vs null vs value are three distinct intents).
@@ -52,6 +65,9 @@ const SETTABLE_STATUSES: &[&str] = &["active", "paused"];
 pub struct AccountPatch {
     #[serde(default, deserialize_with = "double_option")]
     pool: Option<Option<String>>,
+    /// Complete routing-group membership replacement. An empty list makes the account unpooled.
+    #[serde(default)]
+    pools: Option<Vec<String>>,
     #[serde(default)]
     routing_policy: Option<String>,
     #[serde(default)]
@@ -100,6 +116,27 @@ pub async fn patch_account_handler(
             return bad_request("status may only be set to active or paused");
         }
     }
+    if let Some(Some(pool)) = &patch.pool {
+        if !valid_pool_slug(pool) {
+            return bad_request(
+                "pool must be a 1..=48 character lowercase slug using a-z, 0-9, _ or -",
+            );
+        }
+    }
+    if patch.pool.is_some() && patch.pools.is_some() {
+        return bad_request("pool and pools cannot be updated together");
+    }
+    if let Some(pools) = &patch.pools {
+        if pools.iter().any(|pool| !valid_pool_slug(pool)) {
+            return bad_request(
+                "every pool must be a 1..=48 character lowercase slug using a-z, 0-9, _ or -",
+            );
+        }
+        let unique = pools.iter().collect::<std::collections::HashSet<_>>();
+        if unique.len() != pools.len() {
+            return bad_request("pools must not contain duplicate slugs");
+        }
+    }
     // `alias`: present means set/clear. A non-empty trimmed value must be 1..=64 chars; an
     // empty/whitespace value clears (normalized to None below).
     if let Some(Some(a)) = &patch.alias {
@@ -112,6 +149,11 @@ pub async fn patch_account_handler(
     // Apply. Each helper bumps the store generation, so the account cache re-reads on next selection.
     if let Some(pool) = &patch.pool {
         if repo.update_pool(&id, pool.as_deref()).await.is_err() {
+            return internal_error();
+        }
+    }
+    if let Some(pools) = &patch.pools {
+        if repo.replace_pools(&id, pools).await.is_err() {
             return internal_error();
         }
     }
@@ -143,6 +185,46 @@ pub async fn patch_account_handler(
     }
 
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CreatePoolRequest {
+    slug: String,
+    account_ids: Vec<String>,
+}
+
+/// Create a usable routing group by adding the selected accounts as members without removing any
+/// of their existing memberships. Empty groups remain unsupported because there is no pools table.
+pub async fn create_pool_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreatePoolRequest>,
+) -> Response {
+    let slug = body.slug.trim();
+    if !valid_pool_slug(slug) {
+        return bad_request(
+            "slug must be a 1..=48 character lowercase value using a-z, 0-9, _ or -",
+        );
+    }
+    if body.account_ids.is_empty() {
+        return bad_request("account_ids must contain at least one account");
+    }
+    let unique = body
+        .account_ids
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    if unique.len() != body.account_ids.len() || body.account_ids.iter().any(|id| id.is_empty()) {
+        return bad_request("account_ids must be unique and non-empty");
+    }
+    match state
+        .store
+        .accounts()
+        .assign_pool_atomic(&body.account_ids, slug)
+        .await
+    {
+        Ok(true) => Json(serde_json::json!({ "ok": true, "slug": slug })).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "one or more accounts do not exist").into_response(),
+        Err(_) => internal_error(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -197,14 +279,15 @@ pub async fn patch_settings_handler(
     // Validate first (fail closed, all-or-nothing): every key present must be one of the 10 live
     // keys, and every value must coerce to that field's kind. Collected in the FIXED canonical
     // order (budget before heartbeat) — see this fn's doc.
-    let mut to_apply: Vec<(&'static str, SettingValue)> = Vec::new();
-    for key in LIVE_KEYS_ORDER {
+    let mut to_apply: Vec<(&'static str, SettingValue, bool)> = Vec::new();
+    for key in LIVE_KEYS_ORDER.iter().chain(RESTART_KEYS_ORDER.iter()) {
         let Some(raw) = obj.get(*key) else {
             continue;
         };
-        let kind = match live_field_kind(key) {
-            Some(k) => k,
-            None => return bad_request("unknown or non-live setting key"),
+        let is_live = live_field_kind(key).is_some();
+        let kind = match live_field_kind(key).or_else(|| restart_field_kind(key)) {
+            Some(kind) => kind,
+            None => return bad_request("unknown or non-editable setting key"),
         };
         let value = match kind {
             FieldKind::U64 => match raw.as_u64() {
@@ -220,20 +303,27 @@ pub async fn patch_settings_handler(
                 None => return bad_request("value must be a boolean"),
             },
         };
-        to_apply.push((*key, value));
+        to_apply.push((*key, value, is_live));
     }
     // Any key in the body that isn't one of the 10 live keys never reaches `set` — reject the
     // whole PATCH instead of silently ignoring it.
     if obj.len() != to_apply.len() {
-        return bad_request("unknown or non-live setting key");
+        return bad_request("unknown or non-editable setting key");
     }
 
     // Apply + persist, in the same canonical order just validated.
     let now = unix_now();
-    for (key, value) in to_apply {
-        let stored = match state.runtime_settings.set(key, value) {
-            Ok(s) => s,
-            Err(_) => return bad_request("invalid setting value"),
+    for (key, value, is_live) in to_apply {
+        let stored = if is_live {
+            match state.runtime_settings.set(key, value) {
+                Ok(stored) => stored,
+                Err(_) => return bad_request("invalid setting value"),
+            }
+        } else {
+            match restart_setting_string(key, value) {
+                Some(stored) => stored,
+                None => return bad_request("invalid restart-required setting value"),
+            }
         };
         if state.store.settings().set(key, &stored, now).await.is_err() {
             return internal_error();
@@ -241,6 +331,24 @@ pub async fn patch_settings_handler(
     }
 
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
+fn restart_setting_string(key: &str, value: SettingValue) -> Option<String> {
+    match (key, value) {
+        (
+            "client_websocket_enabled"
+            | "http_requests_use_upstream_websocket"
+            | "http_upstream_websocket_ping",
+            SettingValue::Bool(value),
+        ) => Some(value.to_string()),
+        ("websocket_idle_ping_secs", SettingValue::U64(value)) => {
+            Some(crate::config::clamp_websocket_idle_ping_secs(value).to_string())
+        }
+        ("websocket_idle_budget_secs", SettingValue::U64(value)) => {
+            Some(crate::config::clamp_websocket_idle_budget_secs(value).to_string())
+        }
+        _ => None,
+    }
 }
 
 // --- Dashboard API-keys subsystem Outcome 1: `POST /api/keys` (create-show-once) + `PATCH

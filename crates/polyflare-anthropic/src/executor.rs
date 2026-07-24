@@ -74,6 +74,6 @@ impl Executor for AnthropicExecutor {
             .bytes_stream()
             .map(|chunk| chunk.map_err(|e| ExecError::Stream(e.to_string())));
 
-        Ok(Box::pin(stream))
+        Ok(ResponseStream::new(stream))
     }
 }

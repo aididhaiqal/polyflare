@@ -57,14 +57,15 @@ impl From<ResolvedWindow> for WindowView {
 }
 
 /// One entry of `AccountView::usage`: a named rate-limit window (`"five_hour"` | `"weekly"`), how
-/// full it is, and when it resets. The array is ADAPTIVE — a window the provider/account doesn't
-/// report at all (e.g. `five_hour` during the current no-5h-limit promo) is omitted entirely, never
-/// emitted as a zeroed placeholder.
+/// full it is, when it resets, and whether the observation is stale. The array is ADAPTIVE — a
+/// window the provider/account doesn't report at all is omitted; consumers can also hide stale
+/// historical windows when presenting current limits.
 #[derive(Serialize)]
 struct UsageWindowView {
     window: &'static str,
     used_percent: f64,
     reset_at: Option<i64>,
+    stale: bool,
 }
 
 /// The account's stored access-token health, derived from the token's OWN unverified JWT `exp`
@@ -88,6 +89,7 @@ struct AccountView {
     email: String,
     alias: Option<String>,
     pool: Option<String>,
+    pools: Vec<String>,
     provider: String,
     status: String,
     plan_type: String,
@@ -129,6 +131,7 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
                 window: "five_hour",
                 used_percent: w.used_percent,
                 reset_at: w.reset_at,
+                stale: w.stale,
             });
         }
         if let Some(w) = &resolved.weekly {
@@ -136,6 +139,7 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
                 window: "weekly",
                 used_percent: w.used_percent,
                 reset_at: w.reset_at,
+                stale: w.stale,
             });
         }
 
@@ -179,7 +183,12 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
             .map(|(_, total)| total as i64)
             .unwrap_or(0);
 
+        let pools = match repo.list_pools(&account.id).await {
+            Ok(pools) => pools,
+            Err(_) => return Response::error(),
+        };
         views.push(AccountView {
+            pools,
             id: account.id,
             email: account.email,
             alias: account.alias,
@@ -214,6 +223,7 @@ struct AccountIdentityView {
     plan_type: String,
     provider: String,
     pool: Option<String>,
+    pools: Vec<String>,
 }
 
 /// `AccountDetailView::request_totals`: how many requests this account has served (all-time) and
@@ -276,6 +286,7 @@ pub async fn account_detail_handler(
             window: "five_hour",
             used_percent: w.used_percent,
             reset_at: w.reset_at,
+            stale: w.stale,
         });
     }
     if let Some(w) = &resolved.weekly {
@@ -283,6 +294,7 @@ pub async fn account_detail_handler(
             window: "weekly",
             used_percent: w.used_percent,
             reset_at: w.reset_at,
+            stale: w.stale,
         });
     }
 
@@ -334,6 +346,11 @@ pub async fn account_detail_handler(
             .sum(),
     };
 
+    let pools = match repo.list_pools(&id).await {
+        Ok(pools) => pools,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
+    };
+
     Json(AccountDetailView {
         identity: AccountIdentityView {
             id: account.id,
@@ -345,6 +362,7 @@ pub async fn account_detail_handler(
             plan_type: account.plan_type,
             provider: account.provider,
             pool: account.pool,
+            pools,
         },
         status: account.status,
         quota_windows,
@@ -482,15 +500,22 @@ pub async fn pools_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
     let mut by_pool: std::collections::BTreeMap<Option<String>, (usize, usize, usize, f64)> =
         std::collections::BTreeMap::new();
     for snap in &snapshots {
-        let entry = by_pool.entry(snap.pool.clone()).or_insert((0, 0, 0, 0.0));
-        entry.0 += 1;
-        if snap.status == "active" {
-            entry.1 += 1;
+        let memberships: Vec<Option<String>> = if snap.pools.is_empty() {
+            vec![None]
+        } else {
+            snap.pools.iter().cloned().map(Some).collect()
+        };
+        for pool in memberships {
+            let entry = by_pool.entry(pool).or_insert((0, 0, 0, 0.0));
+            entry.0 += 1;
+            if snap.status == "active" {
+                entry.1 += 1;
+            }
+            if is_available(snap, now) {
+                entry.2 += 1;
+            }
+            entry.3 += snap.used_percent;
         }
-        if is_available(snap, now) {
-            entry.2 += 1;
-        }
-        entry.3 += snap.used_percent;
     }
     // BTreeMap orders `None` before `Some(..)`; the dashboard wants named pools first, unpooled
     // last, so pull the unpooled group out and append it.
@@ -603,14 +628,16 @@ struct PaceView {
 /// metrics — never a body or identity). `total_tokens` falls back to `input_tokens + output_tokens`
 /// when `total_tokens` itself is null (Task 7: `0005` import/backfill rows never populate it; a
 /// missing sub-count coalesces to 0, and `reasoning_tokens` is never added — it's a subset of
-/// `output_tokens`). `tps` is derived, not stored: that (fallback) `total_tokens` over the
-/// generation window (`duration_ms - ttft_ms`, seconds — `ttft_ms` itself falling back to
+/// `output_tokens`). `tps` is derived, not stored: output/completion tokens over the generation
+/// window (`duration_ms - ttft_ms`, seconds — `ttft_ms` itself falling back to
 /// `latency_first_token_ms` for the same import/backfill rows), present only when both source
-/// fields are present and the window is positive. The row's own serialized `ttft_ms` field is
-/// NOT backfilled this way — only used internally to derive `tps`.
+/// fields are present and the window is positive. Input/prompt tokens are deliberately excluded:
+/// they are processed before the first output token and are not generation throughput.
 #[derive(Serialize)]
 struct RequestRowView {
     id: i64,
+    request_id: Option<String>,
+    session_key: Option<String>,
     requested_at: i64,
     provider: String,
     method: String,
@@ -619,37 +646,114 @@ struct RequestRowView {
     status: i64,
     duration_ms: i64,
     account_id: Option<String>,
+    target_kind: Option<String>,
+    provider_credential_id: Option<String>,
     model: Option<String>,
+    upstream_model: Option<String>,
+    upstream_transport: Option<String>,
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
     transport: Option<String>,
     ttft_ms: Option<i64>,
     total_tokens: Option<i64>,
     cached_tokens: Option<i64>,
+    orchestration_input_tokens: Option<i64>,
+    orchestration_output_tokens: Option<i64>,
+    orchestration_cached_input_tokens: Option<i64>,
     tps: Option<f64>,
     subagent: Option<String>,
+    /// Imported codex-lb rows have no HTTP status (`status == 0`); this preserves their bounded
+    /// `success`/`error` outcome so the dashboard does not misclassify the sentinel as HTTP 0.
+    outcome: Option<String>,
+    /// Native Codex stream terminal result. When present, this is authoritative over the initial
+    /// HTTP status for success/error presentation.
+    protocol_outcome: Option<String>,
+    error_code: Option<String>,
 }
 
 /// Tokens/sec over the post-first-token generation window, when derivable: needs both
-/// `total_tokens` and `ttft_ms`, and a positive `duration_ms - ttft_ms` window (else the divisor
+/// `output_tokens` and `ttft_ms`, and a positive `duration_ms - ttft_ms` window (else the divisor
 /// would be zero or negative and the ratio is meaningless).
-fn derive_tps(duration_ms: i64, ttft_ms: Option<i64>, total_tokens: Option<i64>) -> Option<f64> {
+fn derive_tps(duration_ms: i64, ttft_ms: Option<i64>, output_tokens: Option<i64>) -> Option<f64> {
     let ttft_ms = ttft_ms?;
-    let total_tokens = total_tokens?;
+    let output_tokens = output_tokens?;
     if duration_ms <= ttft_ms {
         return None;
     }
-    Some(total_tokens as f64 / ((duration_ms - ttft_ms) as f64 / 1000.0))
+    Some(output_tokens as f64 / ((duration_ms - ttft_ms) as f64 / 1000.0))
+}
+
+/// Imported request evidence is a deliberately tiny public vocabulary. The importer preserves
+/// source strings for audit/reprocessing, but arbitrary legacy values must not cross the read API.
+fn canonical_imported_outcome(status: i64, outcome: Option<&str>) -> Option<&'static str> {
+    if status != 0 {
+        return None;
+    }
+    match outcome {
+        Some("success") => Some("success"),
+        Some("error") => Some("error"),
+        _ => None,
+    }
+}
+
+fn canonical_protocol_outcome(outcome: Option<&str>) -> Option<&'static str> {
+    match outcome {
+        Some("completed") => Some("completed"),
+        Some("failed") => Some("failed"),
+        Some("incomplete") => Some("incomplete"),
+        Some("cancelled") => Some("cancelled"),
+        Some("transport_lost") => Some("transport_lost"),
+        _ => None,
+    }
+}
+
+fn bounded_legacy_error_code(error_code: Option<&str>) -> String {
+    match error_code {
+        Some(
+            code @ ("no_accounts"
+            | "stream_incomplete"
+            | "upstream_unavailable"
+            | "codex_previous_response_stale"
+            | "context_length_exceeded"
+            | "usage_limit_reached"
+            | "invalid_request_error"
+            | "websocket_connection_limit_reached"
+            | "upstream_rejected_input"
+            | "server_is_overloaded"
+            | "upstream_error"
+            | "upstream_request_timeout"
+            | "cyber_policy"
+            | "previous_response_owner_unavailable"
+            | "invalid_prompt"
+            | "account_stream_cap"
+            | "internal_error"
+            | "invalid_api_key"
+            | "invalid_value"
+            | "server_error"),
+        ) => code.to_string(),
+        _ => "legacy_error".to_string(),
+    }
+}
+
+fn canonical_imported_error_code(
+    status: i64,
+    outcome: Option<&str>,
+    error_code: Option<&str>,
+) -> Option<String> {
+    (canonical_imported_outcome(status, outcome) == Some("error"))
+        .then(|| bounded_legacy_error_code(error_code))
 }
 
 /// `GET /api/requests` filters + pagination. `limit` is clamped to [1, MAX_LIMIT]; `offset`
-/// defaults to 0. `status_class` is `"success"` (status < 300), `"error"` (status >= 400), or
-/// anything else / unset (no status filter). All filters are content-free identifiers, never
-/// request/response text.
+/// defaults to 0. `status_class` is `"success"`/`"error"` using native HTTP status or an imported
+/// codex-lb outcome when `status == 0`; anything else / unset applies no status filter. All filters
+/// are content-free identifiers, never request/response text.
 #[derive(Deserialize)]
 pub struct RequestsQuery {
     limit: Option<i64>,
     offset: Option<i64>,
+    request_id: Option<String>,
+    session_key: Option<String>,
     account: Option<String>,
     provider: Option<String>,
     status_class: Option<String>,
@@ -668,7 +772,7 @@ struct RequestsView {
     rows: Vec<RequestRowView>,
 }
 
-/// `GET /api/requests?limit=&offset=&account=&provider=&status_class=&model=&transport=&since_ts=`
+/// `GET /api/requests?limit=&offset=&request_id=&account=&provider=&status_class=&model=&transport=&since_ts=`
 /// — filtered, paginated request-log rows (newest first, per the repo's ordering) plus the total
 /// count MATCHING the filters (not the whole table).
 pub async fn requests_handler(
@@ -678,6 +782,8 @@ pub async fn requests_handler(
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = q.offset.unwrap_or(0).max(0);
     let filter = RequestsFilter {
+        request_id: q.request_id,
+        session_key: q.session_key,
         account: q.account,
         provider: q.provider,
         status_class: q.status_class,
@@ -695,7 +801,8 @@ pub async fn requests_handler(
         .map(|r| {
             // Task 7: fall back to input+output when total_tokens itself is null (never add
             // reasoning_tokens — it's a subset of output_tokens, not a third count), and to
-            // latency_first_token_ms when ttft_ms is null, purely for the tps derivation below.
+            // latency_first_token_ms when ttft_ms is null. The effective TTFT is both serialized
+            // for the dashboard and used with output_tokens for the tps derivation below.
             let total_tokens = r
                 .total_tokens
                 .or_else(|| match (r.input_tokens, r.output_tokens) {
@@ -703,8 +810,17 @@ pub async fn requests_handler(
                     (i, o) => Some(i.unwrap_or(0) + o.unwrap_or(0)),
                 });
             let tps_ttft_ms = r.ttft_ms.or(r.latency_first_token_ms);
+            let outcome =
+                canonical_imported_outcome(r.status, r.outcome.as_deref()).map(str::to_string);
+            let error_code = canonical_imported_error_code(
+                r.status,
+                r.outcome.as_deref(),
+                r.error_code.as_deref(),
+            );
             RequestRowView {
                 id: r.id,
+                request_id: r.request_id,
+                session_key: r.session_key,
                 requested_at: r.requested_at,
                 provider: r.provider,
                 method: r.method,
@@ -712,16 +828,27 @@ pub async fn requests_handler(
                 aliased: r.aliased,
                 status: r.status,
                 duration_ms: r.duration_ms,
-                tps: derive_tps(r.duration_ms, tps_ttft_ms, total_tokens),
+                tps: derive_tps(r.duration_ms, tps_ttft_ms, r.output_tokens),
                 account_id: r.account_id,
+                target_kind: r.target_kind,
+                provider_credential_id: r.provider_credential_id,
                 model: r.model,
+                upstream_model: r.upstream_model,
+                upstream_transport: r.upstream_transport,
                 reasoning_effort: r.reasoning_effort,
                 service_tier: r.service_tier,
                 transport: r.transport,
-                ttft_ms: r.ttft_ms,
+                ttft_ms: tps_ttft_ms,
                 total_tokens,
-                cached_tokens: r.cached_tokens,
+                cached_tokens: r.cached_tokens.or(r.cached_input_tokens),
+                orchestration_input_tokens: r.orchestration_input_tokens,
+                orchestration_output_tokens: r.orchestration_output_tokens,
+                orchestration_cached_input_tokens: r.orchestration_cached_input_tokens,
                 subagent: r.subagent,
+                outcome,
+                protocol_outcome: canonical_protocol_outcome(r.protocol_outcome.as_deref())
+                    .map(str::to_string),
+                error_code,
             }
         })
         .collect();
@@ -751,6 +878,8 @@ struct KpisView {
     success_rate: f64,
     avg_latency_ms: f64,
     total_tokens: i64,
+    orchestration_tokens: i64,
+    orchestration_cached_tokens: i64,
 }
 
 impl From<polyflare_store::RequestAggregate> for KpisView {
@@ -767,6 +896,8 @@ impl From<polyflare_store::RequestAggregate> for KpisView {
             success_rate,
             avg_latency_ms: a.avg_latency_ms,
             total_tokens: a.total_tokens,
+            orchestration_tokens: a.orchestration_tokens,
+            orchestration_cached_tokens: a.orchestration_cached_tokens,
         }
     }
 }
@@ -806,7 +937,10 @@ struct PoolOverviewView {
 #[derive(Serialize)]
 struct RecentErrorView {
     status: i64,
+    provider: String,
     account_id: Option<String>,
+    target_kind: Option<String>,
+    provider_credential_id: Option<String>,
     error_code: Option<String>,
     requested_at: i64,
 }
@@ -815,10 +949,64 @@ impl From<polyflare_store::RecentErrorRow> for RecentErrorView {
     fn from(r: polyflare_store::RecentErrorRow) -> Self {
         RecentErrorView {
             status: r.status,
+            provider: r.provider,
             account_id: r.account_id,
-            error_code: r.error_code,
+            target_kind: r.target_kind,
+            provider_credential_id: r.provider_credential_id,
+            // Imported errors use status=0. Native HTTP failures currently carry no error_code;
+            // keep that boundary explicit so a future writer cannot expose arbitrary text here.
+            error_code: (r.status == 0).then(|| bounded_legacy_error_code(r.error_code.as_deref())),
             requested_at: r.requested_at,
         }
+    }
+}
+
+#[derive(Serialize)]
+struct AdmissionOverviewView {
+    waiters: u64,
+    waits_total: u64,
+    acquired_after_wait_total: u64,
+    timeouts_total: u64,
+    ineligible_total: u64,
+    cancelled_total: u64,
+    owner_recovery_total: u64,
+    avg_wait_ms: f64,
+    in_flight_pressure: u64,
+    calibration_ratio: f64,
+    calibration_samples: u64,
+}
+
+fn admission_overview(
+    lanes: &[crate::runtime_state::AdmissionMetricSnapshot],
+    pressure: crate::runtime_state::PressureCalibrationSnapshot,
+    in_flight_pressure: u64,
+) -> AdmissionOverviewView {
+    let waiters = lanes.iter().map(|lane| lane.waiters).sum();
+    let waits_total = lanes.iter().map(|lane| lane.waits).sum();
+    let acquired_after_wait_total = lanes.iter().map(|lane| lane.acquired_after_wait).sum();
+    let timeouts_total = lanes.iter().map(|lane| lane.timeouts).sum();
+    let ineligible_total = lanes.iter().map(|lane| lane.ineligible).sum();
+    let cancelled_total = lanes.iter().map(|lane| lane.cancelled).sum();
+    let owner_recovery_total = lanes.iter().map(|lane| lane.owner_recovery).sum();
+    let wait_milliseconds: u64 = lanes.iter().map(|lane| lane.wait_milliseconds).sum();
+    let finished = acquired_after_wait_total + timeouts_total + cancelled_total;
+    let avg_wait_ms = if finished > 0 {
+        wait_milliseconds as f64 / finished as f64
+    } else {
+        0.0
+    };
+    AdmissionOverviewView {
+        waiters,
+        waits_total,
+        acquired_after_wait_total,
+        timeouts_total,
+        ineligible_total,
+        cancelled_total,
+        owner_recovery_total,
+        avg_wait_ms,
+        in_flight_pressure,
+        calibration_ratio: pressure.ratio,
+        calibration_samples: pressure.samples,
     }
 }
 
@@ -831,6 +1019,7 @@ struct OverviewView {
     pools: Vec<PoolOverviewView>,
     /// Count of accounts eligible for routing right now (see [`is_available`]), across ALL pools.
     accounts_available: usize,
+    admission: AdmissionOverviewView,
     recent_errors: Vec<RecentErrorView>,
 }
 
@@ -886,10 +1075,17 @@ pub async fn overview_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
     let mut by_pool: std::collections::BTreeMap<Option<String>, (usize, usize)> =
         std::collections::BTreeMap::new();
     for snap in &snapshots {
-        let entry = by_pool.entry(snap.pool.clone()).or_insert((0, 0));
-        entry.0 += 1;
-        if is_available(snap, now) {
-            entry.1 += 1;
+        let memberships: Vec<Option<String>> = if snap.pools.is_empty() {
+            vec![None]
+        } else {
+            snap.pools.iter().cloned().map(Some).collect()
+        };
+        for pool in memberships {
+            let entry = by_pool.entry(pool).or_insert((0, 0));
+            entry.0 += 1;
+            if is_available(snap, now) {
+                entry.1 += 1;
+            }
         }
     }
     let unpooled = by_pool.remove(&None);
@@ -932,12 +1128,22 @@ pub async fn overview_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
             weekly,
         })
         .collect();
+    let in_flight_pressure = snapshots
+        .iter()
+        .map(|snapshot| u64::from(snapshot.in_flight_pressure))
+        .sum();
+    let admission = admission_overview(
+        &state.runtime.admission_metrics_snapshot(),
+        state.runtime.pressure_calibration_snapshot(),
+        in_flight_pressure,
+    );
 
     Response::ok(OverviewView {
         kpis,
         quota,
         pools,
         accounts_available,
+        admission,
         recent_errors,
     })
 }
@@ -957,6 +1163,8 @@ struct SeriesBucketView {
     errors: i64,
     avg_latency_ms: f64,
     total_tokens: i64,
+    orchestration_tokens: i64,
+    orchestration_cached_tokens: i64,
 }
 
 impl From<polyflare_store::RequestBucket> for SeriesBucketView {
@@ -967,6 +1175,8 @@ impl From<polyflare_store::RequestBucket> for SeriesBucketView {
             errors: b.errors,
             avg_latency_ms: b.avg_latency_ms,
             total_tokens: b.total_tokens,
+            orchestration_tokens: b.orchestration_tokens,
+            orchestration_cached_tokens: b.orchestration_cached_tokens,
         }
     }
 }
@@ -1014,6 +1224,8 @@ pub async fn overview_series_handler(State(state): State<Arc<AppState>>) -> impl
             errors: 0,
             avg_latency_ms: 0.0,
             total_tokens: 0,
+            orchestration_tokens: 0,
+            orchestration_cached_tokens: 0,
         });
         buckets.push(SeriesBucketView::from(bucket));
         ts += bucket_secs;
@@ -1025,37 +1237,54 @@ pub async fn overview_series_handler(State(state): State<Arc<AppState>>) -> impl
     })
 }
 
-/// One `continuity_sessions` row for the dashboard, LEFT JOINed to its owning account's email
-/// (TA6(c): session→account affinity visibility). `session_key` is a sha256 hash — opaque,
-/// content-free (see module docs). `owning_account_id`/`owner_email` are `null` for a session that
-/// never completed a turn (`state == "fresh"`) or whose owning account was deleted (`ON DELETE
-/// SET NULL`) — that is NOT dropped, it's a valid row. `required_capabilities` is the TA6(b)
-/// sticky-cyber capability tag set (comma-separated), or `null` when none is stamped.
+/// Provider-aware session summary. Built-in continuity sessions retain their ownership state,
+/// while stateless custom-provider sessions are derived from the content-free request ledger and
+/// identify their latest credential target without exposing its API key.
 #[derive(Serialize)]
 struct SessionRowView {
     session_key: String,
     key_strength: String,
     owning_account_id: Option<String>,
     owner_email: Option<String>,
+    provider: String,
+    target_kind: String,
+    target_id: Option<String>,
+    target_label: Option<String>,
+    model: Option<String>,
     state: String,
     required_capabilities: Option<String>,
     created_at: i64,
     updated_at: i64,
     last_activity_at: i64,
+    request_count: i64,
 }
 
-impl From<polyflare_store::continuity_repo::SessionWithOwner> for SessionRowView {
-    fn from(s: polyflare_store::continuity_repo::SessionWithOwner) -> Self {
+impl From<polyflare_store::continuity_repo::DashboardSessionRow> for SessionRowView {
+    fn from(s: polyflare_store::continuity_repo::DashboardSessionRow) -> Self {
+        let target_id = if s.target_kind == "credential" {
+            s.provider_credential_id.clone()
+        } else {
+            s.owning_account_id.clone()
+        };
+        let owner_email = (s.target_kind == "account")
+            .then(|| s.owner_label.clone())
+            .flatten();
         SessionRowView {
             session_key: s.session_key,
             key_strength: s.key_strength,
             owning_account_id: s.owning_account_id,
-            owner_email: s.owner_email,
+            owner_email,
+            provider: s.provider,
+            target_kind: s.target_kind,
+            target_id,
+            target_label: s.owner_label,
+            model: s.model,
             state: s.state,
             required_capabilities: s.required_capabilities,
             created_at: s.created_at,
             updated_at: s.updated_at,
             last_activity_at: s.last_activity_at,
+            request_count: s.request_count,
         }
     }
 }
@@ -1066,6 +1295,7 @@ impl From<polyflare_store::continuity_repo::SessionWithOwner> for SessionRowView
 pub struct SessionsQuery {
     limit: Option<i64>,
     offset: Option<i64>,
+    session_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1088,11 +1318,22 @@ pub async fn sessions_handler(
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = q.offset.unwrap_or(0).max(0);
     let repo = state.store.continuity();
-    let rows = match repo.list_sessions_with_owner(limit, offset).await {
+    if let Some(session_key) = q.session_key.as_deref().filter(|value| !value.is_empty()) {
+        let row = match repo.find_dashboard_session(session_key).await {
+            Ok(row) => row,
+            Err(_) => return Response::error(),
+        };
+        let rows: Vec<SessionRowView> = row.into_iter().map(SessionRowView::from).collect();
+        return Response::ok(SessionsView {
+            total: rows.len() as i64,
+            rows,
+        });
+    }
+    let rows = match repo.list_dashboard_sessions(limit, offset).await {
         Ok(rows) => rows,
         Err(_) => return Response::error(),
     };
-    let total = match repo.count_sessions().await {
+    let total = match repo.count_dashboard_sessions().await {
         Ok(total) => total,
         Err(_) => return Response::error(),
     };
@@ -1135,6 +1376,8 @@ struct ReportBucketView {
     tokens: i64,
     cached_tokens: i64,
     reasoning_tokens: i64,
+    orchestration_tokens: i64,
+    orchestration_cached_tokens: i64,
     avg_duration_ms: f64,
     avg_ttft_ms: f64,
     ttft_sample_count: i64,
@@ -1150,6 +1393,8 @@ impl From<polyflare_store::ReportBucket> for ReportBucketView {
             tokens: b.metrics.tokens,
             cached_tokens: b.metrics.cached_tokens,
             reasoning_tokens: b.metrics.reasoning_tokens,
+            orchestration_tokens: b.metrics.orchestration_tokens,
+            orchestration_cached_tokens: b.metrics.orchestration_cached_tokens,
             avg_duration_ms: b.metrics.avg_duration_ms,
             avg_ttft_ms: b.metrics.avg_ttft_ms,
             ttft_sample_count: b.metrics.ttft_sample_count,
@@ -1168,6 +1413,8 @@ struct ReportBreakdownView {
     tokens: i64,
     cached_tokens: i64,
     reasoning_tokens: i64,
+    orchestration_tokens: i64,
+    orchestration_cached_tokens: i64,
     avg_duration_ms: f64,
     avg_ttft_ms: f64,
     ttft_sample_count: i64,
@@ -1183,6 +1430,8 @@ impl From<polyflare_store::ReportBreakdownRow> for ReportBreakdownView {
             tokens: r.metrics.tokens,
             cached_tokens: r.metrics.cached_tokens,
             reasoning_tokens: r.metrics.reasoning_tokens,
+            orchestration_tokens: r.metrics.orchestration_tokens,
+            orchestration_cached_tokens: r.metrics.orchestration_cached_tokens,
             avg_duration_ms: r.metrics.avg_duration_ms,
             avg_ttft_ms: r.metrics.avg_ttft_ms,
             ttft_sample_count: r.metrics.ttft_sample_count,
@@ -1203,6 +1452,8 @@ struct ReportTotalsView {
     tokens: i64,
     cached_tokens: i64,
     reasoning_tokens: i64,
+    orchestration_tokens: i64,
+    orchestration_cached_tokens: i64,
     avg_duration_ms: f64,
     avg_ttft_ms: f64,
     ttft_sample_count: i64,
@@ -1229,6 +1480,8 @@ impl From<polyflare_store::ReportMetrics> for ReportTotalsView {
             tokens: m.tokens,
             cached_tokens: m.cached_tokens,
             reasoning_tokens: m.reasoning_tokens,
+            orchestration_tokens: m.orchestration_tokens,
+            orchestration_cached_tokens: m.orchestration_cached_tokens,
             avg_duration_ms: m.avg_duration_ms,
             avg_ttft_ms: m.avg_ttft_ms,
             ttft_sample_count: m.ttft_sample_count,
@@ -1421,9 +1674,9 @@ struct FieldSpec {
 /// Every `ServeConfig` field, live or not. Bounds/defaults are copied verbatim from the
 /// `clamp_<field>`/`*_from_env` doc comments in `crate::config` (single source of truth for the
 /// bound logic itself; this table only mirrors the CONSTANTS for display/validation, never
-/// reimplements the clamp). The 10 `class: "live"` rows are the only ones with `coercion: Some(_)`
-/// — a non-live key can never reach [`crate::runtime_settings::RuntimeSettings::set`] from a PATCH
-/// (see `crate::write_api::patch_settings_handler`). The restart-only/fixed rows mirror
+/// reimplements the clamp). Live rows and the five dashboard-managed WebSocket rows carry a
+/// coercion; restart-required values are persisted without mutating the running process. The
+/// remaining restart-only/fixed rows mirror
 /// `docs/superpowers/specs/2026-07-21-dashboard-settings-design.md`'s "Deferred / read-only"
 /// section exactly.
 const FIELD_SPECS: &[FieldSpec] = &[
@@ -1516,9 +1769,9 @@ const FIELD_SPECS: &[FieldSpec] = &[
         coercion: Some(FieldKind::Bool),
         min: None,
         max: None,
-        default: "false",
+        default: "true",
     },
-    // --- restart-only (8) ---
+    // --- restart-only (10; five WebSocket values are editable for the next boot) ---
     FieldSpec {
         key: "routing_strategy",
         class: "restart-only",
@@ -1556,31 +1809,49 @@ const FIELD_SPECS: &[FieldSpec] = &[
         default: "true",
     },
     FieldSpec {
-        key: "ws_downstream",
+        key: "client_websocket_enabled",
         class: "restart-only",
         kind: "bool",
-        coercion: None,
+        coercion: Some(FieldKind::Bool),
+        min: None,
+        max: None,
+        default: "true",
+    },
+    FieldSpec {
+        key: "http_requests_use_upstream_websocket",
+        class: "restart-only",
+        kind: "bool",
+        coercion: Some(FieldKind::Bool),
         min: None,
         max: None,
         default: "false",
     },
     FieldSpec {
-        key: "ws_upstream",
+        key: "http_upstream_websocket_ping",
         class: "restart-only",
         kind: "bool",
-        coercion: None,
+        coercion: Some(FieldKind::Bool),
         min: None,
         max: None,
         default: "false",
     },
     FieldSpec {
-        key: "ws_client_ping",
+        key: "websocket_idle_ping_secs",
         class: "restart-only",
-        kind: "bool",
-        coercion: None,
-        min: None,
-        max: None,
-        default: "false",
+        kind: "secs",
+        coercion: Some(FieldKind::U64),
+        min: Some(0.0),
+        max: Some(300.0),
+        default: "30",
+    },
+    FieldSpec {
+        key: "websocket_idle_budget_secs",
+        class: "restart-only",
+        kind: "secs",
+        coercion: Some(FieldKind::U64),
+        min: Some(60.0),
+        max: Some(86_400.0),
+        default: "1500",
     },
     FieldSpec {
         key: "continuity_watchdog",
@@ -1647,9 +1918,8 @@ const FIELD_SPECS: &[FieldSpec] = &[
         default: "https://auth.openai.com",
     },
     FieldSpec {
-        // NEVER returned/persisted as a value — see restart_or_fixed_value below. Presence-only:
-        // if the caller could reach this handler at all, `require_admin` already proved
-        // `admin_token` is set (an unset token 503s the whole `/api/*` surface — see `auth.rs`).
+        // NEVER returned/persisted as a value — see restart_or_fixed_value below. A token may be
+        // absent for a loopback-open dashboard, so this field describes configuration shape only.
         key: "admin_token",
         class: "fixed",
         kind: "string",
@@ -1684,9 +1954,24 @@ const FIELD_SPECS: &[FieldSpec] = &[
 pub(crate) fn live_field_kind(key: &str) -> Option<FieldKind> {
     FIELD_SPECS
         .iter()
-        .find(|s| s.key == key)
+        .find(|spec| spec.key == key && spec.class == "live")
         .and_then(|s| s.coercion)
 }
+
+pub(crate) fn restart_field_kind(key: &str) -> Option<FieldKind> {
+    FIELD_SPECS
+        .iter()
+        .find(|spec| spec.key == key && spec.class == "restart-only")
+        .and_then(|spec| spec.coercion)
+}
+
+pub(crate) const RESTART_KEYS_ORDER: &[&str] = &[
+    "client_websocket_enabled",
+    "http_requests_use_upstream_websocket",
+    "http_upstream_websocket_ping",
+    "websocket_idle_ping_secs",
+    "websocket_idle_budget_secs",
+];
 
 /// The 10 live keys in a FIXED canonical order that places `starvation_wait_budget` BEFORE
 /// `starvation_heartbeat` — `crate::write_api::patch_settings_handler` applies a multi-key PATCH
@@ -1736,7 +2021,36 @@ fn restart_or_fixed_value(state: &AppState, key: &str) -> Option<String> {
     match key {
         "upstream_base_url" => Some(state.upstream_base_url.clone()),
         "anthropic_upstream_base_url" => Some(state.anthropic_upstream_base_url.clone()),
-        "ws_downstream" => Some(state.ws_downstream.to_string()),
+        "client_websocket_enabled" => Some(
+            state
+                .runtime_settings
+                .client_websocket_enabled()
+                .to_string(),
+        ),
+        "http_requests_use_upstream_websocket" => Some(
+            state
+                .runtime_settings
+                .http_requests_use_upstream_websocket()
+                .to_string(),
+        ),
+        "http_upstream_websocket_ping" => Some(
+            state
+                .runtime_settings
+                .http_upstream_websocket_ping()
+                .to_string(),
+        ),
+        "websocket_idle_ping_secs" => Some(
+            state
+                .runtime_settings
+                .websocket_idle_ping_secs()
+                .to_string(),
+        ),
+        "websocket_idle_budget_secs" => Some(
+            state
+                .runtime_settings
+                .websocket_idle_budget_secs()
+                .to_string(),
+        ),
         "model_catalog_ttl_secs" => {
             Some(state.model_catalog.refresh_interval().as_secs().to_string())
         }
@@ -1755,7 +2069,11 @@ fn restart_or_fixed_value(state: &AppState, key: &str) -> Option<String> {
 #[derive(Serialize)]
 pub struct SettingFieldView {
     pub key: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
     pub value: Option<String>,
+    pub configured_value: Option<String>,
+    pub pending_restart: bool,
     pub default: String,
     pub class: &'static str,
     pub kind: &'static str,
@@ -1769,6 +2087,78 @@ pub struct SettingsView {
     pub fields: Vec<SettingFieldView>,
 }
 
+fn setting_label(key: &'static str) -> &'static str {
+    match key {
+        "client_websocket_enabled" => "Client WebSocket relay",
+        "http_requests_use_upstream_websocket" => "Use an upstream WebSocket for HTTP requests",
+        "http_upstream_websocket_ping" => "HTTP-request upstream WebSocket ping",
+        "websocket_idle_ping_secs" => "Parked WebSocket ping interval",
+        "websocket_idle_budget_secs" => "Parked WebSocket idle budget",
+        _ => "",
+    }
+}
+
+fn setting_description(key: &'static str) -> &'static str {
+    match key {
+        "client_websocket_enabled" => {
+            "Accept client-facing WebSocket sessions and relay them to an upstream WebSocket."
+        }
+        "http_requests_use_upstream_websocket" => {
+            "Convert ordinary HTTP /responses ingress into a WebSocket connection on the Codex upstream leg."
+        }
+        "http_upstream_websocket_ping" => {
+            "Send client-initiated pings during silent active turns only on WebSockets created for HTTP ingress."
+        }
+        "websocket_idle_ping_secs" => {
+            "Ping a healthy relay WebSocket while it is parked between turns. Set 0 to disable."
+        }
+        "websocket_idle_budget_secs" => {
+            "Close both relay legs honestly after this much between-turn inactivity."
+        }
+        _ => "",
+    }
+}
+
+fn configured_restart_value(
+    values: &std::collections::HashMap<String, String>,
+    key: &str,
+) -> Option<String> {
+    let legacy = match key {
+        "client_websocket_enabled" => Some("ws_downstream"),
+        "http_requests_use_upstream_websocket" => Some("ws_upstream"),
+        "http_upstream_websocket_ping" => Some("ws_client_ping"),
+        "websocket_idle_ping_secs" => Some("ws_idle_ping_secs"),
+        "websocket_idle_budget_secs" => Some("ws_idle_budget_secs"),
+        _ => None,
+    };
+    let raw = values
+        .get(key)
+        .or_else(|| legacy.and_then(|legacy| values.get(legacy)))
+        .map(String::as_str)?;
+    match key {
+        "client_websocket_enabled"
+        | "http_requests_use_upstream_websocket"
+        | "http_upstream_websocket_ping" => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" => Some("true".to_string()),
+            "0" | "false" => Some("false".to_string()),
+            _ => None,
+        },
+        "websocket_idle_ping_secs" => raw
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(crate::config::clamp_websocket_idle_ping_secs)
+            .map(|value| value.to_string()),
+        "websocket_idle_budget_secs" => raw
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(crate::config::clamp_websocket_idle_budget_secs)
+            .map(|value| value.to_string()),
+        _ => None,
+    }
+}
+
 /// `GET /api/settings` — the full running config, for the dashboard Settings page: the 10
 /// live-editable fields with their CURRENT `RuntimeSettings` value + clamp bounds, plus every
 /// restart-only/fixed field as an informational row (see `FIELD_SPECS`). Content-free:
@@ -1776,6 +2166,7 @@ pub struct SettingsView {
 /// token, request, or conversation content.
 pub async fn settings_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let rs = &state.runtime_settings;
+    let persisted = state.store.settings().get_all().await.unwrap_or_default();
     let fields = FIELD_SPECS
         .iter()
         .map(|spec| {
@@ -1790,9 +2181,22 @@ pub async fn settings_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
             } else {
                 spec.max
             };
+            let configured_value = if spec.class == "restart-only" && spec.coercion.is_some() {
+                configured_restart_value(&persisted, spec.key)
+            } else {
+                None
+            };
+            let pending_restart = configured_value
+                .as_ref()
+                .zip(value.as_ref())
+                .is_some_and(|(configured, effective)| configured != effective);
             SettingFieldView {
                 key: spec.key,
+                label: setting_label(spec.key),
+                description: setting_description(spec.key),
                 value,
+                configured_value,
+                pending_restart,
                 default: spec.default.to_string(),
                 class: spec.class,
                 kind: spec.kind,

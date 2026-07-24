@@ -20,6 +20,7 @@ use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 
 use crate::app::AppState;
+use crate::runtime_state::{AdmissionMetricSnapshot, PressureCalibrationSnapshot};
 
 /// A plain-data snapshot of everything `/metrics` renders — the 5 process-wide counters (4 read
 /// directly off `AppState`'s metric structs, `polyflare_lease_inflight` derived) plus one
@@ -32,20 +33,30 @@ pub struct MetricsSnapshot {
     pub health_tier_transitions_total: u64,
     pub lease_acquired_total: u64,
     pub lease_released_total: u64,
+    pub admission: Vec<AdmissionMetricSnapshot>,
+    pub pressure_calibration: PressureCalibrationSnapshot,
     pub accounts: Vec<AccountMetric>,
-    /// C11b: one `(account_id, status, count)` triple per distinct pair recorded by
+    /// C11b: one `(provider, target_kind, target_id, status, count)` tuple per distinct target
+    /// recorded by
     /// `AppState::upstream_request_metrics` (`crate::observability::UpstreamRequestMetrics`) — a
     /// content-free, monotonic, in-process counter bumped once per completed client request at
-    /// each of the 3 request-completion wrapper sites. `account_id == ""` is the documented
-    /// `None` (no-eligible-account) render convention, mirroring `AccountMetric::pool`'s
+    /// each of the request-completion wrapper sites. `target_id == ""` is the documented
+    /// `None` (no-eligible-target) render convention, mirroring `AccountMetric::pool`'s
     /// `None -> ""` treatment.
-    pub upstream_requests: Vec<(String, u16, u64)>,
+    pub upstream_requests: Vec<(String, String, String, u16, u64)>,
     /// C11b: one `(type, count)` pair per distinct rate-limit kind recorded by
     /// `AppState::rate_limit_metrics` (`crate::observability::RateLimitMetrics`) — bumped once per
     /// 429 writeback inside `RuntimeStates::record_rate_limit`, the single chokepoint. `type` is
     /// always one of the fixed strings `"upstream"` (upstream supplied `Retry-After`) or
     /// `"backoff"` (computed backoff) — never free-form upstream text.
     pub rate_limit_hits: Vec<(String, u64)>,
+    /// One `(event, count)` pair per distinct WS-relay pump decision recorded by
+    /// `AppState::relay_metrics` (`crate::observability::RelayMetrics`) — fixed `&'static str`
+    /// labels bumped at `crate::ws_relay::pump::run_pump`'s reconnect / move / anchor-signal /
+    /// honest-close decision points, never free-form text. Previously in-memory only; exported
+    /// (honest-liveness work, 2026-07-24) so anchor-resume rates and honest-close frequencies are
+    /// observable without a debugger.
+    pub relay_events: Vec<(String, u64)>,
 }
 
 /// One account's content-free gauge inputs. `account_id` is the OPAQUE store-row id (the same class
@@ -58,6 +69,7 @@ pub struct AccountMetric {
     pub provider: String,
     pub pool: Option<String>,
     pub in_flight: u32,
+    pub in_flight_pressure: u32,
     pub error_count: u32,
     pub health_tier: u8,
     pub cooldown_active: bool,
@@ -140,12 +152,22 @@ pub fn render_prometheus_text(snapshot: &MetricsSnapshot) -> String {
             .saturating_sub(snapshot.lease_released_total),
     );
 
+    write_admission_metrics(&mut out, &snapshot.admission);
+    write_pressure_calibration_metrics(&mut out, snapshot.pressure_calibration);
+
     write_account_gauge(
         &mut out,
         &snapshot.accounts,
         "polyflare_account_inflight",
         "Current in-flight request count per account.",
         |a| a.in_flight as u64,
+    );
+    write_account_gauge(
+        &mut out,
+        &snapshot.accounts,
+        "polyflare_account_inflight_pressure",
+        "Current weighted request-pressure units per account.",
+        |a| a.in_flight_pressure as u64,
     );
     write_account_gauge(
         &mut out,
@@ -173,8 +195,126 @@ pub fn render_prometheus_text(snapshot: &MetricsSnapshot) -> String {
 
     write_upstream_requests_total(&mut out, &snapshot.upstream_requests);
     write_rate_limit_hits_total(&mut out, &snapshot.rate_limit_hits);
+    write_relay_events_total(&mut out, &snapshot.relay_events);
 
     out
+}
+
+fn write_pressure_calibration_metrics(out: &mut String, pressure: PressureCalibrationSnapshot) {
+    for (name, help, kind, value) in [
+        (
+            "polyflare_request_pressure_calibration_ratio",
+            "Rolling actual-to-estimated token ratio used for future admission weights.",
+            "gauge",
+            pressure.ratio,
+        ),
+        (
+            "polyflare_request_pressure_samples_total",
+            "Terminal usage samples incorporated into pressure calibration.",
+            "counter",
+            pressure.samples as f64,
+        ),
+        (
+            "polyflare_request_pressure_estimated_tokens_total",
+            "Estimated tokens represented by pressure calibration samples.",
+            "counter",
+            pressure.estimated_tokens as f64,
+        ),
+        (
+            "polyflare_request_pressure_equivalent_tokens_total",
+            "Terminal compute-equivalent tokens represented by pressure calibration samples.",
+            "counter",
+            pressure.actual_pressure_tokens as f64,
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} {kind}");
+        let _ = writeln!(out, "{name} {value}");
+    }
+}
+
+fn write_admission_metrics(out: &mut String, lanes: &[AdmissionMetricSnapshot]) {
+    write_admission_metric_family(
+        out,
+        lanes,
+        "polyflare_admission_waiters",
+        "Current work items waiting for admission capacity.",
+        "gauge",
+        |lane| lane.waiters,
+    );
+    write_admission_metric_family(
+        out,
+        lanes,
+        "polyflare_admission_wait_total",
+        "Total work items that had to wait for admission capacity.",
+        "counter",
+        |lane| lane.waits,
+    );
+    write_admission_metric_family(
+        out,
+        lanes,
+        "polyflare_admission_acquired_after_wait_total",
+        "Total work items admitted after waiting for capacity.",
+        "counter",
+        |lane| lane.acquired_after_wait,
+    );
+    write_admission_metric_family(
+        out,
+        lanes,
+        "polyflare_admission_wait_milliseconds_total",
+        "Cumulative milliseconds spent waiting for admission capacity.",
+        "counter",
+        |lane| lane.wait_milliseconds,
+    );
+    write_admission_metric_family(
+        out,
+        lanes,
+        "polyflare_admission_owner_recovery_total",
+        "Total pinned work items admitted through an owner recovery slot.",
+        "counter",
+        |lane| lane.owner_recovery,
+    );
+
+    let name = "polyflare_admission_rejected_total";
+    let _ = writeln!(
+        out,
+        "# HELP {name} Total admission rejections by bounded reason."
+    );
+    let _ = writeln!(out, "# TYPE {name} counter");
+    for lane in lanes {
+        for (reason, value) in [
+            ("timeout", lane.timeouts),
+            ("ineligible", lane.ineligible),
+            ("cancelled", lane.cancelled),
+        ] {
+            let _ = writeln!(
+                out,
+                "{name}{{work=\"{}\",scope=\"{}\",reason=\"{reason}\"}} {value}",
+                lane.work, lane.scope,
+            );
+        }
+    }
+}
+
+fn write_admission_metric_family(
+    out: &mut String,
+    lanes: &[AdmissionMetricSnapshot],
+    name: &str,
+    help: &str,
+    kind: &str,
+    value_of: impl Fn(&AdmissionMetricSnapshot) -> u64,
+) {
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} {kind}");
+    for lane in lanes {
+        let _ = writeln!(
+            out,
+            "{name}{{work=\"{}\",scope=\"{}\"}} {}",
+            lane.work,
+            lane.scope,
+            value_of(lane),
+        );
+    }
 }
 
 /// Writes one per-account gauge family: a single `# HELP`/`# TYPE` pair, then one sample line per
@@ -238,18 +378,20 @@ fn write_accounts_total(out: &mut String, accounts: &[AccountMetric]) {
 /// is rendered as its decimal `u16` value (a numeric HTTP status code, not free text); `account_id`
 /// goes through [`escape_label_value`] like every other label this module emits — the empty-string
 /// `None` convention renders as the valid, empty label `account_id=""`.
-fn write_upstream_requests_total(out: &mut String, entries: &[(String, u16, u64)]) {
+fn write_upstream_requests_total(out: &mut String, entries: &[(String, String, String, u16, u64)]) {
     let name = "polyflare_upstream_requests_total";
     let _ = writeln!(
         out,
-        "# HELP {name} Total completed client requests per (account_id, status)."
+        "# HELP {name} Total completed client requests per provider target and status."
     );
     let _ = writeln!(out, "# TYPE {name} counter");
-    for (account_id, status, count) in entries {
+    for (provider, target_kind, target_id, status, count) in entries {
         let _ = writeln!(
             out,
-            "{name}{{account_id=\"{}\",status=\"{status}\"}} {count}",
-            escape_label_value(account_id),
+            "{name}{{provider=\"{}\",target_kind=\"{}\",target_id=\"{}\",status=\"{status}\"}} {count}",
+            escape_label_value(provider),
+            escape_label_value(target_kind),
+            escape_label_value(target_id),
         );
     }
 }
@@ -268,6 +410,23 @@ fn write_rate_limit_hits_total(out: &mut String, entries: &[(String, u64)]) {
             out,
             "{name}{{type=\"{}\"}} {count}",
             escape_label_value(kind),
+        );
+    }
+}
+
+/// Writes `polyflare_relay_events_total{event="..."}` — one sample per `(event, count)` pair the
+/// WS-relay pump has recorded. `event` is always one of the pump's fixed `&'static str` decision
+/// labels (reconnect/move/anchor/honest-close families) but is still escaped via
+/// [`escape_label_value`] for consistency with every other label this module emits.
+fn write_relay_events_total(out: &mut String, entries: &[(String, u64)]) {
+    let name = "polyflare_relay_events_total";
+    let _ = writeln!(out, "# HELP {name} Total WS-relay pump events per kind.");
+    let _ = writeln!(out, "# TYPE {name} counter");
+    for (event, count) in entries {
+        let _ = writeln!(
+            out,
+            "{name}{{event=\"{}\"}} {count}",
+            escape_label_value(event),
         );
     }
 }
@@ -313,6 +472,7 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
             provider: snap.provider.to_string(),
             pool: snap.pool.clone(),
             in_flight: snap.in_flight,
+            in_flight_pressure: snap.in_flight_pressure,
             error_count: snap.error_count,
             health_tier: snap.health_tier,
             cooldown_active: snap.cooldown_until.is_some_and(|c| now < c),
@@ -325,9 +485,12 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
         health_tier_transitions_total: state.health_tier_metrics.total(),
         lease_acquired_total: state.lease_metrics.acquired(),
         lease_released_total: state.lease_metrics.released(),
+        admission: state.runtime.admission_metrics_snapshot(),
+        pressure_calibration: state.runtime.pressure_calibration_snapshot(),
         accounts,
         upstream_requests: state.upstream_request_metrics.snapshot(),
         rate_limit_hits: state.rate_limit_metrics.snapshot(),
+        relay_events: state.relay_metrics.snapshot(),
     };
 
     let body = render_prometheus_text(&snapshot);
@@ -350,6 +513,7 @@ mod tests {
             provider: "codex".to_string(),
             pool: None,
             in_flight: 0,
+            in_flight_pressure: 0,
             error_count: 0,
             health_tier: 0,
             cooldown_active: false,
@@ -367,6 +531,24 @@ mod tests {
             health_tier_transitions_total: 7,
             lease_acquired_total: 10,
             lease_released_total: 4,
+            admission: vec![AdmissionMetricSnapshot {
+                work: "request",
+                scope: "owner",
+                waiters: 2,
+                waits: 5,
+                acquired_after_wait: 3,
+                timeouts: 1,
+                ineligible: 0,
+                cancelled: 1,
+                wait_milliseconds: 250,
+                owner_recovery: 4,
+            }],
+            pressure_calibration: PressureCalibrationSnapshot {
+                ratio: 1.25,
+                samples: 2,
+                estimated_tokens: 20_000,
+                actual_pressure_tokens: 25_000,
+            },
             accounts: vec![
                 AccountMetric {
                     account_id: "acct-a".to_string(),
@@ -374,6 +556,7 @@ mod tests {
                     provider: "codex".to_string(),
                     pool: Some("fast".to_string()),
                     in_flight: 2,
+                    in_flight_pressure: 7,
                     error_count: 1,
                     health_tier: 0,
                     cooldown_active: false,
@@ -384,6 +567,7 @@ mod tests {
                     provider: "claude".to_string(),
                     pool: None,
                     in_flight: 0,
+                    in_flight_pressure: 0,
                     error_count: 4,
                     health_tier: 1,
                     cooldown_active: true,
@@ -391,6 +575,7 @@ mod tests {
             ],
             upstream_requests: vec![],
             rate_limit_hits: vec![],
+            relay_events: vec![],
         };
 
         let body = render_prometheus_text(&snapshot);
@@ -402,9 +587,20 @@ mod tests {
         assert!(body.contains("# TYPE polyflare_health_tier_transitions_total counter"));
         assert!(body.contains("polyflare_health_tier_transitions_total 7"));
         assert!(body.contains("# TYPE polyflare_lease_acquired_total counter"));
+        assert!(body.contains("polyflare_account_inflight_pressure{account_id=\"acct-a\""));
+        assert!(body.contains("} 7"));
+        assert!(body.contains("polyflare_request_pressure_calibration_ratio 1.25"));
+        assert!(body.contains("polyflare_request_pressure_samples_total 2"));
         assert!(body.contains("polyflare_lease_acquired_total 10"));
         assert!(body.contains("# TYPE polyflare_lease_released_total counter"));
         assert!(body.contains("polyflare_lease_released_total 4"));
+        assert!(body.contains("polyflare_admission_waiters{work=\"request\",scope=\"owner\"} 2"));
+        assert!(body.contains(
+            "polyflare_admission_rejected_total{work=\"request\",scope=\"owner\",reason=\"timeout\"} 1"
+        ));
+        assert!(body.contains(
+            "polyflare_admission_owner_recovery_total{work=\"request\",scope=\"owner\"} 4"
+        ));
 
         assert!(body.contains("# TYPE polyflare_account_inflight gauge"));
         assert!(body.contains(
@@ -456,9 +652,12 @@ mod tests {
             health_tier_transitions_total: 0,
             lease_acquired_total: 10,
             lease_released_total: 4,
+            admission: vec![],
+            pressure_calibration: PressureCalibrationSnapshot::default(),
             accounts: vec![],
             upstream_requests: vec![],
             rate_limit_hits: vec![],
+            relay_events: vec![],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(body.contains("# TYPE polyflare_lease_inflight gauge"));
@@ -473,9 +672,12 @@ mod tests {
             health_tier_transitions_total: 0,
             lease_acquired_total: 2,
             lease_released_total: 9,
+            admission: vec![],
+            pressure_calibration: PressureCalibrationSnapshot::default(),
             accounts: vec![],
             upstream_requests: vec![],
             rate_limit_hits: vec![],
+            relay_events: vec![],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(body.contains("polyflare_lease_inflight 0"));
@@ -491,6 +693,8 @@ mod tests {
             health_tier_transitions_total: 0,
             lease_acquired_total: 0,
             lease_released_total: 0,
+            admission: vec![],
+            pressure_calibration: PressureCalibrationSnapshot::default(),
             accounts: vec![
                 account("acct-a", "active"),
                 account("acct-b", "active"),
@@ -498,6 +702,7 @@ mod tests {
             ],
             upstream_requests: vec![],
             rate_limit_hits: vec![],
+            relay_events: vec![],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(body.contains("# TYPE polyflare_accounts_total gauge"));
@@ -517,9 +722,18 @@ mod tests {
             health_tier_transitions_total: 1,
             lease_acquired_total: 1,
             lease_released_total: 1,
+            admission: vec![],
+            pressure_calibration: PressureCalibrationSnapshot::default(),
             accounts: vec![account("acct-opaque-row-id-123", "active")],
-            upstream_requests: vec![("acct-opaque-row-id-123".to_string(), 200, 1)],
+            upstream_requests: vec![(
+                "codex".to_string(),
+                "account".to_string(),
+                "acct-opaque-row-id-123".to_string(),
+                200,
+                1,
+            )],
             rate_limit_hits: vec![("upstream".to_string(), 1)],
+            relay_events: vec![],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(!body.contains('@'), "body must never contain an @: {body}");
@@ -542,9 +756,12 @@ mod tests {
             health_tier_transitions_total: 0,
             lease_acquired_total: 0,
             lease_released_total: 0,
+            admission: vec![],
+            pressure_calibration: PressureCalibrationSnapshot::default(),
             accounts: vec![account("acct-\"quote\"-\\backslash\\", "active")],
             upstream_requests: vec![],
             rate_limit_hits: vec![],
+            relay_events: vec![],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(
@@ -571,9 +788,12 @@ mod tests {
             health_tier_transitions_total: 3,
             lease_acquired_total: 4,
             lease_released_total: 1,
+            admission: vec![],
+            pressure_calibration: PressureCalibrationSnapshot::default(),
             accounts: vec![],
             upstream_requests: vec![],
             rate_limit_hits: vec![],
+            relay_events: vec![],
         };
         let body = render_prometheus_text(&snapshot);
 
@@ -602,7 +822,7 @@ mod tests {
 
     /// (a) C11b: `render_prometheus_text` with seeded `upstream_requests`/`rate_limit_hits` vecs
     /// emits the exact `# TYPE polyflare_upstream_requests_total counter` line ONCE, one labeled
-    /// sample line per `(account_id, status, count)` entry, and the mirrored
+    /// sample line per `(provider, target_kind, target_id, status, count)` entry, and the mirrored
     /// `polyflare_rate_limit_hits_total{type="..."}` family — HELP/TYPE appear once per family, not
     /// once per sample, exactly like every other family this renderer emits.
     #[test]
@@ -613,14 +833,35 @@ mod tests {
             health_tier_transitions_total: 0,
             lease_acquired_total: 0,
             lease_released_total: 0,
+            admission: vec![],
+            pressure_calibration: PressureCalibrationSnapshot::default(),
             accounts: vec![],
             upstream_requests: vec![
-                ("acct-a".to_string(), 200, 5),
-                ("acct-b".to_string(), 429, 2),
-                // The `None` (no-eligible-account) render convention: empty account_id.
-                (String::new(), 503, 1),
+                (
+                    "codex".to_string(),
+                    "account".to_string(),
+                    "acct-a".to_string(),
+                    200,
+                    5,
+                ),
+                (
+                    "anthropic".to_string(),
+                    "account".to_string(),
+                    "acct-b".to_string(),
+                    429,
+                    2,
+                ),
+                // The `None` (no-eligible-target) render convention: empty target_id.
+                (
+                    "codex".to_string(),
+                    "account".to_string(),
+                    String::new(),
+                    503,
+                    1,
+                ),
             ],
             rate_limit_hits: vec![("upstream".to_string(), 3), ("backoff".to_string(), 1)],
+            relay_events: vec![],
         };
 
         let body = render_prometheus_text(&snapshot);
@@ -637,13 +878,17 @@ mod tests {
             1,
             "HELP must be emitted once per family: {body}"
         );
-        assert!(body
-            .contains("polyflare_upstream_requests_total{account_id=\"acct-a\",status=\"200\"} 5"));
-        assert!(body
-            .contains("polyflare_upstream_requests_total{account_id=\"acct-b\",status=\"429\"} 2"));
+        assert!(body.contains(
+            "polyflare_upstream_requests_total{provider=\"codex\",target_kind=\"account\",target_id=\"acct-a\",status=\"200\"} 5"
+        ));
+        assert!(body.contains(
+            "polyflare_upstream_requests_total{provider=\"anthropic\",target_kind=\"account\",target_id=\"acct-b\",status=\"429\"} 2"
+        ));
         assert!(
-            body.contains("polyflare_upstream_requests_total{account_id=\"\",status=\"503\"} 1"),
-            "the None account_id convention must render as the valid empty label: {body}"
+            body.contains(
+                "polyflare_upstream_requests_total{provider=\"codex\",target_kind=\"account\",target_id=\"\",status=\"503\"} 1"
+            ),
+            "the None target_id convention must render as the valid empty label: {body}"
         );
 
         assert_eq!(
@@ -675,9 +920,18 @@ mod tests {
             health_tier_transitions_total: 0,
             lease_acquired_total: 0,
             lease_released_total: 0,
+            admission: vec![],
+            pressure_calibration: PressureCalibrationSnapshot::default(),
             accounts: vec![],
-            upstream_requests: vec![("acct-opaque-row-id-123".to_string(), 200, 1)],
+            upstream_requests: vec![(
+                "codex".to_string(),
+                "account".to_string(),
+                "acct-opaque-row-id-123".to_string(),
+                200,
+                1,
+            )],
             rate_limit_hits: vec![("upstream".to_string(), 1)],
+            relay_events: vec![],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(!body.contains('@'), "body must never contain an @: {body}");

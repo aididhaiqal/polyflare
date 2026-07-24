@@ -14,17 +14,43 @@ use sqlx::{QueryBuilder, Sqlite};
 
 use crate::StoreError;
 
-/// Defines the HTTP status code threshold that classifies a request as an error across all read
-/// surfaces: [`RequestLogRepo::aggregate_since`], [`RequestLogRepo::series_since`],
-/// [`RequestLogRepo::recent_errors`], and [`RequestLogRepo::page`] filtering. Errors are
-/// requests with status >= this value; success are status < 300; 3xx redirects count toward
-/// total but not toward success or error.
+/// Native streaming rows with a terminal `protocol_outcome` classify by that outcome, preserving
+/// their initial HTTP status only as transport metadata. Legacy native rows classify by HTTP
+/// status. Imported codex-lb rows use `status = 0` as an explicit "HTTP status unavailable"
+/// sentinel and classify by their bounded `outcome` instead. Unknown status-0 rows and 3xx
+/// redirects count toward total but not toward success or error.
 ///
-/// **IMPORTANT:** This constant defines error classification EVERYWHERE in this module. If this
-/// value changes, all SQL queries and filters that reference it MUST be updated together to
-/// maintain consistency across the dashboard's request metrics. See the four usage sites:
-/// `aggregate_since`, `series_since`, `recent_errors`, and `push_where`.
-const ERROR_STATUS_MIN: i64 = 400;
+/// **IMPORTANT:** These expressions define classification EVERYWHERE in this module. Keep
+/// aggregates, report series, recent errors, and page filters on the same pair.
+const SUCCESS_SQL: &str = "(protocol_outcome = 'completed' OR \
+    (protocol_outcome IS NULL AND ((status >= 100 AND status < 300) OR \
+    (status = 0 AND outcome = 'success'))))";
+const ERROR_SQL: &str = "(protocol_outcome IN \
+    ('failed', 'incomplete', 'cancelled', 'transport_lost') OR \
+    (protocol_outcome IS NULL AND (status >= 400 OR \
+    (status = 0 AND outcome = 'error'))))";
+
+/// A bounded, content-free terminal result observed inside a native Codex response stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestProtocolOutcome {
+    Completed,
+    Failed,
+    Incomplete,
+    Cancelled,
+    TransportLost,
+}
+
+impl RequestProtocolOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Incomplete => "incomplete",
+            Self::Cancelled => "cancelled",
+            Self::TransportLost => "transport_lost",
+        }
+    }
+}
 
 /// A content-free request-outcome record to persist. Every field is a bounded enum-like string, a
 /// number, or an epoch timestamp — never request content. This is the insert input; the persisted
@@ -50,9 +76,21 @@ pub struct RequestLogRecord {
     pub duration_ms: i64,
     /// The serving account's stable id (never a token or session id) — content-free identifier.
     pub account_id: Option<String>,
+    /// Which target namespace served the request: `account` for built-in OAuth pools or
+    /// `credential` for a custom-provider API key. `None` only on legacy/imported rows.
+    pub target_kind: Option<String>,
+    /// Stable id of the selected custom-provider credential. Never the secret or a secret-derived
+    /// value; mutually exclusive with `account_id` on native rows.
+    pub provider_credential_id: Option<String>,
     /// The resolved backend model name (e.g. `"gpt-5.6-sol"`) — a bounded identifier, never
     /// request/response content.
     pub model: Option<String>,
+    /// Model slug actually sent upstream. Distinct from the public `model` when a provider maps a
+    /// stable public alias such as `fugu-ultra` to a versioned upstream slug.
+    pub upstream_model: Option<String>,
+    /// Upstream transport used behind PolyFlare (`codex_ws`, `http_sse`, ...), distinct from the
+    /// downstream/client-facing `transport`.
+    pub upstream_transport: Option<String>,
     /// The requested reasoning effort (e.g. `"high"`), if applicable to the provider/model.
     pub reasoning_effort: Option<String>,
     /// The resolved service tier (e.g. `"priority"`), if applicable.
@@ -69,11 +107,14 @@ pub struct RequestLogRecord {
     /// `memory_consolidation`/`collab_spawn`), or `None` for the main agent — a bounded role slug,
     /// never conversation content, same content-safety class as `model`/`transport`.
     pub subagent: Option<String>,
-    /// The upstream/client request-correlation id (migration 0005) — a content-free identifier,
+    /// PolyFlare's generated request-correlation id (migration 0005) — a content-free identifier,
     /// never conversation content. Populated at insert time and used by
     /// [`RequestLogRepo::update_usage`] to correlate the stream wrapper's post-completion usage
     /// backfill to this row.
     pub request_id: Option<String>,
+    /// PolyFlare's one-way SHA-256 continuity/session key. This is the same content-free identifier
+    /// shown by the Sessions dashboard, never a raw session/thread/window header.
+    pub session_key: Option<String>,
     /// Prompt/input token count (migration 0005), a content-free count. `None` until the stream
     /// wrapper backfills it via [`RequestLogRepo::update_usage`].
     pub input_tokens: Option<i64>,
@@ -83,6 +124,10 @@ pub struct RequestLogRecord {
     pub cached_input_tokens: Option<i64>,
     /// Reasoning token count (migration 0005), a content-free count.
     pub reasoning_tokens: Option<i64>,
+    /// Provider-reported orchestration work billed outside ordinary visible input/output.
+    pub orchestration_input_tokens: Option<i64>,
+    pub orchestration_output_tokens: Option<i64>,
+    pub orchestration_cached_input_tokens: Option<i64>,
     /// Computed request cost in USD (migration 0005).
     pub cost_usd: Option<f64>,
     /// Time-to-first-token in milliseconds (migration 0005). Distinct from `ttft_ms` (migration
@@ -90,6 +135,10 @@ pub struct RequestLogRecord {
     /// import-shaped near-neighbor of the same concept, backfilled by the stream wrapper alongside
     /// the other usage/cost columns (see 0005's migration comment).
     pub latency_first_token_ms: Option<i64>,
+    /// Bounded native stream terminal result. HTTP-SSE normally fills this through
+    /// [`RequestLogRepo::update_usage`] after the response body drains; transports such as the
+    /// downstream WebSocket relay that already know the terminal at insert time set it directly.
+    pub protocol_outcome: Option<RequestProtocolOutcome>,
 }
 
 /// A persisted request-log row: a [`RequestLogRecord`] plus its surrogate primary key. `status` is
@@ -106,7 +155,11 @@ pub struct RequestLogRow {
     pub status: i64,
     pub duration_ms: i64,
     pub account_id: Option<String>,
+    pub target_kind: Option<String>,
+    pub provider_credential_id: Option<String>,
     pub model: Option<String>,
+    pub upstream_model: Option<String>,
+    pub upstream_transport: Option<String>,
     pub reasoning_effort: Option<String>,
     pub service_tier: Option<String>,
     pub transport: Option<String>,
@@ -115,20 +168,33 @@ pub struct RequestLogRow {
     pub cached_tokens: Option<i64>,
     pub subagent: Option<String>,
     pub request_id: Option<String>,
+    pub session_key: Option<String>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
     pub reasoning_tokens: Option<i64>,
+    pub orchestration_input_tokens: Option<i64>,
+    pub orchestration_output_tokens: Option<i64>,
+    pub orchestration_cached_input_tokens: Option<i64>,
     pub cost_usd: Option<f64>,
     pub latency_first_token_ms: Option<i64>,
+    /// Bounded native stream terminal result. `None` on legacy/imported rows.
+    pub protocol_outcome: Option<String>,
+    /// Legacy codex-lb's bounded text outcome (`success` | `error`). Native PolyFlare rows use a
+    /// real HTTP `status` and leave this null.
+    pub outcome: Option<String>,
+    /// Legacy codex-lb's bounded machine error code, when its `outcome` is `error`.
+    pub error_code: Option<String>,
 }
 
 /// Dashboard filter set for [`RequestLogRepo::page`]. Every field is optional; an unset field
-/// applies no filter. `status_class` is not a raw column value — `"success"` maps to `status < 300`,
-/// `"error"` maps to `status >= 400`, and any other value (including `"all"` or unset) applies no
-/// status filter.
+/// applies no filter. `status_class` is not a raw column value: native rows classify by HTTP
+/// status, imported `status = 0` rows by their bounded `outcome`, and any other value (including
+/// `"all"` or unset) applies no status filter.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RequestsFilter {
+    pub request_id: Option<String>,
+    pub session_key: Option<String>,
     pub account: Option<String>,
     pub provider: Option<String>,
     pub status_class: Option<String>,
@@ -146,6 +212,8 @@ pub struct RequestAggregate {
     pub error: i64,
     pub avg_latency_ms: f64,
     pub total_tokens: i64,
+    pub orchestration_tokens: i64,
+    pub orchestration_cached_tokens: i64,
 }
 
 /// One time bucket of [`RequestLogRepo::series_since`]: a content-free request-volume rollup for a
@@ -160,6 +228,8 @@ pub struct RequestBucket {
     pub errors: i64,
     pub avg_latency_ms: f64,
     pub total_tokens: i64,
+    pub orchestration_tokens: i64,
+    pub orchestration_cached_tokens: i64,
 }
 
 /// The shared metric set for the Reports/Analytics endpoints (`GET /api/reports*`), computed by
@@ -178,6 +248,8 @@ pub struct ReportMetrics {
     pub tokens: i64,
     pub cached_tokens: i64,
     pub reasoning_tokens: i64,
+    pub orchestration_tokens: i64,
+    pub orchestration_cached_tokens: i64,
     pub avg_duration_ms: f64,
     pub avg_ttft_ms: f64,
     /// `COUNT` of rows with a non-NULL `latency_first_token_ms` — the denominator `AVG` silently
@@ -213,7 +285,10 @@ pub struct ReportBreakdownRow {
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct RecentErrorRow {
     pub status: i64,
+    pub provider: String,
     pub account_id: Option<String>,
+    pub target_kind: Option<String>,
+    pub provider_credential_id: Option<String>,
     pub error_code: Option<String>,
     pub requested_at: i64,
 }
@@ -234,11 +309,14 @@ impl RequestLogRepo {
         sqlx::query(
             "INSERT INTO request_log \
              (requested_at, provider, method, path, aliased, status, duration_ms, \
-              account_id, model, reasoning_effort, service_tier, transport, ttft_ms, \
-              total_tokens, cached_tokens, subagent, request_id, input_tokens, \
-              output_tokens, cached_input_tokens, reasoning_tokens, cost_usd, \
-              latency_first_token_ms) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              account_id, target_kind, provider_credential_id, model, upstream_model, \
+              upstream_transport, reasoning_effort, service_tier, transport, ttft_ms, \
+              total_tokens, cached_tokens, subagent, request_id, session_key, input_tokens, \
+              output_tokens, cached_input_tokens, reasoning_tokens, orchestration_input_tokens, \
+              orchestration_output_tokens, orchestration_cached_input_tokens, cost_usd, \
+              latency_first_token_ms, protocol_outcome) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                     ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.requested_at)
         .bind(&record.provider)
@@ -248,7 +326,11 @@ impl RequestLogRepo {
         .bind(i64::from(record.status))
         .bind(record.duration_ms)
         .bind(&record.account_id)
+        .bind(&record.target_kind)
+        .bind(&record.provider_credential_id)
         .bind(&record.model)
+        .bind(&record.upstream_model)
+        .bind(&record.upstream_transport)
         .bind(&record.reasoning_effort)
         .bind(&record.service_tier)
         .bind(&record.transport)
@@ -257,12 +339,17 @@ impl RequestLogRepo {
         .bind(record.cached_tokens)
         .bind(&record.subagent)
         .bind(&record.request_id)
+        .bind(&record.session_key)
         .bind(record.input_tokens)
         .bind(record.output_tokens)
         .bind(record.cached_input_tokens)
         .bind(record.reasoning_tokens)
+        .bind(record.orchestration_input_tokens)
+        .bind(record.orchestration_output_tokens)
+        .bind(record.orchestration_cached_input_tokens)
         .bind(record.cost_usd)
         .bind(record.latency_first_token_ms)
+        .bind(record.protocol_outcome.map(RequestProtocolOutcome::as_str))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -281,8 +368,8 @@ impl RequestLogRepo {
     /// `Instant`). This OVERWRITES the row's `duration_ms` (set at insert time to the much
     /// smaller route+setup-only duration, measured before the body streamed) with the true
     /// total — the two must share an origin for `derive_tps` in `read_api.rs` to be meaningful.
-    /// `COALESCE`'d against the existing value: `None` (e.g. no usage was ever captured) leaves
-    /// the insert's original `duration_ms` untouched rather than nulling it out.
+    /// `COALESCE`'d against the existing value: `None` leaves the insert's original `duration_ms`
+    /// untouched. Timing can still be written when final token usage is unavailable.
     #[allow(clippy::too_many_arguments)]
     pub async fn update_usage(
         &self,
@@ -291,22 +378,32 @@ impl RequestLogRepo {
         output_tokens: Option<i64>,
         cached_input_tokens: Option<i64>,
         reasoning_tokens: Option<i64>,
+        orchestration_input_tokens: Option<i64>,
+        orchestration_output_tokens: Option<i64>,
+        orchestration_cached_input_tokens: Option<i64>,
         cost_usd: Option<f64>,
         latency_first_token_ms: Option<i64>,
         duration_ms: Option<i64>,
+        protocol_outcome: Option<RequestProtocolOutcome>,
     ) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE request_log SET input_tokens=?, output_tokens=?, cached_input_tokens=?, \
-             reasoning_tokens=?, cost_usd=?, latency_first_token_ms=?, \
-             duration_ms = COALESCE(?, duration_ms) WHERE request_id=?",
+             reasoning_tokens=?, orchestration_input_tokens=?, orchestration_output_tokens=?, \
+             orchestration_cached_input_tokens=?, cost_usd=?, latency_first_token_ms=?, \
+             duration_ms = COALESCE(?, duration_ms), \
+             protocol_outcome = COALESCE(?, protocol_outcome) WHERE request_id=?",
         )
         .bind(input_tokens)
         .bind(output_tokens)
         .bind(cached_input_tokens)
         .bind(reasoning_tokens)
+        .bind(orchestration_input_tokens)
+        .bind(orchestration_output_tokens)
+        .bind(orchestration_cached_input_tokens)
         .bind(cost_usd)
         .bind(latency_first_token_ms)
         .bind(duration_ms)
+        .bind(protocol_outcome.map(RequestProtocolOutcome::as_str))
         .bind(request_id)
         .execute(&self.pool)
         .await?;
@@ -317,9 +414,12 @@ impl RequestLogRepo {
     pub async fn list(&self, limit: i64, offset: i64) -> Result<Vec<RequestLogRow>, StoreError> {
         let rows = sqlx::query_as::<_, RequestLogRow>(
             "SELECT id, requested_at, provider, method, path, aliased, status, duration_ms, \
-             account_id, model, reasoning_effort, service_tier, transport, ttft_ms, \
-             total_tokens, cached_tokens, subagent, request_id, input_tokens, output_tokens, \
-             cached_input_tokens, reasoning_tokens, cost_usd, latency_first_token_ms \
+             account_id, target_kind, provider_credential_id, model, upstream_model, \
+             upstream_transport, reasoning_effort, service_tier, transport, ttft_ms, \
+             total_tokens, cached_tokens, subagent, request_id, session_key, input_tokens, output_tokens, \
+             cached_input_tokens, reasoning_tokens, orchestration_input_tokens, \
+             orchestration_output_tokens, orchestration_cached_input_tokens, cost_usd, latency_first_token_ms, \
+             outcome, error_code, protocol_outcome \
              FROM request_log \
              ORDER BY requested_at DESC, id DESC \
              LIMIT ? OFFSET ?",
@@ -351,9 +451,12 @@ impl RequestLogRepo {
     ) -> Result<(Vec<RequestLogRow>, u64), StoreError> {
         let mut select = QueryBuilder::<Sqlite>::new(
             "SELECT id, requested_at, provider, method, path, aliased, status, duration_ms, \
-             account_id, model, reasoning_effort, service_tier, transport, ttft_ms, \
-             total_tokens, cached_tokens, subagent, request_id, input_tokens, output_tokens, \
-             cached_input_tokens, reasoning_tokens, cost_usd, latency_first_token_ms \
+             account_id, target_kind, provider_credential_id, model, upstream_model, \
+             upstream_transport, reasoning_effort, service_tier, transport, ttft_ms, \
+             total_tokens, cached_tokens, subagent, request_id, session_key, input_tokens, output_tokens, \
+             cached_input_tokens, reasoning_tokens, orchestration_input_tokens, \
+             orchestration_output_tokens, orchestration_cached_input_tokens, cost_usd, latency_first_token_ms, \
+             outcome, error_code, protocol_outcome \
              FROM request_log",
         );
         Self::push_where(&mut select, filter);
@@ -375,22 +478,25 @@ impl RequestLogRepo {
 
     /// One-query content-free rollup over `request_log` rows at/after `since_ts` — the dashboard
     /// overview's KPI tile (`GET /api/overview`). `total`/`success`/`error` classify by the same
-    /// status-class rule as [`RequestsFilter::status_class`] (`success` = `status < 300`, `error` =
-    /// `status >= 400`; the gap between them, e.g. 3xx redirects, counts toward `total` only).
+    /// status-class rule as [`RequestsFilter::status_class`] (native HTTP plus imported outcome;
+    /// 3xx and unknown status-0 rows count toward `total` only).
     /// `avg_latency_ms`/`total_tokens` default to `0.0`/`0` (via `COALESCE`) when no row matches,
     /// so an empty window renders as zeroed KPIs rather than nulls. `total_tokens` itself falls
     /// back per row to `input_tokens + output_tokens` (Task 7: `0005` import/backfill rows never
     /// populate `total_tokens`; a missing sub-count coalesces to 0, and `reasoning_tokens` is
     /// never added — it's a subset of `output_tokens`, not a third count).
     pub async fn aggregate_since(&self, since_ts: i64) -> Result<RequestAggregate, StoreError> {
-        let row: (i64, i64, i64, f64, i64) = sqlx::query_as(&format!(
+        let row: (i64, i64, i64, f64, i64, i64, i64) = sqlx::query_as(&format!(
             "SELECT COUNT(*), \
-                    COALESCE(SUM(CASE WHEN status < 300 THEN 1 ELSE 0 END), 0), \
-                    COALESCE(SUM(CASE WHEN status >= {} THEN 1 ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN {success} THEN 1 ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0), \
                     COALESCE(AVG(duration_ms), 0.0), \
-                    COALESCE(SUM(COALESCE(total_tokens, COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))), 0) \
+                    COALESCE(SUM(COALESCE(total_tokens, COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))), 0), \
+                    COALESCE(SUM(COALESCE(orchestration_input_tokens, 0) + COALESCE(orchestration_output_tokens, 0)), 0), \
+                    COALESCE(SUM(COALESCE(orchestration_cached_input_tokens, 0)), 0) \
              FROM request_log WHERE requested_at >= ?",
-            ERROR_STATUS_MIN
+            success = SUCCESS_SQL,
+            error = ERROR_SQL,
         ))
         .bind(since_ts)
         .fetch_one(&self.pool)
@@ -401,6 +507,8 @@ impl RequestLogRepo {
             error: row.2,
             avg_latency_ms: row.3,
             total_tokens: row.4,
+            orchestration_tokens: row.5,
+            orchestration_cached_tokens: row.6,
         })
     }
 
@@ -408,7 +516,8 @@ impl RequestLogRepo {
     /// (`GET /api/overview/series`): one row per `bucket_secs`-wide bucket at/after `since_ts`,
     /// ascending by bucket start (`ts`). Bucketing is done in SQL via integer-division grouping
     /// (`(requested_at / bucket_secs) * bucket_secs`), not by fetching rows into Rust. `errors`
-    /// classifies by the SAME rule [`Self::aggregate_since`] uses (`status >= 400`); `avg_latency_ms`
+    /// classifies by the SAME native-HTTP/imported-outcome rule [`Self::aggregate_since`] uses;
+    /// `avg_latency_ms`
     /// / `total_tokens` are per-bucket `AVG`/`SUM`, never null (a bucket only exists here because it
     /// has >= 1 row). `total_tokens` falls back per row the same way [`Self::aggregate_since`]'s does
     /// (`input_tokens + output_tokens` when `total_tokens` itself is null; never `reasoning_tokens`).
@@ -430,15 +539,17 @@ impl RequestLogRepo {
         bucket_secs: i64,
     ) -> Result<Vec<RequestBucket>, StoreError> {
         let bucket_secs = bucket_secs.max(1);
-        let rows: Vec<(i64, i64, i64, f64, i64)> = sqlx::query_as(&format!(
+        let rows: Vec<(i64, i64, i64, f64, i64, i64, i64)> = sqlx::query_as(&format!(
             "SELECT (requested_at / ?) * ? AS bucket_ts, \
                     COUNT(*), \
-                    COALESCE(SUM(CASE WHEN status >= {} THEN 1 ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0), \
                     COALESCE(AVG(duration_ms), 0.0), \
-                    COALESCE(SUM(COALESCE(total_tokens, COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))), 0) \
+                    COALESCE(SUM(COALESCE(total_tokens, COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))), 0), \
+                    COALESCE(SUM(COALESCE(orchestration_input_tokens, 0) + COALESCE(orchestration_output_tokens, 0)), 0), \
+                    COALESCE(SUM(COALESCE(orchestration_cached_input_tokens, 0)), 0) \
              FROM request_log WHERE requested_at >= ? \
              GROUP BY bucket_ts ORDER BY bucket_ts ASC",
-            ERROR_STATUS_MIN
+            error = ERROR_SQL,
         ))
         .bind(bucket_secs)
         .bind(bucket_secs)
@@ -449,12 +560,22 @@ impl RequestLogRepo {
         Ok(rows
             .into_iter()
             .map(
-                |(ts, requests, errors, avg_latency_ms, total_tokens)| RequestBucket {
+                |(
                     ts,
                     requests,
                     errors,
                     avg_latency_ms,
                     total_tokens,
+                    orchestration_tokens,
+                    orchestration_cached_tokens,
+                )| RequestBucket {
+                    ts,
+                    requests,
+                    errors,
+                    avg_latency_ms,
+                    total_tokens,
+                    orchestration_tokens,
+                    orchestration_cached_tokens,
                 },
             )
             .collect())
@@ -462,7 +583,8 @@ impl RequestLogRepo {
 
     /// The nine-column metric SELECT list shared by [`Self::reports_totals`]/
     /// [`Self::reports_series`]/[`Self::reports_breakdown`] — errors classified by the SAME
-    /// `ERROR_STATUS_MIN` rule as `aggregate_since`/`series_since`, and `tokens`/`cached_tokens`
+    /// native-HTTP/imported-outcome rule as `aggregate_since`/`series_since`, and
+    /// `tokens`/`cached_tokens`
     /// falling back the SAME way (`total_tokens` -> `input_tokens + output_tokens`; `cached_tokens`
     /// -> `cached_input_tokens`; never `+ reasoning_tokens`, which is a subset of `output_tokens`,
     /// not a third count — same reasoning as `aggregate_since`'s `total_tokens` fallback). Column
@@ -471,15 +593,17 @@ impl RequestLogRepo {
     fn reports_metric_select_list() -> String {
         format!(
             "COUNT(*), \
-             COALESCE(SUM(CASE WHEN status >= {min} THEN 1 ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0), \
              COALESCE(SUM(cost_usd), 0.0), \
              COALESCE(SUM(COALESCE(total_tokens, COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))), 0), \
              COALESCE(SUM(COALESCE(cached_tokens, cached_input_tokens, 0)), 0), \
              COALESCE(SUM(COALESCE(reasoning_tokens, 0)), 0), \
+             COALESCE(SUM(COALESCE(orchestration_input_tokens, 0) + COALESCE(orchestration_output_tokens, 0)), 0), \
+             COALESCE(SUM(COALESCE(orchestration_cached_input_tokens, 0)), 0), \
              COALESCE(AVG(duration_ms), 0.0), \
              COALESCE(AVG(latency_first_token_ms), 0.0), \
              COUNT(latency_first_token_ms)",
-            min = ERROR_STATUS_MIN
+            error = ERROR_SQL
         )
     }
 
@@ -487,7 +611,7 @@ impl RequestLogRepo {
     /// [`ReportMetrics`] — the single place all three `reports_*` methods share this conversion, so
     /// the column order only has to be kept in sync in one place.
     fn report_metrics_from_row(
-        row: (i64, i64, f64, i64, i64, i64, f64, f64, i64),
+        row: (i64, i64, f64, i64, i64, i64, i64, i64, f64, f64, i64),
     ) -> ReportMetrics {
         ReportMetrics {
             requests: row.0,
@@ -496,9 +620,11 @@ impl RequestLogRepo {
             tokens: row.3,
             cached_tokens: row.4,
             reasoning_tokens: row.5,
-            avg_duration_ms: row.6,
-            avg_ttft_ms: row.7,
-            ttft_sample_count: row.8,
+            orchestration_tokens: row.6,
+            orchestration_cached_tokens: row.7,
+            avg_duration_ms: row.8,
+            avg_ttft_ms: row.9,
+            ttft_sample_count: row.10,
         }
     }
 
@@ -524,7 +650,8 @@ impl RequestLogRepo {
             }
         );
         let mut query =
-            sqlx::query_as::<_, (i64, i64, f64, i64, i64, i64, f64, f64, i64)>(&sql).bind(since_ts);
+            sqlx::query_as::<_, (i64, i64, f64, i64, i64, i64, i64, i64, f64, f64, i64)>(&sql)
+                .bind(since_ts);
         if let Some(p) = provider {
             query = query.bind(p);
         }
@@ -557,7 +684,7 @@ impl RequestLogRepo {
             }
         );
         let mut query =
-            sqlx::query_as::<_, (i64, i64, i64, f64, i64, i64, i64, f64, f64, i64)>(&sql)
+            sqlx::query_as::<_, (i64, i64, i64, f64, i64, i64, i64, i64, i64, f64, f64, i64)>(&sql)
                 .bind(bucket_secs)
                 .bind(bucket_secs)
                 .bind(since_ts);
@@ -570,14 +697,15 @@ impl RequestLogRepo {
             .map(|row| ReportBucket {
                 ts: row.0,
                 metrics: Self::report_metrics_from_row((
-                    row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
+                    row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11,
                 )),
             })
             .collect())
     }
 
     /// Content-free [`ReportBreakdownRow`] rollup grouped by one dimension (`account`/`model`/
-    /// `provider`, mapping to the `account_id`/`model`/`provider` columns) over `request_log` rows
+    /// `provider`, mapping to the account-or-credential target/model/provider dimensions) over
+    /// `request_log` rows
     /// at/after `since_ts`, optionally narrowed to one `provider` — the Reports/Analytics
     /// endpoint's per-account/per-model/per-provider cost breakdown table. Rows are ordered by
     /// summed `cost_usd` descending (biggest spenders first). `dimension` values other than
@@ -592,16 +720,16 @@ impl RequestLogRepo {
         dimension: &str,
         provider: Option<&str>,
     ) -> Result<Vec<ReportBreakdownRow>, StoreError> {
-        let column = match dimension {
-            "account" => "account_id",
+        let expression = match dimension {
+            "account" => "COALESCE(provider_credential_id, account_id, '')",
             "provider" => "provider",
-            _ => "model",
+            _ => "COALESCE(model, '')",
         };
         let sql = format!(
-            "SELECT COALESCE({col}, '') AS dim_key, {metrics} \
+            "SELECT {expression} AS dim_key, {metrics} \
              FROM request_log WHERE requested_at >= ?{provider_clause} \
-             GROUP BY {col} ORDER BY COALESCE(SUM(cost_usd), 0.0) DESC",
-            col = column,
+             GROUP BY {expression} ORDER BY COALESCE(SUM(cost_usd), 0.0) DESC",
+            expression = expression,
             metrics = Self::reports_metric_select_list(),
             provider_clause = if provider.is_some() {
                 " AND provider = ?"
@@ -609,9 +737,24 @@ impl RequestLogRepo {
                 ""
             }
         );
-        let mut query =
-            sqlx::query_as::<_, (String, i64, i64, f64, i64, i64, i64, f64, f64, i64)>(&sql)
-                .bind(since_ts);
+        let mut query = sqlx::query_as::<
+            _,
+            (
+                String,
+                i64,
+                i64,
+                f64,
+                i64,
+                i64,
+                i64,
+                i64,
+                i64,
+                f64,
+                f64,
+                i64,
+            ),
+        >(&sql)
+        .bind(since_ts);
         if let Some(p) = provider {
             query = query.bind(p);
         }
@@ -621,23 +764,20 @@ impl RequestLogRepo {
             .map(|row| ReportBreakdownRow {
                 key: row.0,
                 metrics: Self::report_metrics_from_row((
-                    row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
+                    row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11,
                 )),
             })
             .collect())
     }
 
-    /// The newest `limit` content-free error rows (`status >= 400`), newest first — the dashboard
-    /// overview's `recent_errors` tile. Deliberately a narrow, dedicated projection (not `page`):
-    /// the overview only ever wants these four fields, and `error_code` (migration 0005) isn't on
-    /// [`RequestLogRow`] — wiring it there is a separate, larger change (every other
-    /// `RequestLogRecord`/`RequestLogRow` call site would need updating) that this dashboard-read
-    /// feature doesn't need.
+    /// The newest `limit` content-free error rows, using the same native-HTTP/imported-outcome
+    /// classification as every aggregate and filter above.
     pub async fn recent_errors(&self, limit: i64) -> Result<Vec<RecentErrorRow>, StoreError> {
         let rows = sqlx::query_as::<_, RecentErrorRow>(&format!(
-            "SELECT status, account_id, error_code, requested_at FROM request_log \
-             WHERE status >= {} ORDER BY requested_at DESC, id DESC LIMIT ?",
-            ERROR_STATUS_MIN
+            "SELECT status, provider, account_id, target_kind, provider_credential_id, \
+                    error_code, requested_at FROM request_log \
+             WHERE {error} ORDER BY requested_at DESC, id DESC LIMIT ?",
+            error = ERROR_SQL,
         ))
         .bind(limit)
         .fetch_all(&self.pool)
@@ -711,10 +851,23 @@ impl RequestLogRepo {
             }
         }
 
+        if let Some(v) = &filter.request_id {
+            sep(qb, &mut first);
+            qb.push("request_id = ");
+            qb.push_bind(v.clone());
+        }
+        if let Some(v) = &filter.session_key {
+            sep(qb, &mut first);
+            qb.push("session_key = ");
+            qb.push_bind(v.clone());
+        }
         if let Some(v) = &filter.account {
             sep(qb, &mut first);
-            qb.push("account_id = ");
+            qb.push("(account_id = ");
             qb.push_bind(v.clone());
+            qb.push(" OR provider_credential_id = ");
+            qb.push_bind(v.clone());
+            qb.push(")");
         }
         if let Some(v) = &filter.provider {
             sep(qb, &mut first);
@@ -724,12 +877,11 @@ impl RequestLogRepo {
         match filter.status_class.as_deref() {
             Some("success") => {
                 sep(qb, &mut first);
-                qb.push("status < 300");
+                qb.push(SUCCESS_SQL);
             }
             Some("error") => {
                 sep(qb, &mut first);
-                qb.push("status >= ");
-                qb.push_bind(ERROR_STATUS_MIN);
+                qb.push(ERROR_SQL);
             }
             _ => {}
         }
@@ -775,7 +927,11 @@ mod tests {
             status: 200,
             duration_ms: 1800,
             account_id: Some("acct-1".into()),
+            target_kind: Some("account".into()),
+            provider_credential_id: None,
             model: Some("gpt-5.6-sol".into()),
+            upstream_model: None,
+            upstream_transport: None,
             reasoning_effort: Some("high".into()),
             service_tier: Some("priority".into()),
             transport: Some("http".into()),
@@ -784,12 +940,17 @@ mod tests {
             cached_tokens: Some(1100),
             subagent: Some("review".into()),
             request_id: None,
+            session_key: None,
             input_tokens: None,
             output_tokens: None,
             cached_input_tokens: None,
             reasoning_tokens: None,
+            orchestration_input_tokens: None,
+            orchestration_output_tokens: None,
+            orchestration_cached_input_tokens: None,
             cost_usd: None,
             latency_first_token_ms: None,
+            protocol_outcome: None,
         };
         repo.insert(&rec).await.unwrap();
 
@@ -811,18 +972,31 @@ mod tests {
     /// `QueryBuilder` SELECT from `list`'s, so this guards against the two SELECT column lists
     /// drifting out of sync (a `FromRow` column-count mismatch panics at runtime, not compile time).
     #[tokio::test]
-    async fn page_round_trips_subagent() {
+    async fn page_round_trips_subagent_and_session_key() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("store.db")).await.unwrap();
         let repo = store.request_log();
 
         let mut rec = rec("codex", "/responses", 200, Some("gpt-5.6-sol"));
         rec.subagent = Some("compact".into());
+        rec.session_key = Some("hashed-session-a".into());
         repo.insert(&rec).await.unwrap();
 
-        let (rows, _total) = repo.page(&RequestsFilter::default(), 10, 0).await.unwrap();
+        let (rows, total) = repo
+            .page(
+                &RequestsFilter {
+                    session_key: Some("hashed-session-a".into()),
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].subagent.as_deref(), Some("compact"));
+        assert_eq!(rows[0].session_key.as_deref(), Some("hashed-session-a"));
     }
 
     fn rec(provider: &str, path: &str, status: u16, model: Option<&str>) -> RequestLogRecord {
@@ -835,7 +1009,11 @@ mod tests {
             status,
             duration_ms: 1000,
             account_id: Some("acct-1".into()),
+            target_kind: Some("account".into()),
+            provider_credential_id: None,
             model: model.map(String::from),
+            upstream_model: None,
+            upstream_transport: None,
             reasoning_effort: None,
             service_tier: None,
             transport: Some("http".into()),
@@ -844,12 +1022,17 @@ mod tests {
             cached_tokens: None,
             subagent: None,
             request_id: None,
+            session_key: None,
             input_tokens: None,
             output_tokens: None,
             cached_input_tokens: None,
             reasoning_tokens: None,
+            orchestration_input_tokens: None,
+            orchestration_output_tokens: None,
+            orchestration_cached_input_tokens: None,
             cost_usd: None,
             latency_first_token_ms: None,
+            protocol_outcome: None,
         }
     }
 
@@ -907,6 +1090,83 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
+    #[tokio::test]
+    async fn page_filters_by_exact_request_correlation_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        let mut first = rec("codex", "/responses", 200, Some("gpt-5.6-sol"));
+        first.request_id = Some("request-debug-a".into());
+        repo.insert(&first).await.unwrap();
+
+        let mut second = rec("codex", "/responses", 200, Some("gpt-5.6-sol"));
+        second.request_id = Some("request-debug-b".into());
+        repo.insert(&second).await.unwrap();
+
+        let filter = RequestsFilter {
+            request_id: Some("request-debug-b".into()),
+            ..Default::default()
+        };
+        let (rows, total) = repo.page(&filter, 10, 0).await.unwrap();
+
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_id.as_deref(), Some("request-debug-b"));
+    }
+
+    #[tokio::test]
+    async fn account_filter_matches_built_in_accounts_and_custom_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        let mut built_in = rec("codex", "/responses", 200, Some("gpt-5.6-sol"));
+        built_in.account_id = Some("account-a".into());
+        built_in.target_kind = Some("account".into());
+        repo.insert(&built_in).await.unwrap();
+
+        let mut custom = rec("sakana", "/responses", 200, Some("fugu-ultra"));
+        custom.target_kind = Some("credential".into());
+        custom.provider_credential_id = Some("credential-fugu".into());
+        repo.insert(&custom).await.unwrap();
+
+        let (account_rows, account_total) = repo
+            .page(
+                &RequestsFilter {
+                    account: Some("account-a".into()),
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(account_total, 1);
+        assert_eq!(account_rows[0].provider, "codex");
+
+        let (credential_rows, credential_total) = repo
+            .page(
+                &RequestsFilter {
+                    account: Some("credential-fugu".into()),
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(credential_total, 1);
+        assert_eq!(credential_rows[0].provider, "sakana");
+
+        let breakdown = repo.reports_breakdown(0, "account", None).await.unwrap();
+        assert!(breakdown.iter().any(|row| row.key == "account-a"));
+        assert!(
+            breakdown.iter().any(|row| row.key == "credential-fugu"),
+            "the target breakdown must not collapse custom credentials into an empty account row"
+        );
+    }
+
     fn row_at(
         requested_at: i64,
         status: u16,
@@ -922,7 +1182,11 @@ mod tests {
             status,
             duration_ms,
             account_id: None,
+            target_kind: None,
+            provider_credential_id: None,
             model: None,
+            upstream_model: None,
+            upstream_transport: None,
             reasoning_effort: None,
             service_tier: None,
             transport: None,
@@ -931,12 +1195,17 @@ mod tests {
             cached_tokens: None,
             subagent: None,
             request_id: None,
+            session_key: None,
             input_tokens: None,
             output_tokens: None,
             cached_input_tokens: None,
             reasoning_tokens: None,
+            orchestration_input_tokens: None,
+            orchestration_output_tokens: None,
+            orchestration_cached_input_tokens: None,
             cost_usd: None,
             latency_first_token_ms: None,
+            protocol_outcome: None,
         }
     }
 
@@ -961,7 +1230,11 @@ mod tests {
             status,
             duration_ms,
             account_id: None,
+            target_kind: None,
+            provider_credential_id: None,
             model: None,
+            upstream_model: None,
+            upstream_transport: None,
             reasoning_effort: None,
             service_tier: None,
             transport: None,
@@ -970,12 +1243,17 @@ mod tests {
             cached_tokens: None,
             subagent: None,
             request_id: None,
+            session_key: None,
             input_tokens: Some(input_tokens),
             output_tokens: Some(output_tokens),
             cached_input_tokens: None,
             reasoning_tokens: Some(50), // subset of output_tokens — must NOT be added to the sum
+            orchestration_input_tokens: None,
+            orchestration_output_tokens: None,
+            orchestration_cached_input_tokens: None,
             cost_usd: None,
             latency_first_token_ms: None,
+            protocol_outcome: None,
         }
     }
 
@@ -1187,7 +1465,11 @@ mod tests {
             status,
             duration_ms,
             account_id: account_id.map(String::from),
+            target_kind: account_id.map(|_| "account".into()),
+            provider_credential_id: None,
             model: Some(model.into()),
+            upstream_model: None,
+            upstream_transport: None,
             reasoning_effort: None,
             service_tier: None,
             transport: Some("http".into()),
@@ -1196,12 +1478,17 @@ mod tests {
             cached_tokens: None,
             subagent: None,
             request_id: None,
+            session_key: None,
             input_tokens: Some(input_tokens),
             output_tokens: Some(output_tokens),
             cached_input_tokens: Some(cached_input_tokens),
             reasoning_tokens: Some(reasoning_tokens),
+            orchestration_input_tokens: None,
+            orchestration_output_tokens: None,
+            orchestration_cached_input_tokens: None,
             cost_usd,
             latency_first_token_ms,
+            protocol_outcome: None,
         }
     }
 
@@ -1566,9 +1853,13 @@ mod tests {
             Some(120),
             Some(6912),
             Some(40),
+            Some(11),
+            Some(7),
+            Some(3),
             Some(0.089),
             Some(3510),
             Some(9000),
+            Some(RequestProtocolOutcome::Completed),
         )
         .await
         .unwrap();
@@ -1583,23 +1874,42 @@ mod tests {
         assert_eq!(row.output_tokens, Some(120));
         assert_eq!(row.cached_input_tokens, Some(6912));
         assert_eq!(row.reasoning_tokens, Some(40));
+        assert_eq!(row.orchestration_input_tokens, Some(11));
+        assert_eq!(row.orchestration_output_tokens, Some(7));
+        assert_eq!(row.orchestration_cached_input_tokens, Some(3));
         assert_eq!(row.cost_usd, Some(0.089));
         assert_eq!(row.latency_first_token_ms, Some(3510));
         assert_eq!(row.request_id.as_deref(), Some("req-xyz"));
+        assert_eq!(row.protocol_outcome.as_deref(), Some("completed"));
         assert_eq!(
             row.duration_ms, 9000,
             "duration_ms must be overwritten to the stream wrapper's true end-to-end value"
         );
 
         // no-op on unknown id returns Ok
-        repo.update_usage("nope", Some(1), None, None, None, None, None, None)
-            .await
-            .unwrap();
+        repo.update_usage(
+            "nope",
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(RequestProtocolOutcome::Completed),
+        )
+        .await
+        .unwrap();
 
         // duration_ms: None must leave the existing value untouched (COALESCE), not null it out.
-        repo.update_usage("req-xyz", None, None, None, None, None, None, None)
-            .await
-            .unwrap();
+        repo.update_usage(
+            "req-xyz", None, None, None, None, None, None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
         let row = repo
             .list(10, 0)
             .await
@@ -1611,6 +1921,100 @@ mod tests {
             row.duration_ms, 9000,
             "duration_ms: None must COALESCE to the existing value, not overwrite it"
         );
+        assert_eq!(
+            row.protocol_outcome.as_deref(),
+            Some("completed"),
+            "a metrics-only update must not erase the terminal protocol outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_protocol_outcome_overrides_initial_http_status_in_all_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("s.db")).await.unwrap();
+        let repo = store.request_log();
+
+        let outcomes = [
+            ("completed", RequestProtocolOutcome::Completed),
+            ("failed", RequestProtocolOutcome::Failed),
+            ("incomplete", RequestProtocolOutcome::Incomplete),
+            ("cancelled", RequestProtocolOutcome::Cancelled),
+            ("transport-lost", RequestProtocolOutcome::TransportLost),
+        ];
+        for (request_id, outcome) in outcomes {
+            let mut rec = sample_record();
+            rec.request_id = Some(request_id.into());
+            rec.status = 200;
+            repo.insert(&rec).await.unwrap();
+            repo.update_usage(
+                request_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(outcome),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Legacy rows without a protocol outcome retain their existing HTTP classification.
+        let mut legacy_success = sample_record();
+        legacy_success.request_id = Some("legacy-success".into());
+        legacy_success.status = 200;
+        repo.insert(&legacy_success).await.unwrap();
+        let mut legacy_error = sample_record();
+        legacy_error.request_id = Some("legacy-error".into());
+        legacy_error.status = 503;
+        repo.insert(&legacy_error).await.unwrap();
+
+        let aggregate = repo.aggregate_since(0).await.unwrap();
+        assert_eq!(aggregate.total, 7);
+        assert_eq!(
+            aggregate.success, 2,
+            "only completed and legacy HTTP 200 count as successful"
+        );
+        assert_eq!(
+            aggregate.error, 5,
+            "failed, incomplete, cancelled, transport_lost, and legacy HTTP 503 count as errors"
+        );
+
+        let errors = repo.recent_errors(10).await.unwrap();
+        assert_eq!(errors.len(), 5);
+
+        let (success_rows, success_total) = repo
+            .page(
+                &RequestsFilter {
+                    status_class: Some("success".into()),
+                    ..RequestsFilter::default()
+                },
+                20,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(success_total, 2);
+        assert_eq!(success_rows.len(), 2);
+
+        let (error_rows, error_total) = repo
+            .page(
+                &RequestsFilter {
+                    status_class: Some("error".into()),
+                    ..RequestsFilter::default()
+                },
+                20,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(error_total, 5);
+        assert_eq!(error_rows.len(), 5);
     }
 
     /// A full `RequestLogRecord` with every existing field populated and every new (usage) field
@@ -1625,7 +2029,11 @@ mod tests {
             status: 200,
             duration_ms: 1000,
             account_id: Some("acct-1".into()),
+            target_kind: Some("account".into()),
+            provider_credential_id: None,
             model: Some("gpt-5.6-sol".into()),
+            upstream_model: None,
+            upstream_transport: None,
             reasoning_effort: None,
             service_tier: None,
             transport: Some("http".into()),
@@ -1634,12 +2042,17 @@ mod tests {
             cached_tokens: None,
             subagent: None,
             request_id: None,
+            session_key: None,
             input_tokens: None,
             output_tokens: None,
             cached_input_tokens: None,
             reasoning_tokens: None,
+            orchestration_input_tokens: None,
+            orchestration_output_tokens: None,
+            orchestration_cached_input_tokens: None,
             cost_usd: None,
             latency_first_token_ms: None,
+            protocol_outcome: None,
         }
     }
 

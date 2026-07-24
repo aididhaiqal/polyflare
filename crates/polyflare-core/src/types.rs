@@ -74,6 +74,10 @@ pub enum ExecError {
     /// classify the failure (429 ⇒ rate-limit cooldown, 5xx ⇒ transient error, etc.).
     #[error("upstream returned status {}", .0.status)]
     UpstreamStatus(FailureSignal),
+    /// A non-2xx HTTP response whose bounded opaque body and safe response metadata can be
+    /// returned faithfully if retries are exhausted. Debug deliberately redacts the body.
+    #[error("upstream returned status {}", .0.signal.status)]
+    UpstreamHttp(UpstreamHttpError),
     #[error("stream error: {0}")]
     Stream(String),
 }
@@ -83,13 +87,88 @@ impl ExecError {
     pub fn failure_signal(&self) -> Option<FailureSignal> {
         match self {
             ExecError::UpstreamStatus(s) => Some(s.clone()),
+            ExecError::UpstreamHttp(response) => Some(response.signal.clone()),
             _ => None,
         }
     }
 }
 
-/// A non-buffering streaming response body: pinned, boxed, `Send` stream of byte chunks.
-pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<Bytes, ExecError>> + Send>>;
+#[derive(Clone)]
+pub struct UpstreamHttpError {
+    pub signal: FailureSignal,
+    pub headers: Vec<(String, String)>,
+    pub body: Bytes,
+}
+
+impl std::fmt::Debug for UpstreamHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamHttpError")
+            .field("signal", &self.signal)
+            .field("headers", &self.headers)
+            .field("body", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResponseMetadata {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+}
+
+impl Default for ResponseMetadata {
+    fn default() -> Self {
+        Self {
+            status: 200,
+            headers: Vec::new(),
+        }
+    }
+}
+
+/// A non-buffering streaming response body together with the upstream HTTP status and safe
+/// response headers. Metadata follows the stream through watchdog/translation wrappers instead of
+/// being reconstructed as a local 200.
+pub struct ResponseStream {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, ExecError>> + Send>>,
+    metadata: ResponseMetadata,
+}
+
+impl ResponseStream {
+    pub fn new<S>(stream: S) -> Self
+    where
+        S: Stream<Item = Result<Bytes, ExecError>> + Send + 'static,
+    {
+        Self {
+            inner: Box::pin(stream),
+            metadata: ResponseMetadata::default(),
+        }
+    }
+
+    pub fn with_metadata<S>(stream: S, metadata: ResponseMetadata) -> Self
+    where
+        S: Stream<Item = Result<Bytes, ExecError>> + Send + 'static,
+    {
+        Self {
+            inner: Box::pin(stream),
+            metadata,
+        }
+    }
+
+    pub fn metadata(&self) -> &ResponseMetadata {
+        &self.metadata
+    }
+}
+
+impl Stream for ResponseStream {
+    type Item = Result<Bytes, ExecError>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
 
 /// A credential/endpoint an executor uses to reach an upstream. M1 = single account from config.
 #[derive(Clone)]
@@ -104,6 +183,10 @@ pub struct Account {
     /// mismatched (token, account) pair the backend rejects. `None` for providers that don't use
     /// it (e.g. Anthropic).
     pub chatgpt_account_id: Option<String>,
+    /// Whether this selected ChatGPT workspace must route through the FedRAMP edge. This value is
+    /// derived from the same account's encrypted ID token and travels with its bearer/account id as
+    /// one indivisible identity tuple.
+    pub is_fedramp: bool,
 }
 
 // `bearer_token` is a secret and must never be printed in clear via `{:?}`.
@@ -114,6 +197,7 @@ impl std::fmt::Debug for Account {
             .field("base_url", &self.base_url)
             .field("bearer_token", &"***")
             .field("chatgpt_account_id", &self.chatgpt_account_id)
+            .field("is_fedramp", &self.is_fedramp)
             .finish()
     }
 }
@@ -125,12 +209,20 @@ impl std::fmt::Debug for Account {
 pub struct RequestCtx {
     pub session_id: Option<String>,
     pub session_key: Option<SessionKey>,
+    /// Hashed, content-free identity of one Codex logical turn. Present only when the native client
+    /// supplied a trustworthy turn id in its canonical metadata projection. Used to aggregate
+    /// proxy-side attempt limits across client retries and transport changes; never sent upstream.
+    pub logical_turn_key: Option<String>,
     pub client_previous_response_id: Option<String>,
     pub is_full_resend: bool,
     /// Number of top-level `input` items, derived once at ingress (array length; a non-array present
     /// input counts as 1; absent as 0). Carried here so the watchdog's diagnostic input count no
     /// longer has to re-read the request body — which, on the native path, is never materialized.
     pub input_count: u32,
+    /// Bounded, content-free estimate of this turn's input plus requested output tokens. Native
+    /// Codex ingress derives it from raw JSON lengths without materializing the prompt tree. Zero
+    /// means unknown and is normalized to one minimum admission-pressure unit by the server.
+    pub estimated_tokens: u32,
     /// The codex sub-agent role slug from `x-openai-subagent` (`review`/`compact`/…), or `None`
     /// for the main agent. Content-free routing metadata (a bounded role label), never conversation
     /// content — used for observability labeling only.
@@ -319,12 +411,20 @@ pub struct AccountSnapshot {
     pub security_work_authorized: bool,
     /// In-flight request count (live-tracked later; 0 in M2b).
     pub in_flight: u32,
+    /// Weighted pressure of the live requests. Kept separate from `in_flight` because request-count
+    /// bulkheads and token-volume pressure protect different upstream limits.
+    pub in_flight_pressure: u32,
+    /// Long-lived upstream WebSocket count, including idle sockets between turns.
+    pub open_ws: u32,
     /// Which backend pool this account belongs to — selects the executor + backend wire `Format`.
     pub provider: Provider,
     /// Named account-pool slug, or `None` (unpooled). The ingress narrows candidates to this via
     /// `filter_by_pool`: a named `/{pool}/...` path matches only accounts with the same slug; the
     /// bare paths match all accounts regardless of pool.
     pub pool: Option<String>,
+    /// Every named routing group this account can serve. `pool` remains the backward-compatible
+    /// primary label; routing membership checks use this complete set.
+    pub pools: Vec<String>,
 }
 
 impl AccountSnapshot {
@@ -348,8 +448,11 @@ impl AccountSnapshot {
             plan_type: "plus".to_string(),
             security_work_authorized: false,
             in_flight: 0,
+            in_flight_pressure: 0,
+            open_ws: 0,
             provider: Provider::Codex,
             pool: None,
+            pools: Vec::new(),
         }
     }
 }
@@ -368,7 +471,7 @@ pub enum Tier {
 
 /// Per-selection context (M2-GATE1). `now`/`rng_seed` keep the `Selector` pure + deterministic:
 /// time and randomness are injected, never read inside the trait. `session_id` is the
-/// session-affinity seam (unused by `capacity_weighted` scoring); `tier` is the subagent-tier
+/// session-family affinity key used by capacity-weighted rendezvous; `tier` is the subagent-tier
 /// signal read only by `cache_affinity_tier`.
 #[derive(Debug, Clone, Default)]
 pub struct SelectionCtx {
@@ -384,6 +487,9 @@ pub struct SelectionCtx {
     /// explicit `=0` disable lever) ⇒ in_flight has ZERO effect on scoring, byte-for-byte the
     /// pre-C9 selection behavior.
     pub inflight_penalty_pct: f64,
+    /// Calibrated pressure units for the request being selected. Zero is normalized to one by the
+    /// atomic admission layer.
+    pub request_pressure_units: u32,
 }
 
 #[cfg(test)]
@@ -397,6 +503,7 @@ mod tests {
             base_url: "https://example.test".into(),
             bearer_token: "super-secret-token-value".into(),
             chatgpt_account_id: None,
+            is_fedramp: false,
         };
 
         let debug_output = format!("{account:?}");

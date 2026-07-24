@@ -50,11 +50,13 @@ pub async fn assemble_snapshots(store: &Store) -> Result<Vec<AccountSnapshot>, S
         snap.used_percent = resolved.five_hour.as_ref().map_or(0.0, |w| w.used_percent);
         snap.secondary_used_percent = resolved.weekly.as_ref().map_or(0.0, |w| w.used_percent);
         snap.reset_at = account.reset_at;
+        snap.cooldown_until = repo.routing_cooldown(&account.id).await?;
         snap.routing_policy = account.routing_policy;
         snap.plan_type = account.plan_type;
         snap.security_work_authorized = account.security_work_authorized;
         snap.provider = provider;
-        snap.pool = account.pool;
+        snap.pools = repo.list_pools(&account.id).await?;
+        snap.pool = account.pool.or_else(|| snap.pools.first().cloned());
         snapshots.push(snap);
     }
     Ok(snapshots)
@@ -85,7 +87,7 @@ pub fn filter_by_pool(snapshots: &[AccountSnapshot], pool: Option<&str>) -> Vec<
         None => snapshots.to_vec(),
         Some(slug) => snapshots
             .iter()
-            .filter(|s| s.pool.as_deref() == Some(slug))
+            .filter(|s| s.pools.iter().any(|membership| membership == slug))
             .cloned()
             .collect(),
     }
@@ -103,7 +105,8 @@ pub fn filter_by_provider_and_pool(
     snapshots
         .iter()
         .filter(|s| {
-            s.provider == provider && pool.is_none_or(|slug| s.pool.as_deref() == Some(slug))
+            s.provider == provider
+                && pool.is_none_or(|slug| s.pools.iter().any(|membership| membership == slug))
         })
         .cloned()
         .collect()
@@ -116,6 +119,7 @@ mod tests {
     fn snap(id: &str, pool: Option<&str>) -> AccountSnapshot {
         let mut s = AccountSnapshot::new(id);
         s.pool = pool.map(str::to_string);
+        s.pools = pool.into_iter().map(str::to_string).collect();
         s
     }
 
@@ -146,5 +150,13 @@ mod tests {
     fn unknown_slug_matches_nothing() {
         let snaps = vec![snap("a", None), snap("b", Some("p1"))];
         assert!(filter_by_pool(&snaps, Some("does-not-exist")).is_empty());
+    }
+
+    #[test]
+    fn one_account_can_match_multiple_named_pools() {
+        let mut account = snap("shared", Some("p1"));
+        account.pools.push("p2".to_string());
+        assert_eq!(filter_by_pool(&[account.clone()], Some("p1")).len(), 1);
+        assert_eq!(filter_by_pool(&[account], Some("p2")).len(), 1);
     }
 }

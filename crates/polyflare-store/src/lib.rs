@@ -7,6 +7,8 @@ pub mod api_key_repo;
 pub mod continuity_repo;
 pub mod crypto;
 pub mod import;
+pub mod onboarding_repo;
+pub mod provider_repo;
 pub mod request_log_repo;
 pub mod settings_repo;
 pub mod store;
@@ -16,12 +18,18 @@ pub use api_key_repo::{ApiKeyRepo, ApiKeyRow};
 pub use continuity_repo::{ContinuityRepo, SessionRow};
 pub use crypto::TokenCipher;
 pub use import::{import_from_codex_lb, ImportSummary};
+pub use onboarding_repo::{OnboardingFlow, OnboardingRepo};
+pub use provider_repo::{
+    CustomProvider, NewCustomProvider, NewProviderModel, ProviderCredential,
+    ProviderCredentialSecret, ProviderModel, ProviderRepo,
+};
 pub use request_log_repo::{
     RecentErrorRow, ReportBreakdownRow, ReportBucket, ReportMetrics, RequestAggregate,
-    RequestBucket, RequestLogRecord, RequestLogRepo, RequestLogRow, RequestsFilter,
+    RequestBucket, RequestLogRecord, RequestLogRepo, RequestLogRow, RequestProtocolOutcome,
+    RequestsFilter,
 };
 pub use settings_repo::SettingsRepo;
-pub use store::Store;
+pub use store::{RequestUsageUpdate, Store};
 
 /// Errors surfaced by the store, crypto, and importer.
 #[derive(Debug, thiserror::Error)]
@@ -36,4 +44,10 @@ pub enum StoreError {
     Crypto(String),
     #[error("import error: {0}")]
     Import(String),
+    #[error("invalid persisted state: {0}")]
+    InvalidState(String),
+    #[error("background persistence queue is full")]
+    BackgroundQueueFull,
+    #[error("background persistence queue is closed")]
+    BackgroundQueueClosed,
 }

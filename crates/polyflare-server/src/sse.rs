@@ -1,10 +1,11 @@
 //! `GET /api/logs/stream`: a flag-gated Server-Sent-Events endpoint that drains
 //! [`crate::log_bus::LogBus`] — backfill first, then live events, with a 15s heartbeat.
 //!
-//! Gated on [`crate::app::AppState::live_logs`] (`POLYFLARE_LIVE_LOGS`): `404` when disabled, so
-//! the capability is discoverable (via `/api/capabilities`) rather than silently absent. Content
-//! safety: the stream carries only [`crate::log_bus::LogEvent`] — never request/response bodies
-//! or conversation content — because that's all `LogBus` ever holds (see its module doc).
+//! Enabled by default and gated on [`crate::app::AppState::live_logs`] (`POLYFLARE_LIVE_LOGS`):
+//! explicit opt-out returns `404`, so the capability is discoverable (via `/api/capabilities`)
+//! rather than silently absent. Content safety: the stream carries only
+//! [`crate::log_bus::LogEvent`] — never request/response bodies or conversation content — because
+//! that's all `LogBus` ever holds (see its module doc).
 
 use std::sync::Arc;
 use std::time::Duration;

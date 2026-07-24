@@ -9,7 +9,7 @@ export function Card({ children, className }: { children: ReactNode; className?:
   return (
     <div
       className={clsx(
-        "flex min-w-0 flex-col overflow-hidden rounded border border-border bg-card px-3.5 py-3",
+        "flex min-w-0 flex-col overflow-hidden rounded-xl border border-border/80 bg-card/90 px-4 py-4 shadow-[0_12px_32px_hsl(var(--surface-shadow)/0.14)]",
         className,
       )}
     >

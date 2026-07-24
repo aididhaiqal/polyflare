@@ -1,25 +1,13 @@
 //! Content-free conversation identity for the WS-downstream handshake.
 //!
-//! Phase-0 capture (2026-07-20) confirmed the codex CLI's WS-handshake `GET /responses` carries the
-//! conversation identity ENTIRELY in the handshake headers — `session-id`, `thread-id`, and
-//! `x-codex-window-id` are all present (`x-codex-turn-state` is server-issued and absent at
-//! handshake). Those three headers UNIQUELY and STABLY identify a codex conversation, so the owner
-//! lookup key is derivable from the handshake alone — no frame read (and thus no content) required.
+//! Current Codex carries `session-id`, `thread-id`, and `x-codex-window-id` on the handshake. Owner
+//! identity is the same session + thread + pool tuple used by HTTP and compact. Window remains a
+//! socket discriminator only because Codex advances it after compaction.
 
 use axum::http::HeaderMap;
 use polyflare_core::{KeyStrength, SessionKey};
 
-use crate::session_key::sha256_hex;
-
-/// Read a header value as a borrowed `&str`, or `""` when the header is absent or non-UTF-8.
-/// `HeaderMap::get` is case-insensitive over `HeaderName`, so the lowercase literal matches the
-/// CLI's header regardless of the wire casing. Degrades to empty rather than panicking.
-fn header_or_empty<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-}
+use crate::session_key::header_session_key_scoped;
 
 /// Derive the content-free, stable owner-lookup `SessionKey` for a WS-downstream conversation from
 /// its handshake headers.
@@ -36,15 +24,17 @@ fn header_or_empty<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
 ///
 /// A missing header degrades to an empty component (never panics); the key stays stable for whatever
 /// identity the handshake did present.
-pub(crate) fn ws_session_key(headers: &HeaderMap) -> SessionKey {
-    let session = header_or_empty(headers, "session-id");
-    let thread = header_or_empty(headers, "thread-id");
-    let window = header_or_empty(headers, "x-codex-window-id");
-    let basis = format!("wsds:{session}:{thread}:{window}");
-    SessionKey {
-        value: sha256_hex(basis.as_bytes()),
-        strength: KeyStrength::Hard,
-    }
+pub(crate) fn ws_session_key(headers: &HeaderMap, pool: Option<&str>) -> SessionKey {
+    header_session_key_scoped(headers, None, pool).unwrap_or_else(|| {
+        // A WS without Codex identity must never share one global hard owner row with every other
+        // anonymous socket. Generate an isolated soft key for this connection instead.
+        SessionKey {
+            value: crate::session_key::sha256_hex(
+                format!("anonymous-ws:{:032x}", rand::random::<u128>()).as_bytes(),
+            ),
+            strength: KeyStrength::Soft,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -70,8 +60,8 @@ mod tests {
             ("thread-id", "t1"),
             ("x-codex-window-id", "w1:0"),
         ]);
-        let k1 = ws_session_key(&h);
-        let k2 = ws_session_key(&h);
+        let k1 = ws_session_key(&h, None);
+        let k2 = ws_session_key(&h, None);
         // Stable: the same handshake headers always yield the same key.
         assert_eq!(k1.value, k2.value, "same conversation must be stable");
         // Content-free: value is a 64-char lowercase sha256 hex, carrying no raw id substring.
@@ -103,20 +93,44 @@ mod tests {
             ("x-codex-window-id", "w1:0"),
         ]);
         assert_ne!(
-            ws_session_key(&a).value,
-            ws_session_key(&b).value,
+            ws_session_key(&a, None).value,
+            ws_session_key(&b, None).value,
             "a different thread-id must produce a different key"
         );
     }
 
     #[test]
-    fn ws_session_key_degrades_on_missing_header() {
-        // One of the three identity headers is absent: must NOT panic and must stay stable.
+    fn ws_session_key_stays_stable_when_window_header_is_missing() {
+        // Window is not part of durable owner identity.
         let h = hdr(&[("session-id", "s1"), ("thread-id", "t1")]);
-        let k1 = ws_session_key(&h);
-        let k2 = ws_session_key(&h);
+        let k1 = ws_session_key(&h, None);
+        let k2 = ws_session_key(&h, None);
         assert_eq!(k1.value.len(), 64);
-        assert_eq!(k1.value, k2.value, "degraded key is still stable");
+        assert_eq!(k1.value, k2.value, "conversation key is still stable");
         assert_eq!(k1.strength, KeyStrength::Hard);
+    }
+
+    #[test]
+    fn ws_and_http_use_the_same_pool_scoped_conversation_key() {
+        let h = hdr(&[
+            ("session-id", "s1"),
+            ("thread-id", "t1"),
+            ("x-codex-window-id", "w1:0"),
+        ]);
+        let ws = ws_session_key(&h, Some("premium"));
+        let http = crate::session_key::header_session_key_scoped(&h, None, Some("premium"))
+            .expect("Codex identity");
+        assert_eq!(ws, http);
+        assert_ne!(ws, ws_session_key(&h, Some("standard")));
+    }
+
+    #[test]
+    fn anonymous_ws_connections_do_not_share_a_global_owner_key() {
+        let h = HeaderMap::new();
+        let a = ws_session_key(&h, None);
+        let b = ws_session_key(&h, None);
+        assert_eq!(a.strength, KeyStrength::Soft);
+        assert_eq!(b.strength, KeyStrength::Soft);
+        assert_ne!(a, b);
     }
 }

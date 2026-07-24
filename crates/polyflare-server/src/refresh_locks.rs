@@ -13,9 +13,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use polyflare_core::AccountId;
 
 /// A registry of per-account async locks, created lazily on first use.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RefreshLocks {
-    map: Mutex<HashMap<AccountId, Arc<AsyncMutex<()>>>>,
+    map: Arc<Mutex<HashMap<AccountId, Arc<AsyncMutex<()>>>>>,
 }
 
 impl RefreshLocks {
@@ -41,6 +41,17 @@ mod tests {
         let h1 = locks.handle(&a);
         let h2 = locks.handle(&a);
         assert!(Arc::ptr_eq(&h1, &h2), "same account must share one lock");
+    }
+
+    #[test]
+    fn clones_share_the_same_account_locks() {
+        let locks = RefreshLocks::default();
+        let clone = locks.clone();
+        let account = AccountId::from("acct-1");
+        assert!(
+            Arc::ptr_eq(&locks.handle(&account), &clone.handle(&account)),
+            "catalog and request paths must serialize refresh-token rotation through one lock"
+        );
     }
 
     #[test]

@@ -1,16 +1,16 @@
-// The Requests page: the dashboard's deepest view into request-log rows — `GET /api/requests`
-// (`useRequests(params)`) is the ONLY endpoint this page consumes (plus `useAccounts()`, read-only,
-// solely to populate the Account filter's option list with every real account id, not just ids that
-// happen to appear on the currently loaded page). The Overview page only summarizes; this page is
-// where "was this http or ws" / "what was TTFT/TPS" actually gets answered — see the explicit user
-// ask captured in task-9-brief.md: the Transport column is the point of this page.
+// The Requests page: the dashboard's deepest view into request-log rows. `GET /api/requests`
+// supplies the durable filtered page; the content-free `/api/logs/stream` SSE channel invalidates
+// it on request-completion events, with 30-second polling retained only while SSE is unavailable.
+// `useAccounts()` resolves account ids to nicknames/emails and populates the Account filter.
 //
 // CONTENT-SAFETY: `request_log` is content-free by construction (see
 // `polyflare_store::request_log_repo`'s own module doc) — counts, ids, statuses, timing, token
 // COUNTS, never a body/prompt/response/key. This page renders ONLY the real fields on
-// `RequestRowView` (read_api.rs:490-508): id, requested_at, provider, method, path, aliased, status,
+// `RequestRowView` (read_api.rs): id, request_id, session_key, requested_at, provider, method, path, aliased, status,
 // duration_ms, account_id, model, reasoning_effort, service_tier, transport, ttft_ms, total_tokens,
-// cached_tokens, tps (server-derived), subagent. `subagent` is the codex sub-agent role slug from
+// cached_tokens, tps (server-derived), subagent, outcome, error_code. `outcome`/`error_code` are
+// bounded legacy codex-lb evidence used only when its imported row has no HTTP status. `subagent`
+// is the codex sub-agent role slug from
 // `x-openai-subagent` (`review`/`compact`/`memory_consolidation`/`collab_spawn`), or `null` for the
 // main agent — a bounded role slug, same content-safety class as `model`, never conversation
 // content. Nothing else exists to render, so nothing else is rendered — see the detail-row section
@@ -26,73 +26,95 @@
 //   Provider    <- r.provider via `ProviderTag` (wire value "codex"/"anthropic", never "claude")
 //   Model       <- r.model (+ r.reasoning_effort / r.service_tier as small chips, all nullable) +
 //                   r.subagent as a small tag ("main" when null — the main agent, not missing data)
-//   Transport   <- r.transport ("http" today; "ws" once the WS milestone lands — see
-//                   observability.rs's own doc comment on `RequestLog.transport`). Historical rows
+//   Transport   <- r.transport ("sse" for streamed HTTP, "http" for buffered HTTP, "ws" for
+//                   WebSocket — see observability.rs's `RequestLog.transport`). Historical rows
 //                   from before this field existed carry `null`, rendered as a dash, never a
 //                   fabricated pill.
-//   Status      <- r.status (HTTP code); toned ok/warn(429)/error(>=400), NOT the account-status
+//   Status      <- native r.status (HTTP code), or imported r.outcome when status=0 means the
+//                   codex-lb source had no HTTP status; toned ok/warn(429)/error, NOT account-status
 //                   `ui/StatusPill` (that component tones backend STATUS STRINGS like "active" /
 //                   "cooldown" — a completely different domain from an HTTP status code) — a small
 //                   local `HttpStatusPill` instead.
-//   TTFT        <- `format.ts::latency(r.ttft_ms)` — null (never backfilled pre-migration-0007 rows,
-//                   or a non-streaming/failed request) renders "—", never "0ms".
-//   TPS         <- `format.ts::tpsFmt(r.tps)` — server-derived (read_api.rs::derive_tps); null
-//                   renders "—".
+//   TTFT        <- `format.ts::latency(r.ttft_ms)` — the API's effective native/imported first-token
+//                   timing; missing/non-streaming/failed requests render "—", never "0ms".
+//   Latency     <- `format.ts::latency(r.duration_ms)` — total end-to-end request duration.
+//   Throughput  <- `format.ts::tpsFmt(r.tps)` — server-derived output tokens divided by the
+//                   post-TTFT generation window; missing source evidence renders "—".
 //   Tokens      <- r.total_tokens (compactNum; null -> "—") + r.cached_tokens as a small "· N cch"
 //                   caption, shown only when cached_tokens is NOT null (a real 0 is shown as "0 cch";
 //                   a missing/unreported value is omitted entirely, never rendered as "0 cch" — the
 //                   brief's absent-vs-0 rule).
 //
 // Expandable detail row: request id, path (method+path), transport, model/effort/tier, subagent
-// ("main" when null), requested-at (full date+time), duration, TTFT, TPS, tokens(+cached), aliased
+// ("main" when null), requested-at (full date+time), duration, TTFT, throughput, tokens(+cached), aliased
 // — every one a real `RequestRowView` field. The mockup's detail row ALSO shows an api key, a pool, a
-// downstream/upstream transport split, retry-after, an upstream error code, and a routing trail —
+// downstream/upstream transport split, retry-after, and a routing trail —
 // NONE of those exist on `RequestRowView` (no pool field; `transport` is a single value, not a
-// downstream/upstream pair; `error_code`/retry-after/routing trail exist nowhere on this endpoint —
-// `error_code` is only on the separate, narrower `RecentErrorRow` used by `/api/overview`, per
-// read_api.rs/request_log_repo.rs). Per this page's binding content-safety constraint (never render
+// downstream/upstream pair; retry-after/routing trail exist nowhere on this endpoint). Per this
+// page's binding content-safety constraint (never render
 // a key) and the general no-fabrication rule, all of those are omitted rather than invented. See
 // task-9-report.md for the full reasoning.
 //
 // Filters drive REAL `RequestsQuery` params only (read_api.rs:527-536): account, provider,
 // status_class ("success"|"error" — the backend has no per-code filter), model, transport, since_ts
-// (derived from the 1h/24h/7d range picker), limit/offset (server pagination). The mockup's
-// request-id search has NO backend equivalent (no id/`q` param on `RequestsQuery` at all) — sending
-// one would be silently ignored by the handler (extra query fields aren't rejected, just unused),
-// which is exactly the "filter the backend can't honor" case the brief warns against. It is
-// implemented instead as a client-side quick-filter over the CURRENTLY LOADED page only (labeled
-// "this page" in the placeholder text) — it never changes `total`/pagination and is intentionally
-// NOT URL-synced (it isn't a real query param).
+// (derived from the 1h/24h/7d/30d range picker), limit/offset (server pagination). The mockup's
+// Correlation-id lookup uses the backend's exact `request_id` filter, so links from Live Logs
+// resolve the durable row even when it is far outside the current page. The input also retains a
+// local substring match for the numeric SQLite row id while no exact correlation filter is active.
 import { useEffect, useState, type ReactNode } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import * as Select from "@radix-ui/react-select";
 import clsx from "clsx";
 
-import type { RequestRowView, RequestsQueryParams } from "../lib/api";
+import type { AccountView, RequestRowView, RequestsQueryParams } from "../lib/api";
+import { accountDisplayLabel } from "../lib/accountDisplay";
 import { compactNum, latency, relTime, tpsFmt } from "../lib/format";
-import { useAccounts, useRequests } from "../lib/queries";
+import { paginationWindow } from "../lib/pagination";
+import { useAccounts, useProviders, useRequests } from "../lib/queries";
+import {
+  latestRequestEventKey,
+  requestLiveLabel,
+} from "../lib/requestLive";
+import { useLogStream } from "../lib/useLogStream";
+import { useCapabilityFlags } from "../capabilities/CapabilitiesProvider";
+import {
+  requestOutcomeIsFailure,
+  requestOutcomeIsSuccess,
+  requestOutcomeLabel,
+  requestOutcomeSource,
+} from "../lib/requestOutcome";
+import {
+  routePseudonym,
+  ShieldedAccount,
+  useScreenShield,
+} from "../privacy/ScreenShield";
 import { Card } from "../ui/Card";
 import { Col, Grid } from "../ui/Grid";
-import { AlertTriangle, ChevronDown, ChevronLeft, ChevronRight, Lock, Search } from "../ui/icons";
+import { AlertTriangle, ChevronDown, ChevronLeft, ChevronRight, Search } from "../ui/icons";
 import { ProviderTag } from "../ui/ProviderTag";
-
-// Mirrors `lib/queries.ts`'s internal (non-exported) `LIST_REFETCH_MS` — kept in sync manually
-// since that constant isn't exported; used only for the live badge's honest "polling Ns" label.
-const POLL_SECS = 30;
+import { RequestDetailPanel } from "../ui/RequestDetails";
+import { ServiceTierBadge } from "../ui/ServiceTierBadge";
+import { TransportPill } from "../ui/TransportPill";
 
 const ALL = "all";
-const PAGE_SIZE = 50;
+const PAGE_SIZE = 20;
 
-type RangeKey = "1h" | "24h" | "7d";
-const RANGE_SECS: Record<RangeKey, number> = { "1h": 3600, "24h": 86400, "7d": 604800 };
+type RangeKey = "1h" | "24h" | "7d" | "30d";
+const RANGE_SECS: Record<RangeKey, number> = {
+  "1h": 3600,
+  "24h": 86400,
+  "7d": 604800,
+  "30d": 2592000,
+};
 const RANGE_OPTIONS: Array<{ value: RangeKey; label: string }> = [
   { value: "1h", label: "1h" },
   { value: "24h", label: "24h" },
   { value: "7d", label: "7d" },
+  { value: "30d", label: "30d" },
 ];
 
 function isRangeKey(v: string | null): v is RangeKey {
-  return v === "1h" || v === "24h" || v === "7d";
+  return v === "1h" || v === "24h" || v === "7d" || v === "30d";
 }
 
 /** Local wall-clock formatters — `format.ts` only has relative-time (`relTime`); an absolute
@@ -101,55 +123,47 @@ function isRangeKey(v: string | null): v is RangeKey {
 function formatClock(unixSecs: number): string {
   return new Date(unixSecs * 1000).toLocaleTimeString(undefined, { hour12: false });
 }
-function formatFullDateTime(unixSecs: number): string {
-  const d = new Date(unixSecs * 1000);
-  return `${d.toLocaleDateString(undefined)} ${formatClock(unixSecs)}`;
-}
-
 // ---------------------------------------------------------------------------------------------
 // HTTP status tone — distinct from `ui/StatusPill` (which tones ACCOUNT status strings like
 // "active"/"cooldown", a different domain from an HTTP response code).
 // ---------------------------------------------------------------------------------------------
 
-type HttpTone = "ok" | "warn" | "error";
+type HttpTone = "ok" | "warn" | "error" | "neutral";
 
-function httpStatusTone(status: number): HttpTone {
-  if (status === 429) return "warn";
-  if (status >= 400) return "error";
-  if (status >= 300) return "warn";
-  return "ok";
+function httpStatusTone(row: RequestRowView): HttpTone {
+  if (row.status === 429) return "warn";
+  if (requestOutcomeIsFailure(row)) return "error";
+  if (requestOutcomeIsSuccess(row)) return "ok";
+  if (row.status >= 300) return "warn";
+  return "neutral";
 }
 
 const HTTP_TONE_CLASS: Record<HttpTone, string> = {
   ok: "bg-success/15 text-success",
   warn: "bg-warn/15 text-warn",
   error: "bg-error/15 text-error",
+  neutral: "bg-muted text-fg opacity-65",
 };
 
-function HttpStatusPill({ status }: { status: number }) {
+function HttpStatusPill({ row }: { row: RequestRowView }) {
+  const source = requestOutcomeSource(row);
+  const title =
+    source === "protocol"
+      ? `Codex stream ${row.protocol_outcome}; initial HTTP status ${row.status}`
+      : source === "imported"
+      ? `Imported codex-lb outcome; HTTP status unavailable${row.error_code ? ` · ${row.error_code}` : ""}`
+      : source === "unknown"
+        ? "HTTP status and imported outcome unavailable"
+        : `HTTP ${row.status}`;
   return (
     <span
+      title={title}
       className={clsx(
         "inline-block whitespace-nowrap rounded px-2 py-0.5 text-[10px] font-semibold leading-none tabular-nums",
-        HTTP_TONE_CLASS[httpStatusTone(status)],
+        HTTP_TONE_CLASS[httpStatusTone(row)],
       )}
     >
-      {status}
-    </span>
-  );
-}
-
-function TransportPill({ transport }: { transport: string | null }) {
-  if (!transport) return <span className="text-fg opacity-40">—</span>;
-  const isWs = transport === "ws";
-  return (
-    <span
-      className={clsx(
-        "inline-block whitespace-nowrap rounded px-1.5 py-0.5 text-[9px] font-bold lowercase leading-none",
-        isWs ? "bg-accent/15 text-accent" : "bg-muted text-fg opacity-70",
-      )}
-    >
-      {transport}
+      {requestOutcomeLabel(row)}
     </span>
   );
 }
@@ -184,20 +198,15 @@ function ModelCell({
   tier: string | null;
   subagent: string | null;
 }) {
-  if (!model) return <span className="text-fg opacity-40">—</span>;
   return (
     <span className="whitespace-nowrap">
-      {model}
-      {effort && (
+      {model ?? <span className="text-fg opacity-40">—</span>}
+      {model && effort && (
         <span className="ml-1 rounded bg-muted px-1 py-0 text-[8.5px] text-fg opacity-60">
           {effort}
         </span>
       )}
-      {tier && (
-        <span className="ml-1 rounded bg-muted px-1 py-0 text-[8.5px] text-fg opacity-60">
-          {tier}
-        </span>
-      )}
+      <ServiceTierBadge tier={tier} className="ml-1" />
       <SubagentTag subagent={subagent} />
     </span>
   );
@@ -268,6 +277,9 @@ function FilterSelect({
 
 export function Requests() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const { active: screenShieldActive } = useScreenShield();
+  const { liveLogs } = useCapabilityFlags();
+  const requestStream = useLogStream({ enabled: liveLogs });
 
   const range: RangeKey = isRangeKey(searchParams.get("range")) ? (searchParams.get("range") as RangeKey) : "24h";
   const accountFilter = searchParams.get("account") ?? ALL;
@@ -275,11 +287,11 @@ export function Requests() {
   const statusFilter = searchParams.get("status") ?? ALL;
   const modelFilter = searchParams.get("model") ?? ALL;
   const transportFilter = searchParams.get("transport") ?? ALL;
+  const requestIdFilter = searchParams.get("request_id") ?? "";
   const offset = Math.max(0, Number(searchParams.get("offset") ?? "0") || 0);
 
-  // Client-only quick filter over the currently loaded page (see the file-header note — no
-  // server-side id search exists). Deliberately not URL-synced.
-  const [searchId, setSearchId] = useState("");
+  const [searchId, setSearchId] = useState(requestIdFilter);
+  useEffect(() => setSearchId(requestIdFilter), [requestIdFilter]);
 
   // Ticks the header's "updated Xs ago" text and re-derives `since_ts` from the selected range —
   // same 5s-tick pattern Overview/Accounts/Pools already use. `since_ts` is bucketed to the minute
@@ -301,6 +313,7 @@ export function Requests() {
     status: ALL,
     model: ALL,
     transport: ALL,
+    request_id: "",
     offset: "0",
   };
 
@@ -316,22 +329,43 @@ export function Requests() {
   }
 
   const accountsQuery = useAccounts();
+  const providersQuery = useProviders();
   const accounts = accountsQuery.data ?? [];
+  const accountById = new Map(accounts.map((account) => [account.id, account]));
+  const credentialLabelById = new Map(
+    (providersQuery.data ?? []).flatMap((provider) =>
+      provider.credentials.map((credential) => [credential.id, credential.label] as const),
+    ),
+  );
 
   const queryParams: RequestsQueryParams = {
     limit: PAGE_SIZE,
     offset,
+    request_id: requestIdFilter || undefined,
     account: accountFilter !== ALL ? accountFilter : undefined,
     provider:
       providerFilter !== ALL ? (providerFilter === "claude" ? "anthropic" : providerFilter) : undefined,
     status_class: statusFilter !== ALL ? statusFilter : undefined,
     model: modelFilter !== ALL ? modelFilter : undefined,
     transport: transportFilter !== ALL ? transportFilter : undefined,
-    since_ts: sinceTs,
+    // An exact correlation-id lookup is intentionally all-time; the operator is following one
+    // known request, so the normal dashboard time window must not hide an older matching row.
+    since_ts: requestIdFilter ? undefined : sinceTs,
   };
 
   const { data, isLoading, isFetching, isError, error, refetch, dataUpdatedAt } =
-    useRequests(queryParams);
+    useRequests(queryParams, { sseConnected: requestStream.connected });
+
+  const latestRequestKey = latestRequestEventKey(requestStream.lines);
+  useEffect(() => {
+    if (!requestStream.connected || latestRequestKey === null) return;
+    // Reconnect backfill can deliver many events in one burst. Coalesce that burst into one
+    // durable-page refresh; a real live completion still appears within a fraction of a second.
+    const timer = window.setTimeout(() => {
+      void refetch();
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [latestRequestKey, refetch, requestStream.connected]);
 
   const [expandedId, setExpandedId] = useState<number | null>(null);
 
@@ -370,13 +404,18 @@ export function Requests() {
     providerFilter !== ALL ||
     statusFilter !== ALL ||
     modelFilter !== ALL ||
-    transportFilter !== ALL;
+    transportFilter !== ALL ||
+    requestIdFilter !== "";
 
   const rows = data.rows;
   const visibleRows =
     searchId.trim() === ""
       ? rows
-      : rows.filter((r) => String(r.id).includes(searchId.trim()));
+      : rows.filter(
+          (r) =>
+            String(r.id).includes(searchId.trim()) ||
+            r.request_id?.toLowerCase().includes(searchId.trim().toLowerCase()),
+        );
 
   // Model filter's options: the backend has no distinct-values endpoint, so options are derived
   // from the currently loaded page — plus the current selection (kept visible even if it later
@@ -391,27 +430,60 @@ export function Requests() {
       .map((m) => ({ value: m, label: m })),
   ];
 
-  const accountOptions = [
+  const targetOptions = [
     { value: ALL, label: "all" },
-    ...accounts.map((a) => ({ value: a.id, label: a.id })),
+    ...accounts.map((a) => ({
+      value: a.id,
+      label: screenShieldActive ? routePseudonym(a.id) : accountDisplayLabel(a, a.id),
+    })),
+    ...(providersQuery.data ?? []).flatMap((provider) =>
+      provider.credentials.map((credential) => ({
+        value: credential.id,
+        label: screenShieldActive
+          ? routePseudonym(credential.id)
+          : `${credential.label} · ${provider.display_name}`,
+      })),
+    ),
+  ];
+  const providerOptions = [
+    { value: ALL, label: "all" },
+    { value: "codex", label: "codex" },
+    { value: "claude", label: "claude" },
+    ...(providersQuery.data ?? [])
+      .filter((provider) => provider.slug !== "codex" && provider.slug !== "anthropic")
+      .map((provider) => ({ value: provider.slug, label: provider.display_name })),
   ];
 
   const pageStart = data.total > 0 ? offset + 1 : 0;
   const pageEnd = offset + rows.length;
   const hasPrev = offset > 0;
   const hasNext = offset + rows.length < data.total;
+  const totalPages = Math.max(1, Math.ceil(data.total / PAGE_SIZE));
+  const currentPage = Math.min(totalPages, Math.floor(offset / PAGE_SIZE) + 1);
+  const pageNumbers = paginationWindow(currentPage, totalPages);
+
+  function goToPage(page: number) {
+    const boundedPage = Math.min(totalPages, Math.max(1, page));
+    setParam("offset", String((boundedPage - 1) * PAGE_SIZE), { resetOffset: false });
+    setExpandedId(null);
+  }
 
   return (
     <div className="flex flex-col gap-3">
       <PageHeader
         subtitle={
           <>
-            {data.total.toLocaleString()} {data.total === 1 ? "request" : "requests"} · last{" "}
-            {range}
+            {data.total.toLocaleString()} {data.total === 1 ? "request" : "requests"} ·{" "}
+            {requestIdFilter ? "exact correlation lookup" : <>last {range}</>}
             {dataUpdatedAt ? <> · updated {relTime(Math.floor(dataUpdatedAt / 1000), nowMs)}</> : null}
           </>
         }
-        actions={<LiveBadge isFetching={isFetching} />}
+        actions={
+          <LiveBadge
+            isFetching={isFetching}
+            sseConnected={requestStream.connected}
+          />
+        }
       />
 
       <div className="flex flex-wrap items-center gap-2">
@@ -434,20 +506,16 @@ export function Requests() {
         </div>
 
         <FilterSelect
-          label="Account"
+          label="Target"
           value={accountFilter}
           onChange={(v) => setParam("account", v)}
-          options={accountOptions}
+          options={targetOptions}
         />
         <FilterSelect
           label="Provider"
           value={providerFilter}
           onChange={(v) => setParam("provider", v)}
-          options={[
-            { value: ALL, label: "all" },
-            { value: "codex", label: "codex" },
-            { value: "claude", label: "claude" },
-          ]}
+          options={providerOptions}
         />
         <FilterSelect
           label="Status"
@@ -471,20 +539,34 @@ export function Requests() {
           onChange={(v) => setParam("transport", v)}
           options={[
             { value: ALL, label: "all" },
-            { value: "http", label: "http" },
-            { value: "ws", label: "ws" },
+            { value: "http", label: "HTTP" },
+            { value: "sse", label: "SSE" },
+            { value: "ws", label: "WS" },
           ]}
         />
 
-        <div className="ml-auto flex shrink-0 items-center gap-1.5 rounded border border-border bg-card px-2.5 py-1 text-[10.5px] text-fg opacity-80">
+        <form
+          className="ml-auto flex shrink-0 items-center gap-1.5 rounded border border-border bg-card px-2 py-1 text-[10.5px] text-fg"
+          onSubmit={(event) => {
+            event.preventDefault();
+            setParam("request_id", searchId.trim());
+          }}
+        >
           <Search className="h-3 w-3 shrink-0 opacity-60" strokeWidth={2} />
           <input
             value={searchId}
             onChange={(e) => setSearchId(e.target.value)}
-            placeholder="Search request id (this page)…"
-            className="w-[168px] bg-transparent text-fg outline-none placeholder:opacity-50"
+            placeholder="Correlation ID…"
+            aria-label="Find request by correlation ID"
+            className="w-[184px] bg-transparent text-fg outline-none placeholder:opacity-50"
           />
-        </div>
+          <button
+            type="submit"
+            className="rounded bg-muted px-2 py-0.5 text-[9.5px] font-semibold opacity-70 hover:opacity-100"
+          >
+            Find
+          </button>
+        </form>
       </div>
 
       {rows.length === 0 ? (
@@ -500,6 +582,8 @@ export function Requests() {
           <Col span={12}>
             <RequestsTable
               rows={visibleRows}
+              accountById={accountById}
+              credentialLabelById={credentialLabelById}
               hiddenBySearch={rows.length - visibleRows.length}
               expandedId={expandedId}
               onToggle={(id) => setExpandedId((cur) => (cur === id ? null : id))}
@@ -509,30 +593,68 @@ export function Requests() {
       )}
 
       {rows.length > 0 && (
-        <div className="flex items-center justify-between text-[10.5px] text-fg opacity-70">
-          <span>
-            Showing {pageStart}–{pageEnd} of {data.total.toLocaleString()} · newest first
-          </span>
-          <div className="flex gap-1.5">
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-card px-3 py-2.5 text-[10.5px] text-fg">
+          <div>
+            <div className="font-semibold tabular-nums">
+              {pageStart}–{pageEnd} of {data.total.toLocaleString()}
+            </div>
+            <div className="mt-0.5 text-[9px] opacity-50">
+              Page {currentPage.toLocaleString()} of {totalPages.toLocaleString()} · newest first
+            </div>
+          </div>
+          <nav aria-label="Request pages" className="flex flex-wrap items-center justify-end gap-1">
             <button
               type="button"
               disabled={!hasPrev}
-              onClick={() => setParam("offset", String(Math.max(0, offset - PAGE_SIZE)), { resetOffset: false })}
-              className="flex items-center gap-1 rounded border border-border bg-card px-2.5 py-1 text-fg disabled:opacity-40"
+              onClick={() => goToPage(1)}
+              className="rounded border border-border px-2 py-1.5 font-medium opacity-70 hover:bg-muted hover:opacity-100 disabled:pointer-events-none disabled:opacity-30"
+            >
+              First
+            </button>
+            <button
+              type="button"
+              disabled={!hasPrev}
+              onClick={() => goToPage(currentPage - 1)}
+              className="flex items-center gap-1 rounded border border-border px-2 py-1.5 font-medium opacity-70 hover:bg-muted hover:opacity-100 disabled:pointer-events-none disabled:opacity-30"
             >
               <ChevronLeft className="h-3 w-3" strokeWidth={2} />
               Prev
             </button>
+            {pageNumbers.map((page) => (
+              <button
+                key={page}
+                type="button"
+                aria-current={page === currentPage ? "page" : undefined}
+                aria-label={`Page ${page}`}
+                onClick={() => goToPage(page)}
+                className={clsx(
+                  "min-w-7 rounded border px-2 py-1.5 font-semibold tabular-nums",
+                  page === currentPage
+                    ? "border-accent/40 bg-accent/15 text-accent"
+                    : "border-border opacity-65 hover:bg-muted hover:opacity-100",
+                )}
+              >
+                {page}
+              </button>
+            ))}
             <button
               type="button"
               disabled={!hasNext}
-              onClick={() => setParam("offset", String(offset + PAGE_SIZE), { resetOffset: false })}
-              className="flex items-center gap-1 rounded border border-border bg-card px-2.5 py-1 text-fg disabled:opacity-40"
+              onClick={() => goToPage(currentPage + 1)}
+              className="flex items-center gap-1 rounded border border-border px-2 py-1.5 font-medium opacity-70 hover:bg-muted hover:opacity-100 disabled:pointer-events-none disabled:opacity-30"
             >
               Next
               <ChevronRight className="h-3 w-3" strokeWidth={2} />
             </button>
-          </div>
+            <button
+              type="button"
+              disabled={!hasNext}
+              onClick={() => goToPage(totalPages)}
+              className="rounded border border-border px-2 py-1.5 font-medium opacity-70 hover:bg-muted hover:opacity-100 disabled:pointer-events-none disabled:opacity-30"
+            >
+              Last
+            </button>
+          </nav>
         </div>
       )}
     </div>
@@ -551,22 +673,41 @@ function PageHeader({ subtitle, actions }: { subtitle?: ReactNode; actions?: Rea
   );
 }
 
-/** The header's "live" indicator. Reflects something REAL: `useRequests`'s own 30s auto-refresh —
- * never a decorative badge implying an SSE stream this page doesn't have (live-logs SSE is Task
- * 10's `useLogStream`, a completely different endpoint). The dot only pulses while `isFetching` is
- * true (an actual network request in flight, including the background poll), and the label switches
- * to "refreshing…" for that same real reason — otherwise it reads as the honest steady state
- * ("polling 30s"). `motion-reduce:hidden` on the ping ring respects `prefers-reduced-motion`. */
-function LiveBadge({ isFetching }: { isFetching: boolean }) {
+/** Honest transport state: SSE while the authenticated stream is open, 30-second polling only
+ * while disconnected/disabled. `isFetching` reflects the durable `/api/requests` refresh. */
+function LiveBadge({
+  isFetching,
+  sseConnected,
+}: {
+  isFetching: boolean;
+  sseConnected: boolean;
+}) {
   return (
-    <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded border border-success/30 bg-success/[0.08] px-2.5 py-1 text-[10.5px] text-success">
+    <span
+      className={clsx(
+        "flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded border px-2.5 py-1 text-[10.5px]",
+        sseConnected
+          ? "border-success/30 bg-success/[0.08] text-success"
+          : "border-warn/30 bg-warn/[0.08] text-warn",
+      )}
+    >
       <span className="relative flex h-[7px] w-[7px] shrink-0">
         {isFetching && (
-          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success opacity-60 motion-reduce:hidden" />
+          <span
+            className={clsx(
+              "absolute inline-flex h-full w-full animate-ping rounded-full opacity-60 motion-reduce:hidden",
+              sseConnected ? "bg-success" : "bg-warn",
+            )}
+          />
         )}
-        <span className="relative inline-flex h-[7px] w-[7px] rounded-full bg-success" />
+        <span
+          className={clsx(
+            "relative inline-flex h-[7px] w-[7px] rounded-full",
+            sseConnected ? "bg-success" : "bg-warn",
+          )}
+        />
       </span>
-      {isFetching ? "Live · refreshing…" : `Live · polling ${POLL_SECS}s`}
+      {requestLiveLabel({ sseConnected, isFetching })}
     </span>
   );
 }
@@ -576,15 +717,19 @@ function LiveBadge({ isFetching }: { isFetching: boolean }) {
 // ---------------------------------------------------------------------------------------------
 
 const TABLE_HEAD_CLASS =
-  "px-2 py-1.5 text-left text-[9px] font-medium uppercase tracking-wide text-fg opacity-60";
+  "px-2.5 py-2 text-left text-[9px] font-medium uppercase tracking-wide text-fg opacity-60";
 
 function RequestsTable({
   rows,
+  accountById,
+  credentialLabelById,
   hiddenBySearch,
   expandedId,
   onToggle,
 }: {
   rows: RequestRowView[];
+  accountById: Map<string, AccountView>;
+  credentialLabelById: Map<string, string>;
   hiddenBySearch: number;
   expandedId: number | null;
   onToggle: (id: number) => void;
@@ -597,24 +742,25 @@ function RequestsTable({
         </p>
       )}
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[860px] border-collapse text-[10.5px]">
+        <table className="w-full min-w-[940px] border-collapse text-[11px]">
           <thead>
             <tr className="border-b border-border">
               <th className={TABLE_HEAD_CLASS}>Time</th>
-              <th className={TABLE_HEAD_CLASS}>Account</th>
+              <th className={TABLE_HEAD_CLASS}>Target</th>
               <th className={TABLE_HEAD_CLASS}>Provider</th>
               <th className={TABLE_HEAD_CLASS}>Model</th>
               <th className={TABLE_HEAD_CLASS}>Transport</th>
               <th className={TABLE_HEAD_CLASS}>Status</th>
               <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>TTFT</th>
-              <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>TPS</th>
+              <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>Latency</th>
+              <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>Throughput</th>
               <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>Tokens</th>
             </tr>
           </thead>
           <tbody>
             {rows.length === 0 ? (
               <tr>
-                <td colSpan={9} className="px-2 py-3 text-center text-fg opacity-50">
+                <td colSpan={10} className="px-2 py-3 text-center text-fg opacity-50">
                   No rows on this page match your search.
                 </td>
               </tr>
@@ -623,6 +769,14 @@ function RequestsTable({
                 <RequestRow
                   key={r.id}
                   row={r}
+                  accountLabel={
+                    r.target_kind === "credential" && r.provider_credential_id
+                      ? credentialLabelById.get(r.provider_credential_id) ??
+                        r.provider_credential_id
+                      : r.account_id
+                      ? accountDisplayLabel(accountById.get(r.account_id), r.account_id)
+                      : undefined
+                  }
                   expanded={expandedId === r.id}
                   onToggle={() => onToggle(r.id)}
                 />
@@ -637,10 +791,12 @@ function RequestsTable({
 
 function RequestRow({
   row: r,
+  accountLabel,
   expanded,
   onToggle,
 }: {
   row: RequestRowView;
+  accountLabel?: string;
   expanded: boolean;
   onToggle: () => void;
 }) {
@@ -662,18 +818,49 @@ function RequestRow({
           !expanded && "last:border-0",
         )}
       >
-        <td className="whitespace-nowrap px-2 py-1.5 font-mono tabular-nums text-fg opacity-90">
-          <ChevronRight
-            className={clsx("mr-1 inline h-3 w-3 opacity-50 transition-transform", expanded && "rotate-90")}
-            strokeWidth={2}
-          />
-          {formatClock(r.requested_at)}
+        <td className="whitespace-nowrap px-2.5 py-2.5 font-mono tabular-nums text-fg opacity-90">
+          <div>
+            <ChevronRight
+              className={clsx("mr-1 inline h-3 w-3 opacity-50 transition-transform", expanded && "rotate-90")}
+              strokeWidth={2}
+            />
+            {formatClock(r.requested_at)}
+          </div>
+          {r.request_id && (
+            <div title={r.request_id} className="ml-4 mt-0.5 text-[8.5px] text-accent opacity-70">
+              req {r.request_id.slice(0, 8)}
+            </div>
+          )}
+          {r.session_key && (
+            <Link
+              to={`/sessions?session_key=${encodeURIComponent(r.session_key)}`}
+              title={`Open session ${r.session_key}`}
+              onClick={(event) => event.stopPropagation()}
+              className="ml-4 mt-0.5 block text-[8.5px] text-fg opacity-50 hover:text-accent hover:opacity-100"
+            >
+              session {r.session_key.slice(0, 8)}
+            </Link>
+          )}
         </td>
-        <td className="whitespace-nowrap px-2 py-1.5 text-fg opacity-90">{r.account_id ?? "—"}</td>
-        <td className="px-2 py-1.5">
+        <td className="whitespace-nowrap px-2.5 py-2.5 text-fg opacity-90">
+          {r.target_kind === "credential" && r.provider_credential_id ? (
+            <ShieldedAccount
+              id={r.provider_credential_id}
+              label={accountLabel ?? r.provider_credential_id}
+            />
+          ) : r.account_id ? (
+            <ShieldedAccount
+              id={r.account_id}
+              label={accountLabel ?? accountDisplayLabel(undefined, r.account_id)}
+            />
+          ) : (
+            "—"
+          )}
+        </td>
+        <td className="px-2.5 py-2.5">
           <ProviderTag provider={r.provider} />
         </td>
-        <td className="px-2 py-1.5">
+        <td className="px-2.5 py-2.5">
           <ModelCell
             model={r.model}
             effort={r.reasoning_effort}
@@ -681,83 +868,33 @@ function RequestRow({
             subagent={r.subagent}
           />
         </td>
-        <td className="px-2 py-1.5">
+        <td className="px-2.5 py-2.5">
           <TransportPill transport={r.transport} />
         </td>
-        <td className="px-2 py-1.5">
-          <HttpStatusPill status={r.status} />
+        <td className="px-2.5 py-2.5">
+          <HttpStatusPill row={r} />
         </td>
-        <td className="whitespace-nowrap px-2 py-1.5 text-right tabular-nums text-fg opacity-80">
+        <td className="whitespace-nowrap px-2.5 py-2.5 text-right tabular-nums text-fg opacity-80">
           {latency(r.ttft_ms)}
         </td>
-        <td className="whitespace-nowrap px-2 py-1.5 text-right tabular-nums text-fg opacity-80">
+        <td className="whitespace-nowrap px-2.5 py-2.5 text-right tabular-nums text-fg opacity-80">
+          {latency(r.duration_ms)}
+        </td>
+        <td className="whitespace-nowrap px-2.5 py-2.5 text-right tabular-nums text-fg opacity-80">
           {tpsFmt(r.tps)}
         </td>
-        <td className="whitespace-nowrap px-2 py-1.5 text-right text-fg opacity-90">
+        <td className="whitespace-nowrap px-2.5 py-2.5 text-right text-fg opacity-90">
           <TokensCell total={r.total_tokens} cached={r.cached_tokens} />
         </td>
       </tr>
       {expanded && (
         <tr className="border-b border-border/55 bg-muted/30 last:border-0">
-          <td colSpan={9} className="p-0">
-            <RequestDetail row={r} />
+          <td colSpan={10} className="p-0">
+            <RequestDetailPanel row={r} accountLabel={accountLabel} />
           </td>
         </tr>
       )}
     </>
-  );
-}
-
-/** Content-free detail row. Every value here is a real `RequestRowView` field — see the file-header
- * comment for the mockup fields (api key, pool, downstream/upstream split, retry-after, upstream
- * error code, routing trail) that are NOT real and are therefore omitted, not fabricated. */
-function RequestDetail({ row: r }: { row: RequestRowView }) {
-  return (
-    <div className="flex flex-col gap-2 px-4 py-3 text-[10.5px]">
-      <div className="flex flex-wrap gap-x-5 gap-y-1">
-        <DetailField label="request id" value={`#${r.id}`} mono />
-        <DetailField label="status" value={String(r.status)} />
-        <DetailField label="account" value={r.account_id ? `${r.account_id} (${r.provider})` : "—"} />
-        <DetailField label="aliased" value={r.aliased ? "yes" : "no"} />
-      </div>
-      <div className="flex flex-wrap gap-x-5 gap-y-1">
-        <DetailField label="path" value={`${r.method} ${r.path}`} mono />
-        <DetailField label="transport" value={r.transport ?? "—"} />
-        <DetailField
-          label="model"
-          value={[r.model ?? "—", r.reasoning_effort, r.service_tier].filter(Boolean).join(" · ")}
-        />
-        <DetailField label="subagent" value={r.subagent ?? "main"} />
-      </div>
-      <div className="flex flex-wrap gap-x-5 gap-y-1">
-        <DetailField label="requested at" value={formatFullDateTime(r.requested_at)} />
-        <DetailField label="duration" value={latency(r.duration_ms)} />
-        <DetailField label="TTFT" value={latency(r.ttft_ms)} />
-        <DetailField label="TPS" value={tpsFmt(r.tps)} />
-        <DetailField
-          label="tokens"
-          value={
-            r.total_tokens === null
-              ? "—"
-              : `${compactNum(r.total_tokens)}${r.cached_tokens !== null ? ` (${compactNum(r.cached_tokens)} cached)` : ""}`
-          }
-        />
-      </div>
-      <div className="flex items-center gap-1.5 rounded border border-dashed border-border bg-card px-2.5 py-1.5 text-[9.5px] text-fg opacity-60">
-        <Lock className="h-3 w-3 shrink-0" strokeWidth={1.9} />
-        No request or response bodies are stored — PolyFlare logs outcomes only (status, timing,
-        token counts, routing).
-      </div>
-    </div>
-  );
-}
-
-function DetailField({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
-  return (
-    <div className="text-fg opacity-60">
-      {label}{" "}
-      <b className={clsx("font-medium text-fg opacity-100", mono && "font-mono")}>{value}</b>
-    </div>
   );
 }
 

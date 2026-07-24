@@ -4,6 +4,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{
+    future::{Future, IntoFuture},
+    io,
+};
 
 use clap::{Parser, Subcommand};
 
@@ -11,7 +15,7 @@ use polyflare_anthropic::AnthropicExecutor;
 use polyflare_codex::oauth::OAuthClient;
 use polyflare_codex::{run_login, CodexVersionCache};
 use polyflare_core::{Continuity, Executor, Selector};
-use polyflare_server::app::{build_app, build_codex_executor, AppState};
+use polyflare_server::app::{build_app_for_bind, build_codex_executor, AppState};
 use polyflare_server::config::{self, ServeConfig};
 use polyflare_server::continuity::CodexContinuity;
 use polyflare_server::model_catalog::{
@@ -164,8 +168,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// The M2b server: store-backed multi-account pool selection.
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
-    let config = ServeConfig::from_env()?;
+    let mut config = ServeConfig::from_env()?;
     let store = Store::open(&config.db_path).await?;
+    let settings_overlay = store.settings().get_all().await?;
+    config::overlay_persisted_websocket_settings(&mut config, &settings_overlay);
     // Live-editable Settings subsystem Task 4: seed the atomic holder from the already-clamped
     // `ServeConfig` — BEFORE any field of `config` below is partially moved out of it
     // (`RuntimeSettings::new` needs a whole-struct borrow, which the borrow checker forbids once a
@@ -174,7 +180,6 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // row that fails to parse (unknown key, or a value of the wrong shape for its field) is
     // skipped — see `overlay_persisted_settings`'s doc.
     let runtime_settings = Arc::new(RuntimeSettings::new(&config));
-    let settings_overlay = store.settings().get_all().await?;
     overlay_persisted_settings(&runtime_settings, &settings_overlay);
     // D18 Task 4: the bind-address-aware posture — resolved ONCE here, BEFORE `AppState`/`build_app`,
     // using only already-available inputs (does any key exist yet; the configured bind; the
@@ -189,10 +194,10 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         config.allow_unauthenticated_remote,
     )?;
     let cipher = TokenCipher::load_or_create(&config.key_path)?;
-    // M5a: `POLYFLARE_WS_UPSTREAM` (default OFF) selects `CodexWsExecutor` over the WS transport
-    // instead of today's HTTP-SSE `CodexExecutor` — see `build_codex_executor`'s doc.
-    let codex_executor: Arc<dyn Executor> =
-        build_codex_executor(config.ws_upstream, config.ws_client_ping)?;
+    let codex_executor: Arc<dyn Executor> = build_codex_executor(
+        config.http_requests_use_upstream_websocket,
+        config.http_upstream_websocket_ping,
+    )?;
     let anthropic_executor: Arc<dyn Executor> = Arc::new(AnthropicExecutor::new()?);
     // Routing: the global default strategy + any per-pool overrides, both from config.
     let selector: Arc<dyn Selector> = config.routing_strategy.selector();
@@ -202,6 +207,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(slug, strat)| (slug.clone(), strat.selector()))
         .collect();
     let oauth = OAuthClient::new(config.auth_base_url)?;
+    let refresh_locks = polyflare_server::refresh_locks::RefreshLocks::default();
     let continuity: Arc<dyn Continuity> = Arc::new(CodexContinuity::new(
         store.continuity(),
         config.continuity_watchdog,
@@ -222,19 +228,23 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // D15 Task 3: the live upstream model-catalog cache. Built AFTER `store`/`cipher`/
-    // `codex_version` above (all three already-owned handles it needs), BEFORE `AppState` — see
-    // `crate::model_catalog::HttpModelSource`'s doc for why (it needs its own owned
-    // store/cipher/version-cache handles, never a circular `Arc<AppState>` back-reference). The
+    // `codex_version` above (plus shared OAuth/refresh-lock handles), BEFORE `AppState` — see
+    // `crate::model_catalog::HttpModelSource`'s doc for why (it needs its own owned handles, never
+    // a circular `Arc<AppState>` back-reference). The
     // floor (`codex_bootstrap_floor()`) is the SAME never-empty static bootstrap `catalog.rs`
     // served before this feature existed, so every fallback rung — disabled, no accounts, fetch
     // failure — degrades to exactly that pre-D15 `/models` behavior.
+    let model_catalog_enabled = config.model_catalog_enabled;
+    let admission_limits = config.admission_limits;
     let model_catalog_floor = polyflare_server::catalog::codex_bootstrap_floor();
-    let model_catalog = Arc::new(if config.model_catalog_enabled {
+    let model_catalog = Arc::new(if model_catalog_enabled {
         let source: Box<dyn ModelSource> = Box::new(HttpModelSource::new(
             store.clone(),
             cipher.clone(),
             config.upstream_base_url.clone(),
             codex_version.clone(),
+            oauth.clone(),
+            refresh_locks.clone(),
         )?);
         ModelCatalogCache::new(
             source,
@@ -244,18 +254,6 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         floor_only_cache(model_catalog_floor)
     });
-    // Background-warm ONLY when enabled — disabled means the floor-only cache never needs (or
-    // gets) a network-touching refresh at all, mirroring `codex_version`'s warm-loop shape above.
-    if config.model_catalog_enabled {
-        let cache = model_catalog.clone();
-        tokio::spawn(async move {
-            loop {
-                cache.get_or_refresh().await;
-                tokio::time::sleep(cache.refresh_interval()).await;
-            }
-        });
-    }
-
     let state = Arc::new(AppState {
         codex_executor,
         control_client: polyflare_codex::build_client().expect("build control_client"),
@@ -268,15 +266,18 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         oauth,
         upstream_base_url: config.upstream_base_url,
         anthropic_upstream_base_url: config.anthropic_upstream_base_url,
-        refresh_locks: Default::default(),
+        refresh_locks,
         capture_fingerprint_path: config.capture_fingerprint_path,
         codex_version,
         account_cache: Arc::new(polyflare_server::account_cache::AccountCache::new()),
         token_cache: Arc::new(polyflare_server::token_cache::TokenCache::new()),
-        runtime: Default::default(),
+        runtime: Arc::new(
+            polyflare_server::runtime_state::RuntimeStates::with_admission_limits(admission_limits),
+        ),
         admin_token: config.admin_token,
         runtime_settings,
-        ws_downstream: config.ws_downstream,
+        ws_downstream: config.client_websocket_enabled,
+        ws_relay_idle: config.websocket_idle_policy,
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -288,6 +289,43 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         relay_metrics: polyflare_server::observability::RelayMetrics::new(),
         model_catalog,
     });
+    if model_catalog_enabled {
+        let readiness_state = state.clone();
+        match await_startup_work_with_budget(
+            async move {
+                polyflare_server::catalog::warm_active_model_scopes(&readiness_state).await
+            },
+            MODEL_CATALOG_STARTUP_WARM_BUDGET,
+        )
+        .await
+        {
+            StartupWork::Completed(warmed) => tracing::info!(
+                attempted_scopes = warmed.attempted_scopes,
+                authoritative_scopes = warmed.authoritative_scopes,
+                "model catalog readiness warmup completed"
+            ),
+            StartupWork::Continuing => tracing::warn!(
+                budget_ms = MODEL_CATALOG_STARTUP_WARM_BUDGET.as_millis(),
+                "model catalog readiness budget elapsed; warmup is continuing in background"
+            ),
+            StartupWork::Failed => tracing::warn!(
+                "model catalog readiness warmup task failed; serving with stale/floor fallback"
+            ),
+        }
+        let warm_state = state.clone();
+        let refresh_interval = state.model_catalog.refresh_interval();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(refresh_interval).await;
+                let warmed = polyflare_server::catalog::warm_active_model_scopes(&warm_state).await;
+                tracing::debug!(
+                    attempted_scopes = warmed.attempted_scopes,
+                    authoritative_scopes = warmed.authoritative_scopes,
+                    "model catalog background scope warmup completed"
+                );
+            }
+        });
+    }
     // Runtime usage-refresh loop: keeps each Codex account's rate-limit windows (5h + weekly) and
     // routing gate live, instead of the frozen numbers the importer left.
     polyflare_server::usage_refresh::spawn_usage_refresh(state.clone());
@@ -295,12 +333,128 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // via POLYFLARE_*_RETENTION_DAYS=0; see `polyflare_server::retention`).
     polyflare_server::retention::spawn_retention_prune(state.clone());
 
-    let app = build_app(state);
+    let app = build_app_for_bind(state.clone(), &config.bind_addr);
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     println!("polyflare listening on {}", config.bind_addr);
-    axum::serve(listener, app).await?;
+    let drain_outcome =
+        serve_with_bounded_shutdown(listener, app, shutdown_signal(), SHUTDOWN_DRAIN_TIMEOUT)
+            .await?;
+    if drain_outcome == DrainOutcome::TimedOut {
+        tracing::warn!(
+            timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+            "shutdown drain timed out; closing remaining connections"
+        );
+    }
+    let flush_result = state.store.flush_background_writes().await;
+    flush_result?;
     Ok(())
+}
+
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const MODEL_CATALOG_STARTUP_WARM_BUDGET: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainOutcome {
+    Drained,
+    TimedOut,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum StartupWork<T> {
+    Completed(T),
+    Continuing,
+    Failed,
+}
+
+/// Give startup work a bounded readiness budget without cancelling it. Dropping a Tokio
+/// `JoinHandle` detaches the task, so a slow catalog warmup continues filling the cache after the
+/// listener starts instead of either delaying service for the full upstream timeout or wasting
+/// successful member fetches already in flight.
+async fn await_startup_work_with_budget<F, T>(work: F, budget: Duration) -> StartupWork<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut task = tokio::spawn(work);
+    match tokio::time::timeout(budget, &mut task).await {
+        Ok(Ok(output)) => StartupWork::Completed(output),
+        Ok(Err(_)) => StartupWork::Failed,
+        Err(_) => StartupWork::Continuing,
+    }
+}
+
+/// Stop accepting new connections when `shutdown` resolves, but never let long-lived streams keep
+/// the process alive forever. The timeout starts at the shutdown signal—not at server startup.
+async fn serve_with_bounded_shutdown<F>(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    shutdown: F,
+    drain_timeout: Duration,
+) -> io::Result<DrainOutcome>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
+    let graceful_shutdown = async move {
+        shutdown.await;
+        let _ = drain_started_tx.send(());
+    };
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(graceful_shutdown)
+        .into_future();
+    tokio::pin!(server);
+
+    let drain_deadline = async move {
+        if drain_started_rx.await.is_ok() {
+            tokio::time::sleep(drain_timeout).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(drain_deadline);
+
+    tokio::select! {
+        result = &mut server => {
+            result?;
+            Ok(DrainOutcome::Drained)
+        }
+        _ = &mut drain_deadline => Ok(DrainOutcome::TimedOut),
+    }
+}
+
+/// Stop accepting new connections on Ctrl-C (and SIGTERM on Unix), then let axum drain active
+/// responses up to [`SHUTDOWN_DRAIN_TIMEOUT`] before `serve` closes the remainder and flushes the
+/// Store's bounded background-writer queue.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "failed to install Ctrl-C shutdown handler");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to install SIGTERM shutdown handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutdown signal received; draining active requests");
 }
 
 /// Run the importer against the configured store + at-rest key, printing only counts. A `dry_run`
@@ -340,6 +494,12 @@ async fn accounts_login(
     open: bool,
     pool: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if pool
+        .as_deref()
+        .is_some_and(|slug| !polyflare_server::write_api::valid_pool_slug(slug))
+    {
+        return Err("pool must be a 1..=48 character lowercase slug using a-z, 0-9, _ or -".into());
+    }
     let data_dir = config::data_dir_from_env();
     let store = Store::open(&config::db_path(&data_dir)).await?;
     let cipher = TokenCipher::load_or_create(&config::key_path(&data_dir))?;
@@ -429,6 +589,12 @@ async fn accounts_set_pool(
     id: &str,
     pool: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if pool
+        .as_deref()
+        .is_some_and(|slug| !polyflare_server::write_api::valid_pool_slug(slug))
+    {
+        return Err("pool must be a 1..=48 character lowercase slug using a-z, 0-9, _ or -".into());
+    }
     let data_dir = config::data_dir_from_env();
     let store = Store::open(&config::db_path(&data_dir)).await?;
     let repo = store.accounts();
@@ -514,6 +680,66 @@ async fn keys_revoke(id: &str) -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[tokio::test]
+    async fn startup_budget_detaches_slow_work_without_cancelling_it() {
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let outcome = await_startup_work_with_budget(
+            async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = finished_tx.send(());
+            },
+            Duration::from_millis(5),
+        )
+        .await;
+
+        assert_eq!(outcome, StartupWork::Continuing);
+        tokio::time::timeout(Duration::from_secs(1), finished_rx)
+            .await
+            .expect("detached warmup must continue after the readiness budget")
+            .expect("warmup completion signal must be sent");
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_is_bounded_for_a_request_that_never_finishes() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let handler_entered = entered.clone();
+        let app = axum::Router::new().route(
+            "/hold",
+            axum::routing::get(move || {
+                let handler_entered = handler_entered.clone();
+                async move {
+                    handler_entered.notify_one();
+                    std::future::pending::<&'static str>().await
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_with_bounded_shutdown(
+            listener,
+            app,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_millis(50),
+        ));
+
+        let request = tokio::spawn(reqwest::get(format!("http://{addr}/hold")));
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("the hanging request must enter its handler");
+        shutdown_tx.send(()).unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("bounded shutdown must return")
+            .expect("server task must not panic")
+            .expect("server must not fail");
+        assert_eq!(outcome, DrainOutcome::TimedOut);
+        request.abort();
+    }
 
     #[test]
     fn cli_definition_is_valid() {

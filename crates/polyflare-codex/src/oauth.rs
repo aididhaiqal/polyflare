@@ -33,6 +33,7 @@ pub struct Claims {
     pub chatgpt_account_id: Option<String>,
     pub chatgpt_user_id: Option<String>,
     pub chatgpt_plan_type: Option<String>,
+    pub chatgpt_account_is_fedramp: bool,
     pub workspace_id: Option<String>,
     pub workspace_label: Option<String>,
     pub seat_type: Option<String>,
@@ -124,10 +125,20 @@ pub fn classify_failure(code: &str) -> FailureClass {
 
 /// Decode (WITHOUT verifying) the identity claims from a JWT id_token.
 pub fn decode_claims(id_token: &str) -> Result<Claims, OAuthError> {
-    let payload_b64 = id_token
-        .split('.')
-        .nth(1)
-        .ok_or_else(|| OAuthError::MalformedJwt("missing payload segment".to_string()))?;
+    let mut parts = id_token.split('.');
+    let (_header_b64, payload_b64, _signature_b64) =
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(header), Some(payload), Some(signature))
+                if !header.is_empty() && !payload.is_empty() && !signature.is_empty() =>
+            {
+                (header, payload, signature)
+            }
+            _ => {
+                return Err(OAuthError::MalformedJwt(
+                    "expected three non-empty JWT segments".to_string(),
+                ))
+            }
+        };
     let bytes = URL_SAFE_NO_PAD
         .decode(payload_b64)
         .map_err(|e| OAuthError::MalformedJwt(format!("base64url: {e}")))?;
@@ -156,11 +167,25 @@ pub fn decode_claims(id_token: &str) -> Result<Claims, OAuthError> {
         chatgpt_account_id: pick("chatgpt_account_id"),
         chatgpt_user_id,
         chatgpt_plan_type: pick("chatgpt_plan_type"),
+        // Unlike legacy profile fields, codex-rs accepts this routing bit only from the namespaced
+        // auth object. A top-level lookalike must never opt an account into a different edge.
+        chatgpt_account_is_fedramp: auth
+            .and_then(|a| a.get("chatgpt_account_is_fedramp"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         workspace_id: pick("workspace_id"),
         workspace_label: pick("workspace_label"),
         seat_type: pick("seat_type"),
         exp: v.get("exp").and_then(Value::as_i64),
     })
+}
+
+/// Fail-closed FedRAMP routing decision from the selected account's ID token. Missing, malformed,
+/// or non-boolean claims are ordinary non-FedRAMP accounts, matching codex-rs.
+pub fn is_fedramp_account(id_token: &str) -> bool {
+    decode_claims(id_token)
+        .map(|claims| claims.chatgpt_account_is_fedramp)
+        .unwrap_or(false)
 }
 
 /// The OAuth client id used by the Codex CLI (a public, non-secret protocol constant).
@@ -241,6 +266,7 @@ pub fn generate_state() -> String {
 
 /// OAuth client for the Codex backend. Holds a `reqwest::Client` + the auth base URL
 /// (default `https://auth.openai.com`; overridable so tests point at `MockOAuth`).
+#[derive(Clone)]
 pub struct OAuthClient {
     http: reqwest::Client,
     auth_base_url: String,
@@ -489,7 +515,8 @@ mod tests {
             "https://api.openai.com/auth": {
                 "chatgpt_account_id": "acct-xyz",
                 "chatgpt_user_id": "user-auth",
-                "chatgpt_plan_type": "pro"
+                "chatgpt_plan_type": "pro",
+                "chatgpt_account_is_fedramp": true
             }
         });
         let claims = decode_claims(&make_jwt(&payload)).unwrap();
@@ -497,6 +524,8 @@ mod tests {
         assert_eq!(claims.chatgpt_account_id.as_deref(), Some("acct-xyz"));
         assert_eq!(claims.chatgpt_user_id.as_deref(), Some("user-auth")); // auth-claim wins
         assert_eq!(claims.chatgpt_plan_type.as_deref(), Some("pro"));
+        assert!(claims.chatgpt_account_is_fedramp);
+        assert!(is_fedramp_account(&make_jwt(&payload)));
         assert_eq!(claims.exp, Some(1_800_000_000));
     }
 
@@ -504,6 +533,8 @@ mod tests {
     fn chatgpt_user_id_falls_back_to_sub() {
         let claims = decode_claims(&make_jwt(&serde_json::json!({ "sub": "sub-only" }))).unwrap();
         assert_eq!(claims.chatgpt_user_id.as_deref(), Some("sub-only"));
+        assert!(!claims.chatgpt_account_is_fedramp);
+        assert!(!is_fedramp_account("malformed"));
     }
 
     #[test]
@@ -525,6 +556,28 @@ mod tests {
             decode_claims("only-one-segment"),
             Err(OAuthError::MalformedJwt(_))
         ));
+    }
+
+    #[test]
+    fn fedramp_claim_fails_closed_for_malformed_or_wrong_location() {
+        let nested_payload = serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_is_fedramp": true
+            }
+        });
+        let valid = make_jwt(&nested_payload);
+        let payload_segment = valid.split('.').nth(1).unwrap();
+
+        assert!(!is_fedramp_account(&format!("header.{payload_segment}")));
+        assert!(!is_fedramp_account(&format!("header.{payload_segment}.")));
+        assert!(!is_fedramp_account(&make_jwt(&serde_json::json!({
+            "chatgpt_account_is_fedramp": true
+        }))));
+        assert!(!is_fedramp_account(&make_jwt(&serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_is_fedramp": "true"
+            }
+        }))));
     }
 
     #[test]

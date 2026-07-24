@@ -34,13 +34,17 @@ pub fn wrap_translating_stream(
     inner: ResponseStream,
     translator: Box<dyn Translator>,
 ) -> ResponseStream {
-    Box::pin(TranslatingStream {
-        inner,
-        translator,
-        line_buf: Vec::new(),
-        ready: VecDeque::new(),
-        inner_done: false,
-    })
+    let metadata = inner.metadata().clone();
+    ResponseStream::with_metadata(
+        TranslatingStream {
+            inner,
+            translator,
+            line_buf: Vec::new(),
+            ready: VecDeque::new(),
+            inner_done: false,
+        },
+        metadata,
+    )
 }
 
 struct TranslatingStream {
@@ -104,7 +108,7 @@ impl Stream for TranslatingStream {
             if this.inner_done {
                 return Poll::Ready(None);
             }
-            match this.inner.as_mut().poll_next(cx) {
+            match Pin::new(&mut this.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
                     this.feed_chunk(&bytes);
                     // loop: either this chunk produced ready frames (emit next iteration), or it
@@ -133,7 +137,7 @@ mod tests {
     }
 
     fn scripted_stream(chunks: Vec<Bytes>) -> ResponseStream {
-        Box::pin(stream::iter(chunks.into_iter().map(Ok::<Bytes, ExecError>)))
+        ResponseStream::new(stream::iter(chunks.into_iter().map(Ok::<Bytes, ExecError>)))
     }
 
     #[tokio::test]

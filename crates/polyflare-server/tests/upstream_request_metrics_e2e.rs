@@ -113,6 +113,7 @@ async fn spawn_polyflare(
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -165,7 +166,13 @@ async fn responses_request_records_upstream_request_metric() {
 
     assert_eq!(
         state.upstream_request_metrics.snapshot(),
-        vec![("codex-1".to_string(), 200, 1)],
+        vec![(
+            "codex".to_string(),
+            "account".to_string(),
+            "codex-1".to_string(),
+            200,
+            1,
+        )],
         "responses_route must record exactly one upstream_requests entry for the served account"
     );
 }
@@ -192,7 +199,13 @@ async fn responses_no_eligible_account_records_empty_account_id_entry() {
 
     assert_eq!(
         state.upstream_request_metrics.snapshot(),
-        vec![("".to_string(), 503, 1)],
+        vec![(
+            "codex".to_string(),
+            "account".to_string(),
+            "".to_string(),
+            503,
+            1,
+        )],
         "a 503-no-eligible-account outcome (no account ever selected) must still be visible, \
          keyed as an empty account_id, never dropped"
     );
@@ -236,7 +249,13 @@ async fn messages_request_records_upstream_request_metric() {
 
     assert_eq!(
         state.upstream_request_metrics.snapshot(),
-        vec![("anthropic-1".to_string(), 200, 1)],
+        vec![(
+            "anthropic".to_string(),
+            "account".to_string(),
+            "anthropic-1".to_string(),
+            200,
+            1,
+        )],
         "messages_route must record exactly one upstream_requests entry for the served account"
     );
 }

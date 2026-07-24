@@ -9,15 +9,15 @@
 // CONSTRUCTION (see that module's own doc comment) — it is built exclusively from
 // `RequestLog::to_log_event` (`observability.rs`), which draws from the same audited field set as
 // the persisted `request_log` row: counts, ids, statuses, timings, never a body/prompt/response/
-// key. This page renders ONLY the 10 real fields on the wire `LogEvent` type (`lib/api.ts`):
-// ts_ms, level, provider, account, model, status, latency_ms, subagent, kind, message. `subagent`
-// is the codex sub-agent role label from `x-openai-subagent` (`"review"` / `"compact"` /
+// key. This page renders ONLY the real fields on the wire `LogEvent` type (`lib/api.ts`):
+// ts_ms, level, request_id, session_key, provider, account, model, status, latency_ms, subagent,
+// kind, message. `subagent` is the codex sub-agent role label from `x-openai-subagent` (`"review"` / `"compact"` /
 // `"memory_consolidation"` / `"collab_spawn"`) — a bounded role slug, i.e. content-free routing
 // metadata, NOT conversation content; same content-safety class as `model`/`provider`. It is
 // `#[serde(skip_serializing_if = "Option::is_none")]` on the wire like `provider`/`account`/`model`,
-// so it is simply absent (not `null`) for the main agent and for non-request events — this page
-// therefore only renders the tag when the field is actually present, exactly like the other
-// optional fields below, never fabricating a "main" label for events that carry no such signal. No
+// so it is simply absent (not `null`) for the main agent and for non-request events. Request
+// completion rows render that absence as the explicit `main` role; non-request events get no
+// agent tag. `session_key` is the one-way hash shared with the Sessions view. No
 // tooltip, no "expand for detail" affordance, no field beyond this set is added anywhere below —
 // there is nothing else in the event to show, so nothing else is shown. `message` itself is the
 // backend's own pre-built content-free string (e.g. `"req 200 · codex · 707ms"`, see
@@ -43,10 +43,14 @@
 // depends on the mapping being correct — if/when the backend bug is fixed, this page's behavior is
 // unchanged.
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Link } from "react-router-dom";
 
 import type { LogEvent, LogLevel } from "../lib/api";
 import { useCapabilityFlags } from "../capabilities/CapabilitiesProvider";
+import { accountDisplayLabel } from "../lib/accountDisplay";
+import { useAccounts, useProviders } from "../lib/queries";
 import { useLogStream } from "../lib/useLogStream";
+import { ShieldedAccount } from "../privacy/ScreenShield";
 import { Card } from "../ui/Card";
 import { Col, Grid } from "../ui/Grid";
 import {
@@ -95,7 +99,10 @@ const LEVEL_TEXT_CLASS: Record<LogLevel, string> = {
  * `provider` is absent (a request can fail before an account/provider is resolved). */
 function accountTextClass(provider: string | undefined): string {
   if (provider === undefined) return "text-fg opacity-80";
-  return providerBrandKey(provider) === "claude" ? "text-claude" : "text-codex";
+  const key = providerBrandKey(provider);
+  if (key === "claude") return "text-claude";
+  if (key === "codex") return "text-codex";
+  return "text-fg opacity-80";
 }
 
 /** HTTP status → text color, matching `Requests.tsx`'s `httpStatusTone` convention exactly (429 is
@@ -125,7 +132,7 @@ function formatLogTs(tsMs: number): string {
  * `useLogStream.ts` out of this task — so instead of touching it, every render here first collapses
  * `stream.lines` down to one entry per distinct event. The key is every real content-free field
  * (never anything invented): two entries are "the same event" only if ts_ms/level/kind/message/
- * status/latency_ms/account/provider/model/subagent all match, which is true for a byte-for-byte
+ * status/latency_ms/account/provider/model/subagent/request_id all match, which is true for a byte-for-byte
  * repeat backfill replay and false for any two genuinely different events (even ones a millisecond
  * apart). First occurrence wins, so chronological order is preserved. */
 function logEventKey(ev: LogEvent): string {
@@ -137,9 +144,13 @@ function logEventKey(ev: LogEvent): string {
     ev.status,
     ev.latency_ms,
     ev.account,
+    ev.target_kind,
+    ev.target_id,
     ev.provider,
     ev.model,
     ev.subagent,
+    ev.request_id,
+    ev.session_key,
   ].join("|");
 }
 
@@ -158,15 +169,20 @@ function dedupeLogEvents(lines: LogEvent[]): LogEvent[] {
 /** Case-insensitive substring match over every real, renderable text-ish field on the event — the
  * page's one client-side "search" affordance. Not URL-synced (this is a live in-memory buffer, not
  * a server query — there is nothing to deep-link to). */
-function matchesTextFilter(ev: LogEvent, needle: string): boolean {
+function matchesTextFilter(ev: LogEvent, needle: string, accountLabel?: string): boolean {
   if (needle === "") return true;
   const haystack = [
     ev.kind,
     ev.message,
     ev.account,
+    ev.target_kind,
+    ev.target_id,
+    accountLabel,
     ev.provider,
     ev.model,
     ev.subagent,
+    ev.request_id,
+    ev.session_key,
     ev.status?.toString(),
   ]
     .filter((v): v is string => v !== undefined && v !== null)
@@ -178,6 +194,8 @@ function matchesTextFilter(ev: LogEvent, needle: string): boolean {
 export function LiveLogs() {
   const { liveLogs } = useCapabilityFlags();
   const stream = useLogStream({ enabled: liveLogs });
+  const { data: accounts = [] } = useAccounts();
+  const { data: providers = [] } = useProviders();
 
   const [levelFilter, setLevelFilter] = useState<LevelFilter>("all");
   const [textFilter, setTextFilter] = useState("");
@@ -194,9 +212,27 @@ export function LiveLogs() {
 
   // De-duplicate first (see `dedupeLogEvents`'s doc comment — a `useLogStream` reconnect gap, not
   // this page's own bug), THEN apply level/text filters on top of the deduplicated set.
+  const accountById = new Map(accounts.map((account) => [account.id, account]));
+  const credentialLabelById = new Map(
+    providers.flatMap((provider) =>
+      provider.credentials.map((credential) => [credential.id, credential.label] as const),
+    ),
+  );
+  const targetLabel = (ev: LogEvent): string | undefined => {
+    const targetId = ev.target_id ?? ev.account;
+    if (!targetId) return undefined;
+    if (ev.target_kind === "credential") return credentialLabelById.get(targetId) ?? targetId;
+    return accountDisplayLabel(accountById.get(targetId), targetId);
+  };
   const dedupedLines = dedupeLogEvents(stream.lines);
   const visibleLines = dedupedLines.filter(
-    (ev) => (levelFilter === "all" || ev.level === levelFilter) && matchesTextFilter(ev, textFilter),
+    (ev) =>
+      (levelFilter === "all" || ev.level === levelFilter) &&
+      matchesTextFilter(
+        ev,
+        textFilter,
+        targetLabel(ev),
+      ),
   );
 
   // Auto-scroll-to-bottom: only runs while the toggle is on, and only reacts to the FILTERED count
@@ -315,7 +351,15 @@ export function LiveLogs() {
                     : "No lines match the current filters."}
                 </p>
               ) : (
-                visibleLines.map((ev) => <LogLine key={logEventKey(ev)} ev={ev} />)
+                visibleLines.map((ev) => (
+                  <LogLine
+                    key={logEventKey(ev)}
+                    ev={ev}
+                    accountLabel={
+                      targetLabel(ev)
+                    }
+                  />
+                ))
               )}
             </div>
           </Card>
@@ -403,7 +447,8 @@ function DisabledNotice() {
 // Console line — every span below is a real `LogEvent` field. See the file-header comment.
 // ---------------------------------------------------------------------------------------------
 
-function LogLine({ ev }: { ev: LogEvent }) {
+function LogLine({ ev, accountLabel }: { ev: LogEvent; accountLabel?: string }) {
+  const targetId = ev.target_id ?? ev.account;
   return (
     <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-0 px-3.5 py-0.5 hover:bg-muted/50">
       <span className="shrink-0 tabular-nums text-fg opacity-45">{formatLogTs(ev.ts_ms)}</span>
@@ -411,17 +456,47 @@ function LogLine({ ev }: { ev: LogEvent }) {
         {ev.level}
       </span>
       <span className="shrink-0 text-fg opacity-40">{ev.kind}</span>
-      {ev.account !== undefined && (
-        <span className={clsx("shrink-0 font-medium", accountTextClass(ev.provider))}>{ev.account}</span>
+      {targetId !== undefined && (
+        <ShieldedAccount
+          id={targetId}
+          label={accountLabel ?? accountDisplayLabel(undefined, targetId)}
+          className={clsx("shrink-0 font-medium", accountTextClass(ev.provider))}
+        />
+      )}
+      {ev.target_kind !== undefined && (
+        <span className="shrink-0 text-[9px] text-fg opacity-35">{ev.target_kind}</span>
       )}
       {ev.provider !== undefined && (
         <span className="shrink-0 text-fg opacity-45">{providerBrandKey(ev.provider)}</span>
       )}
       {ev.model !== undefined && <span className="shrink-0 text-fg opacity-45">{ev.model}</span>}
-      {ev.subagent != null && (
-        <span className="shrink-0 whitespace-nowrap rounded bg-accent/15 px-1 py-0 text-[9px] font-bold lowercase leading-none text-accent">
-          {ev.subagent}
+      {ev.kind === "request" && (
+        <span
+          className={clsx(
+            "shrink-0 whitespace-nowrap rounded px-1 py-0 text-[9px] font-bold lowercase leading-none",
+            ev.subagent ? "bg-accent/15 text-accent" : "bg-muted text-fg opacity-50",
+          )}
+        >
+          {ev.subagent ?? "main"}
         </span>
+      )}
+      {ev.session_key !== undefined && (
+        <Link
+          to={`/sessions?session_key=${encodeURIComponent(ev.session_key)}`}
+          title={`Open session ${ev.session_key}`}
+          className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-[9px] text-fg opacity-60 no-underline hover:bg-accent/15 hover:text-accent hover:opacity-100"
+        >
+          session {ev.session_key.slice(0, 8)}
+        </Link>
+      )}
+      {ev.request_id !== undefined && (
+        <Link
+          to={`/requests?request_id=${encodeURIComponent(ev.request_id)}`}
+          title={`Open request ${ev.request_id}`}
+          className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-[9px] font-semibold text-accent no-underline hover:bg-accent/15"
+        >
+          req {ev.request_id.slice(0, 8)}
+        </Link>
       )}
       <span className="min-w-0 flex-1 break-words text-fg opacity-90">{ev.message}</span>
       {ev.status !== undefined && (

@@ -73,6 +73,7 @@ async fn state(soft_drain_enabled: bool) -> Arc<AppState> {
             live_logs: true,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -107,6 +108,7 @@ fn ctx(now: i64, seed: u64) -> SelectionCtx {
         session_id: None,
         tier: None,
         inflight_penalty_pct: 0.0,
+        request_pressure_units: 1,
     }
 }
 

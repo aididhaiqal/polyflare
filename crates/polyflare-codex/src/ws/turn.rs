@@ -58,7 +58,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -69,7 +69,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use polyflare_core::{ExecError, ResponseStream};
 
 use super::codec::{classify, frame_to_sse, FrameClass};
-use super::conn::WsConn;
+use super::conn::{PendingBaseline, WsConn};
 use super::delta::{item_hashes, non_input_fingerprint};
 
 /// Substring markers embedded in the `ExecError::Stream` messages this module produces for the
@@ -123,6 +123,7 @@ enum TurnState {
 /// [`ResponseStream`] [`turn_stream`] returns. Never constructed directly by a caller.
 struct TurnStream {
     state: TurnState,
+    turn_state: Arc<OnceLock<String>>,
 }
 
 impl Stream for TurnStream {
@@ -154,15 +155,12 @@ impl Stream for TurnStream {
                             this.state = TurnState::Reading(Box::pin(read_next(guard)));
                             continue;
                         };
-                        // NOTE: turn-state is NOT captured from frames here. PolyFlare sends one
-                        // `response.create` per turn and a `response.metadata` frame arrives only
-                        // AFTER that send; a same-turn retry re-dials (fresh upgrade token). So the
-                        // operative turn-state source is the WS UPGRADE-response header captured at
-                        // dial (`ws::conn`, consumed per-turn in `ws::executor::drive_turn`) — a
-                        // mid-response frame-captured token would have no effect in this model. This
-                        // also keeps the wedge-adjacent read path below untouched. (If a future
-                        // live-verify shows the backend relies on echoing a mid-response token, it
-                        // can be added back.)
+                        if let Some(response_turn_state) = response_turn_state(&value) {
+                            // Codex uses a per-turn OnceLock: the first value from either the
+                            // upgrade response or response.metadata wins and is replayed by any
+                            // same-turn retry/reconnect. It is never carried into a later turn.
+                            let _ = this.turn_state.set(response_turn_state);
+                        }
                         match classify(&value) {
                             FrameClass::Event => {
                                 let bytes = frame_to_sse(&text);
@@ -175,10 +173,16 @@ impl Stream for TurnStream {
                                 // same defensive default as the malformed-frame branch above.
                                 continue;
                             }
-                            FrameClass::Terminal => {
+                            FrameClass::Completed => {
                                 // Ground truth §3 (`client.rs:1998-2018`): `LastResponse` comes
                                 // from `response.completed`'s `response.id` on THIS connection —
                                 // Task 6's delta planning reads this back off `WsConn`.
+                                if let Some(baseline) = guard.pending_baseline.take() {
+                                    guard.last_input_count = Some(baseline.input_count);
+                                    guard.last_item_hashes = Some(baseline.item_hashes);
+                                    guard.last_non_input_fingerprint =
+                                        Some(baseline.non_input_fingerprint);
+                                }
                                 if let Some(id) =
                                     value.pointer("/response/id").and_then(Value::as_str)
                                 {
@@ -187,8 +191,16 @@ impl Stream for TurnStream {
                                 this.state = TurnState::Done; // guard dropped: parked, unlocked.
                                 return Poll::Ready(frame_to_sse(&text).map(Ok));
                             }
+                            FrameClass::Failed | FrameClass::Incomplete => {
+                                // Codex only commits LastResponse after response.completed.
+                                // Failed/incomplete ids are diagnostic, never valid delta anchors.
+                                guard.pending_baseline = None;
+                                this.state = TurnState::Done;
+                                return Poll::Ready(frame_to_sse(&text).map(Ok));
+                            }
                             FrameClass::AnchorMiss => {
                                 // Classified, not recovered — see module doc. `guard` drops here.
+                                guard.pending_baseline = None;
                                 this.state = TurnState::Done;
                                 return Poll::Ready(Some(Err(ExecError::Stream(format!(
                                     "{ANCHOR_MISS_MARKER}: anchor miss on this turn (recovery is \
@@ -200,6 +212,7 @@ impl Stream for TurnStream {
                                 // Same treatment as AnchorMiss above: classified here, recovered by
                                 // `ws::executor::CodexWsExecutor` (reconnect + full resend,
                                 // bounded), never by this stream itself.
+                                guard.pending_baseline = None;
                                 this.state = TurnState::Done;
                                 return Poll::Ready(Some(Err(ExecError::Stream(format!(
                                     "{CONNECTION_LIMIT_MARKER}: server's WS connection cap hit \
@@ -207,12 +220,13 @@ impl Stream for TurnStream {
                                 )))));
                             }
                             FrameClass::Error(e) => {
+                                guard.pending_baseline = None;
                                 this.state = TurnState::Done; // `guard` drops here.
                                 return Poll::Ready(Some(Err(e)));
                             }
                         }
                     }
-                    Poll::Ready((_guard, Ok(None))) => {
+                    Poll::Ready((mut guard, Ok(None))) => {
                         // Ground truth §3 (`responses_websocket.rs:800-804`): a `Close` frame (no
                         // close-code inspection) or the stream simply ending both mean "closed
                         // before any terminal frame" — the shape `watchdog.rs`'s `record_
@@ -221,12 +235,14 @@ impl Stream for TurnStream {
                         // socket is actually gone too (the peer closed it), so there is nothing
                         // left to "park"; that distinction is Task 7's reconnect concern, not
                         // this stream's.
+                        guard.pending_baseline = None;
                         this.state = TurnState::Done;
                         return Poll::Ready(Some(Err(ExecError::Stream(format!(
                             "websocket {SOCKET_CLOSED_MARKER}"
                         )))));
                     }
-                    Poll::Ready((_guard, Err(e))) => {
+                    Poll::Ready((mut guard, Err(e))) => {
+                        guard.pending_baseline = None;
                         this.state = TurnState::Done;
                         return Poll::Ready(Some(Err(e)));
                     }
@@ -277,7 +293,7 @@ async fn send_and_track(
     let sent = item_hashes(envelope);
     let full = match (
         envelope.get("previous_response_id").is_some(),
-        guard.last_item_hashes.take(),
+        guard.last_item_hashes.clone(),
     ) {
         (true, Some(mut prev)) => {
             prev.extend(sent);
@@ -285,9 +301,11 @@ async fn send_and_track(
         }
         _ => sent,
     };
-    guard.last_non_input_fingerprint = Some(non_input_fingerprint(envelope));
-    guard.last_input_count = Some(full.len() as u32);
-    guard.last_item_hashes = Some(full);
+    guard.pending_baseline = Some(PendingBaseline {
+        input_count: full.len() as u32,
+        item_hashes: full,
+        non_input_fingerprint: non_input_fingerprint(envelope),
+    });
     Ok(guard)
 }
 
@@ -306,11 +324,12 @@ async fn send_and_track(
 /// the critical section over. `ws::executor::CodexWsExecutor::drive_turn` (M5a Task 8) uses
 /// [`turn_stream_with_guard`] instead — see that function's doc.
 pub fn turn_stream(conn: SharedWsConn, envelope: Value) -> ResponseStream {
-    Box::pin(TurnStream {
+    ResponseStream::new(TurnStream {
         state: TurnState::Sending(Box::pin(async move {
             let guard = conn.lock_owned().await;
             send_and_track(guard, &envelope).await
         })),
+        turn_state: Arc::new(OnceLock::new()),
     })
 }
 
@@ -341,12 +360,35 @@ pub fn turn_stream(conn: SharedWsConn, envelope: Value) -> ResponseStream {
 pub(crate) fn turn_stream_with_guard(
     guard: OwnedMutexGuard<WsConn>,
     envelope: Value,
+    turn_state: Arc<OnceLock<String>>,
 ) -> ResponseStream {
-    Box::pin(TurnStream {
+    ResponseStream::new(TurnStream {
         state: TurnState::Sending(Box::pin(
             async move { send_and_track(guard, &envelope).await },
         )),
+        turn_state,
     })
+}
+
+fn response_turn_state(event: &Value) -> Option<String> {
+    if event.get("type").and_then(Value::as_str) != Some("response.metadata") {
+        return None;
+    }
+    event
+        .get("headers")?
+        .as_object()?
+        .iter()
+        .find_map(|(name, value)| {
+            if name.eq_ignore_ascii_case("x-codex-turn-state") {
+                match value {
+                    Value::String(value) => Some(value.clone()),
+                    Value::Number(value) => Some(value.to_string()),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
 }
 
 #[cfg(test)]
@@ -363,7 +405,27 @@ mod tests {
             base_url,
             bearer_token: "secret-bearer-abc".into(),
             chatgpt_account_id: None,
+            is_fedramp: false,
         }
+    }
+
+    #[test]
+    fn response_metadata_extracts_turn_state_case_insensitively() {
+        let event = json!({
+            "type": "response.metadata",
+            "headers": {"X-Codex-Turn-State": "turn-from-metadata"}
+        });
+        assert_eq!(
+            response_turn_state(&event).as_deref(),
+            Some("turn-from-metadata")
+        );
+        assert_eq!(
+            response_turn_state(&json!({
+                "type": "response.output_text.delta",
+                "headers": {"x-codex-turn-state": "not-metadata"}
+            })),
+            None
+        );
     }
 
     fn envelope(input: Vec<Value>, previous_response_id: Option<&str>) -> Value {
@@ -505,6 +567,74 @@ mod tests {
             shared.lock().await.last_response_id.as_deref(),
             Some("resp_1"),
             "must capture the exact id from response.completed's response.id"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_id_never_becomes_the_connections_last_response() {
+        let mock = MockWsUpstream::new(ScriptedTurn::Failed {
+            code: "context_window_exceeded".to_string(),
+            message: "too long".to_string(),
+        });
+        let base = mock.clone().spawn().await;
+        let conn = WsConn::connect(&test_account(base), &[])
+            .await
+            .expect("connect");
+        let shared = shared_conn(conn);
+
+        let mut stream = turn_stream(shared.clone(), envelope(vec![], None));
+        while stream.next().await.is_some() {}
+
+        assert!(
+            shared.lock().await.last_response_id.is_none(),
+            "Codex commits LastResponse only after response.completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_turn_discards_its_staged_input_baseline() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::Failed {
+                code: "context_window_exceeded".to_string(),
+                message: "too long".to_string(),
+            },
+        ]);
+        let base = mock.clone().spawn().await;
+        let conn = WsConn::connect(&test_account(base), &[])
+            .await
+            .expect("connect");
+        let shared = shared_conn(conn);
+
+        let mut first = turn_stream(
+            shared.clone(),
+            envelope(vec![json!({"role": "user", "content": "first"})], None),
+        );
+        while first.next().await.is_some() {}
+        assert_eq!(
+            shared.lock().await.last_item_hashes.as_ref().unwrap().len(),
+            1
+        );
+
+        let mut failed = turn_stream(
+            shared.clone(),
+            envelope(
+                vec![json!({"role": "user", "content": "second"})],
+                Some("resp_1"),
+            ),
+        );
+        while failed.next().await.is_some() {}
+
+        let guard = shared.lock().await;
+        assert_eq!(guard.last_response_id.as_deref(), Some("resp_1"));
+        assert_eq!(
+            guard.last_item_hashes.as_ref().unwrap().len(),
+            1,
+            "the failed request's appended suffix must not replace the completed baseline"
+        );
+        assert!(
+            guard.pending_baseline.is_none(),
+            "no staged baseline may survive a terminal failure"
         );
     }
 

@@ -102,7 +102,7 @@ impl Executor for RecordingExecutor {
             .push(account.id.as_str().to_string());
         let created = r#"{"type":"response.created","response":{"id":"resp_1"}}"#;
         let completed = r#"{"type":"response.completed","response":{"id":"resp_1"}}"#;
-        Ok(Box::pin(stream::iter(vec![
+        Ok(ResponseStream::new(stream::iter(vec![
             Ok::<Bytes, ExecError>(Bytes::from(format!("data: {created}\n\n"))),
             Ok(Bytes::from(format!("data: {completed}\n\n"))),
         ])))
@@ -161,6 +161,7 @@ fn build_state(
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -356,6 +357,7 @@ async fn layer2_wait_target_and_spliced_account_differ_signal_records_the_splice
         session_id: None,
         tier: None,
         inflight_penalty_pct: 0.0,
+        request_pressure_units: 1,
     };
     let wait_target = state
         .selector

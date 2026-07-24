@@ -23,6 +23,8 @@ export interface MetricCardProps {
   title: string;
   /** The big headline value, e.g. `"12.4k"` or `"98.2"`. */
   value: string;
+  /** One-line evidence or context below the headline value, e.g. error count or cache share. */
+  meta?: string;
   /** Optional small suffix rendered after `value` at a smaller size, e.g. `"s"` in `"1.9s"` or
    * `"M"` in `"4.1M"` (mockup's `.kpi-val small`). */
   unit?: string;
@@ -43,6 +45,7 @@ export function MetricCard({
   icon: Icon,
   title,
   value,
+  meta,
   unit,
   trend,
   sparkline,
@@ -52,11 +55,14 @@ export function MetricCard({
   const positive = trend ? (trend.positive ?? trend.direction === "up") : false;
 
   return (
-    <Card className={className}>
+    <Card className={clsx("min-h-[132px]", className)}>
       <div className="flex items-start justify-between">
-        <Icon className="h-6 w-6 text-fg opacity-20" strokeWidth={1.75} />
+        <span className="flex h-8 w-8 items-center justify-center rounded-lg border border-signal/20 bg-signal/[0.07] text-signal">
+          <Icon className="h-4 w-4" strokeWidth={1.75} />
+        </span>
         {trend && (
           <span
+            title="Compared with the earlier half of the selected range"
             className={clsx(
               "flex items-center gap-0.5 text-[11.5px] font-semibold",
               positive ? "text-success" : "text-error",
@@ -67,11 +73,12 @@ export function MetricCard({
           </span>
         )}
       </div>
-      <div className="mt-2 text-[11.5px] text-fg opacity-60">{title}</div>
-      <div className="text-2xl font-bold leading-tight tabular-nums text-fg">
+      <div className="mt-3 text-[9px] font-bold uppercase tracking-[0.15em] text-fg opacity-45">{title}</div>
+      <div className="mt-0.5 text-[1.75rem] font-semibold leading-tight tracking-[-0.035em] tabular-nums text-fg">
         {value}
         {unit && <span className="ml-0.5 text-xs font-semibold opacity-60">{unit}</span>}
       </div>
+      {meta && <p className="mt-1 truncate text-[9.5px] text-fg opacity-45">{meta}</p>}
       {sparkline && sparkline.length > 0 && (
         <Sparkline data={sparkline} color={sparklineColor} className="mt-auto pt-1.5" />
       )}

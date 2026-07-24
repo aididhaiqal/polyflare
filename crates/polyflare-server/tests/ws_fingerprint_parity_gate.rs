@@ -208,6 +208,7 @@ async fn capture_ws_handshake() -> Vec<RawHeader> {
         base_url: base,
         bearer_token: FAKE_BEARER.into(),
         chatgpt_account_id: Some(FAKE_ACCOUNT_ID.into()),
+        is_fedramp: false,
     };
     let forward_headers = forward_headers_with_turn_state();
 

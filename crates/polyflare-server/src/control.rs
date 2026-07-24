@@ -21,14 +21,15 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use reqwest::Method;
 
-use polyflare_core::{Account, AccountId, Provider, SelectionCtx};
+use polyflare_core::{Account, AccountId, FailureSignal, Provider, SelectionCtx, Selector};
 
 use crate::app::AppState;
 use crate::ingress::{
-    forward_headers_from_inbound, internal_error, no_eligible, resolve_core_account,
-    spawn_persist_request_log,
+    force_refresh_after_unauthorized, forward_headers_from_inbound, internal_error, no_eligible,
+    queue_persist_request_log, resolve_core_account,
 };
 use crate::observability::RequestLog;
+use crate::runtime_state::{InFlightGuard, WsSocketGuard};
 use crate::session_key::header_session_key;
 use crate::snapshot::filter_by_provider_and_pool;
 
@@ -75,6 +76,124 @@ pub(crate) async fn resolve_owner_affine_account(
     session_key: Option<&polyflare_core::SessionKey>,
     pool: Option<&str>,
 ) -> Result<(Account, AccountId), Response> {
+    resolve_owner_affine_account_with_capability(state, session_key, pool, false).await
+}
+
+/// The shared owner-affine resolver with an explicit capability floor. HTTP `/responses` builds
+/// this bit from the prepared continuity directive, pool tag, and request header. The downstream
+/// WS handshake has the same pool/header inputs and this function also folds in the session's
+/// durable sticky capability, keeping the hard selector pre-filter identical across transports.
+pub(crate) async fn resolve_owner_affine_account_with_capability(
+    state: &AppState,
+    session_key: Option<&polyflare_core::SessionKey>,
+    pool: Option<&str>,
+    require_security_work_authorized: bool,
+) -> Result<(Account, AccountId), Response> {
+    let (account, id, _reservation) = resolve_owner_affine_account_inner(
+        state,
+        session_key,
+        None,
+        pool,
+        require_security_work_authorized,
+        ReservationKind::None,
+        None,
+    )
+    .await?;
+    Ok((account, id))
+}
+
+pub(crate) async fn resolve_owner_affine_ws_account_with_capability(
+    state: &AppState,
+    session_key: Option<&polyflare_core::SessionKey>,
+    session_id: Option<&str>,
+    pool: Option<&str>,
+    require_security_work_authorized: bool,
+) -> Result<(Account, AccountId, WsSocketGuard), Response> {
+    let (account, id, reservation) = resolve_owner_affine_account_inner(
+        state,
+        session_key,
+        session_id,
+        pool,
+        require_security_work_authorized,
+        ReservationKind::OpenWs,
+        None,
+    )
+    .await?;
+    let OwnerReservation::OpenWs(guard) = reservation else {
+        unreachable!("WS account resolution always reserves socket pressure")
+    };
+    Ok((account, id, guard))
+}
+
+async fn resolve_owner_affine_unary_account(
+    state: &AppState,
+    session_key: Option<&polyflare_core::SessionKey>,
+    pool: Option<&str>,
+    model: Option<&str>,
+) -> Result<(Account, AccountId, InFlightGuard), Response> {
+    let (account, id, lease) = resolve_owner_affine_account_inner(
+        state,
+        session_key,
+        None,
+        pool,
+        false,
+        ReservationKind::InFlight,
+        model,
+    )
+    .await?;
+    let OwnerReservation::InFlight(lease) = lease else {
+        unreachable!("unary account resolution always reserves an in-flight lease")
+    };
+    Ok((account, id, lease))
+}
+
+#[derive(Clone, Copy)]
+enum ReservationKind {
+    None,
+    InFlight,
+    OpenWs,
+}
+
+enum OwnerReservation {
+    None,
+    InFlight(InFlightGuard),
+    OpenWs(WsSocketGuard),
+}
+
+async fn select_unowned_reservation(
+    state: &AppState,
+    snapshots: &mut [polyflare_core::AccountSnapshot],
+    selector: &dyn Selector,
+    sel_ctx: &SelectionCtx,
+    reservation_kind: ReservationKind,
+    now: i64,
+) -> Option<(AccountId, OwnerReservation)> {
+    match reservation_kind {
+        ReservationKind::None => selector
+            .pick(snapshots, sel_ctx)
+            .map(|id| (id, OwnerReservation::None)),
+        ReservationKind::InFlight => state
+            .runtime
+            .select_and_acquire_wait(snapshots, selector, sel_ctx, now, &state.lease_metrics)
+            .await
+            .map(|(id, guard)| (id, OwnerReservation::InFlight(guard))),
+        ReservationKind::OpenWs => state
+            .runtime
+            .select_and_acquire_open_ws_wait(snapshots, selector, sel_ctx, now)
+            .await
+            .map(|(id, guard)| (id, OwnerReservation::OpenWs(guard))),
+    }
+}
+
+async fn resolve_owner_affine_account_inner(
+    state: &AppState,
+    session_key: Option<&polyflare_core::SessionKey>,
+    session_id: Option<&str>,
+    pool: Option<&str>,
+    require_security_work_authorized: bool,
+    reservation_kind: ReservationKind,
+    model: Option<&str>,
+) -> Result<(Account, AccountId, OwnerReservation), Response> {
     let now = unix_now();
 
     let snapshots = match state.account_cache.snapshots(&state.store).await {
@@ -82,29 +201,40 @@ pub(crate) async fn resolve_owner_affine_account(
         Err(_) => return Err(internal_error()),
     };
     let mut snapshots = filter_by_provider_and_pool(&snapshots, Provider::Codex, pool);
+    if let Some(model) = model {
+        snapshots.retain(|snapshot| {
+            state
+                .model_catalog
+                .account_supports_model(snapshot.id.as_str(), model)
+                != Some(false)
+        });
+    }
     state.runtime.overlay(&mut snapshots, now);
     let selector = state.selector_for(pool);
+    // Read the soft owner and sticky capability in one row lookup. A missing/unreadable row means
+    // neither signal is available; the explicit pool/header requirement remains hard regardless.
+    let (owner, sticky_security_work): (Option<AccountId>, bool) = match session_key {
+        Some(sk) => match state.store.continuity().get_session(&sk.value).await {
+            Ok(Some(row)) => {
+                let sticky = row.has_capability(crate::config::SECURITY_WORK_CAPABILITY);
+                (row.owning_account_id.map(AccountId::from), sticky)
+            }
+            Ok(None) | Err(_) => (None, false),
+        },
+        None => (None, false),
+    };
     let sel_ctx = SelectionCtx {
         now,
+        require_security_work_authorized: require_security_work_authorized || sticky_security_work,
+        session_id: session_id.map(str::to_owned),
         // C9 Task 3: startup-resolved, never a per-request env read (mirrors the `/responses`/
         // `/v1/messages` sel_ctx sites in `crate::ingress`).
         inflight_penalty_pct: state.runtime_settings.inflight_penalty_pct(),
         ..Default::default()
     };
 
-    // Step 2: soft owner lookup — a read-only session-row fetch, no write, no watchdog arm, no
-    // recovery plan (control has none of those concepts; this is deliberately NOT
-    // `Continuity::prepare`, which would also mutate the session row's state).
-    let owner: Option<AccountId> = match session_key {
-        Some(sk) => match state.store.continuity().get_session(&sk.value).await {
-            Ok(Some(row)) => row.owning_account_id.map(AccountId::from),
-            Ok(None) | Err(_) => None,
-        },
-        None => None,
-    };
-
     // Step 2 (eligibility) + Step 3 (inviolable fallback).
-    let picked = match owner {
+    let (picked, reservation) = match owner {
         Some(owner_id) => {
             let narrowed: Vec<_> = snapshots
                 .iter()
@@ -115,24 +245,55 @@ pub(crate) async fn resolve_owner_affine_account(
                 // The owner is present in the eligible pool and the selector accepted it (the
                 // narrowed candidate list has exactly one member, so a `Some` here can only ever
                 // be that owner) — soft affinity hit.
-                Some(id) => id,
+                Some(id) => {
+                    let reservation = match reservation_kind {
+                        ReservationKind::None => OwnerReservation::None,
+                        ReservationKind::InFlight => OwnerReservation::InFlight(
+                            state
+                                .runtime
+                                .acquire_pinned_in_flight(&id, now, &state.lease_metrics)
+                                .await
+                                .ok_or_else(no_eligible)?,
+                        ),
+                        ReservationKind::OpenWs => OwnerReservation::OpenWs(
+                            state
+                                .runtime
+                                .acquire_pinned_open_ws(&id, now)
+                                .await
+                                .ok_or_else(no_eligible)?,
+                        ),
+                    };
+                    (id, reservation)
+                }
                 // Owner absent from the pool entirely, or present but currently ineligible
                 // (benched/cooled-down/inactive/wrong-provider) ⇒ NEVER stranded: fall through to
                 // the same any-eligible selection an unowned request would get.
-                None => match selector.pick(&snapshots, &sel_ctx) {
-                    Some(id) => id,
-                    None => return Err(no_eligible()),
-                },
+                None => select_unowned_reservation(
+                    state,
+                    &mut snapshots,
+                    selector.as_ref(),
+                    &sel_ctx,
+                    reservation_kind,
+                    now,
+                )
+                .await
+                .ok_or_else(no_eligible)?,
             }
         }
-        None => match selector.pick(&snapshots, &sel_ctx) {
-            Some(id) => id,
-            None => return Err(no_eligible()),
-        },
+        None => select_unowned_reservation(
+            state,
+            &mut snapshots,
+            selector.as_ref(),
+            &sel_ctx,
+            reservation_kind,
+            now,
+        )
+        .await
+        .ok_or_else(no_eligible)?,
     };
 
     let (account, _provider) = resolve_core_account(state, &picked, now).await?;
-    Ok((account, picked))
+    Ok((account, picked, reservation))
 }
 
 /// D17's control-endpoint entry point. Control requests have no body ⇒ a header-only session key
@@ -185,6 +346,156 @@ fn control_response_from(cr: polyflare_codex::ControlResponse) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+const MAX_SMALL_UNARY_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_IMAGE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_UNARY_ERROR_CLASSIFICATION_BYTES: usize = 64 * 1024;
+
+fn looks_like_error_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Extract only a short enum-like provider code, never an error message or other prose. Unary
+/// payloads can be much larger (notably images), so classification is bounded to the same 64 KiB
+/// window used by the streaming Codex executor's error classifier.
+fn unary_error_code(body: &[u8]) -> Option<String> {
+    let bounded = &body[..body.len().min(MAX_UNARY_ERROR_CLASSIFICATION_BYTES)];
+    let value: serde_json::Value = serde_json::from_slice(bounded).ok()?;
+    if let Some(error) = value.get("error") {
+        for field in ["code", "type"] {
+            if let Some(code) = error.get(field).and_then(serde_json::Value::as_str) {
+                if looks_like_error_code(code) {
+                    return Some(code.to_string());
+                }
+            }
+        }
+    }
+    value
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .filter(|detail| looks_like_error_code(detail))
+        .map(str::to_string)
+}
+
+fn unary_failure_signal(response: &polyflare_codex::ControlResponse) -> FailureSignal {
+    let retry_after = response
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.trim().parse::<i64>().ok())
+        .filter(|seconds| *seconds >= 0);
+    FailureSignal {
+        status: response.status,
+        retry_after,
+        error_code: unary_error_code(&response.body),
+    }
+}
+
+fn record_unary_success(state: &AppState, account_id: &AccountId) {
+    if let Some(transition) = state.runtime.record_success(account_id) {
+        crate::observability::emit_health_tier_signal(
+            &state.log_bus,
+            &state.health_tier_metrics,
+            account_id.as_str(),
+            transition.from,
+            transition.to,
+            transition.reason,
+        );
+    }
+}
+
+async fn finalize_unary_provider_response(
+    state: &AppState,
+    account_id: &AccountId,
+    response: polyflare_codex::ControlResponse,
+) -> Response {
+    if StatusCode::from_u16(response.status).is_ok_and(|status| status.is_success()) {
+        record_unary_success(state, account_id);
+    } else {
+        let signal = unary_failure_signal(&response);
+        crate::ingress::bench_account_for_failure(state, account_id, Some(&signal), unix_now())
+            .await;
+    }
+    control_response_from(response)
+}
+
+async fn finalize_unary_transport_failure(
+    state: &AppState,
+    account_id: &AccountId,
+    transport_error_body: &'static str,
+) -> Response {
+    crate::ingress::bench_account_for_failure(state, account_id, None, unix_now()).await;
+    (StatusCode::BAD_GATEWAY, transport_error_body).into_response()
+}
+
+/// Forward one unary Codex request and, when the selected bearer is rejected, perform exactly one
+/// synchronized reactive refresh and retry on that same account. Keeping the retry here makes the
+/// policy identical for compact, control, search, and image requests without allowing a 401 to
+/// silently move a conversation or pool-scoped request to another account.
+#[allow(clippy::too_many_arguments)] // route policy stays explicit at the forwarding boundary
+async fn forward_unary_with_reactive_auth(
+    state: &AppState,
+    account: &Account,
+    account_id: &AccountId,
+    _in_flight: InFlightGuard,
+    forward_path: &str,
+    forward_method: Method,
+    forward_headers: &[(String, String)],
+    body: Option<Bytes>,
+    max_response_body_bytes: usize,
+    transport_error_body: &'static str,
+) -> Response {
+    let rejected_access_token = account.bearer_token.clone();
+    let first = polyflare_codex::control_forward_with_limit(
+        &state.control_client,
+        account,
+        forward_path,
+        forward_method.clone(),
+        forward_headers,
+        body.clone(),
+        max_response_body_bytes,
+    )
+    .await;
+    let first = match first {
+        Ok(response) => response,
+        Err(_) => {
+            return finalize_unary_transport_failure(state, account_id, transport_error_body).await;
+        }
+    };
+    if first.status != StatusCode::UNAUTHORIZED.as_u16() {
+        return finalize_unary_provider_response(state, account_id, first).await;
+    }
+
+    match force_refresh_after_unauthorized(state, account_id, &rejected_access_token, unix_now())
+        .await
+    {
+        Ok(Some(refreshed_account)) => {
+            match polyflare_codex::control_forward_with_limit(
+                &state.control_client,
+                &refreshed_account,
+                forward_path,
+                forward_method,
+                forward_headers,
+                body,
+                max_response_body_bytes,
+            )
+            .await
+            {
+                Ok(response) => finalize_unary_provider_response(state, account_id, response).await,
+                Err(_) => {
+                    finalize_unary_transport_failure(state, account_id, transport_error_body).await
+                }
+            }
+        }
+        // A transient OAuth transport failure must not hide the actionable upstream 401.
+        Ok(None) => finalize_unary_provider_response(state, account_id, first).await,
+        Err(response) => response,
+    }
+}
+
 /// Shared control-route glue: resolve the account (Task 2's soft affinity) → forward (Task 1's
 /// unary primitive) → relay the response → persist ONE content-free `request_log` row, mirroring
 /// `crate::ingress::responses_route`'s wrapper shape exactly (grab the log repo/bus, run the
@@ -201,45 +512,54 @@ fn control_response_from(cr: polyflare_codex::ControlResponse) -> Response {
 /// failure (mapped to 502 here) both still write a content-free log row — mirroring
 /// `responses_route`, which logs every outcome (including its own early-exit 503s) via
 /// `responses_handler_impl`'s `RouteOutcome`, never only the success path.
+#[allow(clippy::too_many_arguments)] // shared endpoint adapter keeps method/path/limits visible
 async fn control_route(
     state: Arc<AppState>,
+    pool: Option<String>,
     log_label: &'static str,
     forward_path: &'static str,
     forward_method: Method,
     method_label: &'static str,
     headers: HeaderMap,
     body: Option<Bytes>,
+    max_response_body_bytes: usize,
 ) -> Response {
     let start = Instant::now();
-    // Grab the log repo/bus BEFORE `&state` is borrowed further below — cheap `Arc`/pool clones,
-    // matching `responses_route`'s "grab before the state borrow" ordering.
-    let log_repo = state.store.request_log();
+    // Grab the Store/background-writer handle and log bus before borrowing state further below.
+    let log_store = state.store.clone();
     let log_bus = state.log_bus.clone();
 
     // "Dumb executor, smart ingress": the SAME hop-by-hop drop-list `/responses` uses for its own
     // native forward-headers path (`crate::ingress::forward_headers_from_inbound`) — control
     // requests get identical treatment, not a second, independently-maintained filter.
     let forward_headers = forward_headers_from_inbound(&headers);
+    let session_key = header_session_key(&headers, pool.as_deref());
+    let session_key_value = session_key.as_ref().map(|key| key.value.clone());
 
-    let (response, account_id) = match resolve_control_account(&state, &headers).await {
+    let (response, account_id) = match resolve_owner_affine_unary_account(
+        &state,
+        session_key.as_ref(),
+        pool.as_deref(),
+        None,
+    )
+    .await
+    {
         Err(resp) => (resp, None),
-        Ok((account, account_id)) => {
-            let outcome = polyflare_codex::control_forward(
-                &state.control_client,
+        Ok((account, account_id, in_flight)) => {
+            let response = forward_unary_with_reactive_auth(
+                &state,
                 &account,
+                &account_id,
+                in_flight,
                 forward_path,
                 forward_method,
                 &forward_headers,
                 body,
+                max_response_body_bytes,
+                "control upstream forward failed",
             )
             .await;
-            let resp = match outcome {
-                Ok(cr) => control_response_from(cr),
-                Err(_e) => {
-                    (StatusCode::BAD_GATEWAY, "control upstream forward failed").into_response()
-                }
-            };
-            (resp, Some(account_id))
+            (response, Some(account_id))
         }
     };
 
@@ -250,12 +570,16 @@ async fn control_route(
     let log = RequestLog {
         method: method_label,
         path: log_label,
-        provider: Provider::Codex,
+        provider: Provider::Codex.to_string(),
         aliased: false,
         status: response.status(),
         duration_ms: start.elapsed().as_millis() as u64,
         account_id: account_id.map(|id| id.to_string()),
+        target_kind: Some("account".to_string()),
+        provider_credential_id: None,
         model: None,
+        upstream_model: None,
+        upstream_transport: Some("http".to_string()),
         reasoning_effort: None,
         service_tier: None,
         transport: Some("http".to_string()),
@@ -266,16 +590,20 @@ async fn control_route(
         // the `/responses`/`/v1/messages` set-sites); left `None` here.
         subagent: None,
         request_id: Some(request_id.clone()),
+        session_key: session_key_value,
     };
     log.emit();
     log_bus.publish(log.to_log_event());
     // C11b Task 2: the content-free `upstream_requests` counter, keyed by the SAME
     // `(account_id, status)` pair the log/log-bus/persisted row already carry — bumped exactly
     // once per client control request, mirroring `responses_route`/`messages_route`'s own bump.
-    state
-        .upstream_request_metrics
-        .record(log.account_id.as_deref(), log.status.as_u16());
-    spawn_persist_request_log(log_repo, log.record(unix_now()));
+    state.upstream_request_metrics.record_target(
+        &log.provider,
+        "account",
+        log.account_id.as_deref(),
+        log.status.as_u16(),
+    );
+    queue_persist_request_log(&log_store, log.record(unix_now()));
 
     response
 }
@@ -289,12 +617,14 @@ pub async fn thread_goal_set_handler(
 ) -> Response {
     control_route(
         state,
+        None,
         "codex_control_thread/goal/set",
         "thread/goal/set",
         Method::POST,
         "POST",
         headers,
         Some(body),
+        MAX_SMALL_UNARY_RESPONSE_BYTES,
     )
     .await
 }
@@ -307,12 +637,14 @@ pub async fn thread_goal_clear_handler(
 ) -> Response {
     control_route(
         state,
+        None,
         "codex_control_thread/goal/clear",
         "thread/goal/clear",
         Method::POST,
         "POST",
         headers,
         Some(body),
+        MAX_SMALL_UNARY_RESPONSE_BYTES,
     )
     .await
 }
@@ -324,12 +656,14 @@ pub async fn thread_goal_get_handler(
 ) -> Response {
     control_route(
         state,
+        None,
         "codex_control_thread/goal/get",
         "thread/goal/get",
         Method::GET,
         "GET",
         headers,
         None,
+        MAX_SMALL_UNARY_RESPONSE_BYTES,
     )
     .await
 }
@@ -338,12 +672,14 @@ pub async fn thread_goal_get_handler(
 pub async fn jwks_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     control_route(
         state,
+        None,
         "codex_control_agent-identities/jwks",
         "agent-identities/jwks",
         Method::GET,
         "GET",
         headers,
         None,
+        MAX_SMALL_UNARY_RESPONSE_BYTES,
     )
     .await
 }
@@ -353,12 +689,14 @@ pub async fn jwks_handler(State(state): State<Arc<AppState>>, headers: HeaderMap
 pub async fn wham_jwks_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     control_route(
         state,
+        None,
         "codex_control_wham/agent-identities/jwks",
         "wham/agent-identities/jwks",
         Method::GET,
         "GET",
         headers,
         None,
+        MAX_SMALL_UNARY_RESPONSE_BYTES,
     )
     .await
 }
@@ -371,12 +709,166 @@ pub async fn trace_summarize_handler(
 ) -> Response {
     control_route(
         state,
+        None,
         "codex_control_memories/trace_summarize",
         "memories/trace_summarize",
         Method::POST,
         "POST",
         headers,
         Some(body),
+        MAX_SMALL_UNARY_RESPONSE_BYTES,
+    )
+    .await
+}
+
+/// `POST /{pool}/memories/trace_summarize` — the path Codex derives when its provider base URL
+/// names a PolyFlare pool. The pool is a hard routing and session-identity boundary.
+pub async fn pooled_trace_summarize_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pool): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    control_route(
+        state,
+        Some(pool),
+        "codex_control_memories/trace_summarize",
+        "memories/trace_summarize",
+        Method::POST,
+        "POST",
+        headers,
+        Some(body),
+        MAX_SMALL_UNARY_RESPONSE_BYTES,
+    )
+    .await
+}
+
+async fn auxiliary_post(
+    state: Arc<AppState>,
+    pool: Option<String>,
+    log_label: &'static str,
+    forward_path: &'static str,
+    headers: HeaderMap,
+    body: Bytes,
+    max_response_body_bytes: usize,
+) -> Response {
+    control_route(
+        state,
+        pool,
+        log_label,
+        forward_path,
+        Method::POST,
+        "POST",
+        headers,
+        Some(body),
+        max_response_body_bytes,
+    )
+    .await
+}
+
+pub async fn image_generations_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    auxiliary_post(
+        state,
+        None,
+        "codex_images_generations",
+        "images/generations",
+        headers,
+        body,
+        MAX_IMAGE_RESPONSE_BYTES,
+    )
+    .await
+}
+
+pub async fn pooled_image_generations_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pool): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    auxiliary_post(
+        state,
+        Some(pool),
+        "codex_images_generations",
+        "images/generations",
+        headers,
+        body,
+        MAX_IMAGE_RESPONSE_BYTES,
+    )
+    .await
+}
+
+pub async fn image_edits_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    auxiliary_post(
+        state,
+        None,
+        "codex_images_edits",
+        "images/edits",
+        headers,
+        body,
+        MAX_IMAGE_RESPONSE_BYTES,
+    )
+    .await
+}
+
+pub async fn pooled_image_edits_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pool): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    auxiliary_post(
+        state,
+        Some(pool),
+        "codex_images_edits",
+        "images/edits",
+        headers,
+        body,
+        MAX_IMAGE_RESPONSE_BYTES,
+    )
+    .await
+}
+
+/// Standalone search is currently an under-development, default-off Codex feature. The wire
+/// endpoint is nevertheless routed faithfully when a client explicitly enables it.
+pub async fn alpha_search_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    auxiliary_post(
+        state,
+        None,
+        "codex_alpha_search",
+        "alpha/search",
+        headers,
+        body,
+        MAX_SMALL_UNARY_RESPONSE_BYTES,
+    )
+    .await
+}
+
+pub async fn pooled_alpha_search_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pool): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    auxiliary_post(
+        state,
+        Some(pool),
+        "codex_alpha_search",
+        "alpha/search",
+        headers,
+        body,
+        MAX_SMALL_UNARY_RESPONSE_BYTES,
     )
     .await
 }
@@ -404,12 +896,12 @@ async fn compact_route(
     body: Bytes,
 ) -> Response {
     let start = Instant::now();
-    let log_repo = state.store.request_log();
+    let log_store = state.store.clone();
     let log_bus = state.log_bus.clone();
 
     // Shallow parse: derive the session key (for soft owner affinity) + the content-free model.
     // None ⇒ malformed body ⇒ 400 (mirrors `/responses`'s malformed-body behavior); still log it.
-    let facts = crate::session_key::parse_inbound(&headers, &body);
+    let facts = crate::session_key::parse_inbound_scoped(&headers, &body, pool.as_deref());
     let (session_key, model, subagent) = match &facts {
         Some(f) => (
             f.ctx.session_key.clone(),
@@ -418,6 +910,7 @@ async fn compact_route(
         ),
         None => (None, None, None),
     };
+    let session_key_value = session_key.as_ref().map(|key| key.value.clone());
 
     let forward_headers = forward_headers_from_inbound(&headers);
 
@@ -428,25 +921,30 @@ async fn compact_route(
             None,
         )
     } else {
-        match resolve_owner_affine_account(&state, session_key.as_ref(), pool.as_deref()).await {
+        match resolve_owner_affine_unary_account(
+            &state,
+            session_key.as_ref(),
+            pool.as_deref(),
+            model.as_deref(),
+        )
+        .await
+        {
             Err(resp) => (resp, None),
-            Ok((account, account_id)) => {
-                let outcome = polyflare_codex::control_forward(
-                    &state.control_client,
+            Ok((account, account_id, in_flight)) => {
+                let response = forward_unary_with_reactive_auth(
+                    &state,
                     &account,
+                    &account_id,
+                    in_flight,
                     "responses/compact",
                     Method::POST,
                     &forward_headers,
                     Some(body),
+                    MAX_SMALL_UNARY_RESPONSE_BYTES,
+                    "compact upstream forward failed",
                 )
                 .await;
-                let resp = match outcome {
-                    Ok(cr) => control_response_from(cr),
-                    Err(_e) => {
-                        (StatusCode::BAD_GATEWAY, "compact upstream forward failed").into_response()
-                    }
-                };
-                (resp, Some(account_id))
+                (response, Some(account_id))
             }
         }
     };
@@ -458,12 +956,16 @@ async fn compact_route(
     let log = RequestLog {
         method: "POST",
         path: "responses_compact",
-        provider: Provider::Codex,
+        provider: Provider::Codex.to_string(),
         aliased: false,
         status: response.status(),
         duration_ms: start.elapsed().as_millis() as u64,
         account_id: account_id.map(|id| id.to_string()),
+        target_kind: Some("account".to_string()),
+        provider_credential_id: None,
         model,
+        upstream_model: None,
+        upstream_transport: Some("http".to_string()),
         reasoning_effort: None,
         service_tier: None,
         transport: Some("http".to_string()),
@@ -475,13 +977,17 @@ async fn compact_route(
         // the bodyless `control_route` set-site which genuinely has no facts to derive it from.
         subagent,
         request_id: Some(request_id.clone()),
+        session_key: session_key_value,
     };
     log.emit();
     log_bus.publish(log.to_log_event());
-    state
-        .upstream_request_metrics
-        .record(log.account_id.as_deref(), log.status.as_u16());
-    spawn_persist_request_log(log_repo, log.record(unix_now()));
+    state.upstream_request_metrics.record_target(
+        &log.provider,
+        "account",
+        log.account_id.as_deref(),
+        log.status.as_u16(),
+    );
+    queue_persist_request_log(&log_store, log.record(unix_now()));
 
     response
 }
@@ -650,6 +1156,7 @@ mod tests {
                 live_logs: false,
             })),
             ws_downstream: false,
+            ws_relay_idle: crate::ws_relay::WsRelayIdlePolicy::default(),
             log_bus: crate::log_bus::LogBus::new(1000),
             failover_metrics: crate::observability::FailoverMetrics::new(),
             health_tier_metrics: crate::observability::HealthTierMetrics::new(),

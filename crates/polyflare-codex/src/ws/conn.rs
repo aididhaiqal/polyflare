@@ -66,6 +66,48 @@ const OPENAI_BETA_WS: &str = "responses_websockets=2026-02-06";
 ///
 /// `pub(crate)`: read by `ws::executor` for (3).
 pub(crate) const TURN_STATE_HEADER: &str = "x-codex-turn-state";
+const UPGRADE_RESPONSE_HEADERS: [&str; 4] = [
+    TURN_STATE_HEADER,
+    "x-models-etag",
+    "x-reasoning-included",
+    "openai-model",
+];
+
+/// The part of an upstream WebSocket upgrade response that remains observable to Codex for the
+/// lifetime of its downstream socket. A transparent PolyFlare redial is safe only when this
+/// contract is unchanged; `x-codex-turn-state` is deliberately excluded because it is per-turn
+/// routing state learned from response metadata, not a stable connection capability.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WsRelayContract {
+    models_etag: Option<String>,
+    reasoning_included: bool,
+    model: Option<String>,
+}
+
+impl WsRelayContract {
+    fn from_upgrade_headers(headers: &tokio_tungstenite::tungstenite::http::HeaderMap) -> Self {
+        let value = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        Self {
+            models_etag: value("x-models-etag"),
+            // Codex consumes this as a presence capability (`contains_key`), not as a parsed
+            // boolean header value.
+            reasoning_included: headers.contains_key("x-reasoning-included"),
+            model: value("openai-model"),
+        }
+    }
+
+    /// Replace the catalog identity with the value visible to the downstream client. PolyFlare
+    /// pooled routes use a virtual pool ETag rather than one member account's upstream ETag.
+    pub fn with_models_etag(mut self, models_etag: Option<String>) -> Self {
+        self.models_etag = models_etag;
+        self
+    }
+}
 
 /// Bounded dial/handshake budget — a hung TCP/TLS/WS-upgrade must not stall a turn until the OS TCP
 /// timeout. Mirrors CLIProxyAPI's 30s codex WS dial bound. Overridable per-call via
@@ -112,6 +154,20 @@ pub(crate) const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
 /// rather than a bare literal that could silently drift).
 pub(crate) const WS_READ_IDLE_MARKER: &str = "websocket read idle timeout";
 
+/// True when `err` is the read-idle poison raised by [`WsConn::recv_frame_with_timeout`]'s
+/// deadline (marker [`WS_READ_IDLE_MARKER`]) rather than a genuine transport failure. The relay
+/// pump uses this between turns to tell "the idle budget elapsed — we deliberately let the socket
+/// go" apart from "the peer dropped us" when choosing its honest-close telemetry label.
+pub fn is_read_idle_error(err: &ExecError) -> bool {
+    matches!(err, ExecError::Stream(msg) if msg.contains(WS_READ_IDLE_MARKER))
+}
+
+pub(crate) struct PendingBaseline {
+    pub(crate) input_count: u32,
+    pub(crate) item_hashes: Vec<super::delta::ItemHash>,
+    pub(crate) non_input_fingerprint: String,
+}
+
 /// An established WS connection to a codex backend account, plus the incremental-continuation
 /// state later tasks read/write: `last_response_id` (Task 5, from the most recent
 /// `response.completed` on THIS socket), `last_item_hashes` / `last_non_input_fingerprint` /
@@ -144,6 +200,10 @@ pub struct WsConn {
     /// this. Never raw conversation content. Must be set at the same time and by the same sender
     /// as `last_item_hashes` (see that field's doc for the failure mode if it's forgotten).
     pub last_non_input_fingerprint: Option<String>,
+    /// Baseline staged by a successful send and promoted only by `response.completed`. A failed,
+    /// incomplete, wrapped-error, or pre-terminal-close turn clears it without changing the last
+    /// committed baseline.
+    pub(crate) pending_baseline: Option<PendingBaseline>,
     /// The server-issued `x-codex-turn-state` sticky-routing token captured from THIS socket's WS
     /// UPGRADE-response header at dial (in [`connect_detailed_with_timeout`], this construction
     /// site), or `None` if the header was absent (never fabricated). **A ONE-SHOT belonging to the
@@ -162,6 +222,12 @@ pub struct WsConn {
     /// Content-free routing token (server-issued, not conversation content) — safe to store/replay,
     /// but its VALUE is NEVER logged. `pub(crate)`: consumed by `ws::executor`.
     pub(crate) upgrade_turn_state: Option<String>,
+    /// Codex-consumed metadata from the successful upstream `101`, restricted to the exact
+    /// allowlist the client reads. The downstream relay exposes these on its own `101`.
+    upgrade_response_headers: Vec<(String, String)>,
+    /// Stable, client-visible portion of the successful upstream `101`. Internal upstream
+    /// reconnects must match it because the downstream `101` cannot be updated in place.
+    relay_contract: WsRelayContract,
     /// Set once this socket is known dead: a `Close` frame / clean stream end observed by
     /// `recv_frame`, or a send/recv error. Ground truth §2: real codex reuse is "gated only on
     /// liveness (`conn.is_closed()`)" — Task 7's connection cache reads this via [`Self::is_closed`]
@@ -182,6 +248,16 @@ impl WsConn {
     /// Task 7's connection cache (`ws::executor`), not exposed outside this crate.
     pub(crate) fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// Allowlisted metadata from the successful upstream upgrade response.
+    pub fn upgrade_response_headers(&self) -> &[(String, String)] {
+        &self.upgrade_response_headers
+    }
+
+    /// Stable upgrade contract used to decide whether an internal redial can remain transparent.
+    pub fn relay_contract(&self) -> &WsRelayContract {
+        &self.relay_contract
     }
 
     /// Dial `{account.base_url}/responses` (scheme swapped `http`→`ws` / `https`→`wss`, ground
@@ -222,20 +298,29 @@ impl WsConn {
 /// deflate`, `OpenAI-Beta`, the `Authorization`/`chatgpt-account-id` override, and the ground-truth
 /// §7.1 `x-codex-turn-state` strip — lives in [`connect_detailed`] and is REUSED verbatim, never
 /// reimplemented in the relay. Collapses [`ConnectOutcome`] exactly as [`WsConn::connect`] does:
-/// `Connected → Ok(*conn)`, `UpgradeRequired`/`Failed → Err(ExecError)` (a `426` surfaces as
-/// `ExecError::Upstream`). `forward_headers` are the DOWNSTREAM handshake headers the relay already
-/// filtered through `ingress::forward_headers_from_inbound`; this fn forwards them through the same
-/// insert-not-append rules the HTTP executor uses (see [`connect_detailed`]). No frame is sent here
-/// and nothing is logged (the relay's content-free discipline).
+/// `Connected → Ok(*conn)`, `Failed → Err(ExecError)`, and `UpgradeRequired → UpstreamHttp(426)` so
+/// a downstream relay can preserve Codex's sole WS-to-HTTP fallback signal. `forward_headers` are
+/// the DOWNSTREAM handshake headers the relay already filtered through
+/// `ingress::forward_headers_from_inbound`; this fn forwards them through the same insert-not-append
+/// rules the HTTP executor uses (see [`connect_detailed`]). No frame is sent here and nothing is
+/// logged (the relay's content-free discipline).
 pub async fn dial_upstream(
     account: &Account,
     forward_headers: &[(String, String)],
 ) -> Result<WsConn, ExecError> {
     match connect_detailed(account, forward_headers).await {
         ConnectOutcome::Connected(conn) => Ok(*conn),
-        ConnectOutcome::UpgradeRequired => Err(ExecError::Upstream(
-            "WS handshake rejected: HTTP 426 Upgrade Required".to_string(),
-        )),
+        ConnectOutcome::UpgradeRequired => {
+            Err(ExecError::UpstreamHttp(polyflare_core::UpstreamHttpError {
+                signal: polyflare_core::FailureSignal {
+                    status: 426,
+                    retry_after: None,
+                    error_code: None,
+                },
+                headers: Vec::new(),
+                body: bytes::Bytes::new(),
+            }))
+        }
         ConnectOutcome::Failed(e) => Err(e),
     }
 }
@@ -286,9 +371,17 @@ fn build_handshake_request(
     let bearer = HeaderValue::from_str(&format!("Bearer {}", account.bearer_token))
         .map_err(|e| ExecError::Upstream(e.to_string()))?;
     headers.insert(HeaderName::from_static("authorization"), bearer);
+    headers.remove(HeaderName::from_static("x-openai-fedramp"));
+    if account.is_fedramp {
+        headers.insert(
+            HeaderName::from_static("x-openai-fedramp"),
+            HeaderValue::from_static("true"),
+        );
+    }
     // Pair the SELECTED account's ChatGPT id with its Bearer — same reasoning as
     // `executor.rs:109-119`: `insert` (replace), never leave a forwarded value for a
     // DIFFERENT account sitting next to our overridden Bearer.
+    headers.remove(HeaderName::from_static("chatgpt-account-id"));
     if let Some(account_id) = &account.chatgpt_account_id {
         headers.insert(
             HeaderName::from_static("chatgpt-account-id"),
@@ -368,6 +461,17 @@ pub(crate) async fn connect_detailed_with_timeout(
                     .get(TURN_STATE_HEADER)
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_string);
+                let upgrade_response_headers = UPGRADE_RESPONSE_HEADERS
+                    .iter()
+                    .filter_map(|name| {
+                        response
+                            .headers()
+                            .get(*name)
+                            .and_then(|value| value.to_str().ok())
+                            .map(|value| ((*name).to_string(), value.to_string()))
+                    })
+                    .collect();
+                let relay_contract = WsRelayContract::from_upgrade_headers(response.headers());
                 ConnectOutcome::Connected(Box::new(WsConn {
                     socket,
                     closed: false,
@@ -375,7 +479,10 @@ pub(crate) async fn connect_detailed_with_timeout(
                     last_input_count: None,
                     last_item_hashes: None,
                     last_non_input_fingerprint: None,
+                    pending_baseline: None,
                     upgrade_turn_state,
+                    upgrade_response_headers,
+                    relay_contract,
                     // `None` = codex-rs default: no client-initiated ping. `ws::executor` overrides
                     // this to `Some(WS_PING_INTERVAL)` right after connect ONLY when
                     // `POLYFLARE_WS_CLIENT_PING` is on.
@@ -391,6 +498,49 @@ pub(crate) async fn connect_detailed_with_timeout(
                     == tokio_tungstenite::tungstenite::http::StatusCode::UPGRADE_REQUIRED =>
             {
                 ConnectOutcome::UpgradeRequired
+            }
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                let status = response.status().as_u16();
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<i64>().ok())
+                    .filter(|value| *value >= 0);
+                let headers = response
+                    .headers()
+                    .iter()
+                    .filter(|(name, _)| {
+                        !matches!(
+                            name.as_str(),
+                            "connection"
+                                | "content-length"
+                                | "content-encoding"
+                                | "transfer-encoding"
+                                | "set-cookie"
+                        )
+                    })
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_string(), value.to_string()))
+                    })
+                    .collect();
+                let body = response
+                    .body()
+                    .as_ref()
+                    .map(|body| bytes::Bytes::copy_from_slice(body))
+                    .unwrap_or_default();
+                ConnectOutcome::Failed(ExecError::UpstreamHttp(polyflare_core::UpstreamHttpError {
+                    signal: polyflare_core::FailureSignal {
+                        status,
+                        retry_after,
+                        error_code: None,
+                    },
+                    headers,
+                    body,
+                }))
             }
             Err(e) => ConnectOutcome::Failed(ExecError::Upstream(e.to_string())),
         },
@@ -434,21 +584,46 @@ impl WsConn {
         message: Message,
         timeout: Duration,
     ) -> Result<(), ExecError> {
-        match tokio::time::timeout(timeout, self.socket.send(message)).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.send_message_until(message, deadline, timeout).await
+    }
+
+    /// Send without ever polling the socket after `deadline`. A biased select checks the absolute
+    /// deadline first, unlike `tokio::time::timeout`, whose wrapped future may be polled once before
+    /// its timer. `timeout_label` is the caller-facing budget included in the content-free error.
+    async fn send_message_until(
+        &mut self,
+        message: Message,
+        deadline: tokio::time::Instant,
+        timeout_label: Duration,
+    ) -> Result<(), ExecError> {
+        // `sleep_until(now)` is not guaranteed to be timer-ready until it has been polled once.
+        // Reject an already-spent budget synchronously so an immediately writable socket cannot
+        // win that first poll. If the task is descheduled after this check, the biased select below
+        // polls the now-expired sleep before the send.
+        if tokio::time::Instant::now() >= deadline {
+            self.closed = true;
+            return Err(ExecError::Upstream(format!(
+                "upstream WS send timed out after {timeout_label:?}"
+            )));
+        }
+        let result = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => None,
+            result = self.socket.send(message) => Some(result),
+        };
+        match result {
+            Some(Ok(())) => Ok(()),
+            Some(Err(e)) => {
                 // A send failure means this socket can no longer be trusted for reuse — see
                 // `closed`'s doc. Task 7's cache checks this before ever attempting reuse.
                 self.closed = true;
                 Err(ExecError::Upstream(e.to_string()))
             }
-            // A hung write (backpressured or half-open peer) elapsed the budget: poison the socket
-            // like any other send failure so it is evicted on reuse, and surface the bounded timeout
-            // rather than stalling the turn until the OS TCP timeout.
-            Err(_elapsed) => {
+            None => {
                 self.closed = true;
                 Err(ExecError::Upstream(format!(
-                    "upstream WS send timed out after {timeout:?}"
+                    "upstream WS send timed out after {timeout_label:?}"
                 )))
             }
         }
@@ -506,6 +681,26 @@ impl WsConn {
         self.recv_frame().await
     }
 
+    /// **PUBLIC WS-downstream relay BETWEEN-TURNS recv:** wait for the next upstream frame with the
+    /// caller's own `idle_budget` and optional keepalive-`Ping` cadence instead of the mid-turn
+    /// stall deadline [`WS_READ_IDLE_TIMEOUT`].
+    ///
+    /// Between turns, upstream silence is HEALTHY — the socket is parked waiting for the client's
+    /// next `response.create`, and the 290s deadline (a mid-turn "the model stopped streaming"
+    /// stall bound) is the wrong tool: applying it there poisons a perfectly good idle socket,
+    /// which kills the connection-scoped `store:false` anchor with it and forces the next anchored
+    /// delta into a `previous_response_not_found` round-trip (the 2026-07-24 recurring
+    /// "Reconnecting n/5" incident: every failing turn had sat idle > 290s). `idle_budget` elapsing
+    /// still poisons the socket — distinguishable via [`is_read_idle_error`] so the relay can close
+    /// BOTH legs honestly instead of leaving the client believing its anchor survived.
+    pub async fn recv_text_idle(
+        &mut self,
+        idle_budget: Duration,
+        ping: Option<Duration>,
+    ) -> Result<Option<String>, ExecError> {
+        self.recv_frame_with_timeout(idle_budget, ping).await
+    }
+
     /// [`recv_frame`] with BOTH budgets injected, so a test can pass SHORT durations and prove the
     /// no-ping / keepalive-ping / poison behavior without sleeping the production 290s / 20s.
     /// Production calls delegate here via [`recv_frame`] with [`WS_READ_IDLE_TIMEOUT`] and
@@ -560,10 +755,24 @@ impl WsConn {
                 // payload is EMPTY — never content.
                 Err(_elapsed) => {
                     if ping.is_some() {
-                        if let Err(e) = self.socket.send(Message::Ping(Vec::new().into())).await {
+                        // `timeout(wait, ...)` may return at the absolute idle deadline. Never start
+                        // one final write after the read budget is spent, and cap the write itself
+                        // to both the normal WS send bound and whatever remains of this idle budget.
+                        let now = tokio::time::Instant::now();
+                        if now >= deadline {
                             self.closed = true;
-                            return Err(ExecError::Stream(e.to_string()));
+                            return Err(ExecError::Stream(format!(
+                                "{WS_READ_IDLE_MARKER}: no frame within idle timeout"
+                            )));
                         }
+                        let send_deadline = deadline.min(now + WS_SEND_TIMEOUT);
+                        let send_budget = send_deadline.saturating_duration_since(now);
+                        self.send_message_until(
+                            Message::Ping(Vec::new().into()),
+                            send_deadline,
+                            send_budget,
+                        )
+                        .await?;
                     }
                     continue;
                 }
@@ -643,6 +852,7 @@ mod tests {
             base_url,
             bearer_token: "secret-bearer-abc".into(),
             chatgpt_account_id: Some("chatgpt-acct-xyz".into()),
+            is_fedramp: false,
         }
     }
 
@@ -664,6 +874,51 @@ mod tests {
         assert!(ws_url_for("ftp://example.test").is_err());
     }
 
+    #[test]
+    fn relay_contract_compares_every_stable_upgrade_property_but_not_turn_state() {
+        fn headers(
+            turn_state: &str,
+            models_etag: &str,
+            reasoning_included: &str,
+            model: &str,
+        ) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            for (name, value) in [
+                ("x-codex-turn-state", turn_state),
+                ("x-models-etag", models_etag),
+                ("x-reasoning-included", reasoning_included),
+                ("openai-model", model),
+            ] {
+                headers.insert(
+                    HeaderName::from_static(name),
+                    HeaderValue::from_str(value).unwrap(),
+                );
+            }
+            headers
+        }
+
+        let baseline =
+            WsRelayContract::from_upgrade_headers(&headers("turn-1", "etag-1", "true", "model-a"));
+        assert_eq!(
+            baseline,
+            WsRelayContract::from_upgrade_headers(&headers("turn-2", "etag-1", "false", "model-a")),
+            "turn-state and reasoning header text changes must not force a downstream reconnect"
+        );
+        let mut reasoning_absent = headers("turn-1", "etag-1", "true", "model-a");
+        reasoning_absent.remove("x-reasoning-included");
+        for replacement in [
+            headers("turn-1", "etag-2", "true", "model-a"),
+            headers("turn-1", "etag-1", "true", "model-b"),
+            reasoning_absent,
+        ] {
+            assert_ne!(
+                baseline,
+                WsRelayContract::from_upgrade_headers(&replacement),
+                "each stable upgrade property must independently block transparent redial"
+            );
+        }
+    }
+
     /// A TCP listener bound but NEVER `accept`ing: the kernel completes the TCP handshake into the
     /// backlog, so a client `connect` succeeds at the socket level, but the WS/HTTP-upgrade response
     /// never comes — a "black hole" that hangs the handshake read. Returns the base URL and the
@@ -674,6 +929,46 @@ mod tests {
             .expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         (format!("http://{addr}"), listener)
+    }
+
+    async fn spawn_http_reject(status: u16, retry_after: u64, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let reason = if status == 401 {
+                "Unauthorized"
+            } else {
+                "Error"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                 Retry-After: {retry_after}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.expect("write");
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn non_426_handshake_http_status_remains_structured_and_actionable() {
+        let base = spawn_http_reject(401, 7, "denied").await;
+        let outcome = connect_detailed(&test_account(base), &[]).await;
+        match outcome {
+            ConnectOutcome::Failed(ExecError::UpstreamHttp(response)) => {
+                assert_eq!(response.signal.status, 401);
+                assert_eq!(response.signal.retry_after, Some(7));
+                assert_eq!(response.body.as_ref(), b"denied");
+            }
+            _ => panic!("expected a structured HTTP handshake failure"),
+        }
     }
 
     /// A WS server that completes the handshake then goes permanently silent — never sends a frame,
@@ -896,6 +1191,71 @@ mod tests {
         );
     }
 
+    /// A ping interval that lands exactly on the absolute idle deadline must not cause one final
+    /// keepalive write after the read budget has already expired. The deadline owns the decision:
+    /// the connection is poisoned and no ping reaches the peer.
+    #[tokio::test]
+    async fn recv_frame_does_not_ping_at_the_absolute_deadline() {
+        let unused_frame =
+            r#"{"type":"response.completed","response":{"id":"resp_never"}}"#.to_string();
+        let (base, ping_count) = spawn_ping_observing_then_frame_server(unused_frame).await;
+        let account = test_account(base);
+        let mut conn = WsConn::connect(&account, &[]).await.expect("connect");
+
+        let result = conn
+            .recv_frame_with_timeout(Duration::from_millis(80), Some(Duration::from_millis(80)))
+            .await;
+        // Give the server task a scheduling turn so a mistakenly emitted ping cannot race the
+        // assertion below.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert_eq!(
+            ping_count.load(Ordering::SeqCst),
+            0,
+            "the absolute idle deadline must win before any keepalive send begins"
+        );
+        assert!(
+            matches!(result, Err(ExecError::Stream(ref msg)) if msg.contains(WS_READ_IDLE_MARKER)),
+            "deadline expiry must remain the marked read-idle error, got {result:?}"
+        );
+        assert!(conn.is_closed(), "deadline expiry must poison the socket");
+    }
+
+    /// The absolute send helper must choose an already-ready deadline before it polls an equally
+    /// ready socket write. This guards the parked-read path against scheduler delay between
+    /// calculating its remaining idle budget and beginning a keepalive send.
+    #[tokio::test]
+    async fn send_message_until_expired_deadline_never_emits_ping() {
+        let unused_frame =
+            r#"{"type":"response.completed","response":{"id":"resp_never"}}"#.to_string();
+        let (base, ping_count) = spawn_ping_observing_then_frame_server(unused_frame).await;
+        let account = test_account(base);
+        let mut conn = WsConn::connect(&account, &[]).await.expect("connect");
+
+        let result = conn
+            .send_message_until(
+                Message::Ping(Vec::new().into()),
+                tokio::time::Instant::now(),
+                Duration::ZERO,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            matches!(result, Err(ExecError::Upstream(ref msg)) if msg.contains("send timed out")),
+            "expired absolute send deadline must surface a bounded timeout, got {result:?}"
+        );
+        assert_eq!(
+            ping_count.load(Ordering::SeqCst),
+            0,
+            "an expired absolute deadline must win before the socket send is polled"
+        );
+        assert!(
+            conn.is_closed(),
+            "send deadline expiry must poison the socket"
+        );
+    }
+
     /// The codex-rs-faithful DEFAULT (`POLYFLARE_WS_CLIENT_PING` off ⇒ `ping = None`): during a
     /// silent read the client must NEVER initiate a `Ping` — matching real codex-rs, which never
     /// pings (ground truth §7; verified in `codex-api` + `websocket-client`). It still bounds the
@@ -1063,6 +1423,7 @@ mod tests {
                 "x-codex-turn-state".to_string(),
                 "should-be-stripped".to_string(),
             ),
+            ("x-openai-fedramp".to_string(), "true".to_string()),
         ];
 
         let _conn = WsConn::connect(&account, &forward_headers)
@@ -1100,6 +1461,10 @@ mod tests {
 
         // Dumb-relay: other forwarded headers pass through untouched.
         assert_eq!(headers.get("x-client-request-id").unwrap(), "thread-123");
+        assert!(
+            headers.get("x-openai-fedramp").is_none(),
+            "a non-FedRAMP selected account must remove the client's stale routing header"
+        );
 
         // Fingerprint parity restored (M5a fork adoption): real codex offers permessage-deflate
         // (ground truth §1), and this crate now matches, because it can actually decode it —
@@ -1122,6 +1487,49 @@ mod tests {
             headers.get("sec-websocket-protocol").is_none(),
             "must never set a subprotocol"
         );
+    }
+
+    #[tokio::test]
+    async fn handshake_sets_fedramp_from_the_selected_account() {
+        let (base_url, captured) = spawn_header_capture_server().await;
+        let mut account = test_account(base_url);
+        account.is_fedramp = true;
+
+        let _conn = WsConn::connect(
+            &account,
+            &[("x-openai-fedramp".to_string(), "false".to_string())],
+        )
+        .await
+        .expect("connect");
+
+        let headers = captured.lock().unwrap().clone().expect("headers captured");
+        assert_eq!(headers.get("x-openai-fedramp").unwrap(), "true");
+        assert_eq!(headers.get_all("x-openai-fedramp").iter().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn handshake_removes_forwarded_account_id_when_selected_account_has_none() {
+        let (base_url, captured) = spawn_header_capture_server().await;
+        let mut account = test_account(base_url);
+        account.chatgpt_account_id = None;
+
+        let _conn = WsConn::connect(
+            &account,
+            &[(
+                "chatgpt-account-id".to_string(),
+                "client-stale-workspace".to_string(),
+            )],
+        )
+        .await
+        .expect("connect");
+
+        assert!(captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("headers captured")
+            .get("chatgpt-account-id")
+            .is_none());
     }
 
     /// A WS server that completes the handshake, optionally injecting an `x-codex-turn-state`

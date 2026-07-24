@@ -14,7 +14,7 @@ use polyflare_codex::CodexExecutor;
 use polyflare_core::{CapacityWeighted, Continuity};
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::continuity::CodexContinuity;
-use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
+use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields, SettingValue};
 use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
 use polyflare_testkit::{MockOAuth, MockUpstream};
 use std::time::Duration;
@@ -139,6 +139,7 @@ async fn spawn_with_access_token(
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -172,6 +173,97 @@ async fn spawn_failing_upstream() -> String {
         axum::serve(listener, app).await.unwrap();
     });
     format!("http://{addr}")
+}
+
+async fn spawn_reactive_401_upstream() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
+
+    async fn respond(
+        axum::extract::State(seen): axum::extract::State<Arc<std::sync::Mutex<Vec<String>>>>,
+        headers: HeaderMap,
+    ) -> axum::response::Response {
+        let authorization = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        seen.lock().unwrap().push(authorization.clone());
+        if authorization == "Bearer new-access" {
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_auth\"}}\n\n",
+            )
+                .into_response()
+        } else {
+            (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({
+                    "error": {"code": "invalid_token", "message": "stale server-side token"}
+                })),
+            )
+                .into_response()
+        }
+    }
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let app = axum::Router::new()
+        .route("/responses", axum::routing::post(respond))
+        .with_state(seen.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), seen)
+}
+
+#[tokio::test]
+async fn upstream_401_forces_one_refresh_even_when_jwt_expiry_is_far_away() {
+    let (upstream_url, seen_authorizations) = spawn_reactive_401_upstream().await;
+    let oauth = MockOAuth::ok("new-access", "new-refresh", VALID_JWT);
+    let oauth_handle = oauth.clone();
+    let oauth_url = oauth.spawn().await;
+    let apparently_fresh = jwt_expiring_in(5 * 86_400);
+    let (pf, state) =
+        spawn_with_access_token(oauth_url, upstream_url, now(), &apparently_fresh).await;
+    state
+        .runtime_settings
+        .set("max_account_attempts", SettingValue::U64(1))
+        .unwrap();
+    let turn_metadata = serde_json::json!({"turn_id": "http-auth-refund"}).to_string();
+
+    let response = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .header("session-id", "session-auth-refund")
+        .header("thread-id", "thread-auth-refund")
+        .header("x-codex-turn-metadata", turn_metadata)
+        .json(&serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "the synchronized forced refresh retries the same request successfully"
+    );
+    assert_eq!(oauth_handle.hit_count(), 1, "exactly one refresh attempt");
+    assert_eq!(
+        seen_authorizations.lock().unwrap().as_slice(),
+        [
+            format!("Bearer {apparently_fresh}"),
+            "Bearer new-access".to_string()
+        ]
+    );
+    let persisted = state
+        .store
+        .accounts()
+        .decrypt_tokens("acct-1", &state.cipher)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.access_token, "new-access");
 }
 
 #[tokio::test]
@@ -297,11 +389,10 @@ async fn fresh_token_far_from_expiry_is_not_refreshed() {
 }
 
 #[tokio::test]
-async fn persist_failure_after_successful_refresh_still_serves_with_fresh_token() {
-    // Graceful degradation: if the refresh SUCCEEDS but persisting the rotated tokens fails on every
-    // retry (fault-injected here by a trigger that aborts all UPDATEs), the request the refresh was
-    // for must STILL be served — with the fresh in-memory token — rather than 5xx. (The DB is left
-    // holding the old token; that account will need re-auth later, which is the honest end-state.)
+async fn persist_failure_after_successful_refresh_fails_closed_before_upstream() {
+    // A successful refresh rotates the refresh token. If the new tuple cannot be persisted, using
+    // its access token for one request would leave durable state poisoned for every later request
+    // and let concurrent waiters adopt the old identity. Fail closed before provider egress.
     let upstream = MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()]);
     let up_handle = upstream.clone();
     let upstream_url = upstream.spawn().await;
@@ -330,13 +421,12 @@ async fn persist_failure_after_successful_refresh_still_serves_with_fresh_token(
         .unwrap();
     assert_eq!(
         resp.status(),
-        200,
-        "a persist failure must not fail the request the refresh already succeeded for"
+        500,
+        "a rotated identity must not be used unless its durable write succeeded"
     );
-    assert_eq!(
-        up_handle.last_authorization().unwrap(),
-        "Bearer new-access",
-        "the fresh in-memory token is used for this request despite the persist failure"
+    assert!(
+        up_handle.last_authorization().is_none(),
+        "provider egress must not receive an identity tuple that future requests cannot recover"
     );
     // The persist genuinely failed ⇒ the store still holds the OLD (near-expiry) token.
     let toks = state
@@ -566,10 +656,10 @@ async fn concurrent_stale_requests_on_failing_account_mark_once() {
 }
 
 #[tokio::test]
-async fn upstream_error_yields_generic_502() {
+async fn upstream_http_error_preserves_status_and_body() {
     let upstream_url = spawn_failing_upstream().await;
     // Fresh account ⇒ no refresh; OAuth is never contacted.
-    let (pf, _state) = spawn("http://127.0.0.1:9".to_string(), upstream_url, now()).await;
+    let (pf, state) = spawn("http://127.0.0.1:9".to_string(), upstream_url, now()).await;
 
     let client = reqwest::Client::new();
     let resp = client
@@ -578,10 +668,24 @@ async fn upstream_error_yields_generic_502() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 502);
+    assert_eq!(resp.status(), 500);
     let body = resp.text().await.unwrap();
     assert_eq!(
-        body, "upstream error",
-        "the 502 body must be generic — no upstream status, URL, or token"
+        body, "",
+        "the opaque upstream body is preserved without synthesizing proxy text"
+    );
+    state.store.flush_background_writes().await.unwrap();
+    let row = state
+        .store
+        .request_log()
+        .list(1, 0)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(row.transport.as_deref(), Some("http"));
+    assert_eq!(
+        row.protocol_outcome.as_deref(),
+        Some("failed"),
+        "a completed buffered HTTP error body is a protocol failure, not a transport loss"
     );
 }

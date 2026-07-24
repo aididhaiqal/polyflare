@@ -18,6 +18,7 @@ async fn executor_streams_upstream_events_and_forwards_body() {
         base_url: base,
         bearer_token: "test-token".into(),
         chatgpt_account_id: None,
+        is_fedramp: false,
     };
     let req = PreparedRequest {
         body: Some(serde_json::json!({
@@ -54,6 +55,7 @@ async fn executor_surfaces_upstream_error_status() {
         base_url: format!("{base}/nonexistent-base"),
         bearer_token: "t".into(),
         chatgpt_account_id: None,
+        is_fedramp: false,
     };
     let req = PreparedRequest {
         body: Some(serde_json::json!({"model": "m"})),

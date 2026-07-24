@@ -33,6 +33,57 @@ async fn open_is_idempotent() {
 }
 
 #[tokio::test]
+async fn migration_0016_erases_preexisting_raw_session_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("store.db");
+    let store = Store::open(&db_path).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO request_log \
+         (requested_at, provider, method, path, aliased, status, duration_ms, session_id) \
+         VALUES (1, 'codex', 'POST', '/responses', 0, 200, 1, 'raw-session-secret')",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    // Recreate the exact pre-0016 schema/version boundary, then let Store::open perform the real
+    // embedded upgrade. SQLite supports DROP COLUMN in the version bundled by sqlx.
+    sqlx::query("DROP INDEX idx_request_log_session_key_requested_at")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE request_log DROP COLUMN session_key")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 16")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    store.pool().close().await;
+    drop(store);
+
+    let upgraded = Store::open(&db_path).await.unwrap();
+    let raw_session: Option<String> =
+        sqlx::query_scalar("SELECT session_id FROM request_log LIMIT 1")
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        raw_session, None,
+        "the upgrade must erase legacy raw session identifiers"
+    );
+    let session_key_column: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('request_log') WHERE name = 'session_key'",
+    )
+    .fetch_one(upgraded.pool())
+    .await
+    .unwrap();
+    assert_eq!(session_key_column, 1, "the hashed session column was added");
+}
+
+#[tokio::test]
 async fn ensure_session_reattaching_matches_ensure_then_set_state() {
     // The folded UPSERT must be behavior-equivalent to `ensure_session` + `set_state("reattaching")`:
     // a new key is created directly in `reattaching`; a re-call keeps it reattaching with created_at

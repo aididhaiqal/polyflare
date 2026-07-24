@@ -20,13 +20,13 @@
 //! 2. the new `input` is a **strict extension** of what this socket last sent (identical prefix,
 //!    then new items — not merely "not shorter": an equal-or-shorter length, or a same-length
 //!    array with a changed earlier item, is never an extension);
-//! 3. every non-input field matches: `model`, `instructions`, `tools`, `tool_choice`,
-//!    `parallel_tool_calls`, `reasoning`, `service_tier`, `text` (ground truth §3's
-//!    `ResponseCreateWsRequest` field list, `common.rs:265-293`, minus the fields that
-//!    legitimately vary or are decided elsewhere: `input`/`previous_response_id` are what this
-//!    function computes, and `store`/`stream`/`stream_options`/`include`/`prompt_cache_key`/
-//!    `generate`/`client_metadata` are transport/session plumbing the plan's Task 6 wording does
-//!    not list as part of the match).
+//! 3. every non-input field Codex currently gates reuse on matches: `model`, `instructions`,
+//!    `tools`, `tool_choice`, `parallel_tool_calls`, `reasoning`, `store`, `stream`, `include`,
+//!    `service_tier`, `prompt_cache_key`, and `text`. This mirrors the exhaustive
+//!    `responses_request_properties_match` destructuring in vendored `codex-rs/core/src/client.rs`;
+//!    only `input`, `stream_options`, and `client_metadata` are intentionally excluded there.
+//!    `previous_response_id` and WS-only `generate` are envelope mechanics outside that request
+//!    comparison.
 //!
 //! Any mismatch anywhere in 1-3 => [`RequestPlan::Full`]. When in doubt => `Full`.
 //!
@@ -99,7 +99,11 @@ const NON_INPUT_FIELDS: &[&str] = &[
     "tool_choice",
     "parallel_tool_calls",
     "reasoning",
+    "store",
+    "stream",
+    "include",
     "service_tier",
+    "prompt_cache_key",
     "text",
 ];
 
@@ -143,7 +147,7 @@ pub fn item_hashes(body: &Value) -> Vec<ItemHash> {
 }
 
 /// A content-free fingerprint of `body`'s [`NON_INPUT_FIELDS`] — hashes only the presence/value of
-/// those 8 fields (never `input`). Two envelopes fingerprint equal iff every one of those 8 fields
+/// those fields (never `input`). Two envelopes fingerprint equal iff every one of those fields
 /// is `==` between them (via `Value`'s own equality, same as the original direct comparison this
 /// replaces) — a field's absence is encoded as a MISSING map key, never as `null`, so "field
 /// present as `null`" and "field absent" still fingerprint differently (codex omits fields it
@@ -291,7 +295,11 @@ mod tests {
             "tool_choice": "auto",
             "parallel_tool_calls": true,
             "reasoning": {"effort": "medium"},
+            "store": false,
+            "stream": true,
+            "include": ["reasoning.encrypted_content"],
             "service_tier": "default",
+            "prompt_cache_key": "cache-key-a",
             "text": {"format": {"type": "text"}},
             "input": input,
         })
@@ -345,7 +353,11 @@ mod tests {
             ("tool_choice", json!("required")),
             ("parallel_tool_calls", json!(false)),
             ("reasoning", json!({"effort": "high"})),
+            ("store", json!(true)),
+            ("stream", json!(false)),
+            ("include", json!(["file_search_call.results"])),
             ("service_tier", json!("priority")),
+            ("prompt_cache_key", json!("cache-key-b")),
             ("text", json!({"format": {"type": "json_schema"}})),
         ];
 
@@ -558,6 +570,7 @@ mod tests {
             base_url: base,
             bearer_token: "token".to_string(),
             chatgpt_account_id: None,
+            is_fedramp: false,
         };
         let conn = WsConn::connect(&account, &[]).await.expect("connect");
         assert!(conn.last_response_id.is_none());

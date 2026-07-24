@@ -42,7 +42,7 @@ use polyflare_server::ingress::{
     responses_handler_impl_for_test_with_starvation_timing, wake_jitter_offset_ms,
 };
 use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
-use polyflare_server::session_key::sha256_hex;
+use polyflare_server::session_key::header_session_key;
 use polyflare_store::{PlainTokens, Store, TokenCipher};
 
 fn now() -> i64 {
@@ -120,7 +120,7 @@ impl Executor for RecordingExecutor {
             .push((account.id.as_str().to_string(), self.start.elapsed()));
         let created = r#"{"type":"response.created","response":{"id":"resp_1"}}"#;
         let completed = r#"{"type":"response.completed","response":{"id":"resp_1"}}"#;
-        Ok(Box::pin(stream::iter(vec![
+        Ok(ResponseStream::new(stream::iter(vec![
             Ok::<Bytes, ExecError>(Bytes::from(format!("data: {created}\n\n"))),
             Ok(Bytes::from(format!("data: {completed}\n\n"))),
         ])))
@@ -180,6 +180,7 @@ fn build_state(
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -281,13 +282,18 @@ async fn collect_body(resp: axum::response::Response) -> (axum::http::StatusCode
 
 /// Picks two `x-codex-turn-state` header values (from a small deterministic candidate pool) whose
 /// PREDICTED `wake_jitter_offset_ms` (over the SAME hash derivation `layer2_wait_stream` uses —
-/// `sha256_hex("turn:{header}")`) differ by at least `min_gap_ms` within `wake_jitter_ms`'s window
+/// the canonical header identity derivation) differ by at least `min_gap_ms` within
+/// `wake_jitter_ms`'s window
 /// — avoids a flaky test that happens to pick two keys that hash close together on a given run.
 fn pick_desyncing_keys(wake_jitter_ms: u64, min_gap_ms: u64) -> (String, String) {
     let candidates: Vec<(String, u64)> = (0..32)
         .map(|i| {
             let k = format!("wj-key-{i}");
-            let session_value = sha256_hex(format!("turn:{k}").as_bytes());
+            let mut headers = HeaderMap::new();
+            headers.insert("x-codex-turn-state", k.parse().unwrap());
+            let session_value = header_session_key(&headers, None)
+                .expect("turn-state header derives a continuity key")
+                .value;
             let offset = wake_jitter_offset_ms(&session_value, wake_jitter_ms);
             (k, offset)
         })
@@ -380,10 +386,13 @@ async fn two_concurrent_waiters_on_the_same_account_desync_when_jitter_is_positi
     .await
     .expect("both concurrent waiters must complete within the outer timeout");
 
-    let (status_a, body_a) = tokio::time::timeout(Duration::from_secs(5), collect_body(resp_a))
+    // The response object is returned before its starvation stream finishes. The body deadline
+    // must cover the configured 9s wait budget plus scheduling slack; 5s was shorter than the
+    // deliberately selected positive-jitter path and therefore failed deterministically.
+    let (status_a, body_a) = tokio::time::timeout(Duration::from_secs(12), collect_body(resp_a))
         .await
         .expect("draining waiter A's body must not hang");
-    let (status_b, body_b) = tokio::time::timeout(Duration::from_secs(5), collect_body(resp_b))
+    let (status_b, body_b) = tokio::time::timeout(Duration::from_secs(12), collect_body(resp_b))
         .await
         .expect("draining waiter B's body must not hang");
 

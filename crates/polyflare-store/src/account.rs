@@ -177,6 +177,7 @@ impl AccountRepo {
         account: &Account,
         enc: &EncryptedTokens,
     ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO accounts (\
                 id, chatgpt_account_id, chatgpt_user_id, email, alias, \
@@ -208,13 +209,142 @@ impl AccountRepo {
         .bind(account.security_work_authorized)
         .bind(account.provider.as_str())
         .bind(account.pool.as_deref())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if let Some(pool) = account.pool.as_deref() {
+            sqlx::query("INSERT INTO account_pool_memberships (account_id, pool) VALUES (?, ?)")
+                .bind(&account.id)
+                .bind(pool)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         // A new account affects BOTH caches: the snapshot pool (a new candidate) and the token
         // cache (new identity + tokens).
         self.bump_generation();
         self.bump_token_generation();
         Ok(())
+    }
+
+    /// Persist a dashboard OAuth result and mark its claimed flow complete in one SQLite
+    /// transaction. Existing ChatGPT identities are refreshed in place; a supplied pool retags
+    /// them, while an omitted pool preserves membership.
+    pub async fn upsert_oauth_and_complete_flow(
+        &self,
+        candidate: &Account,
+        tokens: &PlainTokens,
+        cipher: &TokenCipher,
+        flow_id: &str,
+    ) -> Result<String, StoreError> {
+        let enc = EncryptedTokens::encrypt(tokens, cipher)?;
+        let mut tx = self.pool.begin().await?;
+        let existing_id = if let Some(chatgpt_id) = candidate.chatgpt_account_id.as_deref() {
+            sqlx::query_scalar::<_, String>("SELECT id FROM accounts WHERE chatgpt_account_id = ?")
+                .bind(chatgpt_id)
+                .fetch_optional(&mut *tx)
+                .await?
+        } else {
+            None
+        };
+
+        let account_id = if let Some(id) = existing_id {
+            sqlx::query(
+                "UPDATE accounts SET access_token_enc = ?, refresh_token_enc = ?, \
+                 id_token_enc = ?, last_refresh = ?, \
+                 status = CASE WHEN status = 'reauth_required' THEN 'active' ELSE status END \
+                 WHERE id = ?",
+            )
+            .bind(enc.access_token_enc.as_slice())
+            .bind(enc.refresh_token_enc.as_slice())
+            .bind(enc.id_token_enc.as_slice())
+            .bind(candidate.last_refresh)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+            if let Some(pool) = candidate.pool.as_deref() {
+                sqlx::query("UPDATE accounts SET pool = ? WHERE id = ?")
+                    .bind(pool)
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM account_pool_memberships WHERE account_id = ?")
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "INSERT INTO account_pool_memberships (account_id, pool) VALUES (?, ?)",
+                )
+                .bind(&id)
+                .bind(pool)
+                .execute(&mut *tx)
+                .await?;
+            }
+            id
+        } else {
+            sqlx::query(
+                "INSERT INTO accounts (id, chatgpt_account_id, chatgpt_user_id, email, alias, \
+                    workspace_id, workspace_label, seat_type, plan_type, routing_policy, \
+                    access_token_enc, refresh_token_enc, id_token_enc, last_refresh, created_at, \
+                    status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
+                    provider, pool) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&candidate.id)
+            .bind(candidate.chatgpt_account_id.as_deref())
+            .bind(candidate.chatgpt_user_id.as_deref())
+            .bind(&candidate.email)
+            .bind(candidate.alias.as_deref())
+            .bind(candidate.workspace_id.as_deref())
+            .bind(candidate.workspace_label.as_deref())
+            .bind(candidate.seat_type.as_deref())
+            .bind(&candidate.plan_type)
+            .bind(&candidate.routing_policy)
+            .bind(enc.access_token_enc.as_slice())
+            .bind(enc.refresh_token_enc.as_slice())
+            .bind(enc.id_token_enc.as_slice())
+            .bind(candidate.last_refresh)
+            .bind(candidate.created_at)
+            .bind(&candidate.status)
+            .bind(candidate.deactivation_reason.as_deref())
+            .bind(candidate.reset_at)
+            .bind(candidate.blocked_at)
+            .bind(candidate.security_work_authorized)
+            .bind(&candidate.provider)
+            .bind(candidate.pool.as_deref())
+            .execute(&mut *tx)
+            .await?;
+            if let Some(pool) = candidate.pool.as_deref() {
+                sqlx::query(
+                    "INSERT INTO account_pool_memberships (account_id, pool) VALUES (?, ?)",
+                )
+                .bind(&candidate.id)
+                .bind(pool)
+                .execute(&mut *tx)
+                .await?;
+            }
+            candidate.id.clone()
+        };
+
+        let completed = sqlx::query(
+            "UPDATE account_onboarding_flows SET status = 'completed', account_id = ?, \
+             finished_at = ?, error_code = NULL, verifier_enc = X'' \
+             WHERE id = ? AND status = 'exchanging'",
+        )
+        .bind(&account_id)
+        .bind(candidate.last_refresh)
+        .bind(flow_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if completed != 1 {
+            tx.rollback().await?;
+            return Err(StoreError::InvalidState(
+                "OAuth flow was not in exchanging state".into(),
+            ));
+        }
+        tx.commit().await?;
+        self.bump_generation();
+        self.bump_token_generation();
+        Ok(account_id)
     }
 
     /// Fetch one account's metadata by id.
@@ -263,6 +393,55 @@ impl AccountRepo {
         Ok(accounts)
     }
 
+    /// All named routing-group memberships for one account, ordered by slug.
+    pub async fn list_pools(&self, id: &str) -> Result<Vec<String>, StoreError> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT pool FROM account_pool_memberships WHERE account_id = ? ORDER BY pool",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Persist a restart-safe capacity cooldown. The later deadline wins so a stale/short signal
+    /// can never shorten a stronger gate already recorded for the account.
+    pub async fn record_routing_cooldown(
+        &self,
+        id: &str,
+        cooldown_until: i64,
+        reason: &str,
+        updated_at: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO routing_cooldowns (account_id, cooldown_until, reason, updated_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(account_id) DO UPDATE SET
+               cooldown_until = MAX(routing_cooldowns.cooldown_until, excluded.cooldown_until),
+               reason = CASE
+                 WHEN excluded.cooldown_until >= routing_cooldowns.cooldown_until
+                 THEN excluded.reason ELSE routing_cooldowns.reason END,
+               updated_at = MAX(routing_cooldowns.updated_at, excluded.updated_at)",
+        )
+        .bind(id)
+        .bind(cooldown_until)
+        .bind(reason)
+        .bind(updated_at)
+        .execute(&self.pool)
+        .await?;
+        self.bump_generation();
+        Ok(())
+    }
+
+    /// Read the durable routing cooldown deadline for snapshot assembly.
+    pub async fn routing_cooldown(&self, id: &str) -> Result<Option<i64>, StoreError> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT cooldown_until FROM routing_cooldowns WHERE account_id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     /// Find an account by its ChatGPT account id — used by `polyflare login` to decide onboard
     /// (insert) vs re-auth (update the existing seat's tokens) instead of creating a duplicate row.
     pub async fn find_by_chatgpt_account_id(
@@ -287,16 +466,79 @@ impl AccountRepo {
         Ok(())
     }
 
-    /// Assign (`Some(slug)`) or clear (`None`) an account's pool. Bumps the store generation so the
-    /// server's account cache re-reads on the next selection.
+    /// Legacy single-pool setter. Replaces the full membership set with one slug or none, keeping
+    /// the old CLI/API behavior while multi-pool callers use [`Self::replace_pools`].
     pub async fn update_pool(&self, id: &str, pool: Option<&str>) -> Result<(), StoreError> {
+        let pools: Vec<String> = pool.into_iter().map(str::to_string).collect();
+        self.replace_pools(id, &pools).await
+    }
+
+    /// Atomically replace every named routing-group membership for an account. The first slug is
+    /// mirrored into `accounts.pool` as a backward-compatible primary label.
+    pub async fn replace_pools(&self, id: &str, pools: &[String]) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE accounts SET pool = ? WHERE id = ?")
-            .bind(pool)
+            .bind(pools.first().map(String::as_str))
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM account_pool_memberships WHERE account_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for pool in pools {
+            sqlx::query("INSERT INTO account_pool_memberships (account_id, pool) VALUES (?, ?)")
+                .bind(id)
+                .bind(pool)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         self.bump_generation();
         Ok(())
+    }
+
+    /// Assign one routing-group slug to all requested accounts in a single transaction. Returns
+    /// `false` without changing anything when any id is missing (or the input contains duplicates).
+    pub async fn assign_pool_atomic(
+        &self,
+        account_ids: &[String],
+        pool: &str,
+    ) -> Result<bool, StoreError> {
+        if account_ids.is_empty() {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await?;
+        let placeholders = std::iter::repeat_n("?", account_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let count_sql = format!("SELECT COUNT(*) FROM accounts WHERE id IN ({placeholders})");
+        let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
+        for id in account_ids {
+            count_query = count_query.bind(id);
+        }
+        let found = count_query.fetch_one(&mut *tx).await? as usize;
+        if found != account_ids.len() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        for id in account_ids {
+            sqlx::query(
+                "INSERT OR IGNORE INTO account_pool_memberships (account_id, pool) VALUES (?, ?)",
+            )
+            .bind(id)
+            .bind(pool)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("UPDATE accounts SET pool = COALESCE(pool, ?) WHERE id = ?")
+                .bind(pool)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        self.bump_generation();
+        Ok(true)
     }
 
     /// Set (or clear) an account's human-readable alias. `Some(name)` sets it; `None` clears it to
@@ -1157,7 +1399,11 @@ mod tests {
             aliased: false,
             status: 200,
             duration_ms: 1,
+            target_kind: Some("account".into()),
+            provider_credential_id: None,
             model: None,
+            upstream_model: None,
+            upstream_transport: None,
             reasoning_effort: None,
             service_tier: None,
             transport: None,
@@ -1166,12 +1412,17 @@ mod tests {
             cached_tokens: None,
             subagent: None,
             request_id: None,
+            session_key: None,
             input_tokens: None,
             output_tokens: None,
             cached_input_tokens: None,
             reasoning_tokens: None,
+            orchestration_input_tokens: None,
+            orchestration_output_tokens: None,
+            orchestration_cached_input_tokens: None,
             cost_usd: None,
             latency_first_token_ms: None,
+            protocol_outcome: None,
         }
     }
 

@@ -1,7 +1,5 @@
-// The Settings page (`/settings`): surfaces the running config and lets an admin live-edit the 10
-// `class: "live"` `SettingFieldView` tunables via `GET`/`PATCH /api/settings` (Task 5, backend —
-// see read_api.rs::settings_handler / write_api.rs::patch_settings_handler). The other 17 fields
-// (8 restart-only + 9 fixed) are informational — rendered disabled, no PATCH surface for them.
+// The Settings page (`/settings`) surfaces the running config, live-edits runtime tunables, and
+// persists the WebSocket transport/idle policy for the next restart.
 //
 // CONTENT-SAFETY: every field here is a config scalar (a count/seconds/percentage/flag/short
 // string) — never a token or conversation content. `admin_token` is presence-only (`value` is
@@ -18,6 +16,8 @@ import clsx from "clsx";
 
 import type { SettingFieldView, SettingsView } from "../lib/api";
 import { useSettings, useUpdateSettings } from "../lib/queries";
+import type { QuotaDisplayMode } from "../lib/quotaDisplay";
+import { useQuotaDisplayPreference } from "../preferences/QuotaDisplayPreference";
 import { Card } from "../ui/Card";
 import { Col, Grid } from "../ui/Grid";
 import { AlertTriangle } from "../ui/icons";
@@ -25,8 +25,7 @@ import { Switch } from "../ui/Switch";
 
 // ---------------------------------------------------------------------------------------------
 // Grouping — the 10 live keys bucketed by area, per the task brief. `SettingsContent` looks each
-// key up in the `GET /api/settings` response; a key absent from that response (shouldn't happen —
-// the backend always emits all 27 `FIELD_SPECS` rows) is simply skipped, never fabricated.
+// key up in the `GET /api/settings` response; an absent key is skipped, never fabricated.
 // ---------------------------------------------------------------------------------------------
 
 interface SectionDef {
@@ -48,6 +47,14 @@ const LIVE_SECTIONS: SectionDef[] = [
   { title: "Streaming", keys: ["stream_idle_timeout", "soft_drain_enabled"] },
   { title: "Retention", keys: ["request_log_retention_days", "usage_history_retention_days"] },
   { title: "Flags", keys: ["live_logs"] },
+];
+
+const WEBSOCKET_KEYS = [
+  "client_websocket_enabled",
+  "http_requests_use_upstream_websocket",
+  "http_upstream_websocket_ping",
+  "websocket_idle_ping_secs",
+  "websocket_idle_budget_secs",
 ];
 
 /** Turns a snake_case field key into a display label — word-for-word from the key itself (e.g.
@@ -110,6 +117,7 @@ export function Settings() {
   return (
     <div className="flex flex-col gap-3">
       <PageHeader />
+      <DashboardPreferences />
 
       {isLoading ? (
         <SettingsSkeleton />
@@ -146,9 +154,61 @@ function PageHeader() {
     <div>
       <h1 className="text-lg font-semibold text-fg">Settings</h1>
       <p className="mt-0.5 text-[11px] text-fg opacity-60">
-        The 10 live-editable runtime tunables, plus the full running configuration for reference.
+        Dashboard preferences, live runtime tunables, and the full running configuration.
       </p>
     </div>
+  );
+}
+
+function DashboardPreferences() {
+  const { mode, setMode } = useQuotaDisplayPreference();
+  const choices: Array<{ value: QuotaDisplayMode; label: string; description: string }> = [
+    { value: "remaining", label: "Remaining", description: "Show capacity still available" },
+    { value: "used", label: "Used", description: "Show capacity already consumed" },
+  ];
+
+  return (
+    <Card className="gap-3">
+      <div>
+        <div className="text-[10px] uppercase tracking-wide text-fg opacity-60">
+          Dashboard preferences
+        </div>
+        <p className="mt-1 text-[10px] text-fg opacity-45">
+          Stored in this browser and applied across account, pool, and quota views.
+        </p>
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border/70 bg-bg/45 px-3 py-2.5">
+        <div>
+          <div className="text-[11px] font-semibold text-fg">Quota display</div>
+          <div className="mt-0.5 text-[9.5px] text-fg opacity-50">
+            Choose whether quota bars and percentages show remaining or used capacity.
+          </div>
+        </div>
+        <div
+          className="inline-flex rounded-lg border border-border bg-muted/60 p-1"
+          role="group"
+          aria-label="Quota display"
+        >
+          {choices.map((choice) => (
+            <button
+              key={choice.value}
+              type="button"
+              title={choice.description}
+              aria-pressed={mode === choice.value}
+              onClick={() => setMode(choice.value)}
+              className={clsx(
+                "rounded-md px-3 py-1.5 text-[10.5px] font-semibold transition-colors",
+                mode === choice.value
+                  ? "bg-card text-accent shadow-sm"
+                  : "text-fg opacity-55 hover:opacity-90",
+              )}
+            >
+              {choice.label}
+            </button>
+          ))}
+        </div>
+      </div>
+    </Card>
   );
 }
 
@@ -178,23 +238,52 @@ interface SettingsContentProps {
 
 function SettingsContent({ data, pendingKey, onSave }: SettingsContentProps) {
   const byKey = new Map(data.fields.map((f) => [f.key, f]));
-  const restartOnly = data.fields.filter((f) => f.class === "restart-only");
+  const websocketFields = WEBSOCKET_KEYS.flatMap((key) => {
+    const field = byKey.get(key);
+    return field ? [field] : [];
+  });
+  const restartOnly = data.fields.filter(
+    (f) => f.class === "restart-only" && !WEBSOCKET_KEYS.includes(f.key),
+  );
   const fixed = data.fields.filter((f) => f.class === "fixed");
 
   return (
     <Grid>
       {LIVE_SECTIONS.map((section) => (
-        <Col span={6} key={section.title}>
+        <Col span={6} fill key={section.title}>
           <SettingsSection title={section.title}>
             {section.keys.map((key) => {
               const field = byKey.get(key);
               return field ? (
-                <LiveFieldRow key={key} field={field} pendingKey={pendingKey} onSave={onSave} />
+                <EditableFieldRow
+                  key={key}
+                  field={field}
+                  pendingKey={pendingKey}
+                  onSave={onSave}
+                />
               ) : null;
             })}
           </SettingsSection>
         </Col>
       ))}
+
+      <Col span={12}>
+        <SettingsSection
+          title="WebSocket transport"
+          description="Saved here and applied on the next PolyFlare restart. Running and configured values remain separate until then."
+        >
+          <div className="grid grid-cols-1 gap-x-8 md:grid-cols-2">
+            {websocketFields.map((field) => (
+              <EditableFieldRow
+                key={field.key}
+                field={field}
+                pendingKey={pendingKey}
+                onSave={onSave}
+              />
+            ))}
+          </div>
+        </SettingsSection>
+      </Col>
 
       <Col span={12}>
         <Card>
@@ -232,10 +321,19 @@ function SettingsContent({ data, pendingKey, onSave }: SettingsContentProps) {
   );
 }
 
-function SettingsSection({ title, children }: { title: string; children: ReactNode }) {
+function SettingsSection({
+  title,
+  description,
+  children,
+}: {
+  title: string;
+  description?: string;
+  children: ReactNode;
+}) {
   return (
     <Card>
       <div className="text-[10px] uppercase tracking-wide text-fg opacity-60">{title}</div>
+      {description && <p className="mt-1 text-[10px] text-fg opacity-45">{description}</p>}
       <div className="mt-2 flex flex-col gap-0.5">{children}</div>
     </Card>
   );
@@ -250,7 +348,7 @@ function SettingsSection({ title, children }: { title: string; children: ReactNo
 // stale local state.
 // ---------------------------------------------------------------------------------------------
 
-function LiveFieldRow({
+function EditableFieldRow({
   field,
   pendingKey,
   onSave,
@@ -260,13 +358,16 @@ function LiveFieldRow({
   onSave: (key: string, value: number | boolean) => void;
 }) {
   const isBool = field.kind === "bool";
-  const canonical = field.value ?? field.default;
+  const canonical =
+    field.class === "restart-only"
+      ? (field.configured_value ?? field.value ?? field.default)
+      : (field.value ?? field.default);
   const [raw, setRaw] = useState(canonical);
 
   useEffect(() => {
     setRaw(canonical);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [field.value, field.default]);
+  }, [field.value, field.configured_value, field.default]);
 
   const dirty = raw !== canonical;
   const isPending = pendingKey === field.key;
@@ -287,17 +388,34 @@ function LiveFieldRow({
   }
 
   return (
-    <div className="flex items-center justify-between gap-2 py-1.5">
-      <span className="flex min-w-0 items-center gap-1.5 text-[11px] text-fg opacity-80">
-        <span className="truncate">{humanizeKey(field.key)}</span>
-        <ClassBadge cls={field.class} />
-      </span>
+    <div className="flex items-center justify-between gap-3 border-b border-border/40 py-2.5 last:border-b-0">
+      <div className="min-w-0">
+        <span className="flex min-w-0 items-center gap-1.5 text-[11px] text-fg opacity-80">
+          <span className="truncate">{field.label || humanizeKey(field.key)}</span>
+          <ClassBadge cls={field.class} />
+          {field.pending_restart && (
+            <span className="whitespace-nowrap text-[8px] font-semibold uppercase tracking-wide text-warn">
+              restart pending
+            </span>
+          )}
+        </span>
+        {field.description && (
+          <p className="mt-0.5 max-w-xl text-[9.5px] leading-relaxed text-fg opacity-45">
+            {field.description}
+          </p>
+        )}
+        {field.pending_restart && field.value !== null && (
+          <p className="mt-0.5 text-[9px] text-fg opacity-40">
+            Running value: {field.value}
+          </p>
+        )}
+      </div>
       <div className="flex shrink-0 items-center gap-1.5">
         {isBool ? (
           <Switch
             checked={raw === "true"}
             onCheckedChange={(v) => setRaw(v ? "true" : "false")}
-            ariaLabel={humanizeKey(field.key)}
+            ariaLabel={field.label || humanizeKey(field.key)}
           />
         ) : (
           <div className="flex items-center gap-1" title={bounds}>
@@ -309,7 +427,7 @@ function LiveFieldRow({
               step={field.kind === "f64" ? "0.1" : "1"}
               value={raw}
               onChange={(e) => setRaw(e.target.value)}
-              aria-label={humanizeKey(field.key)}
+              aria-label={field.label || humanizeKey(field.key)}
               className="w-20 rounded border border-border bg-bg px-2 py-1 text-right text-[10.5px] tabular-nums text-fg outline-none hover:border-accent focus:border-accent"
             />
             {unit && <span className="text-[9.5px] text-fg opacity-50">{unit}</span>}

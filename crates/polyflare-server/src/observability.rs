@@ -25,10 +25,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use axum::http::StatusCode;
-use polyflare_core::Provider;
-
 use crate::log_bus::{self, LogEvent, LogLevel};
+use axum::http::StatusCode;
 
 /// A request's content-safe completion facts. Emitted as ONE `tracing::info!` event via
 /// [`RequestLog::emit`] — everything on this type is structurally safe to log (no free-form
@@ -36,18 +34,26 @@ use crate::log_bus::{self, LogEvent, LogLevel};
 pub struct RequestLog {
     pub method: &'static str,
     pub path: &'static str,
-    pub provider: Provider,
+    /// Actual upstream provider slug (`codex`, `anthropic`, or an operator-configured provider).
+    pub provider: String,
     pub aliased: bool,
     pub status: StatusCode,
     pub duration_ms: u64,
     /// The account that served (or was selected/attempted to serve) this request — a stable row
     /// id, never a token or session identifier.
     pub account_id: Option<String>,
+    /// `account` for built-in OAuth routing or `credential` for custom-provider API keys.
+    pub target_kind: Option<String>,
+    /// Stable custom-provider credential id; never the secret.
+    pub provider_credential_id: Option<String>,
     /// The requested (native path) or resolved target (translated/aliased path) model string.
     pub model: Option<String>,
+    pub upstream_model: Option<String>,
+    pub upstream_transport: Option<String>,
     /// `reasoning.effort` for this request, when known (native facts or the alias's override).
     pub reasoning_effort: Option<String>,
-    /// The account's subscription/service tier, when known. Not populated by this task.
+    /// The recorded request service tier, when known. Native Responses traffic carries the
+    /// client-requested value; imported history carries codex-lb's recorded tier.
     pub service_tier: Option<String>,
     /// The wire transport this request rode in on (`"http"` today; `"ws"` lands with the WS
     /// milestone).
@@ -68,6 +74,9 @@ pub struct RequestLog {
     /// Stamped onto the persisted `request_log` row by [`Self::record`] so a later stream-wrapper
     /// task can call `RequestLogRepo::update_usage` against the SAME row this request inserted.
     pub request_id: Option<String>,
+    /// One-way SHA-256 continuity/session key used to join this request to the Sessions view.
+    /// Never a raw client session, thread, or window header.
+    pub session_key: Option<String>,
 }
 
 impl RequestLog {
@@ -83,6 +92,9 @@ impl RequestLog {
             aliased = self.aliased,
             status = self.status.as_u16(),
             duration_ms = self.duration_ms,
+            request_id = self.request_id.as_deref().unwrap_or(""),
+            agent = self.subagent.as_deref().unwrap_or("main"),
+            session_key = self.session_key.as_deref().unwrap_or(""),
             "request completed"
         );
     }
@@ -96,14 +108,18 @@ impl RequestLog {
     pub fn record(&self, requested_at: i64) -> polyflare_store::RequestLogRecord {
         polyflare_store::RequestLogRecord {
             requested_at,
-            provider: self.provider.to_string(),
+            provider: self.provider.clone(),
             method: self.method.to_string(),
             path: self.path.to_string(),
             aliased: self.aliased,
             status: self.status.as_u16(),
             duration_ms: self.duration_ms as i64,
             account_id: self.account_id.clone(),
+            target_kind: self.target_kind.clone(),
+            provider_credential_id: self.provider_credential_id.clone(),
             model: self.model.clone(),
+            upstream_model: self.upstream_model.clone(),
+            upstream_transport: self.upstream_transport.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
             service_tier: self.service_tier.clone(),
             transport: self.transport.clone(),
@@ -115,12 +131,17 @@ impl RequestLog {
             // post-insert by `RequestLogRepo::update_usage`, wired by the (later) stream-wrapper
             // task, which correlates its update back to this row via `request_id`.
             request_id: self.request_id.clone(),
+            session_key: self.session_key.clone(),
             input_tokens: None,
             output_tokens: None,
             cached_input_tokens: None,
             reasoning_tokens: None,
+            orchestration_input_tokens: None,
+            orchestration_output_tokens: None,
+            orchestration_cached_input_tokens: None,
             cost_usd: None,
             latency_first_token_ms: None,
+            protocol_outcome: None,
         }
     }
 
@@ -138,16 +159,24 @@ impl RequestLog {
         } else {
             LogLevel::Info
         };
-        let provider = self.provider.to_string();
+        let provider = self.provider.clone();
+        let target_id = self
+            .account_id
+            .clone()
+            .or_else(|| self.provider_credential_id.clone());
         LogEvent {
             ts_ms: log_bus::now_ms(),
             level,
             provider: Some(provider.clone()),
-            account: self.account_id.clone(),
+            account: target_id.clone(),
+            target_kind: self.target_kind.clone(),
+            target_id,
             model: self.model.clone(),
             status: Some(status),
             latency_ms: Some(self.duration_ms as i64),
             subagent: self.subagent.clone(),
+            request_id: self.request_id.clone(),
+            session_key: self.session_key.clone(),
             kind: "request".to_string(),
             message: format!("req {status} · {provider} · {}ms", self.duration_ms),
         }
@@ -222,10 +251,14 @@ impl FailoverSignal<'_> {
             level: LogLevel::Warn,
             provider: None,
             account: Some(self.to_account.to_string()),
+            target_kind: Some("account".to_string()),
+            target_id: Some(self.to_account.to_string()),
             model: None,
             status: None,
             latency_ms: None,
             subagent: None,
+            request_id: None,
+            session_key: None,
             kind: "failover".to_string(),
             message: format!(
                 "failover reason={} from={} to={} attempt={}",
@@ -347,11 +380,15 @@ impl StarvationSignal<'_> {
             ts_ms: log_bus::now_ms(),
             level: LogLevel::Warn,
             provider: None,
-            account: Some(account),
+            account: Some(account.clone()),
+            target_kind: Some("account".to_string()),
+            target_id: Some(account),
             model: None,
             status: None,
             latency_ms: Some(self.waited_ms as i64),
             subagent: None,
+            request_id: None,
+            session_key: None,
             kind: "starvation".to_string(),
             message: format!(
                 "starvation wait reason={} wait_target={} served={} waited_ms={} wake_jitter_applied_ms={}",
@@ -465,10 +502,14 @@ impl HealthTierSignal<'_> {
             level: LogLevel::Warn,
             provider: None,
             account: Some(self.account_id.to_string()),
+            target_kind: Some("account".to_string()),
+            target_id: Some(self.account_id.to_string()),
             model: None,
             status: None,
             latency_ms: None,
             subagent: None,
+            request_id: None,
+            session_key: None,
             kind: "health_tier".to_string(),
             message: format!(
                 "health_tier reason={} account={} from={} to={}",
@@ -577,7 +618,7 @@ impl LeaseMetrics {
 /// operator-managed (tens), statuses are a small fixed HTTP-code set.
 #[derive(Default)]
 pub struct UpstreamRequestMetrics {
-    inner: RwLock<HashMap<(String, u16), u64>>,
+    inner: RwLock<HashMap<(String, String, String, u16), u64>>,
 }
 
 impl UpstreamRequestMetrics {
@@ -593,19 +634,42 @@ impl UpstreamRequestMetrics {
     /// `.unwrap_or_else(|e| e.into_inner())` idiom — a metrics bump must never be the thing that
     /// takes down a request-completion path.
     pub fn record(&self, account_id: Option<&str>, status: u16) {
+        self.record_target("codex", "account", account_id, status);
+    }
+
+    pub fn record_target(
+        &self,
+        provider: &str,
+        target_kind: &str,
+        target_id: Option<&str>,
+        status: u16,
+    ) {
         let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let entry = map
-            .entry((account_id.unwrap_or("").to_string(), status))
+            .entry((
+                provider.to_string(),
+                target_kind.to_string(),
+                target_id.unwrap_or("").to_string(),
+                status,
+            ))
             .or_insert(0);
         *entry += 1;
     }
 
     /// A cloned-out snapshot of every `(account_id, status, count)` recorded so far (test/render
     /// read path — see `crate::metrics`).
-    pub fn snapshot(&self) -> Vec<(String, u16, u64)> {
+    pub fn snapshot(&self) -> Vec<(String, String, String, u16, u64)> {
         let map = self.inner.read().unwrap_or_else(|e| e.into_inner());
         map.iter()
-            .map(|((account_id, status), count)| (account_id.clone(), *status, *count))
+            .map(|((provider, target_kind, target_id, status), count)| {
+                (
+                    provider.clone(),
+                    target_kind.clone(),
+                    target_id.clone(),
+                    *status,
+                    *count,
+                )
+            })
             .collect()
     }
 }
@@ -648,15 +712,16 @@ impl RateLimitMetrics {
 }
 
 /// WS-downstream relay Phase 2/3 Task 5: a process-global, content-free counter of how often the
-/// relay pump reconnects the SAME account, moves to a DIFFERENT account, or hits a same-account
-/// anchor-miss — the residual non-resumption that gates the deferred watchdog decision (Design
-/// Note 4). Shaped exactly like [`RateLimitMetrics`] above (same `RwLock<HashMap<&'static str,
-/// u64>>`, same poison-tolerant `record`/`snapshot` pair) — deliberately not a new shape.
+/// relay pump reconnects the SAME account, moves to a DIFFERENT account, recovers an expired
+/// same-account anchor, or hits a same-account anchor-miss that cannot safely be recovered. Shaped
+/// exactly like [`RateLimitMetrics`] above (same `RwLock<HashMap<&'static str, u64>>`, same
+/// poison-tolerant `record`/`snapshot` pair) — deliberately not a new shape.
 ///
-/// **Content-free by construction:** `record`'s `kind` is ALWAYS one of exactly three fixed
+/// **Content-free by construction:** `record`'s `kind` is ALWAYS one of exactly four fixed
 /// `&'static str` labels the pump/mod pass — `"reconnect_same_account"`, `"move_cross_account"`,
-/// `"same_account_anchor_miss"` — never an account id, error code, retry-after, or any frame body.
-/// Cardinality is a constant 3. In memory only; resets on restart.
+/// `"anchor_miss_client_resend"`, `"same_account_anchor_miss"` — never an account id, error
+/// code, retry-after, or any frame body. Cardinality is a constant 4. In memory only; resets on
+/// restart.
 #[derive(Default)]
 pub struct RelayMetrics {
     inner: RwLock<HashMap<&'static str, u64>>,
@@ -668,7 +733,7 @@ impl RelayMetrics {
         Arc::new(Self::default())
     }
 
-    /// Records one occurrence of `kind` (one of the three fixed labels documented above). Recovers
+    /// Records one occurrence of `kind` (one of the four fixed labels documented above). Recovers
     /// from a poisoned lock rather than panicking, exactly like `RateLimitMetrics::record`.
     pub fn record(&self, kind: &'static str) {
         let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
@@ -751,12 +816,16 @@ mod tests {
             RequestLog {
                 method: "POST",
                 path: "/responses",
-                provider: Provider::Codex,
+                provider: "codex".to_string(),
                 aliased: false,
                 status: StatusCode::OK,
                 duration_ms: 42,
                 account_id: None,
+                target_kind: None,
+                provider_credential_id: None,
                 model: None,
+                upstream_model: None,
+                upstream_transport: None,
                 reasoning_effort: None,
                 service_tier: None,
                 transport: None,
@@ -764,7 +833,10 @@ mod tests {
                 total_tokens: None,
                 cached_tokens: None,
                 subagent: None,
-                request_id: None,
+                request_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+                session_key: Some(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                ),
             }
             .emit();
         });
@@ -784,18 +856,20 @@ mod tests {
             "aliased=false",
             "status=200",
             "duration_ms=42",
+            "request_id=0123456789abcdef0123456789abcdef",
+            "agent=main",
+            "session_key=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         ] {
             assert!(line.contains(expected), "missing `{expected}` in: {line}");
         }
 
-        // The whole point of this feature: the event must never carry a token, account id,
-        // session id, or any request content. Assert none of that ever shows up.
+        // The session value is a one-way hash. Raw session ids, account ids, tokens, and request
+        // content must still never appear.
         for forbidden in [
             "bearer",
             "token",
             "sess_",
             "acct_",
-            "session",
             "model",
             "input",
             "conversation",
@@ -817,12 +891,16 @@ mod tests {
         let log = RequestLog {
             method: "POST",
             path: "/responses",
-            provider: Provider::Codex,
+            provider: "codex".to_string(),
             aliased: false,
             status: StatusCode::OK,
             duration_ms: 42,
             account_id: Some("acct-1".to_string()),
+            target_kind: Some("account".to_string()),
+            provider_credential_id: None,
             model: Some("gpt-5.6-sol".to_string()),
+            upstream_model: None,
+            upstream_transport: Some("http_sse".to_string()),
             reasoning_effort: None,
             service_tier: None,
             transport: Some("http".to_string()),
@@ -830,7 +908,8 @@ mod tests {
             total_tokens: None,
             cached_tokens: None,
             subagent: Some("review".to_string()),
-            request_id: None,
+            request_id: Some("test-id".to_string()),
+            session_key: Some("hashed-session".to_string()),
         };
 
         let record = log.record(100);
@@ -842,6 +921,9 @@ mod tests {
         assert_eq!(ev.subagent.as_deref(), Some("review"));
         assert_eq!(ev.account.as_deref(), Some("acct-1"));
         assert_eq!(ev.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(ev.request_id.as_deref(), Some("test-id"));
+        assert_eq!(record.session_key.as_deref(), Some("hashed-session"));
+        assert_eq!(ev.session_key.as_deref(), Some("hashed-session"));
 
         // Never a bearer/token/session id/raw body — `subagent` is a bounded role slug, not
         // request/response content, same content-safety class as every other field here.
@@ -862,12 +944,16 @@ mod tests {
         let log = RequestLog {
             method: "POST",
             path: "/responses",
-            provider: Provider::Codex,
+            provider: "codex".to_string(),
             aliased: false,
             status: StatusCode::OK,
             duration_ms: 10,
             account_id: None,
+            target_kind: None,
+            provider_credential_id: None,
             model: None,
+            upstream_model: None,
+            upstream_transport: None,
             reasoning_effort: None,
             service_tier: None,
             transport: None,
@@ -876,6 +962,7 @@ mod tests {
             cached_tokens: None,
             subagent: None,
             request_id: None,
+            session_key: None,
         };
 
         assert_eq!(log.record(0).subagent, None);
@@ -890,12 +977,16 @@ mod tests {
         let log = RequestLog {
             method: "POST",
             path: "/responses",
-            provider: Provider::Codex,
+            provider: "codex".to_string(),
             aliased: false,
             status: StatusCode::OK,
             duration_ms: 42,
             account_id: None,
+            target_kind: None,
+            provider_credential_id: None,
             model: None,
+            upstream_model: None,
+            upstream_transport: None,
             reasoning_effort: None,
             service_tier: None,
             transport: None,
@@ -904,6 +995,7 @@ mod tests {
             cached_tokens: None,
             subagent: None,
             request_id: Some("test-id".to_string()),
+            session_key: None,
         };
 
         let record = log.record(100);
@@ -1258,7 +1350,7 @@ mod tests {
         assert_eq!(m.current(), 0, "saturates at 0, never underflows");
     }
 
-    // C11b Task 1: `UpstreamRequestMetrics` — labeled by `(account_id, status)`.
+    // C11b Task 1: `UpstreamRequestMetrics` — labeled by provider target and status.
 
     #[test]
     fn upstream_request_metrics_records_and_dedupes_by_account_and_status() {
@@ -1268,8 +1360,14 @@ mod tests {
         let snapshot = m.snapshot();
         assert_eq!(
             snapshot,
-            vec![("a".to_string(), 200, 2)],
-            "same (account_id, status) accumulates into one entry"
+            vec![(
+                "codex".to_string(),
+                "account".to_string(),
+                "a".to_string(),
+                200,
+                2,
+            )],
+            "same provider target and status accumulates into one entry"
         );
     }
 
@@ -1284,9 +1382,27 @@ mod tests {
         assert_eq!(
             snapshot,
             vec![
-                ("a".to_string(), 200, 1),
-                ("a".to_string(), 500, 1),
-                ("b".to_string(), 200, 1),
+                (
+                    "codex".to_string(),
+                    "account".to_string(),
+                    "a".to_string(),
+                    200,
+                    1,
+                ),
+                (
+                    "codex".to_string(),
+                    "account".to_string(),
+                    "a".to_string(),
+                    500,
+                    1,
+                ),
+                (
+                    "codex".to_string(),
+                    "account".to_string(),
+                    "b".to_string(),
+                    200,
+                    1,
+                ),
             ]
         );
     }
@@ -1298,8 +1414,14 @@ mod tests {
         let snapshot = m.snapshot();
         assert_eq!(
             snapshot,
-            vec![("".to_string(), 503, 1)],
-            "None account_id (e.g. 503-no-eligible) must still be visible, keyed as \"\""
+            vec![(
+                "codex".to_string(),
+                "account".to_string(),
+                "".to_string(),
+                503,
+                1,
+            )],
+            "None target id (e.g. 503-no-eligible) must still be visible, keyed as \"\""
         );
     }
 
@@ -1309,9 +1431,11 @@ mod tests {
         for i in 1..=5u64 {
             m.record(Some("a"), 200);
             let snapshot = m.snapshot();
-            let (_, _, count) = snapshot
+            let (_, _, _, _, count) = snapshot
                 .iter()
-                .find(|(id, status, _)| id == "a" && *status == 200)
+                .find(|(provider, kind, id, status, _)| {
+                    provider == "codex" && kind == "account" && id == "a" && *status == 200
+                })
                 .expect("entry present");
             assert_eq!(*count, i, "count only ever increases, never resets");
         }
@@ -1320,7 +1444,10 @@ mod tests {
     #[test]
     fn upstream_request_metrics_empty_snapshot_is_empty_vec() {
         let m = UpstreamRequestMetrics::new();
-        assert_eq!(m.snapshot(), Vec::<(String, u16, u64)>::new());
+        assert_eq!(
+            m.snapshot(),
+            Vec::<(String, String, String, u16, u64)>::new()
+        );
     }
 
     // C11b Task 1: `RateLimitMetrics` — labeled by a fixed `type` string.
@@ -1345,13 +1472,14 @@ mod tests {
         assert_eq!(m.snapshot(), Vec::<(String, u64)>::new());
     }
 
-    // Phase 2/3 Task 5: `RelayMetrics` — the three fixed relay-observability labels.
+    // Phase 2/3 Task 5: `RelayMetrics` — the fixed relay-observability labels.
 
     #[test]
-    fn relay_metrics_records_the_three_fixed_labels_and_increments() {
+    fn relay_metrics_records_the_four_fixed_labels_and_increments() {
         let m = RelayMetrics::new();
         m.record("reconnect_same_account");
         m.record("move_cross_account");
+        m.record("anchor_miss_client_resend");
         m.record("same_account_anchor_miss");
         m.record("reconnect_same_account");
         let mut snapshot = m.snapshot();
@@ -1359,6 +1487,7 @@ mod tests {
         assert_eq!(
             snapshot,
             vec![
+                ("anchor_miss_client_resend".to_string(), 1),
                 ("move_cross_account".to_string(), 1),
                 ("reconnect_same_account".to_string(), 2),
                 ("same_account_anchor_miss".to_string(), 1),

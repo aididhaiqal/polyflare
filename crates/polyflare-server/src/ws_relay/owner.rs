@@ -29,6 +29,7 @@ use polyflare_codex::WsConn;
 use polyflare_core::{Account, SessionKey};
 
 use crate::app::AppState;
+use crate::runtime_state::WsSocketGuard;
 
 /// Why the conversation's owner account could not be resolved. Kept intentionally small — the WS
 /// relay only needs to know whether to close the downstream socket because no account is available
@@ -60,9 +61,11 @@ pub(crate) enum RelayError {
 /// Resolve — and thereby pin, in memory, for this connection's life — the upstream Codex account
 /// that owns the conversation identified by `session_key`.
 ///
-/// Returns the full [`Account`] (not just an id) because Task 4's upstream WS dial needs it. The
-/// pin is held by the CALLER (the relay task holds the returned `Account`); this function does NOT
-/// write the ownership map — that is Task 6's job, on the first `response.completed`.
+/// Returns the full [`Account`] plus an open-socket pressure guard. New/unowned selection and guard
+/// acquisition are atomic, so concurrent first handshakes cannot all choose from a stale
+/// pre-reservation snapshot. The pin is held by the CALLER (the relay task holds the returned
+/// `Account`); this function does NOT write the ownership map — that is Task 6's job, on the first
+/// `response.completed`.
 ///
 /// Delegates to [`crate::control::resolve_owner_affine_account`] with `pool = None` (the Phase-1
 /// MVP is unpooled, mirroring the bare `/responses` path) — the SAME continuity `get_session` +
@@ -75,12 +78,22 @@ pub(crate) enum RelayError {
 pub(crate) async fn resolve_owner(
     state: &AppState,
     session_key: &SessionKey,
-) -> Result<Account, RelayError> {
-    // `pool = None`: Phase-1 MVP is unpooled (design §4), mirroring the bare `/responses` path.
+    session_id: Option<&str>,
+    pool: Option<&str>,
+    require_security_work_authorized: bool,
+) -> Result<(Account, WsSocketGuard), RelayError> {
     // The returned `AccountId` is discarded — the caller pins the full `Account`; the ownership map
     // is written later by Task 6 (`observe`), not here.
-    match crate::control::resolve_owner_affine_account(state, Some(session_key), None).await {
-        Ok((account, _id)) => Ok(account),
+    match crate::control::resolve_owner_affine_ws_account_with_capability(
+        state,
+        Some(session_key),
+        session_id,
+        pool,
+        require_security_work_authorized,
+    )
+    .await
+    {
+        Ok((account, _id, guard)) => Ok((account, guard)),
         // Map the shared engine's client-facing error `Response` back into a relay error by status:
         // `503` is `no_eligible()` (no owner AND no selectable fallback); anything else is the
         // generic `internal_error()` (e.g. a snapshot/account read failure).
@@ -125,7 +138,10 @@ mod tests {
 
     use polyflare_codex::oauth::OAuthClient;
     use polyflare_codex::CodexExecutor;
-    use polyflare_core::{AccountId, Continuity, KeyStrength, RoundRobin, Selector, SessionKey};
+    use polyflare_core::{
+        AccountId, AccountSnapshot, Continuity, KeyStrength, RoundRobin, SelectionCtx, Selector,
+        SessionKey,
+    };
     use polyflare_store::{Account as StoreAccount, PlainTokens, Store, TokenCipher};
 
     use crate::continuity::CodexContinuity;
@@ -246,6 +262,7 @@ mod tests {
                 live_logs: false,
             })),
             ws_downstream: true,
+            ws_relay_idle: crate::ws_relay::WsRelayIdlePolicy::default(),
             log_bus: crate::log_bus::LogBus::new(1000),
             failover_metrics: crate::observability::FailoverMetrics::new(),
             health_tier_metrics: crate::observability::HealthTierMetrics::new(),
@@ -271,7 +288,7 @@ mod tests {
         let key = session_key("conv-owned");
         pin_owner(&state.store, &key, "B").await;
 
-        let account = resolve_owner(&state, &key)
+        let (account, _guard) = resolve_owner(&state, &key, None, None, false)
             .await
             .expect("pinned owner reused");
         assert_eq!(
@@ -289,12 +306,84 @@ mod tests {
         seed_account(&state.store, &state.cipher, "B", "tokB").await;
         let key = session_key("conv-fresh-unseen");
 
-        let account = resolve_owner(&state, &key)
+        let (account, _guard) = resolve_owner(&state, &key, None, None, false)
             .await
             .expect("an unpinned conversation must select a healthy account, not error");
         assert_eq!(
             account.id, "A",
             "unpinned selection ran (RoundRobin's any-eligible tiebreak)"
+        );
+    }
+
+    #[derive(Debug)]
+    struct SessionFamilySelector;
+
+    impl Selector for SessionFamilySelector {
+        fn name(&self) -> &'static str {
+            "session_family_test"
+        }
+
+        fn pick(&self, candidates: &[AccountSnapshot], ctx: &SelectionCtx) -> Option<AccountId> {
+            let wanted = match ctx.session_id.as_deref() {
+                Some("family-main-and-subagents") => "B",
+                _ => "A",
+            };
+            candidates
+                .iter()
+                .find(|candidate| candidate.id.as_str() == wanted)
+                .map(|candidate| candidate.id.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_passes_raw_ws_session_family_to_selection() {
+        let state = build_state(Arc::new(SessionFamilySelector)).await;
+        seed_account(&state.store, &state.cipher, "A", "tokA").await;
+        seed_account(&state.store, &state.cipher, "B", "tokB").await;
+        let key = session_key("conv-family-affinity");
+
+        let (account, _socket_guard) =
+            resolve_owner(&state, &key, Some("family-main-and-subagents"), None, false)
+                .await
+                .expect("an unpinned WS conversation must use the family-aware selector");
+
+        assert_eq!(
+            account.id, "B",
+            "raw session-id must reach SelectionCtx so main and subagents share affinity"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_keeps_sticky_security_capability_hard_on_ws() {
+        let state = build_state(Arc::new(RoundRobin)).await;
+        seed_account(&state.store, &state.cipher, "A", "tokA").await;
+        seed_account(&state.store, &state.cipher, "B", "tokB").await;
+        state
+            .store
+            .accounts()
+            .update_security_work_authorized("B", true)
+            .await
+            .unwrap();
+        let key = session_key("conv-sticky-security");
+        state
+            .store
+            .continuity()
+            .ensure_session(&key.value, "hard", now())
+            .await
+            .unwrap();
+        state
+            .store
+            .continuity()
+            .set_required_capability(&key.value, "security_work", now())
+            .await
+            .unwrap();
+
+        let (account, _guard) = resolve_owner(&state, &key, None, None, false)
+            .await
+            .expect("the authorized account is eligible");
+        assert_eq!(
+            account.id, "B",
+            "a session's sticky capability must exclude the alphabetically-first unauthorized account"
         );
     }
 
@@ -317,6 +406,7 @@ mod tests {
             base_url: base,
             bearer_token: "owner-bearer".to_string(),
             chatgpt_account_id: Some("owner-cid".to_string()),
+            is_fedramp: false,
         };
 
         // A realistic downstream WS handshake header set: one codex identity header that SHOULD be
@@ -380,7 +470,7 @@ mod tests {
             &state.rate_limit_metrics,
         );
 
-        let account = resolve_owner(&state, &key)
+        let (account, _guard) = resolve_owner(&state, &key, None, None, false)
             .await
             .expect("an ineligible pin must re-select, never strand the connection");
         assert_ne!(account.id, "A", "must NOT return the benched pinned owner");

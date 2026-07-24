@@ -56,8 +56,14 @@ pub enum RouteDecision {
 pub enum WatchdogError {
     #[error("upstream error")]
     Upstream(Option<polyflare_core::FailureSignal>),
+    #[error("upstream returned status {}", .0.signal.status)]
+    UpstreamHttp(polyflare_core::UpstreamHttpError),
     #[error("continuity recovery unavailable")]
     Continuity,
+    /// The same hashed Codex logical turn has already spent its aggregate process-wide generation
+    /// budget. This is client-terminal and must never enter account failover.
+    #[error("logical turn attempt budget exhausted")]
+    AttemptBudgetExhausted,
     /// A streamed `response.failed` carrying `error.code == "cyber_policy"` (codex-rs wire truth:
     /// `codex-api/src/sse/responses.rs` `is_cyber_policy_error`), detected via peek-before-relay —
     /// no client byte was written before this was returned. Content-safe: `capability` is a fixed
@@ -65,6 +71,24 @@ pub enum WatchdogError {
     /// `security_work_authorized` account; THIS type only detects + surfaces — no reroute here.
     #[error("capability rejection: {capability}")]
     CapabilityRejection { capability: &'static str },
+}
+
+fn map_executor_error(error: ExecError) -> WatchdogError {
+    match error {
+        ExecError::UpstreamHttp(response) => WatchdogError::UpstreamHttp(response),
+        other => WatchdogError::Upstream(other.failure_signal()),
+    }
+}
+
+fn consume_logical_turn_attempt(
+    runtime: &RuntimeStates,
+    ctx: &RequestCtx,
+    max_attempts: u32,
+) -> Result<(), WatchdogError> {
+    runtime
+        .try_consume_logical_turn_attempt(ctx.logical_turn_key.as_deref(), max_attempts, unix_now())
+        .then_some(())
+        .ok_or(WatchdogError::AttemptBudgetExhausted)
 }
 
 /// B4 Task 3 — the commit barrier's detection primitive: whether ANY response byte has reached
@@ -195,6 +219,7 @@ pub async fn execute_with_watchdog(
         ctx,
         runtime,
         idle_timeout,
+        3,
         CommitWitness::new(),
         // C9 Task 2: this convenience delegator's callers (the wedge/cyber suites, and every
         // ingress.rs site that has not been given a lease) never carry an `InFlightGuard` — its
@@ -220,6 +245,7 @@ pub async fn execute_with_watchdog_tracked(
     ctx: RequestCtx,
     runtime: Arc<RuntimeStates>,
     idle_timeout: Duration,
+    max_attempts: u32,
     commit: CommitWitness,
     // C9 Task 2: the in-flight lease the CALLER already acquired for `account_id` at selection
     // (`None` for a caller that never acquired one). Moves into whichever `wrap_stream`/
@@ -228,6 +254,7 @@ pub async fn execute_with_watchdog_tracked(
     // the release-on-failed-attempt behavior the crux requires.
     in_flight: Option<InFlightGuard>,
 ) -> Result<ResponseStream, WatchdogError> {
+    consume_logical_turn_attempt(&runtime, &ctx, max_attempts)?;
     let Prepared { req, directive } = prepared;
     let session_key = directive.session_key.clone();
     let (fp, count) = input_fingerprint_and_count(&req, &ctx);
@@ -238,7 +265,7 @@ pub async fn execute_with_watchdog_tracked(
             let stream = executor
                 .execute(req, account, &ctx)
                 .await
-                .map_err(|e| WatchdogError::Upstream(e.failure_signal()))?;
+                .map_err(map_executor_error)?;
             Ok(wrap_stream(
                 stream,
                 continuity,
@@ -256,7 +283,7 @@ pub async fn execute_with_watchdog_tracked(
             let mut stream = executor
                 .execute(req, account, &ctx)
                 .await
-                .map_err(|e| WatchdogError::Upstream(e.failure_signal()))?;
+                .map_err(map_executor_error)?;
             match tokio::time::timeout(timeout, stream.next()).await {
                 Ok(Some(Ok(first))) => {
                     // TA6(b) Task 1 (fixed): real Codex wire ordering emits `response.created`
@@ -333,6 +360,7 @@ pub async fn execute_with_watchdog_tracked(
                                 session_key,
                                 runtime,
                                 idle_timeout,
+                                max_attempts,
                                 commit,
                                 in_flight,
                             )
@@ -368,6 +396,7 @@ pub async fn execute_with_watchdog_tracked(
                         session_key,
                         runtime,
                         idle_timeout,
+                        max_attempts,
                         commit,
                         in_flight,
                     )
@@ -408,6 +437,7 @@ async fn recover_from_silence(
     session_key: Option<SessionKey>,
     runtime: Arc<RuntimeStates>,
     idle_timeout: Duration,
+    max_attempts: u32,
     commit: CommitWitness,
     in_flight: Option<InFlightGuard>,
 ) -> Result<ResponseStream, WatchdogError> {
@@ -423,6 +453,7 @@ async fn recover_from_silence(
                 session_key,
                 runtime,
                 idle_timeout,
+                max_attempts,
                 commit,
                 in_flight,
             )
@@ -453,16 +484,18 @@ pub async fn execute_recovery_tracked(
     session_key: Option<SessionKey>,
     runtime: Arc<RuntimeStates>,
     idle_timeout: Duration,
+    max_attempts: u32,
     commit: CommitWitness,
     // C9 Task 2: see `execute_with_watchdog_tracked`'s matching param doc — moves into the single
     // `wrap_stream` call below on success; drops here (this function's scope) on the `?`-propagated
     // pre-relay `Err` above.
     in_flight: Option<InFlightGuard>,
 ) -> Result<ResponseStream, WatchdogError> {
+    consume_logical_turn_attempt(&runtime, &ctx, max_attempts)?;
     let stream = executor
         .execute(anchorless_req, account, &ctx)
         .await
-        .map_err(|e| WatchdogError::Upstream(e.failure_signal()))?;
+        .map_err(map_executor_error)?;
     Ok(wrap_stream(
         stream,
         continuity,
@@ -495,7 +528,7 @@ pub async fn signal_client_stream(
             &ctx,
         )
         .await;
-    Box::pin(stream::once(async move {
+    ResponseStream::new(stream::once(async move {
         Ok::<Bytes, ExecError>(Bytes::from_static(SIGNAL_SSE))
     }))
 }
@@ -512,13 +545,16 @@ fn build_outcome(
     kind: OutcomeKind,
     session_key: Option<SessionKey>,
     account: AccountId,
-    id: Option<String>,
+    terminal: TerminalOutcome,
 ) -> TurnOutcome {
+    let TerminalOutcome::Completed { response_id } = terminal else {
+        return TurnOutcome::Failed { session_key };
+    };
     match kind {
         OutcomeKind::Completed { fp, count } => TurnOutcome::Completed {
             session_key,
             account,
-            response_id: id,
+            response_id,
             input_fingerprint: fp,
             input_count: count,
             reasoning: None,
@@ -526,72 +562,158 @@ fn build_outcome(
         OutcomeKind::Recovered => TurnOutcome::Recovered {
             session_key,
             account,
-            new_response_id: id,
+            new_response_id: response_id,
         },
     }
 }
 
-/// Bounded, non-buffering sniffer for the streamed `response.id`. Accumulates ≤ 64 KiB until it can
-/// parse a `response.created`/`response.completed` id, then stops accumulating and forwards bytes.
+#[derive(Debug, Default, PartialEq, Eq)]
+enum TerminalOutcome {
+    #[default]
+    Pending,
+    Completed {
+        response_id: Option<String>,
+    },
+    Failed {
+        kind: ProtocolFailureKind,
+    },
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ProtocolFailureKind {
+    /// Stream ended without any terminal protocol event.
+    #[default]
+    TransportLoss,
+    /// Account/server health fault that should contribute to transient backoff.
+    Transient,
+    /// Upstream per-account rate limit.
+    RateLimited,
+    /// Durable capacity exhaustion; trigger a usage refresh immediately.
+    QuotaExceeded,
+    /// Request-level terminal result (invalid input, policy, or an explicit incomplete response).
+    Request,
+}
+
+/// Bounded, non-buffering sniffer for the streamed terminal outcome. A `response.created` id is
+/// retained only as a candidate; continuation is committed exclusively after a matching
+/// `response.completed`. Failed, incomplete, malformed, or clean EOF without completion are never
+/// converted into reusable anchors.
 struct ResponseIdSniffer {
     buf: Vec<u8>,
-    id: Option<String>,
-    done: bool,
+    created_id: Option<String>,
+    terminal: TerminalOutcome,
+    dropping_oversized_line: bool,
 }
 
 impl ResponseIdSniffer {
     fn new() -> Self {
         Self {
             buf: Vec::new(),
-            id: None,
-            done: false,
+            created_id: None,
+            terminal: TerminalOutcome::Pending,
+            dropping_oversized_line: false,
         }
     }
 
     fn feed(&mut self, bytes: &Bytes) {
-        if self.done {
+        if !matches!(self.terminal, TerminalOutcome::Pending) {
             return;
         }
-        self.buf.extend_from_slice(bytes);
-        if let Some(id) = extract_response_id(&self.buf) {
-            self.id = Some(id);
-            self.done = true;
-            self.buf = Vec::new();
-        } else if self.buf.len() > 64 * 1024 {
-            self.done = true; // give up sniffing; stay non-buffering
-            self.buf = Vec::new();
-        }
-    }
 
-    fn take_id(&mut self) -> Option<String> {
-        self.id.take()
-    }
-}
-
-fn extract_response_id(buf: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(buf);
-    for line in text.lines() {
-        let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
-            continue;
-        };
-        if payload == "[DONE]" {
-            continue;
+        let mut incoming = bytes.as_ref();
+        if self.dropping_oversized_line {
+            let Some(end) = incoming.iter().position(|b| *b == b'\n') else {
+                return;
+            };
+            incoming = &incoming[end + 1..];
+            self.dropping_oversized_line = false;
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
-            continue;
-        };
-        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
-        if ty == "response.created" || ty == "response.completed" {
-            if let Some(id) = v
-                .get("response")
-                .and_then(|r| r.get("id"))
-                .and_then(|i| i.as_str())
-            {
-                return Some(id.to_string());
+        self.buf.extend_from_slice(incoming);
+
+        while let Some(end) = self.buf.iter().position(|b| *b == b'\n') {
+            let line = self.buf.drain(..=end).collect::<Vec<_>>();
+            self.observe_line(&line);
+            if !matches!(self.terminal, TerminalOutcome::Pending) {
+                self.buf.clear();
+                return;
             }
         }
+
+        if self.buf.len() > 64 * 1024 {
+            // Skip only this oversized SSE line. Resume parsing after its newline so a later,
+            // compact terminal event can still be recognized. If the terminal event itself is
+            // oversized, the safe result at EOF is Failed—not a guessed completion.
+            self.buf.clear();
+            self.dropping_oversized_line = true;
+        }
     }
-    None
+
+    fn observe_line(&mut self, line: &[u8]) {
+        let Ok(line) = std::str::from_utf8(line) else {
+            return;
+        };
+        let Some(payload) = line.trim_end().strip_prefix("data:").map(str::trim) else {
+            return;
+        };
+        if payload == "[DONE]" {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return;
+        };
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+        let response_id = v
+            .pointer("/response/id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        match ty {
+            "response.created" => self.created_id = response_id,
+            "response.completed" => {
+                self.terminal = TerminalOutcome::Completed {
+                    response_id: response_id.or_else(|| self.created_id.clone()),
+                };
+            }
+            "response.failed" => {
+                let code = v
+                    .pointer("/response/error/code")
+                    .and_then(serde_json::Value::as_str);
+                let kind = match code {
+                    Some("rate_limit_exceeded") => ProtocolFailureKind::RateLimited,
+                    Some("insufficient_quota" | "usage_not_included") => {
+                        ProtocolFailureKind::QuotaExceeded
+                    }
+                    Some("server_is_overloaded" | "slow_down") => ProtocolFailureKind::Transient,
+                    Some(
+                        "context_length_exceeded"
+                        | "invalid_prompt"
+                        | "bio_policy"
+                        | "cyber_policy",
+                    ) => ProtocolFailureKind::Request,
+                    // codex-rs treats all other response.failed errors as retryable.
+                    _ => ProtocolFailureKind::Transient,
+                };
+                self.terminal = TerminalOutcome::Failed { kind };
+            }
+            "response.incomplete" => {
+                self.terminal = TerminalOutcome::Failed {
+                    kind: ProtocolFailureKind::Request,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(&mut self) -> TerminalOutcome {
+        match std::mem::take(&mut self.terminal) {
+            TerminalOutcome::Completed { response_id } => {
+                TerminalOutcome::Completed { response_id }
+            }
+            TerminalOutcome::Pending => TerminalOutcome::Failed {
+                kind: ProtocolFailureKind::TransportLoss,
+            },
+            TerminalOutcome::Failed { kind } => TerminalOutcome::Failed { kind },
+        }
+    }
 }
 
 /// Outcome of [`scan_past_lifecycle`].
@@ -721,8 +843,11 @@ async fn scan_past_lifecycle(
         }
     }
 
-    let rebuilt: ResponseStream =
-        Box::pin(stream::iter(relay_chunks.into_iter().map(Ok::<Bytes, ExecError>)).chain(stream));
+    let metadata = stream.metadata().clone();
+    let rebuilt = ResponseStream::with_metadata(
+        stream::iter(relay_chunks.into_iter().map(Ok::<Bytes, ExecError>)).chain(stream),
+        metadata,
+    );
     ScanOutcome::Alive(rebuilt)
 }
 
@@ -830,7 +955,7 @@ impl Stream for ObservingStream {
         let this = self.get_mut(); // ObservingStream is Unpin (all fields Unpin)
         loop {
             match &mut this.state {
-                ObserveState::Streaming => match this.inner.as_mut().poll_next(cx) {
+                ObserveState::Streaming => match Pin::new(&mut this.inner).poll_next(cx) {
                     Poll::Ready(Some(Ok(bytes))) => {
                         // Task 1: a byte arrived — push the idle deadline back out. No-op when
                         // disabled. Ordered before `mark`/`feed`/return so a LATER poll's deadline
@@ -849,17 +974,63 @@ impl Stream for ObservingStream {
                         // response then failed. Count it as a transient error, then forward the error.
                         this.runtime
                             .record_transient_error(&this.account, unix_now());
+                        this.state = ObserveState::Done;
                         return Poll::Ready(Some(Err(e)));
                     }
                     Poll::Ready(None) => {
-                        // A3: clean EOF ⇒ the account completed the turn — clear its error state so
-                        // intermittent blips don't accumulate it into permanent backoff/drain.
-                        this.runtime.record_success(&this.account);
+                        // Transport EOF is not protocol success. Codex advances LastResponse only
+                        // after response.completed, so failed/incomplete/unterminated streams must
+                        // neither clear account errors nor advance continuity.
+                        let terminal = this.sniffer.finish();
+                        match &terminal {
+                            TerminalOutcome::Completed { .. } => {
+                                this.runtime.record_success(&this.account);
+                                // A completed generation is progress, not amplification: the same
+                                // codex turn id covers every tool-call round of the user turn, so
+                                // the NEXT round must start from a fresh aggregate budget.
+                                this.runtime.clear_logical_turn_attempts(
+                                    this.ctx.logical_turn_key.as_deref(),
+                                );
+                            }
+                            TerminalOutcome::Failed {
+                                kind: ProtocolFailureKind::RateLimited,
+                            } => {
+                                this.runtime.record_stream_rate_limit(
+                                    &this.account,
+                                    None,
+                                    unix_now(),
+                                );
+                                this.runtime.request_usage_refresh(&this.account);
+                            }
+                            TerminalOutcome::Failed {
+                                kind: ProtocolFailureKind::QuotaExceeded,
+                            } => {
+                                this.runtime
+                                    .record_quota_exceeded(&this.account, unix_now());
+                                this.runtime.request_usage_refresh(&this.account);
+                            }
+                            TerminalOutcome::Failed {
+                                kind:
+                                    ProtocolFailureKind::Transient | ProtocolFailureKind::TransportLoss,
+                            } => {
+                                this.runtime
+                                    .record_transient_error(&this.account, unix_now());
+                            }
+                            TerminalOutcome::Failed {
+                                kind: ProtocolFailureKind::Request,
+                            } => {}
+                            // `finish()` always converts Pending to TransportLoss; keep the match
+                            // exhaustive so that invariant remains local and explicit.
+                            TerminalOutcome::Pending => {
+                                this.runtime
+                                    .record_transient_error(&this.account, unix_now());
+                            }
+                        }
                         let outcome = build_outcome(
                             this.kind.clone(),
                             this.session_key.clone(),
                             this.account.clone(),
-                            this.sniffer.take_id(),
+                            terminal,
                         );
                         let continuity = this.continuity.clone();
                         let ctx = this.ctx.clone();
@@ -894,7 +1065,7 @@ impl Stream for ObservingStream {
                                 // above (`Ok(None) | Err(_)` arm of the peek), just applied post-relay.
                                 // Terminate semantics are UNCHANGED: still yields the idle `Err` here,
                                 // then `Poll::Ready(None)` on the following poll.
-                                this.inner = Box::pin(stream::empty());
+                                this.inner = ResponseStream::new(stream::empty());
                                 this.state = ObserveState::Done;
                                 Poll::Ready(Some(Err(ExecError::Stream(
                                     "upstream idle timeout".into(),
@@ -937,20 +1108,24 @@ fn wrap_stream(
     // moves into the returned stream's `_in_flight` field here, and ONLY here.
     in_flight: Option<InFlightGuard>,
 ) -> ResponseStream {
-    Box::pin(ObservingStream {
-        inner,
-        sniffer: ResponseIdSniffer::new(),
-        continuity,
-        ctx,
-        account,
-        session_key,
-        kind,
-        state: ObserveState::Streaming,
-        runtime,
-        idle_deadline: IdleDeadline::new(idle_timeout),
-        commit,
-        _in_flight: in_flight,
-    })
+    let metadata = inner.metadata().clone();
+    ResponseStream::with_metadata(
+        ObservingStream {
+            inner,
+            sniffer: ResponseIdSniffer::new(),
+            continuity,
+            ctx,
+            account,
+            session_key,
+            kind,
+            state: ObserveState::Streaming,
+            runtime,
+            idle_deadline: IdleDeadline::new(idle_timeout),
+            commit,
+            _in_flight: in_flight,
+        },
+        metadata,
+    )
 }
 
 #[cfg(test)]
@@ -958,19 +1133,103 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_id_from_response_created() {
-        let sse = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_42\"}}\n\n";
-        assert_eq!(extract_response_id(sse).as_deref(), Some("resp_42"));
+    fn hard_owner_affinity_precedes_capacity_weighting() {
+        let mut owner = AccountSnapshot::new("owner");
+        owner.capacity_credits = Some(1.0);
+        owner.secondary_used_percent = 99.0;
+        let mut tempting = AccountSnapshot::new("tempting");
+        tempting.capacity_credits = Some(1_000_000.0);
+        tempting.secondary_used_percent = 0.0;
+        let candidates = vec![owner, tempting];
+        let directive = ContinuityDirective {
+            pin_account: Some(AccountId::from("owner")),
+            watchdog: WatchdogArm::Disarmed,
+            recovery: RecoveryPlan::None,
+            session_key: None,
+            require_security_work_authorized: false,
+        };
+
+        for seed in 0..100 {
+            let ctx = SelectionCtx {
+                rng_seed: Some(seed),
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    apply_ownership(
+                        &directive,
+                        &candidates,
+                        &polyflare_core::CapacityWeighted,
+                        &ctx,
+                    ),
+                    RouteDecision::Route(id) if id == AccountId::from("owner")
+                ),
+                "capacity weighting must only see the already narrowed owner candidate"
+            );
+        }
     }
 
     #[test]
-    fn sniffer_is_bounded_and_stops_after_found() {
+    fn response_created_alone_never_commits_continuation() {
+        let mut s = ResponseIdSniffer::new();
+        s.feed(&Bytes::from_static(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_42\"}}\n\n",
+        ));
+        assert_eq!(
+            s.finish(),
+            TerminalOutcome::Failed {
+                kind: ProtocolFailureKind::TransportLoss
+            }
+        );
+    }
+
+    #[test]
+    fn response_completed_commits_the_completed_response_id() {
         let mut s = ResponseIdSniffer::new();
         s.feed(&Bytes::from_static(
             b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
         ));
-        assert_eq!(s.take_id().as_deref(), Some("resp_1"));
-        assert!(s.done);
+        s.feed(&Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        ));
+        assert_eq!(
+            s.finish(),
+            TerminalOutcome::Completed {
+                response_id: Some("resp_1".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn response_failed_after_created_never_commits_the_created_id() {
+        let mut s = ResponseIdSniffer::new();
+        s.feed(&Bytes::from_static(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_poison\"}}\n\n",
+        ));
+        s.feed(&Bytes::from_static(
+            b"data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_poison\",\"error\":{\"code\":\"insufficient_quota\"}}}\n\n",
+        ));
+        assert_eq!(
+            s.finish(),
+            TerminalOutcome::Failed {
+                kind: ProtocolFailureKind::QuotaExceeded
+            }
+        );
+    }
+
+    #[test]
+    fn sniffer_resumes_after_an_oversized_non_terminal_line() {
+        let mut s = ResponseIdSniffer::new();
+        s.feed(&Bytes::from(vec![b'x'; 64 * 1024 + 1]));
+        s.feed(&Bytes::from_static(
+            b"\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_after_large\"}}\n\n",
+        ));
+        assert_eq!(
+            s.finish(),
+            TerminalOutcome::Completed {
+                response_id: Some("resp_after_large".to_string())
+            }
+        );
     }
 
     #[test]
@@ -1011,7 +1270,7 @@ mod tests {
     /// stream yields a byte then errors) lives in `tests/commit_barrier.rs`.
     #[tokio::test]
     async fn observing_stream_marks_commit_on_first_byte_and_it_survives_a_later_error() {
-        let inner: ResponseStream = Box::pin(stream::iter(vec![
+        let inner = ResponseStream::new(stream::iter(vec![
             Ok::<Bytes, ExecError>(Bytes::from_static(b"data: first\n\n")),
             Err(ExecError::Stream("mid-stream drop".into())),
         ]));
@@ -1094,7 +1353,7 @@ mod tests {
 
         // A stream with plenty left to yield — never polled at all here, mirroring a client that
         // disconnects before the server even gets to relay the first byte.
-        let inner: ResponseStream = Box::pin(stream::iter(vec![
+        let inner = ResponseStream::new(stream::iter(vec![
             Ok::<Bytes, ExecError>(Bytes::from_static(b"data: first\n\n")),
             Ok(Bytes::from_static(b"data: second\n\n")),
         ]));
@@ -1146,7 +1405,7 @@ mod tests {
         let metrics = crate::observability::LeaseMetrics::new();
         let guard = rs.acquire_in_flight(&id, 0, &metrics);
 
-        let inner: ResponseStream = Box::pin(stream::iter(vec![Ok::<Bytes, ExecError>(
+        let inner = ResponseStream::new(stream::iter(vec![Ok::<Bytes, ExecError>(
             Bytes::from_static(
                 b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\"}}\n\n",
             ),
@@ -1203,6 +1462,126 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn request_level_response_failed_does_not_record_or_observe_success() {
+        let runtime = Arc::new(RuntimeStates::new());
+        let account = AccountId::from("acct");
+        runtime.record_transient_error(&account, 0);
+        let spy = SpyContinuity::default();
+        let last_outcome = spy.last_outcome.clone();
+        let inner = ResponseStream::new(stream::iter(vec![Ok::<Bytes, ExecError>(
+            Bytes::from_static(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"poison\"}}\n\n\
+                  data: {\"type\":\"response.failed\",\"response\":{\"id\":\"poison\",\"error\":{\"code\":\"context_length_exceeded\"}}}\n\n",
+            ),
+        )]));
+        let mut observing = wrap_stream(
+            inner,
+            Arc::new(spy),
+            RequestCtx::default(),
+            account.clone(),
+            None,
+            OutcomeKind::Completed {
+                fp: "fp".to_string(),
+                count: 1,
+            },
+            runtime.clone(),
+            Duration::ZERO,
+            CommitWitness::new(),
+            None,
+        );
+
+        while observing.next().await.is_some() {}
+
+        assert_eq!(
+            *last_outcome.lock().unwrap(),
+            Some("failed"),
+            "transport EOF after response.failed must observe a failed turn"
+        );
+        let mut snapshots = vec![AccountSnapshot::new("acct")];
+        runtime.overlay(&mut snapshots, 0);
+        assert_eq!(
+            snapshots[0].error_count, 1,
+            "a request-level response.failed must neither reward nor penalize the account"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_capacity_failures_update_routing_and_request_fresh_usage() {
+        for (code, expect_error, expect_cooldown) in [
+            ("rate_limit_exceeded", 1, true),
+            ("insufficient_quota", 0, true),
+        ] {
+            let runtime = Arc::new(RuntimeStates::new());
+            let account = AccountId::from(format!("acct-{code}"));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            runtime.register_usage_refresh(tx);
+            let frame = format!(
+                "data: {{\"type\":\"response.failed\",\"response\":{{\"error\":{{\"code\":\"{code}\"}}}}}}\n\n"
+            );
+            let inner = ResponseStream::new(stream::iter(vec![Ok::<Bytes, ExecError>(
+                Bytes::from(frame),
+            )]));
+            let mut observing = wrap_stream(
+                inner,
+                Arc::new(polyflare_core::NoopContinuity),
+                RequestCtx::default(),
+                account.clone(),
+                None,
+                OutcomeKind::Completed {
+                    fp: String::new(),
+                    count: 0,
+                },
+                runtime.clone(),
+                Duration::ZERO,
+                CommitWitness::new(),
+                None,
+            );
+            while observing.next().await.is_some() {}
+
+            let mut snapshots = vec![AccountSnapshot::new(account.as_str())];
+            runtime.overlay(&mut snapshots, unix_now());
+            assert_eq!(snapshots[0].error_count, expect_error, "{code}");
+            assert_eq!(
+                snapshots[0].cooldown_until.is_some(),
+                expect_cooldown,
+                "{code}"
+            );
+            assert_eq!(rx.try_recv().unwrap(), account, "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_eof_without_terminal_event_is_a_transport_failure() {
+        let runtime = Arc::new(RuntimeStates::new());
+        let account = AccountId::from("acct-unterminated");
+        let inner = ResponseStream::new(stream::iter(vec![Ok::<Bytes, ExecError>(
+            Bytes::from_static(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"never_done\"}}\n\n",
+            ),
+        )]));
+        let mut observing = wrap_stream(
+            inner,
+            Arc::new(polyflare_core::NoopContinuity),
+            RequestCtx::default(),
+            account.clone(),
+            None,
+            OutcomeKind::Completed {
+                fp: String::new(),
+                count: 0,
+            },
+            runtime.clone(),
+            Duration::ZERO,
+            CommitWitness::new(),
+            None,
+        );
+        while observing.next().await.is_some() {}
+
+        let mut snapshots = vec![AccountSnapshot::new(account.as_str())];
+        runtime.overlay(&mut snapshots, unix_now());
+        assert_eq!(snapshots[0].error_count, 1);
+    }
+
     /// C9 Task 2: a mid-stream error (the `Poll::Ready(Some(Err(_)))` arm) forwards the error
     /// unchanged (as before this task) and, once the stream is dropped, releases the lease.
     /// `record_transient_error` still fires — same "unchanged bookkeeping" proof as the clean-drain
@@ -1214,7 +1593,7 @@ mod tests {
         let metrics = crate::observability::LeaseMetrics::new();
         let guard = rs.acquire_in_flight(&id, 0, &metrics);
 
-        let inner: ResponseStream = Box::pin(stream::iter(vec![
+        let inner = ResponseStream::new(stream::iter(vec![
             Ok::<Bytes, ExecError>(Bytes::from_static(b"data: first\n\n")),
             Err(ExecError::Stream("mid-stream drop".into())),
         ]));
@@ -1368,6 +1747,7 @@ mod tests {
     // ---- Task 1: mid-stream idle deadline (THE CRUX) ---------------------------------------
 
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex as StdMutex;
 
     use async_trait::async_trait;
     use polyflare_core::ContinuityError;
@@ -1378,6 +1758,7 @@ mod tests {
             base_url: "http://unused.invalid".into(),
             bearer_token: "tok".into(),
             chatgpt_account_id: None,
+            is_fedramp: false,
         }
     }
 
@@ -1417,11 +1798,107 @@ mod tests {
         ) -> Result<ResponseStream, ExecError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let first = Ok::<Bytes, ExecError>(Bytes::from_static(b"data: first\n\n"));
-            Ok(Box::pin(
+            Ok(ResponseStream::new(
                 stream::once(async move { first })
                     .chain(stream::pending::<Result<Bytes, ExecError>>()),
             ))
         }
+    }
+
+    #[tokio::test]
+    async fn tracked_execution_rejects_a_second_request_for_the_same_logical_turn() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = ByteThenStallExecutor {
+            calls: calls.clone(),
+        };
+        let runtime = Arc::new(RuntimeStates::new());
+        let ctx = RequestCtx {
+            logical_turn_key: Some("hashed-logical-turn".to_string()),
+            ..RequestCtx::default()
+        };
+        let prepared = idle_test_disarmed(serde_json::json!({"input": []}));
+
+        let first = execute_with_watchdog_tracked(
+            &executor,
+            Arc::new(polyflare_core::NoopContinuity),
+            prepared.clone(),
+            &idle_test_account(),
+            AccountId::from("acct"),
+            ctx.clone(),
+            runtime.clone(),
+            Duration::ZERO,
+            1,
+            CommitWitness::new(),
+            None,
+        )
+        .await;
+        assert!(first.is_ok());
+        drop(first);
+
+        let second = execute_with_watchdog_tracked(
+            &executor,
+            Arc::new(polyflare_core::NoopContinuity),
+            prepared,
+            &idle_test_account(),
+            AccountId::from("acct"),
+            ctx,
+            runtime,
+            Duration::ZERO,
+            1,
+            CommitWitness::new(),
+            None,
+        )
+        .await;
+        let error = second.err().expect("the second attempt must be rejected");
+        assert!(matches!(&error, WatchdogError::AttemptBudgetExhausted));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!error.to_string().contains("hashed-logical-turn"));
+    }
+
+    /// The budget bounds attempts WITHOUT progress, not generations: codex reuses one turn id for
+    /// every tool-call round of a user turn, so a stream that terminates with
+    /// `response.completed` must clear the turn's spent attempts — otherwise round
+    /// `max_account_attempts + 1` of a healthy tool loop is rejected as amplification (the
+    /// 2026-07-24 live regression: 3 completed rounds, then an instant 400).
+    #[tokio::test]
+    async fn completed_stream_clears_the_logical_turn_budget_for_the_next_round() {
+        let runtime = Arc::new(RuntimeStates::new());
+        let ctx = RequestCtx {
+            logical_turn_key: Some("hashed-logical-turn".to_string()),
+            ..RequestCtx::default()
+        };
+        // The round's own attempt (spent at execute entry) exhausts a limit of 1.
+        assert!(runtime.try_consume_logical_turn_attempt(ctx.logical_turn_key.as_deref(), 1, 0));
+        assert!(!runtime.try_consume_logical_turn_attempt(ctx.logical_turn_key.as_deref(), 1, 0));
+
+        let inner = ResponseStream::new(stream::once(async {
+            Ok::<Bytes, ExecError>(Bytes::from_static(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+            ))
+        }));
+        let mut wrapped = wrap_stream(
+            inner,
+            Arc::new(polyflare_core::NoopContinuity) as Arc<dyn Continuity>,
+            ctx.clone(),
+            AccountId::from("acct"),
+            None,
+            OutcomeKind::Completed {
+                fp: String::new(),
+                count: 0,
+            },
+            runtime.clone(),
+            Duration::ZERO, // idle watchdog disabled: not under test here
+            CommitWitness::new(),
+            None,
+        );
+        while let Some(item) = wrapped.next().await {
+            item.expect("the completing stream must relay cleanly");
+        }
+
+        assert!(
+            runtime.try_consume_logical_turn_attempt(ctx.logical_turn_key.as_deref(), 1, 1),
+            "a forwarded response.completed must reset the aggregate budget for the next round"
+        );
     }
 
     /// A `Continuity` that only counts `observe` calls — used to prove `observe` DID/DID NOT run,
@@ -1429,6 +1906,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct SpyContinuity {
         observe_calls: Arc<AtomicUsize>,
+        last_outcome: Arc<StdMutex<Option<&'static str>>>,
     }
 
     #[async_trait]
@@ -1443,10 +1921,15 @@ mod tests {
 
         async fn observe(
             &self,
-            _outcome: TurnOutcome,
+            outcome: TurnOutcome,
             _ctx: &RequestCtx,
         ) -> Result<(), ContinuityError> {
             self.observe_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_outcome.lock().unwrap() = Some(match outcome {
+                TurnOutcome::Completed { .. } => "completed",
+                TurnOutcome::Recovered { .. } => "recovered",
+                TurnOutcome::Failed { .. } => "failed",
+            });
             Ok(())
         }
 
@@ -1467,7 +1950,7 @@ mod tests {
     #[tokio::test]
     async fn wrap_stream_terminates_after_genuine_mid_stream_silence() {
         let idle = Duration::from_millis(250);
-        let inner: ResponseStream = Box::pin(
+        let inner = ResponseStream::new(
             stream::once(async { Ok::<Bytes, ExecError>(Bytes::from_static(b"data: first\n\n")) })
                 .chain(stream::pending::<Result<Bytes, ExecError>>()),
         );
@@ -1553,6 +2036,7 @@ mod tests {
             RequestCtx::default(),
             runtime,
             Duration::from_millis(250),
+            3,
             commit.clone(),
             None,
         )
@@ -1597,10 +2081,15 @@ mod tests {
         let idle = Duration::from_millis(200);
         let gap = idle / 2;
         // 4 live chunks, each within `gap` of the last, then a clean end (`None`).
-        let chunks: Vec<Bytes> = (0..4)
-            .map(|i| Bytes::from(format!("data: chunk-{i}\n\n")))
-            .collect();
-        let inner: ResponseStream = Box::pin(stream::unfold(
+        let chunks = vec![
+            Bytes::from_static(b"data: chunk-0\n\n"),
+            Bytes::from_static(b"data: chunk-1\n\n"),
+            Bytes::from_static(b"data: chunk-2\n\n"),
+            Bytes::from_static(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\"}}\n\n",
+            ),
+        ];
+        let inner = ResponseStream::new(stream::unfold(
             chunks.into_iter(),
             move |mut it| async move {
                 let next = it.next()?;
@@ -1616,6 +2105,7 @@ mod tests {
         let observe_calls = Arc::new(AtomicUsize::new(0));
         let continuity: Arc<dyn Continuity> = Arc::new(SpyContinuity {
             observe_calls: observe_calls.clone(),
+            last_outcome: Default::default(),
         });
 
         let mut wrapped = wrap_stream(
@@ -1667,7 +2157,7 @@ mod tests {
     /// stream actually finishing.
     #[tokio::test]
     async fn disabled_idle_timeout_never_terminates_a_stalled_stream() {
-        let inner: ResponseStream = Box::pin(
+        let inner = ResponseStream::new(
             stream::once(async { Ok::<Bytes, ExecError>(Bytes::from_static(b"data: first\n\n")) })
                 .chain(stream::pending::<Result<Bytes, ExecError>>()),
         );
@@ -1746,7 +2236,7 @@ mod tests {
     async fn idle_terminate_proactively_drops_the_inner_stream() {
         let idle = Duration::from_millis(200);
         let dropped = Arc::new(AtomicBool::new(false));
-        let inner: ResponseStream = Box::pin(DropSpyStall {
+        let inner = ResponseStream::new(DropSpyStall {
             yielded: false,
             dropped: dropped.clone(),
         });

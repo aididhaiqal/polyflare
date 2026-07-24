@@ -62,6 +62,7 @@ export {
   Coins,
   Copy,
   Download,
+  Eye,
   EyeOff,
   Flame,
   Key,

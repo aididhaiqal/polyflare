@@ -8,8 +8,9 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
 
-/// The built dashboard bundle. `dashboard/dist` is produced by `bun run build` in that directory
+/// The built dashboard bundle. `dashboard/dist` is produced by `npm run build` in that directory
 /// and committed, so a Rust-only CI (no node toolchain) can still embed it.
+/// Rebuild this crate after regenerating the bundle so the binary picks up the embedded asset hashes.
 #[derive(RustEmbed)]
 #[folder = "dashboard/dist"]
 struct DashboardAssets;
@@ -35,7 +36,7 @@ fn serve(path: &str) -> Response {
             .into_response(),
         None => (
             StatusCode::NOT_FOUND,
-            "dashboard not built (run `bun run build` in crates/polyflare-server/dashboard)",
+            "dashboard not built (run `npm run build` in crates/polyflare-server/dashboard)",
         )
             .into_response(),
     }

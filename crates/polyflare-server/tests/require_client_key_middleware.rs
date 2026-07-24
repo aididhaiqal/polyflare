@@ -63,6 +63,7 @@ async fn build_state() -> Arc<AppState> {
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -125,7 +126,7 @@ async fn valid_enabled_key_passes_through_and_touches_last_used() {
         "the inner handler must have actually run"
     );
 
-    // `touch_last_used` is fire-and-forget (see auth.rs's doc comment) — poll briefly instead of
+    // `touch_last_used` is queued (see auth.rs's doc comment) — poll briefly instead of
     // asserting immediately after the response, which only proves `next.run` completed, not that
     // the spawned audit write landed yet.
     let hash = sha256_hex(&created.raw);

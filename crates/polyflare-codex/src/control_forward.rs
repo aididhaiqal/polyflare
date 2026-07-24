@@ -62,6 +62,8 @@ const ALLOWED_RESPONSE_HEADERS: &[&str] = &[
     "location",
     "openai-processing-ms",
     "request-id",
+    "retry-after",
+    "x-codex-turn-state",
     "x-request-id",
 ];
 
@@ -97,6 +99,8 @@ pub enum ControlError {
     Transport(String),
     #[error("invalid control forward header: {0}")]
     InvalidHeader(String),
+    #[error("control response body exceeds {limit} bytes")]
+    ResponseTooLarge { limit: usize },
 }
 
 /// Builds the final upstream URL for a control-path forward from `account.base_url` and a control
@@ -134,6 +138,32 @@ pub async fn control_forward(
     forward_headers: &[(String, String)],
     body: Option<Bytes>,
 ) -> Result<ControlResponse, ControlError> {
+    control_forward_with_limit(
+        client,
+        account,
+        path,
+        method,
+        forward_headers,
+        body,
+        MAX_CONTROL_BODY_BYTES,
+    )
+    .await
+}
+
+/// The same opaque unary forward as [`control_forward`], with a caller-selected response cap.
+///
+/// Stable image endpoints return base64-encoded image bytes and legitimately exceed the small
+/// control-plane ceiling, so they use a larger bounded cap without weakening the default for
+/// goals, JWKS, compact, and other small responses.
+pub async fn control_forward_with_limit(
+    client: &reqwest::Client,
+    account: &Account,
+    path: &str,
+    method: Method,
+    forward_headers: &[(String, String)],
+    body: Option<Bytes>,
+    max_response_body_bytes: usize,
+) -> Result<ControlResponse, ControlError> {
     let url = control_url(&account.base_url, path);
 
     let mut headers = HeaderMap::new();
@@ -149,9 +179,17 @@ pub async fn control_forward(
     let bearer = HeaderValue::from_str(&format!("Bearer {}", account.bearer_token))
         .map_err(|e| ControlError::InvalidHeader(e.to_string()))?;
     headers.insert(AUTHORIZATION, bearer);
+    headers.remove(HeaderName::from_static("x-openai-fedramp"));
+    if account.is_fedramp {
+        headers.insert(
+            HeaderName::from_static("x-openai-fedramp"),
+            HeaderValue::from_static("true"),
+        );
+    }
     // Pair the SELECTED account's ChatGPT id with its Bearer — identical rule to
     // `CodexExecutor::execute` (`executor.rs:171-181`): `insert` so a client-forwarded value for a
     // DIFFERENT account can never survive next to the overridden Bearer.
+    headers.remove(HeaderName::from_static("chatgpt-account-id"));
     if let Some(account_id) = &account.chatgpt_account_id {
         headers.insert(
             HeaderName::from_static("chatgpt-account-id"),
@@ -191,7 +229,7 @@ pub async fn control_forward(
         })
         .collect();
 
-    let body = read_bounded_body(resp).await?;
+    let body = read_bounded_body(resp, max_response_body_bytes).await?;
 
     Ok(ControlResponse {
         status,
@@ -200,28 +238,33 @@ pub async fn control_forward(
     })
 }
 
-/// Reads a control response body up to [`MAX_CONTROL_BODY_BYTES`], then stops (the remainder of
-/// an oversized body is never read into memory). A mid-stream transport error is surfaced as
-/// [`ControlError::Transport`] — unlike `executor.rs::read_bounded_error_body` (which is
-/// best-effort since it only feeds a discardable error-code scrape), a control response body IS
-/// the payload handed back to the caller, so a read failure must not be silently swallowed into a
-/// truncated-but-"successful" body.
-async fn read_bounded_body(resp: reqwest::Response) -> Result<Bytes, ControlError> {
+/// Reads a control response body up to [`MAX_CONTROL_BODY_BYTES`]. Oversize is an explicit
+/// [`ControlError::ResponseTooLarge`] rather than a truncated body carrying the upstream success
+/// status. A mid-stream transport error is likewise surfaced as [`ControlError::Transport`] —
+/// unlike `executor.rs::read_bounded_error_body` (which is best-effort because it only feeds a
+/// discardable error-code scrape), this payload is handed back to the caller and must be complete.
+async fn read_bounded_body(
+    resp: reqwest::Response,
+    max_body_bytes: usize,
+) -> Result<Bytes, ControlError> {
+    if resp
+        .content_length()
+        .is_some_and(|length| length > max_body_bytes as u64)
+    {
+        return Err(ControlError::ResponseTooLarge {
+            limit: max_body_bytes,
+        });
+    }
     let mut buf = Vec::new();
     let mut stream = resp.bytes_stream();
-    while buf.len() < MAX_CONTROL_BODY_BYTES {
-        match stream.next().await {
-            Some(Ok(chunk)) => {
-                let room = MAX_CONTROL_BODY_BYTES - buf.len();
-                let take = room.min(chunk.len());
-                buf.extend_from_slice(&chunk[..take]);
-                if take < chunk.len() {
-                    break; // hit the cap mid-chunk; stop reading (stream dropped on return)
-                }
-            }
-            Some(Err(e)) => return Err(ControlError::Transport(e.to_string())),
-            None => break,
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| ControlError::Transport(e.to_string()))?;
+        if chunk.len() > max_body_bytes.saturating_sub(buf.len()) {
+            return Err(ControlError::ResponseTooLarge {
+                limit: max_body_bytes,
+            });
         }
+        buf.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(buf))
 }

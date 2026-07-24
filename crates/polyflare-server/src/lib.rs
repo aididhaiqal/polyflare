@@ -1,6 +1,7 @@
 //! PolyFlare server edge: ingress, config, snapshot assembly, wiring.
 
 pub mod account_cache;
+pub mod account_onboarding;
 pub mod alias;
 pub mod app;
 pub mod auth;
@@ -9,6 +10,7 @@ pub mod collect_message;
 pub mod config;
 pub mod continuity;
 pub mod control;
+pub mod custom_provider;
 pub mod dashboard;
 pub mod failover;
 pub mod fingerprint_capture;
@@ -19,6 +21,8 @@ pub mod metrics;
 pub mod model_catalog;
 pub mod observability;
 pub mod posture;
+pub mod provider_api;
+pub mod reactive_auth;
 pub mod read_api;
 pub mod refresh_locks;
 pub mod retention;

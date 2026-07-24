@@ -61,6 +61,7 @@ pub struct MockUpstream {
     /// emitting `events[1..]`. Simulates a real upstream's inter-chunk gap so callers can assert
     /// a relay forwards the first chunk immediately instead of buffering the whole stream.
     gap_after_first: Option<Duration>,
+    extra_response_headers: Arc<Vec<(String, String)>>,
 }
 
 impl MockUpstream {
@@ -74,6 +75,7 @@ impl MockUpstream {
             emitted_ids: Arc::new(Mutex::new(Vec::new())),
             counter: Arc::new(AtomicU32::new(0)),
             gap_after_first: None,
+            extra_response_headers: Arc::new(Vec::new()),
         }
     }
 
@@ -142,6 +144,15 @@ impl MockUpstream {
                 first_chunk: first_chunk.into(),
             },
         )
+    }
+
+    pub fn with_response_header(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        Arc::make_mut(&mut self.extra_response_headers).push((name.into(), value.into()));
+        self
     }
 
     /// The most recent request body, if any.
@@ -314,7 +325,7 @@ async fn handler(
         .map(str::to_string);
     *mock.last_headers.lock().unwrap() = Some(headers.clone());
 
-    match mock.mode {
+    let mut response = match mock.mode.clone() {
         MockMode::Scripted => {
             let events = (*mock.events).clone();
             let gap_after_first = mock.gap_after_first;
@@ -342,31 +353,32 @@ async fn handler(
             if silent_on_anchor && has_anchor {
                 // The wedge: 200 headers, then a body that never yields a byte (no keep-alive).
                 let pending = stream::pending::<Result<Bytes, std::io::Error>>();
-                return Response::builder()
+                Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "text/event-stream")
                     .body(Body::from_stream(pending))
-                    .unwrap();
+                    .unwrap()
+            } else {
+                let n = mock.counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let id = format!("resp_{n}");
+                mock.emitted_ids.lock().unwrap().push(id.clone());
+                let mut frames: Vec<Bytes> = Vec::new();
+                frames.push(sse_frame(&format!(
+                    r#"{{"type":"response.created","response":{{"id":"{id}"}}}}"#
+                )));
+                for e in mock.events.iter() {
+                    frames.push(sse_frame(e));
+                }
+                frames.push(sse_frame(&format!(
+                    r#"{{"type":"response.completed","response":{{"id":"{id}"}}}}"#
+                )));
+                let s = stream::iter(frames.into_iter().map(Ok::<Bytes, std::io::Error>));
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(s))
+                    .unwrap()
             }
-            let n = mock.counter.fetch_add(1, Ordering::SeqCst) + 1;
-            let id = format!("resp_{n}");
-            mock.emitted_ids.lock().unwrap().push(id.clone());
-            let mut frames: Vec<Bytes> = Vec::new();
-            frames.push(sse_frame(&format!(
-                r#"{{"type":"response.created","response":{{"id":"{id}"}}}}"#
-            )));
-            for e in mock.events.iter() {
-                frames.push(sse_frame(e));
-            }
-            frames.push(sse_frame(&format!(
-                r#"{{"type":"response.completed","response":{{"id":"{id}"}}}}"#
-            )));
-            let s = stream::iter(frames.into_iter().map(Ok::<Bytes, std::io::Error>));
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/event-stream")
-                .body(Body::from_stream(s))
-                .unwrap()
         }
         MockMode::Error { status, body } => Response::builder()
             .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
@@ -383,7 +395,16 @@ async fn handler(
                 .body(Body::from_stream(s))
                 .unwrap()
         }
+    };
+    for (name, value) in mock.extra_response_headers.iter() {
+        if let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::from_bytes(name.as_bytes()),
+            axum::http::HeaderValue::from_str(value),
+        ) {
+            response.headers_mut().insert(name, value);
+        }
     }
+    response
 }
 
 #[cfg(test)]

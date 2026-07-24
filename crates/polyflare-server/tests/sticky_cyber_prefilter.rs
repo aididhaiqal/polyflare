@@ -172,6 +172,7 @@ async fn spawn_app(
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -229,8 +230,11 @@ async fn sticky_session_selects_the_capable_account_directly_with_no_second_reje
         .unwrap();
 
     let session_header = "sess-sticky-a";
-    let session_key =
-        polyflare_server::session_key::sha256_hex(format!("session:{session_header}").as_bytes());
+    let mut identity_headers = HeaderMap::new();
+    identity_headers.insert("session_id", session_header.parse().unwrap());
+    let session_key = polyflare_server::session_key::header_session_key(&identity_headers, None)
+        .expect("session header derives a continuity key")
+        .value;
     // Simulate Task 2's stamp: a prior turn on this session already moved to a capable account.
     store
         .continuity()

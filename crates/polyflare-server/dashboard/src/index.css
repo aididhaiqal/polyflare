@@ -2,38 +2,103 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ccflare-parity design tokens. Values are bare HSL components (no `hsl()` wrapper) so Tailwind's
-   `hsl(var(--x))` color indirection in tailwind.config.ts works. Dark is the default; the
-   `data-theme` attribute is stamped onto <html> before first paint (see index.html) to avoid a
-   flash of the wrong theme. */
+/* PolyFlare's routing-observatory palette. Values are bare HSL components (no `hsl()` wrapper)
+   so Tailwind's `hsl(var(--x))` color indirection works. Dark is the default; index.html stamps
+   data-theme before first paint to avoid a flash of the wrong theme. */
 :root {
-  --bg: 220 13% 8%;
-  --card: 220 13% 12%;
-  --muted: 220 13% 18%;
-  --border: 220 13% 20%;
-  --fg: 0 0% 95%;
-  --accent: 24 89% 56%;
-  --codex: 24 89% 56%;
-  --claude: 267 100% 74%;
-  --success: 130 53% 46%;
-  --warn: 36 79% 58%;
-  --error: 3 85% 60%;
+  color-scheme: dark;
+  --bg: 225 35% 8%;
+  --card: 224 29% 12%;
+  --muted: 222 22% 18%;
+  --border: 220 20% 24%;
+  --fg: 210 30% 94%;
+  --accent: 7 96% 68%;
+  --codex: 7 96% 68%;
+  --claude: 268 91% 75%;
+  --success: 153 57% 52%;
+  --warn: 40 93% 63%;
+  --error: 354 91% 68%;
+  --signal: 190 77% 62%;
+  --surface-shadow: 228 58% 3%;
 }
 
 :root[data-theme="light"] {
-  --bg: 0 0% 100%;
+  color-scheme: light;
+  --bg: 216 38% 97%;
   --card: 0 0% 100%;
-  --muted: 220 14% 96%;
-  --border: 240 6% 90%;
-  --fg: 240 10% 4%;
-  --claude: 267 70% 48%;
+  --muted: 218 29% 93%;
+  --border: 218 22% 84%;
+  --fg: 224 34% 14%;
+  --accent: 7 78% 53%;
+  --codex: 7 78% 53%;
+  --claude: 268 63% 48%;
+  --success: 153 63% 34%;
+  --warn: 36 91% 42%;
+  --error: 354 72% 49%;
+  --signal: 191 74% 36%;
+  --surface-shadow: 218 40% 72%;
+}
+
+html {
+  background: hsl(var(--bg));
 }
 
 body {
   @apply bg-bg text-fg;
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  font-family: "Avenir Next", "Segoe UI Variable", "Segoe UI", sans-serif;
   font-variant-numeric: tabular-nums;
+  text-rendering: optimizeLegibility;
+  background-image:
+    radial-gradient(circle at 78% -10%, hsl(var(--signal) / 0.08), transparent 30rem),
+    radial-gradient(circle at 8% 105%, hsl(var(--accent) / 0.055), transparent 34rem);
+  background-attachment: fixed;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button,
+a {
+  -webkit-tap-highlight-color: transparent;
+}
+
+:focus-visible {
+  outline: 2px solid hsl(var(--signal));
+  outline-offset: 2px;
+}
+
+::selection {
+  color: hsl(var(--fg));
+  background: hsl(var(--accent) / 0.35);
+}
+
+* {
+  scrollbar-color: hsl(var(--border)) transparent;
+  scrollbar-width: thin;
 }
 
 .font-mono {
-  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  font-family: "SFMono-Regular", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+}
+
+.pf-wordmark {
+  letter-spacing: -0.045em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

@@ -8,16 +8,32 @@ import {
   api,
   ApiError,
   createKey,
+  createPool,
+  completeCodexOnboarding,
+  createProvider,
+  createProviderCredential,
+  createProviderModel,
   deleteAccount,
+  deleteProvider,
+  deleteProviderCredential,
+  deleteProviderModel,
   patchAccount,
   patchKey,
+  patchProviderCredentialEnabled,
+  patchProviderEnabled,
+  patchProviderModel,
   patchSettings,
+  startCodexOnboarding,
+  testProvider,
   type AccountDetailView,
   type AccountPatchBody,
   type AccountView,
   type ApiKeysView,
   type CapabilitiesView,
   type CreatedApiKey,
+  type CreateProviderBody,
+  type CreateProviderModelBody,
+  type CustomProviderView,
   type OverviewSeriesView,
   type OverviewView,
   type PaceResponse,
@@ -30,6 +46,7 @@ import {
   type SettingsView,
   type TrendsView,
 } from "./api";
+import { requestRefreshInterval } from "./requestLive";
 import { useToast } from "../ui/Toast";
 
 /** How often the landing-page/list views poll for fresh data while mounted. Per the task brief:
@@ -50,6 +67,7 @@ export const queryKeys = {
   reports: (params: ReportsParams) => ["reports", params] as const,
   settings: ["settings"] as const,
   keys: ["keys"] as const,
+  providers: ["providers"] as const,
   capabilities: ["capabilities"] as const,
 };
 
@@ -125,12 +143,14 @@ export function usePace() {
 
 /** Serializes `RequestsQuery`'s filter/pagination fields into a `?`-prefixed query string,
  * omitting any field left `undefined`. Field names/order match `read_api.rs::RequestsQuery`
- * exactly (`limit,offset,account,provider,status_class,model,transport,since_ts`). */
+ * exactly (`limit,offset,request_id,account,provider,status_class,model,transport,since_ts`). */
 function buildRequestsQueryString(params: RequestsQueryParams): string {
   const sp = new URLSearchParams();
   const order: Array<keyof RequestsQueryParams> = [
     "limit",
     "offset",
+    "request_id",
+    "session_key",
     "account",
     "provider",
     "status_class",
@@ -147,20 +167,23 @@ function buildRequestsQueryString(params: RequestsQueryParams): string {
   return qs ? `?${qs}` : "";
 }
 
-export function useRequests(params: RequestsQueryParams = {}) {
+export function useRequests(
+  params: RequestsQueryParams = {},
+  options: { sseConnected?: boolean } = {},
+) {
   return useQuery<RequestsView>({
     queryKey: queryKeys.requests(params),
     queryFn: () => api.requests(buildRequestsQueryString(params)),
-    refetchInterval: LIST_REFETCH_MS,
+    refetchInterval: requestRefreshInterval(options.sseConnected ?? false),
     staleTime: LIST_REFETCH_MS,
   });
 }
 
 /** Serializes `SessionsQuery`'s pagination fields into a `?`-prefixed query string, omitting any
- * field left `undefined`. Field names/order match `read_api.rs::SessionsQuery` (`limit,offset`). */
+ * field left `undefined`. Field names/order match `read_api.rs::SessionsQuery`. */
 function buildSessionsQueryString(params: SessionsQueryParams): string {
   const sp = new URLSearchParams();
-  const order: Array<keyof SessionsQueryParams> = ["limit", "offset"];
+  const order: Array<keyof SessionsQueryParams> = ["limit", "offset", "session_key"];
   for (const key of order) {
     const value = params[key];
     if (value === undefined) continue;
@@ -242,12 +265,152 @@ export function useKeys() {
   });
 }
 
+export function useProviders() {
+  return useQuery<CustomProviderView[]>({
+    queryKey: queryKeys.providers,
+    queryFn: api.providers,
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+  });
+}
+
+export function useCreateProviderBundle() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: async (input: {
+      provider: CreateProviderBody;
+      credential: { label: string; api_key: string; routing_weight?: number };
+      model: CreateProviderModelBody;
+    }) => {
+      const provider = await createProvider(input.provider);
+      try {
+        await createProviderCredential(provider.id, input.credential);
+        await createProviderModel(provider.id, input.model);
+        return provider;
+      } catch (error) {
+        // Keep the onboarding bundle atomic from the operator's perspective. Provider deletion
+        // cascades only the just-created key/model rows; historical request rows retain their
+        // provider slug and stable target ids.
+        await deleteProvider(provider.id).catch(() => undefined);
+        throw error;
+      }
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.providers });
+      toast({ title: "Provider added", variant: "success" });
+    },
+    onError: (e) =>
+      toast({ title: "Provider setup failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+export function useAddProviderCredential() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (input: {
+      providerId: string;
+      credential: { label: string; api_key: string; routing_weight?: number };
+    }) => createProviderCredential(input.providerId, input.credential),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.providers });
+      toast({ title: "Credential added", variant: "success" });
+    },
+    onError: (e) =>
+      toast({ title: "Credential failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+export function useAddProviderModel() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (input: { providerId: string; model: CreateProviderModelBody }) =>
+      createProviderModel(input.providerId, input.model),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.providers });
+      toast({ title: "Model added", variant: "success" });
+    },
+    onError: (e) =>
+      toast({ title: "Model failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+export type ProviderAction =
+  | { kind: "provider_enabled"; id: string; enabled: boolean }
+  | { kind: "provider_delete"; id: string }
+  | { kind: "credential_enabled"; id: string; enabled: boolean }
+  | { kind: "credential_delete"; id: string }
+  | { kind: "model_enabled"; id: string; enabled: boolean }
+  | {
+      kind: "model_visibility";
+      id: string;
+      visible_in_codex?: boolean;
+      visible_in_openai?: boolean;
+    }
+  | { kind: "model_delete"; id: string };
+
+export function useProviderAction() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (action: ProviderAction) => {
+      switch (action.kind) {
+        case "provider_enabled":
+          return patchProviderEnabled(action.id, action.enabled);
+        case "provider_delete":
+          return deleteProvider(action.id);
+        case "credential_enabled":
+          return patchProviderCredentialEnabled(action.id, action.enabled);
+        case "credential_delete":
+          return deleteProviderCredential(action.id);
+        case "model_enabled":
+          return patchProviderModel(action.id, { enabled: action.enabled });
+        case "model_visibility":
+          return patchProviderModel(action.id, {
+            visible_in_codex: action.visible_in_codex,
+            visible_in_openai: action.visible_in_openai,
+          });
+        case "model_delete":
+          return deleteProviderModel(action.id);
+      }
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.providers });
+      qc.invalidateQueries({ queryKey: queryKeys.overview });
+      qc.invalidateQueries({ queryKey: ["reports"] });
+      toast({ title: "Provider configuration updated", variant: "success" });
+    },
+    onError: (e) =>
+      toast({ title: "Provider update failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+export function useTestProvider() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (id: string) => testProvider(id),
+    onSuccess: (result) => {
+      qc.invalidateQueries({ queryKey: queryKeys.providers });
+      toast({
+        title: `${result.provider} connection ready`,
+        description: `${result.model} · HTTP ${result.upstream_status} · ${result.latency_ms}ms`,
+        variant: "success",
+      });
+    },
+    onError: (e) =>
+      toast({ title: "Connection test failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
 export function useCapabilities() {
   return useQuery<CapabilitiesView>({
     queryKey: queryKeys.capabilities,
     queryFn: api.capabilities,
-    // Feature flags sourced from process env at server startup — effectively static for the life
-    // of a running server, so never proactively refetch.
+    // Avoid background polling. The only current flag, `live_logs`, is refreshed explicitly after
+    // a successful Settings mutation; external control-plane changes appear on the next page load.
     staleTime: Infinity,
   });
 }
@@ -276,9 +439,51 @@ export function usePatchAccount() {
     onSuccess: (_r, v) => {
       qc.invalidateQueries({ queryKey: queryKeys.accounts });
       qc.invalidateQueries({ queryKey: queryKeys.account(v.id) });
+      qc.invalidateQueries({ queryKey: queryKeys.overview });
+      qc.invalidateQueries({ queryKey: queryKeys.pools });
+      qc.invalidateQueries({ queryKey: queryKeys.pace });
       toast({ title: "Account updated", variant: "success" });
     },
     onError: (e) => toast({ title: "Update failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+export function useStartCodexOnboarding() {
+  return useMutation({
+    mutationFn: (initialPool?: string) => startCodexOnboarding(initialPool),
+  });
+}
+
+export function useCompleteCodexOnboarding() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (v: { flowId: string; callbackUrl: string }) =>
+      completeCodexOnboarding(v.flowId, v.callbackUrl),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.accounts });
+      qc.invalidateQueries({ queryKey: queryKeys.pools });
+      qc.invalidateQueries({ queryKey: queryKeys.overview });
+      toast({ title: "Codex account added", variant: "success" });
+    },
+    onError: (e) =>
+      toast({ title: "Account onboarding failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+export function useCreatePool() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (v: { slug: string; accountIds: string[] }) => createPool(v.slug, v.accountIds),
+    onSuccess: (_r, v) => {
+      qc.invalidateQueries({ queryKey: queryKeys.accounts });
+      qc.invalidateQueries({ queryKey: queryKeys.pools });
+      qc.invalidateQueries({ queryKey: queryKeys.overview });
+      toast({ title: `Routing group ${v.slug} created`, variant: "success" });
+    },
+    onError: (e) =>
+      toast({ title: "Routing group creation failed", description: mutationErrorText(e), variant: "error" }),
   });
 }
 
@@ -299,9 +504,10 @@ export function useDeleteAccount() {
 /** `PATCH /api/settings` — live-edit one or more of the 10 live tunables (Settings page). Same
  * mutation shape as `usePatchAccount`: on success, invalidates `["settings"]` so the page refetches
  * the CLAMPED canonical value the backend actually stored (never just optimistically keeps the raw
- * submitted one — a `9999` submitted for a field clamped to `300` should show `300`, not `9999`),
- * plus a success toast; on error, the toast's description is the backend's 400 validation/clamp
- * message via `mutationErrorText`. */
+ * submitted one — a `9999` submitted for a field clamped to `300` should show `300`, not `9999`).
+ * It also invalidates `["capabilities"]`: `live_logs` is a live setting, and the Requests/Live Logs
+ * UI must connect or fall back immediately instead of retaining the old process-start capability
+ * forever. */
 export function useUpdateSettings() {
   const qc = useQueryClient();
   const { toast } = useToast();
@@ -309,6 +515,7 @@ export function useUpdateSettings() {
     mutationFn: (body: Record<string, number | boolean>) => patchSettings(body),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: queryKeys.settings });
+      qc.invalidateQueries({ queryKey: queryKeys.capabilities });
       toast({ title: "Settings updated", variant: "success" });
     },
     onError: (e) =>

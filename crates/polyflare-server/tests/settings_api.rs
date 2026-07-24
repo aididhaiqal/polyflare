@@ -267,9 +267,11 @@ async fn get_returns_every_field_with_the_correct_class() {
         "pool_strategies",
         "model_catalog_ttl_secs",
         "model_catalog_enabled",
-        "ws_downstream",
-        "ws_upstream",
-        "ws_client_ping",
+        "client_websocket_enabled",
+        "http_requests_use_upstream_websocket",
+        "http_upstream_websocket_ping",
+        "websocket_idle_ping_secs",
+        "websocket_idle_budget_secs",
         "continuity_watchdog",
     ];
     for key in restart_only_keys {
@@ -279,6 +281,15 @@ async fn get_returns_every_field_with_the_correct_class() {
             "{key} must be class=restart-only"
         );
     }
+    assert_eq!(
+        find_field(&body, "client_websocket_enabled")["default"],
+        "true",
+        "the dashboard must describe downstream WS as the production default"
+    );
+    assert_eq!(
+        find_field(&body, "http_requests_use_upstream_websocket")["label"],
+        "Use an upstream WebSocket for HTTP requests"
+    );
 
     let fixed_keys = [
         "bind_addr",
@@ -310,6 +321,91 @@ async fn get_returns_every_field_with_the_correct_class() {
         fields.len(),
         live_keys.len() + restart_only_keys.len() + fixed_keys.len()
     );
+}
+
+#[tokio::test]
+async fn websocket_settings_persist_for_restart_and_report_pending_state() {
+    let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
+    let (pf, state) = spawn(up).await;
+    let c = reqwest::Client::new();
+
+    let resp = c
+        .patch(format!("{pf}/api/settings"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({
+            "http_requests_use_upstream_websocket": true,
+            "websocket_idle_ping_secs": 1,
+            "websocket_idle_budget_secs": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let persisted = state.store.settings().get_all().await.unwrap();
+    assert_eq!(
+        persisted
+            .get("http_requests_use_upstream_websocket")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        persisted
+            .get("websocket_idle_ping_secs")
+            .map(String::as_str),
+        Some("5")
+    );
+    assert_eq!(
+        persisted
+            .get("websocket_idle_budget_secs")
+            .map(String::as_str),
+        Some("60")
+    );
+
+    let body: serde_json::Value = c
+        .get(format!("{pf}/api/settings"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let transport = find_field(&body, "http_requests_use_upstream_websocket");
+    assert_eq!(transport["value"], "false");
+    assert_eq!(transport["configured_value"], "true");
+    assert_eq!(transport["pending_restart"], true);
+
+    let ping = find_field(&body, "websocket_idle_ping_secs");
+    assert_eq!(ping["value"], "30");
+    assert_eq!(ping["configured_value"], "5");
+    assert_eq!(ping["pending_restart"], true);
+}
+
+#[tokio::test]
+async fn legacy_restart_values_are_canonicalized_before_pending_comparison() {
+    let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
+    let (pf, state) = spawn(up).await;
+    state
+        .store
+        .settings()
+        .set("ws_downstream", "1", 1)
+        .await
+        .unwrap();
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/settings"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let field = find_field(&body, "client_websocket_enabled");
+    assert_eq!(field["value"], "true");
+    assert_eq!(field["configured_value"], "true");
+    assert_eq!(field["pending_restart"], false);
 }
 
 #[tokio::test]

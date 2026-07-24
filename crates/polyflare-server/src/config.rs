@@ -32,38 +32,43 @@ pub struct ServeConfig {
     pub routing_strategy: RoutingStrategy,
     /// Per-pool routing-strategy overrides (`POLYFLARE_POOL_STRATEGY="slug=strategy,slug2=..."`).
     pub pool_strategies: HashMap<String, RoutingStrategy>,
-    /// Admin token gating every `/api/*` dashboard route (`POLYFLARE_ADMIN_TOKEN`, via
-    /// `Authorization: Bearer <token>`). Unset ⇒ the dashboard API is disabled (503), not open.
+    /// Optional admin token gating every `/api/*` dashboard route (`POLYFLARE_ADMIN_TOKEN`, via
+    /// `Authorization: Bearer <token>`). Unset is open only on a loopback bind; non-loopback
+    /// management remains disabled.
     pub admin_token: Option<String>,
-    /// Enables the live log stream (`POLYFLARE_LIVE_LOGS=1|true`). Consumed by a later task
-    /// (`/api/logs/stream`); wired through now so `AppState` construction doesn't churn again.
+    /// Enables the dashboard live log/request stream (`POLYFLARE_LIVE_LOGS`). **Default ON**;
+    /// `0`/`false`/`no`/`off` is the explicit polling-only rollback lever.
     pub live_logs: bool,
-    /// M5a: selects the upstream WebSocket transport (`POLYFLARE_WS_UPSTREAM=1|true`) for the
-    /// Codex executor instead of today's HTTP-SSE. **Default OFF** — off means `CodexExecutor`
-    /// exactly as before this flag existed, zero behavior change (see `SPEC-M5-WEBSOCKET.md` §6:
-    /// "HTTP-SSE remains the fallback on every path"). Consumed by
-    /// `crate::app::build_codex_executor`.
-    pub ws_upstream: bool,
-    /// WS-downstream relay plan Task 2: selects the DOWNSTREAM (client-facing) WebSocket transport
-    /// (`POLYFLARE_WS_DOWNSTREAM=1|true`). **Default OFF** — off means the WS-handshake `GET
-    /// /responses` (and `/{pool}/responses`) still answers `426 Upgrade Required`
-    /// (`crate::ingress::websocket_fallback_handler`), byte-identical to before this flag existed
-    /// (see `docs/superpowers/specs/2026-07-20-ws-downstream-relay-design.md` §8: "Flag-gated
-    /// (`POLYFLARE_WS_DOWNSTREAM`, default off); additive; HTTP-SSE and translation paths
-    /// byte-unchanged"). Only an explicit `1`/`true` routes that GET to `crate::ws_relay`'s upgrade
-    /// handler instead. Same fail-safe-default convention as `ws_upstream` above: any
-    /// unset/empty/unrecognized value is treated as OFF, never a startup error. Consumed by
-    /// `crate::app::build_app` (via `AppState::ws_downstream`) to shape the router.
-    pub ws_downstream: bool,
-    /// Opt-in client-initiated WS keepalive pings (`POLYFLARE_WS_CLIENT_PING=1|true`). **Default
-    /// OFF = codex-rs-faithful**: real codex-rs NEVER initiates a client ping (it only auto-pongs
+    /// Whether ordinary HTTP `/responses` requests should use a WebSocket for their Codex
+    /// upstream leg (`POLYFLARE_HTTP_REQUESTS_USE_UPSTREAM_WEBSOCKET`). This does not control the
+    /// client-facing WebSocket relay. **Default OFF** keeps HTTP/SSE on both legs. The former
+    /// `POLYFLARE_WS_UPSTREAM` name remains a deprecated fallback.
+    pub http_requests_use_upstream_websocket: bool,
+    /// Selects the client-facing WebSocket relay
+    /// (`POLYFLARE_CLIENT_WEBSOCKET_ENABLED`). **Default ON** — unset, `1`, or `true` accepts the
+    /// WS handshake
+    /// on `/responses` (and `/{pool}/responses`). `0`/`false`/`no`/`off` is the explicit rollback
+    /// lever and restores `426 Upgrade Required`
+    /// (`crate::ingress::websocket_fallback_handler`). `POLYFLARE_WS_DOWNSTREAM` remains a
+    /// deprecated fallback. Empty or unrecognized values
+    /// fall back to the default ON behavior; only an explicit disable spelling turns the relay
+    /// off. Consumed by `crate::app::build_app` to shape the router.
+    pub client_websocket_enabled: bool,
+    /// Between-turns relay idle policy (`POLYFLARE_WEBSOCKET_IDLE_PING_SECS` /
+    /// `POLYFLARE_WEBSOCKET_IDLE_BUDGET_SECS`): keepalive cadence and idle budget for a parked
+    /// upstream socket. The former `POLYFLARE_WS_IDLE_*` names remain deprecated fallbacks.
+    pub websocket_idle_policy: crate::ws_relay::WsRelayIdlePolicy,
+    /// Opt-in client-initiated keepalive pings for the WebSocket created specifically to service
+    /// an HTTP ingress request (`POLYFLARE_HTTP_UPSTREAM_WEBSOCKET_PING`). **Default OFF =
+    /// codex-rs-faithful**: real codex-rs NEVER initiates a client ping (it only auto-pongs
     /// inbound server pings and bounds reads with an idle timeout — `docs/WS-GROUND-TRUTH-CODEX.md`
     /// §7; verified in `codex-api` + `websocket-client`), so OFF makes PolyFlare's WS egress match it
     /// exactly. **ON = codex-lb-style keepalive pings** during a silent read, for deployments behind
     /// aggressive NAT/middleboxes that reap idle sockets; this is a DELIBERATE, documented
-    /// fingerprint divergence from codex-rs. Consumed by `crate::app::build_codex_executor` →
-    /// `polyflare_codex::ws::CodexWsExecutor` (no effect unless `ws_upstream` is also on).
-    pub ws_client_ping: bool,
+    /// fingerprint divergence from codex-rs. The former `POLYFLARE_WS_CLIENT_PING` name remains a
+    /// deprecated fallback. This has no effect unless
+    /// `http_requests_use_upstream_websocket` is also enabled.
+    pub http_upstream_websocket_ping: bool,
     /// B4/B5 Task 5: the bounded cross-account failover loop's total upstream-attempt cap
     /// (`POLYFLARE_MAX_ACCOUNT_ATTEMPTS`; see [`max_account_attempts_from_env`] for the
     /// malformed/zero handling decision). Resolved ONCE here at startup and threaded through
@@ -85,7 +90,7 @@ pub struct ServeConfig {
     /// D18 Task 4: `POLYFLARE_ALLOW_UNAUTHENTICATED_REMOTE=1` — the ONLY way to boot the proxy
     /// surface unauthenticated on a non-loopback bind with no client API key configured (see
     /// `crate::posture::resolve_proxy_enforcement`). Fail-safe-default: any value other than
-    /// exactly `"1"` is treated as unset (mirrors `live_logs`/`ws_upstream` above) — a typo here
+    /// exactly `"1"` is treated as unset (mirrors `ws_upstream` above) — a typo here
     /// must never accidentally grant the dangerous path.
     pub allow_unauthenticated_remote: bool,
     /// Stream-idle-timeout plan Task 2: the per-response mid-stream idle deadline
@@ -126,6 +131,9 @@ pub struct ServeConfig {
     /// documented disable lever: `AccountSnapshot.in_flight` is still tracked (Tasks 1-2), it is
     /// simply folded in at zero weight, a byte-for-byte rollback to pre-C9 selection scoring.
     pub inflight_penalty_pct: f64,
+    /// Hard process-local admission caps. Zero disables an individual cap; defaults mirror
+    /// codex-lb's response-create and upstream-WebSocket bulkheads.
+    pub admission_limits: crate::runtime_state::AdmissionLimits,
     /// C12 Task 3: `request_log` age-retention, in days (`POLYFLARE_REQUEST_LOG_RETENTION_DAYS`;
     /// see [`request_log_retention_days_from_env`] for the default/clamp/disable-lever decision).
     /// Resolved ONCE here at startup and threaded through `AppState` — never a per-request
@@ -686,6 +694,263 @@ pub fn model_catalog_enabled_from_env() -> bool {
     }
 }
 
+/// Downstream Codex WebSockets are the normal transport. The HTTP-SSE 426 fallback remains an
+/// explicit operational rollback, not the default.
+///
+/// - Unset or any enable spelling ⇒ `true`.
+/// - `"0"` / `"false"` / `"no"` / `"off"` (case-insensitive, trimmed) ⇒ `false`.
+/// - Malformed values ⇒ `true`, the declared default.
+fn client_websocket_enabled_value(raw: Option<&str>) -> bool {
+    !raw.is_some_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+}
+
+fn env_with_legacy_alias(canonical: &str, legacy: &str) -> Option<String> {
+    std::env::var(canonical)
+        .ok()
+        .or_else(|| std::env::var(legacy).ok())
+}
+
+fn opt_in_bool_value(raw: Option<&str>) -> bool {
+    raw.is_some_and(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+}
+
+pub fn client_websocket_enabled_from_env() -> bool {
+    let raw = env_with_legacy_alias(
+        "POLYFLARE_CLIENT_WEBSOCKET_ENABLED",
+        "POLYFLARE_WS_DOWNSTREAM",
+    );
+    client_websocket_enabled_value(raw.as_deref())
+}
+
+pub fn http_requests_use_upstream_websocket_from_env() -> bool {
+    let raw = env_with_legacy_alias(
+        "POLYFLARE_HTTP_REQUESTS_USE_UPSTREAM_WEBSOCKET",
+        "POLYFLARE_WS_UPSTREAM",
+    );
+    opt_in_bool_value(raw.as_deref())
+}
+
+pub fn http_upstream_websocket_ping_from_env() -> bool {
+    let raw = env_with_legacy_alias(
+        "POLYFLARE_HTTP_UPSTREAM_WEBSOCKET_PING",
+        "POLYFLARE_WS_CLIENT_PING",
+    );
+    opt_in_bool_value(raw.as_deref())
+}
+
+/// Between-turns relay idle policy (see `crate::ws_relay::WsRelayIdlePolicy`).
+///
+/// - `POLYFLARE_WEBSOCKET_IDLE_PING_SECS`: keepalive ping cadence while parked between turns. `0`
+///   disables pings entirely; malformed/unset ⇒ the 30s default; well-formed values clamp to
+///   5s–300s (a sub-5s cadence is pure noise; a longer cadence is unlikely to preserve an idle
+///   intermediary).
+/// - `POLYFLARE_WEBSOCKET_IDLE_BUDGET_SECS`: how long a parked upstream stays alive before the relay
+///   deliberately closes both legs. Malformed/unset ⇒ the 1500s (25 min) default; well-formed
+///   values clamp to 60s–86400s (24h), preventing both accidental rapid teardown and duration
+///   overflow from an unbounded environment value.
+pub fn clamp_websocket_idle_ping_secs(secs: u64) -> u64 {
+    if secs == 0 {
+        0
+    } else {
+        secs.clamp(5, 300)
+    }
+}
+
+pub fn clamp_websocket_idle_budget_secs(secs: u64) -> u64 {
+    secs.clamp(60, 86_400)
+}
+
+pub fn websocket_idle_policy_from_env() -> crate::ws_relay::WsRelayIdlePolicy {
+    let default = crate::ws_relay::WsRelayIdlePolicy::default();
+    let ping_interval = match env_with_legacy_alias(
+        "POLYFLARE_WEBSOCKET_IDLE_PING_SECS",
+        "POLYFLARE_WS_IDLE_PING_SECS",
+    ) {
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(std::time::Duration::from_secs(
+                clamp_websocket_idle_ping_secs(secs),
+            )),
+            Err(_) => default.ping_interval,
+        },
+        None => default.ping_interval,
+    };
+    let idle_budget = match env_with_legacy_alias(
+        "POLYFLARE_WEBSOCKET_IDLE_BUDGET_SECS",
+        "POLYFLARE_WS_IDLE_BUDGET_SECS",
+    ) {
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) => std::time::Duration::from_secs(clamp_websocket_idle_budget_secs(secs)),
+            Err(_) => default.idle_budget,
+        },
+        None => default.idle_budget,
+    };
+    crate::ws_relay::WsRelayIdlePolicy {
+        ping_interval,
+        idle_budget,
+    }
+}
+
+fn persisted_value_with_alias<'a>(
+    values: &'a HashMap<String, String>,
+    canonical: &str,
+    legacy: &str,
+) -> Option<&'a str> {
+    values
+        .get(canonical)
+        .or_else(|| values.get(legacy))
+        .map(String::as_str)
+}
+
+fn parse_persisted_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Apply dashboard-managed, restart-required WebSocket settings to the boot configuration.
+///
+/// Canonical keys always win over deprecated keys when both exist. Invalid legacy rows are
+/// ignored, leaving the already-resolved environment/default value intact.
+pub fn overlay_persisted_websocket_settings(
+    config: &mut ServeConfig,
+    values: &HashMap<String, String>,
+) {
+    if let Some(value) =
+        persisted_value_with_alias(values, "client_websocket_enabled", "ws_downstream")
+            .and_then(parse_persisted_bool)
+    {
+        config.client_websocket_enabled = value;
+    }
+    if let Some(value) = persisted_value_with_alias(
+        values,
+        "http_requests_use_upstream_websocket",
+        "ws_upstream",
+    )
+    .and_then(parse_persisted_bool)
+    {
+        config.http_requests_use_upstream_websocket = value;
+    }
+    if let Some(value) =
+        persisted_value_with_alias(values, "http_upstream_websocket_ping", "ws_client_ping")
+            .and_then(parse_persisted_bool)
+    {
+        config.http_upstream_websocket_ping = value;
+    }
+    if let Some(secs) =
+        persisted_value_with_alias(values, "websocket_idle_ping_secs", "ws_idle_ping_secs")
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+    {
+        let secs = clamp_websocket_idle_ping_secs(secs);
+        config.websocket_idle_policy.ping_interval = (secs != 0).then(|| Duration::from_secs(secs));
+    }
+    if let Some(secs) =
+        persisted_value_with_alias(values, "websocket_idle_budget_secs", "ws_idle_budget_secs")
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+    {
+        config.websocket_idle_policy.idle_budget =
+            Duration::from_secs(clamp_websocket_idle_budget_secs(secs));
+    }
+}
+
+/// Dashboard SSE is the normal update transport. Polling remains an automatic fallback in the
+/// dashboard and an explicit operational rollback here.
+///
+/// - Unset or any enable spelling ⇒ `true`.
+/// - `"0"` / `"false"` / `"no"` / `"off"` (case-insensitive, trimmed) ⇒ `false`.
+/// - Malformed values ⇒ `true`, the declared default.
+fn live_logs_enabled_value(raw: Option<&str>) -> bool {
+    !raw.is_some_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+}
+
+pub fn live_logs_enabled_from_env() -> bool {
+    let raw = std::env::var("POLYFLARE_LIVE_LOGS").ok();
+    live_logs_enabled_value(raw.as_deref())
+}
+
+fn admission_limit_from_env(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+/// Preserve at least one ordinary new-work slot whenever a per-account bound is enabled. A zero
+/// account limit means "unbounded", so its reserve is inert and can remain unchanged.
+fn clamp_owner_recovery_reserve(account_limit: u32, reserve: u32) -> u32 {
+    if account_limit == 0 {
+        reserve
+    } else {
+        reserve.min(account_limit.saturating_sub(1))
+    }
+}
+
+fn admission_limits_from_env() -> crate::runtime_state::AdmissionLimits {
+    let defaults = crate::runtime_state::AdmissionLimits::default();
+    let account_in_flight = admission_limit_from_env(
+        "POLYFLARE_ADMISSION_ACCOUNT_INFLIGHT",
+        defaults.account_in_flight,
+    );
+    let account_in_flight_pressure = admission_limit_from_env(
+        "POLYFLARE_ADMISSION_ACCOUNT_PRESSURE",
+        defaults.account_in_flight_pressure,
+    );
+    let owner_recovery_reserve = clamp_owner_recovery_reserve(
+        account_in_flight,
+        admission_limit_from_env(
+            "POLYFLARE_ADMISSION_OWNER_RECOVERY_RESERVE",
+            defaults.owner_recovery_reserve,
+        ),
+    );
+    let owner_recovery_pressure_reserve = clamp_owner_recovery_reserve(
+        account_in_flight_pressure,
+        admission_limit_from_env(
+            "POLYFLARE_ADMISSION_OWNER_RECOVERY_PRESSURE_RESERVE",
+            defaults.owner_recovery_pressure_reserve,
+        ),
+    );
+    crate::runtime_state::AdmissionLimits {
+        global_in_flight: admission_limit_from_env(
+            "POLYFLARE_ADMISSION_GLOBAL_INFLIGHT",
+            defaults.global_in_flight,
+        ),
+        account_in_flight,
+        global_in_flight_pressure: admission_limit_from_env(
+            "POLYFLARE_ADMISSION_GLOBAL_PRESSURE",
+            defaults.global_in_flight_pressure,
+        ),
+        account_in_flight_pressure,
+        global_open_ws: admission_limit_from_env(
+            "POLYFLARE_ADMISSION_GLOBAL_OPEN_WS",
+            defaults.global_open_ws,
+        ),
+        account_open_ws: admission_limit_from_env(
+            "POLYFLARE_ADMISSION_ACCOUNT_OPEN_WS",
+            defaults.account_open_ws,
+        ),
+        owner_recovery_reserve,
+        owner_recovery_pressure_reserve,
+        wait_timeout: Duration::from_millis(
+            std::env::var("POLYFLARE_ADMISSION_WAIT_TIMEOUT_MS")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+                .unwrap_or(defaults.wait_timeout.as_millis() as u64),
+        ),
+    }
+}
+
 impl ServeConfig {
     pub fn from_env() -> Result<Self, String> {
         let bind_addr =
@@ -719,34 +984,22 @@ impl ServeConfig {
             Err(_) => HashMap::new(),
         };
         let admin_token = std::env::var("POLYFLARE_ADMIN_TOKEN").ok();
-        let live_logs = matches!(
-            std::env::var("POLYFLARE_LIVE_LOGS").as_deref(),
-            Ok("1") | Ok("true")
-        );
-        // M5a: same fail-safe-default convention as `live_logs` above — any unset/empty/unrecognized
-        // value is treated as OFF (never a startup error), so a malformed env var degrades to
-        // today's HTTP-SSE behavior rather than failing to boot.
-        let ws_upstream = matches!(
-            std::env::var("POLYFLARE_WS_UPSTREAM").as_deref(),
-            Ok("1") | Ok("true")
-        );
-        // WS-downstream relay plan Task 2: same fail-safe-default convention as `ws_upstream` above —
-        // any unset/empty/unrecognized value is OFF (never a startup error), so a malformed env var
-        // degrades to today's `426`-on-the-WS-GET behavior rather than failing to boot. Only an
-        // explicit `1`/`true` engages the WS-relay accept path (`crate::ws_relay`).
-        let ws_downstream = matches!(
-            std::env::var("POLYFLARE_WS_DOWNSTREAM").as_deref(),
-            Ok("1") | Ok("true")
-        );
-        // Opt-in client keepalive pings. Same fail-safe-default convention as `ws_upstream` above:
+        // Default ON because the dashboard uses this content-free SSE stream for both Live Logs
+        // and request-list updates. Operators retain a clean polling-only rollback.
+        let live_logs = live_logs_enabled_from_env();
+        // M5a: unset/empty/unrecognized values are treated as OFF (never a startup error), so a
+        // malformed env var degrades to today's HTTP-SSE behavior rather than failing to boot.
+        let http_requests_use_upstream_websocket = http_requests_use_upstream_websocket_from_env();
+        // Default ON now that the relay has per-turn telemetry and reconnect/move coverage.
+        // Operators retain a clean HTTP-SSE rollback with `=0|false|no|off`.
+        let client_websocket_enabled = client_websocket_enabled_from_env();
+        let websocket_idle_policy = websocket_idle_policy_from_env();
+        // Opt-in client keepalive pings for the HTTP-ingress upstream socket.
         // any unset/empty/unrecognized value is OFF, which is the codex-rs-faithful default (no
         // client-initiated ping). Only an explicit `1`/`true` opts into the codex-lb-style keepalive
         // (a deliberate, documented fingerprint divergence for aggressive-NAT/middlebox deployments).
-        let ws_client_ping = matches!(
-            std::env::var("POLYFLARE_WS_CLIENT_PING").as_deref(),
-            Ok("1") | Ok("true")
-        );
-        // D18 Task 4: same fail-safe-default convention as `live_logs`/`ws_upstream` above — any
+        let http_upstream_websocket_ping = http_upstream_websocket_ping_from_env();
+        // D18 Task 4: same fail-safe-default convention as `ws_upstream` above — any
         // unset/empty/unrecognized value is treated as OFF (never a startup error on its own; the
         // consequence of leaving it off on a non-loopback bind with no keys is a REFUSE-TO-START
         // from `crate::posture::resolve_proxy_enforcement`, resolved further down in `serve()`).
@@ -764,6 +1017,7 @@ impl ServeConfig {
         let soft_drain_enabled = soft_drain_enabled_from_env();
         let wake_jitter_ms = wake_jitter_ms_from_env();
         let inflight_penalty_pct = inflight_penalty_pct_from_env();
+        let admission_limits = admission_limits_from_env();
         let request_log_retention_days = request_log_retention_days_from_env();
         let usage_history_retention_days = usage_history_retention_days_from_env();
         let model_catalog_ttl_secs = model_catalog_ttl_secs_from_env();
@@ -781,9 +1035,10 @@ impl ServeConfig {
             pool_strategies,
             admin_token,
             live_logs,
-            ws_upstream,
-            ws_downstream,
-            ws_client_ping,
+            http_requests_use_upstream_websocket,
+            client_websocket_enabled,
+            websocket_idle_policy,
+            http_upstream_websocket_ping,
             max_account_attempts,
             starvation_wait_budget,
             starvation_heartbeat,
@@ -792,6 +1047,7 @@ impl ServeConfig {
             soft_drain_enabled,
             wake_jitter_ms,
             inflight_penalty_pct,
+            admission_limits,
             request_log_retention_days,
             usage_history_retention_days,
             model_catalog_ttl_secs,
@@ -822,6 +1078,175 @@ pub fn key_path(data_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_websocket_is_default_on_with_explicit_opt_out() {
+        assert!(client_websocket_enabled_value(None));
+        for enabled in ["", "1", "true", "TRUE", "not-a-bool"] {
+            assert!(
+                client_websocket_enabled_value(Some(enabled)),
+                "{enabled:?} should retain the default-on relay"
+            );
+        }
+        for disabled in ["0", "false", " False ", "NO", "off"] {
+            assert!(
+                !client_websocket_enabled_value(Some(disabled)),
+                "{disabled:?} should explicitly disable the relay"
+            );
+        }
+    }
+
+    fn ws_relay_idle_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn clear_ws_relay_idle_env() {
+        unsafe {
+            std::env::remove_var("POLYFLARE_CLIENT_WEBSOCKET_ENABLED");
+            std::env::remove_var("POLYFLARE_HTTP_REQUESTS_USE_UPSTREAM_WEBSOCKET");
+            std::env::remove_var("POLYFLARE_HTTP_UPSTREAM_WEBSOCKET_PING");
+            std::env::remove_var("POLYFLARE_WS_DOWNSTREAM");
+            std::env::remove_var("POLYFLARE_WS_UPSTREAM");
+            std::env::remove_var("POLYFLARE_WS_CLIENT_PING");
+            std::env::remove_var("POLYFLARE_WEBSOCKET_IDLE_PING_SECS");
+            std::env::remove_var("POLYFLARE_WEBSOCKET_IDLE_BUDGET_SECS");
+            std::env::remove_var("POLYFLARE_WS_IDLE_PING_SECS");
+            std::env::remove_var("POLYFLARE_WS_IDLE_BUDGET_SECS");
+        }
+    }
+
+    #[test]
+    fn deprecated_websocket_env_names_remain_fallbacks_but_canonical_names_win() {
+        let _guard = ws_relay_idle_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_ws_relay_idle_env();
+        unsafe {
+            std::env::set_var("POLYFLARE_WS_DOWNSTREAM", "false");
+            std::env::set_var("POLYFLARE_WS_UPSTREAM", "true");
+            std::env::set_var("POLYFLARE_WS_CLIENT_PING", "true");
+        }
+        assert!(!client_websocket_enabled_from_env());
+        assert!(http_requests_use_upstream_websocket_from_env());
+        assert!(http_upstream_websocket_ping_from_env());
+
+        unsafe {
+            std::env::set_var("POLYFLARE_CLIENT_WEBSOCKET_ENABLED", "true");
+            std::env::set_var("POLYFLARE_HTTP_REQUESTS_USE_UPSTREAM_WEBSOCKET", "false");
+            std::env::set_var("POLYFLARE_HTTP_UPSTREAM_WEBSOCKET_PING", "false");
+        }
+        assert!(client_websocket_enabled_from_env());
+        assert!(!http_requests_use_upstream_websocket_from_env());
+        assert!(!http_upstream_websocket_ping_from_env());
+        clear_ws_relay_idle_env();
+    }
+
+    #[test]
+    fn ws_relay_idle_defaults_are_stable() {
+        let _guard = ws_relay_idle_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_ws_relay_idle_env();
+
+        let policy = websocket_idle_policy_from_env();
+        assert_eq!(
+            policy.ping_interval,
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(policy.idle_budget, std::time::Duration::from_secs(1500));
+    }
+
+    #[test]
+    fn ws_relay_idle_zero_ping_disables_keepalives() {
+        let _guard = ws_relay_idle_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_ws_relay_idle_env();
+        unsafe {
+            std::env::set_var("POLYFLARE_WEBSOCKET_IDLE_PING_SECS", "0");
+        }
+
+        assert_eq!(websocket_idle_policy_from_env().ping_interval, None);
+        clear_ws_relay_idle_env();
+    }
+
+    #[test]
+    fn ws_relay_idle_values_clamp_to_safe_minimums() {
+        let _guard = ws_relay_idle_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_ws_relay_idle_env();
+        unsafe {
+            std::env::set_var("POLYFLARE_WEBSOCKET_IDLE_PING_SECS", "1");
+            std::env::set_var("POLYFLARE_WEBSOCKET_IDLE_BUDGET_SECS", "1");
+        }
+
+        let policy = websocket_idle_policy_from_env();
+        assert_eq!(
+            policy.ping_interval,
+            Some(std::time::Duration::from_secs(5))
+        );
+        assert_eq!(policy.idle_budget, std::time::Duration::from_secs(60));
+        clear_ws_relay_idle_env();
+    }
+
+    #[test]
+    fn ws_relay_idle_values_clamp_to_safe_maximums() {
+        let _guard = ws_relay_idle_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_ws_relay_idle_env();
+        unsafe {
+            std::env::set_var("POLYFLARE_WEBSOCKET_IDLE_PING_SECS", u64::MAX.to_string());
+            std::env::set_var("POLYFLARE_WEBSOCKET_IDLE_BUDGET_SECS", u64::MAX.to_string());
+        }
+
+        let policy = websocket_idle_policy_from_env();
+        assert_eq!(
+            policy.ping_interval,
+            Some(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(policy.idle_budget, std::time::Duration::from_secs(86_400));
+        clear_ws_relay_idle_env();
+    }
+
+    #[test]
+    fn ws_relay_idle_malformed_values_fall_back_to_defaults() {
+        let _guard = ws_relay_idle_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_ws_relay_idle_env();
+        unsafe {
+            std::env::set_var("POLYFLARE_WEBSOCKET_IDLE_PING_SECS", "soon");
+            std::env::set_var("POLYFLARE_WEBSOCKET_IDLE_BUDGET_SECS", "-1");
+        }
+
+        let policy = websocket_idle_policy_from_env();
+        assert_eq!(
+            policy.ping_interval,
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(policy.idle_budget, std::time::Duration::from_secs(1500));
+        clear_ws_relay_idle_env();
+    }
+
+    #[test]
+    fn live_logs_are_default_on_with_explicit_opt_out() {
+        assert!(live_logs_enabled_value(None));
+        for enabled in ["", "1", "true", "TRUE", "yes", "not-a-bool"] {
+            assert!(
+                live_logs_enabled_value(Some(enabled)),
+                "{enabled:?} should retain the default-on dashboard stream"
+            );
+        }
+        for disabled in ["0", "false", " False ", "NO", "off"] {
+            assert!(
+                !live_logs_enabled_value(Some(disabled)),
+                "{disabled:?} should explicitly disable the dashboard stream"
+            );
+        }
+    }
 
     #[test]
     fn parse_pool_strategies_reads_pairs_and_rejects_bad_input() {
@@ -1901,5 +2326,14 @@ mod tests {
             3650,
             "at the MAX boundary"
         );
+    }
+
+    #[test]
+    fn owner_recovery_reserve_always_leaves_one_ordinary_slot_when_bounded() {
+        assert_eq!(clamp_owner_recovery_reserve(0, 99), 99);
+        assert_eq!(clamp_owner_recovery_reserve(1, 1), 0);
+        assert_eq!(clamp_owner_recovery_reserve(4, 1), 1);
+        assert_eq!(clamp_owner_recovery_reserve(4, 4), 3);
+        assert_eq!(clamp_owner_recovery_reserve(4, 99), 3);
     }
 }

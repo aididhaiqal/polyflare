@@ -28,8 +28,11 @@ pub(crate) enum UpstreamSignal {
     /// `websocket_connection_limit_reached` — the relay must INTERCEPT this frame (never forward
     /// it downstream) and re-dial the same account.
     ConnectionLimit,
-    /// `previous_response_not_found` — forward verbatim; the client (codex CLI) resolves this by
-    /// stripping the anchor and resending, exactly as it does over HTTP-SSE.
+    /// `previous_response_not_found` — the pump decides: an anchored generating in-flight turn is
+    /// answered with a forged RETRYABLE envelope so the CLIENT resends its full history (over WS a
+    /// raw 400 maps to codex-rs's non-retryable `InvalidRequest` and wedges the task, and an
+    /// anchored frame's `input` is only a delta suffix, so no server-side replay can recover it);
+    /// anything else is forwarded verbatim.
     AnchorMissing,
     /// Any other error envelope — bench the account and re-select (move-or-retry). Phase-2's Task 3
     /// forwards this exactly like `Normal` (the pump's `_ =>` arm); the inner `FailureSignal` is not
@@ -49,7 +52,27 @@ pub(crate) fn classify_upstream_signal(text: &str) -> UpstreamSignal {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
         return UpstreamSignal::Normal;
     };
-    if v.get("type").and_then(|t| t.as_str()) != Some("error") {
+    let frame_type = v.get("type").and_then(|t| t.as_str());
+    if frame_type == Some("response.failed") {
+        let code = v
+            .pointer("/response/error/code")
+            .and_then(serde_json::Value::as_str);
+        let status = match code {
+            Some("rate_limit_exceeded" | "insufficient_quota" | "usage_not_included") => 429,
+            Some("server_is_overloaded" | "slow_down") => 503,
+            Some("context_length_exceeded" | "invalid_prompt" | "bio_policy" | "cyber_policy") => {
+                return UpstreamSignal::Normal
+            }
+            // codex-rs treats otherwise-unclassified response.failed errors as retryable.
+            _ => 500,
+        };
+        return UpstreamSignal::Error(FailureSignal {
+            status,
+            retry_after: None,
+            error_code: code.map(str::to_string),
+        });
+    }
+    if frame_type != Some("error") {
         return UpstreamSignal::Normal;
     }
 
@@ -91,6 +114,46 @@ mod tests {
             classify_upstream_signal(r#"{"type":"response.completed","response":{"id":"resp_1"}}"#),
             UpstreamSignal::Normal
         ));
+    }
+
+    #[test]
+    fn response_failed_capacity_and_overload_frames_are_health_signals() {
+        for (code, expected_status) in [
+            ("rate_limit_exceeded", 429),
+            ("insufficient_quota", 429),
+            ("usage_not_included", 429),
+            ("server_is_overloaded", 503),
+            ("slow_down", 503),
+        ] {
+            let frame = format!(
+                r#"{{"type":"response.failed","response":{{"error":{{"code":"{code}","message":"ignored"}}}}}}"#
+            );
+            match classify_upstream_signal(&frame) {
+                UpstreamSignal::Error(signal) => {
+                    assert_eq!(signal.status, expected_status, "{code}");
+                    assert_eq!(signal.error_code.as_deref(), Some(code));
+                }
+                _ => panic!("expected response.failed {code} to affect account health"),
+            }
+        }
+    }
+
+    #[test]
+    fn response_failed_request_errors_remain_client_level() {
+        for code in [
+            "context_length_exceeded",
+            "invalid_prompt",
+            "bio_policy",
+            "cyber_policy",
+        ] {
+            let frame = format!(
+                r#"{{"type":"response.failed","response":{{"error":{{"code":"{code}"}}}}}}"#
+            );
+            assert!(matches!(
+                classify_upstream_signal(&frame),
+                UpstreamSignal::Normal
+            ));
+        }
     }
 
     #[test]

@@ -71,6 +71,7 @@ async fn state() -> Arc<AppState> {
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -106,6 +107,7 @@ fn ctx(now: i64, seed: u64) -> SelectionCtx {
         tier: None,
         // The production default (`POLYFLARE_INFLIGHT_PENALTY_PCT` unset ⇒ 2.5).
         inflight_penalty_pct: 2.5,
+        request_pressure_units: 1,
     }
 }
 
@@ -179,6 +181,48 @@ async fn busy_account_holding_several_leases_is_depreferred_in_live_selection() 
 
     // Cleanup: release every held lease so this test doesn't leak into later assertions.
     drop(guards);
+}
+
+#[tokio::test]
+async fn one_large_request_exerts_more_live_selection_pressure_than_one_tiny_request() {
+    let state = state().await;
+    let now = 1_500_000;
+    let large = AccountId::from("large");
+    let tiny = AccountId::from("tiny");
+    let large_guard =
+        state
+            .runtime
+            .acquire_in_flight_weighted(&large, now, &state.lease_metrics, 8);
+    let tiny_guard = state
+        .runtime
+        .acquire_in_flight_weighted(&tiny, now, &state.lease_metrics, 1);
+
+    let mut snaps = vec![snap("large"), snap("tiny")];
+    state.runtime.overlay(&mut snaps, now);
+    assert_eq!(snaps[0].in_flight, 1);
+    assert_eq!(snaps[1].in_flight, 1);
+    assert_eq!(snaps[0].in_flight_pressure, 8);
+    assert_eq!(snaps[1].in_flight_pressure, 1);
+
+    let mut tiny_wins = 0;
+    for seed in 0..1_000u64 {
+        if state
+            .selector
+            .pick(&snaps, &ctx(now, seed))
+            .unwrap()
+            .as_str()
+            == "tiny"
+        {
+            tiny_wins += 1;
+        }
+    }
+    assert!(
+        tiny_wins > 650,
+        "equal request counts must not hide the large turn's pressure, got {tiny_wins}/1000"
+    );
+
+    drop(large_guard);
+    drop(tiny_guard);
 }
 
 /// Releasing the leases (a) restores `in_flight` to 0 (re-proving C9 Task 1-2's leak-proof
