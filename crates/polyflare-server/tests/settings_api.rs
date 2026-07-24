@@ -52,6 +52,37 @@ async fn patch_max_account_attempts_applies_live_and_persists() {
 }
 
 #[tokio::test]
+async fn patch_chatgpt_backend_passthrough_disable_applies_live_and_persists() {
+    let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
+    let (pf, state) = spawn(up).await;
+    let c = reqwest::Client::new();
+
+    assert!(state.runtime_settings.chatgpt_backend_passthrough_enabled());
+    let resp = c
+        .patch(format!("{pf}/api/settings"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({
+            "chatgpt_backend_passthrough_enabled": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(!state.runtime_settings.chatgpt_backend_passthrough_enabled());
+    assert_eq!(
+        state
+            .store
+            .settings()
+            .get_all()
+            .await
+            .unwrap()
+            .get("chatgpt_backend_passthrough_enabled")
+            .map(String::as_str),
+        Some("false")
+    );
+}
+
+#[tokio::test]
 async fn patch_inflight_penalty_pct_clamps_to_fifty_and_persists_the_clamped_value() {
     let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
     let (pf, state) = spawn(up).await;
@@ -252,6 +283,7 @@ async fn get_returns_every_field_with_the_correct_class() {
         "request_log_retention_days",
         "usage_history_retention_days",
         "live_logs",
+        "chatgpt_backend_passthrough_enabled",
     ];
     for key in live_keys {
         let f = find_field(&body, key);
@@ -289,6 +321,10 @@ async fn get_returns_every_field_with_the_correct_class() {
     assert_eq!(
         find_field(&body, "http_requests_use_upstream_websocket")["label"],
         "Use an upstream WebSocket for HTTP requests"
+    );
+    assert_eq!(
+        find_field(&body, "chatgpt_backend_passthrough_enabled")["default"],
+        "true"
     );
 
     let fixed_keys = [

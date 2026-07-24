@@ -68,6 +68,7 @@ import {
   requestBucketErrorRate,
   summarizeRequestVolume,
 } from "../lib/requestVolume";
+import { backendRequestDisplay } from "../lib/requestClassification";
 import { useQuotaDisplayPreference } from "../preferences/QuotaDisplayPreference";
 import {
   requestOutcomeIsFailure,
@@ -127,6 +128,7 @@ const BUILT_IN_PROVIDER_FILTERS: Array<{ value: ProviderFilter; label: string }>
   { value: "all", label: "All" },
   { value: "codex", label: "Codex" },
   { value: "claude", label: "Claude" },
+  { value: "chatgpt_backend", label: "Backend" },
 ];
 
 const OVERVIEW_RANGES: Array<{ value: OverviewRange; label: string }> = [
@@ -2770,16 +2772,17 @@ function RecentRequestsCard(
           </div>
           <div className="mt-2 divide-y divide-border/55 sm:hidden">
             {visibleRows.map((row) => {
+              const backend = backendRequestDisplay(row);
               return (
                 <article key={row.id} className="py-3 first:pt-1 last:pb-0">
                   <div className="flex min-w-0 items-start justify-between gap-3">
                     <div className="min-w-0">
                       <div className="flex min-w-0 items-center gap-1.5">
-                        <ProviderTag provider={row.provider} />
+                        <ProviderTag provider={backend ? "chatgpt_backend" : row.provider} />
                         <ServiceTierBadge tier={row.service_tier} />
                         <TransportPill transport={row.transport} />
                         <span className="truncate text-[11px] font-semibold text-fg">
-                          {row.model ?? row.path}
+                          {backend?.operationLabel ?? row.model ?? row.path}
                         </span>
                       </div>
                       <div className="mt-1 truncate font-mono text-[9px] text-fg opacity-45">
@@ -2807,7 +2810,11 @@ function RecentRequestsCard(
 
                   <div className="mt-2 flex min-w-0 items-center justify-between gap-3">
                     <div className="min-w-0">
-                      {row.account_id ? (
+                      {backend ? (
+                        <span className="block truncate text-[10px] font-semibold text-signal">
+                          {backend.targetLabel}
+                        </span>
+                      ) : row.account_id ? (
                         <Link
                           to={`/accounts/${encodeURIComponent(row.account_id)}`}
                           className="block truncate text-[10px] font-semibold text-fg no-underline hover:text-accent"
@@ -2880,13 +2887,16 @@ function RecentRequestsCard(
             </thead>
             <tbody>
               {visibleRows.map((row) => {
+                const backend = backendRequestDisplay(row);
                 return (
                   <tr key={row.id} className="border-b border-border/55 last:border-0 hover:bg-muted/35">
                     <td className="whitespace-nowrap px-2 py-2 font-mono text-fg opacity-65">
                       {relTime(row.requested_at, nowMs)}
                     </td>
                     <td className="max-w-[190px] px-2 py-2">
-                      {row.account_id ? (
+                      {backend ? (
+                        <span className="font-semibold text-signal">{backend.targetLabel}</span>
+                      ) : row.account_id ? (
                         <Link
                           to={`/accounts/${encodeURIComponent(row.account_id)}`}
                           className="block truncate font-semibold text-fg no-underline hover:text-accent"
@@ -2902,9 +2912,11 @@ function RecentRequestsCard(
                     </td>
                     <td className="max-w-[240px] px-2 py-2">
                       <div className="flex items-center gap-1.5">
-                        <ProviderTag provider={row.provider} />
+                        <ProviderTag provider={backend ? "chatgpt_backend" : row.provider} />
                         <ServiceTierBadge tier={row.service_tier} />
-                        <span className="truncate font-medium text-fg">{row.model ?? row.path}</span>
+                        <span className="truncate font-medium text-fg">
+                          {backend?.operationLabel ?? row.model ?? row.path}
+                        </span>
                       </div>
                       <div className="mt-0.5 truncate font-mono text-[9px] text-fg opacity-40">
                         {row.method} {row.path}

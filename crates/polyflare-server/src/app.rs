@@ -501,6 +501,14 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             get(crate::chatgpt_backend::pooled_usage_handler),
         )
         .route(
+            "/backend-api/wham/remote/control/server",
+            get(crate::chatgpt_backend::remote_control_ws_handler),
+        )
+        .route(
+            "/{pool}/backend-api/wham/remote/control/server",
+            get(crate::chatgpt_backend::pooled_remote_control_ws_handler),
+        )
+        .route(
             "/backend-api/{*path}",
             any(crate::chatgpt_backend::passthrough_handler),
         )

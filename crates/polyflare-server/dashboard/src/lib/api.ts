@@ -405,7 +405,7 @@ export interface ReportBucketView extends ReportMetricsView {
 }
 
 /** `read_api.rs::ReportBreakdownView` — one row of `ReportsView.breakdown`: metrics scoped to one
- * value of the requested `dimension` (`account`/`model`/`provider`). */
+ * value of the requested `dimension` (`account`/`model`/`provider`/`operation`). */
 export interface ReportBreakdownView extends ReportMetricsView {
   key: string;
 }
@@ -787,7 +787,7 @@ export function deleteAccount(id: string, opts?: { deleteHistory?: boolean }): P
   return fetchJson<OkResponse>(`/api/accounts/${encodeURIComponent(id)}${qs}`, { method: "DELETE" });
 }
 
-/** Body for `PATCH /api/settings`: one or more of the 10 live setting keys, each value typed per
+/** Body for `PATCH /api/settings`: one or more live setting keys, each value typed per
  * that field's `kind` (see `SettingFieldView`) — a JSON number for `u32`/`secs`/`f64` kinds, a
  * JSON boolean for `bool` kinds. Never a string for these — the backend 400s on a wrong JSON type
  * (`write_api.rs::patch_settings_handler`). Validated all-or-nothing server-side: an unknown key

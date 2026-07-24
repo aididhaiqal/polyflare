@@ -401,9 +401,9 @@ pub struct ReportBucket {
 }
 
 /// One row of [`RequestLogRepo::reports_breakdown`]: [`ReportMetrics`] scoped to one value of the
-/// requested dimension (account/model/provider). `key` is the dimension's raw value, or `""` for
-/// NULL — `account_id`/`model` are nullable columns (see [`RequestLogRecord`]); `provider` is
-/// `NOT NULL` so `""` never occurs for that dimension.
+/// requested dimension (account/model/provider/operation). `key` is the dimension's raw value,
+/// or `""` for NULL — `account_id`/`model` are nullable columns (see [`RequestLogRecord`]);
+/// provider and the content-safe derived operation label are never NULL.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReportBreakdownRow {
     pub key: String,
@@ -873,16 +873,15 @@ impl RequestLogRepo {
     }
 
     /// Content-free [`ReportBreakdownRow`] rollup grouped by one dimension (`account`/`model`/
-    /// `provider`, mapping to the account-or-credential target/model/provider dimensions) over
-    /// `request_log` rows
+    /// `provider`/`operation`, mapping to the account-or-credential target/model/provider or a
+    /// bounded label derived from the normalized route) over `request_log` rows
     /// at/after `since_ts`, optionally narrowed to one `provider` — the Reports/Analytics
     /// endpoint's per-account/per-model/per-provider cost breakdown table. Rows are ordered by
     /// summed `cost_usd` descending (biggest spenders first). `dimension` values other than
-    /// `"account"`/`"model"`/`"provider"` default to `"model"`; the handler is expected to validate
-    /// `dimension` before calling this, so this fallback is defense-in-depth, not the primary
-    /// validation. NULL dimension values (`account_id`/`model` are nullable — see
-    /// [`RequestLogRecord`]) collapse into a single `""`-keyed row via `COALESCE(col, '')`;
-    /// `provider` is `NOT NULL` so this never applies to that dimension.
+    /// `"account"`/`"model"`/`"provider"`/`"operation"` default to `"model"`; the handler is
+    /// expected to validate `dimension` before calling this, so this fallback is defense-in-depth,
+    /// not the primary validation. NULL dimension values (`account_id`/`model` are nullable — see
+    /// [`RequestLogRecord`]) collapse into a single `""`-keyed row via `COALESCE(col, '')`.
     pub async fn reports_breakdown(
         &self,
         since_ts: i64,
@@ -892,6 +891,13 @@ impl RequestLogRepo {
         let expression = match dimension {
             "account" => "COALESCE(provider_credential_id, account_id, '')",
             "provider" => "provider",
+            "operation" => {
+                "CASE \
+                    WHEN path LIKE 'chatgpt_backend_synthetic_%' THEN 'Synthetic usage' \
+                    WHEN path LIKE 'chatgpt_backend_passthrough_%' THEN 'Backend passthrough' \
+                    ELSE 'Model response' \
+                 END"
+            }
             _ => "COALESCE(model, '')",
         };
         let sql = format!(
@@ -1840,6 +1846,75 @@ mod tests {
             "only row3 has a NULL account_id"
         );
         assert_eq!(empty_key_row.metrics.cost_usd, 0.0);
+    }
+
+    #[tokio::test]
+    async fn reports_breakdown_by_operation_separates_backend_traffic_from_model_responses() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        let mut synthetic = report_row(
+            10,
+            "chatgpt_backend",
+            "unused",
+            None,
+            200,
+            10,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+        );
+        synthetic.path = "chatgpt_backend_synthetic_wham/usage".into();
+        synthetic.model = None;
+        repo.insert(&synthetic).await.unwrap();
+
+        let mut passthrough = report_row(
+            20,
+            "chatgpt_backend",
+            "unused",
+            None,
+            101,
+            20,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+        );
+        passthrough.path = "chatgpt_backend_passthrough_wham/remote/control/server".into();
+        passthrough.model = None;
+        repo.insert(&passthrough).await.unwrap();
+
+        repo.insert(&report_row(
+            30,
+            "codex",
+            "gpt-5.6",
+            Some("acct"),
+            200,
+            30,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let rows = repo.reports_breakdown(0, "operation", None).await.unwrap();
+        for expected in ["Synthetic usage", "Backend passthrough", "Model response"] {
+            let row = rows
+                .iter()
+                .find(|row| row.key == expected)
+                .unwrap_or_else(|| panic!("missing operation bucket {expected}: {rows:?}"));
+            assert_eq!(row.metrics.requests, 1);
+        }
     }
 
     /// An unrecognized `dimension` value defaults to grouping by `model` (defense-in-depth; the

@@ -1,11 +1,11 @@
-//! Live-editable Settings subsystem Task 2: `RuntimeSettings`, an atomic holder for the 10
-//! live-editable `ServeConfig` fields. Task 1's pure `clamp_<field>` fns (`crate::config`) are the
+//! Live-editable Settings subsystem Task 2: `RuntimeSettings`, an atomic holder for the 11
+//! live-editable settings. Task 1's pure `clamp_<field>` fns (`crate::config`) are the
 //! single source of truth for each field's bound; `set` re-validates every write through the SAME
 //! fns the boot path (`ServeConfig::from_env`) uses — never a second copy of a bound that can
 //! drift. A later task wires this into `AppState` + the settings PATCH endpoint; this module only
 //! holds the live values and validates writes.
 //!
-//! **Ordering:** every load/store is `Ordering::Relaxed` — each of the 10 fields is an
+//! **Ordering:** every load/store is `Ordering::Relaxed` — each of the 11 fields is an
 //! independently atomic cell with no cross-field invariant that needs a stronger ordering, save
 //! one: `starvation_heartbeat`'s clamp reads the CURRENT `starvation_wait_budget` atomic (via
 //! [`RuntimeSettings::starvation_wait_budget`]) at the moment of the `set` call, not the value
@@ -27,7 +27,7 @@ use crate::config::{
 /// A raw value submitted to [`RuntimeSettings::set`], before clamping. The three variants mirror
 /// the three atomic families this module holds: every `u32`- or `u64`-backed field (counts, ms,
 /// secs) takes `U64` and narrows to the field's width; the one `f64`-backed field
-/// (`inflight_penalty_pct`) takes `F64`; the two flags take `Bool`. `set` rejects a value
+/// (`inflight_penalty_pct`) takes `F64`; flags take `Bool`. `set` rejects a value
 /// submitted against the wrong field's kind (`SettingsError::WrongKind`) rather than silently
 /// coercing it (e.g. truncating an `F64` into an integer field).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -41,7 +41,7 @@ pub enum SettingValue {
 /// caller-supplied key name, never any other detail.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SettingsError {
-    /// `key` is not one of the 10 live-editable fields (either misspelled, or a real
+    /// `key` is not one of the live-editable fields (either misspelled, or a real
     /// `ServeConfig` field that is not live-editable).
     #[error("unknown or non-live setting key: {0}")]
     UnknownKey(String),
@@ -51,7 +51,7 @@ pub enum SettingsError {
     WrongKind(String),
 }
 
-/// Atomic holder for the 10 live-editable `ServeConfig` fields (live-editable Settings subsystem,
+/// Atomic holder for the live-editable settings (live-editable Settings subsystem,
 /// Task 2). Seeded once from an already-clamped `ServeConfig`
 /// (`ServeConfig::from_env` already ran every field through its `clamp_<field>` fn at boot), then
 /// mutated only via [`RuntimeSettings::set`], which re-validates through the SAME clamp fns —
@@ -70,6 +70,7 @@ pub struct RuntimeSettings {
     request_log_retention_days: AtomicU32,
     usage_history_retention_days: AtomicU32,
     live_logs: AtomicBool,
+    chatgpt_backend_passthrough_enabled: AtomicBool,
     // Restart-required settings are immutable snapshots of what this process actually applied at
     // boot. PATCH persists a configured value for the next boot but deliberately does not mutate
     // these fields, allowing GET /api/settings to report an honest pending-restart state.
@@ -81,7 +82,8 @@ pub struct RuntimeSettings {
 }
 
 /// Named-field seed for [`RuntimeSettings::new_from_fields`] — see that fn's doc. Field names/
-/// types mirror `ServeConfig`'s (and the former `AppState`'s) 10 live-editable fields exactly.
+/// types mirror the `ServeConfig`-backed live-editable fields. Gateway-only flags use safe
+/// defaults in `RuntimeSettings` so existing test-state constructors do not need to opt in.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RuntimeSettingsFields {
     pub max_account_attempts: u32,
@@ -121,6 +123,7 @@ impl RuntimeSettings {
             request_log_retention_days: AtomicU32::new(cfg.request_log_retention_days),
             usage_history_retention_days: AtomicU32::new(cfg.usage_history_retention_days),
             live_logs: AtomicBool::new(cfg.live_logs),
+            chatgpt_backend_passthrough_enabled: AtomicBool::new(true),
             client_websocket_enabled: cfg.client_websocket_enabled,
             http_requests_use_upstream_websocket: cfg.http_requests_use_upstream_websocket,
             http_upstream_websocket_ping: cfg.http_upstream_websocket_ping,
@@ -152,6 +155,7 @@ impl RuntimeSettings {
             request_log_retention_days: AtomicU32::new(f.request_log_retention_days),
             usage_history_retention_days: AtomicU32::new(f.usage_history_retention_days),
             live_logs: AtomicBool::new(f.live_logs),
+            chatgpt_backend_passthrough_enabled: AtomicBool::new(true),
             client_websocket_enabled: true,
             http_requests_use_upstream_websocket: false,
             http_upstream_websocket_ping: false,
@@ -200,6 +204,11 @@ impl RuntimeSettings {
         self.live_logs.load(Ordering::Relaxed)
     }
 
+    pub fn chatgpt_backend_passthrough_enabled(&self) -> bool {
+        self.chatgpt_backend_passthrough_enabled
+            .load(Ordering::Relaxed)
+    }
+
     pub fn client_websocket_enabled(&self) -> bool {
         self.client_websocket_enabled
     }
@@ -220,7 +229,7 @@ impl RuntimeSettings {
         self.websocket_idle_budget_secs
     }
 
-    /// Validate + apply a live write to one of the 10 fields. Unknown/non-live `key` ⇒
+    /// Validate + apply a live write. Unknown/non-live `key` ⇒
     /// `UnknownKey`; a known key with the wrong `SettingValue` kind ⇒ `WrongKind`; otherwise the
     /// value is clamped via that field's `clamp_<field>` fn (`starvation_heartbeat` clamps
     /// against the CURRENT `starvation_wait_budget`, read live — see the module doc's Ordering
@@ -291,6 +300,12 @@ impl RuntimeSettings {
                 self.live_logs.store(b, Ordering::Relaxed);
                 Ok(b.to_string())
             }
+            "chatgpt_backend_passthrough_enabled" => {
+                let b = expect_bool(key, raw)?;
+                self.chatgpt_backend_passthrough_enabled
+                    .store(b, Ordering::Relaxed);
+                Ok(b.to_string())
+            }
             _ => Err(SettingsError::UnknownKey(key.to_string())),
         }
     }
@@ -299,7 +314,7 @@ impl RuntimeSettings {
 /// Task 4 (wiring): parse a persisted `settings` table row's string `value` into the
 /// [`SettingValue`] variant [`RuntimeSettings::set`] expects for `key`, per that field's kind
 /// (see `SettingValue`'s doc for the three families). Pure and total: an unknown `key` (not one of
-/// the 10 live-editable fields) or a `value` that fails to parse as that field's kind both yield
+/// the live-editable fields) or a `value` that fails to parse as that field's kind both yield
 /// `None` — the caller ([`overlay_persisted_settings`]) treats `None` as "skip this row," never a
 /// panic, and never a partial/best-guess apply. A row that PARSES but is out of range (e.g.
 /// `max_account_attempts=99999`) is NOT this function's concern — it returns `Some`, and `set`'s
@@ -307,7 +322,9 @@ impl RuntimeSettings {
 /// that at apply time, exactly as it does for a live PATCH.
 pub fn parse_setting_value(key: &str, s: &str) -> Option<SettingValue> {
     match key {
-        "soft_drain_enabled" | "live_logs" => s.parse::<bool>().ok().map(SettingValue::Bool),
+        "soft_drain_enabled" | "live_logs" | "chatgpt_backend_passthrough_enabled" => {
+            s.parse::<bool>().ok().map(SettingValue::Bool)
+        }
         "inflight_penalty_pct" => s.parse::<f64>().ok().map(SettingValue::F64),
         "max_account_attempts"
         | "starvation_wait_budget"
@@ -340,7 +357,7 @@ pub fn parse_setting_value(key: &str, s: &str) -> Option<SettingValue> {
 /// heartbeat-first would clamp against the still-seeded default budget rather than the
 /// about-to-be-applied persisted one, settling on a different (wrong) heartbeat depending on
 /// hash-iteration luck — see `crate::runtime_settings`'s module doc's Ordering note. A key in
-/// `overlay` that isn't one of the 10 live keys is never visited (there is no persisted row for
+/// `overlay` that isn't one of the live keys is never visited (there is no persisted row for
 /// it to skip past), matching `parse_setting_value`'s `None` for an unknown key.
 pub fn overlay_persisted_settings(rs: &RuntimeSettings, overlay: &HashMap<String, String>) {
     for key in crate::read_api::LIVE_KEYS_ORDER {
@@ -377,7 +394,7 @@ fn expect_f64(key: &str, raw: SettingValue) -> Result<f64, SettingsError> {
     }
 }
 
-/// Kind-check helper for `set`'s two flag fields: only `SettingValue::Bool` is accepted.
+/// Kind-check helper for `set`'s flag fields: only `SettingValue::Bool` is accepted.
 fn expect_bool(key: &str, raw: SettingValue) -> Result<bool, SettingsError> {
     match raw {
         SettingValue::Bool(b) => Ok(b),
@@ -393,7 +410,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    /// A `ServeConfig` with distinct, easily-recognizable values for each of the 10 live-editable
+    /// A `ServeConfig` with distinct, easily-recognizable values for each config-backed live
     /// fields (so a seeding bug that swaps two fields is caught, not silently masked by equal
     /// values). The other (non-live) fields are filled with harmless placeholders — this module
     /// never reads them.
@@ -445,6 +462,7 @@ mod tests {
         assert_eq!(rs.request_log_retention_days(), 30);
         assert_eq!(rs.usage_history_retention_days(), 45);
         assert!(!rs.live_logs());
+        assert!(rs.chatgpt_backend_passthrough_enabled());
         assert!(!rs.client_websocket_enabled());
         assert!(!rs.http_requests_use_upstream_websocket());
         assert!(!rs.http_upstream_websocket_ping());
@@ -638,6 +656,20 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_backend_passthrough_defaults_on_and_can_be_disabled_live() {
+        let rs = RuntimeSettings::new(&test_config());
+        assert!(rs.chatgpt_backend_passthrough_enabled());
+        let stored = rs
+            .set(
+                "chatgpt_backend_passthrough_enabled",
+                SettingValue::Bool(false),
+            )
+            .unwrap();
+        assert_eq!(stored, "false");
+        assert!(!rs.chatgpt_backend_passthrough_enabled());
+    }
+
+    #[test]
     fn set_unknown_key_is_rejected() {
         let rs = RuntimeSettings::new(&test_config());
         let err = rs
@@ -706,6 +738,10 @@ mod tests {
             Some(SettingValue::Bool(false))
         );
         assert_eq!(
+            parse_setting_value("chatgpt_backend_passthrough_enabled", "true"),
+            Some(SettingValue::Bool(true))
+        );
+        assert_eq!(
             parse_setting_value("inflight_penalty_pct", "12.5"),
             Some(SettingValue::F64(12.5))
         );
@@ -745,6 +781,18 @@ mod tests {
         overlay.insert("live_logs".to_string(), "true".to_string());
         overlay_persisted_settings(&rs, &overlay);
         assert!(rs.live_logs());
+    }
+
+    #[test]
+    fn overlay_persisted_settings_can_disable_chatgpt_backend_passthrough() {
+        let rs = RuntimeSettings::new(&test_config());
+        let mut overlay = HashMap::new();
+        overlay.insert(
+            "chatgpt_backend_passthrough_enabled".to_string(),
+            "false".to_string(),
+        );
+        overlay_persisted_settings(&rs, &overlay);
+        assert!(!rs.chatgpt_backend_passthrough_enabled());
     }
 
     #[test]

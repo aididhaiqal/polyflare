@@ -2029,6 +2029,22 @@ async fn reports_endpoint_assembles_zero_filled_series_breakdown_and_totals() {
         assert_eq!(b["errors"], 0);
         assert_eq!(b["tokens"], 0);
     }
+
+    let operation_view: serde_json::Value = client
+        .get(format!(
+            "{pf}/api/reports?range=7d&dimension=operation&provider=codex"
+        ))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let operation_breakdown = operation_view["breakdown"].as_array().unwrap();
+    assert_eq!(operation_breakdown.len(), 1);
+    assert_eq!(operation_breakdown[0]["key"], "Model response");
+    assert_eq!(operation_breakdown[0]["requests"], 3);
 }
 
 #[tokio::test]

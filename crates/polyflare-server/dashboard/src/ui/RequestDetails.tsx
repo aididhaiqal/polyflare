@@ -5,6 +5,7 @@ import clsx from "clsx";
 import type { RequestRowView } from "../lib/api";
 import { accountDisplayLabel } from "../lib/accountDisplay";
 import { compactNum, latency, tpsFmt } from "../lib/format";
+import { backendRequestDisplay } from "../lib/requestClassification";
 import {
   requestOutcomeIsFailure,
   requestOutcomeIsSuccess,
@@ -59,6 +60,7 @@ export function RequestDetailPanel({
   row: RequestRowView;
   accountLabel?: string;
 }) {
+  const backend = backendRequestDisplay(row);
   const tokenValue = row.total_tokens === null ? "—" : compactNum(row.total_tokens);
   const cacheMeta =
     row.cached_input_tokens === null
@@ -66,7 +68,9 @@ export function RequestDetailPanel({
       : `${compactNum(row.cached_input_tokens)} cached input`;
   const orchestration =
     (row.orchestration_input_tokens ?? 0) + (row.orchestration_output_tokens ?? 0);
-  const modelContract = [row.model ?? "—", row.reasoning_effort].filter(Boolean).join(" · ");
+  const modelContract = [backend?.operationLabel ?? row.model ?? "—", row.reasoning_effort]
+    .filter(Boolean)
+    .join(" · ");
 
   return (
     <div className="flex flex-col gap-3 px-4 py-3">
@@ -87,9 +91,13 @@ export function RequestDetailPanel({
             Routing envelope
           </div>
           <DetailField
-            label={row.target_kind === "credential" ? "Credential" : "Account"}
+            label={
+              backend ? "Target" : row.target_kind === "credential" ? "Credential" : "Account"
+            }
             value={
-              row.target_kind === "credential" ? (
+              backend ? (
+                backend.targetLabel
+              ) : row.target_kind === "credential" ? (
                 <ShieldedAccount
                   id={row.provider_credential_id ?? "unassigned"}
                   label={accountLabel ?? row.provider_credential_id ?? "Unassigned"}
@@ -104,9 +112,9 @@ export function RequestDetailPanel({
               )
             }
           />
-          <DetailField label="Provider" value={row.provider} />
+          <DetailField label="Provider" value={backend ? "chatgpt_backend" : row.provider} />
           <DetailField label="Tier" value={<ServiceTierBadge tier={row.service_tier} />} />
-          <DetailField label="Model" value={modelContract} />
+          <DetailField label={backend ? "Operation" : "Model"} value={modelContract} />
           <DetailField label="Transport" value={row.transport ?? "—"} />
           {row.upstream_model && row.upstream_model !== row.model && (
             <DetailField label="Upstream model" value={row.upstream_model} mono />
@@ -137,7 +145,7 @@ export function RequestDetailPanel({
             />
           )}
           {row.error_code && <DetailField label="Error code" value={row.error_code} mono />}
-          <DetailField label="Agent" value={row.subagent ?? "main"} />
+          {!backend && <DetailField label="Agent" value={row.subagent ?? "main"} />}
           <DetailField
             label="Session"
             value={
@@ -246,6 +254,7 @@ export function RequestDetailsDialog({
   useDialogA11y(row !== null, onClose, dialogRef, closeRef);
 
   if (!row) return null;
+  const backend = backendRequestDisplay(row);
 
   return (
     <div
@@ -264,7 +273,7 @@ export function RequestDetailsDialog({
         <div className="flex items-start gap-3 border-b border-border px-4 py-3">
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
-              <ProviderTag provider={row.provider} />
+              <ProviderTag provider={backend ? "chatgpt_backend" : row.provider} />
               <ServiceTierBadge tier={row.service_tier} />
               <span
                 className={clsx(
@@ -279,7 +288,8 @@ export function RequestDetailsDialog({
               Request {row.request_id ? row.request_id.slice(0, 8) : `#${row.id}`}
             </h2>
             <p className="mt-0.5 truncate font-mono text-[9.5px] text-fg opacity-45">
-              {row.method} {row.path} · {row.model ?? "model not reported"}
+              {row.method} {row.path} ·{" "}
+              {backend?.operationLabel ?? row.model ?? "model not reported"}
             </p>
           </div>
           <button

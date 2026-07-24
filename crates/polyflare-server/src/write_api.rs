@@ -249,7 +249,7 @@ pub async fn delete_account_handler(
     }
 }
 
-/// `PATCH /api/settings` — live-edit one or more of the 10 live-editable `RuntimeSettings` fields
+/// `PATCH /api/settings` — live-edit one or more live-editable `RuntimeSettings` fields
 /// (Settings subsystem Task 5). Body is a bare JSON object `{ <key>: <value> }`; each `key` must be
 /// one of `crate::read_api::LIVE_KEYS_ORDER` (else `400`, and no key in the body is applied — same
 /// validate-BEFORE-apply, fail-closed posture as `patch_account_handler` above), and each `value`
@@ -276,7 +276,7 @@ pub async fn patch_settings_handler(
         return bad_request("request body must be a JSON object");
     };
 
-    // Validate first (fail closed, all-or-nothing): every key present must be one of the 10 live
+    // Validate first (fail closed, all-or-nothing): every key present must be a live
     // keys, and every value must coerce to that field's kind. Collected in the FIXED canonical
     // order (budget before heartbeat) — see this fn's doc.
     let mut to_apply: Vec<(&'static str, SettingValue, bool)> = Vec::new();
@@ -305,7 +305,7 @@ pub async fn patch_settings_handler(
         };
         to_apply.push((*key, value, is_live));
     }
-    // Any key in the body that isn't one of the 10 live keys never reaches `set` — reject the
+    // Any key in the body that isn't one of the live keys never reaches `set` — reject the
     // whole PATCH instead of silently ignoring it.
     if obj.len() != to_apply.len() {
         return bad_request("unknown or non-editable setting key");

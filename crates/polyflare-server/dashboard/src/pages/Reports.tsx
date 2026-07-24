@@ -38,14 +38,16 @@ const RANGE_OPTIONS: Array<{ value: RangeKey; label: string }> = [
   { value: "30d", label: "30d" },
 ];
 
-type DimensionKey = "account" | "model" | "provider";
+type DimensionKey = "account" | "model" | "provider" | "operation";
 const DIMENSION_OPTIONS: Array<{ value: DimensionKey; label: string }> = [
   { value: "account", label: "Target" },
   { value: "model", label: "Model" },
   { value: "provider", label: "Provider" },
+  { value: "operation", label: "Operation" },
 ];
 
-/** Backend wire values for `provider` are "codex"/"anthropic" (never "claude") — same mapping
+/** Backend wire values for model providers are "codex"/"anthropic" (never "claude"); gateway
+ * requests use the distinct "chatgpt_backend" identity. This is the same mapping
  * `Requests.tsx`'s provider filter uses. `ALL` means "omit the param entirely", not a literal
  * `provider=all` sent to the backend. */
 const ALL = "all";
@@ -53,6 +55,7 @@ const BUILT_IN_PROVIDER_OPTIONS: Array<{ value: string; label: string }> = [
   { value: ALL, label: "all providers" },
   { value: "codex", label: "codex" },
   { value: "anthropic", label: "claude" },
+  { value: "chatgpt_backend", label: "backend" },
 ];
 
 const SELECT_CLASS =
@@ -63,7 +66,7 @@ function parseRange(value: string | null): RangeKey {
 }
 
 function parseDimension(value: string | null): DimensionKey {
-  return value === "account" || value === "provider" ? value : "model";
+  return value === "account" || value === "provider" || value === "operation" ? value : "model";
 }
 
 function parseProvider(value: string | null): string {
@@ -74,8 +77,11 @@ function parseProvider(value: string | null): string {
 export function Reports() {
   const [searchParams, setSearchParams] = useSearchParams();
   const range = parseRange(searchParams.get("range"));
-  const dimension = parseDimension(searchParams.get("dimension"));
   const provider = parseProvider(searchParams.get("provider"));
+  const dimension =
+    provider === "chatgpt_backend" && searchParams.get("dimension") === null
+      ? "operation"
+      : parseDimension(searchParams.get("dimension"));
   const providersQuery = useProviders();
   const providerOptions = [
     ...BUILT_IN_PROVIDER_OPTIONS,
@@ -94,6 +100,23 @@ export function Reports() {
         const next = new URLSearchParams(current);
         if (value === defaults[key]) next.delete(key);
         else next.set(key, value);
+        return next;
+      },
+      { replace: true },
+    );
+  }
+
+  function setProvider(value: string) {
+    setSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        if (value === ALL) next.delete("provider");
+        else next.set("provider", value);
+        if (value === "chatgpt_backend") {
+          next.set("dimension", "operation");
+        } else if (next.get("dimension") === "operation") {
+          next.delete("dimension");
+        }
         return next;
       },
       { replace: true },
@@ -150,7 +173,7 @@ export function Reports() {
 
         <select
           value={provider}
-          onChange={(e) => setReportParam("provider", e.target.value)}
+          onChange={(e) => setProvider(e.target.value)}
           className={SELECT_CLASS}
           aria-label="Provider filter"
         >

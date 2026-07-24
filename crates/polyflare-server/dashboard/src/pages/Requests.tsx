@@ -70,6 +70,7 @@ import type { AccountView, RequestRowView, RequestsQueryParams } from "../lib/ap
 import { accountDisplayLabel } from "../lib/accountDisplay";
 import { compactNum, latency, relTime, tpsFmt } from "../lib/format";
 import { paginationWindow } from "../lib/pagination";
+import { backendRequestDisplay } from "../lib/requestClassification";
 import { useAccounts, useProviders, useRequests } from "../lib/queries";
 import {
   latestRequestEventKey,
@@ -192,11 +193,13 @@ function ModelCell({
   effort,
   tier,
   subagent,
+  showAgent = true,
 }: {
   model: string | null;
   effort: string | null;
   tier: string | null;
   subagent: string | null;
+  showAgent?: boolean;
 }) {
   return (
     <span className="whitespace-nowrap">
@@ -207,7 +210,7 @@ function ModelCell({
         </span>
       )}
       <ServiceTierBadge tier={tier} className="ml-1" />
-      <SubagentTag subagent={subagent} />
+      {showAgent && <SubagentTag subagent={subagent} />}
     </span>
   );
 }
@@ -449,6 +452,7 @@ export function Requests() {
     { value: ALL, label: "all" },
     { value: "codex", label: "codex" },
     { value: "claude", label: "claude" },
+    { value: "chatgpt_backend", label: "backend" },
     ...(providersQuery.data ?? [])
       .filter((provider) => provider.slug !== "codex" && provider.slug !== "anthropic")
       .map((provider) => ({ value: provider.slug, label: provider.display_name })),
@@ -800,6 +804,7 @@ function RequestRow({
   expanded: boolean;
   onToggle: () => void;
 }) {
+  const backend = backendRequestDisplay(r);
   return (
     <>
       <tr
@@ -843,7 +848,9 @@ function RequestRow({
           )}
         </td>
         <td className="whitespace-nowrap px-2.5 py-2.5 text-fg opacity-90">
-          {r.target_kind === "credential" && r.provider_credential_id ? (
+          {backend ? (
+            <span className="font-semibold text-signal">{backend.targetLabel}</span>
+          ) : r.target_kind === "credential" && r.provider_credential_id ? (
             <ShieldedAccount
               id={r.provider_credential_id}
               label={accountLabel ?? r.provider_credential_id}
@@ -858,14 +865,15 @@ function RequestRow({
           )}
         </td>
         <td className="px-2.5 py-2.5">
-          <ProviderTag provider={r.provider} />
+          <ProviderTag provider={backend ? "chatgpt_backend" : r.provider} />
         </td>
         <td className="px-2.5 py-2.5">
           <ModelCell
-            model={r.model}
+            model={backend?.operationLabel ?? r.model}
             effort={r.reasoning_effort}
             tier={r.service_tier}
             subagent={r.subagent}
+            showAgent={!backend}
           />
         </td>
         <td className="px-2.5 py-2.5">

@@ -1381,9 +1381,10 @@ const REPORTS_BUCKET_DAILY_SECS: i64 = 24 * 3600;
 
 /// `GET /api/reports` query params. `range` ∈ {`24h`,`7d`,`30d`}: ABSENT defaults to `7d`; an
 /// explicit value outside that set is a `400` (see [`reports_handler`]), never silently
-/// defaulted. `dimension` ∈ {`account`,`model`,`provider`} follows the identical absent-defaults/
-/// explicit-invalid-400 rule, defaulting to `model`. `provider` (unvalidated — any string) narrows
-/// all three store calls to that provider, same as `/api/requests`' own `provider` filter.
+/// defaulted. `dimension` ∈ {`account`,`model`,`provider`,`operation`} follows the identical
+/// absent-defaults/explicit-invalid-400 rule, defaulting to `model`. `operation` is a content-safe
+/// classification derived from normalized request paths. `provider` (unvalidated — any string)
+/// narrows all three store calls to that provider, same as `/api/requests`' own `provider` filter.
 #[derive(Deserialize)]
 pub struct ReportsQuery {
     range: Option<String>,
@@ -1552,12 +1553,12 @@ struct ReportsView {
 /// `reports_series`/`reports_breakdown` into one payload over a shared `(since_ts, bucket_secs)`
 /// window resolved from `range`.
 ///
-/// `range` ∈ {`24h`,`7d`,`30d`} (absent → `7d`) and `dimension` ∈ {`account`,`model`,`provider`}
-/// (absent → `model`); an EXPLICIT value outside those sets is a `400`, never silently defaulted
-/// (only absence defaults) — the same "unknown-but-present is a client error" posture as
-/// `/api/requests`' `status_class` would if it validated (it currently doesn't, but this endpoint
-/// does, per its own brief). `provider` is passed through unvalidated, same as elsewhere in this
-/// module.
+/// `range` ∈ {`24h`,`7d`,`30d`} (absent → `7d`) and `dimension` ∈
+/// {`account`,`model`,`provider`,`operation`} (absent → `model`); an EXPLICIT value outside those
+/// sets is a `400`, never silently defaulted (only absence defaults) — the same
+/// "unknown-but-present is a client error" posture as `/api/requests`' `status_class` would if it
+/// validated (it currently doesn't, but this endpoint does, per its own brief). `provider` is
+/// passed through unvalidated, same as elsewhere in this module.
 ///
 /// `time_series` is ZERO-FILLED across the aligned `[since_ts, now]` grid at `bucket_secs` — the
 /// store's `reports_series` only emits buckets with >= 1 row, same contract `series_since` has;
@@ -1587,7 +1588,7 @@ pub async fn reports_handler(
     };
 
     let dimension = q.dimension.as_deref().unwrap_or("model");
-    if !matches!(dimension, "account" | "model" | "provider") {
+    if !matches!(dimension, "account" | "model" | "provider" | "operation") {
         return (StatusCode::BAD_REQUEST, "invalid dimension").into_response();
     }
 
@@ -1726,7 +1727,7 @@ struct FieldSpec {
 /// `docs/superpowers/specs/2026-07-21-dashboard-settings-design.md`'s "Deferred / read-only"
 /// section exactly.
 const FIELD_SPECS: &[FieldSpec] = &[
-    // --- live (10) ---
+    // --- live (11) ---
     FieldSpec {
         key: "max_account_attempts",
         class: "live",
@@ -1810,6 +1811,15 @@ const FIELD_SPECS: &[FieldSpec] = &[
     },
     FieldSpec {
         key: "live_logs",
+        class: "live",
+        kind: "bool",
+        coercion: Some(FieldKind::Bool),
+        min: None,
+        max: None,
+        default: "true",
+    },
+    FieldSpec {
+        key: "chatgpt_backend_passthrough_enabled",
         class: "live",
         kind: "bool",
         coercion: Some(FieldKind::Bool),
@@ -1994,7 +2004,7 @@ const FIELD_SPECS: &[FieldSpec] = &[
     },
 ];
 
-/// `crate::write_api::patch_settings_handler`'s key→kind lookup: `Some(_)` only for one of the 10
+/// `crate::write_api::patch_settings_handler`'s key→kind lookup: `Some(_)` only for a
 /// live keys (never a restart-only/fixed one), so a non-live key can never be coerced/applied —
 /// the caller treats `None` as "reject with 400", never as "skip".
 pub(crate) fn live_field_kind(key: &str) -> Option<FieldKind> {
@@ -2019,7 +2029,7 @@ pub(crate) const RESTART_KEYS_ORDER: &[&str] = &[
     "websocket_idle_budget_secs",
 ];
 
-/// The 10 live keys in a FIXED canonical order that places `starvation_wait_budget` BEFORE
+/// The live keys in a FIXED canonical order that places `starvation_wait_budget` BEFORE
 /// `starvation_heartbeat` — `crate::write_api::patch_settings_handler` applies a multi-key PATCH
 /// in this order (never the JSON object's own arbitrary key order), so a PATCH containing both
 /// clamps the heartbeat against the INCOMING budget, not the stale pre-PATCH one (see
@@ -2035,6 +2045,7 @@ pub(crate) const LIVE_KEYS_ORDER: &[&str] = &[
     "request_log_retention_days",
     "usage_history_retention_days",
     "live_logs",
+    "chatgpt_backend_passthrough_enabled",
 ];
 
 /// A live field's current value, stringified. Durations emit the whole-seconds number (e.g.
@@ -2052,6 +2063,9 @@ fn live_value(rs: &crate::runtime_settings::RuntimeSettings, key: &str) -> Strin
         "request_log_retention_days" => rs.request_log_retention_days().to_string(),
         "usage_history_retention_days" => rs.usage_history_retention_days().to_string(),
         "live_logs" => rs.live_logs().to_string(),
+        "chatgpt_backend_passthrough_enabled" => {
+            rs.chatgpt_backend_passthrough_enabled().to_string()
+        }
         _ => unreachable!("live_value called with a non-live key: {key}"),
     }
 }
@@ -2140,6 +2154,7 @@ fn setting_label(key: &'static str) -> &'static str {
         "http_upstream_websocket_ping" => "HTTP-request upstream WebSocket ping",
         "websocket_idle_ping_secs" => "Parked WebSocket ping interval",
         "websocket_idle_budget_secs" => "Parked WebSocket idle budget",
+        "chatgpt_backend_passthrough_enabled" => "ChatGPT backend passthrough",
         _ => "",
     }
 }
@@ -2160,6 +2175,9 @@ fn setting_description(key: &'static str) -> &'static str {
         }
         "websocket_idle_budget_secs" => {
             "Close both relay legs honestly after this much between-turn inactivity."
+        }
+        "chatgpt_backend_passthrough_enabled" => {
+            "Enabled by default. Forward non-usage ChatGPT backend HTTP and WebSocket routes with the client's own credentials; disable as a live rollback."
         }
         _ => "",
     }

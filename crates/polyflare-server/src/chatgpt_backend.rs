@@ -5,7 +5,7 @@
 //! PolyFlare therefore requires two behaviors on one boundary:
 //!
 //! - synthesize only `wham/usage` from the local aggregate pool quota;
-//! - transparently forward every other ChatGPT backend request with the client's own auth.
+//! - forward every other ChatGPT backend request with the client's own auth by default.
 //!
 //! Passthrough never selects an account, decrypts a token, or reads the store. It reuses the
 //! process-wide pinned-TLS HTTP client and streams request and response bodies. Completion
@@ -16,11 +16,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
+use axum::extract::ws::{Message as DownstreamMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, HeaderName, Method, Request, StatusCode};
+use axum::http::{HeaderMap, HeaderName, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use polyflare_core::Provider;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::Message as UpstreamMessage;
 
 use crate::app::AppState;
 use crate::ingress::queue_persist_request_log;
@@ -29,6 +32,7 @@ use crate::observability::RequestLog;
 const WEEKLY_MINUTES: i64 = 10_080;
 const FIVE_HOUR_MINUTES: i64 = 300;
 const SYNTHETIC_USAGE_LOG_PATH: &str = "chatgpt_backend_synthetic_wham/usage";
+const BACKEND_PROVIDER: &str = "chatgpt_backend";
 
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
@@ -58,10 +62,11 @@ fn record_gateway_request(
     started: Instant,
 ) {
     let request_id = format!("{:032x}", rand::random::<u128>());
+    let transport = if method == "WS" { "ws" } else { "http" };
     let log = RequestLog {
         method,
         path,
-        provider: Provider::Codex.to_string(),
+        provider: BACKEND_PROVIDER.to_string(),
         aliased: false,
         status,
         duration_ms: started.elapsed().as_millis() as u64,
@@ -70,10 +75,10 @@ fn record_gateway_request(
         provider_credential_id: None,
         model: None,
         upstream_model: None,
-        upstream_transport: Some("http".to_string()),
+        upstream_transport: Some(transport.to_string()),
         reasoning_effort: None,
         service_tier: None,
-        transport: Some("http".to_string()),
+        transport: Some(transport.to_string()),
         ttft_ms: None,
         total_tokens: None,
         cached_tokens: None,
@@ -83,9 +88,12 @@ fn record_gateway_request(
     };
     log.emit();
     state.log_bus.publish(log.to_log_event());
-    state
-        .upstream_request_metrics
-        .record_target("codex", "account", None, status.as_u16());
+    state.upstream_request_metrics.record_target(
+        BACKEND_PROVIDER,
+        "backend",
+        None,
+        status.as_u16(),
+    );
     queue_persist_request_log(&state.store, log.record(unix_now()));
 }
 
@@ -291,6 +299,181 @@ fn end_to_end_headers(headers: &HeaderMap) -> HeaderMap {
     forwarded
 }
 
+fn remote_control_websocket_url(
+    upstream_base_url: &str,
+    query: Option<&str>,
+) -> Result<reqwest::Url, ()> {
+    let mut url = passthrough_url(upstream_base_url, "wham/remote/control/server", query)?;
+    let scheme = match url.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        _ => return Err(()),
+    };
+    url.set_scheme(scheme).map_err(|_| ())?;
+    Ok(url)
+}
+
+fn remote_control_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut forwarded = end_to_end_headers(headers);
+    for name in [
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-extensions",
+    ] {
+        forwarded.remove(name);
+    }
+    forwarded
+}
+
+fn to_upstream_message(message: DownstreamMessage) -> UpstreamMessage {
+    match message {
+        DownstreamMessage::Text(text) => UpstreamMessage::Text(text.to_string().into()),
+        DownstreamMessage::Binary(bytes) => UpstreamMessage::Binary(bytes),
+        DownstreamMessage::Ping(bytes) => UpstreamMessage::Ping(bytes),
+        DownstreamMessage::Pong(bytes) => UpstreamMessage::Pong(bytes),
+        DownstreamMessage::Close(_) => UpstreamMessage::Close(None),
+    }
+}
+
+fn to_downstream_message(message: UpstreamMessage) -> Option<DownstreamMessage> {
+    match message {
+        UpstreamMessage::Text(text) => Some(DownstreamMessage::Text(text.to_string().into())),
+        UpstreamMessage::Binary(bytes) => Some(DownstreamMessage::Binary(bytes)),
+        UpstreamMessage::Ping(bytes) => Some(DownstreamMessage::Ping(bytes)),
+        UpstreamMessage::Pong(bytes) => Some(DownstreamMessage::Pong(bytes)),
+        UpstreamMessage::Close(_) => Some(DownstreamMessage::Close(None)),
+        UpstreamMessage::Frame(_) => None,
+    }
+}
+
+async fn relay_remote_control(
+    downstream: WebSocket,
+    upstream: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) {
+    let (mut downstream_tx, mut downstream_rx) = downstream.split();
+    let (mut upstream_tx, mut upstream_rx) = upstream.split();
+    loop {
+        tokio::select! {
+            message = downstream_rx.next() => {
+                let Some(Ok(message)) = message else {
+                    let _ = upstream_tx.send(UpstreamMessage::Close(None)).await;
+                    break;
+                };
+                let closes = matches!(message, DownstreamMessage::Close(_));
+                if upstream_tx.send(to_upstream_message(message)).await.is_err() || closes {
+                    break;
+                }
+            }
+            message = upstream_rx.next() => {
+                let Some(Ok(message)) = message else {
+                    let _ = downstream_tx.send(DownstreamMessage::Close(None)).await;
+                    break;
+                };
+                let closes = matches!(message, UpstreamMessage::Close(_));
+                if let Some(message) = to_downstream_message(message) {
+                    if downstream_tx.send(message).await.is_err() {
+                        break;
+                    }
+                }
+                if closes {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn remote_control_ws_route(
+    state: Arc<AppState>,
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let started = Instant::now();
+    let log_path = normalized_route("wham/remote/control/server");
+    if !state.runtime_settings.chatgpt_backend_passthrough_enabled() {
+        let response = error_response(StatusCode::NOT_FOUND, "backend_passthrough_disabled");
+        record_gateway_request(&state, "WS", log_path, response.status(), started);
+        return response;
+    }
+    let target = match remote_control_websocket_url(&state.upstream_base_url, uri.query()) {
+        Ok(target) => target,
+        Err(_) => {
+            let response = error_response(StatusCode::BAD_REQUEST, "invalid_backend_path");
+            record_gateway_request(&state, "WS", log_path, response.status(), started);
+            return response;
+        }
+    };
+    let mut request = match target.as_str().into_client_request() {
+        Ok(request) => request,
+        Err(_) => {
+            let response = error_response(StatusCode::BAD_REQUEST, "invalid_backend_path");
+            record_gateway_request(&state, "WS", log_path, response.status(), started);
+            return response;
+        }
+    };
+    for (name, value) in remote_control_headers(&headers) {
+        if let Some(name) = name {
+            request.headers_mut().append(name, value);
+        }
+    }
+    let (upstream, upstream_response) = match tokio_tungstenite::connect_async(request).await {
+        Ok(result) => result,
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            let status = response.status();
+            let response = error_response(status, "backend_forward_failed");
+            record_gateway_request(&state, "WS", log_path, response.status(), started);
+            return response;
+        }
+        Err(_) => {
+            let response = error_response(StatusCode::BAD_GATEWAY, "backend_forward_failed");
+            record_gateway_request(&state, "WS", log_path, response.status(), started);
+            return response;
+        }
+    };
+    let accepted_protocol = upstream_response
+        .headers()
+        .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let ws = match accepted_protocol {
+        Some(protocol) => ws.protocols([protocol]),
+        None => ws,
+    };
+    let state_for_log = state.clone();
+    ws.on_upgrade(move |downstream| async move {
+        relay_remote_control(downstream, upstream).await;
+        record_gateway_request(
+            &state_for_log,
+            "WS",
+            log_path,
+            StatusCode::SWITCHING_PROTOCOLS,
+            started,
+        );
+    })
+}
+
+pub async fn remote_control_ws_handler(
+    State(state): State<Arc<AppState>>,
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    remote_control_ws_route(state, ws, headers, uri).await
+}
+
+pub async fn pooled_remote_control_ws_handler(
+    State(state): State<Arc<AppState>>,
+    Path(_pool): Path<String>,
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    remote_control_ws_route(state, ws, headers, uri).await
+}
+
 fn normalized_route(path: &str) -> String {
     let segments: Vec<&str> = path
         .split('/')
@@ -361,6 +544,11 @@ async fn passthrough_route(state: Arc<AppState>, path: String, request: Request<
     let method = request.method().clone();
     let method_name = method_label(&method);
     let log_path = normalized_route(&path);
+    if !state.runtime_settings.chatgpt_backend_passthrough_enabled() {
+        let response = error_response(StatusCode::NOT_FOUND, "backend_passthrough_disabled");
+        record_gateway_request(&state, method_name, log_path, response.status(), started);
+        return response;
+    }
     let query = request.uri().query().map(str::to_string);
     let target = match passthrough_url(&state.upstream_base_url, &path, query.as_deref()) {
         Ok(target) => target,
