@@ -22,7 +22,7 @@ pub use traits::{Continuity, Coordinator, Executor, Selector};
 pub use translate::{IdentityTranslator, Translator, TranslatorRegistry};
 pub use types::{
     Account, AccountId, AccountSnapshot, ContinuityDirective, ContinuityError, ExecError,
-    FailureSignal, KeyStrength, Prepared, PreparedRequest, ReasoningItems, RecoveryPlan,
-    RequestCtx, ResponseMetadata, ResponseStream, SelectionCtx, SessionKey, Tier, TurnOutcome,
-    UpstreamHttpError, WatchdogArm,
+    FailureSignal, KeyStrength, Prepared, PreparedRequest, QuotaWindowSnapshot, ReasoningItems,
+    RecoveryPlan, RequestCtx, ResponseMetadata, ResponseStream, SelectionCtx, SessionKey, Tier,
+    TurnOutcome, UpstreamHttpError, WatchdogArm,
 };

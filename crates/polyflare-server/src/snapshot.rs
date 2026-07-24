@@ -5,7 +5,7 @@
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use polyflare_core::{AccountSnapshot, Provider};
+use polyflare_core::{AccountSnapshot, Provider, QuotaWindowSnapshot};
 use polyflare_store::{Store, StoreError};
 
 use crate::usage_windows::resolve;
@@ -49,6 +49,20 @@ pub async fn assemble_snapshots(store: &Store) -> Result<Vec<AccountSnapshot>, S
         snap.status = account.status;
         snap.used_percent = resolved.five_hour.as_ref().map_or(0.0, |w| w.used_percent);
         snap.secondary_used_percent = resolved.weekly.as_ref().map_or(0.0, |w| w.used_percent);
+        snap.five_hour_quota = resolved.five_hour.map(|window| QuotaWindowSnapshot {
+            used_percent: window.used_percent,
+            window_minutes: window.window_minutes,
+            reset_at: window.reset_at,
+            recorded_at: window.recorded_at,
+            stale: window.stale,
+        });
+        snap.weekly_quota = resolved.weekly.map(|window| QuotaWindowSnapshot {
+            used_percent: window.used_percent,
+            window_minutes: window.window_minutes,
+            reset_at: window.reset_at,
+            recorded_at: window.recorded_at,
+            stale: window.stale,
+        });
         snap.reset_at = account.reset_at;
         snap.cooldown_until = repo.routing_cooldown(&account.id).await?;
         snap.routing_policy = account.routing_policy;

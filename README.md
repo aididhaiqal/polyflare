@@ -523,8 +523,24 @@ Every request receives a random content-free request ID. Request rows can includ
 - requested and actual service tier;
 - terminal protocol outcome;
 - TTFT, total latency, post-TTFT output throughput;
-- input, output, cached, reasoning, and orchestration token counts;
+- input, cached-input, cache-write-input, output, reasoning-output, upstream-reported total, and
+  orchestration token counts;
 - computed cost when pricing is known.
+
+Usage follows the Responses contract used by Codex. Cached input is a subset of input, and
+reasoning output is a subset of output, so neither is added to the API total a second time.
+PolyFlare keeps the upstream-reported total as its own fact and derives separately:
+
+- **API total** — upstream `total_tokens`, then a legacy compatibility total, then a complete
+  `input_tokens + output_tokens` pair when older data lacks an upstream total;
+- **uncached input** — `input_tokens - cached_input_tokens`, clamped at zero;
+- **visible output** — `output_tokens - reasoning_tokens`, clamped at zero;
+- **effective Codex usage** — uncached input plus all output;
+- **cache-hit rate** — cached input divided by input, not by total tokens.
+
+New terminal observations are marked with their usage schema, upstream source, and final status.
+Migrated request history remains usable but is labeled `legacy`; PolyFlare does not invent
+historical cache-write counts or upstream totals that were never recorded.
 
 Throughput is output tokens divided by the generation window
 `(duration_ms - ttft_ms)`, not total request duration. Terminal protocol outcomes take precedence

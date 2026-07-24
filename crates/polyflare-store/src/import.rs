@@ -326,6 +326,10 @@ pub async fn import_from_codex_lb(
         // is unknown historically (false); `status` (HTTP int) was never recorded by codex-lb (0 =
         // "no HTTP status", the outcome/error_code carry the result); `duration_ms` <- `latency_ms`.
         let duration_ms = src.latency_ms.unwrap_or(0);
+        let has_usage = src.input_tokens.is_some()
+            || src.output_tokens.is_some()
+            || src.cached_input_tokens.is_some()
+            || src.reasoning_tokens.is_some();
         let result = sqlx::query(
             "INSERT OR IGNORE INTO request_log (\
                 requested_at, provider, method, path, aliased, status, duration_ms, \
@@ -333,9 +337,9 @@ pub async fn import_from_codex_lb(
                 outcome, error_code, input_tokens, output_tokens, cached_input_tokens, \
                 reasoning_tokens, cost_usd, reasoning_effort, latency_first_token_ms, \
                 service_tier, requested_service_tier, actual_service_tier, transport, \
-                deleted_at, import_source_id\
+                deleted_at, import_source_id, usage_schema, usage_source, usage_status\
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                      ?, ?, ?)",
+                      ?, ?, ?, ?, ?, ?)",
         )
         .bind(requested_at)
         .bind("codex")
@@ -365,6 +369,9 @@ pub async fn import_from_codex_lb(
         .bind(src.transport.as_deref())
         .bind(deleted_at)
         .bind(src.id)
+        .bind(has_usage.then_some("legacy_unknown"))
+        .bind(has_usage.then_some("codex_lb_import"))
+        .bind(has_usage.then_some("legacy"))
         .execute(&mut *tx)
         .await?;
         // `OR IGNORE` yields 0 rows_affected when a source id is already present (idempotent

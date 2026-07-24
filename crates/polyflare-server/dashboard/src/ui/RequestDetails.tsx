@@ -61,7 +61,9 @@ export function RequestDetailPanel({
 }) {
   const tokenValue = row.total_tokens === null ? "—" : compactNum(row.total_tokens);
   const cacheMeta =
-    row.cached_tokens === null ? "cache not reported" : `${compactNum(row.cached_tokens)} cached`;
+    row.cached_input_tokens === null
+      ? "cache read not reported"
+      : `${compactNum(row.cached_input_tokens)} cached input`;
   const orchestration =
     (row.orchestration_input_tokens ?? 0) + (row.orchestration_output_tokens ?? 0);
   const modelContract = [row.model ?? "—", row.reasoning_effort].filter(Boolean).join(" · ");
@@ -154,6 +156,68 @@ export function RequestDetailPanel({
           <DetailField label="Aliased" value={row.aliased ? "yes" : "no"} />
         </section>
       </div>
+
+      <section className="overflow-hidden rounded-lg border border-border bg-card">
+        <div className="border-b border-border px-3 py-2">
+          <div className="text-[8.5px] font-bold uppercase tracking-[0.13em] text-signal opacity-65">
+            Token ledger
+          </div>
+          <div className="mt-0.5 text-[8.5px] text-fg opacity-40">
+            Raw Responses usage and Codex-derived effective usage—subsets are never added twice.
+          </div>
+        </div>
+        <div className="grid grid-cols-2 divide-x divide-y divide-border sm:grid-cols-3 lg:grid-cols-6 lg:divide-y-0">
+          <DetailMetric
+            label="API total"
+            value={tokenValue}
+            meta={row.reported_total_tokens === null ? "compatibility fallback" : "upstream reported"}
+          />
+          <DetailMetric
+            label="Input"
+            value={row.input_tokens === null ? "—" : compactNum(row.input_tokens)}
+            meta={
+              row.cached_input_tokens === null
+                ? "cache read unknown"
+                : `${compactNum(row.cached_input_tokens)} cache read`
+            }
+          />
+          <DetailMetric
+            label="Cache write"
+            value={
+              row.cache_write_input_tokens === null
+                ? "—"
+                : compactNum(row.cache_write_input_tokens)
+            }
+            meta="separate input detail"
+          />
+          <DetailMetric
+            label="Output"
+            value={row.output_tokens === null ? "—" : compactNum(row.output_tokens)}
+            meta={
+              row.reasoning_output_tokens === null
+                ? "reasoning unknown"
+                : `${compactNum(row.reasoning_output_tokens)} reasoning`
+            }
+          />
+          <DetailMetric
+            label="Visible output"
+            value={
+              row.visible_output_tokens === null ? "—" : compactNum(row.visible_output_tokens)
+            }
+            meta="output − reasoning"
+          />
+          <DetailMetric
+            label="Effective"
+            value={row.effective_tokens === null ? "—" : compactNum(row.effective_tokens)}
+            meta="uncached input + output"
+          />
+        </div>
+        <div className="flex flex-wrap gap-x-4 gap-y-1 border-t border-border px-3 py-2 text-[8.5px] text-fg opacity-45">
+          <span>status: {row.usage_status ?? "unknown"}</span>
+          <span>schema: {row.usage_schema ?? "unknown"}</span>
+          <span>source: {row.usage_source ?? "unknown"}</span>
+        </div>
+      </section>
 
       <div className="flex items-start gap-2 rounded-lg border border-dashed border-border bg-muted/15 px-3 py-2 text-[9.5px] text-fg opacity-55">
         <Lock className="mt-0.5 h-3 w-3 shrink-0" strokeWidth={1.9} />

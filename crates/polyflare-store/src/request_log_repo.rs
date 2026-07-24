@@ -30,6 +30,76 @@ const ERROR_SQL: &str = "(protocol_outcome IN \
     (protocol_outcome IS NULL AND (status >= 400 OR \
     (status = 0 AND outcome = 'error'))))";
 
+/// Upstream Responses total when observed, then the legacy compatibility total, then a complete
+/// input+output pair. Cached input and reasoning output are subsets and are never added again.
+const API_TOTAL_SQL: &str = "CASE \
+    WHEN reported_total_tokens >= 0 THEN reported_total_tokens \
+    WHEN total_tokens >= 0 THEN total_tokens \
+    WHEN input_tokens IS NOT NULL AND output_tokens IS NOT NULL \
+        THEN MAX(input_tokens, 0) + MAX(output_tokens, 0) \
+    ELSE 0 END";
+
+/// Codex's primary blended/effective usage: non-cached input plus all output. This is distinct
+/// from upstream API total, monetary cost, and PolyFlare's weighted routing-pressure estimate.
+const EFFECTIVE_TOKENS_SQL: &str = "CASE \
+    WHEN input_tokens IS NOT NULL AND output_tokens IS NOT NULL THEN \
+        MAX(MAX(input_tokens, 0) - \
+            MIN(MAX(COALESCE(cached_input_tokens, cached_tokens, 0), 0), MAX(input_tokens, 0)), 0) \
+        + MAX(output_tokens, 0) \
+    ELSE 0 END";
+
+type RequestBucketSqlRow = (i64, i64, i64, f64, i64, i64, i64, i64, i64);
+type ReportMetricsSqlRow = (
+    i64,
+    i64,
+    f64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    f64,
+    f64,
+    i64,
+);
+type ReportBucketSqlRow = (
+    i64,
+    i64,
+    i64,
+    f64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    f64,
+    f64,
+    i64,
+);
+type ReportBreakdownSqlRow = (
+    String,
+    i64,
+    i64,
+    f64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    f64,
+    f64,
+    i64,
+);
+
 /// A bounded, content-free terminal result observed inside a native Codex response stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestProtocolOutcome {
@@ -99,9 +169,10 @@ pub struct RequestLogRecord {
     pub transport: Option<String>,
     /// Time-to-first-token in milliseconds, for streaming requests.
     pub ttft_ms: Option<i64>,
-    /// Total tokens consumed by the request (prompt + completion), a content-free count.
+    /// Legacy compatibility total. New canonical capture keeps the upstream value separately in
+    /// [`RequestLogRow::reported_total_tokens`].
     pub total_tokens: Option<i64>,
-    /// Cached tokens counted toward `total_tokens`, a content-free count.
+    /// Legacy compatibility copy of cached input.
     pub cached_tokens: Option<i64>,
     /// The codex sub-agent role label (`x-openai-subagent`: `review`/`compact`/
     /// `memory_consolidation`/`collab_spawn`), or `None` for the main agent — a bounded role slug,
@@ -172,7 +243,17 @@ pub struct RequestLogRow {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
+    /// Input tokens written into a provider cache. This is independent evidence from cache reads.
+    pub cache_write_input_tokens: Option<i64>,
     pub reasoning_tokens: Option<i64>,
+    /// The upstream `usage.total_tokens` value. Unlike the older `total_tokens` compatibility
+    /// column, this is never synthesized by PolyFlare.
+    pub reported_total_tokens: Option<i64>,
+    /// Usage payload contract, provenance, and evidentiary status. New terminal Responses usage is
+    /// `openai_responses_v1` / `upstream_response` / `final`; migrated rows are explicitly legacy.
+    pub usage_schema: Option<String>,
+    pub usage_source: Option<String>,
+    pub usage_status: Option<String>,
     pub orchestration_input_tokens: Option<i64>,
     pub orchestration_output_tokens: Option<i64>,
     pub orchestration_cached_input_tokens: Option<i64>,
@@ -185,6 +266,48 @@ pub struct RequestLogRow {
     pub outcome: Option<String>,
     /// Legacy codex-lb's bounded machine error code, when its `outcome` is `error`.
     pub error_code: Option<String>,
+}
+
+impl RequestLogRow {
+    /// API token total with explicit evidence precedence. `None` means neither an authoritative
+    /// total nor a complete input/output pair exists.
+    pub fn api_total_tokens(&self) -> Option<i64> {
+        self.reported_total_tokens
+            .filter(|value| *value >= 0)
+            .or(self.total_tokens)
+            .filter(|value| *value >= 0)
+            .or_else(|| {
+                self.input_tokens
+                    .zip(self.output_tokens)
+                    .map(|(input, output)| input.max(0).saturating_add(output.max(0)))
+            })
+    }
+
+    pub fn uncached_input_tokens(&self) -> Option<i64> {
+        self.input_tokens.map(|input| {
+            let input = input.max(0);
+            let cached = self
+                .cached_input_tokens
+                .or(self.cached_tokens)
+                .unwrap_or(0)
+                .clamp(0, input);
+            input.saturating_sub(cached)
+        })
+    }
+
+    pub fn visible_output_tokens(&self) -> Option<i64> {
+        self.output_tokens.map(|output| {
+            output
+                .max(0)
+                .saturating_sub(self.reasoning_tokens.unwrap_or(0).clamp(0, output.max(0)))
+        })
+    }
+
+    pub fn effective_tokens(&self) -> Option<i64> {
+        self.uncached_input_tokens()
+            .zip(self.output_tokens)
+            .map(|(input, output)| input.saturating_add(output.max(0)))
+    }
 }
 
 /// Dashboard filter set for [`RequestLogRepo::page`]. Every field is optional; an unset field
@@ -212,6 +335,8 @@ pub struct RequestAggregate {
     pub error: i64,
     pub avg_latency_ms: f64,
     pub total_tokens: i64,
+    pub effective_tokens: i64,
+    pub cache_write_input_tokens: i64,
     pub orchestration_tokens: i64,
     pub orchestration_cached_tokens: i64,
 }
@@ -228,6 +353,8 @@ pub struct RequestBucket {
     pub errors: i64,
     pub avg_latency_ms: f64,
     pub total_tokens: i64,
+    pub effective_tokens: i64,
+    pub cache_write_input_tokens: i64,
     pub orchestration_tokens: i64,
     pub orchestration_cached_tokens: i64,
 }
@@ -246,8 +373,11 @@ pub struct ReportMetrics {
     pub errors: i64,
     pub cost_usd: f64,
     pub tokens: i64,
+    pub input_tokens: i64,
     pub cached_tokens: i64,
+    pub cache_write_tokens: i64,
     pub reasoning_tokens: i64,
+    pub effective_tokens: i64,
     pub orchestration_tokens: i64,
     pub orchestration_cached_tokens: i64,
     pub avg_duration_ms: f64,
@@ -355,7 +485,7 @@ impl RequestLogRepo {
         Ok(())
     }
 
-    /// Fill in the six 0005 usage/cost columns on an already-inserted row, correlated by
+    /// Fill in terminal usage, cost, and timing on an already-inserted row, correlated by
     /// `request_id` — the stream wrapper's post-completion usage backfill (streaming responses
     /// only know final token/cost counts once the stream ends, well after [`Self::insert`] already
     /// wrote the row). Does NOT bump any store generation: `request_log` is a history table, not
@@ -377,7 +507,9 @@ impl RequestLogRepo {
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
         cached_input_tokens: Option<i64>,
+        cache_write_input_tokens: Option<i64>,
         reasoning_tokens: Option<i64>,
+        reported_total_tokens: Option<i64>,
         orchestration_input_tokens: Option<i64>,
         orchestration_output_tokens: Option<i64>,
         orchestration_cached_input_tokens: Option<i64>,
@@ -386,9 +518,22 @@ impl RequestLogRepo {
         duration_ms: Option<i64>,
         protocol_outcome: Option<RequestProtocolOutcome>,
     ) -> Result<(), StoreError> {
+        let has_usage = input_tokens.is_some()
+            || output_tokens.is_some()
+            || cached_input_tokens.is_some()
+            || cache_write_input_tokens.is_some()
+            || reasoning_tokens.is_some()
+            || reported_total_tokens.is_some()
+            || orchestration_input_tokens.is_some()
+            || orchestration_output_tokens.is_some()
+            || orchestration_cached_input_tokens.is_some();
         sqlx::query(
             "UPDATE request_log SET input_tokens=?, output_tokens=?, cached_input_tokens=?, \
-             reasoning_tokens=?, orchestration_input_tokens=?, orchestration_output_tokens=?, \
+             cache_write_input_tokens=?, reasoning_tokens=?, reported_total_tokens=?, \
+             usage_schema = CASE WHEN ? THEN 'openai_responses_v1' ELSE usage_schema END, \
+             usage_source = CASE WHEN ? THEN 'upstream_response' ELSE usage_source END, \
+             usage_status = CASE WHEN ? THEN 'final' ELSE usage_status END, \
+             orchestration_input_tokens=?, orchestration_output_tokens=?, \
              orchestration_cached_input_tokens=?, cost_usd=?, latency_first_token_ms=?, \
              duration_ms = COALESCE(?, duration_ms), \
              protocol_outcome = COALESCE(?, protocol_outcome) WHERE request_id=?",
@@ -396,7 +541,12 @@ impl RequestLogRepo {
         .bind(input_tokens)
         .bind(output_tokens)
         .bind(cached_input_tokens)
+        .bind(cache_write_input_tokens)
         .bind(reasoning_tokens)
+        .bind(reported_total_tokens)
+        .bind(has_usage)
+        .bind(has_usage)
+        .bind(has_usage)
         .bind(orchestration_input_tokens)
         .bind(orchestration_output_tokens)
         .bind(orchestration_cached_input_tokens)
@@ -417,7 +567,8 @@ impl RequestLogRepo {
              account_id, target_kind, provider_credential_id, model, upstream_model, \
              upstream_transport, reasoning_effort, service_tier, transport, ttft_ms, \
              total_tokens, cached_tokens, subagent, request_id, session_key, input_tokens, output_tokens, \
-             cached_input_tokens, reasoning_tokens, orchestration_input_tokens, \
+             cached_input_tokens, cache_write_input_tokens, reasoning_tokens, \
+             reported_total_tokens, usage_schema, usage_source, usage_status, orchestration_input_tokens, \
              orchestration_output_tokens, orchestration_cached_input_tokens, cost_usd, latency_first_token_ms, \
              outcome, error_code, protocol_outcome \
              FROM request_log \
@@ -454,7 +605,8 @@ impl RequestLogRepo {
              account_id, target_kind, provider_credential_id, model, upstream_model, \
              upstream_transport, reasoning_effort, service_tier, transport, ttft_ms, \
              total_tokens, cached_tokens, subagent, request_id, session_key, input_tokens, output_tokens, \
-             cached_input_tokens, reasoning_tokens, orchestration_input_tokens, \
+             cached_input_tokens, cache_write_input_tokens, reasoning_tokens, \
+             reported_total_tokens, usage_schema, usage_source, usage_status, orchestration_input_tokens, \
              orchestration_output_tokens, orchestration_cached_input_tokens, cost_usd, latency_first_token_ms, \
              outcome, error_code, protocol_outcome \
              FROM request_log",
@@ -480,23 +632,26 @@ impl RequestLogRepo {
     /// overview's KPI tile (`GET /api/overview`). `total`/`success`/`error` classify by the same
     /// status-class rule as [`RequestsFilter::status_class`] (native HTTP plus imported outcome;
     /// 3xx and unknown status-0 rows count toward `total` only).
-    /// `avg_latency_ms`/`total_tokens` default to `0.0`/`0` (via `COALESCE`) when no row matches,
-    /// so an empty window renders as zeroed KPIs rather than nulls. `total_tokens` itself falls
-    /// back per row to `input_tokens + output_tokens` (Task 7: `0005` import/backfill rows never
-    /// populate `total_tokens`; a missing sub-count coalesces to 0, and `reasoning_tokens` is
-    /// never added — it's a subset of `output_tokens`, not a third count).
+    /// `avg_latency_ms`/`total_tokens` default to `0.0`/`0` when no row matches. API total prefers
+    /// upstream `reported_total_tokens`, then the legacy compatibility total, then a complete
+    /// input/output pair. Effective usage is the separate Codex measure: uncached input + output.
     pub async fn aggregate_since(&self, since_ts: i64) -> Result<RequestAggregate, StoreError> {
-        let row: (i64, i64, i64, f64, i64, i64, i64) = sqlx::query_as(&format!(
+        let row: (i64, i64, i64, f64, i64, i64, i64, i64, i64) =
+            sqlx::query_as(&format!(
             "SELECT COUNT(*), \
                     COALESCE(SUM(CASE WHEN {success} THEN 1 ELSE 0 END), 0), \
                     COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0), \
                     COALESCE(AVG(duration_ms), 0.0), \
-                    COALESCE(SUM(COALESCE(total_tokens, COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))), 0), \
+                    COALESCE(SUM({api_total}), 0), \
+                    COALESCE(SUM({effective}), 0), \
+                    COALESCE(SUM(MAX(COALESCE(cache_write_input_tokens, 0), 0)), 0), \
                     COALESCE(SUM(COALESCE(orchestration_input_tokens, 0) + COALESCE(orchestration_output_tokens, 0)), 0), \
                     COALESCE(SUM(COALESCE(orchestration_cached_input_tokens, 0)), 0) \
              FROM request_log WHERE requested_at >= ?",
             success = SUCCESS_SQL,
             error = ERROR_SQL,
+            api_total = API_TOTAL_SQL,
+            effective = EFFECTIVE_TOKENS_SQL,
         ))
         .bind(since_ts)
         .fetch_one(&self.pool)
@@ -507,8 +662,10 @@ impl RequestLogRepo {
             error: row.2,
             avg_latency_ms: row.3,
             total_tokens: row.4,
-            orchestration_tokens: row.5,
-            orchestration_cached_tokens: row.6,
+            effective_tokens: row.5,
+            cache_write_input_tokens: row.6,
+            orchestration_tokens: row.7,
+            orchestration_cached_tokens: row.8,
         })
     }
 
@@ -520,7 +677,8 @@ impl RequestLogRepo {
     /// `avg_latency_ms`
     /// / `total_tokens` are per-bucket `AVG`/`SUM`, never null (a bucket only exists here because it
     /// has >= 1 row). `total_tokens` falls back per row the same way [`Self::aggregate_since`]'s does
-    /// (`input_tokens + output_tokens` when `total_tokens` itself is null; never `reasoning_tokens`).
+    /// (a non-negative reported total, then a non-negative compatibility total, then a complete
+    /// `input_tokens + output_tokens` pair; never `reasoning_tokens`).
     ///
     /// # `bucket_secs` guard
     /// Clamped to a minimum of 1 so the SQL integer division can never divide by zero. There is no
@@ -539,17 +697,21 @@ impl RequestLogRepo {
         bucket_secs: i64,
     ) -> Result<Vec<RequestBucket>, StoreError> {
         let bucket_secs = bucket_secs.max(1);
-        let rows: Vec<(i64, i64, i64, f64, i64, i64, i64)> = sqlx::query_as(&format!(
+        let rows: Vec<RequestBucketSqlRow> = sqlx::query_as(&format!(
             "SELECT (requested_at / ?) * ? AS bucket_ts, \
                     COUNT(*), \
                     COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0), \
                     COALESCE(AVG(duration_ms), 0.0), \
-                    COALESCE(SUM(COALESCE(total_tokens, COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))), 0), \
+                    COALESCE(SUM({api_total}), 0), \
+                    COALESCE(SUM({effective}), 0), \
+                    COALESCE(SUM(MAX(COALESCE(cache_write_input_tokens, 0), 0)), 0), \
                     COALESCE(SUM(COALESCE(orchestration_input_tokens, 0) + COALESCE(orchestration_output_tokens, 0)), 0), \
                     COALESCE(SUM(COALESCE(orchestration_cached_input_tokens, 0)), 0) \
              FROM request_log WHERE requested_at >= ? \
              GROUP BY bucket_ts ORDER BY bucket_ts ASC",
             error = ERROR_SQL,
+            api_total = API_TOTAL_SQL,
+            effective = EFFECTIVE_TOKENS_SQL,
         ))
         .bind(bucket_secs)
         .bind(bucket_secs)
@@ -566,6 +728,8 @@ impl RequestLogRepo {
                     errors,
                     avg_latency_ms,
                     total_tokens,
+                    effective_tokens,
+                    cache_write_input_tokens,
                     orchestration_tokens,
                     orchestration_cached_tokens,
                 )| RequestBucket {
@@ -574,6 +738,8 @@ impl RequestLogRepo {
                     errors,
                     avg_latency_ms,
                     total_tokens,
+                    effective_tokens,
+                    cache_write_input_tokens,
                     orchestration_tokens,
                     orchestration_cached_tokens,
                 },
@@ -581,13 +747,12 @@ impl RequestLogRepo {
             .collect())
     }
 
-    /// The nine-column metric SELECT list shared by [`Self::reports_totals`]/
+    /// The canonical metric SELECT list shared by [`Self::reports_totals`]/
     /// [`Self::reports_series`]/[`Self::reports_breakdown`] — errors classified by the SAME
     /// native-HTTP/imported-outcome rule as `aggregate_since`/`series_since`, and
-    /// `tokens`/`cached_tokens`
-    /// falling back the SAME way (`total_tokens` -> `input_tokens + output_tokens`; `cached_tokens`
-    /// -> `cached_input_tokens`; never `+ reasoning_tokens`, which is a subset of `output_tokens`,
-    /// not a third count — same reasoning as `aggregate_since`'s `total_tokens` fallback). Column
+    /// `tokens` uses the same authoritative/compatibility precedence as overview totals. Cached
+    /// input and reasoning output remain subset dimensions and are never added to API total.
+    /// Effective tokens are uncached input + output. Column
     /// order here MUST match the tuple type each caller destructures and
     /// [`Self::report_metrics_from_row`].
     fn reports_metric_select_list() -> String {
@@ -595,36 +760,42 @@ impl RequestLogRepo {
             "COUNT(*), \
              COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0), \
              COALESCE(SUM(cost_usd), 0.0), \
-             COALESCE(SUM(COALESCE(total_tokens, COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))), 0), \
+             COALESCE(SUM({api_total}), 0), \
+             COALESCE(SUM(MAX(COALESCE(input_tokens, 0), 0)), 0), \
              COALESCE(SUM(COALESCE(cached_tokens, cached_input_tokens, 0)), 0), \
+             COALESCE(SUM(MAX(COALESCE(cache_write_input_tokens, 0), 0)), 0), \
              COALESCE(SUM(COALESCE(reasoning_tokens, 0)), 0), \
+             COALESCE(SUM({effective}), 0), \
              COALESCE(SUM(COALESCE(orchestration_input_tokens, 0) + COALESCE(orchestration_output_tokens, 0)), 0), \
              COALESCE(SUM(COALESCE(orchestration_cached_input_tokens, 0)), 0), \
              COALESCE(AVG(duration_ms), 0.0), \
              COALESCE(AVG(latency_first_token_ms), 0.0), \
              COUNT(latency_first_token_ms)",
-            error = ERROR_SQL
+            error = ERROR_SQL,
+            api_total = API_TOTAL_SQL,
+            effective = EFFECTIVE_TOKENS_SQL,
         )
     }
 
-    /// Map one row of [`Self::reports_metric_select_list`]'s nine columns (in that exact order) to
+    /// Map one row of [`Self::reports_metric_select_list`] (in that exact order) to
     /// [`ReportMetrics`] — the single place all three `reports_*` methods share this conversion, so
     /// the column order only has to be kept in sync in one place.
-    fn report_metrics_from_row(
-        row: (i64, i64, f64, i64, i64, i64, i64, i64, f64, f64, i64),
-    ) -> ReportMetrics {
+    fn report_metrics_from_row(row: ReportMetricsSqlRow) -> ReportMetrics {
         ReportMetrics {
             requests: row.0,
             errors: row.1,
             cost_usd: row.2,
             tokens: row.3,
-            cached_tokens: row.4,
-            reasoning_tokens: row.5,
-            orchestration_tokens: row.6,
-            orchestration_cached_tokens: row.7,
-            avg_duration_ms: row.8,
-            avg_ttft_ms: row.9,
-            ttft_sample_count: row.10,
+            input_tokens: row.4,
+            cached_tokens: row.5,
+            cache_write_tokens: row.6,
+            reasoning_tokens: row.7,
+            effective_tokens: row.8,
+            orchestration_tokens: row.9,
+            orchestration_cached_tokens: row.10,
+            avg_duration_ms: row.11,
+            avg_ttft_ms: row.12,
+            ttft_sample_count: row.13,
         }
     }
 
@@ -649,9 +820,7 @@ impl RequestLogRepo {
                 ""
             }
         );
-        let mut query =
-            sqlx::query_as::<_, (i64, i64, f64, i64, i64, i64, i64, i64, f64, f64, i64)>(&sql)
-                .bind(since_ts);
+        let mut query = sqlx::query_as::<_, ReportMetricsSqlRow>(&sql).bind(since_ts);
         if let Some(p) = provider {
             query = query.bind(p);
         }
@@ -683,11 +852,10 @@ impl RequestLogRepo {
                 ""
             }
         );
-        let mut query =
-            sqlx::query_as::<_, (i64, i64, i64, f64, i64, i64, i64, i64, i64, f64, f64, i64)>(&sql)
-                .bind(bucket_secs)
-                .bind(bucket_secs)
-                .bind(since_ts);
+        let mut query = sqlx::query_as::<_, ReportBucketSqlRow>(&sql)
+            .bind(bucket_secs)
+            .bind(bucket_secs)
+            .bind(since_ts);
         if let Some(p) = provider {
             query = query.bind(p);
         }
@@ -698,6 +866,7 @@ impl RequestLogRepo {
                 ts: row.0,
                 metrics: Self::report_metrics_from_row((
                     row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11,
+                    row.12, row.13, row.14,
                 )),
             })
             .collect())
@@ -737,24 +906,7 @@ impl RequestLogRepo {
                 ""
             }
         );
-        let mut query = sqlx::query_as::<
-            _,
-            (
-                String,
-                i64,
-                i64,
-                f64,
-                i64,
-                i64,
-                i64,
-                i64,
-                i64,
-                f64,
-                f64,
-                i64,
-            ),
-        >(&sql)
-        .bind(since_ts);
+        let mut query = sqlx::query_as::<_, ReportBreakdownSqlRow>(&sql).bind(since_ts);
         if let Some(p) = provider {
             query = query.bind(p);
         }
@@ -765,6 +917,7 @@ impl RequestLogRepo {
                 key: row.0,
                 metrics: Self::report_metrics_from_row((
                     row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11,
+                    row.12, row.13, row.14,
                 )),
             })
             .collect())
@@ -1852,7 +2005,9 @@ mod tests {
             Some(8380),
             Some(120),
             Some(6912),
+            Some(256),
             Some(40),
+            Some(8500),
             Some(11),
             Some(7),
             Some(3),
@@ -1873,7 +2028,12 @@ mod tests {
         assert_eq!(row.input_tokens, Some(8380));
         assert_eq!(row.output_tokens, Some(120));
         assert_eq!(row.cached_input_tokens, Some(6912));
+        assert_eq!(row.cache_write_input_tokens, Some(256));
         assert_eq!(row.reasoning_tokens, Some(40));
+        assert_eq!(row.reported_total_tokens, Some(8500));
+        assert_eq!(row.usage_schema.as_deref(), Some("openai_responses_v1"));
+        assert_eq!(row.usage_source.as_deref(), Some("upstream_response"));
+        assert_eq!(row.usage_status.as_deref(), Some("final"));
         assert_eq!(row.orchestration_input_tokens, Some(11));
         assert_eq!(row.orchestration_output_tokens, Some(7));
         assert_eq!(row.orchestration_cached_input_tokens, Some(3));
@@ -1899,6 +2059,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Some(RequestProtocolOutcome::Completed),
         )
         .await
@@ -1906,7 +2068,7 @@ mod tests {
 
         // duration_ms: None must leave the existing value untouched (COALESCE), not null it out.
         repo.update_usage(
-            "req-xyz", None, None, None, None, None, None, None, None, None, None, None,
+            "req-xyz", None, None, None, None, None, None, None, None, None, None, None, None, None,
         )
         .await
         .unwrap();
@@ -1929,6 +2091,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_usage_preserves_upstream_total_and_derives_codex_metrics_without_double_counting(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("s.db")).await.unwrap();
+        let repo = store.request_log();
+        let mut rec = sample_record();
+        rec.request_id = Some("canonical-usage".into());
+        rec.total_tokens = None;
+        rec.cached_tokens = None;
+        repo.insert(&rec).await.unwrap();
+
+        repo.update_usage(
+            "canonical-usage",
+            Some(100),
+            Some(25),
+            Some(80),
+            Some(12),
+            Some(5),
+            Some(999),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(RequestProtocolOutcome::Completed),
+        )
+        .await
+        .unwrap();
+
+        let row = repo.list(1, 0).await.unwrap().remove(0);
+        assert_eq!(row.api_total_tokens(), Some(999));
+        assert_eq!(row.uncached_input_tokens(), Some(20));
+        assert_eq!(row.visible_output_tokens(), Some(20));
+        assert_eq!(row.effective_tokens(), Some(45));
+
+        let aggregate = repo.aggregate_since(0).await.unwrap();
+        assert_eq!(aggregate.total_tokens, 999);
+        assert_eq!(aggregate.effective_tokens, 45);
+        assert_eq!(aggregate.cache_write_input_tokens, 12);
+
+        let report = repo.reports_totals(0, None).await.unwrap();
+        assert_eq!(report.tokens, 999);
+        assert_eq!(report.input_tokens, 100);
+        assert_eq!(report.cached_tokens, 80);
+        assert_eq!(report.cache_write_tokens, 12);
+        assert_eq!(report.reasoning_tokens, 5);
+        assert_eq!(report.effective_tokens, 45);
+    }
+
+    #[tokio::test]
+    async fn invalid_legacy_total_does_not_hide_a_complete_input_output_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("s.db")).await.unwrap();
+        let repo = store.request_log();
+        let mut rec = sample_record();
+        rec.request_id = Some("invalid-legacy-total".into());
+        rec.total_tokens = Some(-1);
+        rec.input_tokens = Some(100);
+        rec.output_tokens = Some(25);
+        repo.insert(&rec).await.unwrap();
+
+        let row = repo.list(1, 0).await.unwrap().remove(0);
+        assert_eq!(row.api_total_tokens(), Some(125));
+
+        let aggregate = repo.aggregate_since(0).await.unwrap();
+        assert_eq!(aggregate.total_tokens, 125);
+    }
+
+    #[tokio::test]
+    async fn orchestration_only_terminal_usage_is_still_classified_as_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("s.db")).await.unwrap();
+        let repo = store.request_log();
+        let mut rec = sample_record();
+        rec.request_id = Some("orchestration-only".into());
+        repo.insert(&rec).await.unwrap();
+
+        repo.update_usage(
+            "orchestration-only",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(11),
+            Some(7),
+            Some(3),
+            None,
+            None,
+            None,
+            Some(RequestProtocolOutcome::Completed),
+        )
+        .await
+        .unwrap();
+
+        let row = repo.list(1, 0).await.unwrap().remove(0);
+        assert_eq!(row.usage_schema.as_deref(), Some("openai_responses_v1"));
+        assert_eq!(row.usage_source.as_deref(), Some("upstream_response"));
+        assert_eq!(row.usage_status.as_deref(), Some("final"));
+    }
+
+    #[tokio::test]
     async fn terminal_protocol_outcome_overrides_initial_http_status_in_all_classification() {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::Store::open(&dir.path().join("s.db")).await.unwrap();
@@ -1948,6 +2214,8 @@ mod tests {
             repo.insert(&rec).await.unwrap();
             repo.update_usage(
                 request_id,
+                None,
+                None,
                 None,
                 None,
                 None,

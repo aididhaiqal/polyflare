@@ -229,9 +229,8 @@ struct AccountIdentityView {
 /// `AccountDetailView::request_totals`: how many requests this account has served (all-time) and
 /// their summed token count. Derived from `RequestLogRepo::page` filtered to this account: `total`
 /// is the filtered row count (accurate regardless of page size); `total_tokens` sums each returned
-/// row's `total_tokens`, falling back per row to `input_tokens + output_tokens` (Task 7: `0005`
-/// import/backfill rows never populate `total_tokens` itself; a missing sub-count coalesces to 0,
-/// and `reasoning_tokens` is never added — it's a subset of `output_tokens`, not a third count).
+/// row's upstream-reported total, then its compatibility total, then a complete input/output pair.
+/// Cached input and reasoning output are subsets and are never added again.
 /// The query fetches with an effectively unbounded limit rather than the dashboard's page-sized
 /// default (see `account_detail_handler`) — this is a per-account detail read, not the hot path,
 /// same tradeoff `accounts_handler` already makes for `request_count_24h`.
@@ -339,10 +338,7 @@ pub async fn account_detail_handler(
         request_count: total as i64,
         total_tokens: rows
             .iter()
-            .map(|r| {
-                r.total_tokens
-                    .unwrap_or_else(|| r.input_tokens.unwrap_or(0) + r.output_tokens.unwrap_or(0))
-            })
+            .filter_map(polyflare_store::RequestLogRow::api_total_tokens)
             .sum(),
     };
 
@@ -625,10 +621,9 @@ struct PaceView {
 
 /// One request-log row for the dashboard: content-free by construction (the same audited field set
 /// the tracing event carries — method/path/provider/status/latency plus the content-free per-request
-/// metrics — never a body or identity). `total_tokens` falls back to `input_tokens + output_tokens`
-/// when `total_tokens` itself is null (Task 7: `0005` import/backfill rows never populate it; a
-/// missing sub-count coalesces to 0, and `reasoning_tokens` is never added — it's a subset of
-/// `output_tokens`). `tps` is derived, not stored: output/completion tokens over the generation
+/// metrics — never a body or identity). API total prefers upstream-reported total, then the
+/// compatibility total, then a complete input/output pair. `tps` is derived, not stored:
+/// output/completion tokens over the generation
 /// window (`duration_ms - ttft_ms`, seconds — `ttft_ms` itself falling back to
 /// `latency_first_token_ms` for the same import/backfill rows), present only when both source
 /// fields are present and the window is positive. Input/prompt tokens are deliberately excluded:
@@ -657,6 +652,18 @@ struct RequestRowView {
     ttft_ms: Option<i64>,
     total_tokens: Option<i64>,
     cached_tokens: Option<i64>,
+    input_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    cache_write_input_tokens: Option<i64>,
+    uncached_input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    reasoning_output_tokens: Option<i64>,
+    visible_output_tokens: Option<i64>,
+    reported_total_tokens: Option<i64>,
+    effective_tokens: Option<i64>,
+    usage_schema: Option<String>,
+    usage_source: Option<String>,
+    usage_status: Option<String>,
     orchestration_input_tokens: Option<i64>,
     orchestration_output_tokens: Option<i64>,
     orchestration_cached_input_tokens: Option<i64>,
@@ -799,16 +806,14 @@ pub async fn requests_handler(
     let rows = rows
         .into_iter()
         .map(|r| {
-            // Task 7: fall back to input+output when total_tokens itself is null (never add
-            // reasoning_tokens — it's a subset of output_tokens, not a third count), and to
+            // Prefer upstream-reported total, then compatibility evidence, then input+output.
+            // Reasoning is already a subset of output. TTFT falls back to
             // latency_first_token_ms when ttft_ms is null. The effective TTFT is both serialized
             // for the dashboard and used with output_tokens for the tps derivation below.
-            let total_tokens = r
-                .total_tokens
-                .or_else(|| match (r.input_tokens, r.output_tokens) {
-                    (None, None) => None,
-                    (i, o) => Some(i.unwrap_or(0) + o.unwrap_or(0)),
-                });
+            let total_tokens = r.api_total_tokens();
+            let uncached_input_tokens = r.uncached_input_tokens();
+            let visible_output_tokens = r.visible_output_tokens();
+            let effective_tokens = r.effective_tokens();
             let tps_ttft_ms = r.ttft_ms.or(r.latency_first_token_ms);
             let outcome =
                 canonical_imported_outcome(r.status, r.outcome.as_deref()).map(str::to_string);
@@ -841,6 +846,18 @@ pub async fn requests_handler(
                 ttft_ms: tps_ttft_ms,
                 total_tokens,
                 cached_tokens: r.cached_tokens.or(r.cached_input_tokens),
+                input_tokens: r.input_tokens,
+                cached_input_tokens: r.cached_input_tokens.or(r.cached_tokens),
+                cache_write_input_tokens: r.cache_write_input_tokens,
+                uncached_input_tokens,
+                output_tokens: r.output_tokens,
+                reasoning_output_tokens: r.reasoning_tokens,
+                visible_output_tokens,
+                reported_total_tokens: r.reported_total_tokens,
+                effective_tokens,
+                usage_schema: r.usage_schema,
+                usage_source: r.usage_source,
+                usage_status: r.usage_status,
                 orchestration_input_tokens: r.orchestration_input_tokens,
                 orchestration_output_tokens: r.orchestration_output_tokens,
                 orchestration_cached_input_tokens: r.orchestration_cached_input_tokens,
@@ -878,6 +895,8 @@ struct KpisView {
     success_rate: f64,
     avg_latency_ms: f64,
     total_tokens: i64,
+    effective_tokens: i64,
+    cache_write_input_tokens: i64,
     orchestration_tokens: i64,
     orchestration_cached_tokens: i64,
 }
@@ -896,6 +915,8 @@ impl From<polyflare_store::RequestAggregate> for KpisView {
             success_rate,
             avg_latency_ms: a.avg_latency_ms,
             total_tokens: a.total_tokens,
+            effective_tokens: a.effective_tokens,
+            cache_write_input_tokens: a.cache_write_input_tokens,
             orchestration_tokens: a.orchestration_tokens,
             orchestration_cached_tokens: a.orchestration_cached_tokens,
         }
@@ -1163,6 +1184,8 @@ struct SeriesBucketView {
     errors: i64,
     avg_latency_ms: f64,
     total_tokens: i64,
+    effective_tokens: i64,
+    cache_write_input_tokens: i64,
     orchestration_tokens: i64,
     orchestration_cached_tokens: i64,
 }
@@ -1175,6 +1198,8 @@ impl From<polyflare_store::RequestBucket> for SeriesBucketView {
             errors: b.errors,
             avg_latency_ms: b.avg_latency_ms,
             total_tokens: b.total_tokens,
+            effective_tokens: b.effective_tokens,
+            cache_write_input_tokens: b.cache_write_input_tokens,
             orchestration_tokens: b.orchestration_tokens,
             orchestration_cached_tokens: b.orchestration_cached_tokens,
         }
@@ -1224,6 +1249,8 @@ pub async fn overview_series_handler(State(state): State<Arc<AppState>>) -> impl
             errors: 0,
             avg_latency_ms: 0.0,
             total_tokens: 0,
+            effective_tokens: 0,
+            cache_write_input_tokens: 0,
             orchestration_tokens: 0,
             orchestration_cached_tokens: 0,
         });
@@ -1374,8 +1401,11 @@ struct ReportBucketView {
     errors: i64,
     cost_usd: f64,
     tokens: i64,
+    input_tokens: i64,
     cached_tokens: i64,
+    cache_write_tokens: i64,
     reasoning_tokens: i64,
+    effective_tokens: i64,
     orchestration_tokens: i64,
     orchestration_cached_tokens: i64,
     avg_duration_ms: f64,
@@ -1391,8 +1421,11 @@ impl From<polyflare_store::ReportBucket> for ReportBucketView {
             errors: b.metrics.errors,
             cost_usd: b.metrics.cost_usd,
             tokens: b.metrics.tokens,
+            input_tokens: b.metrics.input_tokens,
             cached_tokens: b.metrics.cached_tokens,
+            cache_write_tokens: b.metrics.cache_write_tokens,
             reasoning_tokens: b.metrics.reasoning_tokens,
+            effective_tokens: b.metrics.effective_tokens,
             orchestration_tokens: b.metrics.orchestration_tokens,
             orchestration_cached_tokens: b.metrics.orchestration_cached_tokens,
             avg_duration_ms: b.metrics.avg_duration_ms,
@@ -1411,8 +1444,11 @@ struct ReportBreakdownView {
     errors: i64,
     cost_usd: f64,
     tokens: i64,
+    input_tokens: i64,
     cached_tokens: i64,
+    cache_write_tokens: i64,
     reasoning_tokens: i64,
+    effective_tokens: i64,
     orchestration_tokens: i64,
     orchestration_cached_tokens: i64,
     avg_duration_ms: f64,
@@ -1428,8 +1464,11 @@ impl From<polyflare_store::ReportBreakdownRow> for ReportBreakdownView {
             errors: r.metrics.errors,
             cost_usd: r.metrics.cost_usd,
             tokens: r.metrics.tokens,
+            input_tokens: r.metrics.input_tokens,
             cached_tokens: r.metrics.cached_tokens,
+            cache_write_tokens: r.metrics.cache_write_tokens,
             reasoning_tokens: r.metrics.reasoning_tokens,
+            effective_tokens: r.metrics.effective_tokens,
             orchestration_tokens: r.metrics.orchestration_tokens,
             orchestration_cached_tokens: r.metrics.orchestration_cached_tokens,
             avg_duration_ms: r.metrics.avg_duration_ms,
@@ -1442,7 +1481,8 @@ impl From<polyflare_store::ReportBreakdownRow> for ReportBreakdownView {
 /// `ReportsView::totals`: the same flat [`polyflare_store::ReportMetrics`] fields as
 /// [`ReportBucketView`]/[`ReportBreakdownView`], plus two derived ratios the dashboard's KPI tiles
 /// want directly rather than re-deriving client-side: `error_rate` (`errors / requests`, `0.0`
-/// when `requests == 0`) and `cache_hit_rate` (`cached_tokens / tokens`, `0.0` when `tokens == 0`)
+/// when `requests == 0`) and `cache_hit_rate` (bounded cached input / input, `0.0` when input is
+/// unavailable)
 /// — both guarded against a 0/0 divide the same way `KpisView::success_rate` already is.
 #[derive(Serialize)]
 struct ReportTotalsView {
@@ -1450,8 +1490,11 @@ struct ReportTotalsView {
     errors: i64,
     cost_usd: f64,
     tokens: i64,
+    input_tokens: i64,
     cached_tokens: i64,
+    cache_write_tokens: i64,
     reasoning_tokens: i64,
+    effective_tokens: i64,
     orchestration_tokens: i64,
     orchestration_cached_tokens: i64,
     avg_duration_ms: f64,
@@ -1468,8 +1511,8 @@ impl From<polyflare_store::ReportMetrics> for ReportTotalsView {
         } else {
             0.0
         };
-        let cache_hit_rate = if m.tokens > 0 {
-            m.cached_tokens as f64 / m.tokens as f64
+        let cache_hit_rate = if m.input_tokens > 0 {
+            m.cached_tokens.clamp(0, m.input_tokens) as f64 / m.input_tokens as f64
         } else {
             0.0
         };
@@ -1478,8 +1521,11 @@ impl From<polyflare_store::ReportMetrics> for ReportTotalsView {
             errors: m.errors,
             cost_usd: m.cost_usd,
             tokens: m.tokens,
+            input_tokens: m.input_tokens,
             cached_tokens: m.cached_tokens,
+            cache_write_tokens: m.cache_write_tokens,
             reasoning_tokens: m.reasoning_tokens,
+            effective_tokens: m.effective_tokens,
             orchestration_tokens: m.orchestration_tokens,
             orchestration_cached_tokens: m.orchestration_cached_tokens,
             avg_duration_ms: m.avg_duration_ms,

@@ -206,10 +206,12 @@ impl WsTurnTelemetry {
                 .runtime
                 .record_actual_pressure(self.estimated_tokens, actual_tokens);
         }
-        let total_tokens = usage
-            .input_tokens
-            .zip(usage.output_tokens)
-            .map(|(input, output)| input.saturating_add(output));
+        let total_tokens = usage.reported_total_tokens.or_else(|| {
+            usage
+                .input_tokens
+                .zip(usage.output_tokens)
+                .map(|(input, output)| input.saturating_add(output))
+        });
         let cost = self
             .model
             .as_deref()
@@ -247,7 +249,7 @@ impl WsTurnTelemetry {
             total_tokens,
             cached_tokens: usage.cached_input_tokens,
             subagent: self.subagent,
-            request_id: Some(request_id),
+            request_id: Some(request_id.clone()),
             session_key: self.session_key,
         };
 
@@ -269,6 +271,27 @@ impl WsTurnTelemetry {
         record.latency_first_token_ms = log.ttft_ms;
         record.protocol_outcome = Some(terminal.protocol_outcome);
         crate::ingress::queue_persist_request_log(&state.store, record);
+        if let Err(error) = state
+            .store
+            .enqueue_request_usage(polyflare_store::RequestUsageUpdate {
+                request_id,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                cache_write_input_tokens: usage.cache_write_input_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+                reported_total_tokens: usage.reported_total_tokens,
+                orchestration_input_tokens: usage.orchestration_input_tokens,
+                orchestration_output_tokens: usage.orchestration_output_tokens,
+                orchestration_cached_input_tokens: usage.orchestration_cached_input_tokens,
+                cost_usd: cost,
+                latency_first_token_ms: log.ttft_ms,
+                duration_ms: Some(duration_ms as i64),
+                protocol_outcome: terminal.protocol_outcome,
+            })
+        {
+            tracing::warn!(%error, "websocket request usage queue failed");
+        }
     }
 }
 
@@ -315,12 +338,15 @@ mod tests {
             .is_none());
         let terminal = turn
             .observe(
-                r#"{"type":"response.completed","response":{"usage":{"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":80},"output_tokens_details":{"reasoning_tokens":5}}}}"#,
+                r#"{"type":"response.completed","response":{"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":80,"cache_write_tokens":7},"output_tokens_details":{"reasoning_tokens":5}}}}"#,
             )
             .unwrap();
         assert_eq!(terminal.status, StatusCode::OK);
         assert_eq!(terminal.protocol_outcome, RequestProtocolOutcome::Completed);
-        assert_eq!(terminal.usage.unwrap().cached_input_tokens, Some(80));
+        let usage = terminal.usage.unwrap();
+        assert_eq!(usage.cached_input_tokens, Some(80));
+        assert_eq!(usage.cache_write_input_tokens, Some(7));
+        assert_eq!(usage.reported_total_tokens, Some(120));
         assert_eq!(turn.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(turn.service_tier.as_deref(), Some("priority"));
         assert_eq!(turn.subagent.as_deref(), Some("review"));

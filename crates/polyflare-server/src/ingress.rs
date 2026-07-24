@@ -404,6 +404,8 @@ struct RouteOutcome {
     session_key: Option<String>,
     /// Content-free pre-route token estimate used for weighted admission and terminal calibration.
     estimated_tokens: u32,
+    /// Final capability boundary used to scope the downstream synthetic pool quota.
+    require_security_work_authorized: bool,
 }
 
 struct ResponsesHandlerOptions {
@@ -1406,6 +1408,7 @@ async fn reroute_cyber_rejection(
     now: i64,
     outcome: &mut RouteOutcome,
 ) -> Response {
+    outcome.require_security_work_authorized = true;
     let anchorless_req = match recovery {
         RecoveryPlan::ResendFull { anchorless_req } => anchorless_req,
         _ => return (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
@@ -1815,7 +1818,9 @@ fn apply_captured_usage(
         input_tokens: u.input_tokens,
         output_tokens: u.output_tokens,
         cached_input_tokens: u.cached_input_tokens,
+        cache_write_input_tokens: u.cache_write_input_tokens,
         reasoning_tokens: u.reasoning_tokens,
+        reported_total_tokens: u.reported_total_tokens,
         orchestration_input_tokens: u.orchestration_input_tokens,
         orchestration_output_tokens: u.orchestration_output_tokens,
         orchestration_cached_input_tokens: u.orchestration_cached_input_tokens,
@@ -1883,6 +1888,7 @@ async fn responses_route_with_transport(
     // C11b Task 2: same reason — grab the content-free `upstream_requests` counter handle before
     // `state` moves into the impl below.
     let upstream_request_metrics = state.upstream_request_metrics.clone();
+    let quota_state = state.clone();
     let catalog_etag = match pool.as_deref() {
         Some(pool) => crate::catalog::pooled_models_etag(&state, pool).await,
         None => crate::catalog::root_models_etag(&state).await,
@@ -1890,6 +1896,25 @@ async fn responses_route_with_transport(
     let (mut response, outcome) =
         responses_handler_impl(state, pool.as_deref(), headers, body, resolved_custom_route).await;
     apply_scope_models_etag(&mut response, catalog_etag);
+    if response.status().is_success()
+        && outcome.account_id.is_some()
+        && outcome.provider_credential_id.is_none()
+    {
+        if let Ok(snapshots) = quota_state
+            .account_cache
+            .snapshots(&quota_state.store)
+            .await
+        {
+            if let Some(quota) = crate::pool_quota::synthesize(
+                &snapshots,
+                Provider::Codex,
+                pool.as_deref(),
+                outcome.require_security_work_authorized,
+            ) {
+                crate::pool_quota::apply_http_headers(response.headers_mut(), &quota);
+            }
+        }
+    }
     // Live-usage-cost-capture Task 6: clone the model slug for pricing BEFORE it's moved into
     // `RequestLog` below (`model: outcome.model` takes ownership of the original).
     let model_for_cost = outcome.model.clone();
@@ -2299,6 +2324,7 @@ async fn responses_handler_impl_with_max_attempts(
         inflight_penalty_pct: state.runtime_settings.inflight_penalty_pct(),
         request_pressure_units: state.runtime.request_pressure_units(ctx.estimated_tokens),
     };
+    outcome.require_security_work_authorized = sel_ctx.require_security_work_authorized;
     let session_key = prepared.directive.session_key.clone();
 
     // C5: ownership pre-filter. New/unowned work selects and reserves under one runtime-state
@@ -3595,7 +3621,9 @@ mod tests {
                     input_tokens: Some(100_000),
                     output_tokens: Some(10_000),
                     cached_input_tokens: Some(20_000),
+                    cache_write_input_tokens: Some(1_000),
                     reasoning_tokens: Some(500),
+                    reported_total_tokens: Some(110_000),
                     ..Default::default()
                 }),
                 ttft_ms: Some(1200),
@@ -3615,7 +3643,12 @@ mod tests {
             assert_eq!(row.input_tokens, Some(100_000));
             assert_eq!(row.output_tokens, Some(10_000));
             assert_eq!(row.cached_input_tokens, Some(20_000));
+            assert_eq!(row.cache_write_input_tokens, Some(1_000));
             assert_eq!(row.reasoning_tokens, Some(500));
+            assert_eq!(row.reported_total_tokens, Some(110_000));
+            assert_eq!(row.usage_schema.as_deref(), Some("openai_responses_v1"));
+            assert_eq!(row.usage_source.as_deref(), Some("upstream_response"));
+            assert_eq!(row.usage_status.as_deref(), Some("final"));
             let cost = row
                 .cost_usd
                 .expect("cost must be computed for a known model");

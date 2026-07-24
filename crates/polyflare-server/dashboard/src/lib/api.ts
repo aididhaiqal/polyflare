@@ -282,8 +282,22 @@ export interface RequestRowView {
   service_tier: string | null;
   transport: string | null;
   ttft_ms: number | null;
+  /** API total: upstream-reported total when present, otherwise a compatibility fallback. */
   total_tokens: number | null;
   cached_tokens: number | null;
+  input_tokens: number | null;
+  cached_input_tokens: number | null;
+  cache_write_input_tokens: number | null;
+  uncached_input_tokens: number | null;
+  output_tokens: number | null;
+  reasoning_output_tokens: number | null;
+  visible_output_tokens: number | null;
+  reported_total_tokens: number | null;
+  /** Codex blended/effective usage: uncached input + all output. */
+  effective_tokens: number | null;
+  usage_schema: "openai_responses_v1" | "legacy_unknown" | null;
+  usage_source: "upstream_response" | "codex_lb_import" | "polyflare_legacy" | null;
+  usage_status: "final" | "legacy" | null;
   orchestration_input_tokens: number | null;
   orchestration_output_tokens: number | null;
   orchestration_cached_input_tokens: number | null;
@@ -371,8 +385,11 @@ export interface ReportMetricsView {
   errors: number;
   cost_usd: number;
   tokens: number;
+  input_tokens: number;
   cached_tokens: number;
+  cache_write_tokens: number;
   reasoning_tokens: number;
+  effective_tokens: number;
   orchestration_tokens: number;
   orchestration_cached_tokens: number;
   avg_duration_ms: number;
@@ -394,7 +411,7 @@ export interface ReportBreakdownView extends ReportMetricsView {
 }
 
 /** `read_api.rs::ReportTotalsView` — `ReportsView.totals`: the same flat metrics fields plus two
- * derived ratios (`error_rate = errors/requests`, `cache_hit_rate = cached_tokens/tokens`, both
+ * derived ratios (`error_rate = errors/requests`, `cache_hit_rate = cached_tokens/input_tokens`, both
  * `0.0` on a 0/0 divide — the same guard `KpisView.success_rate` uses). */
 export interface ReportTotalsView extends ReportMetricsView {
   error_rate: number;
@@ -418,6 +435,8 @@ export interface KpisView {
   success_rate: number;
   avg_latency_ms: number;
   total_tokens: number;
+  effective_tokens: number;
+  cache_write_input_tokens: number;
   orchestration_tokens: number;
   orchestration_cached_tokens: number;
 }
@@ -482,6 +501,8 @@ export interface SeriesBucketView {
   errors: number;
   avg_latency_ms: number;
   total_tokens: number;
+  effective_tokens: number;
+  cache_write_input_tokens: number;
   orchestration_tokens: number;
   orchestration_cached_tokens: number;
 }

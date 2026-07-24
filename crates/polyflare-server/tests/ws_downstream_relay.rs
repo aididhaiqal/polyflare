@@ -244,6 +244,18 @@ mod relay_through {
             )
             .await
             .unwrap();
+        store
+            .accounts()
+            .insert_usage_window(
+                id,
+                "secondary",
+                40.0,
+                Some(now() + 86_400),
+                Some(10_080),
+                now(),
+            )
+            .await
+            .unwrap();
 
         let continuity: Arc<dyn Continuity> = Arc::new(CodexContinuity::new(
             store.continuity(),
@@ -378,6 +390,72 @@ mod relay_through {
             axum::serve(listener, app).await.unwrap();
         });
         format!("ws://{addr}")
+    }
+
+    #[tokio::test]
+    async fn rate_limit_event_becomes_selected_and_aggregate_pool_meters() {
+        let rate_limits = serde_json::json!({
+            "type": "codex.rate_limits",
+            "plan_type": "pro",
+            "rate_limits": {
+                "primary": {
+                    "used_percent": 70.0,
+                    "window_minutes": 300,
+                    "reset_at": now() + 3_600
+                },
+                "secondary": {
+                    "used_percent": 80.0,
+                    "window_minutes": 10080,
+                    "reset_at": now() + 86_400
+                }
+            }
+        })
+        .to_string();
+        let mock = MockWsUpstream::new(ScriptedTurn::normal(vec![rate_limits]));
+        let upstream = mock.spawn().await;
+        let (base, _state) = spawn_with_pinned_account("quota-account", &upstream).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        ws.send(TMessage::Text(
+            serde_json::json!({
+                "type": "response.create",
+                "model": "gpt-5.6-sol",
+                "input": [{"role": "user", "content": "hello"}]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+        let mut meters = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let TMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == "codex.rate_limits" {
+                    meters.push(value);
+                } else if value["type"] == "response.completed" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("completed turn");
+
+        assert_eq!(meters.len(), 2);
+        assert_eq!(meters[0]["metered_limit_name"], "polyflare_selected");
+        assert_eq!(meters[0]["rate_limits"]["secondary"]["used_percent"], 80.0);
+        assert_eq!(meters[1]["metered_limit_name"], "codex");
+        assert_eq!(meters[1]["rate_limits"]["secondary"]["used_percent"], 40.0);
+        assert!(
+            meters[1]["rate_limits"].get("primary").is_none(),
+            "aggregate 5h remains absent without fresh fleet-wide evidence"
+        );
     }
 
     #[tokio::test]
@@ -1357,6 +1435,7 @@ mod relay_through {
             100_000,
             10_000,
             20_000,
+            1_000,
             2_000,
         ));
         let mock_base = mock.spawn().await;
@@ -1442,7 +1521,12 @@ mod relay_through {
         assert_eq!(row.input_tokens, Some(100_000));
         assert_eq!(row.output_tokens, Some(10_000));
         assert_eq!(row.cached_input_tokens, Some(20_000));
+        assert_eq!(row.cache_write_input_tokens, Some(1_000));
         assert_eq!(row.reasoning_tokens, Some(2_000));
+        assert_eq!(row.reported_total_tokens, Some(110_000));
+        assert_eq!(row.usage_schema.as_deref(), Some("openai_responses_v1"));
+        assert_eq!(row.usage_source.as_deref(), Some("upstream_response"));
+        assert_eq!(row.usage_status.as_deref(), Some("final"));
         assert_eq!(row.total_tokens, Some(110_000));
         assert_eq!(row.cached_tokens, Some(20_000));
         assert!(row.ttft_ms.is_some());

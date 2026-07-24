@@ -31,7 +31,9 @@ pub struct RequestUsageUpdate {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
+    pub cache_write_input_tokens: Option<i64>,
     pub reasoning_tokens: Option<i64>,
+    pub reported_total_tokens: Option<i64>,
     pub orchestration_input_tokens: Option<i64>,
     pub orchestration_output_tokens: Option<i64>,
     pub orchestration_cached_input_tokens: Option<i64>,
@@ -91,7 +93,9 @@ async fn run_background_writer(pool: SqlitePool, mut rx: mpsc::Receiver<Backgrou
                         update.input_tokens,
                         update.output_tokens,
                         update.cached_input_tokens,
+                        update.cache_write_input_tokens,
                         update.reasoning_tokens,
+                        update.reported_total_tokens,
                         update.orchestration_input_tokens,
                         update.orchestration_output_tokens,
                         update.orchestration_cached_input_tokens,
@@ -331,7 +335,9 @@ mod tests {
                 input_tokens: Some(10),
                 output_tokens: Some(5),
                 cached_input_tokens: Some(2),
+                cache_write_input_tokens: Some(1),
                 reasoning_tokens: Some(1),
+                reported_total_tokens: Some(15),
                 orchestration_input_tokens: None,
                 orchestration_output_tokens: None,
                 orchestration_cached_input_tokens: None,
@@ -347,6 +353,11 @@ mod tests {
         assert_eq!(row.request_id.as_deref(), Some("rq-1"));
         assert_eq!(row.input_tokens, Some(10));
         assert_eq!(row.output_tokens, Some(5));
+        assert_eq!(row.cache_write_input_tokens, Some(1));
+        assert_eq!(row.reported_total_tokens, Some(15));
+        assert_eq!(row.usage_schema.as_deref(), Some("openai_responses_v1"));
+        assert_eq!(row.usage_source.as_deref(), Some("upstream_response"));
+        assert_eq!(row.usage_status.as_deref(), Some("final"));
         assert_eq!(row.duration_ms, 20);
         assert_eq!(row.protocol_outcome.as_deref(), Some("completed"));
     }

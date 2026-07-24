@@ -586,6 +586,7 @@ async fn relay(
         session_key,
         relay_contract,
         pool,
+        require_security_work_authorized,
     )
     .await;
 }

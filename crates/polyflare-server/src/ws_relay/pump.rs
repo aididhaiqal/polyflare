@@ -108,7 +108,7 @@ use futures_util::StreamExt;
 
 use polyflare_codex::ws::WS_CONNECTION_LIMIT_CODE;
 use polyflare_codex::{WsConn, WsRelayContract};
-use polyflare_core::{Account, AccountId, FailureSignal, SessionKey};
+use polyflare_core::{Account, AccountId, FailureSignal, Provider, SessionKey};
 
 use crate::app::AppState;
 
@@ -128,6 +128,25 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+async fn rewrite_rate_limit_frames(
+    state: &AppState,
+    pool: Option<&str>,
+    require_security_work_authorized: bool,
+    payload: &str,
+) -> Option<(String, String)> {
+    if !payload.contains("codex.rate_limits") {
+        return None;
+    }
+    let snapshots = state.account_cache.snapshots(&state.store).await.ok()?;
+    let quota = crate::pool_quota::synthesize(
+        snapshots.as_ref(),
+        Provider::Codex,
+        pool,
+        require_security_work_authorized,
+    )?;
+    crate::pool_quota::rewrite_ws_event(payload, &quota)
 }
 
 fn attempt_budget_exhausted_frame() -> String {
@@ -426,6 +445,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
     session_key: SessionKey,
     relay_contract: WsRelayContract,
     pool: Option<String>,
+    require_security_work_authorized: bool,
 ) where
     F: Fn(AccountId, String) -> Fut,
     Fut: Future<Output = ()>,
@@ -913,7 +933,30 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                             }
                             // Normal: forward VERBATIM, then sniff for ownership.
                             UpstreamSignal::Normal => {
-                                if downstream.send(Message::Text(text.clone().into())).await.is_err() {
+                                if let Some((selected, aggregate)) = rewrite_rate_limit_frames(
+                                    &state,
+                                    pool.as_deref(),
+                                    require_security_work_authorized,
+                                    &text,
+                                )
+                                .await
+                                {
+                                    if downstream
+                                        .send(Message::Text(selected.into()))
+                                        .await
+                                        .is_err()
+                                        || downstream
+                                            .send(Message::Text(aggregate.into()))
+                                            .await
+                                            .is_err()
+                                    {
+                                        break;
+                                    }
+                                } else if downstream
+                                    .send(Message::Text(text.clone().into()))
+                                    .await
+                                    .is_err()
+                                {
                                     break;
                                 }
                                 client_visible_upstream_for_turn = true;

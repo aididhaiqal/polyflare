@@ -390,6 +390,13 @@ pub struct AccountSnapshot {
     pub used_percent: f64,
     /// Secondary-window used percent (0–100) — drives the capacity weight.
     pub secondary_used_percent: f64,
+    /// Resolved five-hour quota evidence, including freshness and reset metadata. The selector
+    /// continues to read `used_percent`; downstream pool-quota synthesis reads this richer copy.
+    pub five_hour_quota: Option<QuotaWindowSnapshot>,
+    /// Resolved weekly quota evidence, including freshness and reset metadata. The selector
+    /// continues to read `secondary_used_percent`; downstream pool-quota synthesis reads this
+    /// richer copy.
+    pub weekly_quota: Option<QuotaWindowSnapshot>,
     /// Durable rate-limit/quota reset epoch (seconds); auto-recovery gate.
     pub reset_at: Option<i64>,
     /// Per-account capacity override (credits); `None` ⇒ derive from `plan_type`.
@@ -437,6 +444,8 @@ impl AccountSnapshot {
             status: "active".to_string(),
             used_percent: 0.0,
             secondary_used_percent: 0.0,
+            five_hour_quota: None,
+            weekly_quota: None,
             reset_at: None,
             capacity_credits: None,
             routing_policy: "normal".to_string(),
@@ -455,6 +464,17 @@ impl AccountSnapshot {
             pools: Vec::new(),
         }
     }
+}
+
+/// One duration-resolved account quota window carried through the account cache. This is factual
+/// upstream evidence, not a synthesized pool value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaWindowSnapshot {
+    pub used_percent: f64,
+    pub window_minutes: Option<i64>,
+    pub reset_at: Option<i64>,
+    pub recorded_at: i64,
+    pub stale: bool,
 }
 
 /// Request cost/volume tier, derived at ingress from the model alias / reasoning effort (Claude

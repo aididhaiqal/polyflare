@@ -18,7 +18,8 @@
 //!     "usage": {
 //!       "input_tokens": 8380,
 //!       "output_tokens": 120,
-//!       "input_tokens_details": { "cached_tokens": 6912 },
+//!       "total_tokens": 8500,
+//!       "input_tokens_details": { "cached_tokens": 6912, "cache_write_tokens": 256 },
 //!       "output_tokens_details": { "reasoning_tokens": 40 }
 //!     }
 //!   }
@@ -38,7 +39,7 @@ use bytes::Bytes;
 use futures_core::Stream;
 use serde_json::Value;
 
-/// The four numeric token counts pulled from a `response.completed` frame's `usage` object.
+/// The canonical numeric token counts pulled from a `response.completed` frame's `usage` object.
 /// Every field is `Option` because a real frame may omit any of them; content is never carried
 /// here, only counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -46,10 +47,16 @@ pub struct ResponseUsage {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
+    pub cache_write_input_tokens: Option<i64>,
     pub reasoning_tokens: Option<i64>,
+    pub reported_total_tokens: Option<i64>,
     pub orchestration_input_tokens: Option<i64>,
     pub orchestration_output_tokens: Option<i64>,
     pub orchestration_cached_input_tokens: Option<i64>,
+}
+
+fn non_negative_i64(value: &Value) -> Option<i64> {
+    value.as_i64().filter(|value| *value >= 0)
 }
 
 /// Convert authoritative terminal usage into the same compute-pressure scale used by the
@@ -72,7 +79,7 @@ pub fn pressure_equivalent_tokens(usage: ResponseUsage) -> Option<u64> {
 }
 
 /// Parse one JSON stream frame and, if it is a `response.completed` frame carrying a
-/// `response.usage` object, return the four numeric usage counts. Returns `None` for any other
+/// `response.usage` object, return its canonical numeric usage counts. Returns `None` for any other
 /// frame type, malformed JSON, or a `response.completed` frame with no `usage` object.
 ///
 /// Reads ONLY the numeric usage fields (see module docs) — never any content/text field.
@@ -89,16 +96,21 @@ pub fn parse_response_usage(frame_json: &str) -> Option<ResponseUsage> {
     }
 
     Some(ResponseUsage {
-        input_tokens: usage.get("input_tokens").and_then(Value::as_i64),
-        output_tokens: usage.get("output_tokens").and_then(Value::as_i64),
+        input_tokens: usage.get("input_tokens").and_then(non_negative_i64),
+        output_tokens: usage.get("output_tokens").and_then(non_negative_i64),
         cached_input_tokens: usage
             .get("input_tokens_details")
             .and_then(|d| d.get("cached_tokens"))
-            .and_then(Value::as_i64),
+            .and_then(non_negative_i64),
+        cache_write_input_tokens: usage
+            .get("input_tokens_details")
+            .and_then(|d| d.get("cache_write_tokens"))
+            .and_then(non_negative_i64),
         reasoning_tokens: usage
             .get("output_tokens_details")
             .and_then(|d| d.get("reasoning_tokens"))
-            .and_then(Value::as_i64),
+            .and_then(non_negative_i64),
+        reported_total_tokens: usage.get("total_tokens").and_then(non_negative_i64),
         orchestration_input_tokens: usage
             .get("orchestration_input_tokens")
             .or_else(|| {
@@ -111,7 +123,7 @@ pub fn parse_response_usage(frame_json: &str) -> Option<ResponseUsage> {
                     .get("orchestration_tokens_details")
                     .and_then(|d| d.get("input_tokens"))
             })
-            .and_then(Value::as_i64),
+            .and_then(non_negative_i64),
         orchestration_output_tokens: usage
             .get("orchestration_output_tokens")
             .or_else(|| {
@@ -124,7 +136,7 @@ pub fn parse_response_usage(frame_json: &str) -> Option<ResponseUsage> {
                     .get("orchestration_tokens_details")
                     .and_then(|d| d.get("output_tokens"))
             })
-            .and_then(Value::as_i64),
+            .and_then(non_negative_i64),
         orchestration_cached_input_tokens: usage
             .get("orchestration_cached_input_tokens")
             .or_else(|| {
@@ -142,7 +154,7 @@ pub fn parse_response_usage(frame_json: &str) -> Option<ResponseUsage> {
                     .get("orchestration_tokens_details")
                     .and_then(|d| d.get("cached_input_tokens"))
             })
-            .and_then(Value::as_i64),
+            .and_then(non_negative_i64),
     })
 }
 
@@ -643,12 +655,29 @@ mod tests {
 
     #[test]
     fn parses_usage_from_completed_frame() {
-        let f = r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":8380,"output_tokens":120,"input_tokens_details":{"cached_tokens":6912},"output_tokens_details":{"reasoning_tokens":40}}}}"#;
+        let f = r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":8380,"output_tokens":120,"total_tokens":8500,"input_tokens_details":{"cached_tokens":6912,"cache_write_tokens":256},"output_tokens_details":{"reasoning_tokens":40}}}}"#;
         let u = parse_response_usage(f).unwrap();
         assert_eq!(u.input_tokens, Some(8380));
         assert_eq!(u.output_tokens, Some(120));
         assert_eq!(u.cached_input_tokens, Some(6912));
+        assert_eq!(u.cache_write_input_tokens, Some(256));
         assert_eq!(u.reasoning_tokens, Some(40));
+        assert_eq!(u.reported_total_tokens, Some(8500));
+    }
+
+    #[test]
+    fn ignores_negative_usage_counts_instead_of_persisting_invalid_evidence() {
+        let u = parse_response_usage(
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":-1,"total_tokens":-2,"input_tokens_details":{"cached_tokens":-3,"cache_write_tokens":-4},"output_tokens_details":{"reasoning_tokens":-5}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            u,
+            ResponseUsage {
+                input_tokens: Some(10),
+                ..ResponseUsage::default()
+            }
+        );
     }
 
     #[test]

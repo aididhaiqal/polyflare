@@ -31,7 +31,9 @@ pub enum WindowKind {
 #[derive(Debug, Clone)]
 pub struct ResolvedWindow {
     pub used_percent: f64,
+    pub window_minutes: Option<i64>,
     pub reset_at: Option<i64>,
+    pub recorded_at: i64,
     pub stale: bool,
 }
 
@@ -74,7 +76,9 @@ pub fn resolve(usage: &UsageSnapshot, now: i64) -> ResolvedUsage {
             .max_by_key(|(_, w)| w.recorded_at)
             .map(|(_, w)| ResolvedWindow {
                 used_percent: w.used_percent,
+                window_minutes: w.window_minutes,
                 reset_at: w.reset_at,
+                recorded_at: w.recorded_at,
                 stale: now - w.recorded_at > STALE_AFTER_SECS,
             })
     };

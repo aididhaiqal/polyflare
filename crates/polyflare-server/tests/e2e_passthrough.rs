@@ -62,6 +62,18 @@ async fn spawn_polyflare(upstream: String) -> String {
         )
         .await
         .unwrap();
+    store
+        .accounts()
+        .insert_usage_window(
+            "e2e",
+            "secondary",
+            40.0,
+            Some(now() + 86_400),
+            Some(10_080),
+            now(),
+        )
+        .await
+        .unwrap();
     let continuity: Arc<dyn Continuity> = Arc::new(CodexContinuity::new(
         store.continuity(),
         Duration::from_secs(30),
@@ -152,4 +164,37 @@ async fn end_to_end_streaming_passthrough() {
     let done = body.find("response.completed").unwrap();
     assert!(first < second && second < done);
     assert_eq!(handle.last_body().unwrap()["model"], "gpt-5.6-sol");
+}
+
+#[tokio::test]
+async fn native_http_exposes_pool_quota_and_selected_account_separately() {
+    let mock = MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()])
+        .with_response_header("x-codex-primary-used-percent", "70")
+        .with_response_header("x-codex-primary-window-minutes", "300")
+        .with_response_header("x-codex-secondary-used-percent", "80")
+        .with_response_header("x-codex-secondary-window-minutes", "10080")
+        .with_response_header("x-codex-credits-has-credits", "true")
+        .with_response_header("x-codex-credits-unlimited", "false");
+    let upstream = mock.spawn().await;
+    let pf = spawn_polyflare(upstream).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let headers = response.headers();
+    assert_eq!(headers["x-codex-limit-name"], "PolyFlare pool");
+    assert_eq!(headers["x-codex-secondary-used-percent"], "40");
+    assert!(
+        headers.get("x-codex-primary-used-percent").is_none(),
+        "the aggregate must omit 5h when the pool has no fresh 5h evidence"
+    );
+    assert_eq!(headers["x-polyflare-selected-primary-used-percent"], "70");
+    assert_eq!(headers["x-polyflare-selected-secondary-used-percent"], "80");
+    assert!(headers.get("x-codex-credits-has-credits").is_none());
+    assert_eq!(headers["x-polyflare-selected-credits-has-credits"], "true");
 }

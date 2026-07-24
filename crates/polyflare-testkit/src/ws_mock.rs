@@ -71,6 +71,7 @@ pub enum ScriptedTurn {
         input_tokens: i64,
         output_tokens: i64,
         cached_input_tokens: i64,
+        cache_write_input_tokens: i64,
         reasoning_tokens: i64,
     },
     /// A terminal `response.failed` carrying `error.code` / `error.message` — no preceding
@@ -134,6 +135,7 @@ impl ScriptedTurn {
         input_tokens: i64,
         output_tokens: i64,
         cached_input_tokens: i64,
+        cache_write_input_tokens: i64,
         reasoning_tokens: i64,
     ) -> Self {
         ScriptedTurn::TurnWithUsage {
@@ -141,6 +143,7 @@ impl ScriptedTurn {
             input_tokens,
             output_tokens,
             cached_input_tokens,
+            cache_write_input_tokens,
             reasoning_tokens,
         }
     }
@@ -590,6 +593,7 @@ async fn handle_socket(mut socket: WebSocket, mock: MockWsUpstream) {
                 input_tokens,
                 output_tokens,
                 cached_input_tokens,
+                cache_write_input_tokens,
                 reasoning_tokens,
             } => {
                 for e in &events {
@@ -606,7 +610,11 @@ async fn handle_socket(mut socket: WebSocket, mock: MockWsUpstream) {
                         "usage": {
                             "input_tokens": input_tokens,
                             "output_tokens": output_tokens,
-                            "input_tokens_details": {"cached_tokens": cached_input_tokens},
+                            "total_tokens": input_tokens.saturating_add(output_tokens),
+                            "input_tokens_details": {
+                                "cached_tokens": cached_input_tokens,
+                                "cache_write_tokens": cache_write_input_tokens
+                            },
                             "output_tokens_details": {"reasoning_tokens": reasoning_tokens}
                         }
                     }
