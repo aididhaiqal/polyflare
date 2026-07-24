@@ -218,7 +218,7 @@ function TokensCell({ total, cached }: { total: number | null; cached: number | 
     <span className="whitespace-nowrap tabular-nums">
       {compactNum(total)}
       {cached !== null && (
-        <span className="ml-1 text-[9px] text-fg opacity-50">· {compactNum(cached)} cch</span>
+        <span className="ml-1 text-[9px] text-fg opacity-50">· {compactNum(cached)} cache</span>
       )}
     </span>
   );
@@ -754,7 +754,7 @@ function RequestsTable({
               <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>TTFT</th>
               <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>Latency</th>
               <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>Throughput</th>
-              <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>Tokens</th>
+              <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>API tokens</th>
             </tr>
           </thead>
           <tbody>

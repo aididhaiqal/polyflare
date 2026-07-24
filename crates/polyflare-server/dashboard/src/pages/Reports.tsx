@@ -301,32 +301,30 @@ function CostSection({ data, dimensionLabel }: { data: ReportsView; dimensionLab
 }
 
 // ---------------------------------------------------------------------------------------------
-// Usage section — token throughput. Plots `tokens` ALONE: `cached_tokens` is a subset of input
-// tokens and `reasoning_tokens` is a subset of output tokens, both already folded into `tokens`,
-// so stacking all three would double-count. Cached/requests still appear per-dimension in the
-// breakdown table, just not as extra chart series.
+// Usage section — plots API total and Codex effective usage. Cached input and reasoning output are
+// subsets, so they remain detail dimensions instead of being stacked into either total.
 // ---------------------------------------------------------------------------------------------
 
 const USAGE_COLUMNS: ReportSectionColumn[] = [
   {
-    header: "Tokens",
+    header: "API total",
     align: "right",
     render: (row: ReportBreakdownView) => compactNum(row.tokens),
   },
   {
-    header: "Cached",
+    header: "Effective",
+    align: "right",
+    render: (row: ReportBreakdownView) => compactNum(row.effective_tokens),
+  },
+  {
+    header: "Cache read",
     align: "right",
     render: (row: ReportBreakdownView) => compactNum(row.cached_tokens),
   },
   {
-    header: "Orchestration",
+    header: "Cache write",
     align: "right",
-    render: (row: ReportBreakdownView) => compactNum(row.orchestration_tokens),
-  },
-  {
-    header: "Requests",
-    align: "right",
-    render: (row: ReportBreakdownView) => compactNum(row.requests),
+    render: (row: ReportBreakdownView) => compactNum(row.cache_write_tokens),
   },
 ];
 
@@ -337,14 +335,19 @@ function UsageSection({ data, dimensionLabel }: { data: ReportsView; dimensionLa
       kpis={
         <>
           <Col span={3}>
-            <MetricCard icon={Layers} title="Total tokens" value={compactNum(data.totals.tokens)} />
+            <MetricCard
+              icon={Layers}
+              title="API total"
+              value={compactNum(data.totals.tokens)}
+              meta="input + output"
+            />
           </Col>
           <Col span={3}>
             <MetricCard
               icon={Zap}
-              title="Orchestration"
-              value={compactNum(data.totals.orchestration_tokens)}
-              meta={`${compactNum(data.totals.orchestration_cached_tokens)} cached`}
+              title="Effective"
+              value={compactNum(data.totals.effective_tokens)}
+              meta="uncached input + output"
             />
           </Col>
           <Col span={3}>
@@ -355,7 +358,12 @@ function UsageSection({ data, dimensionLabel }: { data: ReportsView; dimensionLa
             />
           </Col>
           <Col span={3}>
-            <MetricCard icon={BarChart3} title="Requests" value={compactNum(data.totals.requests)} />
+            <MetricCard
+              icon={BarChart3}
+              title="Cache writes"
+              value={compactNum(data.totals.cache_write_tokens)}
+              meta={`${compactNum(data.totals.orchestration_tokens)} orchestration`}
+            />
           </Col>
         </>
       }
@@ -367,7 +375,7 @@ function UsageSection({ data, dimensionLabel }: { data: ReportsView; dimensionLa
                 <stop offset="0%" stopColor="hsl(var(--claude))" stopOpacity={0.32} />
                 <stop offset="100%" stopColor="hsl(var(--claude))" stopOpacity={0} />
               </linearGradient>
-              <linearGradient id="orchestration-trend" x1="0" y1="0" x2="0" y2="1">
+              <linearGradient id="effective-trend" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stopColor="hsl(var(--accent))" stopOpacity={0.24} />
                 <stop offset="100%" stopColor="hsl(var(--accent))" stopOpacity={0} />
               </linearGradient>
@@ -392,10 +400,10 @@ function UsageSection({ data, dimensionLabel }: { data: ReportsView; dimensionLa
             />
             <Area
               type="monotone"
-              dataKey="orchestration_tokens"
+              dataKey="effective_tokens"
               stroke="hsl(var(--accent))"
               strokeWidth={1.5}
-              fill="url(#orchestration-trend)"
+              fill="url(#effective-trend)"
               isAnimationActive={false}
               dot={false}
             />

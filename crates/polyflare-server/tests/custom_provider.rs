@@ -33,10 +33,10 @@ async fn upstream_handler(
         concat!(
             "event: response.completed\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_custom\",",
-            "\"usage\":{\"input_tokens\":100,\"output_tokens\":25,",
-            "\"input_tokens_details\":{\"cached_tokens\":20,\"orchestration_input_tokens\":10,",
+            "\"usage\":{\"input_tokens\":100,\"output_tokens\":25,\"total_tokens\":125,",
+            "\"input_tokens_details\":{\"cached_tokens\":20,\"cache_write_tokens\":9,\"orchestration_input_tokens\":10,",
             "\"orchestration_input_cached_tokens\":3},",
-            "\"output_tokens_details\":{\"orchestration_output_tokens\":4}}}}\n\n"
+            "\"output_tokens_details\":{\"reasoning_tokens\":5,\"orchestration_output_tokens\":4}}}}\n\n"
         )
         .to_string(),
     )
@@ -226,6 +226,12 @@ async fn custom_model_routes_statelessly_and_is_provider_aware_everywhere() {
     );
     assert_eq!(row.model.as_deref(), Some("fugu-ultra"));
     assert_eq!(row.upstream_model.as_deref(), Some("fugu-ultra-v1.1"));
+    assert_eq!(row.cache_write_input_tokens, Some(9));
+    assert_eq!(row.reasoning_tokens, Some(5));
+    assert_eq!(row.reported_total_tokens, Some(125));
+    assert_eq!(row.usage_schema.as_deref(), Some("openai_responses_v1"));
+    assert_eq!(row.usage_source.as_deref(), Some("upstream_response"));
+    assert_eq!(row.usage_status.as_deref(), Some("final"));
     assert_eq!(row.orchestration_input_tokens, Some(10));
     assert_eq!(row.orchestration_output_tokens, Some(4));
     assert_eq!(row.orchestration_cached_input_tokens, Some(3));

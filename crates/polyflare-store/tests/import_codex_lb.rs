@@ -361,7 +361,8 @@ async fn imports_accounts_usage_and_tokens_roundtrip() {
          account_id, session_id, request_id, model, plan_type, request_kind, input_tokens, \
          output_tokens, cached_input_tokens, reasoning_tokens, cost_usd, reasoning_effort, \
          latency_first_token_ms, service_tier, actual_service_tier, transport, deleted_at, \
-         import_source_id FROM request_log",
+         import_source_id, cache_write_input_tokens, reported_total_tokens, usage_schema, \
+         usage_source, usage_status FROM request_log",
     )
     .fetch_one(store.pool())
     .await
@@ -399,6 +400,11 @@ async fn imports_accounts_usage_and_tokens_roundtrip() {
     assert_eq!(row.get::<String, _>("transport"), "websocket");
     assert_eq!(row.get::<Option<i64>, _>("deleted_at"), None);
     assert_eq!(row.get::<i64, _>("import_source_id"), 1);
+    assert_eq!(row.get::<Option<i64>, _>("cache_write_input_tokens"), None);
+    assert_eq!(row.get::<Option<i64>, _>("reported_total_tokens"), None);
+    assert_eq!(row.get::<String, _>("usage_schema"), "legacy_unknown");
+    assert_eq!(row.get::<String, _>("usage_source"), "codex_lb_import");
+    assert_eq!(row.get::<String, _>("usage_status"), "legacy");
 
     // Content safety: the free-form / PII columns must not exist in PolyFlare's request_log at all,
     // so the useragent / client_ip / error_message the fixture carried could never be persisted.

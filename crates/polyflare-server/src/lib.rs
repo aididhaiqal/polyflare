@@ -20,6 +20,7 @@ pub mod log_bus;
 pub mod metrics;
 pub mod model_catalog;
 pub mod observability;
+pub mod pool_quota;
 pub mod posture;
 pub mod provider_api;
 pub mod reactive_auth;

@@ -209,10 +209,7 @@ function summarizeBuckets(buckets: ReportBucketView[]): PeriodMetrics {
           requests
         : 0,
     cost: buckets.reduce((sum, bucket) => sum + bucket.cost_usd, 0),
-    tokens: buckets.reduce(
-      (sum, bucket) => sum + bucket.tokens + bucket.orchestration_tokens,
-      0,
-    ),
+    tokens: buckets.reduce((sum, bucket) => sum + bucket.tokens, 0),
   };
 }
 
@@ -757,15 +754,11 @@ function CommandMetricsStrip({
           />
           <CommandMetric
             icon={Coins}
-            title="Tokens"
-            value={
-              report
-                ? compactNum(report.totals.tokens + report.totals.orchestration_tokens)
-                : "—"
-            }
+            title="API tokens"
+            value={report ? compactNum(report.totals.tokens) : "—"}
             meta={
               report
-                ? `${compactNum(report.totals.tokens)} model · ${compactNum(report.totals.orchestration_tokens)} orchestration`
+                ? `${compactNum(report.totals.effective_tokens)} effective · ${compactNum(report.totals.cached_tokens)} cache read`
                 : "Loading analytics"
             }
             trend={reportTrends?.tokens}

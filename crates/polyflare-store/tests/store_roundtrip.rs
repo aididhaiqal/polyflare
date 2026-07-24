@@ -2,6 +2,14 @@
 
 use polyflare_store::Store;
 
+type UsageClassificationRow = (
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 #[tokio::test]
 async fn open_creates_schema() {
     let dir = tempfile::tempdir().unwrap();
@@ -81,6 +89,62 @@ async fn migration_0016_erases_preexisting_raw_session_ids() {
     .await
     .unwrap();
     assert_eq!(session_key_column, 1, "the hashed session column was added");
+}
+
+#[tokio::test]
+async fn migration_0021_classifies_legacy_usage_without_inventing_new_token_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("store.db");
+    let store = Store::open(&db_path).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO request_log \
+         (requested_at, provider, method, path, aliased, status, duration_ms, input_tokens, \
+          output_tokens, cached_input_tokens, reasoning_tokens, import_source_id) \
+         VALUES (1, 'codex', 'POST', '/responses', 0, 0, 1, 100, 25, 80, 5, 42)",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    for column in [
+        "usage_status",
+        "usage_source",
+        "usage_schema",
+        "reported_total_tokens",
+        "cache_write_input_tokens",
+    ] {
+        sqlx::query(&format!("ALTER TABLE request_log DROP COLUMN {column}"))
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 21")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    store.pool().close().await;
+    drop(store);
+
+    let upgraded = Store::open(&db_path).await.unwrap();
+    let row: UsageClassificationRow = sqlx::query_as(
+        "SELECT cache_write_input_tokens, reported_total_tokens, usage_schema, usage_source, \
+             usage_status FROM request_log WHERE import_source_id = 42",
+    )
+    .fetch_one(upgraded.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        (
+            None,
+            None,
+            Some("legacy_unknown".into()),
+            Some("codex_lb_import".into()),
+            Some("legacy".into()),
+        ),
+        "migration must classify provenance while leaving unobserved token facts unknown"
+    );
 }
 
 #[tokio::test]

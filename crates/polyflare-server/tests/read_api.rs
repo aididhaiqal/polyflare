@@ -1485,6 +1485,61 @@ async fn requests_endpoint_falls_back_to_input_output_tokens_and_latency_first_t
 }
 
 #[tokio::test]
+async fn requests_endpoint_exposes_canonical_raw_and_derived_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let repo = store.request_log();
+    let mut record = req_row_at(now(), 200, 0);
+    record.request_id = Some("canonical-request".into());
+    record.total_tokens = None;
+    repo.insert(&record).await.unwrap();
+    repo.update_usage(
+        "canonical-request",
+        Some(100),
+        Some(25),
+        Some(80),
+        Some(12),
+        Some(5),
+        Some(999),
+        None,
+        None,
+        None,
+        None,
+        Some(10),
+        Some(100),
+        Some(polyflare_store::RequestProtocolOutcome::Completed),
+    )
+    .await
+    .unwrap();
+    std::mem::forget(dir);
+
+    let pf = spawn(store).await;
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/requests?request_id=canonical-request"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = &body["rows"][0];
+    assert_eq!(row["input_tokens"], 100);
+    assert_eq!(row["cached_input_tokens"], 80);
+    assert_eq!(row["cache_write_input_tokens"], 12);
+    assert_eq!(row["uncached_input_tokens"], 20);
+    assert_eq!(row["output_tokens"], 25);
+    assert_eq!(row["reasoning_output_tokens"], 5);
+    assert_eq!(row["visible_output_tokens"], 20);
+    assert_eq!(row["reported_total_tokens"], 999);
+    assert_eq!(row["total_tokens"], 999);
+    assert_eq!(row["effective_tokens"], 45);
+    assert_eq!(row["usage_schema"], "openai_responses_v1");
+    assert_eq!(row["usage_source"], "upstream_response");
+    assert_eq!(row["usage_status"], "final");
+}
+
+#[tokio::test]
 async fn account_trends_returns_seeded_history_split_by_window() {
     // Task 9: GET /api/accounts/{id}/trends — a 7-day per-window usage series derived from
     // `usage_history`. Seed 3 rows for acct-1 (2 primary, 1 secondary) across distinct
@@ -1831,8 +1886,8 @@ fn report_endpoint_row(
         subagent: None,
         request_id: None,
         session_key: None,
-        input_tokens: None,
-        output_tokens: None,
+        input_tokens: Some(total_tokens),
+        output_tokens: Some(0),
         cached_input_tokens: None,
         reasoning_tokens: None,
         orchestration_input_tokens: None,
@@ -1919,7 +1974,10 @@ async fn reports_endpoint_assembles_zero_filled_series_breakdown_and_totals() {
     assert_eq!(v["totals"]["requests"], 3);
     assert_eq!(v["totals"]["errors"], 1);
     assert_eq!(v["totals"]["tokens"], 3500);
+    assert_eq!(v["totals"]["input_tokens"], 3500);
     assert_eq!(v["totals"]["cached_tokens"], 1450);
+    assert_eq!(v["totals"]["cache_write_tokens"], 0);
+    assert_eq!(v["totals"]["effective_tokens"], 2050);
     let cost = v["totals"]["cost_usd"].as_f64().unwrap();
     assert!((cost - 4.5).abs() < 0.001, "cost_usd: {cost}");
     let error_rate = v["totals"]["error_rate"].as_f64().unwrap();
@@ -1971,4 +2029,38 @@ async fn reports_endpoint_assembles_zero_filled_series_breakdown_and_totals() {
         assert_eq!(b["errors"], 0);
         assert_eq!(b["tokens"], 0);
     }
+}
+
+#[tokio::test]
+async fn reports_endpoint_bounds_cache_hit_rate_for_inconsistent_legacy_subsets() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    store
+        .request_log()
+        .insert(&report_endpoint_row(
+            now(),
+            "legacy-model",
+            200,
+            100,
+            150,
+            0.0,
+        ))
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+
+    let pf = spawn(store).await;
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/reports?range=7d"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["totals"]["input_tokens"], 100);
+    assert_eq!(body["totals"]["cached_tokens"], 150);
+    assert_eq!(body["totals"]["cache_hit_rate"], 1.0);
 }
