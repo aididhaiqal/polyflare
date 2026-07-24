@@ -13,9 +13,9 @@ use clap::{Parser, Subcommand};
 
 use polyflare_anthropic::AnthropicExecutor;
 use polyflare_codex::oauth::OAuthClient;
-use polyflare_codex::{run_login, CodexVersionCache};
+use polyflare_codex::{build_client, run_login, CodexVersionCache};
 use polyflare_core::{Continuity, Executor, Selector};
-use polyflare_server::app::{build_app_for_bind, build_codex_executor, AppState};
+use polyflare_server::app::{build_app_for_bind, build_codex_executor_with_client, AppState};
 use polyflare_server::config::{self, ServeConfig};
 use polyflare_server::continuity::CodexContinuity;
 use polyflare_server::model_catalog::{
@@ -194,7 +194,9 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         config.allow_unauthenticated_remote,
     )?;
     let cipher = TokenCipher::load_or_create(&config.key_path)?;
-    let codex_executor: Arc<dyn Executor> = build_codex_executor(
+    let control_client = build_client()?;
+    let codex_executor: Arc<dyn Executor> = build_codex_executor_with_client(
+        control_client.clone(),
         config.http_requests_use_upstream_websocket,
         config.http_upstream_websocket_ping,
     )?;
@@ -256,7 +258,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     });
     let state = Arc::new(AppState {
         codex_executor,
-        control_client: polyflare_codex::build_client().expect("build control_client"),
+        control_client,
         anthropic_executor,
         selector,
         pool_selectors,

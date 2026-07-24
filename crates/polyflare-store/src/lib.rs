@@ -21,7 +21,7 @@ pub use import::{import_from_codex_lb, ImportSummary};
 pub use onboarding_repo::{OnboardingFlow, OnboardingRepo};
 pub use provider_repo::{
     CustomProvider, NewCustomProvider, NewProviderModel, ProviderCredential,
-    ProviderCredentialSecret, ProviderModel, ProviderRepo,
+    ProviderCredentialSecret, ProviderModel, ProviderModelPatch, ProviderRepo,
 };
 pub use request_log_repo::{
     RecentErrorRow, ReportBreakdownRow, ReportBucket, ReportMetrics, RequestAggregate,

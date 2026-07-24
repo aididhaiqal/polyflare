@@ -3,6 +3,7 @@
 //! Credential secrets are write-only: response views contain stable ids, labels, health, and
 //! routing policy, never ciphertext or plaintext API keys.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,6 +13,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use polyflare_store::{
     CustomProvider, NewCustomProvider, NewProviderModel, ProviderCredential, ProviderModel,
+    ProviderModelPatch,
 };
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +44,17 @@ fn valid_slug(value: &str) -> bool {
 
 fn valid_label(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 128
+}
+
+fn valid_reasoning_levels(levels: &[String]) -> bool {
+    levels.len() <= 7
+        && levels.iter().all(|level| {
+            matches!(
+                level.as_str(),
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+            )
+        })
+        && levels.iter().collect::<HashSet<_>>().len() == levels.len()
 }
 
 fn validate_base_url(base_url: &str, allow_private_hosts: bool) -> bool {
@@ -366,6 +379,88 @@ pub async fn test_provider(State(state): State<Arc<AppState>>, Path(id): Path<St
     }
 }
 
+pub async fn sync_models(
+    State(state): State<Arc<AppState>>,
+    Path(provider_id): Path<String>,
+) -> Response {
+    let Some(provider) = state
+        .store
+        .providers()
+        .get_provider(&provider_id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let discovered =
+        match crate::custom_provider::discover_models(&state.store, &state.cipher, &provider).await
+        {
+            Ok(discovered) => discovered,
+            Err(message) => return (StatusCode::BAD_GATEWAY, message).into_response(),
+        };
+    let existing = match state.store.providers().list_models(&provider_id).await {
+        Ok(existing) => existing,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let existing_slugs = existing
+        .into_iter()
+        .map(|model| model.public_model)
+        .collect::<std::collections::HashSet<_>>();
+    let timestamp = now();
+    let mut imported = 0usize;
+    let mut skipped_existing = 0usize;
+    let mut skipped_conflicts = 0usize;
+    for discovered_model in &discovered {
+        if existing_slugs.contains(&discovered_model.upstream_model) {
+            skipped_existing += 1;
+            continue;
+        }
+        if crate::catalog::model_slug_is_reserved(&state, &discovered_model.upstream_model) {
+            skipped_conflicts += 1;
+            continue;
+        }
+        let model = NewProviderModel {
+            id: id("model"),
+            provider_id: provider.id.clone(),
+            public_model: discovered_model.upstream_model.clone(),
+            upstream_model: discovered_model.upstream_model.clone(),
+            display_name: discovered_model.display_name.clone(),
+            context_window: discovered_model.context_window,
+            max_output_tokens: discovered_model.max_output_tokens,
+            supports_tools: discovered_model.supports_tools,
+            supports_vision: discovered_model.supports_vision,
+            supports_parallel_tool_calls: discovered_model.supports_parallel_tool_calls,
+            supports_web_search: discovered_model.supports_web_search,
+            supports_reasoning_summaries: discovered_model.supports_reasoning_summaries,
+            reasoning_levels_json: serde_json::to_string(&discovered_model.reasoning_levels)
+                .unwrap_or_else(|_| "[]".into()),
+            model_info_json: discovered_model
+                .model_info
+                .as_ref()
+                .map(serde_json::Value::to_string),
+            input_per_million: None,
+            cached_input_per_million: None,
+            output_per_million: None,
+            visible_in_codex: true,
+            visible_in_openai: true,
+            enabled: true,
+            created_at: timestamp,
+        };
+        match state.store.providers().create_model(&model).await {
+            Ok(()) => imported += 1,
+            Err(_) => skipped_conflicts += 1,
+        }
+    }
+    Json(serde_json::json!({
+        "discovered": discovered.len(),
+        "imported": imported,
+        "skipped_existing": skipped_existing,
+        "skipped_conflicts": skipped_conflicts,
+    }))
+    .into_response()
+}
+
 #[derive(Deserialize)]
 pub struct CreateCredential {
     label: String,
@@ -510,12 +605,7 @@ pub async fn create_model(
         || input.context_window.is_some_and(|value| value <= 0)
         || input.max_output_tokens.is_some_and(|value| value <= 0)
         || !valid_prices
-        || input.reasoning_levels.iter().any(|level| {
-            !matches!(
-                level.as_str(),
-                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-            )
-        })
+        || !valid_reasoning_levels(&input.reasoning_levels)
         || input.model_info.as_ref().is_some_and(|value| {
             value.to_string().len() > 64 * 1024
                 || !crate::catalog::safe_codex_model_info_extensions(value)
@@ -578,6 +668,16 @@ pub struct ModelPatch {
     enabled: Option<bool>,
     visible_in_codex: Option<bool>,
     visible_in_openai: Option<bool>,
+    upstream_model: Option<String>,
+    display_name: Option<String>,
+    context_window: Option<i64>,
+    max_output_tokens: Option<i64>,
+    supports_tools: Option<bool>,
+    supports_vision: Option<bool>,
+    supports_parallel_tool_calls: Option<bool>,
+    supports_web_search: Option<bool>,
+    supports_reasoning_summaries: Option<bool>,
+    reasoning_levels: Option<Vec<String>>,
 }
 
 pub async fn patch_model(
@@ -588,19 +688,57 @@ pub async fn patch_model(
     if input.enabled.is_none()
         && input.visible_in_codex.is_none()
         && input.visible_in_openai.is_none()
+        && input.upstream_model.is_none()
+        && input.display_name.is_none()
+        && input.context_window.is_none()
+        && input.max_output_tokens.is_none()
+        && input.supports_tools.is_none()
+        && input.supports_vision.is_none()
+        && input.supports_parallel_tool_calls.is_none()
+        && input.supports_web_search.is_none()
+        && input.supports_reasoning_summaries.is_none()
+        && input.reasoning_levels.is_none()
     {
         return (StatusCode::BAD_REQUEST, "empty model patch").into_response();
     }
+    if input
+        .upstream_model
+        .as_deref()
+        .is_some_and(|value| !valid_slug(value))
+        || input
+            .display_name
+            .as_deref()
+            .is_some_and(|value| !valid_label(value))
+        || input.context_window.is_some_and(|value| value <= 0)
+        || input.max_output_tokens.is_some_and(|value| value <= 0)
+        || input
+            .reasoning_levels
+            .as_ref()
+            .is_some_and(|levels| !valid_reasoning_levels(levels))
+    {
+        return (StatusCode::BAD_REQUEST, "invalid model patch").into_response();
+    }
+    let patch = ProviderModelPatch {
+        upstream_model: input.upstream_model,
+        display_name: input.display_name.map(|value| value.trim().to_string()),
+        context_window: input.context_window,
+        max_output_tokens: input.max_output_tokens,
+        supports_tools: input.supports_tools,
+        supports_vision: input.supports_vision,
+        supports_parallel_tool_calls: input.supports_parallel_tool_calls,
+        supports_web_search: input.supports_web_search,
+        supports_reasoning_summaries: input.supports_reasoning_summaries,
+        reasoning_levels_json: input
+            .reasoning_levels
+            .map(|levels| serde_json::to_string(&levels).unwrap_or_else(|_| "[]".into())),
+        visible_in_codex: input.visible_in_codex,
+        visible_in_openai: input.visible_in_openai,
+        enabled: input.enabled,
+    };
     match state
         .store
         .providers()
-        .update_model_policy(
-            &id,
-            input.enabled,
-            input.visible_in_codex,
-            input.visible_in_openai,
-            now(),
-        )
+        .update_model(&id, &patch, now())
         .await
     {
         Ok(true) => ok(),

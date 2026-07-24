@@ -209,6 +209,22 @@ output limit, tool/vision/search/reasoning capabilities, pricing, and whether it
 or generic OpenAI model discovery. Catalog visibility does not disable an explicitly addressed
 route.
 
+After adding at least one credential, **Sync** asks the provider's authenticated
+`GET {base_url}/models` endpoint for its current catalog. PolyFlare accepts both the OpenAI
+`data[].id` shape and the richer Codex `models[].slug` shape, imports only model slugs that are not
+already configured or reserved, and then merges the imported rows into PolyFlare's own `/models`
+and `/v1/models` responses. This is an operator-triggered snapshot, not a pass-through request on
+every client catalog read. Existing manual mappings always win and are never overwritten by a
+later sync.
+
+Rich Codex catalogs can supply context, capability, and reasoning metadata directly. A thin
+OpenAI catalog normally supplies only IDs, so PolyFlare uses conservative defaults and the model's
+**Edit** action controls tools, vision, parallel tools, web search, reasoning summaries, and the
+ordered reasoning-effort list. The first effort is advertised to Codex as the default. Valid values
+are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; entries must be unique.
+PolyFlare preserves the client's selected `reasoning.effort` in the proxied request and rewrites
+only the model ID.
+
 For stateless providers, PolyFlare removes `previous_response_id` and sends the materialized
 request. This prevents account-scoped Responses anchors from leaking into a provider that does not
 share that state. Custom-provider traffic is still represented in Requests, Sessions, Reports,
@@ -234,9 +250,22 @@ Add a credential using the Sakana API key, then add a model:
 | Display name | `Fugu Ultra` |
 | Context window | `1000000` |
 
-Use the provider’s current documentation as the authority for the upstream model slug and
-capabilities. After saving, use **Test** on the provider card. A client can then request
-`model = "fugu-ultra"` through the normal root `/responses` endpoint.
+Alternatively, press **Sync** to import the models returned by Sakana's `/v1/models` endpoint.
+PolyFlare knows the documented Fugu effort profiles even when Sakana returns the thin OpenAI model
+list:
+
+| Model | Advertised efforts |
+|---|---|
+| `fugu` | `high`, `xhigh` |
+| `fugu-ultra`, `fugu-ultra-v1.1` | `high`, `xhigh`, `max` |
+| `fugu-ultra-v1.0` | `high`, `xhigh` |
+| `fugu-cyber`, `fugu-cyber-v1.0` | `high`, `xhigh` |
+
+You can edit any imported row afterward. This Fugu convenience does not constrain other providers:
+unknown models remain importable and use metadata supplied by their catalog or your dashboard
+configuration. Use the provider's current documentation as the authority for the upstream model
+slug and capabilities. After saving or syncing, use **Test** on the provider card. A client can
+then request `model = "fugu-ultra"` through the normal root `/responses` endpoint.
 
 ## Model discovery
 

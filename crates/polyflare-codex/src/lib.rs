@@ -1,6 +1,7 @@
 //! Codex backend: WS/SSE transport, fingerprint laundering, continuity, OAuth. M1 = SSE identity
 //! pass-through; M2b adds the `oauth` module (claims decode + refresh).
 
+mod chatgpt_cloudflare_cookies;
 pub mod codex_headers;
 pub mod codex_version;
 pub mod control_forward;

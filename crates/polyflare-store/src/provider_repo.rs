@@ -122,6 +122,23 @@ pub struct NewProviderModel {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProviderModelPatch {
+    pub upstream_model: Option<String>,
+    pub display_name: Option<String>,
+    pub context_window: Option<i64>,
+    pub max_output_tokens: Option<i64>,
+    pub supports_tools: Option<bool>,
+    pub supports_vision: Option<bool>,
+    pub supports_parallel_tool_calls: Option<bool>,
+    pub supports_web_search: Option<bool>,
+    pub supports_reasoning_summaries: Option<bool>,
+    pub reasoning_levels_json: Option<String>,
+    pub visible_in_codex: Option<bool>,
+    pub visible_in_openai: Option<bool>,
+    pub enabled: Option<bool>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderRepo {
     pool: SqlitePool,
@@ -483,6 +500,54 @@ impl ProviderRepo {
         .bind(enabled)
         .bind(visible_in_codex)
         .bind(visible_in_openai)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1;
+        if changed {
+            self.bump_generation();
+        }
+        Ok(changed)
+    }
+
+    pub async fn update_model(
+        &self,
+        id: &str,
+        patch: &ProviderModelPatch,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let changed = sqlx::query(
+            "UPDATE provider_models SET \
+             upstream_model = COALESCE(?, upstream_model), \
+             display_name = COALESCE(?, display_name), \
+             context_window = COALESCE(?, context_window), \
+             max_output_tokens = COALESCE(?, max_output_tokens), \
+             supports_tools = COALESCE(?, supports_tools), \
+             supports_vision = COALESCE(?, supports_vision), \
+             supports_parallel_tool_calls = COALESCE(?, supports_parallel_tool_calls), \
+             supports_web_search = COALESCE(?, supports_web_search), \
+             supports_reasoning_summaries = COALESCE(?, supports_reasoning_summaries), \
+             reasoning_levels_json = COALESCE(?, reasoning_levels_json), \
+             visible_in_codex = COALESCE(?, visible_in_codex), \
+             visible_in_openai = COALESCE(?, visible_in_openai), \
+             enabled = COALESCE(?, enabled), \
+             updated_at = ? WHERE id = ?",
+        )
+        .bind(&patch.upstream_model)
+        .bind(&patch.display_name)
+        .bind(patch.context_window)
+        .bind(patch.max_output_tokens)
+        .bind(patch.supports_tools)
+        .bind(patch.supports_vision)
+        .bind(patch.supports_parallel_tool_calls)
+        .bind(patch.supports_web_search)
+        .bind(patch.supports_reasoning_summaries)
+        .bind(&patch.reasoning_levels_json)
+        .bind(patch.visible_in_codex)
+        .bind(patch.visible_in_openai)
+        .bind(patch.enabled)
         .bind(now)
         .bind(id)
         .execute(&self.pool)

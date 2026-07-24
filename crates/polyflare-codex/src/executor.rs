@@ -31,6 +31,8 @@ use polyflare_core::{
     UpstreamHttpError,
 };
 
+use crate::chatgpt_cloudflare_cookies::with_chatgpt_cloudflare_cookie_store;
+
 /// Parse the numeric-seconds form of `Retry-After` (the form the Codex/OpenAI backend sends on a
 /// 429). The HTTP-date form is ignored (returns `None` ⇒ the caller falls back to exponential
 /// backoff). Negative values are rejected.
@@ -161,7 +163,7 @@ pub fn build_client() -> Result<reqwest::Client, ExecError> {
     // Must run before the first TLS use so reqwest's rustls backend picks up aws-lc-rs instead
     // of falling back to ring (see reqwest's `TlsBackend::Rustls` build path).
     ensure_rustls_crypto_provider();
-    reqwest::Client::builder()
+    with_chatgpt_cloudflare_cookie_store(reqwest::Client::builder())
         // Force rustls: `default-tls` (native-tls) is also compiled in workspace-wide, so
         // without this the client would silently use native-tls instead.
         .use_rustls_tls()
@@ -179,6 +181,15 @@ impl CodexExecutor {
         Ok(Self {
             client: build_client()?,
         })
+    }
+
+    /// Construct an executor from an already-built shared client.
+    ///
+    /// Production server startup uses this path so `/responses`, unary control calls, and the
+    /// ChatGPT backend gateway clone one `reqwest::Client` and therefore share both its
+    /// connection pool and its restricted Cloudflare affinity-cookie store.
+    pub fn from_client(client: reqwest::Client) -> Self {
+        Self { client }
     }
 
     /// The executor's own `reqwest::Client` — a cheap clone (reqwest clients are `Arc`-backed
