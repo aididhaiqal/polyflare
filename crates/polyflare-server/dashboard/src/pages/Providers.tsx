@@ -633,20 +633,10 @@ function ProviderForm({
     providerSlug: "sakana",
     baseUrl: "https://api.sakana.ai/v1",
     apiKey: "",
-    publicModel: "fugu-ultra",
-    upstreamModel: "fugu-ultra-v1.1",
-    modelName: "Fugu Ultra",
-    contextWindow: "1000000",
-    inputPrice: "",
-    cachedPrice: "",
-    outputPrice: "",
   });
-  const [visibleInCodex, setVisibleInCodex] = useState(true);
-  const [visibleInOpenAi, setVisibleInOpenAi] = useState(true);
 
   function submit(event: FormEvent) {
     event.preventDefault();
-    const number = (value: string) => (value.trim() ? Number(value) : undefined);
     onSubmit({
       provider: {
         slug: form.providerSlug,
@@ -657,23 +647,6 @@ function ProviderForm({
         request_max_retries: form.providerSlug === "sakana" ? 4 : 1,
       },
       credential: { label: "primary", api_key: form.apiKey, routing_weight: 1 },
-      model: {
-        public_model: form.publicModel,
-        upstream_model: form.upstreamModel,
-        display_name: form.modelName,
-        context_window: number(form.contextWindow),
-        supports_tools: true,
-        supports_vision: true,
-        supports_parallel_tool_calls: true,
-        supports_web_search: true,
-        supports_reasoning_summaries: true,
-        reasoning_levels: ["high", "xhigh", "max"],
-        input_per_million: number(form.inputPrice),
-        cached_input_per_million: number(form.cachedPrice),
-        output_per_million: number(form.outputPrice),
-        visible_in_codex: visibleInCodex,
-        visible_in_openai: visibleInOpenAi,
-      },
     });
   }
 
@@ -686,7 +659,7 @@ function ProviderForm({
         className={INPUT}
         type={type}
         value={form[key]}
-        required={key !== "inputPrice" && key !== "cachedPrice" && key !== "outputPrice"}
+        required
         autoComplete={key === "apiKey" ? "off" : undefined}
         onChange={(event) => setForm((current) => ({ ...current, [key]: event.target.value }))}
       />
@@ -698,46 +671,22 @@ function ProviderForm({
       <div>
         <div className="text-[12px] font-semibold text-fg">Provider onboarding</div>
         <p className="mt-1 text-[10px] text-fg opacity-48">
-          The API key is encrypted at rest and is never returned by PolyFlare.
+          Add the provider and its first encrypted credential, then use Sync to discover models.
+          The API key is never returned by PolyFlare.
         </p>
       </div>
-      <form onSubmit={submit} className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+      <form onSubmit={submit} className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
         {field("providerName", "Provider name")}
         {field("providerSlug", "Provider slug")}
         {field("baseUrl", "Base URL", "url")}
         {field("apiKey", "API key", "password")}
-        {field("publicModel", "Public model")}
-        {field("upstreamModel", "Upstream model")}
-        {field("modelName", "Model display name")}
-        {field("contextWindow", "Context window", "number")}
-        {field("inputPrice", "Input / 1M USD", "number")}
-        {field("cachedPrice", "Cached input / 1M USD", "number")}
-        {field("outputPrice", "Output / 1M USD", "number")}
-        <div className="flex flex-wrap items-end gap-4">
-          <label className="flex h-9 items-center gap-2 text-[9px] text-fg opacity-70">
-            <input
-              type="checkbox"
-              checked={visibleInCodex}
-              onChange={(event) => setVisibleInCodex(event.target.checked)}
-            />
-            Codex picker
-          </label>
-          <label className="flex h-9 items-center gap-2 text-[9px] text-fg opacity-70">
-            <input
-              type="checkbox"
-              checked={visibleInOpenAi}
-              onChange={(event) => setVisibleInOpenAi(event.target.checked)}
-            />
-            OpenAI list
-          </label>
-        </div>
-        <div className="flex items-end">
+        <div className="flex items-end md:col-span-2 xl:col-span-4">
           <button
             type="submit"
             disabled={pending}
-            className="h-9 w-full rounded-lg bg-accent px-3 text-[11px] font-semibold text-white disabled:opacity-45"
+            className="h-9 rounded-lg bg-accent px-5 text-[11px] font-semibold text-white disabled:opacity-45"
           >
-            {pending ? "Adding provider…" : "Add provider, key, and model"}
+            {pending ? "Adding provider…" : "Add provider and credential"}
           </button>
         </div>
       </form>

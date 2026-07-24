@@ -283,12 +283,14 @@ export function useCreateProviderBundle() {
     mutationFn: async (input: {
       provider: CreateProviderBody;
       credential: { label: string; api_key: string; routing_weight?: number };
-      model: CreateProviderModelBody;
+      model?: CreateProviderModelBody;
     }) => {
       const provider = await createProvider(input.provider);
       try {
         await createProviderCredential(provider.id, input.credential);
-        await createProviderModel(provider.id, input.model);
+        if (input.model) {
+          await createProviderModel(provider.id, input.model);
+        }
         return provider;
       } catch (error) {
         // Keep the onboarding bundle atomic from the operator's perspective. Provider deletion
