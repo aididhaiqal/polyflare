@@ -966,7 +966,23 @@ impl Stream for ObservingStream {
                         // LATER poll on this same stream can yield `Err` (the mid-stream-failure
                         // case), the witness is already `true`.
                         this.commit.mark();
+                        let terminal_was_pending =
+                            matches!(this.sniffer.terminal, TerminalOutcome::Pending);
                         this.sniffer.feed(&bytes);
+                        // A completed generation is progress, not amplification: the same codex
+                        // turn id covers every tool-call round of the user turn, so the NEXT
+                        // round must start from a fresh aggregate budget. Cleared HERE at the
+                        // frame's sighting — codex drops the connection the moment it sees
+                        // `response.completed`, so an EOF-side clear loses a race the client is
+                        // allowed to win (2026-07-24 live: 3 completed rounds whose clears were
+                        // all dropped with the stream, then an instant 400 on round 4). The
+                        // transition guard fires exactly once; failure terminals never clear.
+                        if terminal_was_pending
+                            && matches!(this.sniffer.terminal, TerminalOutcome::Completed { .. })
+                        {
+                            this.runtime
+                                .clear_logical_turn_attempts(this.ctx.logical_turn_key.as_deref());
+                        }
                         return Poll::Ready(Some(Ok(bytes)));
                     }
                     Poll::Ready(Some(Err(e))) => {
@@ -985,12 +1001,12 @@ impl Stream for ObservingStream {
                         match &terminal {
                             TerminalOutcome::Completed { .. } => {
                                 this.runtime.record_success(&this.account);
-                                // A completed generation is progress, not amplification: the same
-                                // codex turn id covers every tool-call round of the user turn, so
-                                // the NEXT round must start from a fresh aggregate budget.
-                                this.runtime.clear_logical_turn_attempts(
-                                    this.ctx.logical_turn_key.as_deref(),
-                                );
+                                // The aggregate turn budget was already cleared when the
+                                // `response.completed` frame was sighted in the chunk arm above
+                                // (`Completed` only ever arises from `observe_line` — `finish()`
+                                // turns a Pending EOF into TransportLoss, never Completed). NOT
+                                // repeated here: a second clear could land after the next round
+                                // already spent its attempt and would erase that live entry.
                             }
                             TerminalOutcome::Failed {
                                 kind: ProtocolFailureKind::RateLimited,
@@ -1898,6 +1914,61 @@ mod tests {
         assert!(
             runtime.try_consume_logical_turn_attempt(ctx.logical_turn_key.as_deref(), 1, 1),
             "a forwarded response.completed must reset the aggregate budget for the next round"
+        );
+    }
+
+    /// The clear must happen when the `response.completed` FRAME is relayed, not at the post-EOF
+    /// poll: codex drops the connection the moment it sees the terminal frame, so the wrapper is
+    /// dropped without ever being polled to `Poll::Ready(None)`. (The 2026-07-24 second live
+    /// regression: rounds logged `protocol_outcome=completed`, yet the budget kept accumulating —
+    /// every EOF-side clear lost the disconnect race — until round 4 hit an instant 400.)
+    #[tokio::test]
+    async fn budget_clears_at_completed_frame_sighting_even_if_client_drops_before_eof() {
+        let runtime = Arc::new(RuntimeStates::new());
+        let ctx = RequestCtx {
+            logical_turn_key: Some("hashed-logical-turn".to_string()),
+            ..RequestCtx::default()
+        };
+        // The round's own attempt (spent at execute entry) exhausts a limit of 1.
+        assert!(runtime.try_consume_logical_turn_attempt(ctx.logical_turn_key.as_deref(), 1, 0));
+        assert!(!runtime.try_consume_logical_turn_attempt(ctx.logical_turn_key.as_deref(), 1, 0));
+
+        // The terminal frame, then genuine silence — never a clean EOF. The client hangs up
+        // after the completed frame, so the wrapper is dropped mid-`Streaming`.
+        let inner = ResponseStream::new(
+            stream::once(async {
+                Ok::<Bytes, ExecError>(Bytes::from_static(
+                    b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+                ))
+            })
+            .chain(stream::pending::<Result<Bytes, ExecError>>()),
+        );
+        let mut wrapped = wrap_stream(
+            inner,
+            Arc::new(polyflare_core::NoopContinuity) as Arc<dyn Continuity>,
+            ctx.clone(),
+            AccountId::from("acct"),
+            None,
+            OutcomeKind::Completed {
+                fp: String::new(),
+                count: 0,
+            },
+            runtime.clone(),
+            Duration::ZERO, // idle watchdog disabled: not under test here
+            CommitWitness::new(),
+            None,
+        );
+        wrapped
+            .next()
+            .await
+            .expect("the completed frame must be relayed")
+            .expect("the completed frame must relay cleanly");
+        drop(wrapped); // the client disconnect: no EOF poll ever happens
+
+        assert!(
+            runtime.try_consume_logical_turn_attempt(ctx.logical_turn_key.as_deref(), 1, 1),
+            "sighting the completed frame must reset the aggregate budget even when the client \
+             disconnects before EOF"
         );
     }
 
