@@ -1,5 +1,7 @@
 import clsx from "clsx";
 
+import { quotaDisplayLabel, quotaDisplayPercent } from "../lib/quotaDisplay";
+import { useQuotaDisplayPreference } from "../preferences/QuotaDisplayPreference";
 import { ProviderTag, providerBrandKey } from "./ProviderTag";
 
 export interface QuotaWindowRow {
@@ -45,6 +47,7 @@ export function QuotaBars({
   groups: QuotaProviderGroup[];
   className?: string;
 }) {
+  const { mode } = useQuotaDisplayPreference();
   return (
     <div className={className}>
       {groups.map((group) => {
@@ -55,8 +58,14 @@ export function QuotaBars({
             {rows.length === 0 ? (
               <div className="mt-1 text-[10px] text-fg opacity-40">no reported windows</div>
             ) : (
-              rows.map((w) => (
-                <div key={w.window} className="mt-1 flex items-center gap-2 text-[10px]">
+              rows.map((w) => {
+                const displayed = quotaDisplayPercent(w.usedPercent as number, mode);
+                return (
+                <div
+                  key={w.window}
+                  className="mt-1 flex items-center gap-2 text-[10px]"
+                  aria-label={`${labelForWindow(w.window)} ${quotaDisplayLabel(mode)} ${Math.round(displayed)} percent`}
+                >
                   <span className="w-11 shrink-0 text-fg opacity-60">{labelForWindow(w.window)}</span>
                   <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
                     <div
@@ -64,12 +73,13 @@ export function QuotaBars({
                         "h-full rounded-full",
                         PROVIDER_BAR_CLASS[providerBrandKey(group.provider)] ?? "bg-accent",
                       )}
-                      style={{ width: `${Math.max(0, Math.min(100, w.usedPercent as number))}%` }}
+                      style={{ width: `${displayed}%` }}
                     />
                   </div>
                   {w.meta && <span className="w-10 shrink-0 text-right text-fg opacity-70">{w.meta}</span>}
                 </div>
-              ))
+                );
+              })
             )}
           </div>
         );

@@ -90,7 +90,6 @@ struct SrcRequestLog {
     /// codex-lb's PK — carried only as `import_source_id` for idempotent re-import.
     id: i64,
     account_id: Option<String>,
-    session_id: Option<String>,
     request_id: Option<String>,
     model: Option<String>,
     plan_type: Option<String>,
@@ -307,7 +306,7 @@ pub async fn import_from_codex_lb(
     // Content-safe subset only (see module doc): the free-form/PII columns are never SELECTed.
     // Idempotent via `import_source_id` (codex-lb's row id) + the unique index → `INSERT OR IGNORE`.
     let src_logs = sqlx::query_as::<_, SrcRequestLog>(
-        "SELECT id, account_id, session_id, request_id, model, plan_type, source, \
+        "SELECT id, account_id, request_id, model, plan_type, source, \
          request_kind, status, error_code, input_tokens, output_tokens, cached_input_tokens, \
          reasoning_tokens, cost_usd, reasoning_effort, latency_ms, latency_first_token_ms, \
          service_tier, requested_service_tier, actual_service_tier, transport, \
@@ -330,13 +329,13 @@ pub async fn import_from_codex_lb(
         let result = sqlx::query(
             "INSERT OR IGNORE INTO request_log (\
                 requested_at, provider, method, path, aliased, status, duration_ms, \
-                account_id, session_id, request_id, model, plan_type, source, request_kind, \
+                account_id, request_id, model, plan_type, source, request_kind, \
                 outcome, error_code, input_tokens, output_tokens, cached_input_tokens, \
                 reasoning_tokens, cost_usd, reasoning_effort, latency_first_token_ms, \
                 service_tier, requested_service_tier, actual_service_tier, transport, \
                 deleted_at, import_source_id\
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                      ?, ?, ?, ?)",
+                      ?, ?, ?)",
         )
         .bind(requested_at)
         .bind("codex")
@@ -346,7 +345,6 @@ pub async fn import_from_codex_lb(
         .bind(0_i64)
         .bind(duration_ms)
         .bind(src.account_id.as_deref())
-        .bind(src.session_id.as_deref())
         .bind(src.request_id.as_deref())
         .bind(src.model.as_deref())
         .bind(src.plan_type.as_deref())

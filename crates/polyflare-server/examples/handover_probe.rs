@@ -280,10 +280,12 @@ async fn resolve_account(
         .expect("db")
         .expect("account row");
     let mut access = tokens.access_token.clone();
+    let mut id_token = tokens.id_token.clone();
     if oauth::should_refresh(oauth::token_exp(&access), row.last_refresh, now_secs()) {
         match oauth.refresh(&tokens.refresh_token).await {
             Ok(r) => {
                 access = r.tokens.access_token;
+                id_token = r.tokens.id_token;
                 eprintln!("  [{label}] token refreshed");
             }
             Err(e) => eprintln!("  [{label}] refresh failed ({e:?}); using stored token"),
@@ -294,6 +296,7 @@ async fn resolve_account(
         base_url: CODEX_BASE.to_string(),
         bearer_token: access,
         chatgpt_account_id: row.chatgpt_account_id,
+        is_fedramp: oauth::is_fedramp_account(&id_token),
     }
 }
 

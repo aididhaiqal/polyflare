@@ -17,7 +17,7 @@ use polyflare_server::app::{build_app, AppState};
 use polyflare_server::continuity::CodexContinuity;
 use polyflare_server::keys::sha256_hex;
 use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
-use polyflare_server::session_key::header_session_key;
+use polyflare_server::session_key::{header_session_key, parse_inbound_scoped};
 use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
 use polyflare_testkit::MockControlUpstream;
 
@@ -117,6 +117,7 @@ async fn spawn_app(enforce_client_keys: bool, mock_base: &str) -> (String, Arc<A
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -169,7 +170,8 @@ async fn rows_eventually(store: &Store) -> Vec<polyflare_store::RequestLogRow> {
 
 #[tokio::test]
 async fn compact_is_forwarded_and_the_mock_response_is_relayed() {
-    let mock = MockControlUpstream::new(200, r#"{"output":[{"type":"message"}]}"#);
+    let mock = MockControlUpstream::new(200, r#"{"output":[{"type":"message"}]}"#)
+        .with_header("x-codex-turn-state", "compact-turn-state-1");
     let mock_base = mock.clone().spawn().await;
 
     let (base, state) = spawn_app(true, &mock_base).await;
@@ -193,6 +195,13 @@ async fn compact_is_forwarded_and_the_mock_response_is_relayed() {
         .unwrap();
 
     assert_eq!(resp.status(), 200, "compact POST no longer 404s");
+    assert_eq!(
+        resp.headers()
+            .get("x-codex-turn-state")
+            .and_then(|value| value.to_str().ok()),
+        Some("compact-turn-state-1"),
+        "the compact response's per-turn routing state must reach Codex"
+    );
     let body = resp.text().await.unwrap();
     assert_eq!(
         body, r#"{"output":[{"type":"message"}]}"#,
@@ -286,18 +295,9 @@ async fn sentinel_compact_body_is_forwarded_but_never_reaches_the_request_log() 
 }
 
 // -------------------------------------------------------------------------------------------
-// 3. Owner affinity that proves BODY-keying, not just header-keying. The seeded continuity
-//    session is keyed by `header_session_key(headers, Some(prompt_cache_key))` — the SAME
-//    Hard-strength derivation `parse_inbound` runs internally for a `session_id` header. Crucially,
-//    the derived value DEPENDS on the body's `prompt_cache_key` (it's suffixed onto the `session_id`
-//    header before hashing) — so a regression that resolved compact's affinity via
-//    `resolve_control_account`/`header_session_key(headers, None)` (i.e. body-BLIND, exactly the
-//    control-endpoint derivation) would compute a DIFFERENT session-key value, miss the seeded
-//    session row entirely, and fall back to normal (any-eligible) selection. `acct-b` (the seeded
-//    owner) is deliberately NOT the RoundRobin tiebreak default (that's `acct-a`, alphabetically
-//    first, proven by `control_endpoints_e2e.rs`'s own `no_session_header_falls_back_to_normal_
-//    selection`), so a body-blind regression would resolve to `acct-a` instead — making this
-//    assertion FAIL, not pass by coincidence.
+// 3. Owner affinity for a headerless compact request must still use the body's prompt_cache_key
+//    as its soft fallback. Current Codex session-id + thread-id headers are the canonical durable
+//    identity and intentionally do not change when prompt_cache_key changes.
 // -------------------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -331,31 +331,25 @@ async fn compact_owner_affinity_is_derived_from_the_body_prompt_cache_key() {
     )
     .await;
 
-    // Compute the SAME key the production code derives: `session_id` header + the body's
-    // `prompt_cache_key` (NOT `x-codex-turn-state`, whose branch in `header_session_key` ignores
-    // `prompt_cache_key` entirely — using it here would make the key header-only and prove
-    // nothing about body-keying).
-    let headers_for_key = {
-        let mut h = axum::http::HeaderMap::new();
-        h.insert("session_id", "sess-compact-owner".parse().unwrap());
-        h
-    };
-    let sk = header_session_key(&headers_for_key, Some(PROMPT_CACHE_KEY))
-        .expect("session_id header + prompt_cache_key must yield a Hard key");
-
-    // Sanity: a body-BLIND derivation (what a regression to `resolve_control_account` would
-    // compute) yields a DIFFERENT key value — the premise the rest of this test depends on.
-    let blind_key = header_session_key(&headers_for_key, None).unwrap();
-    assert_ne!(
-        sk.value, blind_key.value,
-        "the body's prompt_cache_key must change the derived session key"
+    let headers_for_key = axum::http::HeaderMap::new();
+    let compact_body = format!(
+        r#"{{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":"{PROMPT_CACHE_KEY}"}}"#
+    );
+    let sk = parse_inbound_scoped(&headers_for_key, compact_body.as_bytes(), None)
+        .expect("valid compact body")
+        .ctx
+        .session_key
+        .expect("prompt_cache_key yields a soft affinity key");
+    assert!(
+        header_session_key(&headers_for_key, None).is_none(),
+        "a header-only control derivation must have no affinity for this request"
     );
 
     let t = now();
     state
         .store
         .continuity()
-        .ensure_session(&sk.value, "hard", t)
+        .ensure_session(&sk.value, "soft", t)
         .await
         .unwrap();
     state
@@ -363,7 +357,7 @@ async fn compact_owner_affinity_is_derived_from_the_body_prompt_cache_key() {
         .continuity()
         .record_completion(
             &sk.value,
-            "hard",
+            "soft",
             "acct-b",
             "resp_compact_owned",
             "fp",
@@ -377,10 +371,7 @@ async fn compact_owner_affinity_is_derived_from_the_body_prompt_cache_key() {
     let resp = client
         .post(format!("{base}/responses/compact"))
         .header("authorization", "Bearer sk-pf-compact-affinity-test")
-        .header("session_id", "sess-compact-owner")
-        .body(format!(
-            r#"{{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":"{PROMPT_CACHE_KEY}"}}"#
-        ))
+        .body(compact_body)
         .send()
         .await
         .unwrap();
@@ -393,8 +384,7 @@ async fn compact_owner_affinity_is_derived_from_the_body_prompt_cache_key() {
             .get("authorization")
             .and_then(|v| v.to_str().ok()),
         Some("Bearer tok-b"),
-        "compact must land on the session's OWNER (acct-b), derived from the BODY's \
-         prompt_cache_key — not on acct-a (the body-blind fallback pick)"
+        "compact must land on the soft session owner derived from the body's prompt_cache_key"
     );
 
     let rows = rows_eventually(&state.store).await;

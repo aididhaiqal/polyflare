@@ -70,6 +70,14 @@ pub struct RuntimeSettings {
     request_log_retention_days: AtomicU32,
     usage_history_retention_days: AtomicU32,
     live_logs: AtomicBool,
+    // Restart-required settings are immutable snapshots of what this process actually applied at
+    // boot. PATCH persists a configured value for the next boot but deliberately does not mutate
+    // these fields, allowing GET /api/settings to report an honest pending-restart state.
+    client_websocket_enabled: bool,
+    http_requests_use_upstream_websocket: bool,
+    http_upstream_websocket_ping: bool,
+    websocket_idle_ping_secs: u64,
+    websocket_idle_budget_secs: u64,
 }
 
 /// Named-field seed for [`RuntimeSettings::new_from_fields`] — see that fn's doc. Field names/
@@ -113,6 +121,14 @@ impl RuntimeSettings {
             request_log_retention_days: AtomicU32::new(cfg.request_log_retention_days),
             usage_history_retention_days: AtomicU32::new(cfg.usage_history_retention_days),
             live_logs: AtomicBool::new(cfg.live_logs),
+            client_websocket_enabled: cfg.client_websocket_enabled,
+            http_requests_use_upstream_websocket: cfg.http_requests_use_upstream_websocket,
+            http_upstream_websocket_ping: cfg.http_upstream_websocket_ping,
+            websocket_idle_ping_secs: cfg
+                .websocket_idle_policy
+                .ping_interval
+                .map_or(0, |duration| duration.as_secs()),
+            websocket_idle_budget_secs: cfg.websocket_idle_policy.idle_budget.as_secs(),
         }
     }
 
@@ -136,6 +152,11 @@ impl RuntimeSettings {
             request_log_retention_days: AtomicU32::new(f.request_log_retention_days),
             usage_history_retention_days: AtomicU32::new(f.usage_history_retention_days),
             live_logs: AtomicBool::new(f.live_logs),
+            client_websocket_enabled: true,
+            http_requests_use_upstream_websocket: false,
+            http_upstream_websocket_ping: false,
+            websocket_idle_ping_secs: 30,
+            websocket_idle_budget_secs: 1500,
         }
     }
 
@@ -177,6 +198,26 @@ impl RuntimeSettings {
 
     pub fn live_logs(&self) -> bool {
         self.live_logs.load(Ordering::Relaxed)
+    }
+
+    pub fn client_websocket_enabled(&self) -> bool {
+        self.client_websocket_enabled
+    }
+
+    pub fn http_requests_use_upstream_websocket(&self) -> bool {
+        self.http_requests_use_upstream_websocket
+    }
+
+    pub fn http_upstream_websocket_ping(&self) -> bool {
+        self.http_upstream_websocket_ping
+    }
+
+    pub fn websocket_idle_ping_secs(&self) -> u64 {
+        self.websocket_idle_ping_secs
+    }
+
+    pub fn websocket_idle_budget_secs(&self) -> u64 {
+        self.websocket_idle_budget_secs
     }
 
     /// Validate + apply a live write to one of the 10 fields. Unknown/non-live `key` ⇒
@@ -370,9 +411,10 @@ mod tests {
             pool_strategies: HashMap::new(),
             admin_token: None,
             live_logs: false,
-            ws_upstream: false,
-            ws_downstream: false,
-            ws_client_ping: false,
+            http_requests_use_upstream_websocket: false,
+            client_websocket_enabled: false,
+            websocket_idle_policy: crate::ws_relay::WsRelayIdlePolicy::default(),
+            http_upstream_websocket_ping: false,
             max_account_attempts: 5,
             starvation_wait_budget: Duration::from_secs(120),
             starvation_heartbeat: Duration::from_secs(15),
@@ -381,6 +423,7 @@ mod tests {
             soft_drain_enabled: true,
             wake_jitter_ms: 250,
             inflight_penalty_pct: 3.5,
+            admission_limits: Default::default(),
             request_log_retention_days: 30,
             usage_history_retention_days: 45,
             model_catalog_ttl_secs: 3600,
@@ -402,6 +445,43 @@ mod tests {
         assert_eq!(rs.request_log_retention_days(), 30);
         assert_eq!(rs.usage_history_retention_days(), 45);
         assert!(!rs.live_logs());
+        assert!(!rs.client_websocket_enabled());
+        assert!(!rs.http_requests_use_upstream_websocket());
+        assert!(!rs.http_upstream_websocket_ping());
+        assert_eq!(rs.websocket_idle_ping_secs(), 30);
+        assert_eq!(rs.websocket_idle_budget_secs(), 1500);
+    }
+
+    #[test]
+    fn persisted_websocket_settings_become_the_effective_boot_snapshot() {
+        let mut cfg = test_config();
+        let values = HashMap::from([
+            ("client_websocket_enabled".to_string(), "true".to_string()),
+            (
+                "http_requests_use_upstream_websocket".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "http_upstream_websocket_ping".to_string(),
+                "true".to_string(),
+            ),
+            ("websocket_idle_ping_secs".to_string(), "1".to_string()),
+            (
+                "websocket_idle_budget_secs".to_string(),
+                "90000".to_string(),
+            ),
+            // A deprecated alias must not override its canonical replacement.
+            ("ws_upstream".to_string(), "false".to_string()),
+        ]);
+
+        crate::config::overlay_persisted_websocket_settings(&mut cfg, &values);
+        let rs = RuntimeSettings::new(&cfg);
+
+        assert!(rs.client_websocket_enabled());
+        assert!(rs.http_requests_use_upstream_websocket());
+        assert!(rs.http_upstream_websocket_ping());
+        assert_eq!(rs.websocket_idle_ping_secs(), 5);
+        assert_eq!(rs.websocket_idle_budget_secs(), 86_400);
     }
 
     #[test]

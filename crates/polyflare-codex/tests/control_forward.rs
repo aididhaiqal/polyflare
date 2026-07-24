@@ -20,6 +20,7 @@ fn account_for(mock_base: &str) -> Account {
         base_url: format!("{mock_base}/codex"),
         bearer_token: "the-account-bearer-token".to_string(),
         chatgpt_account_id: Some("chatgpt-acct-42".to_string()),
+        is_fedramp: false,
     }
 }
 
@@ -36,7 +37,7 @@ async fn post_forwards_to_codex_path_with_bearer_and_account_id() {
         &account,
         "memories/trace_summarize",
         reqwest::Method::POST,
-        &[],
+        &[("x-openai-fedramp".into(), "true".into())],
         Some(Bytes::from(r#"{"trace":"sentinel-body"}"#)),
     )
     .await
@@ -64,13 +65,46 @@ async fn post_forwards_to_codex_path_with_bearer_and_account_id() {
             .and_then(|v| v.to_str().ok()),
         Some("chatgpt-acct-42")
     );
+    assert!(
+        recorded.headers.get("x-openai-fedramp").is_none(),
+        "control forwarding must remove a stale client FedRAMP header"
+    );
     assert_eq!(recorded.body.as_ref(), br#"{"trace":"sentinel-body"}"#);
+}
+
+#[tokio::test]
+async fn control_removes_forwarded_account_id_when_selected_account_has_none() {
+    let mock = MockControlUpstream::new(200, "{}");
+    let handle = mock.clone();
+    let base = mock.spawn().await;
+    let mut account = account_for(&base);
+    account.chatgpt_account_id = None;
+
+    polyflare_codex::control_forward(
+        &reqwest::Client::new(),
+        &account,
+        "responses/compact",
+        reqwest::Method::POST,
+        &[("chatgpt-account-id".into(), "client-stale-workspace".into())],
+        Some(Bytes::from("{}")),
+    )
+    .await
+    .unwrap();
+
+    assert!(handle
+        .last_request()
+        .unwrap()
+        .headers
+        .get("chatgpt-account-id")
+        .is_none());
 }
 
 #[tokio::test]
 async fn response_headers_are_filtered_to_the_allow_set() {
     let mock = MockControlUpstream::new(200, "{}")
         .with_header("etag", "W/\"abc123\"")
+        .with_header("retry-after", "73")
+        .with_header("x-codex-turn-state", "compact-turn-state")
         .with_header("x-internal-secret", "shh-do-not-leak")
         .with_header("set-cookie", "session=leaked");
     let base = mock.spawn().await;
@@ -94,12 +128,47 @@ async fn response_headers_are_filtered_to_the_allow_set() {
         "allow-listed header `etag` must survive filtering: {names:?}"
     );
     assert!(
+        names.contains(&"retry-after"),
+        "Retry-After must survive so routing can apply the exact upstream cooldown: {names:?}"
+    );
+    assert!(
+        names.contains(&"x-codex-turn-state"),
+        "Codex turn state from unary endpoints must survive filtering: {names:?}"
+    );
+    assert!(
         !names.contains(&"x-internal-secret"),
         "non-allow-listed header `x-internal-secret` must be dropped: {names:?}"
     );
     assert!(
         !names.contains(&"set-cookie"),
         "non-allow-listed header `set-cookie` must be dropped: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn oversized_response_is_rejected_instead_of_returned_as_truncated_success() {
+    let mock = MockControlUpstream::new(200, "12345");
+    let base = mock.spawn().await;
+    let account = account_for(&base);
+    let client = reqwest::Client::new();
+
+    let result = polyflare_codex::control_forward_with_limit(
+        &client,
+        &account,
+        "responses/compact",
+        reqwest::Method::POST,
+        &[],
+        Some(Bytes::from("{}")),
+        4,
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(polyflare_codex::ControlError::ResponseTooLarge { limit: 4 })
+        ),
+        "oversized success bodies must fail explicitly, got: {result:?}"
     );
 }
 
@@ -167,6 +236,7 @@ async fn transport_failure_returns_a_typed_error_not_a_panic() {
         base_url: "http://unused.invalid/codex".to_string(),
         bearer_token: "tok".to_string(),
         chatgpt_account_id: None,
+        is_fedramp: false,
     };
     let client = reqwest::Client::new();
 

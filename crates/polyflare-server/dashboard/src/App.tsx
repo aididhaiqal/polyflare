@@ -7,12 +7,15 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { AuthProvider, RequireAuth } from "./auth/AuthProvider";
 import { CapabilitiesProvider } from "./capabilities/CapabilitiesProvider";
 import { AccountDetail } from "./pages/AccountDetail";
+import { QuotaDisplayPreferenceProvider } from "./preferences/QuotaDisplayPreference";
+import { ScreenShieldProvider } from "./privacy/ScreenShield";
 import { Accounts } from "./pages/Accounts";
 import { Keys } from "./pages/Keys";
 import { LiveLogs } from "./pages/LiveLogs";
 import { Login } from "./pages/Login";
 import { Overview } from "./pages/Overview";
 import { Pools } from "./pages/Pools";
+import { Providers } from "./pages/Providers";
 import { Reports } from "./pages/Reports";
 import { Requests } from "./pages/Requests";
 import { Sessions } from "./pages/Sessions";
@@ -33,9 +36,11 @@ export function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <ToastProvider>
-        <BrowserRouter basename="/dashboard">
-          <AuthProvider>
-            <Routes>
+        <QuotaDisplayPreferenceProvider>
+          <ScreenShieldProvider>
+            <BrowserRouter basename="/dashboard">
+            <AuthProvider>
+              <Routes>
               <Route path="/login" element={<Login />} />
               <Route
                 path="/"
@@ -51,6 +56,7 @@ export function App() {
                 <Route path="accounts" element={<Accounts />} />
                 <Route path="accounts/:id" element={<AccountDetail />} />
                 <Route path="pools" element={<Pools />} />
+                <Route path="providers" element={<Providers />} />
                 <Route path="requests" element={<Requests />} />
                 <Route path="sessions" element={<Sessions />} />
                 <Route path="reports" element={<Reports />} />
@@ -59,9 +65,11 @@ export function App() {
                 <Route path="logs" element={<LiveLogs />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
               </Route>
-            </Routes>
-          </AuthProvider>
-        </BrowserRouter>
+              </Routes>
+            </AuthProvider>
+            </BrowserRouter>
+          </ScreenShieldProvider>
+        </QuotaDisplayPreferenceProvider>
       </ToastProvider>
     </QueryClientProvider>
   );

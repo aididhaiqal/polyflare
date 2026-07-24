@@ -23,5 +23,6 @@ pub use translate::{IdentityTranslator, Translator, TranslatorRegistry};
 pub use types::{
     Account, AccountId, AccountSnapshot, ContinuityDirective, ContinuityError, ExecError,
     FailureSignal, KeyStrength, Prepared, PreparedRequest, ReasoningItems, RecoveryPlan,
-    RequestCtx, ResponseStream, SelectionCtx, SessionKey, Tier, TurnOutcome, WatchdogArm,
+    RequestCtx, ResponseMetadata, ResponseStream, SelectionCtx, SessionKey, Tier, TurnOutcome,
+    UpstreamHttpError, WatchdogArm,
 };

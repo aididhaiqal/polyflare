@@ -25,7 +25,7 @@ use polyflare_codex::CodexExecutor;
 use polyflare_core::{CapacityWeighted, Continuity};
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::continuity::CodexContinuity;
-use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
+use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields, SettingValue};
 use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
 
 fn now() -> i64 {
@@ -205,6 +205,7 @@ async fn spawn_app(
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -333,8 +334,11 @@ async fn owner_rejects_cyber_policy_reroutes_to_capable_account_and_rehomes_owne
     );
 
     // Ownership re-homed via `record_recovery` (the SAME machinery `RouteDecision::Recover` uses).
-    let session_key =
-        polyflare_server::session_key::sha256_hex(format!("session:{session_header}").as_bytes());
+    let mut identity_headers = HeaderMap::new();
+    identity_headers.insert("session_id", session_header.parse().unwrap());
+    let session_key = polyflare_server::session_key::header_session_key(&identity_headers, None)
+        .expect("session header derives a continuity key")
+        .value;
     let row = state
         .store
         .continuity()
@@ -346,6 +350,79 @@ async fn owner_rejects_cyber_policy_reroutes_to_capable_account_and_rehomes_owne
         row.owning_account_id.as_deref(),
         Some("capable-acct"),
         "ownership re-homed to the capable account"
+    );
+}
+
+#[tokio::test]
+async fn cyber_reroute_surfaces_terminal_attempt_budget_exhaustion() {
+    let owner_token = "owner-budget-tok".to_string();
+    let capable_token = "capable-budget-tok".to_string();
+    let (upstream, mock) =
+        spawn_cyber_mock(owner_token.clone(), OwnerAnchorBehavior::CyberPolicy).await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[17u8; 32]).unwrap();
+    store
+        .accounts()
+        .insert(
+            &account("owner-budget", false),
+            &tokens(&owner_token),
+            &cipher,
+        )
+        .await
+        .unwrap();
+    let (pf, state) = spawn_app(store, cipher, upstream).await;
+    let client = reqwest::Client::new();
+    let session = "sess-cyber-budget";
+
+    let first = client
+        .post(format!("{pf}/responses"))
+        .header("session-id", session)
+        .json(&serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": [{"a": 1}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let anchor = extract_id(&first.text().await.unwrap()).unwrap();
+
+    state
+        .store
+        .accounts()
+        .insert(
+            &account("capable-budget", true),
+            &tokens(&capable_token),
+            &state.cipher,
+        )
+        .await
+        .unwrap();
+    state
+        .runtime_settings
+        .set("max_account_attempts", SettingValue::U64(1))
+        .unwrap();
+    let turn_metadata = serde_json::json!({"turn_id": "cyber-budget-turn"}).to_string();
+    let response = client
+        .post(format!("{pf}/responses"))
+        .header("session-id", session)
+        .header("thread-id", "thread-cyber-budget")
+        .header("x-codex-turn-metadata", turn_metadata)
+        .json(&serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "previous_response_id": anchor,
+            "input": [{"a": 1}, {"b": 2}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "logical_turn_attempts_exhausted");
+    assert_eq!(
+        mock.tokens_seen.lock().unwrap().len(),
+        2,
+        "the exhausted reroute must not reach the capable account"
     );
 }
 
@@ -441,7 +518,7 @@ async fn no_capable_account_yields_a_clear_error_and_never_retries_unfiltered() 
 /// before — proving the new branch triggers ONLY on `WatchdogError::CapabilityRejection`, never on
 /// any other `WatchdogError` variant.
 #[tokio::test]
-async fn non_cyber_failure_still_routes_to_record_failure_and_502() {
+async fn non_cyber_failure_still_records_health_and_preserves_upstream_status() {
     let owner_token = "owner-plain-tok".to_string();
     let (upstream, mock) =
         spawn_cyber_mock(owner_token.clone(), OwnerAnchorBehavior::Plain500).await;
@@ -488,8 +565,8 @@ async fn non_cyber_failure_still_routes_to_record_failure_and_502() {
 
     assert_eq!(
         r2.status(),
-        502,
-        "a plain (non-cyber) upstream failure surfaces exactly as before: the generic 502"
+        500,
+        "a plain (non-cyber) upstream HTTP failure preserves the actionable upstream status"
     );
 
     // Exactly 2 attempts: turn1 + the failed owner attempt — the new branch must NOT have

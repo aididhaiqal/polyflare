@@ -99,11 +99,13 @@ export interface WindowView {
 
 /** `read_api.rs::UsageWindowView` — one entry of `AccountView.usage` / `AccountDetailView.
  * quota_windows`. `window` is `"five_hour" | "weekly"` in practice but left as `string` since the
- * backend types it `&'static str`, not a closed enum. */
+ * backend types it `&'static str`, not a closed enum. Stale observations remain available as
+ * historical evidence but are not current limits. */
 export interface UsageWindowView {
   window: string;
   used_percent: number;
   reset_at: number | null;
+  stale: boolean;
 }
 
 /** `read_api.rs::TokenHealthView` — derived JWT-`exp` state only; NEVER a token. */
@@ -118,6 +120,7 @@ export interface AccountView {
   email: string;
   alias: string | null;
   pool: string | null;
+  pools: string[];
   provider: string;
   status: string;
   plan_type: string;
@@ -142,6 +145,7 @@ export interface AccountIdentityView {
   plan_type: string;
   provider: string;
   pool: string | null;
+  pools: string[];
 }
 
 /** `read_api.rs::RequestTotalsView` — `AccountDetailView.request_totals`. */
@@ -257,6 +261,10 @@ export interface PoolView {
 /** `read_api.rs::RequestRowView` — one row of `GET /api/requests`. */
 export interface RequestRowView {
   id: number;
+  /** PolyFlare-generated correlation id shared with structured and live logs. */
+  request_id: string | null;
+  /** One-way SHA-256 continuity key shared with the Sessions view. */
+  session_key: string | null;
   requested_at: number;
   provider: string;
   method: string;
@@ -265,14 +273,32 @@ export interface RequestRowView {
   status: number;
   duration_ms: number;
   account_id: string | null;
+  target_kind: "account" | "credential" | null;
+  provider_credential_id: string | null;
   model: string | null;
+  upstream_model: string | null;
+  upstream_transport: string | null;
   reasoning_effort: string | null;
   service_tier: string | null;
   transport: string | null;
   ttft_ms: number | null;
   total_tokens: number | null;
   cached_tokens: number | null;
+  orchestration_input_tokens: number | null;
+  orchestration_output_tokens: number | null;
+  orchestration_cached_input_tokens: number | null;
   tps: number | null;
+  /** Imported codex-lb rows use status=0 as "no HTTP status" and carry this bounded outcome. */
+  outcome: "success" | "error" | null;
+  /** Native Codex stream terminal result; authoritative over its initial HTTP status. */
+  protocol_outcome:
+    | "completed"
+    | "failed"
+    | "incomplete"
+    | "cancelled"
+    | "transport_lost"
+    | null;
+  error_code: string | null;
   /** The codex sub-agent role label from `x-openai-subagent` (`"review"` / `"compact"` /
    * `"memory_consolidation"` / `"collab_spawn"`), or `null` for the main agent. A bounded role
    * slug — content-free, same content-safety class as `model`. */
@@ -290,6 +316,8 @@ export interface RequestsView {
 export interface RequestsQueryParams {
   limit?: number;
   offset?: number;
+  request_id?: string;
+  session_key?: string;
   account?: string;
   provider?: string;
   status_class?: string;
@@ -307,11 +335,17 @@ export interface SessionRowView {
   key_strength: string;
   owning_account_id: string | null;
   owner_email: string | null;
+  provider: string;
+  target_kind: "account" | "credential";
+  target_id: string | null;
+  target_label: string | null;
+  model: string | null;
   state: string;
   required_capabilities: string | null;
   created_at: number;
   updated_at: number;
   last_activity_at: number;
+  request_count: number;
 }
 
 /** `read_api.rs::SessionsView` — `GET /api/sessions` response envelope. */
@@ -325,6 +359,7 @@ export interface SessionsView {
 export interface SessionsQueryParams {
   limit?: number;
   offset?: number;
+  session_key?: string;
 }
 
 /** `read_api.rs::ReportBucketView`/`ReportBreakdownView`/`ReportTotalsView` share this same flat
@@ -338,6 +373,8 @@ export interface ReportMetricsView {
   tokens: number;
   cached_tokens: number;
   reasoning_tokens: number;
+  orchestration_tokens: number;
+  orchestration_cached_tokens: number;
   avg_duration_ms: number;
   avg_ttft_ms: number;
   ttft_sample_count: number;
@@ -381,6 +418,8 @@ export interface KpisView {
   success_rate: number;
   avg_latency_ms: number;
   total_tokens: number;
+  orchestration_tokens: number;
+  orchestration_cached_tokens: number;
 }
 
 /** `read_api.rs::ProviderQuotaView` — one entry of `OverviewView.quota`. */
@@ -400,9 +439,28 @@ export interface PoolOverviewView {
 /** `read_api.rs::RecentErrorView` — one entry of `OverviewView.recent_errors`. */
 export interface RecentErrorView {
   status: number;
+  provider: string;
   account_id: string | null;
+  target_kind: "account" | "credential" | null;
+  provider_credential_id: string | null;
   error_code: string | null;
   requested_at: number;
+}
+
+/** Process-local, content-free admission pressure aggregated across request/socket and
+ * new/owner lanes. */
+export interface AdmissionOverviewView {
+  waiters: number;
+  waits_total: number;
+  acquired_after_wait_total: number;
+  timeouts_total: number;
+  ineligible_total: number;
+  cancelled_total: number;
+  owner_recovery_total: number;
+  avg_wait_ms: number;
+  in_flight_pressure: number;
+  calibration_ratio: number;
+  calibration_samples: number;
 }
 
 /** `read_api.rs::OverviewView` — `GET /api/overview` response. */
@@ -411,6 +469,7 @@ export interface OverviewView {
   quota: ProviderQuotaView[];
   pools: PoolOverviewView[];
   accounts_available: number;
+  admission: AdmissionOverviewView;
   recent_errors: RecentErrorView[];
 }
 
@@ -423,6 +482,8 @@ export interface SeriesBucketView {
   errors: number;
   avg_latency_ms: number;
   total_tokens: number;
+  orchestration_tokens: number;
+  orchestration_cached_tokens: number;
 }
 
 /** `read_api.rs::OverviewSeriesView` — `GET /api/overview/series` response: the rolling-24h
@@ -454,8 +515,14 @@ export type LogLevel = "info" | "warn" | "error" | "debug";
 export interface LogEvent {
   ts_ms: number;
   level: LogLevel;
+  /** Matches `RequestRowView.request_id` for request-completion events. */
+  request_id?: string;
+  /** One-way SHA-256 continuity key shared with request history. */
+  session_key?: string;
   provider?: string;
   account?: string;
+  target_kind?: "account" | "credential";
+  target_id?: string;
   model?: string;
   status?: number;
   latency_ms?: number;
@@ -475,7 +542,11 @@ export interface LogEvent {
  * -> a number/text input. */
 export interface SettingFieldView {
   key: string;
+  label: string;
+  description: string;
   value: string | null;
+  configured_value: string | null;
+  pending_restart: boolean;
   default: string;
   class: "live" | "restart-only" | "fixed";
   kind: "u32" | "secs" | "bool" | "f64" | "string";
@@ -483,8 +554,7 @@ export interface SettingFieldView {
   max: number | null;
 }
 
-/** `read_api.rs::SettingsView` — `GET /api/settings` response: every `ServeConfig` field (27
- * total — 10 live + 8 restart-only + 9 fixed), for the Settings page. */
+/** `read_api.rs::SettingsView` — the complete Settings-page configuration view. */
 export interface SettingsView {
   fields: SettingFieldView[];
 }
@@ -517,6 +587,96 @@ export interface CreatedApiKey {
   key: string;
 }
 
+export interface ProviderCredentialView {
+  id: string;
+  provider_id: string;
+  label: string;
+  enabled: boolean;
+  health_status: string;
+  routing_weight: number;
+  max_concurrency: number | null;
+  cooldown_until: number | null;
+  last_error_at: number | null;
+}
+
+export interface ProviderModelView {
+  id: string;
+  provider_id: string;
+  public_model: string;
+  upstream_model: string;
+  display_name: string;
+  context_window: number | null;
+  max_output_tokens: number | null;
+  supports_tools: boolean;
+  supports_vision: boolean;
+  supports_parallel_tool_calls: boolean;
+  supports_web_search: boolean;
+  supports_reasoning_summaries: boolean;
+  reasoning_levels: string[];
+  input_per_million: number | null;
+  cached_input_per_million: number | null;
+  output_per_million: number | null;
+  visible_in_codex: boolean;
+  visible_in_openai: boolean;
+  enabled: boolean;
+}
+
+export interface CustomProviderView {
+  id: string;
+  slug: string;
+  display_name: string;
+  base_url: string;
+  wire_api: string;
+  enabled: boolean;
+  stateless_responses: boolean;
+  allow_private_hosts: boolean;
+  connect_timeout_ms: number;
+  stream_idle_timeout_ms: number;
+  request_max_retries: number;
+  max_concurrency: number | null;
+  credentials: ProviderCredentialView[];
+  models: ProviderModelView[];
+}
+
+export interface CreateProviderBody {
+  slug: string;
+  display_name: string;
+  base_url: string;
+  stateless_responses?: boolean;
+  allow_private_hosts?: boolean;
+  connect_timeout_ms?: number;
+  stream_idle_timeout_ms?: number;
+  request_max_retries?: number;
+  max_concurrency?: number;
+}
+
+export interface CreateProviderModelBody {
+  public_model: string;
+  upstream_model: string;
+  display_name: string;
+  context_window?: number;
+  supports_tools?: boolean;
+  supports_vision?: boolean;
+  supports_parallel_tool_calls?: boolean;
+  supports_web_search?: boolean;
+  supports_reasoning_summaries?: boolean;
+  reasoning_levels?: string[];
+  input_per_million?: number;
+  cached_input_per_million?: number;
+  output_per_million?: number;
+  visible_in_codex?: boolean;
+  visible_in_openai?: boolean;
+}
+
+export interface ProviderTestResult {
+  ok: boolean;
+  upstream_status: number;
+  provider: string;
+  model: string;
+  credential_id: string | null;
+  latency_ms: number;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Mutation client — write endpoints (queries.ts wraps these in useMutation). Content-free: every
 // body field is account metadata (pool/policy/status/alias), never a token or conversation content.
@@ -527,6 +687,7 @@ export interface CreatedApiKey {
  * string sets; `status` is "active"|"paused"; `routing_policy` is "normal"|"burn_first"|"preserve". */
 export interface AccountPatchBody {
   pool?: string | null;
+  pools?: string[];
   routing_policy?: string;
   status?: string;
   security_work_authorized?: boolean;
@@ -536,6 +697,47 @@ export interface AccountPatchBody {
 /** `{ok:true}` envelope returned by the account PATCH/DELETE mutations. */
 export interface OkResponse {
   ok: boolean;
+}
+
+export interface OAuthOnboardingStart {
+  flow_id: string;
+  authorize_url: string;
+  expires_at: number;
+}
+
+export interface OAuthOnboardingResult {
+  status: "completed";
+  account_id: string;
+}
+
+export function startCodexOnboarding(initialPool?: string): Promise<OAuthOnboardingStart> {
+  return fetchJson<OAuthOnboardingStart>("/api/account-onboarding/codex", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ initial_pool: initialPool || null }),
+  });
+}
+
+export function completeCodexOnboarding(
+  flowId: string,
+  callbackUrl: string,
+): Promise<OAuthOnboardingResult> {
+  return fetchJson<OAuthOnboardingResult>(
+    `/api/account-onboarding/${encodeURIComponent(flowId)}/callback`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ callback_url: callbackUrl }),
+    },
+  );
+}
+
+export function createPool(slug: string, accountIds: string[]): Promise<OkResponse & { slug: string }> {
+  return fetchJson<OkResponse & { slug: string }>("/api/pools", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ slug, account_ids: accountIds }),
+  });
 }
 
 export function patchAccount(id: string, body: AccountPatchBody): Promise<OkResponse> {
@@ -586,6 +788,95 @@ export function patchKey(id: string, body: { enabled: boolean }): Promise<OkResp
   });
 }
 
+export function createProvider(body: CreateProviderBody): Promise<CustomProviderView> {
+  return fetchJson<CustomProviderView>("/api/providers", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export function createProviderCredential(
+  providerId: string,
+  body: { label: string; api_key: string; routing_weight?: number; max_concurrency?: number },
+): Promise<ProviderCredentialView> {
+  return fetchJson<ProviderCredentialView>(
+    `/api/providers/${encodeURIComponent(providerId)}/credentials`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+export function createProviderModel(
+  providerId: string,
+  body: CreateProviderModelBody,
+): Promise<ProviderModelView> {
+  return fetchJson<ProviderModelView>(`/api/providers/${encodeURIComponent(providerId)}/models`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export function patchProviderEnabled(id: string, enabled: boolean): Promise<OkResponse> {
+  return fetchJson<OkResponse>(`/api/providers/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export function deleteProvider(id: string): Promise<OkResponse> {
+  return fetchJson<OkResponse>(`/api/providers/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export function testProvider(id: string): Promise<ProviderTestResult> {
+  return fetchJson<ProviderTestResult>(`/api/providers/${encodeURIComponent(id)}/test`, {
+    method: "POST",
+  });
+}
+
+export function patchProviderCredentialEnabled(
+  id: string,
+  enabled: boolean,
+): Promise<OkResponse> {
+  return fetchJson<OkResponse>(`/api/provider-credentials/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export function deleteProviderCredential(id: string): Promise<OkResponse> {
+  return fetchJson<OkResponse>(`/api/provider-credentials/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export function patchProviderModel(
+  id: string,
+  patch: {
+    enabled?: boolean;
+    visible_in_codex?: boolean;
+    visible_in_openai?: boolean;
+  },
+): Promise<OkResponse> {
+  return fetchJson<OkResponse>(`/api/provider-models/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+}
+
+export function deleteProviderModel(id: string): Promise<OkResponse> {
+  return fetchJson<OkResponse>(`/api/provider-models/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Thin per-endpoint helpers (queries.ts wraps these in useQuery).
 // ---------------------------------------------------------------------------------------------
@@ -604,6 +895,7 @@ export const api = {
   reports: (qs: string) => fetchJson<ReportsView>(`/api/reports${qs}`),
   settings: () => fetchJson<SettingsView>("/api/settings"),
   keys: () => fetchJson<ApiKeysView>("/api/keys"),
+  providers: () => fetchJson<CustomProviderView[]>("/api/providers"),
   capabilities: () => fetchJson<CapabilitiesView>("/api/capabilities"),
   whoami: () => fetchJson<WhoamiView>("/api/whoami"),
 };

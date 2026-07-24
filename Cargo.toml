@@ -50,6 +50,7 @@ rust-embed = { version = "8", features = ["mime-guess"] }
 # NOT add `default-features = false` here, or the post-quantum hybrid key share disappears.
 rustls = { version = "=0.23.36", features = ["aws_lc_rs"] }
 aws-lc-rs = "=1.16.2"
+zstd = "0.13"
 
 # M5a (WS deflate parity, E4(a) — docs/DESIGN-DECISIONS.md): the WS handshake must offer
 # `permessage-deflate` the way real codex does, and PolyFlare must actually be able to decode it.

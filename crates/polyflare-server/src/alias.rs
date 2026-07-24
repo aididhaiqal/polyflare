@@ -13,15 +13,12 @@ pub struct ModelAlias {
     pub reasoning_effort: Option<String>,
 }
 
-/// A synthetic model PolyFlare advertises in its catalog AND routes: a client-facing `id` (what a
-/// client selects / what the model list shows) plus the `needle` [`lookup_alias`] matches on
-/// (Claude Code sends full dated ids like `claude-opus-4-1-20250805`, so match by tier substring,
-/// not the exact id), and the `alias` (target provider/model/effort). This one table is the single
-/// source of truth for both `/v1/messages` routing and the served model catalog (see
-/// `crate::catalog`) — the "config/transform" mechanism CLIProxyAPI/codex-lb use for synthetic
-/// models, since the Claude model list can't be fetched with a subscription-OAuth token.
+/// A Claude request-translation alias: a stable public id, the `needle` [`lookup_alias`] matches
+/// on (Claude Code sends dated ids such as `claude-opus-4-1-20250805`), and its target. These rows
+/// are routing definitions for `/v1/messages`, not model-discovery entries; `crate::catalog`
+/// deliberately keeps them out of Codex and generic OpenAI pickers.
 pub struct SyntheticModel {
-    /// Client-facing model id advertised in the catalog (e.g. `claude-opus-4-1`).
+    /// Stable client-facing family id used for collision reservation and operator diagnostics.
     pub id: &'static str,
     /// Case-insensitive substring `lookup_alias` matches an inbound `model` string against.
     pub needle: &'static str,
@@ -31,7 +28,7 @@ pub struct SyntheticModel {
     pub alias: ModelAlias,
 }
 
-/// The synthetic model definitions (first match wins in [`lookup_alias`]). U2: confirm exact
+/// The translation model definitions (first match wins in [`lookup_alias`]). U2: confirm exact
 /// strings/pairs. Defaults per SPEC-M4 §3.6/§7: `opus` -> Codex `gpt-5.6-sol` @ high, `sonnet` ->
 /// `gpt-5.6-terra` @ medium, `haiku` -> `gpt-5.6-luna` @ low. Edit here to add/repoint synthetic
 /// models without touching lookup or catalog logic.

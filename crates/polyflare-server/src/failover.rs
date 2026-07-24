@@ -88,8 +88,10 @@ pub fn failover_verdict(
     }
     match err {
         WatchdogError::Upstream(signal) => classify_upstream(signal.as_ref()),
+        WatchdogError::UpstreamHttp(response) => classify_upstream(Some(&response.signal)),
         // TA6(b)'s own reroute owns this — see the module doc. Conservative default: no fan-out.
         WatchdogError::CapabilityRejection { .. } => FailoverVerdict::Surface,
+        WatchdogError::AttemptBudgetExhausted => FailoverVerdict::Surface,
         // No resend strategy exists for this request at all (session/directive-level dead end, not
         // an account problem) — see the module doc.
         WatchdogError::Continuity => FailoverVerdict::Surface,
@@ -156,7 +158,22 @@ pub fn failover_reason_code(err: &WatchdogError) -> &'static str {
             }
         }
         WatchdogError::Upstream(None) => "transport_error",
+        WatchdogError::UpstreamHttp(response) => {
+            let sig = &response.signal;
+            if let Some(code) = &sig.error_code {
+                if classify_failure(code).status().is_some() {
+                    return "permanent_auth";
+                }
+            }
+            match sig.status {
+                429 => "rate_limited",
+                s if (500..=599).contains(&s) => "transient",
+                401 | 403 | 408 => "transient",
+                _ => "other",
+            }
+        }
         WatchdogError::CapabilityRejection { .. } => "capability_rejection",
+        WatchdogError::AttemptBudgetExhausted => "attempt_budget_exhausted",
         WatchdogError::Continuity => "continuity",
     }
 }

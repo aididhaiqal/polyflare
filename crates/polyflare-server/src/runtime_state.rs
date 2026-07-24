@@ -17,9 +17,11 @@
 //! [`overlay`]: RuntimeStates::overlay
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
-use polyflare_core::{AccountId, AccountSnapshot};
+use polyflare_core::{AccountId, AccountSnapshot, SelectionCtx, Selector};
 
 use crate::observability::{LeaseMetrics, RateLimitMetrics};
 
@@ -28,6 +30,8 @@ use crate::observability::{LeaseMetrics, RateLimitMetrics};
 const BACKOFF_BASE_MS: i64 = 200;
 /// Cap on the exponent so a large `error_count` can't overflow / produce an absurd delay.
 const BACKOFF_MAX_SHIFT: u32 = 16;
+const PRESSURE_TOKENS_PER_UNIT: u64 = 16_384;
+const DEFAULT_MAX_REQUEST_PRESSURE_UNITS: u32 = 16;
 /// Floor on a rate-limit cooldown (codex-lb `RATE_LIMITED_MIN_COOLDOWN_SECONDS`): even a tiny
 /// upstream `Retry-After` benches the account for at least this long.
 pub const RATE_LIMITED_MIN_COOLDOWN_SECS: i64 = 30;
@@ -72,6 +76,27 @@ pub const REASON_QUIET_PROMOTE: &str = "quiet_promote";
 pub const REASON_PROBE_PROMOTE: &str = "probe_promote";
 /// The `POLYFLARE_SOFT_DRAIN_ENABLED=0` disable lever forced a non-HEALTHY account back to HEALTHY.
 pub const REASON_DISABLED_RESET: &str = "disabled_reset";
+
+/// A logical turn's aggregate attempt history only needs to cover Codex's immediate retry window.
+/// Sliding expiry bounds process memory while still joining HTTP retries, WS replay, and transport
+/// fallback for the same active turn.
+const LOGICAL_TURN_ATTEMPT_TTL_SECS: i64 = 15 * 60;
+/// Defense-in-depth bound for hostile high-cardinality metadata. Keys are already fixed-size
+/// SHA-256 hex digests, but the number of distinct logical turns must be bounded too.
+const LOGICAL_TURN_ATTEMPT_MAX_KEYS: usize = 16_384;
+const LOGICAL_TURN_ATTEMPT_CLEANUP_INTERVAL_SECS: i64 = 60;
+
+#[derive(Clone, Copy)]
+struct LogicalTurnAttempts {
+    consumed: u32,
+    expires_at: i64,
+}
+
+#[derive(Default)]
+struct LogicalTurnAttemptRegistry {
+    entries: HashMap<String, LogicalTurnAttempts>,
+    next_cleanup_at: i64,
+}
 
 /// B8 Task 4: one actual health-tier change (`from != to`), returned UPWARD by the funnel /
 /// poller methods so the CALLER — which owns the `log_bus` + `HealthTierMetrics` handles — emits the
@@ -132,6 +157,11 @@ pub struct RuntimeState {
     /// must return `false` — an in-flight account can never be GC'd out of the map mid-request, or
     /// the count would be lost. Defaults to `0`, which stays neutral like every other field.
     pub in_flight: u32,
+    /// Bounded token-volume units held by the live requests. A large turn can contribute several
+    /// units while still counting as exactly one request in `in_flight`.
+    pub in_flight_pressure: u32,
+    /// Long-lived upstream WebSocket connections, including idle sockets between turns.
+    pub open_ws: u32,
 }
 
 impl RuntimeState {
@@ -317,9 +347,267 @@ pub fn evaluate_health_tier(
 
 /// Concurrent map of per-account runtime state. Cheap reads (overlay) under a shared lock; brief
 /// exclusive locks on the (rare) mutation path.
-#[derive(Default)]
 pub struct RuntimeStates {
     inner: RwLock<HashMap<AccountId, RuntimeState>>,
+    logical_turn_attempts: Mutex<LogicalTurnAttemptRegistry>,
+    usage_refresh_tx: RwLock<Option<tokio::sync::mpsc::UnboundedSender<AccountId>>>,
+    /// At most one queued/in-progress refresh per account. `true` means another signal arrived
+    /// while that refresh was outstanding and one follow-up pass is required.
+    usage_refresh_pending: Mutex<HashMap<AccountId, bool>>,
+    usage_refresh_coalesced: AtomicU64,
+    cooldown_persist_tx: RwLock<Option<tokio::sync::mpsc::UnboundedSender<RoutingCooldownWrite>>>,
+    admission_limits: AdmissionLimits,
+    admission_changed: tokio::sync::Notify,
+    admission_metrics: AdmissionMetrics,
+    pressure_calibration: PressureCalibration,
+}
+
+/// Hard process-local admission bounds. Zero disables the corresponding bound.
+///
+/// The defaults match codex-lb's response-create and upstream-WebSocket bulkheads. These are
+/// deliberately concurrency caps, not quota-derived weights: weekly credits do not prove how many
+/// simultaneous requests an upstream account can safely sustain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionLimits {
+    pub global_in_flight: u32,
+    pub account_in_flight: u32,
+    pub global_in_flight_pressure: u32,
+    pub account_in_flight_pressure: u32,
+    pub global_open_ws: u32,
+    pub account_open_ws: u32,
+    pub owner_recovery_reserve: u32,
+    pub owner_recovery_pressure_reserve: u32,
+    pub wait_timeout: Duration,
+}
+
+impl Default for AdmissionLimits {
+    fn default() -> Self {
+        Self {
+            global_in_flight: 256,
+            account_in_flight: 4,
+            global_in_flight_pressure: 1_024,
+            account_in_flight_pressure: 16,
+            global_open_ws: 128,
+            account_open_ws: 8,
+            owner_recovery_reserve: 1,
+            owner_recovery_pressure_reserve: 4,
+            wait_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+impl Default for RuntimeStates {
+    fn default() -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+            logical_turn_attempts: Mutex::new(LogicalTurnAttemptRegistry::default()),
+            usage_refresh_tx: RwLock::new(None),
+            usage_refresh_pending: Mutex::new(HashMap::new()),
+            usage_refresh_coalesced: AtomicU64::new(0),
+            cooldown_persist_tx: RwLock::new(None),
+            admission_limits: AdmissionLimits::default(),
+            admission_changed: tokio::sync::Notify::new(),
+            admission_metrics: AdmissionMetrics::default(),
+            pressure_calibration: PressureCalibration::default(),
+        }
+    }
+}
+
+/// Fixed-cardinality rolling calibration between the cheap pre-route estimate and terminal usage.
+/// The ratio is stored in thousandths and updated with a 1/8 EWMA. Samples are clamped so one
+/// malformed or unusual terminal cannot make subsequent admission weights collapse or explode.
+struct PressureCalibration {
+    ratio_milli: AtomicU64,
+    samples: AtomicU64,
+    estimated_tokens: AtomicU64,
+    actual_pressure_tokens: AtomicU64,
+}
+
+impl Default for PressureCalibration {
+    fn default() -> Self {
+        Self {
+            ratio_milli: AtomicU64::new(1_000),
+            samples: AtomicU64::new(0),
+            estimated_tokens: AtomicU64::new(0),
+            actual_pressure_tokens: AtomicU64::new(0),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AdmissionLane {
+    NewRequest,
+    OwnerRequest,
+    NewSocket,
+    OwnerSocket,
+}
+
+impl AdmissionLane {
+    fn labels(self) -> (&'static str, &'static str) {
+        match self {
+            Self::NewRequest => ("request", "new"),
+            Self::OwnerRequest => ("request", "owner"),
+            Self::NewSocket => ("websocket", "new"),
+            Self::OwnerSocket => ("websocket", "owner"),
+        }
+    }
+}
+
+#[derive(Default)]
+struct AdmissionLaneMetrics {
+    waiters: AtomicU64,
+    waits: AtomicU64,
+    acquired_after_wait: AtomicU64,
+    timeouts: AtomicU64,
+    ineligible: AtomicU64,
+    cancelled: AtomicU64,
+    wait_milliseconds: AtomicU64,
+    owner_recovery: AtomicU64,
+}
+
+impl AdmissionLaneMetrics {
+    fn snapshot(&self, lane: AdmissionLane) -> AdmissionMetricSnapshot {
+        let (work, scope) = lane.labels();
+        AdmissionMetricSnapshot {
+            work,
+            scope,
+            waiters: self.waiters.load(Ordering::Relaxed),
+            waits: self.waits.load(Ordering::Relaxed),
+            acquired_after_wait: self.acquired_after_wait.load(Ordering::Relaxed),
+            timeouts: self.timeouts.load(Ordering::Relaxed),
+            ineligible: self.ineligible.load(Ordering::Relaxed),
+            cancelled: self.cancelled.load(Ordering::Relaxed),
+            wait_milliseconds: self.wait_milliseconds.load(Ordering::Relaxed),
+            owner_recovery: self.owner_recovery.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Default)]
+struct AdmissionMetrics {
+    new_request: AdmissionLaneMetrics,
+    owner_request: AdmissionLaneMetrics,
+    new_socket: AdmissionLaneMetrics,
+    owner_socket: AdmissionLaneMetrics,
+}
+
+impl AdmissionMetrics {
+    fn lane(&self, lane: AdmissionLane) -> &AdmissionLaneMetrics {
+        match lane {
+            AdmissionLane::NewRequest => &self.new_request,
+            AdmissionLane::OwnerRequest => &self.owner_request,
+            AdmissionLane::NewSocket => &self.new_socket,
+            AdmissionLane::OwnerSocket => &self.owner_socket,
+        }
+    }
+
+    fn start_wait(&self, lane: AdmissionLane) -> AdmissionWaitGuard<'_> {
+        let metrics = self.lane(lane);
+        metrics.waits.fetch_add(1, Ordering::Relaxed);
+        metrics.waiters.fetch_add(1, Ordering::Relaxed);
+        AdmissionWaitGuard {
+            metrics,
+            started_at: Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn record_ineligible(&self, lane: AdmissionLane) {
+        self.lane(lane).ineligible.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_owner_recovery(&self, lane: AdmissionLane) {
+        self.lane(lane)
+            .owner_recovery
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Vec<AdmissionMetricSnapshot> {
+        [
+            AdmissionLane::NewRequest,
+            AdmissionLane::OwnerRequest,
+            AdmissionLane::NewSocket,
+            AdmissionLane::OwnerSocket,
+        ]
+        .into_iter()
+        .map(|lane| self.lane(lane).snapshot(lane))
+        .collect()
+    }
+}
+
+enum AdmissionWaitOutcome {
+    Acquired,
+    Timeout,
+    Ineligible,
+}
+
+struct AdmissionWaitGuard<'a> {
+    metrics: &'a AdmissionLaneMetrics,
+    started_at: Instant,
+    finished: bool,
+}
+
+impl AdmissionWaitGuard<'_> {
+    fn finish(mut self, outcome: AdmissionWaitOutcome) {
+        match outcome {
+            AdmissionWaitOutcome::Acquired => {
+                self.metrics
+                    .acquired_after_wait
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            AdmissionWaitOutcome::Timeout => {
+                self.metrics.timeouts.fetch_add(1, Ordering::Relaxed);
+            }
+            AdmissionWaitOutcome::Ineligible => {
+                self.metrics.ineligible.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for AdmissionWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.metrics.waiters.fetch_sub(1, Ordering::Relaxed);
+        self.metrics.wait_milliseconds.fetch_add(
+            self.started_at.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        if !self.finished {
+            self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// One fixed-cardinality, content-free admission lane exposed to Prometheus and the dashboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionMetricSnapshot {
+    pub work: &'static str,
+    pub scope: &'static str,
+    pub waiters: u64,
+    pub waits: u64,
+    pub acquired_after_wait: u64,
+    pub timeouts: u64,
+    pub ineligible: u64,
+    pub cancelled: u64,
+    pub wait_milliseconds: u64,
+    pub owner_recovery: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PressureCalibrationSnapshot {
+    pub ratio: f64,
+    pub samples: u64,
+    pub estimated_tokens: u64,
+    pub actual_pressure_tokens: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RoutingCooldownWrite {
+    pub account_id: AccountId,
+    pub cooldown_until: i64,
+    pub reason: &'static str,
+    pub updated_at: i64,
 }
 
 /// C9 Task 1: a leak-proof RAII lease on one account's `in_flight` count, returned by
@@ -345,6 +633,7 @@ pub struct RuntimeStates {
 pub struct InFlightGuard {
     runtime: Arc<RuntimeStates>,
     id: AccountId,
+    pressure_units: u32,
     metrics: Arc<LeaseMetrics>,
 }
 
@@ -355,7 +644,9 @@ impl Drop for InFlightGuard {
         // decrement below zero would be a worse defect than a silently-clamped no-op.
         self.runtime.mutate(&self.id, |rt| {
             rt.in_flight = rt.in_flight.saturating_sub(1);
+            rt.in_flight_pressure = rt.in_flight_pressure.saturating_sub(self.pressure_units);
         });
+        self.runtime.admission_changed.notify_waiters();
         // C9 Task 4: the release counter. This fires on EVERY way this guard stops existing —
         // clean drain, client disconnect, mid-stream error, idle-timeout, or a failover reselect's
         // dropped pre-stream attempt — the exact same leak-proof coverage the `in_flight` decrement
@@ -364,9 +655,271 @@ impl Drop for InFlightGuard {
     }
 }
 
+#[must_use]
+pub struct WsSocketGuard {
+    runtime: Arc<RuntimeStates>,
+    id: AccountId,
+}
+
+impl Drop for WsSocketGuard {
+    fn drop(&mut self) {
+        self.runtime.mutate(&self.id, |rt| {
+            rt.open_ws = rt.open_ws.saturating_sub(1);
+        });
+        self.runtime.admission_changed.notify_waiters();
+    }
+}
+
 impl RuntimeStates {
+    /// Atomically spend one generation attempt from the process-wide budget for a hashed logical
+    /// turn. Missing turn identity deliberately bypasses this aggregate layer and retains the
+    /// caller's existing per-request retry bound.
+    ///
+    /// `limit` is the same live `max_account_attempts` policy used by the HTTP failover loop.
+    /// Zero is treated as one defensively, matching the configuration clamp.
+    pub fn try_consume_logical_turn_attempt(
+        &self,
+        logical_turn_key: Option<&str>,
+        limit: u32,
+        now: i64,
+    ) -> bool {
+        let Some(key) = logical_turn_key else {
+            return true;
+        };
+        let limit = limit.max(1);
+        let mut registry = self
+            .logical_turn_attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if now >= registry.next_cleanup_at
+            || registry.entries.len() >= LOGICAL_TURN_ATTEMPT_MAX_KEYS
+        {
+            registry.entries.retain(|_, entry| entry.expires_at > now);
+            registry.next_cleanup_at =
+                now.saturating_add(LOGICAL_TURN_ATTEMPT_CLEANUP_INTERVAL_SECS);
+        }
+
+        if let Some(entry) = registry.entries.get_mut(key) {
+            if entry.consumed >= limit {
+                return false;
+            }
+            entry.consumed = entry.consumed.saturating_add(1);
+            entry.expires_at = now.saturating_add(LOGICAL_TURN_ATTEMPT_TTL_SECS);
+            return true;
+        }
+
+        // Preserve budgets already protecting active turns. Evicting one here would let a
+        // high-cardinality client erase another turn's spent attempts and resume amplification.
+        if registry.entries.len() >= LOGICAL_TURN_ATTEMPT_MAX_KEYS {
+            return false;
+        }
+        registry.entries.insert(
+            key.to_owned(),
+            LogicalTurnAttempts {
+                consumed: 1,
+                expires_at: now.saturating_add(LOGICAL_TURN_ATTEMPT_TTL_SECS),
+            },
+        );
+        true
+    }
+
+    /// Refund an attempt that an upstream rejected at authentication before model sampling could
+    /// begin. This is intentionally narrow: transport failures, 429s, 5xx responses, replay, and
+    /// account failover all remain charged.
+    pub fn refund_logical_turn_attempt(&self, logical_turn_key: Option<&str>) {
+        let Some(key) = logical_turn_key else {
+            return;
+        };
+        let mut registry = self
+            .logical_turn_attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let remove = registry.entries.get_mut(key).is_some_and(|entry| {
+            entry.consumed = entry.consumed.saturating_sub(1);
+            entry.consumed == 0
+        });
+        if remove {
+            registry.entries.remove(key);
+        }
+    }
+
+    /// Release a logical turn's spent attempts after a forwarded terminal `response.completed`.
+    ///
+    /// Codex's `turn_id` spans EVERY generation of a user turn (one per tool-call round — the
+    /// submission id in `codex-rs` `session/turn_context.rs`), not just retries of a failing one.
+    /// A completed generation is real progress: the next `response.create` under the same turn id
+    /// is new work, so it must start from a fresh budget. Without this, any turn with more than
+    /// `max_account_attempts` tool rounds inside the TTL is rejected mid-loop despite zero
+    /// failures. Failure paths never reach here, so a turn that keeps erroring still accumulates
+    /// spend across client retries — the amplification bound this budget exists for.
+    pub fn clear_logical_turn_attempts(&self, logical_turn_key: Option<&str>) {
+        let Some(key) = logical_turn_key else {
+            return;
+        };
+        self.logical_turn_attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .remove(key);
+    }
+
+    /// Register the background usage poller's immediate-refresh channel. Replacing a prior sender
+    /// is intentional during test/server reconstruction; request paths always use the latest live
+    /// worker.
+    pub fn register_usage_refresh(&self, tx: tokio::sync::mpsc::UnboundedSender<AccountId>) {
+        *self
+            .usage_refresh_tx
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    pub fn register_cooldown_persistence(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<RoutingCooldownWrite>,
+    ) {
+        *self
+            .cooldown_persist_tx
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    fn persist_cooldown(&self, write: RoutingCooldownWrite) {
+        if let Some(tx) = self
+            .cooldown_persist_tx
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            if tx.send(write).is_err() {
+                tracing::warn!("routing cooldown persistence worker is unavailable");
+            }
+        }
+    }
+
+    /// Ask the background poller to refresh one account immediately after a protocol-level
+    /// capacity failure. This is best-effort and non-blocking; the regular ten-minute sweep
+    /// remains the fallback when no worker is registered or the process is shutting down.
+    pub fn request_usage_refresh(&self, id: &AccountId) {
+        {
+            let mut pending = self
+                .usage_refresh_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(dirty) = pending.get_mut(id) {
+                *dirty = true;
+                self.usage_refresh_coalesced.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            pending.insert(id.clone(), false);
+        }
+        let tx = self
+            .usage_refresh_tx
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(tx) = tx {
+            if tx.send(id.clone()).is_ok() {
+                return;
+            }
+        }
+        self.usage_refresh_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+    }
+
+    /// Complete one immediate usage refresh. Returns `true` when signals arrived during the
+    /// outstanding pass and exactly one follow-up refresh should run before releasing the key.
+    pub fn finish_usage_refresh(&self, id: &AccountId) -> bool {
+        let mut pending = self
+            .usage_refresh_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match pending.get_mut(id) {
+            Some(dirty) if *dirty => {
+                *dirty = false;
+                true
+            }
+            Some(_) => {
+                pending.remove(id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    pub fn usage_refresh_coalesced(&self) -> u64 {
+        self.usage_refresh_coalesced.load(Ordering::Relaxed)
+    }
+
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_admission_limits(admission_limits: AdmissionLimits) -> Self {
+        Self {
+            admission_limits,
+            ..Self::default()
+        }
+    }
+
+    /// Convert the content-free token estimate into bounded admission units using the rolling
+    /// terminal-usage calibration. A request always costs at least one unit. The maximum is the
+    /// ordinary per-account pressure budget when configured, so a single large new request can
+    /// still make progress without consuming the owner-only recovery reserve.
+    pub fn request_pressure_units(&self, estimated_tokens: u32) -> u32 {
+        let ratio = self
+            .pressure_calibration
+            .ratio_milli
+            .load(Ordering::Relaxed);
+        let calibrated = u64::from(estimated_tokens.max(1))
+            .saturating_mul(ratio)
+            .div_ceil(1_000);
+        let units = calibrated.div_ceil(PRESSURE_TOKENS_PER_UNIT).max(1);
+        let ordinary_limit = self
+            .admission_limits
+            .account_in_flight_pressure
+            .saturating_sub(self.admission_limits.owner_recovery_pressure_reserve);
+        let max_units = if self.admission_limits.account_in_flight_pressure == 0 {
+            DEFAULT_MAX_REQUEST_PRESSURE_UNITS
+        } else {
+            ordinary_limit.max(1)
+        };
+        u32::try_from(units).unwrap_or(u32::MAX).min(max_units)
+    }
+
+    /// Reconcile a completed request's cheap estimate with authoritative terminal usage. This does
+    /// not retroactively move a completed lease; it calibrates subsequent requests before routing.
+    pub fn record_actual_pressure(&self, estimated_tokens: u32, actual_pressure_tokens: u64) {
+        if estimated_tokens == 0 || actual_pressure_tokens == 0 {
+            return;
+        }
+        let estimated = u64::from(estimated_tokens);
+        let sample_ratio = actual_pressure_tokens
+            .saturating_mul(1_000)
+            .checked_div(estimated)
+            .unwrap_or(1_000)
+            .clamp(250, 4_000);
+        self.pressure_calibration
+            .ratio_milli
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
+                Some(
+                    previous
+                        .saturating_mul(7)
+                        .saturating_add(sample_ratio)
+                        .div_ceil(8),
+                )
+            })
+            .expect("pressure calibration update always returns Some");
+        self.pressure_calibration
+            .samples
+            .fetch_add(1, Ordering::Relaxed);
+        self.pressure_calibration
+            .estimated_tokens
+            .fetch_add(estimated, Ordering::Relaxed);
+        self.pressure_calibration
+            .actual_pressure_tokens
+            .fetch_add(actual_pressure_tokens, Ordering::Relaxed);
     }
 
     /// Patch the live runtime fields onto each snapshot from the map. Snapshots for accounts with no
@@ -389,7 +942,11 @@ impl RuntimeStates {
                 // expired cooldown here lets `error_count` accumulate normally again; the 429's own
                 // error contribution is cleared for real by `record_success` on the next completed
                 // turn (or the entry is GC'd once neutral).
-                snap.cooldown_until = rt.cooldown_until.filter(|&cd| now < cd);
+                let runtime_cooldown = rt.cooldown_until.filter(|&cd| now < cd);
+                snap.cooldown_until = match (snap.cooldown_until, runtime_cooldown) {
+                    (Some(durable), Some(runtime)) => Some(durable.max(runtime)),
+                    (durable, runtime) => durable.or(runtime),
+                };
                 snap.last_selected_at = rt.last_selected_at;
                 // B8 Task 2: expose the live soft-drain tier so select.rs's already-built
                 // health_tier_pool sees real values instead of the always-0 default. An absent
@@ -399,6 +956,8 @@ impl RuntimeStates {
                 // C9 Task 1: expose the live in-flight lease count. An absent entry leaves the
                 // snapshot at its neutral `in_flight: 0` default (the loop above already skips it).
                 snap.in_flight = rt.in_flight;
+                snap.in_flight_pressure = rt.in_flight_pressure;
+                snap.open_ws = rt.open_ws;
             }
         }
     }
@@ -443,7 +1002,28 @@ impl RuntimeStates {
         } else {
             "backoff"
         });
-        self.mutate(id, |rt| {
+        self.apply_rate_limit(id, retry_after, now)
+    }
+
+    /// Record a rate-limit discovered inside a streamed terminal frame. Unlike an HTTP 429, that
+    /// frame has already reached the client and is classified after stream creation, where the
+    /// request-level metrics handle is unavailable. Routing state is still updated exactly once.
+    pub fn record_stream_rate_limit(
+        &self,
+        id: &AccountId,
+        retry_after: Option<i64>,
+        now: i64,
+    ) -> Option<HealthTierTransition> {
+        self.apply_rate_limit(id, retry_after, now)
+    }
+
+    fn apply_rate_limit(
+        &self,
+        id: &AccountId,
+        retry_after: Option<i64>,
+        now: i64,
+    ) -> Option<HealthTierTransition> {
+        let (transition, cooldown_until) = self.mutate(id, |rt| {
             rt.error_count = rt.error_count.saturating_add(1);
             rt.last_error_at = Some(now);
             // Clamp the (upstream-controlled) delay into [floor, ceiling] — the floor guarantees a
@@ -462,44 +1042,38 @@ impl RuntimeStates {
             }
             let should_drain =
                 compute_should_drain(None, None, rt.error_count, rt.last_error_at, now);
-            rt.apply_funnel_transition(should_drain, now)
-        })
+            (
+                rt.apply_funnel_transition(should_drain, now),
+                rt.cooldown_until.expect("rate limit sets cooldown"),
+            )
+        });
+        self.persist_cooldown(RoutingCooldownWrite {
+            account_id: id.clone(),
+            cooldown_until,
+            reason: "rate_limit",
+            updated_at: now,
+        });
+        transition
     }
 
     /// Record a quota-exceeded hit: bench for [`QUOTA_EXCEEDED_COOLDOWN_SECS`] WITHOUT bumping
     /// `error_count` (quota is a capacity signal, not a health error — bumping it would double-
     /// penalize a merely-full account into the drain tier). The later cooldown wins.
     ///
-    /// **A6 (failure-code writeback plan, Task 5): deliberately NOT called from the request-failure
-    /// path** (`ingress::record_failure`) — this is a considered retirement, not an oversight. The
-    /// real upstream wire codes for quota exhaustion are `insufficient_quota` and
-    /// `usage_not_included` (verified against `codex-rs`: `codex-api/src/sse/responses.rs:630,634`,
-    /// `api_bridge.rs:21-22,112-113`, and the `quota_exceeded_emits_single_error_event` test in
-    /// `codex-rs/core/tests/suite/quota_exceeded.rs`). On this codebase's actual wire path neither
-    /// code can ever reach `FailureSignal.error_code`:
-    /// - `insufficient_quota` arrives ONLY inside a `response.failed` terminal SSE/WS frame — both
-    ///   `polyflare_codex::ws::codec::classify` (`FrameClass::Terminal`) and the HTTP-SSE relay
-    ///   deliberately reframe that frame as SSE and pass it through to the CLIENT instead of turning
-    ///   it into an `ExecError` (see `ws/codec.rs`'s `FrameClass::Terminal` doc and the
-    ///   `terminal_response_failed_is_reframed_as_sse_and_passed_through` test) — it never becomes a
-    ///   `WatchdogError::Upstream(_)` at all.
-    /// - `usage_not_included` CAN arrive as a raw pre-stream HTTP 429, but only under the JSON key
-    ///   `error.type` (`codex-rs`'s `UsageErrorBody` has no `code` field — `api_bridge.rs:208-218`);
-    ///   `polyflare_codex::executor::extract_error_code` reads ONLY `error.code` (plus a `detail`-
-    ///   token fallback), so this shape yields `error_code: None`, by design.
-    ///
-    /// So there is no reliable (or even any) request-path quota signal to route through today — a
-    /// code-keyed branch here would be dead code from day one, worse than this function's current
-    /// standing as untriggered-but-reachable infrastructure. The durable `quota_exceeded` status is
-    /// instead owned entirely by the `usage_refresh.rs` poller, which derives it from actual
-    /// used-percent windows (a strictly more reliable signal than scraping an error code) every
-    /// ≤600s. This function is kept (not deleted) as tested, correct building-block infrastructure
-    /// that a future architecture change (e.g. the TA6(b) cyber-move, if it ever parses
-    /// `response.failed` content) could legitimately wire up.
+    /// Used by both pre-stream HTTP errors and streamed `response.failed` terminal events. The
+    /// immediate cooldown prevents another new session selecting known-full capacity while the
+    /// asynchronous usage refresh obtains the authoritative reset window and durable gate.
     pub fn record_quota_exceeded(&self, id: &AccountId, now: i64) {
-        self.mutate(id, |rt| {
+        let cooldown_until = self.mutate(id, |rt| {
             let until = now.saturating_add(QUOTA_EXCEEDED_COOLDOWN_SECS);
             rt.cooldown_until = Some(rt.cooldown_until.map_or(until, |c| c.max(until)));
+            rt.cooldown_until.expect("quota cooldown is set")
+        });
+        self.persist_cooldown(RoutingCooldownWrite {
+            account_id: id.clone(),
+            cooldown_until,
+            reason: "quota",
+            updated_at: now,
         });
     }
 
@@ -680,15 +1254,564 @@ impl RuntimeStates {
         now: i64,
         metrics: &Arc<LeaseMetrics>,
     ) -> InFlightGuard {
+        self.acquire_in_flight_weighted(id, now, metrics, 1)
+    }
+
+    pub fn acquire_in_flight_weighted(
+        self: &Arc<Self>,
+        id: &AccountId,
+        now: i64,
+        metrics: &Arc<LeaseMetrics>,
+        pressure_units: u32,
+    ) -> InFlightGuard {
         let _ = now;
+        let pressure_units = pressure_units.max(1);
         self.mutate(id, |rt| {
             rt.in_flight = rt.in_flight.saturating_add(1);
+            rt.in_flight_pressure = rt.in_flight_pressure.saturating_add(pressure_units);
         });
         metrics.record_acquire();
         InFlightGuard {
             runtime: Arc::clone(self),
             id: id.clone(),
+            pressure_units,
             metrics: Arc::clone(metrics),
+        }
+    }
+
+    pub fn acquire_open_ws(self: &Arc<Self>, id: &AccountId) -> WsSocketGuard {
+        self.mutate(id, |rt| {
+            rt.open_ws = rt.open_ws.saturating_add(1);
+        });
+        WsSocketGuard {
+            runtime: Arc::clone(self),
+            id: id.clone(),
+        }
+    }
+
+    /// Reserve ordinary (non-owner-recovery) work on a specific account if both hard limits allow
+    /// it. The recovery reserve is intentionally withheld here; only
+    /// [`Self::acquire_pinned_in_flight`] may consume that final per-account slot.
+    pub fn try_acquire_in_flight(
+        self: &Arc<Self>,
+        id: &AccountId,
+        now: i64,
+        metrics: &Arc<LeaseMetrics>,
+    ) -> Option<InFlightGuard> {
+        self.try_acquire_in_flight_weighted(id, now, metrics, 1)
+    }
+
+    pub fn try_acquire_in_flight_weighted(
+        self: &Arc<Self>,
+        id: &AccountId,
+        now: i64,
+        metrics: &Arc<LeaseMetrics>,
+        pressure_units: u32,
+    ) -> Option<InFlightGuard> {
+        let pressure_units = pressure_units.max(1);
+        let acquired = {
+            let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+            let global = map
+                .values()
+                .fold(0u32, |total, state| total.saturating_add(state.in_flight));
+            let global_pressure = map.values().fold(0u32, |total, state| {
+                total.saturating_add(state.in_flight_pressure)
+            });
+            let account = map.get(id).map_or(0, |state| state.in_flight);
+            let account_pressure = map.get(id).map_or(0, |state| state.in_flight_pressure);
+            let ordinary_limit = self
+                .admission_limits
+                .account_in_flight
+                .saturating_sub(self.admission_limits.owner_recovery_reserve);
+            let ordinary_pressure_limit = self
+                .admission_limits
+                .account_in_flight_pressure
+                .saturating_sub(self.admission_limits.owner_recovery_pressure_reserve);
+            let global_available = self.admission_limits.global_in_flight == 0
+                || global < self.admission_limits.global_in_flight;
+            let account_available =
+                self.admission_limits.account_in_flight == 0 || account < ordinary_limit;
+            let global_pressure_available = self.admission_limits.global_in_flight_pressure == 0
+                || global_pressure.saturating_add(pressure_units)
+                    <= self.admission_limits.global_in_flight_pressure;
+            let account_pressure_available = self.admission_limits.account_in_flight_pressure == 0
+                || account_pressure.saturating_add(pressure_units) <= ordinary_pressure_limit;
+            if global_available
+                && account_available
+                && global_pressure_available
+                && account_pressure_available
+            {
+                let runtime = map.entry(id.clone()).or_default();
+                runtime.last_selected_at = Some(now);
+                runtime.in_flight = runtime.in_flight.saturating_add(1);
+                runtime.in_flight_pressure =
+                    runtime.in_flight_pressure.saturating_add(pressure_units);
+                true
+            } else {
+                false
+            }
+        };
+        if !acquired {
+            return None;
+        }
+        metrics.record_acquire();
+        Some(InFlightGuard {
+            runtime: Arc::clone(self),
+            id: id.clone(),
+            pressure_units,
+            metrics: Arc::clone(metrics),
+        })
+    }
+
+    /// Wait for capacity on an exact continuation owner. This never considers another account:
+    /// response IDs and turn-state tokens are account-affine, so cross-account spill would trade a
+    /// short capacity delay for a guaranteed continuity hazard.
+    pub async fn acquire_pinned_in_flight(
+        self: &Arc<Self>,
+        id: &AccountId,
+        now: i64,
+        metrics: &Arc<LeaseMetrics>,
+    ) -> Option<InFlightGuard> {
+        self.acquire_pinned_in_flight_weighted(id, now, metrics, 1)
+            .await
+    }
+
+    pub async fn acquire_pinned_in_flight_weighted(
+        self: &Arc<Self>,
+        id: &AccountId,
+        now: i64,
+        metrics: &Arc<LeaseMetrics>,
+        pressure_units: u32,
+    ) -> Option<InFlightGuard> {
+        let pressure_units = pressure_units.max(1);
+        let deadline = tokio::time::Instant::now() + self.admission_limits.wait_timeout;
+        let mut wait: Option<AdmissionWaitGuard<'_>> = None;
+        loop {
+            // Register before checking under the lock so a release between the check and await
+            // leaves a stored notification instead of stranding this waiter until timeout.
+            let changed = self.admission_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let acquired = {
+                let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+                let global = map
+                    .values()
+                    .fold(0u32, |total, state| total.saturating_add(state.in_flight));
+                let global_pressure = map.values().fold(0u32, |total, state| {
+                    total.saturating_add(state.in_flight_pressure)
+                });
+                let account = map.get(id).map_or(0, |state| state.in_flight);
+                let account_pressure = map.get(id).map_or(0, |state| state.in_flight_pressure);
+                let global_available = self.admission_limits.global_in_flight == 0
+                    || global < self.admission_limits.global_in_flight;
+                let account_available = self.admission_limits.account_in_flight == 0
+                    || account < self.admission_limits.account_in_flight;
+                let global_pressure_available = self.admission_limits.global_in_flight_pressure
+                    == 0
+                    || global_pressure.saturating_add(pressure_units)
+                        <= self.admission_limits.global_in_flight_pressure;
+                let account_pressure_available = self.admission_limits.account_in_flight_pressure
+                    == 0
+                    || account_pressure.saturating_add(pressure_units)
+                        <= self.admission_limits.account_in_flight_pressure;
+                if global_available
+                    && account_available
+                    && global_pressure_available
+                    && account_pressure_available
+                {
+                    let runtime = map.entry(id.clone()).or_default();
+                    runtime.last_selected_at = Some(now);
+                    runtime.in_flight = runtime.in_flight.saturating_add(1);
+                    runtime.in_flight_pressure =
+                        runtime.in_flight_pressure.saturating_add(pressure_units);
+                    let ordinary_limit = self
+                        .admission_limits
+                        .account_in_flight
+                        .saturating_sub(self.admission_limits.owner_recovery_reserve);
+                    let ordinary_pressure_limit = self
+                        .admission_limits
+                        .account_in_flight_pressure
+                        .saturating_sub(self.admission_limits.owner_recovery_pressure_reserve);
+                    Some(
+                        (self.admission_limits.account_in_flight > 0 && account >= ordinary_limit)
+                            || (self.admission_limits.account_in_flight_pressure > 0
+                                && account_pressure.saturating_add(pressure_units)
+                                    > ordinary_pressure_limit),
+                    )
+                } else {
+                    None
+                }
+            };
+            if let Some(used_recovery_slot) = acquired {
+                metrics.record_acquire();
+                if used_recovery_slot {
+                    self.admission_metrics
+                        .record_owner_recovery(AdmissionLane::OwnerRequest);
+                }
+                if let Some(wait) = wait.take() {
+                    wait.finish(AdmissionWaitOutcome::Acquired);
+                }
+                return Some(InFlightGuard {
+                    runtime: Arc::clone(self),
+                    id: id.clone(),
+                    pressure_units,
+                    metrics: Arc::clone(metrics),
+                });
+            }
+            if wait.is_none() {
+                wait = Some(
+                    self.admission_metrics
+                        .start_wait(AdmissionLane::OwnerRequest),
+                );
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                wait.take()
+                    .expect("owner request wait starts before timeout")
+                    .finish(AdmissionWaitOutcome::Timeout);
+                return None;
+            }
+        }
+    }
+
+    pub async fn acquire_pinned_open_ws(
+        self: &Arc<Self>,
+        id: &AccountId,
+        now: i64,
+    ) -> Option<WsSocketGuard> {
+        let deadline = tokio::time::Instant::now() + self.admission_limits.wait_timeout;
+        let mut wait: Option<AdmissionWaitGuard<'_>> = None;
+        loop {
+            let changed = self.admission_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let acquired = {
+                let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+                let global = map
+                    .values()
+                    .fold(0u32, |total, state| total.saturating_add(state.open_ws));
+                let account = map.get(id).map_or(0, |state| state.open_ws);
+                let global_available = self.admission_limits.global_open_ws == 0
+                    || global < self.admission_limits.global_open_ws;
+                let account_available = self.admission_limits.account_open_ws == 0
+                    || account < self.admission_limits.account_open_ws;
+                if global_available && account_available {
+                    let runtime = map.entry(id.clone()).or_default();
+                    runtime.last_selected_at = Some(now);
+                    runtime.open_ws = runtime.open_ws.saturating_add(1);
+                    let ordinary_limit = self
+                        .admission_limits
+                        .account_open_ws
+                        .saturating_sub(self.admission_limits.owner_recovery_reserve);
+                    Some(self.admission_limits.account_open_ws > 0 && account >= ordinary_limit)
+                } else {
+                    None
+                }
+            };
+            if let Some(used_recovery_slot) = acquired {
+                if used_recovery_slot {
+                    self.admission_metrics
+                        .record_owner_recovery(AdmissionLane::OwnerSocket);
+                }
+                if let Some(wait) = wait.take() {
+                    wait.finish(AdmissionWaitOutcome::Acquired);
+                }
+                return Some(WsSocketGuard {
+                    runtime: Arc::clone(self),
+                    id: id.clone(),
+                });
+            }
+            if wait.is_none() {
+                wait = Some(
+                    self.admission_metrics
+                        .start_wait(AdmissionLane::OwnerSocket),
+                );
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                wait.take()
+                    .expect("owner socket wait starts before timeout")
+                    .finish(AdmissionWaitOutcome::Timeout);
+                return None;
+            }
+        }
+    }
+
+    /// Atomically overlay current routing pressure, select an account, and reserve its in-flight
+    /// lease. New-session callers use this instead of the racy
+    /// `overlay -> pick -> record_selected -> acquire_in_flight` sequence, where concurrent
+    /// requests could all observe the same pre-reservation snapshot and dogpile one account.
+    ///
+    /// The selector is synchronous and pure, so no await or external I/O occurs while the routing
+    /// state write lock is held. Pinned continuation owners deliberately keep using the ordinary
+    /// acquire path: ownership is a hard protocol constraint, not a load-balancing choice.
+    pub fn select_and_acquire(
+        self: &Arc<Self>,
+        snapshots: &mut [AccountSnapshot],
+        selector: &dyn Selector,
+        ctx: &SelectionCtx,
+        now: i64,
+        metrics: &Arc<LeaseMetrics>,
+    ) -> Option<(AccountId, InFlightGuard)> {
+        let pressure_units = ctx.request_pressure_units.max(1);
+        let id = {
+            let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+            if self.admission_limits.global_in_flight > 0
+                && map.values().fold(0u32, |total, runtime| {
+                    total.saturating_add(runtime.in_flight)
+                }) >= self.admission_limits.global_in_flight
+            {
+                return None;
+            }
+            if self.admission_limits.global_in_flight_pressure > 0
+                && map
+                    .values()
+                    .fold(0u32, |total, runtime| {
+                        total.saturating_add(runtime.in_flight_pressure)
+                    })
+                    .saturating_add(pressure_units)
+                    > self.admission_limits.global_in_flight_pressure
+            {
+                return None;
+            }
+            for snap in snapshots.iter_mut() {
+                if let Some(rt) = map.get(&snap.id) {
+                    snap.error_count = rt.error_count;
+                    snap.last_error_at = rt.last_error_at;
+                    let runtime_cooldown = rt.cooldown_until.filter(|&cd| now < cd);
+                    snap.cooldown_until = match (snap.cooldown_until, runtime_cooldown) {
+                        (Some(durable), Some(runtime)) => Some(durable.max(runtime)),
+                        (durable, runtime) => durable.or(runtime),
+                    };
+                    snap.last_selected_at = rt.last_selected_at;
+                    snap.health_tier = rt.health_tier;
+                    snap.in_flight = rt.in_flight;
+                    snap.in_flight_pressure = rt.in_flight_pressure;
+                    snap.open_ws = rt.open_ws;
+                }
+            }
+            let available: Vec<_> = snapshots
+                .iter()
+                .filter(|snapshot| {
+                    let ordinary_limit = self
+                        .admission_limits
+                        .account_in_flight
+                        .saturating_sub(self.admission_limits.owner_recovery_reserve);
+                    let ordinary_pressure_limit = self
+                        .admission_limits
+                        .account_in_flight_pressure
+                        .saturating_sub(self.admission_limits.owner_recovery_pressure_reserve);
+                    let count_available = self.admission_limits.account_in_flight == 0
+                        || map.get(&snapshot.id).map_or(0, |runtime| runtime.in_flight)
+                            < ordinary_limit;
+                    let pressure_available = self.admission_limits.account_in_flight_pressure == 0
+                        || map
+                            .get(&snapshot.id)
+                            .map_or(0, |runtime| runtime.in_flight_pressure)
+                            .saturating_add(pressure_units)
+                            <= ordinary_pressure_limit;
+                    count_available && pressure_available
+                })
+                .cloned()
+                .collect();
+            let id = selector.pick(&available, ctx)?;
+            let rt = map.entry(id.clone()).or_default();
+            rt.last_selected_at = Some(now);
+            rt.in_flight = rt.in_flight.saturating_add(1);
+            rt.in_flight_pressure = rt.in_flight_pressure.saturating_add(pressure_units);
+            id
+        };
+
+        metrics.record_acquire();
+        let guard = InFlightGuard {
+            runtime: Arc::clone(self),
+            id: id.clone(),
+            pressure_units,
+            metrics: Arc::clone(metrics),
+        };
+        Some((id, guard))
+    }
+
+    /// Queue otherwise-eligible new work behind the hard admission cap for the configured bounded
+    /// window. A genuinely ineligible/empty pool returns immediately; only capacity saturation
+    /// waits for a guard drop notification.
+    pub async fn select_and_acquire_wait(
+        self: &Arc<Self>,
+        snapshots: &mut [AccountSnapshot],
+        selector: &dyn Selector,
+        ctx: &SelectionCtx,
+        now: i64,
+        metrics: &Arc<LeaseMetrics>,
+    ) -> Option<(AccountId, InFlightGuard)> {
+        let deadline = tokio::time::Instant::now() + self.admission_limits.wait_timeout;
+        let mut wait: Option<AdmissionWaitGuard<'_>> = None;
+        loop {
+            let changed = self.admission_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+
+            // Probe without hard-cap filtering. If the normal eligibility pipeline rejects every
+            // account, waiting for a lease release cannot help and would only delay the real 503.
+            let mut eligibility_probe = snapshots.to_vec();
+            self.overlay(&mut eligibility_probe, now);
+            if selector.pick(&eligibility_probe, ctx).is_none() {
+                if let Some(wait) = wait.take() {
+                    wait.finish(AdmissionWaitOutcome::Ineligible);
+                } else {
+                    self.admission_metrics
+                        .record_ineligible(AdmissionLane::NewRequest);
+                }
+                return None;
+            }
+            if let Some(reservation) =
+                self.select_and_acquire(snapshots, selector, ctx, now, metrics)
+            {
+                if let Some(wait) = wait.take() {
+                    wait.finish(AdmissionWaitOutcome::Acquired);
+                }
+                return Some(reservation);
+            }
+            if wait.is_none() {
+                wait = Some(self.admission_metrics.start_wait(AdmissionLane::NewRequest));
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                wait.take()
+                    .expect("new request wait starts before timeout")
+                    .finish(AdmissionWaitOutcome::Timeout);
+                return None;
+            }
+        }
+    }
+
+    /// Atomically overlay routing pressure, select a new WebSocket owner, and reserve that
+    /// socket's pressure before another concurrent handshake can select from the same snapshot.
+    ///
+    /// This is the open-socket counterpart to [`Self::select_and_acquire`]. A WebSocket does not
+    /// hold an in-flight turn while idle, so admission reserves `open_ws`; each generating turn
+    /// acquires its own ordinary in-flight lease in the relay pump.
+    pub fn select_and_acquire_open_ws(
+        self: &Arc<Self>,
+        snapshots: &mut [AccountSnapshot],
+        selector: &dyn Selector,
+        ctx: &SelectionCtx,
+        now: i64,
+    ) -> Option<(AccountId, WsSocketGuard)> {
+        let id = {
+            let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+            if self.admission_limits.global_open_ws > 0
+                && map
+                    .values()
+                    .fold(0u32, |total, runtime| total.saturating_add(runtime.open_ws))
+                    >= self.admission_limits.global_open_ws
+            {
+                return None;
+            }
+            for snap in snapshots.iter_mut() {
+                if let Some(rt) = map.get(&snap.id) {
+                    snap.error_count = rt.error_count;
+                    snap.last_error_at = rt.last_error_at;
+                    let runtime_cooldown = rt.cooldown_until.filter(|&cd| now < cd);
+                    snap.cooldown_until = match (snap.cooldown_until, runtime_cooldown) {
+                        (Some(durable), Some(runtime)) => Some(durable.max(runtime)),
+                        (durable, runtime) => durable.or(runtime),
+                    };
+                    snap.last_selected_at = rt.last_selected_at;
+                    snap.health_tier = rt.health_tier;
+                    snap.in_flight = rt.in_flight;
+                    snap.in_flight_pressure = rt.in_flight_pressure;
+                    snap.open_ws = rt.open_ws;
+                }
+            }
+            let available: Vec<_> = snapshots
+                .iter()
+                .filter(|snapshot| {
+                    let ordinary_limit = self
+                        .admission_limits
+                        .account_open_ws
+                        .saturating_sub(self.admission_limits.owner_recovery_reserve);
+                    self.admission_limits.account_open_ws == 0
+                        || map.get(&snapshot.id).map_or(0, |runtime| runtime.open_ws)
+                            < ordinary_limit
+                })
+                .cloned()
+                .collect();
+            let id = selector.pick(&available, ctx)?;
+            let rt = map.entry(id.clone()).or_default();
+            rt.last_selected_at = Some(now);
+            rt.open_ws = rt.open_ws.saturating_add(1);
+            id
+        };
+
+        let guard = WsSocketGuard {
+            runtime: Arc::clone(self),
+            id: id.clone(),
+        };
+        Some((id, guard))
+    }
+
+    pub async fn select_and_acquire_open_ws_wait(
+        self: &Arc<Self>,
+        snapshots: &mut [AccountSnapshot],
+        selector: &dyn Selector,
+        ctx: &SelectionCtx,
+        now: i64,
+    ) -> Option<(AccountId, WsSocketGuard)> {
+        let deadline = tokio::time::Instant::now() + self.admission_limits.wait_timeout;
+        let mut wait: Option<AdmissionWaitGuard<'_>> = None;
+        loop {
+            let changed = self.admission_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+
+            let mut eligibility_probe = snapshots.to_vec();
+            self.overlay(&mut eligibility_probe, now);
+            if selector.pick(&eligibility_probe, ctx).is_none() {
+                if let Some(wait) = wait.take() {
+                    wait.finish(AdmissionWaitOutcome::Ineligible);
+                } else {
+                    self.admission_metrics
+                        .record_ineligible(AdmissionLane::NewSocket);
+                }
+                return None;
+            }
+            if let Some(reservation) =
+                self.select_and_acquire_open_ws(snapshots, selector, ctx, now)
+            {
+                if let Some(wait) = wait.take() {
+                    wait.finish(AdmissionWaitOutcome::Acquired);
+                }
+                return Some(reservation);
+            }
+            if wait.is_none() {
+                wait = Some(self.admission_metrics.start_wait(AdmissionLane::NewSocket));
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                wait.take()
+                    .expect("new socket wait starts before timeout")
+                    .finish(AdmissionWaitOutcome::Timeout);
+                return None;
+            }
+        }
+    }
+
+    pub fn admission_metrics_snapshot(&self) -> Vec<AdmissionMetricSnapshot> {
+        self.admission_metrics.snapshot()
+    }
+
+    pub fn pressure_calibration_snapshot(&self) -> PressureCalibrationSnapshot {
+        PressureCalibrationSnapshot {
+            ratio: self
+                .pressure_calibration
+                .ratio_milli
+                .load(Ordering::Relaxed) as f64
+                / 1_000.0,
+            samples: self.pressure_calibration.samples.load(Ordering::Relaxed),
+            estimated_tokens: self
+                .pressure_calibration
+                .estimated_tokens
+                .load(Ordering::Relaxed),
+            actual_pressure_tokens: self
+                .pressure_calibration
+                .actual_pressure_tokens
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -708,8 +1831,96 @@ impl RuntimeStates {
 mod tests {
     use super::*;
 
+    #[test]
+    fn logical_turn_attempt_budget_is_atomic_across_concurrent_requests() {
+        let runtime = Arc::new(RuntimeStates::new());
+        let barrier = Arc::new(std::sync::Barrier::new(32));
+        let mut workers = Vec::new();
+
+        for _ in 0..32 {
+            let runtime = runtime.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                runtime.try_consume_logical_turn_attempt(Some("hashed-turn-key"), 3, 1_000)
+            }));
+        }
+
+        let admitted = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().expect("attempt worker").then_some(()))
+            .count();
+        assert_eq!(
+            admitted, 3,
+            "the process-wide limit must be consumed atomically"
+        );
+    }
+
+    #[test]
+    fn logical_turn_attempt_budget_exhausts_and_resets_after_ttl() {
+        let runtime = RuntimeStates::new();
+        let key = Some("hashed-turn-key");
+
+        assert!(runtime.try_consume_logical_turn_attempt(key, 2, 1_000));
+        assert!(runtime.try_consume_logical_turn_attempt(key, 2, 1_001));
+        assert!(!runtime.try_consume_logical_turn_attempt(key, 2, 1_002));
+        assert!(
+            runtime.try_consume_logical_turn_attempt(key, 2, 1_001 + LOGICAL_TURN_ATTEMPT_TTL_SECS),
+            "an expired logical turn must start with a fresh budget"
+        );
+    }
+
+    #[test]
+    fn missing_logical_turn_key_bypasses_the_aggregate_budget() {
+        let runtime = RuntimeStates::new();
+        for _ in 0..100 {
+            assert!(runtime.try_consume_logical_turn_attempt(None, 1, 1_000));
+        }
+    }
+
+    #[test]
+    fn completed_generation_clears_the_logical_turn_budget_for_the_next_round() {
+        let runtime = RuntimeStates::new();
+        let key = Some("hashed-turn-key");
+
+        // Codex reuses one turn id for every tool-call round of a user turn: exhaust the budget
+        // with successful rounds, then prove a forwarded completion resets it for round N+1.
+        assert!(runtime.try_consume_logical_turn_attempt(key, 2, 1_000));
+        assert!(runtime.try_consume_logical_turn_attempt(key, 2, 1_001));
+        assert!(!runtime.try_consume_logical_turn_attempt(key, 2, 1_002));
+        runtime.clear_logical_turn_attempts(key);
+        assert!(
+            runtime.try_consume_logical_turn_attempt(key, 2, 1_003),
+            "a completed generation must reset the aggregate budget for the turn's next round"
+        );
+        runtime.clear_logical_turn_attempts(None); // missing identity stays a no-op
+        runtime.clear_logical_turn_attempts(Some("never-consumed")); // absent key stays a no-op
+    }
+
+    #[test]
+    fn rejected_auth_attempt_can_be_refunded_without_expanding_the_limit() {
+        let runtime = RuntimeStates::new();
+        let key = Some("hashed-turn-key");
+
+        assert!(runtime.try_consume_logical_turn_attempt(key, 1, 1_000));
+        runtime.refund_logical_turn_attempt(key);
+        assert!(
+            runtime.try_consume_logical_turn_attempt(key, 1, 1_001),
+            "a bearer rejected before sampling must not spend the generation budget"
+        );
+        assert!(!runtime.try_consume_logical_turn_attempt(key, 1, 1_002));
+    }
+
     fn snap(id: &str) -> AccountSnapshot {
         AccountSnapshot::new(id)
+    }
+
+    fn admission_lane(runtime: &RuntimeStates, work: &str, scope: &str) -> AdmissionMetricSnapshot {
+        runtime
+            .admission_metrics_snapshot()
+            .into_iter()
+            .find(|lane| lane.work == work && lane.scope == scope)
+            .expect("fixed admission lane")
     }
 
     /// Test-only seam: directly mutate an account's runtime entry, bypassing the funnel API, so a
@@ -895,6 +2106,27 @@ mod tests {
         assert_eq!(
             snaps[0].cooldown_until,
             Some(1000 + QUOTA_EXCEEDED_COOLDOWN_SECS)
+        );
+    }
+
+    #[test]
+    fn cooldown_persistence_does_not_drop_writes_at_the_old_queue_capacity() {
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rs.register_cooldown_persistence(tx);
+
+        for now in 0..600 {
+            rs.record_quota_exceeded(&id, now);
+        }
+
+        let mut received = 0;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(
+            received, 600,
+            "persistence must not silently lose writes when the former 256-item queue would fill"
         );
     }
 
@@ -1474,5 +2706,589 @@ mod tests {
             Some(0),
             "saturating_sub clamps at 0 instead of underflowing"
         );
+    }
+
+    #[test]
+    fn select_and_acquire_reserves_before_the_next_pick() {
+        struct ObserveInFlight(std::sync::atomic::AtomicUsize);
+
+        impl Selector for ObserveInFlight {
+            fn pick(
+                &self,
+                candidates: &[AccountSnapshot],
+                _ctx: &SelectionCtx,
+            ) -> Option<AccountId> {
+                match self.0.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        assert!(candidates.iter().all(|candidate| candidate.in_flight == 0));
+                        Some(AccountId::from("a"))
+                    }
+                    1 => {
+                        let first = candidates
+                            .iter()
+                            .find(|candidate| candidate.id.as_str() == "a")
+                            .expect("the first account remains a candidate");
+                        assert_eq!(
+                            first.in_flight, 1,
+                            "the second selection must observe the first request reservation"
+                        );
+                        assert_eq!(
+                            first.last_selected_at,
+                            Some(1_000),
+                            "reservation pressure must not be encoded by distorting the stored \
+                             selection timestamp"
+                        );
+                        Some(AccountId::from("b"))
+                    }
+                    call => panic!("unexpected selector call {call}"),
+                }
+            }
+
+            fn name(&self) -> &'static str {
+                "observe_in_flight"
+            }
+        }
+
+        let runtime = Arc::new(RuntimeStates::new());
+        let metrics = LeaseMetrics::new();
+        let selector = ObserveInFlight(std::sync::atomic::AtomicUsize::new(0));
+        let ctx = SelectionCtx {
+            now: 1_000,
+            inflight_penalty_pct: 2.5,
+            ..SelectionCtx::default()
+        };
+        let mut guards = Vec::new();
+        let mut picks = Vec::new();
+
+        for _ in 0..2 {
+            let mut snapshots = vec![snap("a"), snap("b")];
+            let (id, guard) = runtime
+                .select_and_acquire(&mut snapshots, &selector, &ctx, 1_000, &metrics)
+                .expect("an account remains eligible");
+            picks.push(id.to_string());
+            guards.push(guard);
+        }
+
+        assert_eq!(
+            picks,
+            ["a", "b"],
+            "each reservation must be visible before the next selector runs"
+        );
+        assert_eq!(metrics.acquired(), 2);
+        drop(guards);
+        assert_eq!(metrics.released(), 2);
+    }
+
+    #[test]
+    fn select_and_acquire_open_ws_reserves_before_the_next_pick() {
+        struct ObserveOpenWs(std::sync::atomic::AtomicUsize);
+
+        impl Selector for ObserveOpenWs {
+            fn pick(
+                &self,
+                candidates: &[AccountSnapshot],
+                _ctx: &SelectionCtx,
+            ) -> Option<AccountId> {
+                match self.0.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        assert!(candidates.iter().all(|candidate| candidate.open_ws == 0));
+                        Some(AccountId::from("A"))
+                    }
+                    1 => {
+                        let first = candidates
+                            .iter()
+                            .find(|candidate| candidate.id.as_str() == "A")
+                            .expect("the first account remains a candidate");
+                        assert_eq!(
+                            first.open_ws, 1,
+                            "the second selection must observe the first socket reservation"
+                        );
+                        assert_eq!(
+                            first.last_selected_at,
+                            Some(1_000),
+                            "socket pressure must not be encoded by distorting the stored selection \
+                             timestamp"
+                        );
+                        Some(AccountId::from("B"))
+                    }
+                    call => panic!("unexpected selector call {call}"),
+                }
+            }
+
+            fn name(&self) -> &'static str {
+                "observe_open_ws"
+            }
+        }
+
+        let runtime = Arc::new(RuntimeStates::default());
+        let selector = ObserveOpenWs(std::sync::atomic::AtomicUsize::new(0));
+        let ctx = SelectionCtx {
+            now: 1_000,
+            inflight_penalty_pct: 2.5,
+            ..SelectionCtx::default()
+        };
+        let mut snapshots = vec![AccountSnapshot::new("A"), AccountSnapshot::new("B")];
+
+        let (first, first_guard) = runtime
+            .select_and_acquire_open_ws(&mut snapshots, &selector, &ctx, 1_000)
+            .expect("first socket owner");
+        let (second, _second_guard) = runtime
+            .select_and_acquire_open_ws(&mut snapshots, &selector, &ctx, 1_000)
+            .expect("second socket owner");
+
+        assert_eq!(first, AccountId::from("A"));
+        assert_eq!(second, AccountId::from("B"));
+        drop(first_guard);
+    }
+
+    #[test]
+    fn select_and_acquire_skips_an_account_at_its_hard_limit() {
+        struct FirstCandidate;
+
+        impl Selector for FirstCandidate {
+            fn pick(
+                &self,
+                candidates: &[AccountSnapshot],
+                _ctx: &SelectionCtx,
+            ) -> Option<AccountId> {
+                candidates.first().map(|candidate| candidate.id.clone())
+            }
+
+            fn name(&self) -> &'static str {
+                "first_candidate"
+            }
+        }
+
+        let runtime = Arc::new(RuntimeStates::new());
+        let metrics = LeaseMetrics::new();
+        let account_a = AccountId::from("a");
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(runtime.acquire_in_flight(&account_a, 1_000, &metrics));
+        }
+        let mut snapshots = vec![snap("a"), snap("b")];
+
+        let (picked, _guard) = runtime
+            .select_and_acquire(
+                &mut snapshots,
+                &FirstCandidate,
+                &SelectionCtx::default(),
+                1_000,
+                &metrics,
+            )
+            .expect("the unsaturated account remains available");
+
+        assert_eq!(picked, AccountId::from("b"));
+        drop(held);
+    }
+
+    #[test]
+    fn select_and_acquire_rejects_when_the_global_hard_limit_is_full() {
+        struct FirstCandidate;
+
+        impl Selector for FirstCandidate {
+            fn pick(
+                &self,
+                candidates: &[AccountSnapshot],
+                _ctx: &SelectionCtx,
+            ) -> Option<AccountId> {
+                candidates.first().map(|candidate| candidate.id.clone())
+            }
+
+            fn name(&self) -> &'static str {
+                "first_candidate"
+            }
+        }
+
+        let runtime = Arc::new(RuntimeStates::new());
+        let metrics = LeaseMetrics::new();
+        let mut held = Vec::new();
+        for index in 0..256 {
+            held.push(runtime.acquire_in_flight(
+                &AccountId::from(format!("busy-{index}")),
+                1_000,
+                &metrics,
+            ));
+        }
+        let mut snapshots = vec![snap("otherwise-idle")];
+
+        assert!(
+            runtime
+                .select_and_acquire(
+                    &mut snapshots,
+                    &FirstCandidate,
+                    &SelectionCtx::default(),
+                    1_000,
+                    &metrics,
+                )
+                .is_none(),
+            "global saturation must reject before invoking an upstream account"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn select_and_acquire_open_ws_skips_an_account_at_its_hard_limit() {
+        struct FirstCandidate;
+
+        impl Selector for FirstCandidate {
+            fn pick(
+                &self,
+                candidates: &[AccountSnapshot],
+                _ctx: &SelectionCtx,
+            ) -> Option<AccountId> {
+                candidates.first().map(|candidate| candidate.id.clone())
+            }
+
+            fn name(&self) -> &'static str {
+                "first_candidate"
+            }
+        }
+
+        let runtime = Arc::new(RuntimeStates::new());
+        let account_a = AccountId::from("a");
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            held.push(runtime.acquire_open_ws(&account_a));
+        }
+        let mut snapshots = vec![snap("a"), snap("b")];
+
+        let (picked, _guard) = runtime
+            .select_and_acquire_open_ws(
+                &mut snapshots,
+                &FirstCandidate,
+                &SelectionCtx::default(),
+                1_000,
+            )
+            .expect("the unsaturated websocket account remains available");
+
+        assert_eq!(picked, AccountId::from("b"));
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn pinned_in_flight_waits_for_and_reacquires_only_its_owner() {
+        let runtime = Arc::new(RuntimeStates::with_admission_limits(AdmissionLimits {
+            global_in_flight: 8,
+            account_in_flight: 1,
+            wait_timeout: Duration::from_secs(1),
+            ..AdmissionLimits::default()
+        }));
+        let metrics = LeaseMetrics::new();
+        let owner = AccountId::from("owner");
+        let held = runtime.acquire_in_flight(&owner, 1_000, &metrics);
+        let waiter_runtime = runtime.clone();
+        let waiter_metrics = metrics.clone();
+        let waiter_owner = owner.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_runtime
+                .acquire_pinned_in_flight(&waiter_owner, 1_001, &waiter_metrics)
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "a saturated owner must wait instead of bypassing its cap"
+        );
+        let waiting = admission_lane(&runtime, "request", "owner");
+        assert_eq!(waiting.waiters, 1);
+        assert_eq!(waiting.waits, 1);
+        drop(held);
+
+        let acquired = waiter
+            .await
+            .expect("wait task")
+            .expect("owner capacity becomes available");
+        let after = admission_lane(&runtime, "request", "owner");
+        assert_eq!(after.waiters, 0);
+        assert_eq!(after.acquired_after_wait, 1);
+        assert_eq!(after.timeouts, 0);
+        assert_eq!(peek(&runtime, &owner).map(|state| state.in_flight), Some(1));
+        drop(acquired);
+    }
+
+    #[tokio::test]
+    async fn pinned_in_flight_times_out_without_rerouting() {
+        let runtime = Arc::new(RuntimeStates::with_admission_limits(AdmissionLimits {
+            global_in_flight: 8,
+            account_in_flight: 1,
+            wait_timeout: Duration::from_millis(10),
+            ..AdmissionLimits::default()
+        }));
+        let metrics = LeaseMetrics::new();
+        let owner = AccountId::from("owner");
+        let _held = runtime.acquire_in_flight(&owner, 1_000, &metrics);
+
+        assert!(
+            runtime
+                .acquire_pinned_in_flight(&owner, 1_001, &metrics)
+                .await
+                .is_none(),
+            "bounded owner wait must return capacity exhaustion, never another account"
+        );
+        let lane = admission_lane(&runtime, "request", "owner");
+        assert_eq!(lane.waiters, 0);
+        assert_eq!(lane.waits, 1);
+        assert_eq!(lane.timeouts, 1);
+        assert_eq!(lane.acquired_after_wait, 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_reserve_cannot_be_consumed_by_ordinary_work() {
+        struct FirstCandidate;
+
+        impl Selector for FirstCandidate {
+            fn pick(
+                &self,
+                candidates: &[AccountSnapshot],
+                _ctx: &SelectionCtx,
+            ) -> Option<AccountId> {
+                candidates.first().map(|candidate| candidate.id.clone())
+            }
+
+            fn name(&self) -> &'static str {
+                "first_candidate"
+            }
+        }
+
+        let runtime = Arc::new(RuntimeStates::with_admission_limits(AdmissionLimits {
+            global_in_flight: 8,
+            account_in_flight: 1,
+            owner_recovery_reserve: 1,
+            wait_timeout: Duration::from_millis(1),
+            ..AdmissionLimits::default()
+        }));
+        let metrics = LeaseMetrics::new();
+        let owner = AccountId::from("owner");
+        let mut snapshots = vec![snap("owner")];
+
+        assert!(
+            runtime
+                .select_and_acquire_wait(
+                    &mut snapshots,
+                    &FirstCandidate,
+                    &SelectionCtx::default(),
+                    1_000,
+                    &metrics,
+                )
+                .await
+                .is_none(),
+            "ordinary work must not consume the only reserved slot"
+        );
+        assert!(
+            runtime
+                .acquire_pinned_in_flight(&owner, 1_000, &metrics)
+                .await
+                .is_some(),
+            "the pinned owner may consume its reserved slot"
+        );
+        let new_lane = admission_lane(&runtime, "request", "new");
+        assert_eq!(new_lane.waits, 1);
+        assert_eq!(new_lane.timeouts, 1);
+        let owner_lane = admission_lane(&runtime, "request", "owner");
+        assert_eq!(owner_lane.owner_recovery, 1);
+    }
+
+    #[test]
+    fn weighted_admission_routes_around_pressure_even_below_request_count_cap() {
+        struct FirstCandidate;
+        impl Selector for FirstCandidate {
+            fn pick(
+                &self,
+                candidates: &[AccountSnapshot],
+                _ctx: &SelectionCtx,
+            ) -> Option<AccountId> {
+                candidates.first().map(|candidate| candidate.id.clone())
+            }
+
+            fn name(&self) -> &'static str {
+                "first_candidate"
+            }
+        }
+
+        let runtime = Arc::new(RuntimeStates::with_admission_limits(AdmissionLimits {
+            global_in_flight: 32,
+            account_in_flight: 8,
+            global_in_flight_pressure: 32,
+            account_in_flight_pressure: 8,
+            owner_recovery_reserve: 1,
+            owner_recovery_pressure_reserve: 2,
+            ..AdmissionLimits::default()
+        }));
+        let metrics = LeaseMetrics::new();
+        let mut snapshots = vec![snap("a"), snap("b")];
+        let ctx = SelectionCtx {
+            request_pressure_units: 6,
+            ..SelectionCtx::default()
+        };
+
+        let (first, first_guard) = runtime
+            .select_and_acquire(&mut snapshots, &FirstCandidate, &ctx, 1_000, &metrics)
+            .expect("first large request fits");
+        assert_eq!(first.as_str(), "a");
+
+        let (second, second_guard) = runtime
+            .select_and_acquire(&mut snapshots, &FirstCandidate, &ctx, 1_001, &metrics)
+            .expect("second large request routes to another account");
+        assert_eq!(
+            second.as_str(),
+            "b",
+            "weighted pressure must prevent dogpiling even though a has only one request"
+        );
+
+        let mut overlaid = vec![snap("a"), snap("b")];
+        runtime.overlay(&mut overlaid, 1_001);
+        assert_eq!(overlaid[0].in_flight, 1);
+        assert_eq!(overlaid[0].in_flight_pressure, 6);
+        assert_eq!(overlaid[1].in_flight_pressure, 6);
+
+        drop(first_guard);
+        drop(second_guard);
+        runtime.overlay(&mut overlaid, 1_002);
+        assert_eq!(overlaid[0].in_flight_pressure, 0);
+        assert_eq!(overlaid[1].in_flight_pressure, 0);
+    }
+
+    #[test]
+    fn terminal_usage_calibrates_future_pressure_without_unbounded_keys() {
+        let runtime = RuntimeStates::new();
+        let estimate = 16_384;
+        assert_eq!(runtime.request_pressure_units(estimate), 1);
+
+        runtime.record_actual_pressure(estimate, 65_536);
+
+        assert_eq!(
+            runtime.request_pressure_units(estimate),
+            2,
+            "the bounded EWMA must increase future pressure after a four-times underestimate"
+        );
+        assert_eq!(
+            runtime.pressure_calibration.samples.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_owner_can_use_reserved_pressure_that_new_work_cannot_consume() {
+        let runtime = Arc::new(RuntimeStates::with_admission_limits(AdmissionLimits {
+            global_in_flight: 32,
+            account_in_flight: 8,
+            global_in_flight_pressure: 32,
+            account_in_flight_pressure: 8,
+            owner_recovery_reserve: 1,
+            owner_recovery_pressure_reserve: 2,
+            ..AdmissionLimits::default()
+        }));
+        let metrics = LeaseMetrics::new();
+        let owner = AccountId::from("owner");
+        let ordinary = runtime
+            .try_acquire_in_flight_weighted(&owner, 1_000, &metrics, 6)
+            .expect("ordinary request fills the non-reserved pressure budget");
+
+        assert!(
+            runtime
+                .try_acquire_in_flight_weighted(&owner, 1_001, &metrics, 1)
+                .is_none(),
+            "new work must not consume owner-reserved pressure"
+        );
+        let owner_recovery = runtime
+            .acquire_pinned_in_flight_weighted(&owner, 1_001, &metrics, 2)
+            .await
+            .expect("pinned continuation may use the pressure reserve");
+        assert_eq!(
+            admission_lane(&runtime, "request", "owner").owner_recovery,
+            1
+        );
+
+        drop(owner_recovery);
+        drop(ordinary);
+    }
+
+    #[tokio::test]
+    async fn cancelled_owner_wait_releases_the_waiter_gauge() {
+        let runtime = Arc::new(RuntimeStates::with_admission_limits(AdmissionLimits {
+            global_in_flight: 8,
+            account_in_flight: 1,
+            wait_timeout: Duration::from_secs(10),
+            ..AdmissionLimits::default()
+        }));
+        let metrics = LeaseMetrics::new();
+        let owner = AccountId::from("owner");
+        let _held = runtime.acquire_in_flight(&owner, 1_000, &metrics);
+        let waiter_runtime = runtime.clone();
+        let waiter_metrics = metrics.clone();
+        let waiter_owner = owner.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_runtime
+                .acquire_pinned_in_flight(&waiter_owner, 1_001, &waiter_metrics)
+                .await
+        });
+
+        for _ in 0..10 {
+            if admission_lane(&runtime, "request", "owner").waiters == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(admission_lane(&runtime, "request", "owner").waiters, 1);
+        waiter.abort();
+        let _ = waiter.await;
+
+        let lane = admission_lane(&runtime, "request", "owner");
+        assert_eq!(lane.waiters, 0);
+        assert_eq!(lane.cancelled, 1);
+        assert_eq!(lane.timeouts, 0);
+    }
+
+    #[test]
+    fn usage_refresh_signals_are_keyed_and_coalesced_while_one_is_outstanding() {
+        let runtime = RuntimeStates::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.register_usage_refresh(tx);
+        let id = AccountId::from("account-a");
+
+        for _ in 0..100 {
+            runtime.request_usage_refresh(&id);
+        }
+
+        assert_eq!(rx.try_recv().unwrap(), id);
+        assert!(
+            rx.try_recv().is_err(),
+            "only one queue item may exist for an account"
+        );
+        assert_eq!(runtime.usage_refresh_coalesced(), 99);
+        assert!(
+            runtime.finish_usage_refresh(&AccountId::from("account-a")),
+            "signals received during the pass request exactly one follow-up"
+        );
+        assert!(
+            !runtime.finish_usage_refresh(&AccountId::from("account-a")),
+            "the clean follow-up releases the keyed single-flight slot"
+        );
+    }
+
+    #[test]
+    fn idle_websocket_counts_as_admission_pressure_until_socket_guard_drops() {
+        let runtime = Arc::new(RuntimeStates::new());
+        let id = AccountId::from("account-a");
+        let guard = runtime.acquire_open_ws(&id);
+
+        let mut snapshots = vec![snap("account-a")];
+        runtime.overlay(&mut snapshots, 1_000);
+        assert_eq!(
+            snapshots[0].in_flight, 0,
+            "an idle socket is not an active request"
+        );
+        assert_eq!(
+            snapshots[0].open_ws, 1,
+            "an idle upstream socket must be visible to load selection"
+        );
+
+        drop(guard);
+        let mut after = vec![snap("account-a")];
+        runtime.overlay(&mut after, 1_000);
+        assert_eq!(after[0].in_flight, 0);
+        assert_eq!(after[0].open_ws, 0);
     }
 }

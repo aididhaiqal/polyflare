@@ -378,7 +378,11 @@ async fn imports_accounts_usage_and_tokens_roundtrip() {
     assert_eq!(row.get::<String, _>("outcome"), "success"); // <- codex-lb TEXT `status`
                                                             // content-safe columns carried verbatim.
     assert_eq!(row.get::<String, _>("account_id"), "acct-1");
-    assert_eq!(row.get::<String, _>("session_id"), "sess-xyz");
+    assert_eq!(
+        row.get::<Option<String>, _>("session_id"),
+        None,
+        "raw legacy session ids must never be retained"
+    );
     assert_eq!(row.get::<String, _>("request_id"), "req-abc");
     assert_eq!(row.get::<String, _>("model"), "gpt-5.6-sol");
     assert_eq!(row.get::<String, _>("plan_type"), "pro");

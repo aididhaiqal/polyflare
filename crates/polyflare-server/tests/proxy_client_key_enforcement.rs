@@ -77,7 +77,7 @@ fn ok_events() -> Vec<String> {
 /// unaffected-by-the-proxy-layer test has something to gate on). Returns the base URL, the state
 /// (for creating keys / asserting store side effects), and the `Store` handle is reachable via
 /// `state.store`.
-async fn spawn(enforce_client_keys: bool) -> (String, Arc<AppState>) {
+async fn spawn_with_ws(enforce_client_keys: bool, ws_downstream: bool) -> (String, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
     std::mem::forget(dir);
@@ -128,7 +128,8 @@ async fn spawn(enforce_client_keys: bool) -> (String, Arc<AppState>) {
             usage_history_retention_days: 0,
             live_logs: false,
         })),
-        ws_downstream: false,
+        ws_downstream,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -149,6 +150,10 @@ async fn spawn(enforce_client_keys: bool) -> (String, Arc<AppState>) {
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), state)
+}
+
+async fn spawn(enforce_client_keys: bool) -> (String, Arc<AppState>) {
+    spawn_with_ws(enforce_client_keys, false).await
 }
 
 fn responses_body() -> serde_json::Value {
@@ -177,6 +182,21 @@ async fn enforced_keyless_post_responses_is_401() {
         resp.status(),
         401,
         "enforcement on + no Authorization header ⇒ 401, not routed to the real handler"
+    );
+}
+
+#[tokio::test]
+async fn enforced_keyless_websocket_route_is_401_when_relay_is_enabled() {
+    let (base, state) = spawn_with_ws(true, true).await;
+    create_key(&state.store, Some("caller"), now())
+        .await
+        .unwrap();
+
+    let resp = reqwest::get(format!("{base}/responses")).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "an enabled WebSocket relay is account-consuming proxy traffic and must not bypass keys"
     );
 }
 

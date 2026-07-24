@@ -92,6 +92,7 @@ async fn spawn_with(store: Store) -> String {
             live_logs: true,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -193,6 +194,42 @@ async fn patch_assigns_pool_and_pauses_then_clears() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert!(fetch_account(&pf, "acct-1").await["pool"].is_null());
+}
+
+#[tokio::test]
+async fn patch_replaces_multiple_pool_memberships() {
+    let store = store_with_one().await;
+    let repo = store.accounts();
+    let pf = spawn_with(store).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "pools": ["team-a", "overflow"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        repo.list_pools("acct-1").await.unwrap(),
+        vec!["overflow".to_string(), "team-a".to_string()]
+    );
+    assert_eq!(
+        fetch_account(&pf, "acct-1").await["pools"],
+        serde_json::json!(["overflow", "team-a"])
+    );
+
+    let resp = client
+        .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "pools": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(repo.list_pools("acct-1").await.unwrap().is_empty());
+    assert!(repo.get("acct-1").await.unwrap().unwrap().pool.is_none());
 }
 
 #[tokio::test]
@@ -379,6 +416,101 @@ async fn patch_validation_fails_closed() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+
+    let resp = client
+        .patch(format!("{pf}/api/accounts/acct-1"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "pool": "Not Valid" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn create_routing_group_assigns_all_accounts_atomically() {
+    let store = store_with_one().await;
+    let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
+    store
+        .accounts()
+        .insert(&account("acct-2", None), &tokens(), &cipher)
+        .await
+        .unwrap();
+    let repo = store.accounts();
+    let pf = spawn_with(store).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{pf}/api/pools"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "slug": "team-a", "account_ids": ["acct-1", "acct-2"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        repo.get("acct-1").await.unwrap().unwrap().pool.as_deref(),
+        Some("team-a")
+    );
+    assert_eq!(
+        repo.get("acct-2").await.unwrap().unwrap().pool.as_deref(),
+        Some("team-a")
+    );
+
+    let response = client
+        .post(format!("{pf}/api/pools"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "slug": "team-b", "account_ids": ["acct-1"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        repo.list_pools("acct-1").await.unwrap(),
+        vec!["team-a".to_string(), "team-b".to_string()],
+        "creating another group adds membership instead of moving the account"
+    );
+
+    let response = client
+        .post(format!("{pf}/api/pools"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "slug": "team-b", "account_ids": ["acct-1", "missing"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    assert_eq!(
+        repo.get("acct-1").await.unwrap().unwrap().pool.as_deref(),
+        Some("team-a"),
+        "missing member must roll back every assignment"
+    );
+}
+
+#[tokio::test]
+async fn create_routing_group_validates_input_and_auth() {
+    let pf = spawn_with(store_with_one().await).await;
+    let client = reqwest::Client::new();
+    for body in [
+        serde_json::json!({ "slug": "Bad Slug", "account_ids": ["acct-1"] }),
+        serde_json::json!({ "slug": "team-a", "account_ids": [] }),
+        serde_json::json!({ "slug": "team-a", "account_ids": ["acct-1", "acct-1"] }),
+    ] {
+        let response = client
+            .post(format!("{pf}/api/pools"))
+            .header("authorization", "Bearer secret")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+    }
+    let response = client
+        .post(format!("{pf}/api/pools"))
+        .json(&serde_json::json!({ "slug": "team-a", "account_ids": ["acct-1"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
 }
 
 // Task 4: `DELETE /api/accounts/{id}` — remove an account, optionally purging its `request_log`

@@ -27,6 +27,7 @@ export function useDialogA11y(
 
   useEffect(() => {
     if (!active) return;
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const dialog = dialogRef.current;
     const focusables = () =>
       dialog ? Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE)) : [];
@@ -60,7 +61,10 @@ export function useDialogA11y(
     }
 
     document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      if (opener?.isConnected) opener.focus();
+    };
     // onClose is read via onCloseRef; dialogRef/initialFocusRef are stable ref objects.
   }, [active, dialogRef, initialFocusRef]);
 }

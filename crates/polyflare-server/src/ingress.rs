@@ -12,13 +12,15 @@ use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 
 use polyflare_anthropic::AnthropicToResponses;
-use polyflare_codex::oauth::{classify_failure, should_refresh, token_exp, OAuthError};
+use polyflare_codex::oauth::{
+    classify_failure, is_fedramp_account, should_refresh, token_exp, OAuthError,
+};
 use polyflare_core::{
     Account, AccountId, AccountSnapshot, BackoffKind, Continuity, ContinuityDirective,
     FailureSignal, NoopContinuity, Prepared, PreparedRequest, Provider, RecoveryPlan, RequestCtx,
     ResponseStream, SelectionCtx, Selector, SessionKey, Tier, Translator, WatchdogArm,
 };
-use polyflare_store::{PlainTokens, RequestLogRecord, RequestLogRepo};
+use polyflare_store::{CustomProvider, PlainTokens, ProviderModel, RequestLogRecord, Store};
 
 use crate::alias::{self, ModelAlias};
 use crate::app::AppState;
@@ -27,7 +29,10 @@ use crate::config;
 use crate::failover::{exclude_tried, failover_reason_code, failover_verdict, FailoverVerdict};
 use crate::fingerprint_capture::{append_fingerprint_capture, capture_request_fingerprint};
 use crate::observability::{FailoverSignal, RequestLog};
-use crate::session_key::parse_inbound;
+use crate::reactive_auth::{
+    ReactiveAuth, ReactiveAuthError, PERSIST_MAX_ATTEMPTS, PERSIST_RETRY_BACKOFF,
+};
+use crate::session_key::parse_inbound_scoped;
 use crate::snapshot::filter_by_provider_and_pool;
 use crate::starvation;
 use crate::translate_stream::wrap_translating_stream;
@@ -55,12 +60,6 @@ fn unix_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Bounded retries for the post-refresh token persist (the one write whose loss kills an account —
-/// see the call site). `busy_timeout` is the first line of defense; this is the backstop.
-const PERSIST_MAX_ATTEMPTS: u32 = 3;
-/// Fixed backoff between persist retries (small — the write is on the hot lock).
-const PERSIST_RETRY_BACKOFF: Duration = Duration::from_millis(100);
-
 /// Stream-idle-timeout plan (`docs/superpowers/plans/2026-07-18-stream-idle-timeout.md`) Task 2:
 /// the DEFAULT source for the mid-stream idle deadline — matches codex's own `stream_idle_timeout`
 /// default (`model-provider-info/src/lib.rs:26`, 300000ms). Every `execute_with_watchdog*`/
@@ -83,6 +82,22 @@ fn tier_from_effort(effort: Option<&str>) -> Option<Tier> {
         "low" | "minimal" => Some(Tier::Low),
         _ => None,
     }
+}
+
+fn estimate_materialized_request_tokens(
+    body: &serde_json::Value,
+    input_field: &str,
+    output_field: &str,
+) -> u32 {
+    let input_len = body
+        .get(input_field)
+        .and_then(|input| serde_json::to_vec(input).ok())
+        .map_or(0, |bytes| bytes.len());
+    let output_tokens = body
+        .get(output_field)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(4_096);
+    crate::session_key::estimate_tokens_from_json_len(input_len, output_tokens)
 }
 
 fn account_unavailable() -> Response {
@@ -131,16 +146,10 @@ fn no_authorized_account_for_security_work() -> Response {
 /// already awaits other work in the same `async fn`, so awaiting here is a plain, non-blocking
 /// dependency, not a new sync/async boundary.
 ///
-/// A6 (deliberately NOT implemented here — a retirement, not a gap): there is no third branch
-/// dispatching to `runtime_state::record_quota_exceeded`. See that function's doc comment for the
-/// full evidence trail; in short, the real quota wire codes (`insufficient_quota`/
-/// `usage_not_included`) never reach `sig.error_code` on this codebase's actual wire path (they
-/// arrive inside a `response.failed` frame that's reframed as SSE and passed through to the client,
-/// never becoming a `WatchdogError::Upstream(_)`), so a code-keyed quota branch here would be dead
-/// code from day one. `usage_refresh.rs`'s poller is the sole, authoritative owner of the durable
-/// `quota_exceeded` status. `failure_routing.rs` carries two regression tests proving a quota-shaped
-/// code that DOES somehow reach `error_code` still falls through to the ordinary status-keyed
-/// bucketing below (never to `record_quota_exceeded`).
+/// Capacity codes (`insufficient_quota` / `usage_not_included`) are distinct from account-health
+/// errors: apply a short capacity cooldown without incrementing `error_count`, then request an
+/// immediate authoritative `/wham/usage` refresh. Every other 429 also requests that refresh while
+/// retaining the ordinary rate-limit cooldown and Retry-After handling.
 ///
 /// WS-relay Phase 3 Task 4: this is the reusable CORE of `record_failure`'s policy, extracted
 /// verbatim so the WS-downstream relay's exhaustion-move (`ws_relay`'s `on_upstream_error`) benches
@@ -158,6 +167,21 @@ pub(crate) async fn bench_account_for_failure(
 ) {
     if let Some(sig) = sig {
         if let Some(code) = &sig.error_code {
+            if matches!(code.as_str(), "insufficient_quota" | "usage_not_included") {
+                state.runtime.record_quota_exceeded(id, now);
+                let _ = state
+                    .store
+                    .accounts()
+                    .record_routing_cooldown(
+                        id.as_str(),
+                        now.saturating_add(crate::runtime_state::QUOTA_EXCEEDED_COOLDOWN_SECS),
+                        "quota",
+                        now,
+                    )
+                    .await;
+                state.runtime.request_usage_refresh(id);
+                return;
+            }
             if let Some(status) = classify_failure(code).status() {
                 let _ = state
                     .store
@@ -170,6 +194,19 @@ pub(crate) async fn bench_account_for_failure(
     }
     let transition = match sig {
         Some(sig) if sig.status == 429 => {
+            state.runtime.request_usage_refresh(id);
+            let delay = sig
+                .retry_after
+                .unwrap_or(crate::runtime_state::RATE_LIMITED_MIN_COOLDOWN_SECS)
+                .clamp(
+                    crate::runtime_state::RATE_LIMITED_MIN_COOLDOWN_SECS,
+                    crate::runtime_state::MAX_COOLDOWN_SECS,
+                );
+            let _ = state
+                .store
+                .accounts()
+                .record_routing_cooldown(id.as_str(), now.saturating_add(delay), "rate_limit", now)
+                .await;
             state
                 .runtime
                 .record_rate_limit(id, sig.retry_after, now, &state.rate_limit_metrics)
@@ -203,10 +240,12 @@ pub(crate) async fn bench_account_for_failure(
 /// calls. Behavior-preserving extraction (WS-relay Phase 3 Task 4): identical outcome to the
 /// pre-extraction body for every existing caller.
 async fn record_failure(state: &AppState, id: &AccountId, err: &WatchdogError, now: i64) {
-    let WatchdogError::Upstream(signal) = err else {
-        return;
+    let signal = match err {
+        WatchdogError::Upstream(signal) => signal.as_ref(),
+        WatchdogError::UpstreamHttp(response) => Some(&response.signal),
+        _ => return,
     };
-    bench_account_for_failure(state, id, signal.as_ref(), now).await;
+    bench_account_for_failure(state, id, signal, now).await;
 }
 
 /// M5 capture-fixture mechanism: if `state.capture_fingerprint_path` is set, append this
@@ -240,6 +279,8 @@ const DROPPED_INBOUND_HEADERS: &[&str] = &[
     "connection",
     "transfer-encoding",
     "authorization",
+    "chatgpt-account-id",
+    "x-openai-fedramp",
 ];
 
 /// Filters a native `/responses` request's inbound `HeaderMap` down to the surviving
@@ -342,23 +383,97 @@ fn derive_alias_prompt_cache_key(body: &serde_json::Value) -> String {
 struct RouteOutcome {
     /// The account selected to serve (or attempted for) this request, when selection got that far.
     account_id: Option<String>,
+    /// Actual upstream provider. Built-in paths leave this unset and use their fixed provider.
+    provider_slug: Option<String>,
+    provider_credential_id: Option<String>,
+    upstream_model: Option<String>,
+    upstream_transport: Option<String>,
+    custom_pricing: Option<(f64, f64, f64)>,
     /// The requested (native path) or resolved target (translated/aliased path) model string.
     model: Option<String>,
     /// `reasoning.effort` for this request, when known.
     reasoning_effort: Option<String>,
+    /// Client-requested service tier on native Responses traffic, when explicitly present.
+    service_tier: Option<String>,
     /// The codex sub-agent role label (`x-openai-subagent`, see `RequestCtx::subagent`), when
     /// known. Only the native `/responses` path can ever carry one (a real Codex client sends the
     /// header); the alias/translated `/v1/messages` paths are Claude→Codex requests with no codex
     /// sub-agent concept, so they always leave this `None`.
     subagent: Option<String>,
+    /// One-way SHA-256 continuity/session key, when the ingress path derived one.
+    session_key: Option<String>,
+    /// Content-free pre-route token estimate used for weighted admission and terminal calibration.
+    estimated_tokens: u32,
+}
+
+struct ResponsesHandlerOptions {
+    resolved_custom_route: Option<(CustomProvider, ProviderModel)>,
+    max_attempts: u32,
+    starvation_budget: Duration,
+    starvation_heartbeat: Duration,
 }
 
 fn stream_response(stream: ResponseStream) -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
+    let metadata = stream.metadata().clone();
+    let status = StatusCode::from_u16(metadata.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let has_content_type = metadata
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+    let mut builder = Response::builder().status(status);
+    for (name, value) in metadata.headers {
+        if let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::from_bytes(name.as_bytes()),
+            axum::http::HeaderValue::from_str(&value),
+        ) {
+            builder = builder.header(name, value);
+        }
+    }
+    if !has_content_type {
+        builder = builder.header(header::CONTENT_TYPE, "text/event-stream");
+    }
+    builder
         .body(Body::from_stream(stream))
         .expect("valid response")
+}
+
+fn upstream_http_error_response(error: &WatchdogError) -> Option<Response> {
+    let WatchdogError::UpstreamHttp(response) = error else {
+        return None;
+    };
+    let status = StatusCode::from_u16(response.signal.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(status);
+    for (name, value) in &response.headers {
+        if let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::from_bytes(name.as_bytes()),
+            axum::http::HeaderValue::from_str(value),
+        ) {
+            builder = builder.header(name, value);
+        }
+    }
+    Some(
+        builder
+            .body(Body::from(response.body.clone()))
+            .expect("valid upstream error response"),
+    )
+}
+
+fn surface_watchdog_error(error: &WatchdogError) -> Response {
+    if matches!(error, WatchdogError::AttemptBudgetExhausted) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "logical_turn_attempts_exhausted",
+                    "message": "This logical turn exhausted its upstream attempt budget.",
+                    "type": "invalid_request_error"
+                }
+            })),
+        )
+            .into_response();
+    }
+    upstream_http_error_response(error)
+        .unwrap_or_else(|| (StatusCode::BAD_GATEWAY, "upstream error").into_response())
 }
 
 /// Outcome 3's non-streaming `/v1/messages` success response: a single buffered Anthropic
@@ -374,25 +489,41 @@ fn json_message_response(message: serde_json::Value) -> Response {
         .expect("valid response")
 }
 
-/// Persist a request-outcome row off the response path: fire-and-forget (a detached task, mirroring
-/// codex-lb's pattern), so a slow or failing DB write never delays or fails the client's request.
-/// The row is content-free by construction — it comes from `RequestLog::record`, the same audited
-/// field set the tracing event carries (see `crate::observability`). `repo` is taken by value (it
-/// owns a cheap pool clone) so the caller can build it before `state` is consumed by the handler.
+/// Dashboard-facing transport classification for HTTP ingress responses.
 ///
-/// D17 Task 3: promoted `pub(crate)` (from private) so `crate::control`'s handlers persist their
-/// content-free control-endpoint log rows through this SAME fire-and-forget funnel, rather than a
-/// second, parallel `tokio::spawn` write path.
-pub(crate) fn spawn_persist_request_log(repo: RequestLogRepo, record: RequestLogRecord) {
-    tokio::spawn(async move {
-        if let Err(e) = repo.insert(&record).await {
-            tracing::warn!(
-                target: "polyflare_server::request",
-                error = %e,
-                "request_log persist failed"
-            );
-        }
-    });
+/// The wire request itself is always HTTP POST here, but a successful streaming response is
+/// delivered as Server-Sent Events and should be distinguishable from buffered JSON in request
+/// telemetry. WebSocket turns bypass these wrappers and are recorded separately by `ws_relay`.
+fn response_transport(response: &Response) -> &'static str {
+    let is_sse = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"));
+
+    if is_sse {
+        "sse"
+    } else {
+        "http"
+    }
+}
+
+/// Offer a request-outcome row to the Store's bounded FIFO writer, so a slow or failing DB write
+/// never delays or fails the client's request and never creates an unbounded task per request.
+/// The row is content-free by construction — it comes from `RequestLog::record`, the same audited
+/// field set the tracing event carries (see `crate::observability`).
+///
+/// D17 Task 3: `pub(crate)` so `crate::control`'s handlers persist their content-free
+/// control-endpoint log rows through this same queue rather than a parallel write path.
+pub(crate) fn queue_persist_request_log(store: &Store, record: RequestLogRecord) {
+    if let Err(e) = store.enqueue_request_log(record) {
+        tracing::warn!(
+            target: "polyflare_server::request",
+            error = %e,
+            "request_log queue failed"
+        );
+    }
 }
 
 /// Load + decrypt + refresh-if-stale the selected account, returning the core `Account` to execute
@@ -477,16 +608,20 @@ pub(crate) async fn resolve_core_account(
                     // a dead refresh token in the DB and the account dies on its next refresh. The
                     // pool's `busy_timeout` (5s) already absorbs lock contention at the driver; these
                     // bounded retries add a backstop for a post-timeout busy or a transient IO blip.
-                    // `update_tokens` is an idempotent UPDATE, so retrying is safe. On FINAL failure
-                    // the refresh still succeeded and `new` is valid in-memory for THIS request —
-                    // serve it rather than 5xx — but the stored token is now stale (a later refresh
-                    // will need re-auth); log loudly (content-safe: no token material).
+                    // `update_tokens` is an idempotent UPDATE, so retrying is safe. On final failure
+                    // fail closed: using the new access token while retaining the now-invalidated
+                    // refresh token would create a one-request success followed by durable account
+                    // death, and concurrent waiters would still read the old identity.
+                    let mut persisted = false;
                     for attempt in 1..=PERSIST_MAX_ATTEMPTS {
                         match repo
                             .update_tokens(picked.as_str(), &new, &state.cipher, now)
                             .await
                         {
-                            Ok(()) => break, // success bumps the store generation, invalidating caches
+                            Ok(()) => {
+                                persisted = true;
+                                break;
+                            }
                             Err(e) if attempt < PERSIST_MAX_ATTEMPTS => {
                                 tracing::warn!(
                                     attempt,
@@ -495,12 +630,17 @@ pub(crate) async fn resolve_core_account(
                                 );
                                 tokio::time::sleep(PERSIST_RETRY_BACKOFF).await;
                             }
-                            Err(e) => tracing::error!(
-                                error = %e,
-                                "failed to persist refreshed tokens after {PERSIST_MAX_ATTEMPTS} \
-                                 attempts; stored refresh token is now stale — account will need re-auth"
-                            ),
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "failed to persist refreshed tokens after \
+                                     {PERSIST_MAX_ATTEMPTS} attempts"
+                                );
+                            }
                         }
+                    }
+                    if !persisted {
+                        return Err(internal_error());
                     }
                     tokens = new;
                 }
@@ -536,9 +676,34 @@ pub(crate) async fn resolve_core_account(
             // Clone (not move) the token out: `PlainTokens` is `ZeroizeOnDrop`, so `tokens` can't be
             // partially moved from — and this way the original is wiped when `tokens` drops here.
             bearer_token: tokens.access_token.clone(),
+            is_fedramp: provider == Provider::Codex && is_fedramp_account(&tokens.id_token),
         },
         provider,
     ))
+}
+
+/// One reactive OAuth recovery after an upstream 401, even when the rejected JWT still has a
+/// future `exp`. The per-account lock plus rejected-token comparison makes concurrent 401s a
+/// single-flight: the first waiter refreshes, later waiters adopt the newly stored token.
+pub(crate) async fn force_refresh_after_unauthorized(
+    state: &AppState,
+    picked: &AccountId,
+    rejected_access_token: &str,
+    now: i64,
+) -> Result<Option<Account>, Response> {
+    ReactiveAuth::new(
+        state.store.clone(),
+        state.cipher.clone(),
+        state.oauth.clone(),
+        state.refresh_locks.clone(),
+        state.upstream_base_url_for(Provider::Codex).to_string(),
+    )
+    .refresh_after_unauthorized(picked, rejected_access_token, now)
+    .await
+    .map_err(|error| match error {
+        ReactiveAuthError::Internal => internal_error(),
+        ReactiveAuthError::AccountUnavailable => account_unavailable(),
+    })
 }
 
 /// B5-anthropic Task 3: which SSE dialect the *client* of a Layer-1/Layer-2 recovery-wait speaks —
@@ -578,6 +743,24 @@ impl WaitClient {
             WaitClient::Anthropic | WaitClient::AnthropicTranslated(_) => {
                 starvation::anthropic_in_band_error_frame(outcome)
             }
+        }
+    }
+
+    /// A terminal, non-retryable in-band error for an attempt budget discovered after Layer 2
+    /// already committed HTTP 200 with keepalives.
+    fn attempt_budget_error_frame(&self) -> Bytes {
+        match self {
+            WaitClient::Codex => Bytes::from_static(
+                b"event: response.failed\n\
+                  data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\
+                  \"invalid_prompt\",\"message\":\"This logical turn exhausted its upstream \
+                  attempt budget.\"}}}\n\n",
+            ),
+            WaitClient::Anthropic | WaitClient::AnthropicTranslated(_) => Bytes::from_static(
+                b"event: error\n\
+                  data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\
+                  \"message\":\"This logical turn exhausted its upstream attempt budget.\"}}\n\n",
+            ),
         }
     }
 
@@ -678,9 +861,12 @@ async fn try_layer1_serve_now(
                                    // streaming selection site (see `execute_recovery_tracked`'s call below, which is
                                    // `execute_recovery`'s exact behavior plus this one added, never-read `in_flight` capability —
                                    // see `execute_recovery`'s doc for why its own signature stays untouched).
-    let in_flight = state
-        .runtime
-        .acquire_in_flight(&fresh, now, &state.lease_metrics);
+    let in_flight = state.runtime.try_acquire_in_flight_weighted(
+        &fresh,
+        now,
+        &state.lease_metrics,
+        sel_ctx.request_pressure_units,
+    )?;
     let response = match execute_recovery_tracked(
         state.executor_for(provider).as_ref(),
         state.continuity.clone(),
@@ -691,6 +877,7 @@ async fn try_layer1_serve_now(
         session_key,
         state.runtime.clone(),
         state.runtime_settings.stream_idle_timeout(),
+        state.runtime_settings.max_account_attempts(),
         CommitWitness::new(),
         Some(in_flight),
     )
@@ -699,7 +886,7 @@ async fn try_layer1_serve_now(
         Ok(stream) => stream_response(client.wrap_recovered(stream)),
         Err(e) => {
             record_failure(state, &health_id, &e, unix_now()).await;
-            (StatusCode::BAD_GATEWAY, "upstream error").into_response()
+            surface_watchdog_error(&e)
         }
     };
     Some(response)
@@ -978,7 +1165,7 @@ fn layer2_wait_stream(
     // the generator for its whole lifetime (every yield site below reads it).
     client: WaitClient,
 ) -> ResponseStream {
-    Box::pin(async_stream::stream! {
+    ResponseStream::new(async_stream::stream! {
         // B5 Task 5: wall-clock start of the wait, purely for the content-free
         // `StarvationSignal.waited_ms` field — independent of the `wait_start`/`recover_at`
         // UNIX-second math above (that math is unchanged from Task 4; this is additive).
@@ -1056,6 +1243,12 @@ fn layer2_wait_stream(
         };
         let mut fresh_snapshots =
             filter_by_provider_and_pool(&fresh_snapshots, pool_provider, pool.as_deref());
+        fresh_snapshots.retain(|snapshot| {
+            state
+                .model_catalog
+                .account_supports_model(snapshot.id.as_str(), &req.model)
+                != Some(false)
+        });
         state.runtime.overlay(&mut fresh_snapshots, fresh_now);
 
         let fresh = match selector.pick(&fresh_snapshots, &fresh_sel_ctx) {
@@ -1093,7 +1286,27 @@ fn layer2_wait_stream(
         let health_id = fresh.clone(); // `fresh` is moved into the executor below.
         // C9 Task 2: the Layer-2 wait's actual served attempt is a real upstream request on
         // `fresh` — same lease treatment as every other streaming selection site.
-        let in_flight = state.runtime.acquire_in_flight(&fresh, fresh_now, &state.lease_metrics);
+        let Some(in_flight) =
+            state
+                .runtime
+                .try_acquire_in_flight_weighted(
+                    &fresh,
+                    fresh_now,
+                    &state.lease_metrics,
+                    sel_ctx.request_pressure_units,
+                )
+        else {
+            emit_starvation_signal(
+                &state,
+                &wait_target,
+                wait_started,
+                starvation::StarvationOutcome::BudgetExceeded.code(),
+                None,
+                jitter_ms,
+            );
+            yield Ok(client.error_frame(starvation::StarvationOutcome::BudgetExceeded));
+            return;
+        };
         match execute_recovery_tracked(
             state.executor_for(provider).as_ref(),
             state.continuity.clone(),
@@ -1104,6 +1317,7 @@ fn layer2_wait_stream(
             session_key,
             state.runtime.clone(),
             state.runtime_settings.stream_idle_timeout(),
+            state.runtime_settings.max_account_attempts(),
             CommitWitness::new(),
             Some(in_flight),
         )
@@ -1132,15 +1346,25 @@ fn layer2_wait_stream(
             }
             Err(e) => {
                 record_failure(&state, &health_id, &e, unix_now()).await;
+                let attempt_budget_exhausted =
+                    matches!(e, WatchdogError::AttemptBudgetExhausted);
                 emit_starvation_signal(
                     &state,
                     &wait_target,
                     wait_started,
-                    starvation::StarvationOutcome::ExecutorError.code(),
+                    if attempt_budget_exhausted {
+                        "logical_turn_attempts_exhausted"
+                    } else {
+                        starvation::StarvationOutcome::ExecutorError.code()
+                    },
                     None,
                     jitter_ms,
                 );
-                yield Ok(client.error_frame(starvation::StarvationOutcome::ExecutorError));
+                yield Ok(if attempt_budget_exhausted {
+                    client.attempt_budget_error_frame()
+                } else {
+                    client.error_frame(starvation::StarvationOutcome::ExecutorError)
+                });
             }
         }
     })
@@ -1208,9 +1432,14 @@ async fn reroute_cyber_rejection(
     let session_key_for_stamp = session_key.clone();
     // C9 Task 2: the cyber-reroute's move onto the capability-holding account is a real upstream
     // attempt on `fresh` — same lease treatment as every other streaming selection site.
-    let in_flight = state
-        .runtime
-        .acquire_in_flight(&fresh, now, &state.lease_metrics);
+    let Some(in_flight) = state.runtime.try_acquire_in_flight_weighted(
+        &fresh,
+        now,
+        &state.lease_metrics,
+        sel_ctx.request_pressure_units,
+    ) else {
+        return no_eligible();
+    };
     match execute_recovery_tracked(
         state.executor_for(provider).as_ref(),
         state.continuity.clone(),
@@ -1221,6 +1450,7 @@ async fn reroute_cyber_rejection(
         session_key,
         state.runtime.clone(),
         state.runtime_settings.stream_idle_timeout(),
+        state.runtime_settings.max_account_attempts(),
         CommitWitness::new(),
         Some(in_flight),
     )
@@ -1242,7 +1472,7 @@ async fn reroute_cyber_rejection(
         }
         Err(e) => {
             record_failure(state, &health_id, &e, unix_now()).await;
-            (StatusCode::BAD_GATEWAY, "upstream error").into_response()
+            surface_watchdog_error(&e)
         }
     }
 }
@@ -1334,7 +1564,7 @@ async fn run_failover_loop(
         // `tried.len()` does NOT yet include `failed_id` — see the doc's "Bookkeeping order".
         let attempts_left = (tried.len() as u32) + 1 < max_attempts;
         if failover_verdict(&err, attempts_left, committed) == FailoverVerdict::Surface {
-            return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
+            return surface_watchdog_error(&err);
         }
         // FailoverNext: this account is excluded from every future pick this request (T2). Clone
         // the id BEFORE it moves into `tried` — the observability signal below needs it as
@@ -1400,7 +1630,7 @@ async fn run_failover_loop(
                 return if sel_ctx.require_security_work_authorized {
                     no_authorized_account_for_security_work()
                 } else {
-                    (StatusCode::BAD_GATEWAY, "upstream error").into_response()
+                    surface_watchdog_error(&err)
                 };
             }
         };
@@ -1439,9 +1669,14 @@ async fn run_failover_loop(
         // strictly before this match arm runs, and therefore strictly before the loop's next
         // `selector.pick` (at the top of the next iteration) can ever select account B. No explicit
         // `drop()` needed — this is Rust's ordinary move-then-scope-end semantics, not a special case.
-        let in_flight = state
-            .runtime
-            .acquire_in_flight(&fresh, now, &state.lease_metrics);
+        let Some(in_flight) = state.runtime.try_acquire_in_flight_weighted(
+            &fresh,
+            now,
+            &state.lease_metrics,
+            sel_ctx.request_pressure_units,
+        ) else {
+            return no_eligible();
+        };
         match execute_recovery_tracked(
             state.executor_for(provider).as_ref(),
             state.continuity.clone(),
@@ -1452,6 +1687,7 @@ async fn run_failover_loop(
             session_key.clone(),
             state.runtime.clone(),
             state.runtime_settings.stream_idle_timeout(),
+            max_attempts,
             commit.clone(),
             Some(in_flight),
         )
@@ -1525,70 +1761,148 @@ pub async fn websocket_fallback_handler() -> Response {
         .into_response()
 }
 
-/// Compute cost from captured usage (via the pricing table) and fire the row's usage UPDATE.
-/// Content-free (numbers + model slug only). No-op if no usage was captured (e.g. the client
-/// disconnected before a `response.completed` frame arrived, or the upstream never sent one).
+/// Persist independently observed stream timing and any captured usage, computing cost when the
+/// required input/output counts are present. Content-free (numbers + model slug only). Missing
+/// usage remains `None`; it is never fabricated as zero.
 ///
-/// Fire-and-forget by construction: callers run this inside a detached `tokio::spawn` (see
-/// `responses_route`'s stream-wrapper `on_done`), and its own `update_usage` error is dropped
-/// (`let _ =`) — a slow or failing DB write must never delay or fail the client's request, and by
-/// the time this runs the client response has already been fully streamed.
-async fn apply_captured_usage(
-    repo: &RequestLogRepo,
+/// Non-blocking by construction: the stream wrapper calls this synchronously only to offer the
+/// update to the Store's bounded writer. A slow or failing SQLite write therefore cannot delay or
+/// fail the client's response, which has already been fully streamed by the time this runs.
+fn apply_captured_usage(
+    store: &Store,
     request_id: &str,
     model: Option<&str>,
+    custom_pricing: Option<(f64, f64, f64)>,
     captured: usage_capture::CapturedUsage,
 ) {
-    let Some(u) = captured.usage else {
-        return;
+    let u = captured.usage.unwrap_or_default();
+    let cost = if let Some((input_price, cached_price, output_price)) = custom_pricing {
+        u.input_tokens.zip(u.output_tokens).map(|(input, output)| {
+            let cached = u.cached_input_tokens.unwrap_or(0).clamp(0, input.max(0));
+            let uncached = input.saturating_sub(cached);
+            let orchestration_input = u.orchestration_input_tokens.unwrap_or(0).max(0);
+            let orchestration_cached = u
+                .orchestration_cached_input_tokens
+                .unwrap_or(0)
+                .clamp(0, orchestration_input);
+            let orchestration_uncached = orchestration_input.saturating_sub(orchestration_cached);
+            let orchestration_output = u.orchestration_output_tokens.unwrap_or(0).max(0);
+            (uncached as f64 * input_price
+                + cached as f64 * cached_price
+                + output as f64 * output_price
+                + orchestration_uncached as f64 * input_price
+                + orchestration_cached as f64 * cached_price
+                + orchestration_output as f64 * output_price)
+                / 1_000_000.0
+        })
+    } else {
+        model
+            .and_then(polyflare_core::pricing::pricing_for_model)
+            .zip(u.input_tokens)
+            .zip(u.output_tokens)
+            .map(|((pricing, input), output)| {
+                polyflare_core::pricing::cost_usd(
+                    pricing,
+                    input,
+                    output,
+                    u.cached_input_tokens.unwrap_or(0),
+                    None,
+                )
+            })
     };
-    let input = u.input_tokens.unwrap_or(0);
-    let output = u.output_tokens.unwrap_or(0);
-    let cached = u.cached_input_tokens.unwrap_or(0);
-    let cost = model
-        .and_then(polyflare_core::pricing::pricing_for_model)
-        .map(|p| polyflare_core::pricing::cost_usd(p, input, output, cached, None));
-    let _ = repo
-        .update_usage(
-            request_id,
-            Some(input),
-            Some(output),
-            Some(cached),
-            u.reasoning_tokens,
-            cost,
-            captured.ttft_ms,
-            captured.duration_ms,
-        )
-        .await;
+    if let Err(e) = store.enqueue_request_usage(polyflare_store::RequestUsageUpdate {
+        request_id: request_id.to_string(),
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        cached_input_tokens: u.cached_input_tokens,
+        reasoning_tokens: u.reasoning_tokens,
+        orchestration_input_tokens: u.orchestration_input_tokens,
+        orchestration_output_tokens: u.orchestration_output_tokens,
+        orchestration_cached_input_tokens: u.orchestration_cached_input_tokens,
+        cost_usd: cost,
+        latency_first_token_ms: captured.ttft_ms,
+        duration_ms: captured.duration_ms,
+        protocol_outcome: captured.protocol_outcome,
+    }) {
+        tracing::warn!(
+            target: "polyflare_server::request",
+            error = %e,
+            "request usage queue failed"
+        );
+    }
 }
 
 /// Shared `/responses` route: thin timing + content-safe logging wrapper around
 /// [`responses_handler_impl`], parameterized by the optional account-pool slug. See
 /// `crate::observability` for the content-safety constraint on what may be logged.
-async fn responses_route(
+pub(crate) async fn responses_route(
     state: Arc<AppState>,
     pool: Option<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    responses_route_with_transport(state, pool, headers, body, None, None).await
+}
+
+pub(crate) async fn responses_custom_route_for_ws(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+    provider: CustomProvider,
+    model: ProviderModel,
+) -> Response {
+    responses_route_with_transport(
+        state,
+        None,
+        headers,
+        body,
+        Some("websocket"),
+        Some((provider, model)),
+    )
+    .await
+}
+
+async fn responses_route_with_transport(
+    state: Arc<AppState>,
+    pool: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+    downstream_transport: Option<&'static str>,
+    resolved_custom_route: Option<(CustomProvider, ProviderModel)>,
+) -> Response {
     let start = Instant::now();
     maybe_capture_fingerprint(&state, "POST", "/responses", &headers);
-    // Build the log repo BEFORE `state` moves into the impl (it owns a cheap pool clone).
-    let log_repo = state.store.request_log();
-    // Live-usage-cost-capture Task 6: a SECOND repo handle, same reason (cheap pool clone) — this
-    // one is moved into the stream wrapper's `on_done` closure below to backfill usage/cost on
-    // this SAME row once the stream completes, well after `log_repo` above is already consumed by
-    // `spawn_persist_request_log`'s insert.
-    let usage_repo = state.store.request_log();
+    // Keep a Store clone BEFORE `state` moves into the impl; it owns the bounded writer handle.
+    let log_store = state.store.clone();
+    // A second Store handle moves into the stream wrapper to queue usage/cost on this same row
+    // after completion. The single FIFO writer preserves insert-before-update ordering.
+    let usage_store = state.store.clone();
+    let pressure_runtime = state.runtime.clone();
     // Same reason: `state` moves into the impl below, so grab the log-bus handle first.
     let log_bus = state.log_bus.clone();
     // C11b Task 2: same reason — grab the content-free `upstream_requests` counter handle before
     // `state` moves into the impl below.
     let upstream_request_metrics = state.upstream_request_metrics.clone();
-    let (response, outcome) = responses_handler_impl(state, pool.as_deref(), headers, body).await;
+    let catalog_etag = match pool.as_deref() {
+        Some(pool) => crate::catalog::pooled_models_etag(&state, pool).await,
+        None => crate::catalog::root_models_etag(&state).await,
+    };
+    let (mut response, outcome) =
+        responses_handler_impl(state, pool.as_deref(), headers, body, resolved_custom_route).await;
+    apply_scope_models_etag(&mut response, catalog_etag);
     // Live-usage-cost-capture Task 6: clone the model slug for pricing BEFORE it's moved into
     // `RequestLog` below (`model: outcome.model` takes ownership of the original).
     let model_for_cost = outcome.model.clone();
+    let custom_pricing = outcome.custom_pricing;
+    let estimated_tokens = outcome.estimated_tokens;
+    let response_transport_kind = response_transport(&response);
+    let eof_outcome = if response_transport_kind == "sse" {
+        polyflare_store::RequestProtocolOutcome::TransportLost
+    } else if response.status().is_success() {
+        polyflare_store::RequestProtocolOutcome::Completed
+    } else {
+        polyflare_store::RequestProtocolOutcome::Failed
+    };
     // Live-usage-cost-capture Task 4: a fresh per-request correlation id — content-free (128
     // random bits, never derived from request/response data) — so the (later) stream-wrapper task
     // can call `RequestLogRepo::update_usage` against the SAME row this request inserts.
@@ -1600,23 +1914,44 @@ async fn responses_route(
         // `filter_by_provider(&snapshots, Provider::Codex)` call below. The provider is
         // structurally fixed regardless of which branch produced the response (including the
         // early-exit error paths, which never resolve an account at all).
-        provider: Provider::Codex,
+        provider: outcome
+            .provider_slug
+            .clone()
+            .unwrap_or_else(|| Provider::Codex.to_string()),
         aliased: false,
         status: response.status(),
         duration_ms: start.elapsed().as_millis() as u64,
         account_id: outcome.account_id,
+        target_kind: Some(
+            if outcome.provider_credential_id.is_some() {
+                "credential"
+            } else {
+                "account"
+            }
+            .to_string(),
+        ),
+        provider_credential_id: outcome.provider_credential_id,
         model: outcome.model,
+        upstream_model: outcome.upstream_model,
+        upstream_transport: outcome
+            .upstream_transport
+            .or_else(|| Some("http_sse".to_string())),
         reasoning_effort: outcome.reasoning_effort,
         // Not yet known at this chokepoint (SPEC-M4a has no per-account subscription-tier read
         // wired here today).
-        service_tier: None,
-        transport: Some("http".to_string()),
+        service_tier: outcome.service_tier,
+        transport: Some(
+            downstream_transport
+                .unwrap_or(response_transport_kind)
+                .to_string(),
+        ),
         // TODO(follow-up): populate ttft/tokens from the stream observer.
         ttft_ms: None,
         total_tokens: None,
         cached_tokens: None,
         subagent: outcome.subagent,
         request_id: Some(request_id.clone()),
+        session_key: outcome.session_key,
     };
     log.emit();
     log_bus.publish(log.to_log_event());
@@ -1624,16 +1959,22 @@ async fn responses_route(
     // `(account_id, status)` pair `log` already carries — bumped exactly once per client request
     // (the final outcome only; per-attempt retries are `FailoverMetrics`, never double-counted
     // here).
-    upstream_request_metrics.record(log.account_id.as_deref(), log.status.as_u16());
-    spawn_persist_request_log(log_repo, log.record(unix_now()));
+    upstream_request_metrics.record_target(
+        &log.provider,
+        log.target_kind.as_deref().unwrap_or("account"),
+        log.account_id
+            .as_deref()
+            .or(log.provider_credential_id.as_deref()),
+        log.status.as_u16(),
+    );
+    queue_persist_request_log(&log_store, log.record(unix_now()));
     // Live-usage-cost-capture Task 6 (THE CRUX): wrap the final Response body in a
     // `UsageCapturingStream` — byte-for-byte passthrough (see that type's docs) that observes the
     // Codex SSE stream for a trailing `response.completed` frame's `usage` object + TTFT. This is
     // the SAME body `stream_response` built from `Body::from_stream(stream)` (or an error path's
     // non-streaming body — `into_data_stream` handles either uniformly), so re-wrapping it here
     // observes the identical bytes the client receives; nothing is altered, buffered, or delayed.
-    // `on_done` only `tokio::spawn`s the persist — it never blocks the stream, and its own error
-    // is dropped inside `apply_captured_usage` (fire-and-forget, same as `spawn_persist_request_log`).
+    // `on_done` only offers the update to the bounded queue; it never waits on SQLite.
     let (parts, body) = response.into_parts();
     let stream = body.into_data_stream(); // Stream<Item = Result<Bytes, axum::Error>>
 
@@ -1643,16 +1984,40 @@ async fn responses_route(
     // `Instant::now()`. This makes `ttft_ms` and the wrapper's `duration_ms` share an origin with
     // each other (and with the route's own timing), which is what `derive_tps` in `read_api.rs`
     // requires to compute a sane tokens/sec for live rows.
-    let wrapped =
-        usage_capture::UsageCapturingStream::new(Box::pin(stream), start, move |captured| {
-            let repo = usage_repo;
+    let wrapped = usage_capture::UsageCapturingStream::new_with_eof_outcome(
+        Box::pin(stream),
+        start,
+        eof_outcome,
+        move |captured| {
+            let store = usage_store;
             let request_id = request_id;
             let model = model_for_cost;
-            tokio::spawn(async move {
-                apply_captured_usage(&repo, &request_id, model.as_deref(), captured).await;
-            });
-        });
+            if let Some(actual_tokens) = captured
+                .usage
+                .and_then(usage_capture::pressure_equivalent_tokens)
+            {
+                pressure_runtime.record_actual_pressure(estimated_tokens, actual_tokens);
+            }
+            apply_captured_usage(
+                &store,
+                &request_id,
+                model.as_deref(),
+                custom_pricing,
+                captured,
+            );
+        },
+    );
     Response::from_parts(parts, Body::from_stream(wrapped))
+}
+
+/// Replace any account-native upstream catalog identity with the root/pool virtual identity.
+/// `None` is meaningful: the exact fleet scope could not be authoritatively warmed, so exposing a
+/// selected member's raw ETag would be actively wrong.
+fn apply_scope_models_etag(response: &mut Response, catalog_etag: Option<String>) {
+    response.headers_mut().remove("x-models-etag");
+    if let Some(etag) = catalog_etag.and_then(|value| value.parse().ok()) {
+        response.headers_mut().insert("x-models-etag", etag);
+    }
 }
 
 /// B4/B5 Task 5: the production entrypoint reads the bounded failover loop's attempt cap from
@@ -1673,6 +2038,7 @@ async fn responses_handler_impl(
     pool: Option<&str>,
     headers: HeaderMap,
     raw: Bytes,
+    resolved_custom_route: Option<(CustomProvider, ProviderModel)>,
 ) -> (Response, RouteOutcome) {
     let max_attempts = state.runtime_settings.max_account_attempts();
     let starvation_wait_budget = state.runtime_settings.starvation_wait_budget();
@@ -1682,9 +2048,12 @@ async fn responses_handler_impl(
         pool,
         headers,
         raw,
-        max_attempts,
-        starvation_wait_budget,
-        starvation_heartbeat,
+        ResponsesHandlerOptions {
+            resolved_custom_route,
+            max_attempts,
+            starvation_budget: starvation_wait_budget,
+            starvation_heartbeat,
+        },
     )
     .await
 }
@@ -1710,9 +2079,12 @@ pub async fn responses_handler_impl_for_test(
         pool.as_deref(),
         headers,
         body,
-        max_attempts,
-        starvation::DEFAULT_WAIT_BUDGET,
-        starvation::DEFAULT_HEARTBEAT,
+        ResponsesHandlerOptions {
+            resolved_custom_route: None,
+            max_attempts,
+            starvation_budget: starvation::DEFAULT_WAIT_BUDGET,
+            starvation_heartbeat: starvation::DEFAULT_HEARTBEAT,
+        },
     )
     .await
     .0
@@ -1739,12 +2111,47 @@ pub async fn responses_handler_impl_for_test_with_starvation_timing(
         pool.as_deref(),
         headers,
         body,
-        max_attempts,
-        starvation_budget,
-        starvation_heartbeat,
+        ResponsesHandlerOptions {
+            resolved_custom_route: None,
+            max_attempts,
+            starvation_budget,
+            starvation_heartbeat,
+        },
     )
     .await
     .0
+}
+
+async fn execute_custom_model(
+    state: &AppState,
+    headers: &HeaderMap,
+    raw: &Bytes,
+    provider: CustomProvider,
+    provider_model: ProviderModel,
+    mut outcome: RouteOutcome,
+) -> (Response, RouteOutcome) {
+    let (response, custom) = crate::custom_provider::execute(
+        &state.store,
+        &state.cipher,
+        provider,
+        provider_model,
+        headers,
+        raw,
+    )
+    .await;
+    outcome.provider_slug = Some(custom.provider_slug);
+    outcome.provider_credential_id = custom.credential_id;
+    outcome.upstream_model = Some(custom.upstream_model);
+    outcome.upstream_transport = Some(custom.upstream_transport);
+    outcome.custom_pricing = match (
+        custom.input_per_million,
+        custom.cached_input_per_million,
+        custom.output_per_million,
+    ) {
+        (Some(input), Some(cached), Some(output)) => Some((input, cached, output)),
+        _ => None,
+    };
+    (response, outcome)
 }
 
 async fn responses_handler_impl_with_max_attempts(
@@ -1752,17 +2159,25 @@ async fn responses_handler_impl_with_max_attempts(
     pool: Option<&str>,
     headers: HeaderMap,
     raw: Bytes,
-    max_attempts: u32,
-    starvation_budget: Duration,
-    starvation_heartbeat: Duration,
+    options: ResponsesHandlerOptions,
 ) -> (Response, RouteOutcome) {
+    let ResponsesHandlerOptions {
+        resolved_custom_route,
+        max_attempts,
+        starvation_budget,
+        starvation_heartbeat,
+    } = options;
+    let (headers, raw) = match decode_responses_body(headers, raw).await {
+        Ok(decoded) => decoded,
+        Err(response) => return (response, RouteOutcome::default()),
+    };
     // Parse ONCE — but only the scalars + the `input` SHAPE, NOT the deep conversation tree. The
     // wire bytes are forwarded verbatim (see `PreparedRequest::raw_body`), so `body` stays `None`
     // here; everything the request path needs (model, tier, continuity ctx, input count) comes off
     // this cheap parse. Only a MALFORMED body (invalid JSON, or a non-object root) 400s here;
     // semantic/schema checks (field types, numeric ranges, duplicate keys) are deferred to upstream,
     // the schema authority — a genuine pass-through, matching the old full-`Value` parse's tolerance.
-    let facts = match parse_inbound(&headers, &raw) {
+    let facts = match parse_inbound_scoped(&headers, &raw, pool) {
         Some(f) => f,
         None => {
             return (
@@ -1772,6 +2187,7 @@ async fn responses_handler_impl_with_max_attempts(
         }
     };
     let model = facts.model;
+    let model_for_selection = model.clone();
     let now = unix_now();
     let tier = tier_from_effort(facts.effort.as_deref());
     // Model + effort are known from the parse itself, regardless of what happens next; account_id
@@ -1782,8 +2198,37 @@ async fn responses_handler_impl_with_max_attempts(
         account_id: None,
         model: Some(model.clone()),
         reasoning_effort: facts.effort.clone(),
+        service_tier: facts.service_tier.clone(),
         subagent: facts.ctx.subagent.clone(),
+        session_key: facts.ctx.session_key.as_ref().map(|key| key.value.clone()),
+        estimated_tokens: facts.ctx.estimated_tokens,
+        ..Default::default()
     };
+
+    if let Some((provider, provider_model)) = resolved_custom_route {
+        return execute_custom_model(&state, &headers, &raw, provider, provider_model, outcome)
+            .await;
+    }
+
+    // Custom models are a root-catalog contract. Resolve them before any built-in account or
+    // continuity selection so API-key providers never enter OAuth ownership machinery.
+    if pool.is_none() && !crate::catalog::model_slug_is_reserved(&state, &model) {
+        match state.store.providers().resolve_model(&model).await {
+            Ok(Some((provider, provider_model))) => {
+                return execute_custom_model(
+                    &state,
+                    &headers,
+                    &raw,
+                    provider,
+                    provider_model,
+                    outcome,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(_) => return (internal_error(), outcome),
+        }
+    }
 
     // C3: continuity ctx derived from headers + body at parse time.
     let ctx: RequestCtx = facts.ctx;
@@ -1813,6 +2258,12 @@ async fn responses_handler_impl_with_max_attempts(
     // M4a has no cross-format translator (that's M4b): `/responses` may only ever pick a
     // Codex-provider account. One pass also narrows to the requested pool (`None` = all accounts).
     let mut snapshots = filter_by_provider_and_pool(&snapshots, Provider::Codex, pool);
+    snapshots.retain(|snapshot| {
+        state
+            .model_catalog
+            .account_supports_model(snapshot.id.as_str(), &model_for_selection)
+            != Some(false)
+    });
     // Overlay live per-account routing state (error_count/cooldown/last_error) onto the filtered
     // slice so the selector's eligibility gates see real failure signal, not neutral defaults.
     state.runtime.overlay(&mut snapshots, now);
@@ -1846,144 +2297,401 @@ async fn responses_handler_impl_with_max_attempts(
         // C9 Task 3: startup-resolved (`AppState.inflight_penalty_pct`), never a per-request env
         // read — mirrors every other config-derived field on `sel_ctx`.
         inflight_penalty_pct: state.runtime_settings.inflight_penalty_pct(),
+        request_pressure_units: state.runtime.request_pressure_units(ctx.estimated_tokens),
     };
     let session_key = prepared.directive.session_key.clone();
 
-    // C5: ownership pre-filter.
-    let response =
-        match apply_ownership(&prepared.directive, &snapshots, selector.as_ref(), &sel_ctx) {
-            RouteDecision::Route(id) => {
-                // Stamp last_selected_at NOW (not at completion) so concurrent picks in a burst see this
-                // one — the round_robin + capacity_weighted tiebreaks read it.
-                state.runtime.record_selected(&id, now);
-                outcome.account_id = Some(id.as_str().to_string());
-                let (account, provider) = match resolve_core_account(&state, &id, now).await {
-                    Ok(a) => a,
-                    Err(r) => return (r, outcome),
-                };
-                let health_id = id.clone(); // `id` is moved into the executor below.
-                                            // C9 Task 2: the in-flight lease for this FIRST attempt on `id`. On success it
-                                            // rides inside the returned stream; on any `Err` below (including the
-                                            // `CapabilityRejection`/general-failure arms) it releases when
-                                            // `execute_with_watchdog_tracked`'s own frame ends — strictly before
-                                            // `reroute_cyber_rejection`/`run_failover_loop` (each of which acquires its OWN
-                                            // fresh lease for whatever account it tries next) ever runs.
-                let in_flight = state
+    // C5: ownership pre-filter. New/unowned work selects and reserves under one runtime-state
+    // critical section so a simultaneous main/subagent burst cannot all observe the same
+    // pre-lease snapshot. A hard continuation owner is not a balancing choice and keeps the
+    // ordinary acquire path below.
+    let (route_decision, mut reserved_in_flight) = if prepared.directive.pin_account.is_none() {
+        match state
+            .runtime
+            .select_and_acquire_wait(
+                &mut snapshots,
+                selector.as_ref(),
+                &sel_ctx,
+                now,
+                &state.lease_metrics,
+            )
+            .await
+        {
+            Some((id, lease)) => (RouteDecision::Route(id), Some(lease)),
+            None => (RouteDecision::NoEligibleAccount, None),
+        }
+    } else {
+        (
+            apply_ownership(&prepared.directive, &snapshots, selector.as_ref(), &sel_ctx),
+            None,
+        )
+    };
+
+    let response = match route_decision {
+        RouteDecision::Route(id) => {
+            outcome.account_id = Some(id.as_str().to_string());
+            let (account, provider) = match resolve_core_account(&state, &id, now).await {
+                Ok(a) => a,
+                Err(r) => return (r, outcome),
+            };
+            let health_id = id.clone(); // `id` is moved into the executor below.
+                                        // C9 Task 2: the in-flight lease for this FIRST attempt on `id`. On success it
+                                        // rides inside the returned stream; on any `Err` below (including the
+                                        // `CapabilityRejection`/general-failure arms) it releases when
+                                        // `execute_with_watchdog_tracked`'s own frame ends — strictly before
+                                        // `reroute_cyber_rejection`/`run_failover_loop` (each of which acquires its OWN
+                                        // fresh lease for whatever account it tries next) ever runs.
+            let in_flight = match reserved_in_flight.take() {
+                Some(lease) => lease,
+                None => {
+                    // A pinned continuation may wait briefly for its exact owner, including the
+                    // reserved recovery slot. It must never spill to another account merely
+                    // because that owner is busy: the previous response and turn state are scoped
+                    // to the selected upstream identity.
+                    let Some(lease) = state
+                        .runtime
+                        .acquire_pinned_in_flight_weighted(
+                            &id,
+                            now,
+                            &state.lease_metrics,
+                            sel_ctx.request_pressure_units,
+                        )
+                        .await
+                    else {
+                        return (no_eligible(), outcome);
+                    };
+                    lease
+                }
+            };
+            // TA6(b) Task 2: capture the recovery plan + a `ctx` clone BEFORE `prepared`/`ctx`
+            // move into the executor below, so a `CapabilityRejection` can trigger the cyber
+            // reselect+resend (`reroute_cyber_rejection`) without re-preparing the request.
+            let recovery_for_cyber = prepared.directive.recovery.clone();
+            let ctx_for_cyber = ctx.clone();
+            // B4 Task 4 — CONTINUITY OWNERSHIP gate (see the plan's Global Constraints): the
+            // bounded cross-account failover loop (`run_failover_loop`) may only fan out an
+            // ANCHORLESS attempt onto a NEW account. A live anchor (this turn is
+            // `WatchdogArm::Armed`, i.e. it carries `previous_response_id`) must NEVER be
+            // resent to a different account on a general (non-cyber) failure — that would
+            // re-home the conversation's ownership off the back of an ordinary retryable
+            // failure instead of the reviewed, capability-scoped `reroute_cyber_rejection`
+            // path, and risks re-opening the wedge. So an Armed turn's failure here surfaces
+            // exactly as before this task (today's 502) — see `tests/failover_loop.rs`'s `(e)`.
+            // A Disarmed turn's own request body carries no anchor at all, so it is already a
+            // self-sufficient resend for any account: clone it now, before `prepared` moves
+            // into the executor below, in case a failure needs to fail over.
+            let resend_req_for_loop = match prepared.directive.watchdog {
+                WatchdogArm::Disarmed => Some(prepared.req.clone()),
+                WatchdogArm::Armed { .. } => None,
+            };
+            let prepared_for_auth_retry = prepared.clone();
+            let rejected_access_token = account.bearer_token.clone();
+            let commit = CommitWitness::new();
+            let mut execution = execute_with_watchdog_tracked(
+                state.executor_for(provider).as_ref(),
+                state.continuity.clone(),
+                prepared,
+                &account,
+                id.clone(),
+                ctx.clone(),
+                state.runtime.clone(),
+                state.runtime_settings.stream_idle_timeout(),
+                max_attempts,
+                commit.clone(),
+                Some(in_flight),
+            )
+            .await;
+            let unauthorized = matches!(
+                &execution,
+                Err(WatchdogError::Upstream(Some(signal))) if signal.status == 401
+            ) || matches!(
+                &execution,
+                Err(WatchdogError::UpstreamHttp(response)) if response.signal.status == 401
+            );
+            if provider == Provider::Codex && unauthorized {
+                // A rejected bearer cannot have started model sampling. Return this slot before
+                // the synchronized same-account refresh so the authenticated retry, not the 401,
+                // spends the logical turn's generation budget.
+                state
                     .runtime
-                    .acquire_in_flight(&id, now, &state.lease_metrics);
-                // TA6(b) Task 2: capture the recovery plan + a `ctx` clone BEFORE `prepared`/`ctx`
-                // move into the executor below, so a `CapabilityRejection` can trigger the cyber
-                // reselect+resend (`reroute_cyber_rejection`) without re-preparing the request.
-                let recovery_for_cyber = prepared.directive.recovery.clone();
-                let ctx_for_cyber = ctx.clone();
-                // B4 Task 4 — CONTINUITY OWNERSHIP gate (see the plan's Global Constraints): the
-                // bounded cross-account failover loop (`run_failover_loop`) may only fan out an
-                // ANCHORLESS attempt onto a NEW account. A live anchor (this turn is
-                // `WatchdogArm::Armed`, i.e. it carries `previous_response_id`) must NEVER be
-                // resent to a different account on a general (non-cyber) failure — that would
-                // re-home the conversation's ownership off the back of an ordinary retryable
-                // failure instead of the reviewed, capability-scoped `reroute_cyber_rejection`
-                // path, and risks re-opening the wedge. So an Armed turn's failure here surfaces
-                // exactly as before this task (today's 502) — see `tests/failover_loop.rs`'s `(e)`.
-                // A Disarmed turn's own request body carries no anchor at all, so it is already a
-                // self-sufficient resend for any account: clone it now, before `prepared` moves
-                // into the executor below, in case a failure needs to fail over.
-                let resend_req_for_loop = match prepared.directive.watchdog {
-                    WatchdogArm::Disarmed => Some(prepared.req.clone()),
-                    WatchdogArm::Armed { .. } => None,
-                };
-                let commit = CommitWitness::new();
-                match execute_with_watchdog_tracked(
-                    state.executor_for(provider).as_ref(),
-                    state.continuity.clone(),
-                    prepared,
-                    &account,
-                    id,
-                    ctx.clone(),
-                    state.runtime.clone(),
-                    state.runtime_settings.stream_idle_timeout(),
-                    commit.clone(),
-                    Some(in_flight),
+                    .refund_logical_turn_attempt(ctx.logical_turn_key.as_deref());
+                match force_refresh_after_unauthorized(
+                    &state,
+                    &id,
+                    &rejected_access_token,
+                    unix_now(),
                 )
                 .await
                 {
-                    Ok(stream) => stream_response(stream),
-                    Err(WatchdogError::CapabilityRejection { .. }) => {
-                        // NOT an account-health signal (see `record_failure`'s doc): a capability
-                        // rejection says nothing about the owner's health, so no writeback here.
-                        // Composes with (does NOT conflict with) B4's general failover loop: a
-                        // `CapabilityRejection` always routes here, never into
-                        // `run_failover_loop`, regardless of `resend_req_for_loop`.
-                        reroute_cyber_rejection(
-                            &state,
-                            recovery_for_cyber,
-                            &snapshots,
-                            selector.as_ref(),
-                            &sel_ctx,
-                            ctx_for_cyber,
-                            session_key.clone(),
-                            now,
-                            &mut outcome,
+                    Ok(Some(refreshed_account)) => {
+                        let Some(retry_lease) = state
+                            .runtime
+                            .acquire_pinned_in_flight_weighted(
+                                &id,
+                                unix_now(),
+                                &state.lease_metrics,
+                                sel_ctx.request_pressure_units,
+                            )
+                            .await
+                        else {
+                            return (no_eligible(), outcome);
+                        };
+                        execution = execute_with_watchdog_tracked(
+                            state.executor_for(provider).as_ref(),
+                            state.continuity.clone(),
+                            prepared_for_auth_retry,
+                            &refreshed_account,
+                            id.clone(),
+                            ctx.clone(),
+                            state.runtime.clone(),
+                            state.runtime_settings.stream_idle_timeout(),
+                            max_attempts,
+                            commit.clone(),
+                            Some(retry_lease),
                         )
-                        .await
+                        .await;
                     }
-                    Err(e) => {
-                        record_failure(&state, &health_id, &e, unix_now()).await;
-                        match resend_req_for_loop {
-                            // Anchorless: eligible for the bounded cross-account failover loop.
-                            Some(resend_req) => {
-                                run_failover_loop(
-                                    &state,
-                                    health_id,
-                                    e,
-                                    commit.is_committed(),
-                                    resend_req,
-                                    &snapshots,
-                                    selector.as_ref(),
-                                    selector.clone(),
-                                    &sel_ctx,
-                                    ctx,
-                                    session_key.clone(),
-                                    now,
-                                    max_attempts,
-                                    pool_owned.clone(),
-                                    starvation_budget,
-                                    starvation_heartbeat,
-                                    &mut outcome,
-                                )
-                                .await
-                            }
-                            // A live-anchor pinned turn: surfaces exactly as before this task.
-                            None => (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
+                    Ok(None) => {}
+                    Err(response) => return (response, outcome),
+                }
+            }
+            match execution {
+                Ok(stream) => stream_response(stream),
+                Err(WatchdogError::CapabilityRejection { .. }) => {
+                    // NOT an account-health signal (see `record_failure`'s doc): a capability
+                    // rejection says nothing about the owner's health, so no writeback here.
+                    // Composes with (does NOT conflict with) B4's general failover loop: a
+                    // `CapabilityRejection` always routes here, never into
+                    // `run_failover_loop`, regardless of `resend_req_for_loop`.
+                    reroute_cyber_rejection(
+                        &state,
+                        recovery_for_cyber,
+                        &snapshots,
+                        selector.as_ref(),
+                        &sel_ctx,
+                        ctx_for_cyber,
+                        session_key.clone(),
+                        now,
+                        &mut outcome,
+                    )
+                    .await
+                }
+                Err(e) => {
+                    record_failure(&state, &health_id, &e, unix_now()).await;
+                    match resend_req_for_loop {
+                        // Anchorless: eligible for the bounded cross-account failover loop.
+                        Some(resend_req) => {
+                            run_failover_loop(
+                                &state,
+                                health_id,
+                                e,
+                                commit.is_committed(),
+                                resend_req,
+                                &snapshots,
+                                selector.as_ref(),
+                                selector.clone(),
+                                &sel_ctx,
+                                ctx,
+                                session_key.clone(),
+                                now,
+                                max_attempts,
+                                pool_owned.clone(),
+                                starvation_budget,
+                                starvation_heartbeat,
+                                &mut outcome,
+                            )
+                            .await
                         }
+                        // A live-anchor pinned turn: surfaces exactly as before this task.
+                        None => surface_watchdog_error(&e),
                     }
                 }
             }
-            RouteDecision::Recover => {
-                // Owner pinned but ineligible: recover on a freshly-selected account (full pool), or
-                // signal the client if the input is a bare tail.
-                match prepared.directive.recovery {
-                    RecoveryPlan::ResendFull { anchorless_req } => {
-                        let fresh = match selector.pick(&snapshots, &sel_ctx) {
-                            Some(id) => id,
-                            None => {
-                                // B5 Task 3 — Layer 1: guarded serve-soonest-error-backoff before
-                                // the 503, over the SAME snapshots the pick above just exhausted.
-                                // Cloned (not moved) so the ORIGINALS survive for Layer 2 below.
-                                let layer1 = try_layer1_serve_now(
-                                    &state,
+        }
+        RouteDecision::Recover => {
+            // Owner pinned but ineligible: recover on a freshly-selected account (full pool), or
+            // signal the client if the input is a bare tail.
+            match prepared.directive.recovery {
+                RecoveryPlan::ResendFull { anchorless_req } => {
+                    let fresh = match selector.pick(&snapshots, &sel_ctx) {
+                        Some(id) => id,
+                        None => {
+                            // B5 Task 3 — Layer 1: guarded serve-soonest-error-backoff before
+                            // the 503, over the SAME snapshots the pick above just exhausted.
+                            // Cloned (not moved) so the ORIGINALS survive for Layer 2 below.
+                            let layer1 = try_layer1_serve_now(
+                                &state,
+                                &snapshots,
+                                selector.as_ref(),
+                                &sel_ctx,
+                                anchorless_req.clone(),
+                                ctx.clone(),
+                                session_key.clone(),
+                                now,
+                                &mut outcome,
+                                &WaitClient::Codex,
+                            )
+                            .await;
+                            let resp = layer1.or_else(|| {
+                                try_layer2_recovery_wait(
+                                    state.clone(),
                                     &snapshots,
-                                    selector.as_ref(),
+                                    pool_owned.clone(),
+                                    Provider::Codex,
+                                    selector.clone(),
                                     &sel_ctx,
-                                    anchorless_req.clone(),
-                                    ctx.clone(),
-                                    session_key.clone(),
+                                    anchorless_req,
+                                    ctx,
+                                    session_key,
                                     now,
+                                    starvation_budget,
+                                    starvation_heartbeat,
                                     &mut outcome,
-                                    &WaitClient::Codex,
+                                    WaitClient::Codex,
                                 )
-                                .await;
-                                let resp = layer1.or_else(|| {
+                            });
+                            return (resp.unwrap_or_else(no_eligible), outcome);
+                        }
+                    };
+                    state.runtime.record_selected(&fresh, now);
+                    outcome.account_id = Some(fresh.as_str().to_string());
+                    let (account, provider) = match resolve_core_account(&state, &fresh, now).await
+                    {
+                        Ok(a) => a,
+                        Err(r) => return (r, outcome),
+                    };
+                    let health_id = fresh.clone(); // `fresh` is moved into the executor below.
+                                                   // C9 Task 2: the owner-ineligible recovery's reselected attempt on `fresh`
+                                                   // is a real upstream request — same lease treatment as every other
+                                                   // streaming selection site.
+                    let Some(in_flight) = state.runtime.try_acquire_in_flight_weighted(
+                        &fresh,
+                        now,
+                        &state.lease_metrics,
+                        sel_ctx.request_pressure_units,
+                    ) else {
+                        return (no_eligible(), outcome);
+                    };
+                    match execute_recovery_tracked(
+                        state.executor_for(provider).as_ref(),
+                        state.continuity.clone(),
+                        anchorless_req,
+                        &account,
+                        fresh,
+                        ctx,
+                        session_key,
+                        state.runtime.clone(),
+                        state.runtime_settings.stream_idle_timeout(),
+                        max_attempts,
+                        CommitWitness::new(),
+                        Some(in_flight),
+                    )
+                    .await
+                    {
+                        Ok(stream) => stream_response(stream),
+                        Err(e) => {
+                            record_failure(&state, &health_id, &e, unix_now()).await;
+                            surface_watchdog_error(&e)
+                        }
+                    }
+                }
+                RecoveryPlan::SignalClient => {
+                    let owner = prepared
+                        .directive
+                        .pin_account
+                        .clone()
+                        .unwrap_or_else(|| AccountId::from("unknown"));
+                    // No account is actually served here (the client is signaled, not relayed) —
+                    // but `owner` is the pinned account this request was scoped to, so it's still
+                    // a meaningful (and content-free) identifier to surface.
+                    outcome.account_id = Some(owner.as_str().to_string());
+                    let stream =
+                        signal_client_stream(state.continuity.clone(), ctx, owner, session_key)
+                            .await;
+                    stream_response(stream)
+                }
+                RecoveryPlan::None => {
+                    // No anchor ⇒ this request is self-sufficient (nothing to resume), so a
+                    // pinned-but-ineligible owner (cooldown / rate-limited / reauth_required /
+                    // a stale Soft session-row pin) is NOT fatal: fail over to any eligible
+                    // account from the FULL candidate pool, ignoring the pin, and relay as a
+                    // normal (Disarmed) request. `prepared.req` is still owned here — only
+                    // `directive.recovery` was moved by the outer match.
+                    match selector.pick(&snapshots, &sel_ctx) {
+                        Some(fresh) => {
+                            state.runtime.record_selected(&fresh, now);
+                            outcome.account_id = Some(fresh.as_str().to_string());
+                            let (account, provider) =
+                                match resolve_core_account(&state, &fresh, now).await {
+                                    Ok(a) => a,
+                                    Err(r) => return (r, outcome),
+                                };
+                            let fallback = Prepared {
+                                req: prepared.req,
+                                directive: ContinuityDirective {
+                                    pin_account: None,
+                                    watchdog: prepared.directive.watchdog,
+                                    recovery: RecoveryPlan::None,
+                                    session_key: prepared.directive.session_key.clone(),
+                                    require_security_work_authorized: prepared
+                                        .directive
+                                        .require_security_work_authorized,
+                                },
+                            };
+                            let health_id = fresh.clone(); // moved into the executor below.
+                                                           // C9 Task 2: the pin-ignoring fallback's attempt on `fresh` is a
+                                                           // real upstream request — same lease treatment as every other
+                                                           // streaming selection site.
+                            let Some(in_flight) = state.runtime.try_acquire_in_flight_weighted(
+                                &fresh,
+                                now,
+                                &state.lease_metrics,
+                                sel_ctx.request_pressure_units,
+                            ) else {
+                                return (no_eligible(), outcome);
+                            };
+                            match execute_with_watchdog_tracked(
+                                state.executor_for(provider).as_ref(),
+                                state.continuity.clone(),
+                                fallback,
+                                &account,
+                                fresh,
+                                ctx,
+                                state.runtime.clone(),
+                                state.runtime_settings.stream_idle_timeout(),
+                                max_attempts,
+                                CommitWitness::new(),
+                                Some(in_flight),
+                            )
+                            .await
+                            {
+                                Ok(stream) => stream_response(stream),
+                                Err(e) => {
+                                    record_failure(&state, &health_id, &e, unix_now()).await;
+                                    surface_watchdog_error(&e)
+                                }
+                            }
+                        }
+                        None => {
+                            // B5 Task 3 — Layer 1: guarded serve-soonest-error-backoff before
+                            // the 503. `prepared.req` is still owned here (see the comment
+                            // above — only `directive.recovery` was moved by the outer match).
+                            // Cloned (not moved) so the ORIGINAL survives for Layer 2 below.
+                            let layer1 = try_layer1_serve_now(
+                                &state,
+                                &snapshots,
+                                selector.as_ref(),
+                                &sel_ctx,
+                                prepared.req.clone(),
+                                ctx.clone(),
+                                session_key.clone(),
+                                now,
+                                &mut outcome,
+                                &WaitClient::Codex,
+                            )
+                            .await;
+                            layer1
+                                .or_else(|| {
                                     try_layer2_recovery_wait(
                                         state.clone(),
                                         &snapshots,
@@ -1991,7 +2699,7 @@ async fn responses_handler_impl_with_max_attempts(
                                         Provider::Codex,
                                         selector.clone(),
                                         &sel_ctx,
-                                        anchorless_req,
+                                        prepared.req,
                                         ctx,
                                         session_key,
                                         now,
@@ -2000,203 +2708,102 @@ async fn responses_handler_impl_with_max_attempts(
                                         &mut outcome,
                                         WaitClient::Codex,
                                     )
-                                });
-                                return (resp.unwrap_or_else(no_eligible), outcome);
-                            }
-                        };
-                        state.runtime.record_selected(&fresh, now);
-                        outcome.account_id = Some(fresh.as_str().to_string());
-                        let (account, provider) =
-                            match resolve_core_account(&state, &fresh, now).await {
-                                Ok(a) => a,
-                                Err(r) => return (r, outcome),
-                            };
-                        let health_id = fresh.clone(); // `fresh` is moved into the executor below.
-                                                       // C9 Task 2: the owner-ineligible recovery's reselected attempt on `fresh`
-                                                       // is a real upstream request — same lease treatment as every other
-                                                       // streaming selection site.
-                        let in_flight =
-                            state
-                                .runtime
-                                .acquire_in_flight(&fresh, now, &state.lease_metrics);
-                        match execute_recovery_tracked(
-                            state.executor_for(provider).as_ref(),
-                            state.continuity.clone(),
-                            anchorless_req,
-                            &account,
-                            fresh,
-                            ctx,
-                            session_key,
-                            state.runtime.clone(),
-                            state.runtime_settings.stream_idle_timeout(),
-                            CommitWitness::new(),
-                            Some(in_flight),
-                        )
-                        .await
-                        {
-                            Ok(stream) => stream_response(stream),
-                            Err(e) => {
-                                record_failure(&state, &health_id, &e, unix_now()).await;
-                                (StatusCode::BAD_GATEWAY, "upstream error").into_response()
-                            }
-                        }
-                    }
-                    RecoveryPlan::SignalClient => {
-                        let owner = prepared
-                            .directive
-                            .pin_account
-                            .clone()
-                            .unwrap_or_else(|| AccountId::from("unknown"));
-                        // No account is actually served here (the client is signaled, not relayed) —
-                        // but `owner` is the pinned account this request was scoped to, so it's still
-                        // a meaningful (and content-free) identifier to surface.
-                        outcome.account_id = Some(owner.as_str().to_string());
-                        let stream =
-                            signal_client_stream(state.continuity.clone(), ctx, owner, session_key)
-                                .await;
-                        stream_response(stream)
-                    }
-                    RecoveryPlan::None => {
-                        // No anchor ⇒ this request is self-sufficient (nothing to resume), so a
-                        // pinned-but-ineligible owner (cooldown / rate-limited / reauth_required /
-                        // a stale Soft session-row pin) is NOT fatal: fail over to any eligible
-                        // account from the FULL candidate pool, ignoring the pin, and relay as a
-                        // normal (Disarmed) request. `prepared.req` is still owned here — only
-                        // `directive.recovery` was moved by the outer match.
-                        match selector.pick(&snapshots, &sel_ctx) {
-                            Some(fresh) => {
-                                state.runtime.record_selected(&fresh, now);
-                                outcome.account_id = Some(fresh.as_str().to_string());
-                                let (account, provider) =
-                                    match resolve_core_account(&state, &fresh, now).await {
-                                        Ok(a) => a,
-                                        Err(r) => return (r, outcome),
-                                    };
-                                let fallback = Prepared {
-                                    req: prepared.req,
-                                    directive: ContinuityDirective {
-                                        pin_account: None,
-                                        watchdog: prepared.directive.watchdog,
-                                        recovery: RecoveryPlan::None,
-                                        session_key: prepared.directive.session_key.clone(),
-                                        require_security_work_authorized: prepared
-                                            .directive
-                                            .require_security_work_authorized,
-                                    },
-                                };
-                                let health_id = fresh.clone(); // moved into the executor below.
-                                                               // C9 Task 2: the pin-ignoring fallback's attempt on `fresh` is a
-                                                               // real upstream request — same lease treatment as every other
-                                                               // streaming selection site.
-                                let in_flight = state.runtime.acquire_in_flight(
-                                    &fresh,
-                                    now,
-                                    &state.lease_metrics,
-                                );
-                                match execute_with_watchdog_tracked(
-                                    state.executor_for(provider).as_ref(),
-                                    state.continuity.clone(),
-                                    fallback,
-                                    &account,
-                                    fresh,
-                                    ctx,
-                                    state.runtime.clone(),
-                                    state.runtime_settings.stream_idle_timeout(),
-                                    CommitWitness::new(),
-                                    Some(in_flight),
-                                )
-                                .await
-                                {
-                                    Ok(stream) => stream_response(stream),
-                                    Err(e) => {
-                                        record_failure(&state, &health_id, &e, unix_now()).await;
-                                        (StatusCode::BAD_GATEWAY, "upstream error").into_response()
-                                    }
-                                }
-                            }
-                            None => {
-                                // B5 Task 3 — Layer 1: guarded serve-soonest-error-backoff before
-                                // the 503. `prepared.req` is still owned here (see the comment
-                                // above — only `directive.recovery` was moved by the outer match).
-                                // Cloned (not moved) so the ORIGINAL survives for Layer 2 below.
-                                let layer1 = try_layer1_serve_now(
-                                    &state,
-                                    &snapshots,
-                                    selector.as_ref(),
-                                    &sel_ctx,
-                                    prepared.req.clone(),
-                                    ctx.clone(),
-                                    session_key.clone(),
-                                    now,
-                                    &mut outcome,
-                                    &WaitClient::Codex,
-                                )
-                                .await;
-                                layer1
-                                    .or_else(|| {
-                                        try_layer2_recovery_wait(
-                                            state.clone(),
-                                            &snapshots,
-                                            pool_owned.clone(),
-                                            Provider::Codex,
-                                            selector.clone(),
-                                            &sel_ctx,
-                                            prepared.req,
-                                            ctx,
-                                            session_key,
-                                            now,
-                                            starvation_budget,
-                                            starvation_heartbeat,
-                                            &mut outcome,
-                                            WaitClient::Codex,
-                                        )
-                                    })
-                                    .unwrap_or_else(no_eligible)
-                            }
+                                })
+                                .unwrap_or_else(no_eligible)
                         }
                     }
                 }
             }
-            RouteDecision::NoEligibleAccount => {
-                // B5 Task 3 — Layer 1: the unowned first-attempt pick found the eligible pool
-                // empty; try the guarded serve-soonest-error-backoff candidate before the 503.
-                // Cloned (not moved) so the ORIGINAL survives for Layer 2 below.
-                let layer1 = try_layer1_serve_now(
-                    &state,
-                    &snapshots,
-                    selector.as_ref(),
-                    &sel_ctx,
-                    prepared.req.clone(),
-                    ctx.clone(),
-                    session_key.clone(),
-                    now,
-                    &mut outcome,
-                    &WaitClient::Codex,
-                )
-                .await;
-                layer1
-                    .or_else(|| {
-                        try_layer2_recovery_wait(
-                            state.clone(),
-                            &snapshots,
-                            pool_owned.clone(),
-                            Provider::Codex,
-                            selector.clone(),
-                            &sel_ctx,
-                            prepared.req,
-                            ctx,
-                            session_key,
-                            now,
-                            starvation_budget,
-                            starvation_heartbeat,
-                            &mut outcome,
-                            WaitClient::Codex,
-                        )
-                    })
-                    .unwrap_or_else(no_eligible)
-            }
-        };
+        }
+        RouteDecision::NoEligibleAccount => {
+            // B5 Task 3 — Layer 1: the unowned first-attempt pick found the eligible pool
+            // empty; try the guarded serve-soonest-error-backoff candidate before the 503.
+            // Cloned (not moved) so the ORIGINAL survives for Layer 2 below.
+            let layer1 = try_layer1_serve_now(
+                &state,
+                &snapshots,
+                selector.as_ref(),
+                &sel_ctx,
+                prepared.req.clone(),
+                ctx.clone(),
+                session_key.clone(),
+                now,
+                &mut outcome,
+                &WaitClient::Codex,
+            )
+            .await;
+            layer1
+                .or_else(|| {
+                    try_layer2_recovery_wait(
+                        state.clone(),
+                        &snapshots,
+                        pool_owned.clone(),
+                        Provider::Codex,
+                        selector.clone(),
+                        &sel_ctx,
+                        prepared.req,
+                        ctx,
+                        session_key,
+                        now,
+                        starvation_budget,
+                        starvation_heartbeat,
+                        &mut outcome,
+                        WaitClient::Codex,
+                    )
+                })
+                .unwrap_or_else(no_eligible)
+        }
+    };
     (response, outcome)
+}
+
+async fn decode_responses_body(
+    mut headers: HeaderMap,
+    raw: Bytes,
+) -> Result<(HeaderMap, Bytes), Response> {
+    let encoding = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    match encoding {
+        None | Some("") | Some("identity") => Ok((headers, raw)),
+        Some(encoding) if encoding.eq_ignore_ascii_case("zstd") => {
+            let decoded = tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+
+                let decoder =
+                    zstd::stream::read::Decoder::new(std::io::Cursor::new(raw)).map_err(|_| ())?;
+                let mut bounded = decoder.take(crate::app::MAX_REQUEST_BODY_BYTES as u64 + 1);
+                let mut decoded = Vec::new();
+                bounded.read_to_end(&mut decoded).map_err(|_| ())?;
+                Ok::<Vec<u8>, ()>(decoded)
+            })
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "request decompression failed",
+                )
+                    .into_response()
+            })?
+            .map_err(|_| (StatusCode::BAD_REQUEST, "invalid zstd request body").into_response())?;
+            if decoded.len() > crate::app::MAX_REQUEST_BODY_BYTES {
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "decompressed request body exceeds limit",
+                )
+                    .into_response());
+            }
+            headers.remove(header::CONTENT_ENCODING);
+            headers.remove(header::CONTENT_LENGTH);
+            Ok((headers, Bytes::from(decoded)))
+        }
+        Some(_) => Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported content encoding",
+        )
+            .into_response()),
+    }
 }
 
 /// The `/v1/messages` ingress entrypoint. A client `model` string that `alias::lookup_alias` maps
@@ -2233,8 +2840,8 @@ async fn messages_route(
 ) -> Response {
     let start = Instant::now();
     maybe_capture_fingerprint(&state, "POST", "/v1/messages", &headers);
-    // Build the log repo BEFORE `state` moves into a sub-handler (it owns a cheap pool clone).
-    let log_repo = state.store.request_log();
+    // Keep the bounded background-writer handle before `state` moves into a sub-handler.
+    let log_store = state.store.clone();
     // Same reason: `state` moves into a sub-handler below, so grab the log-bus handle first.
     let log_bus = state.log_bus.clone();
     // C11b Task 2: same reason — grab the content-free `upstream_requests` counter handle before
@@ -2271,22 +2878,27 @@ async fn messages_route(
     let log = RequestLog {
         method: "POST",
         path: "/v1/messages",
-        provider,
+        provider: provider.to_string(),
         aliased: aliased_to_codex,
         status: response.status(),
         duration_ms: start.elapsed().as_millis() as u64,
         account_id: outcome.account_id,
+        target_kind: Some("account".to_string()),
+        provider_credential_id: None,
         model: outcome.model,
+        upstream_model: None,
+        upstream_transport: Some("http_sse".to_string()),
         reasoning_effort: outcome.reasoning_effort,
         // Not yet known at this chokepoint.
         service_tier: None,
-        transport: Some("http".to_string()),
+        transport: Some(response_transport(&response).to_string()),
         // TODO(follow-up): populate ttft/tokens from the stream observer.
         ttft_ms: None,
         total_tokens: None,
         cached_tokens: None,
         subagent: outcome.subagent,
         request_id: Some(request_id.clone()),
+        session_key: outcome.session_key,
     };
     log.emit();
     log_bus.publish(log.to_log_event());
@@ -2294,8 +2906,15 @@ async fn messages_route(
     // `(account_id, status)` pair `log` already carries — bumped exactly once per client request
     // (the final outcome only; per-attempt retries are `FailoverMetrics`, never double-counted
     // here).
-    upstream_request_metrics.record(log.account_id.as_deref(), log.status.as_u16());
-    spawn_persist_request_log(log_repo, log.record(unix_now()));
+    upstream_request_metrics.record_target(
+        &log.provider,
+        log.target_kind.as_deref().unwrap_or("account"),
+        log.account_id
+            .as_deref()
+            .or(log.provider_credential_id.as_deref()),
+        log.status.as_u16(),
+    );
+    queue_persist_request_log(&log_store, log.record(unix_now()));
 
     response
 }
@@ -2311,6 +2930,7 @@ async fn messages_handler_native(
     model: String,
 ) -> (Response, RouteOutcome) {
     let now = unix_now();
+    let estimated_tokens = estimate_materialized_request_tokens(&body, "messages", "max_tokens");
     // The client-requested model is known up front, regardless of what happens next; the native
     // Anthropic path carries no Codex-style reasoning-effort concept, so that field stays `None`.
     // No codex sub-agent concept either — this is a native Anthropic-Messages request.
@@ -2318,7 +2938,11 @@ async fn messages_handler_native(
         account_id: None,
         model: Some(model.clone()),
         reasoning_effort: None,
+        service_tier: None,
         subagent: None,
+        session_key: None,
+        estimated_tokens,
+        ..Default::default()
     };
     // Native Anthropic path: the AnthropicExecutor does not use `forward_headers` (that field is
     // the Codex egress identity set), so there is nothing to forward here.
@@ -2355,9 +2979,20 @@ async fn messages_handler_native(
         tier: None,
         // C9 Task 3: startup-resolved, never a per-request env read.
         inflight_penalty_pct: state.runtime_settings.inflight_penalty_pct(),
+        request_pressure_units: state.runtime.request_pressure_units(estimated_tokens),
     };
-    let picked = match selector.pick(&snapshots, &sel_ctx) {
-        Some(id) => id,
+    let (picked, in_flight) = match state
+        .runtime
+        .select_and_acquire_wait(
+            &mut snapshots,
+            selector.as_ref(),
+            &sel_ctx,
+            now,
+            &state.lease_metrics,
+        )
+        .await
+    {
+        Some(reservation) => reservation,
         None => {
             // B5-anthropic Task 3: the native `/v1/messages` mirror of `/responses`'s Layer 1 →
             // Layer 2 → `no_eligible` empty-pool fallthrough (see the `RouteDecision::
@@ -2406,7 +3041,6 @@ async fn messages_handler_native(
             return (resp.unwrap_or_else(no_eligible), outcome);
         }
     };
-    state.runtime.record_selected(&picked, now);
     outcome.account_id = Some(picked.as_str().to_string());
     let (account, provider) = match resolve_core_account(&state, &picked, now).await {
         Ok(a) => a,
@@ -2416,9 +3050,6 @@ async fn messages_handler_native(
     let health_id = picked.clone(); // moved into the executor below.
                                     // C9 Task 2: the native `/v1/messages` streaming selection site — same lease treatment as
                                     // `/responses`'s Route arm.
-    let in_flight = state
-        .runtime
-        .acquire_in_flight(&picked, now, &state.lease_metrics);
     let response = match execute_with_watchdog_tracked(
         state.executor_for(provider).as_ref(),
         Arc::new(NoopContinuity) as Arc<dyn Continuity>,
@@ -2428,6 +3059,7 @@ async fn messages_handler_native(
         ctx,
         state.runtime.clone(),
         state.runtime_settings.stream_idle_timeout(),
+        state.runtime_settings.max_account_attempts(),
         CommitWitness::new(),
         Some(in_flight),
     )
@@ -2436,7 +3068,7 @@ async fn messages_handler_native(
         Ok(stream) => stream_response(stream),
         Err(e) => {
             record_failure(&state, &health_id, &e, unix_now()).await;
-            (StatusCode::BAD_GATEWAY, "upstream error").into_response()
+            surface_watchdog_error(&e)
         }
     };
     (response, outcome)
@@ -2468,7 +3100,11 @@ async fn messages_handler_codex_aliased(
         account_id: None,
         model: Some(model_alias.target_model.clone()),
         reasoning_effort: model_alias.reasoning_effort.clone(),
+        service_tier: None,
         subagent: None,
+        session_key: None,
+        estimated_tokens: 0,
+        ..Default::default()
     };
     // Outcome 3: the client's stream preference, read BEFORE `body` moves into
     // `translate_request` below. Anthropic's Messages API defaults `stream:false` — absent means
@@ -2499,6 +3135,9 @@ async fn messages_handler_codex_aliased(
         let key = derive_alias_prompt_cache_key(&translated_body);
         translated_body["prompt_cache_key"] = serde_json::Value::String(key);
     }
+    let estimated_tokens =
+        estimate_materialized_request_tokens(&translated_body, "input", "max_output_tokens");
+    outcome.estimated_tokens = estimated_tokens;
 
     // Translated path: there is no real Codex client to forward, so SYNTHESIZE codex-rs's identity
     // headers (see `synthesize_codex_forward_headers`). Mirrors codex-lb's forward-native /
@@ -2509,6 +3148,7 @@ async fn messages_handler_codex_aliased(
         &translated_body,
         &state.codex_version.cached_or_fallback(),
     );
+    let model_for_selection = model_alias.target_model.clone();
     let req = PreparedRequest {
         // Translated alias body is built, not a raw pass-through ⇒ serialized by the executor.
         body: Some(translated_body),
@@ -2530,6 +3170,12 @@ async fn messages_handler_codex_aliased(
     // The mirror of `/responses`'s Codex-only filter: an aliased-to-Codex turn may only ever pick
     // a Codex-provider account, regardless of what `/v1/messages` itself would otherwise select.
     let mut snapshots = filter_by_provider_and_pool(&snapshots, Provider::Codex, pool);
+    snapshots.retain(|snapshot| {
+        state
+            .model_catalog
+            .account_supports_model(snapshot.id.as_str(), &model_for_selection)
+            != Some(false)
+    });
     state.runtime.overlay(&mut snapshots, now);
     let selector = state.selector_for(pool);
     let sel_ctx = SelectionCtx {
@@ -2541,9 +3187,20 @@ async fn messages_handler_codex_aliased(
         tier: tier_from_effort(model_alias.reasoning_effort.as_deref()),
         // C9 Task 3: startup-resolved, never a per-request env read.
         inflight_penalty_pct: state.runtime_settings.inflight_penalty_pct(),
+        request_pressure_units: state.runtime.request_pressure_units(estimated_tokens),
     };
-    let picked = match selector.pick(&snapshots, &sel_ctx) {
-        Some(id) => id,
+    let (picked, in_flight) = match state
+        .runtime
+        .select_and_acquire_wait(
+            &mut snapshots,
+            selector.as_ref(),
+            &sel_ctx,
+            now,
+            &state.lease_metrics,
+        )
+        .await
+    {
+        Some(reservation) => reservation,
         None => {
             // KNOWN LIMITATION (M4 non-streaming, 2026-07-22): this pool-STARVATION recovery-wait
             // fallback always returns SSE (via `try_layer1/2` → `stream_response`), even for a
@@ -2602,7 +3259,6 @@ async fn messages_handler_codex_aliased(
             return (resp.unwrap_or_else(no_eligible), outcome);
         }
     };
-    state.runtime.record_selected(&picked, now);
     outcome.account_id = Some(picked.as_str().to_string());
     let (account, provider) = match resolve_core_account(&state, &picked, now).await {
         Ok(a) => a,
@@ -2614,9 +3270,6 @@ async fn messages_handler_codex_aliased(
                                     // as `/responses`'s Route arm. `wrap_translating_stream` below just wraps the returned
                                     // `ResponseStream` (the `ObservingStream` carrying `_in_flight`) in another stream layer that
                                     // owns it by value — the lease's lifetime is unaffected by the translation wrapper.
-    let in_flight = state
-        .runtime
-        .acquire_in_flight(&picked, now, &state.lease_metrics);
     let response = match execute_with_watchdog_tracked(
         state.executor_for(provider).as_ref(),
         Arc::new(NoopContinuity) as Arc<dyn Continuity>,
@@ -2626,6 +3279,7 @@ async fn messages_handler_codex_aliased(
         ctx,
         state.runtime.clone(),
         state.runtime_settings.stream_idle_timeout(),
+        state.runtime_settings.max_account_attempts(),
         CommitWitness::new(),
         Some(in_flight),
     )
@@ -2650,7 +3304,7 @@ async fn messages_handler_codex_aliased(
         }
         Err(e) => {
             record_failure(&state, &health_id, &e, unix_now()).await;
-            (StatusCode::BAD_GATEWAY, "upstream error").into_response()
+            surface_watchdog_error(&e)
         }
     };
     (response, outcome)
@@ -2658,8 +3312,77 @@ async fn messages_handler_codex_aliased(
 
 #[cfg(test)]
 mod tests {
-    use super::derive_alias_prompt_cache_key;
+    use super::{
+        apply_scope_models_etag, derive_alias_prompt_cache_key, response_transport,
+        surface_watchdog_error, WaitClient,
+    };
+    use crate::watchdog::WatchdogError;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Response, StatusCode};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn logical_turn_budget_error_is_non_retryable_and_content_safe() {
+        let response = surface_watchdog_error(&WatchdogError::AttemptBudgetExhausted);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "logical_turn_attempts_exhausted");
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+    }
+
+    #[test]
+    fn post_commit_attempt_budget_frame_is_non_retryable_for_each_dialect() {
+        let codex =
+            String::from_utf8(WaitClient::Codex.attempt_budget_error_frame().to_vec()).unwrap();
+        assert!(codex.contains("\"code\":\"invalid_prompt\""));
+        assert!(codex.contains("logical turn exhausted"));
+
+        let anthropic =
+            String::from_utf8(WaitClient::Anthropic.attempt_budget_error_frame().to_vec()).unwrap();
+        assert!(anthropic.contains("\"type\":\"invalid_request_error\""));
+        assert!(anthropic.contains("logical turn exhausted"));
+    }
+
+    #[test]
+    fn response_transport_distinguishes_sse_from_buffered_http() {
+        let sse = Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+            .body(Body::empty())
+            .unwrap();
+        let json = Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::empty())
+            .unwrap();
+
+        assert_eq!(response_transport(&sse), "sse");
+        assert_eq!(response_transport(&json), "http");
+    }
+
+    #[test]
+    fn scoped_response_etag_never_leaks_selected_accounts_native_identity() {
+        let mut cold = Response::builder()
+            .header("x-models-etag", "account-native")
+            .body(Body::empty())
+            .unwrap();
+        apply_scope_models_etag(&mut cold, None);
+        assert!(
+            cold.headers().get("x-models-etag").is_none(),
+            "cold scope must remove the selected account's native ETag"
+        );
+
+        let mut warm = Response::builder()
+            .header("x-models-etag", "account-native")
+            .body(Body::empty())
+            .unwrap();
+        apply_scope_models_etag(&mut warm, Some("\"polyflare-scope\"".to_string()));
+        assert_eq!(
+            warm.headers()
+                .get("x-models-etag")
+                .and_then(|value| value.to_str().ok()),
+            Some("\"polyflare-scope\"")
+        );
+    }
 
     /// The same conversation across turns (same system prompt + same first message, later turns
     /// append more input) must yield the SAME key — that is what makes the prompt cache hit.
@@ -2820,7 +3543,11 @@ mod tests {
                 status: 200,
                 duration_ms: 1000,
                 account_id: Some("acct-1".into()),
+                target_kind: Some("account".into()),
+                provider_credential_id: None,
                 model: Some("gpt-5.6-sol".into()),
+                upstream_model: None,
+                upstream_transport: Some("http_sse".into()),
                 reasoning_effort: None,
                 service_tier: None,
                 transport: Some("http".into()),
@@ -2829,12 +3556,17 @@ mod tests {
                 cached_tokens: None,
                 subagent: None,
                 request_id: Some(request_id.into()),
+                session_key: None,
                 input_tokens: None,
                 output_tokens: None,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                orchestration_input_tokens: None,
+                orchestration_output_tokens: None,
+                orchestration_cached_input_tokens: None,
                 cost_usd: None,
                 latency_first_token_ms: None,
+                protocol_outcome: None,
             }
         }
 
@@ -2846,7 +3578,7 @@ mod tests {
         /// Live-row-tps-basis fix: ALSO asserts `duration_ms` is overwritten from the insert's
         /// baseline (1000, `sample_record`'s route+setup-only figure) to the captured end-to-end
         /// value (9000), and that the row's numbers now derive a SANE tokens/sec — mirroring
-        /// `read_api::derive_tps`'s `total_tokens / ((duration_ms - ttft_ms) / 1000.0)` formula
+        /// `read_api::derive_tps`'s `output_tokens / ((duration_ms - ttft_ms) / 1000.0)` formula
         /// (that fn is private to `read_api.rs`, so this inlines the identical arithmetic) — rather
         /// than the pre-fix bug where `duration_ms` (route+setup only, e.g. ~50ms) could be SMALLER
         /// than a wrapper-origin `ttft_ms`, driving `derive_tps` to `None`/nonsense or an inflated
@@ -2864,11 +3596,14 @@ mod tests {
                     output_tokens: Some(10_000),
                     cached_input_tokens: Some(20_000),
                     reasoning_tokens: Some(500),
+                    ..Default::default()
                 }),
                 ttft_ms: Some(1200),
                 duration_ms: Some(9000),
+                protocol_outcome: polyflare_store::RequestProtocolOutcome::Completed,
             };
-            apply_captured_usage(&repo, "rq", Some("gpt-5.6-sol"), captured).await;
+            apply_captured_usage(&store, "rq", Some("gpt-5.6-sol"), None, captured);
+            store.flush_background_writes().await.unwrap();
 
             let row = repo
                 .list(10, 0)
@@ -2895,48 +3630,46 @@ mod tests {
                  the insert's route+setup-only baseline (1000)"
             );
 
-            // Same-origin sanity: total_tokens falls back to input+output (110_000, matching
-            // `read_api::requests_handler`'s fallback since this row's `total_tokens` column is
-            // never set by `update_usage`), and `derive_tps`'s formula on the now-consistent
-            // duration_ms/ttft_ms pair must be a finite, positive number — not the inflated or
-            // nonsensical value the pre-fix two-clock-origins bug produced.
-            let total_tokens = 100_000_i64 + 10_000_i64;
+            // Same-origin sanity: generation throughput uses output tokens only, and
+            // `derive_tps`'s formula on the now-consistent duration_ms/ttft_ms pair must be a
+            // finite, positive number — not the inflated or nonsensical value the pre-fix
+            // two-clock-origins bug produced.
+            let output_tokens = 10_000_i64;
             let window_ms = row.duration_ms - row.latency_first_token_ms.unwrap();
             assert!(
                 window_ms > 0,
                 "post-TTFT generation window must be positive"
             );
-            let tps = total_tokens as f64 / (window_ms as f64 / 1000.0);
+            let tps = output_tokens as f64 / (window_ms as f64 / 1000.0);
             assert!(
                 tps.is_finite() && tps > 0.0,
                 "expected a sane finite tps, got {tps}"
             );
         }
 
-        /// `captured.usage = None` (e.g. the client disconnected before a `response.completed`
-        /// frame arrived) must be a no-op — the row's usage columns stay `None`, never zeroed out.
-        /// `apply_captured_usage` returns early in this branch (never calls `update_usage` at
-        /// all), so `duration_ms` also stays at `sample_record`'s insert-time baseline (1000)
-        /// despite `captured.duration_ms` being `Some(4000)` — the same-origin `duration_ms` fix
-        /// only ever overwrites a row when usage was actually captured.
+        /// `captured.usage = None` (e.g. disconnect before `response.completed`) keeps token/cost
+        /// evidence unknown while still persisting the independently observed TTFT and end-to-end
+        /// duration.
         #[tokio::test]
-        async fn no_usage_captured_leaves_the_row_untouched() {
+        async fn no_usage_captured_still_persists_observed_stream_timings() {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::open(&dir.path().join("s.db")).await.unwrap();
             let repo = store.request_log();
             repo.insert(&sample_record("rq2")).await.unwrap();
 
             apply_captured_usage(
-                &repo,
+                &store,
                 "rq2",
                 Some("gpt-5.6-sol"),
+                None,
                 CapturedUsage {
                     usage: None,
                     ttft_ms: Some(500),
                     duration_ms: Some(4000),
+                    protocol_outcome: polyflare_store::RequestProtocolOutcome::Cancelled,
                 },
-            )
-            .await;
+            );
+            store.flush_background_writes().await.unwrap();
 
             let row = repo
                 .list(10, 0)
@@ -2948,11 +3681,51 @@ mod tests {
             assert_eq!(row.input_tokens, None);
             assert_eq!(row.output_tokens, None);
             assert_eq!(row.cost_usd, None);
-            assert_eq!(row.latency_first_token_ms, None);
+            assert_eq!(row.latency_first_token_ms, Some(500));
             assert_eq!(
-                row.duration_ms, 1000,
-                "no update_usage call at all in this branch — duration_ms stays at insert baseline"
+                row.duration_ms, 4000,
+                "observed end-to-end latency must not be discarded with missing final usage"
             );
+        }
+
+        #[tokio::test]
+        async fn missing_output_usage_stays_unknown_instead_of_becoming_zero() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("s.db")).await.unwrap();
+            let repo = store.request_log();
+            repo.insert(&sample_record("rq3")).await.unwrap();
+
+            apply_captured_usage(
+                &store,
+                "rq3",
+                Some("gpt-5.6-sol"),
+                None,
+                CapturedUsage {
+                    usage: Some(ResponseUsage {
+                        input_tokens: Some(1_000),
+                        output_tokens: None,
+                        cached_input_tokens: None,
+                        reasoning_tokens: None,
+                        ..Default::default()
+                    }),
+                    ttft_ms: Some(250),
+                    duration_ms: Some(2000),
+                    protocol_outcome: polyflare_store::RequestProtocolOutcome::Completed,
+                },
+            );
+            store.flush_background_writes().await.unwrap();
+
+            let row = repo
+                .list(10, 0)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.request_id.as_deref() == Some("rq3"))
+                .unwrap();
+            assert_eq!(row.input_tokens, Some(1_000));
+            assert_eq!(row.output_tokens, None);
+            assert_eq!(row.cached_input_tokens, None);
+            assert_eq!(row.cost_usd, None);
         }
     }
 }

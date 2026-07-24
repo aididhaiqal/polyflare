@@ -10,11 +10,13 @@ pub mod oauth;
 pub mod ws;
 
 pub use codex_version::CodexVersionCache;
-pub use control_forward::{control_forward, control_url, ControlError, ControlResponse};
+pub use control_forward::{
+    control_forward, control_forward_with_limit, control_url, ControlError, ControlResponse,
+};
 pub use executor::{build_client, CodexExecutor};
 pub use login::{run_login, LoginError};
 pub use oauth::{
     classify_failure, decode_claims, should_refresh, token_exp, Claims, FailureClass, OAuthClient,
     OAuthError, Refreshed, RefreshedTokens,
 };
-pub use ws::{CodexWsExecutor, WsConn};
+pub use ws::{CodexWsExecutor, WsConn, WsRelayContract};

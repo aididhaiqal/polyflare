@@ -164,6 +164,7 @@ async fn spawn(upstream_url: String) -> (String, Arc<AppState>) {
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -231,15 +232,27 @@ async fn a_429_cools_the_account_down_and_benches_it_next_request() {
     let client = reqwest::Client::new();
     let body = serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"});
 
-    // Request 1: the only account 429s ⇒ the client sees a generic 502, and record_failure writes
-    // the runtime cooldown for that account.
+    // Request 1: the only account 429s ⇒ the client receives the faithful upstream status, and
+    // record_failure writes the runtime cooldown for that account.
     let r1 = client
         .post(format!("{pf}/responses"))
         .json(&body)
         .send()
         .await
         .unwrap();
-    assert_eq!(r1.status(), 502, "a 429 upstream surfaces as a generic 502");
+    assert_eq!(r1.status(), 429, "the upstream 429 status is preserved");
+    assert_eq!(
+        r1.headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("90"),
+        "actionable retry metadata is preserved"
+    );
+    assert_eq!(
+        r1.text().await.unwrap(),
+        "rate limited",
+        "the bounded opaque upstream error body is preserved"
+    );
 
     // The runtime state now carries a cooldown honoring the Retry-After (90s ≥ the 30s floor).
     let mut snaps = vec![AccountSnapshot::new("acct-1")];
@@ -294,8 +307,8 @@ async fn a_401_invalid_grant_parks_a_durable_reauth_required_status() {
         .unwrap();
     assert_eq!(
         resp.status(),
-        502,
-        "surfaces as the generic 502 like any other upstream failure"
+        401,
+        "the upstream authentication status is preserved"
     );
 
     // Durable status write: read straight from the store, not the runtime overlay.
@@ -339,7 +352,7 @@ async fn an_account_deactivated_code_parks_a_durable_deactivated_status() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 502);
+    assert_eq!(resp.status(), 403);
 
     let stored = state
         .store
@@ -351,21 +364,8 @@ async fn an_account_deactivated_code_parks_a_durable_deactivated_status() {
     assert_eq!(stored.status, "deactivated");
 }
 
-/// A6 (resolved as retirement — see `record_quota_exceeded`'s doc comment and
-/// `docs/PORTING-CODEXLB.md`'s A6 audit note for the full evidence trail): the REAL upstream wire
-/// code for a quota-exhausted account is `insufficient_quota` (verified against `codex-rs`'s
-/// `codex-api/src/sse/responses.rs:630` / `api_bridge.rs:21` and the `quota_exceeded_emits_single_
-/// error_event` test in `codex-rs/core/tests/suite/quota_exceeded.rs`). Even when that exact code
-/// DOES reach `FailureSignal.error_code` (this test forces it to, via the same
-/// `spawn_error_code_upstream` helper A7's tests use), `classify_failure("insufficient_quota")` is
-/// `Transient` (no quota bucket exists there — confirmed in `oauth.rs:105-123`), so the request path
-/// must fall through to the ORDINARY status-keyed bucketing: a 429 still routes to
-/// `record_rate_limit`, never to `record_quota_exceeded`. Distinguishing signal: `record_rate_limit`
-/// bumps `error_count` and sets a cooldown at the 30s floor; `record_quota_exceeded` would leave
-/// `error_count` at 0 and set a 120s cooldown instead — the two are asserted together so either
-/// mistake (wrong counter OR wrong cooldown magnitude) fails this test.
 #[tokio::test]
-async fn an_insufficient_quota_code_on_a_429_still_routes_via_rate_limit_not_quota_exceeded() {
+async fn an_insufficient_quota_code_uses_capacity_cooldown_not_health_penalty() {
     let upstream = spawn_error_code_upstream(429, "insufficient_quota").await;
     let (pf, state) = spawn(upstream).await;
     let body = serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"});
@@ -378,8 +378,8 @@ async fn an_insufficient_quota_code_on_a_429_still_routes_via_rate_limit_not_quo
         .unwrap();
     assert_eq!(
         resp.status(),
-        502,
-        "surfaces as the generic 502 like any other upstream failure"
+        429,
+        "the upstream capacity status is preserved"
     );
 
     // No durable park: Transient has no `.status()`, so A7's branch is a no-op here too.
@@ -398,25 +398,18 @@ async fn an_insufficient_quota_code_on_a_429_still_routes_via_rate_limit_not_quo
     let mut snaps = vec![AccountSnapshot::new("acct-1")];
     state.runtime.overlay(&mut snaps, now());
     assert_eq!(
-        snaps[0].error_count, 1,
-        "record_rate_limit bumped error_count — record_quota_exceeded (which does NOT bump it) was \
-         not called"
+        snaps[0].error_count, 0,
+        "quota exhaustion is capacity, not an account-health error"
     );
-    assert_eq!(
-        snaps[0].cooldown_until,
-        Some(snaps[0].last_error_at.unwrap() + 30),
-        "the 30s rate-limit floor (no Retry-After header here), NOT the 120s quota cooldown"
+    let remaining = snaps[0].cooldown_until.unwrap() - now();
+    assert!(
+        (119..=polyflare_server::runtime_state::QUOTA_EXCEEDED_COOLDOWN_SECS).contains(&remaining),
+        "the short quota cooldown protects selection until usage refresh supplies the real reset"
     );
 }
 
-/// A6 companion: the OTHER real quota wire code, `usage_not_included` (verified against `codex-rs`'s
-/// `codex-api/src/sse/responses.rs:634` / `api_bridge.rs:22,112-113`), arriving on a NON-429 status
-/// (403) still routes via the ordinary transient bucket (`record_transient_error`), never
-/// `record_quota_exceeded`. Distinguishing signal: transient sets NO cooldown at all, while
-/// `record_quota_exceeded` would set one (+120s) without bumping `error_count` — the opposite
-/// signature, so either mistake fails this test too.
 #[tokio::test]
-async fn a_usage_not_included_code_on_a_403_still_routes_via_transient_not_quota_exceeded() {
+async fn a_usage_not_included_code_is_also_capacity_not_health() {
     let upstream = spawn_error_code_upstream(403, "usage_not_included").await;
     let (pf, state) = spawn(upstream).await;
     let body = serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"});
@@ -427,7 +420,7 @@ async fn a_usage_not_included_code_on_a_403_still_routes_via_transient_not_quota
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 502);
+    assert_eq!(resp.status(), 403);
 
     let stored = state
         .store
@@ -441,13 +434,12 @@ async fn a_usage_not_included_code_on_a_403_still_routes_via_transient_not_quota
     let mut snaps = vec![AccountSnapshot::new("acct-1")];
     state.runtime.overlay(&mut snaps, now());
     assert_eq!(
-        snaps[0].error_count, 1,
-        "record_transient_error bumped error_count"
+        snaps[0].error_count, 0,
+        "usage_not_included must not poison account health"
     );
-    assert_eq!(
-        snaps[0].cooldown_until, None,
-        "record_transient_error sets no cooldown — a 120s quota cooldown here would prove \
-         record_quota_exceeded fired instead"
+    let remaining = snaps[0].cooldown_until.unwrap() - now();
+    assert!(
+        (119..=polyflare_server::runtime_state::QUOTA_EXCEEDED_COOLDOWN_SECS).contains(&remaining)
     );
 }
 
@@ -466,7 +458,7 @@ async fn a_plain_500_with_no_code_still_routes_transient_not_durable() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 502);
+    assert_eq!(resp.status(), 500);
 
     let stored = state
         .store

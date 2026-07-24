@@ -54,6 +54,7 @@ rand = { workspace = true }
 # (where it was already present for test code) to a real dependency now that `src/keys.rs` needs
 # it too.
 base64 = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
 polyflare-testkit = { path = "../polyflare-testkit" }

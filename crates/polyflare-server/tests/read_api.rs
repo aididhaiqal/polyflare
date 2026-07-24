@@ -94,7 +94,11 @@ async fn seed_store() -> Store {
             status: 200,
             duration_ms: 12,
             account_id: None,
+            target_kind: None,
+            provider_credential_id: None,
             model: None,
+            upstream_model: None,
+            upstream_transport: None,
             reasoning_effort: None,
             service_tier: None,
             transport: None,
@@ -103,12 +107,17 @@ async fn seed_store() -> Store {
             cached_tokens: None,
             subagent: None,
             request_id: None,
+            session_key: None,
             input_tokens: None,
             output_tokens: None,
             cached_input_tokens: None,
             reasoning_tokens: None,
+            orchestration_input_tokens: None,
+            orchestration_output_tokens: None,
+            orchestration_cached_input_tokens: None,
             cost_usd: None,
             latency_first_token_ms: None,
+            protocol_outcome: None,
         })
         .await
         .unwrap();
@@ -182,6 +191,7 @@ async fn spawn_with_state(store: Store) -> (String, Arc<AppState>) {
             live_logs: true,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -290,7 +300,11 @@ async fn accounts_endpoint_carries_provider_pool_usage_token_health_and_request_
             status: 200,
             duration_ms: 10,
             account_id: Some("codex-c".to_string()),
+            target_kind: Some("account".to_string()),
+            provider_credential_id: None,
             model: None,
+            upstream_model: None,
+            upstream_transport: None,
             reasoning_effort: None,
             service_tier: None,
             transport: None,
@@ -299,12 +313,17 @@ async fn accounts_endpoint_carries_provider_pool_usage_token_health_and_request_
             cached_tokens: None,
             subagent: None,
             request_id: None,
+            session_key: None,
             input_tokens: None,
             output_tokens: None,
             cached_input_tokens: None,
             reasoning_tokens: None,
+            orchestration_input_tokens: None,
+            orchestration_output_tokens: None,
+            orchestration_cached_input_tokens: None,
             cost_usd: None,
             latency_first_token_ms: None,
+            protocol_outcome: None,
         })
         .await
         .unwrap();
@@ -586,7 +605,15 @@ async fn pools_endpoint_carries_available_usage_percent_and_strategy() {
 
 #[tokio::test]
 async fn requests_endpoint_pages_the_log() {
-    let pf = spawn(seed_store().await).await;
+    let store = seed_store().await;
+    sqlx::query(
+        "UPDATE request_log SET session_key = 'hashed-request-session', \
+         protocol_outcome = 'incomplete'",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let pf = spawn(store).await;
     let client = reqwest::Client::new();
     let body: serde_json::Value = client
         .get(format!("{pf}/api/requests?limit=10"))
@@ -603,6 +630,180 @@ async fn requests_endpoint_pages_the_log() {
     assert_eq!(rows[0]["path"], "/responses");
     assert_eq!(rows[0]["status"], 200);
     assert_eq!(rows[0]["duration_ms"], 12);
+    assert_eq!(rows[0]["session_key"], "hashed-request-session");
+    assert_eq!(rows[0]["protocol_outcome"], "incomplete");
+
+    let exact: serde_json::Value = client
+        .get(format!(
+            "{pf}/api/requests?session_key=hashed-request-session"
+        ))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(exact["total"], 1);
+    assert_eq!(exact["rows"][0]["session_key"], "hashed-request-session");
+}
+
+#[tokio::test]
+async fn requests_endpoint_preserves_imported_outcome_when_http_status_is_unknown() {
+    let store = seed_store().await;
+    sqlx::query(
+        "UPDATE request_log SET status = 0, outcome = 'success', error_code = NULL, \
+         transport = 'websocket'",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO request_log \
+         (requested_at, provider, method, path, aliased, status, duration_ms, outcome, error_code, transport) \
+         VALUES (?, 'codex', 'POST', '/responses', 0, 0, 25, 'error', 'stream_incomplete', 'websocket')",
+    )
+    .bind(now())
+    .execute(store.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO request_log \
+         (requested_at, provider, method, path, aliased, status, duration_ms, outcome, error_code, transport) \
+         VALUES (?, 'codex', 'POST', '/responses', 0, 0, 30, 'error', \
+                 'free form upstream failure: do not expose', 'websocket')",
+    )
+    .bind(now())
+    .execute(store.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO request_log \
+         (requested_at, provider, method, path, aliased, status, duration_ms, outcome, error_code, transport) \
+         VALUES (?, 'codex', 'POST', '/responses', 0, 0, 35, \
+                 'arbitrary imported outcome', 'also arbitrary', 'websocket')",
+    )
+    .bind(now())
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    let pf = spawn(store).await;
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/requests?limit=10"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = body["rows"].as_array().unwrap();
+    let success = rows.iter().find(|row| row["outcome"] == "success").unwrap();
+    let failure = rows.iter().find(|row| row["duration_ms"] == 25).unwrap();
+
+    assert_eq!(
+        success["status"], 0,
+        "legacy row keeps its no-HTTP-status sentinel"
+    );
+    assert!(success["error_code"].is_null());
+    assert_eq!(success["transport"], "websocket");
+    assert_eq!(failure["status"], 0);
+    assert_eq!(failure["error_code"], "stream_incomplete");
+    let bounded_failure = rows
+        .iter()
+        .find(|row| row["error_code"] == "legacy_error")
+        .expect("unknown imported error codes must collapse to a bounded fallback");
+    assert_eq!(bounded_failure["outcome"], "error");
+    assert!(
+        !body.to_string().contains("free form upstream failure"),
+        "arbitrary imported error strings must never cross the API boundary"
+    );
+    let unknown_outcome = rows
+        .iter()
+        .find(|row| row["duration_ms"] == 35)
+        .expect("hostile-outcome fixture is returned as a request row");
+    assert!(unknown_outcome["outcome"].is_null());
+    assert!(unknown_outcome["error_code"].is_null());
+    assert!(!body.to_string().contains("arbitrary imported"));
+
+    let client = reqwest::Client::new();
+    for (status_class, expected_outcome) in [("success", "success"), ("error", "error")] {
+        let filtered: serde_json::Value = client
+            .get(format!("{pf}/api/requests?status_class={status_class}"))
+            .header("authorization", "Bearer secret")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let expected_total = if status_class == "success" { 1 } else { 2 };
+        assert_eq!(
+            filtered["total"], expected_total,
+            "{status_class} filter must classify only canonical legacy outcomes"
+        );
+        assert_eq!(filtered["rows"][0]["outcome"], expected_outcome);
+    }
+
+    let overview: serde_json::Value = client
+        .get(format!("{pf}/api/overview"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(overview["kpis"]["requests"], 4);
+    assert_eq!(overview["kpis"]["success"], 1);
+    assert_eq!(overview["kpis"]["errors"], 2);
+    let recent_errors = overview["recent_errors"].as_array().unwrap();
+    assert_eq!(recent_errors.len(), 2);
+    assert!(recent_errors
+        .iter()
+        .any(|row| row["error_code"] == "stream_incomplete"));
+    assert!(recent_errors
+        .iter()
+        .any(|row| row["error_code"] == "legacy_error"));
+    assert!(!overview.to_string().contains("free form upstream failure"));
+
+    let series: serde_json::Value = client
+        .get(format!("{pf}/api/overview/series"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let buckets = series["buckets"].as_array().unwrap();
+    assert_eq!(
+        buckets
+            .iter()
+            .map(|b| b["requests"].as_i64().unwrap())
+            .sum::<i64>(),
+        4
+    );
+    assert_eq!(
+        buckets
+            .iter()
+            .map(|b| b["errors"].as_i64().unwrap())
+            .sum::<i64>(),
+        2
+    );
+
+    let reports: serde_json::Value = client
+        .get(format!("{pf}/api/reports?range=24h&dimension=provider"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reports["totals"]["requests"], 4);
+    assert_eq!(reports["totals"]["errors"], 2);
 }
 
 /// Seeds 3 rows (2 codex/200 with metrics, 1 anthropic/500) so filters + the content-free metric
@@ -620,7 +821,11 @@ async fn seed_store_for_filters() -> Store {
         status: 200,
         duration_ms: 2000,
         account_id: Some("acct-1".to_string()),
+        target_kind: Some("account".to_string()),
+        provider_credential_id: None,
         model: Some("gpt-5.6-sol".to_string()),
+        upstream_model: None,
+        upstream_transport: None,
         reasoning_effort: Some("high".to_string()),
         service_tier: Some("priority".to_string()),
         transport: Some("http".to_string()),
@@ -629,12 +834,17 @@ async fn seed_store_for_filters() -> Store {
         cached_tokens: Some(1000),
         subagent: Some("review".to_string()),
         request_id: None,
+        session_key: None,
         input_tokens: None,
-        output_tokens: None,
+        output_tokens: Some(300),
         cached_input_tokens: None,
         reasoning_tokens: None,
+        orchestration_input_tokens: None,
+        orchestration_output_tokens: None,
+        orchestration_cached_input_tokens: None,
         cost_usd: None,
         latency_first_token_ms: None,
+        protocol_outcome: None,
     })
     .await
     .unwrap();
@@ -647,7 +857,11 @@ async fn seed_store_for_filters() -> Store {
         status: 200,
         duration_ms: 1500,
         account_id: Some("acct-2".to_string()),
+        target_kind: Some("account".to_string()),
+        provider_credential_id: None,
         model: Some("gpt-5.6-sol".to_string()),
+        upstream_model: None,
+        upstream_transport: None,
         reasoning_effort: None,
         service_tier: None,
         transport: Some("http".to_string()),
@@ -656,12 +870,17 @@ async fn seed_store_for_filters() -> Store {
         cached_tokens: None,
         subagent: None,
         request_id: None,
+        session_key: None,
         input_tokens: None,
         output_tokens: None,
         cached_input_tokens: None,
         reasoning_tokens: None,
+        orchestration_input_tokens: None,
+        orchestration_output_tokens: None,
+        orchestration_cached_input_tokens: None,
         cost_usd: None,
         latency_first_token_ms: None,
+        protocol_outcome: None,
     })
     .await
     .unwrap();
@@ -674,7 +893,11 @@ async fn seed_store_for_filters() -> Store {
         status: 500,
         duration_ms: 300,
         account_id: Some("acct-3".to_string()),
+        target_kind: Some("account".to_string()),
+        provider_credential_id: None,
         model: Some("claude-x".to_string()),
+        upstream_model: None,
+        upstream_transport: None,
         reasoning_effort: None,
         service_tier: None,
         transport: Some("sse".to_string()),
@@ -683,12 +906,17 @@ async fn seed_store_for_filters() -> Store {
         cached_tokens: None,
         subagent: None,
         request_id: None,
+        session_key: None,
         input_tokens: None,
         output_tokens: None,
         cached_input_tokens: None,
         reasoning_tokens: None,
+        orchestration_input_tokens: None,
+        orchestration_output_tokens: None,
+        orchestration_cached_input_tokens: None,
         cost_usd: None,
         latency_first_token_ms: None,
+        protocol_outcome: None,
     })
     .await
     .unwrap();
@@ -714,8 +942,9 @@ async fn requests_endpoint_filters_by_provider_and_carries_content_free_metrics(
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|r| r["provider"] == "codex"));
 
-    // The row with both ttft_ms and total_tokens gets a derived tps; duration_ms=2000,
-    // ttft_ms=500 → elapsed generation window = 1500ms = 1.5s; total_tokens=3000 → tps = 2000.0.
+    // Generation throughput uses completion tokens only: duration_ms=2000, ttft_ms=500 →
+    // generation window = 1500ms = 1.5s; output_tokens=300 → tps = 200.0. Prompt tokens are
+    // excluded because they were processed before the first output token.
     let full = rows
         .iter()
         .find(|r| r["account_id"] == "acct-1")
@@ -727,13 +956,13 @@ async fn requests_endpoint_filters_by_provider_and_carries_content_free_metrics(
     assert_eq!(full["ttft_ms"], 500);
     assert_eq!(full["total_tokens"], 3000);
     assert_eq!(full["cached_tokens"], 1000);
-    assert_eq!(full["tps"], 2000.0);
+    assert_eq!(full["tps"], 200.0);
     assert_eq!(
         full["subagent"], "review",
         "Task 3: read API surfaces the sub-agent label"
     );
 
-    // The row missing ttft_ms/total_tokens gets no derived tps.
+    // The row missing TTFT/output tokens gets no derived tps.
     let partial = rows
         .iter()
         .find(|r| r["account_id"] == "acct-2")
@@ -760,7 +989,11 @@ fn req_row(status: u16, total_tokens: i64) -> RequestLogRecord {
         status,
         duration_ms: 100,
         account_id: None,
+        target_kind: None,
+        provider_credential_id: None,
         model: None,
+        upstream_model: None,
+        upstream_transport: None,
         reasoning_effort: None,
         service_tier: None,
         transport: None,
@@ -769,12 +1002,17 @@ fn req_row(status: u16, total_tokens: i64) -> RequestLogRecord {
         cached_tokens: None,
         subagent: None,
         request_id: None,
+        session_key: None,
         input_tokens: None,
         output_tokens: None,
         cached_input_tokens: None,
         reasoning_tokens: None,
+        orchestration_input_tokens: None,
+        orchestration_output_tokens: None,
+        orchestration_cached_input_tokens: None,
         cost_usd: None,
         latency_first_token_ms: None,
+        protocol_outcome: None,
     }
 }
 
@@ -820,6 +1058,14 @@ async fn overview_reports_kpis_and_recent_errors_from_request_log() {
     assert!(v["pools"].as_array().unwrap().is_empty());
     assert_eq!(v["accounts_available"], 0);
     assert!(v["quota"].as_array().unwrap().is_empty());
+    assert_eq!(v["admission"]["waiters"], 0);
+    assert_eq!(v["admission"]["waits_total"], 0);
+    assert_eq!(v["admission"]["timeouts_total"], 0);
+    assert_eq!(v["admission"]["owner_recovery_total"], 0);
+    assert_eq!(v["admission"]["avg_wait_ms"], 0.0);
+    assert_eq!(v["admission"]["in_flight_pressure"], 0);
+    assert_eq!(v["admission"]["calibration_ratio"], 1.0);
+    assert_eq!(v["admission"]["calibration_samples"], 0);
 }
 
 #[tokio::test]
@@ -876,7 +1122,11 @@ fn req_row_at(requested_at: i64, status: u16, total_tokens: i64) -> RequestLogRe
         status,
         duration_ms: 100,
         account_id: None,
+        target_kind: None,
+        provider_credential_id: None,
         model: None,
+        upstream_model: None,
+        upstream_transport: None,
         reasoning_effort: None,
         service_tier: None,
         transport: None,
@@ -885,12 +1135,17 @@ fn req_row_at(requested_at: i64, status: u16, total_tokens: i64) -> RequestLogRe
         cached_tokens: None,
         subagent: None,
         request_id: None,
+        session_key: None,
         input_tokens: None,
         output_tokens: None,
         cached_input_tokens: None,
         reasoning_tokens: None,
+        orchestration_input_tokens: None,
+        orchestration_output_tokens: None,
+        orchestration_cached_input_tokens: None,
         cost_usd: None,
         latency_first_token_ms: None,
+        protocol_outcome: None,
     }
 }
 
@@ -1073,7 +1328,11 @@ async fn account_detail_request_totals_fall_back_to_input_plus_output_tokens() {
         status: 200,
         duration_ms: 100,
         account_id: Some("acct-1".to_string()),
+        target_kind: Some("account".to_string()),
+        provider_credential_id: None,
         model: None,
+        upstream_model: None,
+        upstream_transport: None,
         reasoning_effort: None,
         service_tier: None,
         transport: None,
@@ -1082,12 +1341,17 @@ async fn account_detail_request_totals_fall_back_to_input_plus_output_tokens() {
         cached_tokens: None,
         subagent: None,
         request_id: None,
+        session_key: None,
         input_tokens: None,
         output_tokens: None,
         cached_input_tokens: None,
         reasoning_tokens: None,
+        orchestration_input_tokens: None,
+        orchestration_output_tokens: None,
+        orchestration_cached_input_tokens: None,
         cost_usd: None,
         latency_first_token_ms: None,
+        protocol_outcome: None,
     })
     .await
     .unwrap();
@@ -1101,7 +1365,11 @@ async fn account_detail_request_totals_fall_back_to_input_plus_output_tokens() {
         status: 200,
         duration_ms: 100,
         account_id: Some("acct-1".to_string()),
+        target_kind: Some("account".to_string()),
+        provider_credential_id: None,
         model: None,
+        upstream_model: None,
+        upstream_transport: None,
         reasoning_effort: None,
         service_tier: None,
         transport: None,
@@ -1110,12 +1378,17 @@ async fn account_detail_request_totals_fall_back_to_input_plus_output_tokens() {
         cached_tokens: None,
         subagent: None,
         request_id: None,
+        session_key: None,
         input_tokens: Some(1200),
         output_tokens: Some(300),
         cached_input_tokens: None,
         reasoning_tokens: Some(150),
+        orchestration_input_tokens: None,
+        orchestration_output_tokens: None,
+        orchestration_cached_input_tokens: None,
         cost_usd: None,
         latency_first_token_ms: None,
+        protocol_outcome: None,
     })
     .await
     .unwrap();
@@ -1141,9 +1414,8 @@ async fn account_detail_request_totals_fall_back_to_input_plus_output_tokens() {
 
 /// Task 7: same fallback, but for `/api/requests`' per-row `total_tokens`/`tps` — an
 /// imported-shaped row (native `total_tokens`/`ttft_ms` absent, 0005 columns present) must still
-/// surface a real `total_tokens` and a derived `tps`, via `input_tokens + output_tokens` and
-/// `ttft_ms.or(latency_first_token_ms)` respectively. The row's raw `ttft_ms` column itself stays
-/// `None` in the response — only used internally to derive `tps`.
+/// surface a real `total_tokens`, effective TTFT, and derived `tps`. Throughput uses output tokens
+/// over the post-first-token generation window; input tokens are excluded.
 #[tokio::test]
 async fn requests_endpoint_falls_back_to_input_output_tokens_and_latency_first_token_ms() {
     let dir = tempfile::tempdir().unwrap();
@@ -1158,7 +1430,11 @@ async fn requests_endpoint_falls_back_to_input_output_tokens_and_latency_first_t
         status: 200,
         duration_ms: 1300,
         account_id: Some("acct-1".to_string()),
+        target_kind: Some("account".to_string()),
+        provider_credential_id: None,
         model: None,
+        upstream_model: None,
+        upstream_transport: None,
         reasoning_effort: None,
         service_tier: None,
         transport: None,
@@ -1167,12 +1443,17 @@ async fn requests_endpoint_falls_back_to_input_output_tokens_and_latency_first_t
         cached_tokens: None,
         subagent: None,
         request_id: None,
+        session_key: None,
         input_tokens: Some(1500),
         output_tokens: Some(500),
         cached_input_tokens: None,
         reasoning_tokens: Some(200), // subset of output_tokens — must NOT be added to the total
+        orchestration_input_tokens: None,
+        orchestration_output_tokens: None,
+        orchestration_cached_input_tokens: None,
         cost_usd: None,
         latency_first_token_ms: Some(300),
+        protocol_outcome: None,
     })
     .await
     .unwrap();
@@ -1194,11 +1475,12 @@ async fn requests_endpoint_falls_back_to_input_output_tokens_and_latency_first_t
         rows[0]["total_tokens"], 2000,
         "1500 input + 500 output, NOT + reasoning_tokens(200)"
     );
-    // duration_ms(1300) - latency_first_token_ms(300) = 1000ms = 1.0s → tps = 2000 / 1.0 = 2000.0.
-    assert_eq!(rows[0]["tps"], 2000.0);
-    assert!(
-        rows[0]["ttft_ms"].is_null(),
-        "the raw ttft_ms column is not itself backfilled from latency_first_token_ms"
+    // duration_ms(1300) - latency_first_token_ms(300) = 1000ms = 1.0s;
+    // output_tokens(500) / 1.0s = 500.0 tokens/sec.
+    assert_eq!(rows[0]["tps"], 500.0);
+    assert_eq!(
+        rows[0]["ttft_ms"], 300,
+        "the API should surface the effective imported/backfilled TTFT"
     );
 }
 
@@ -1384,6 +1666,19 @@ async fn sessions_endpoint_surfaces_owner_email_and_keeps_null_owner_rows() {
         assert!(row["updated_at"].is_i64());
         assert!(row["last_activity_at"].is_i64());
     }
+
+    let exact: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/sessions?session_key=sk-owned-a"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(exact["total"], 1);
+    assert_eq!(exact["rows"][0]["session_key"], "sk-owned-a");
+    assert_eq!(exact["rows"][0]["owner_email"], "sess-a@example.test");
 }
 
 /// `limit`/`offset` are honored (like `/api/requests`) and clamped: `limit=0` clamps up to 1
@@ -1522,7 +1817,11 @@ fn report_endpoint_row(
         status,
         duration_ms: 100,
         account_id: None,
+        target_kind: None,
+        provider_credential_id: None,
         model: Some(model.to_string()),
+        upstream_model: None,
+        upstream_transport: None,
         reasoning_effort: None,
         service_tier: None,
         transport: None,
@@ -1531,12 +1830,17 @@ fn report_endpoint_row(
         cached_tokens: Some(cached_tokens),
         subagent: None,
         request_id: None,
+        session_key: None,
         input_tokens: None,
         output_tokens: None,
         cached_input_tokens: None,
         reasoning_tokens: None,
+        orchestration_input_tokens: None,
+        orchestration_output_tokens: None,
+        orchestration_cached_input_tokens: None,
         cost_usd: Some(cost_usd),
         latency_first_token_ms: None,
+        protocol_outcome: None,
     }
 }
 

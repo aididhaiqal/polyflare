@@ -411,11 +411,29 @@ impl CodexWsExecutor {
     /// longer locks anything itself; it is plain, synchronous, content-free planning over a
     /// reference the caller already holds exclusively.
     fn plan_and_build_locked(conn: &WsConn, body: &Value, turn_state: Option<&str>) -> Value {
-        let mut envelope = match plan_request_for_conn(conn, body) {
-            RequestPlan::Incremental { anchor, suffix } => {
-                build_response_create(body, Some(&anchor), &suffix, None)
+        // A body carrying its own `previous_response_id` is a CLIENT-PLANNED delta (codex-rs
+        // sets that field exactly when `input` holds only the new suffix —
+        // `client.rs::prepare_websocket_request`). PolyFlare does NOT hold the full history for
+        // such a body, so the planner's `Full` fallback — which builds ANCHORLESS from `body`'s
+        // input — would silently amputate the conversation to just that suffix (a 200 OK with a
+        // brand-new upstream conversation root: the 2026-07-23 parrot incident, seen on the
+        // relay path). Forward it verbatim instead: the client's anchor, the client's input,
+        // untouched. If the anchor can't resolve upstream, the anchor-miss surfaces through the
+        // existing bounded recovery and the CLIENT full-resends — loud, never a silent shrink.
+        let client_anchor = body
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let generate = body.get("generate").and_then(Value::as_bool);
+        let mut envelope = if let Some(anchor) = client_anchor {
+            build_response_create(body, Some(&anchor), &full_input(body), generate)
+        } else {
+            match plan_request_for_conn(conn, body) {
+                RequestPlan::Incremental { anchor, suffix } => {
+                    build_response_create(body, Some(&anchor), &suffix, generate)
+                }
+                RequestPlan::Full => build_response_create(body, None, &full_input(body), generate),
             }
-            RequestPlan::Full => build_response_create(body, None, &full_input(body), None),
         };
         // Task 4 F1 (codex parity, `client.rs:1568-1569`): replay the PER-TURN turn-state — the
         // caller (`drive_turn`) supplies the socket's one-shot upgrade token to the turn that
@@ -455,6 +473,7 @@ impl CodexWsExecutor {
     /// snapshot. A turn on a DIFFERENT session key uses a different `SharedWsConn` (a different
     /// `Mutex`) and is never blocked by this one. See `ws::turn::turn_stream_with_guard`'s doc for
     /// the full race this closes.
+    #[allow(clippy::too_many_arguments)] // explicit wire/identity inputs keep retry state auditable
     async fn drive_turn(
         &self,
         account: &Account,
@@ -462,6 +481,7 @@ impl CodexWsExecutor {
         conn_key: Option<&str>,
         session_key: Option<&str>,
         body: &Value,
+        anchor_provenance: AnchorProvenance,
         mut shared: SharedWsConn,
     ) -> Result<ResponseStream, ExecError> {
         let mut anchor_attempts: u32 = 0;
@@ -474,7 +494,7 @@ impl CodexWsExecutor {
         // but its token is ADOPTED only under first-wins: a reconnect after the token was already set
         // keeps the ORIGINAL (and discards the fresh socket's), while a reconnect during a turn that
         // had none takes the new socket's — matching codex's set-if-empty `OnceLock`.
-        let mut turn_state: Option<String> = None;
+        let turn_state = Arc::new(std::sync::OnceLock::<String>::new());
 
         loop {
             let mut guard = shared.clone().lock_owned().await;
@@ -491,11 +511,12 @@ impl CodexWsExecutor {
             // never sends (codex's per-turn `OnceLock` is empty on a reused socket). So drain
             // unconditionally; ADOPT only under first-wins.
             let dialed = guard.upgrade_turn_state.take();
-            if turn_state.is_none() {
-                turn_state = dialed;
+            if let Some(dialed) = dialed {
+                let _ = turn_state.set(dialed);
             }
-            let envelope = Self::plan_and_build_locked(&guard, body, turn_state.as_deref());
-            let mut stream = turn_stream_with_guard(guard, envelope);
+            let envelope =
+                Self::plan_and_build_locked(&guard, body, turn_state.get().map(String::as_str));
+            let mut stream = turn_stream_with_guard(guard, envelope, turn_state.clone());
 
             match stream.next().await {
                 None => {
@@ -515,9 +536,18 @@ impl CodexWsExecutor {
                     let combined =
                         futures_util::stream::once(async move { Ok::<_, ExecError>(first) })
                             .chain(rest);
-                    return Ok(Box::pin(combined));
+                    return Ok(ResponseStream::new(combined));
                 }
                 Some(Err(e)) => match classify_recovery(&e) {
+                    RecoveryAction::StripAnchorAndResend
+                        if anchor_provenance == AnchorProvenance::ClientProvided =>
+                    {
+                        // This request contains only the client-planned suffix. Stripping its
+                        // anchor would silently start a truncated conversation, while retrying it
+                        // unchanged can only repeat the same miss. Surface once so the client can
+                        // resend its full history.
+                        return Err(e);
+                    }
                     RecoveryAction::StripAnchorAndResend
                         if anchor_attempts < self.max_anchor_miss_retries =>
                     {
@@ -604,6 +634,12 @@ enum RecoveryAction {
     /// ...) unconditionally — SPEC-M5 §4's "key off STATUS, not the code string" — and any
     /// `ExecError::Stream`/`Upstream` that doesn't carry one of the known recoverable markers.
     Surface,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorProvenance {
+    ClientProvided,
+    ProxyGenerated,
 }
 
 fn classify_recovery(e: &ExecError) -> RecoveryAction {
@@ -743,6 +779,15 @@ impl Executor for CodexWsExecutor {
         // recovery loop performs. Does NOT touch any `NON_INPUT_FIELDS` field, so the `conn_key`
         // fingerprint computed just below (and the incremental-caching chain) is unaffected.
         seed_trace_headers(&mut body, &req.forward_headers);
+        let anchor_provenance = if body
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            AnchorProvenance::ClientProvided
+        } else {
+            AnchorProvenance::ProxyGenerated
+        };
 
         // Per-account, per-thread, per-model-stream connection key. `account.id` LEADS the key:
         // a chatgpt.com WS socket is authenticated per-account at the handshake (Bearer +
@@ -803,6 +848,7 @@ impl Executor for CodexWsExecutor {
             conn_key.as_deref(),
             session_key.as_deref(),
             &body,
+            anchor_provenance,
             shared,
         )
         .await
@@ -823,6 +869,7 @@ mod tests {
             base_url,
             bearer_token: "secret-bearer".into(),
             chatgpt_account_id: None,
+            is_fedramp: false,
         }
     }
 
@@ -919,7 +966,7 @@ mod tests {
             _ctx: &RequestCtx,
         ) -> Result<ResponseStream, ExecError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::pin(futures_util::stream::empty()))
+            Ok(ResponseStream::new(futures_util::stream::empty()))
         }
     }
 
@@ -1026,6 +1073,27 @@ mod tests {
             envelope["client_metadata"]["x-codex-turn-state"],
             json!("ts-9"),
             "the per-turn turn-state must be replayed into the frame's client_metadata: {envelope}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_and_build_locked_preserves_generate_false_prewarm() {
+        let mock = MockWsUpstream::new(ScriptedTurn::normal(vec![]));
+        let base = mock.clone().spawn().await;
+        let conn = WsConn::connect(&test_account(base), &[])
+            .await
+            .expect("connect");
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [item(0)],
+            "generate": false
+        });
+
+        let envelope = CodexWsExecutor::plan_and_build_locked(&conn, &body, None);
+        assert_eq!(
+            envelope["generate"],
+            json!(false),
+            "Codex v2 prewarm is a response.create with generate=false"
         );
     }
 
@@ -1427,6 +1495,110 @@ mod tests {
             "model B's second turn must send only the one new item — a real delta on B's OWN \
              chain, independent of model A's"
         );
+    }
+
+    // ---- Client-planned deltas: the client's own anchor must survive verbatim -----------------
+
+    /// The 2026-07-23 parrot regression, executor edition. A body carrying its own
+    /// `previous_response_id` is a CLIENT-PLANNED delta: `input` holds only the new suffix
+    /// (codex-rs `prepare_websocket_request` sets the anchor exactly when it sends the delta
+    /// form). The old planner ignored the client's anchor entirely: a 1-item body against a
+    /// 2-item socket ledger failed the strict-extension rule, planned `Full`, and
+    /// `build_response_create(body, None, ..)` actively STRIPPED the client's anchor — upstream
+    /// then happily started a brand-new 1-item conversation (200 OK, ~39 input tokens, total
+    /// context amnesia). The client's anchor and input must go out verbatim instead.
+    #[tokio::test]
+    async fn client_anchored_body_is_forwarded_verbatim_never_stripped() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::normal(vec![]),
+        ]);
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::new(never_called_fallback(), false);
+        let account = test_account(base);
+        let ctx = ctx_with_session("client-anchored");
+
+        // Turn 1: an ordinary anchorless 2-item full body seeds the socket's hash ledger.
+        let t1 = json!({"model": "m", "input": [item(0), item(1)]});
+        let stream = executor
+            .execute(prepared(t1), &account, &ctx)
+            .await
+            .expect("turn 1 must succeed");
+        drain(stream).await;
+
+        // Turn 2: a client-planned delta — a 1-item suffix plus the client's OWN anchor. Its
+        // 1-item input can never extend the 2-item ledger, so the pre-fix planner chose `Full`
+        // and stripped the anchor. It must instead go out anchored on the CLIENT's id with the
+        // client's input untouched.
+        let t2 = json!({
+            "model": "m",
+            "input": [item(7)],
+            "previous_response_id": "resp_client_anchor",
+        });
+        let stream = executor
+            .execute(prepared(t2), &account, &ctx)
+            .await
+            .expect("turn 2 must succeed");
+        drain(stream).await;
+
+        assert_eq!(
+            mock.last_frame_anchor(),
+            Some("resp_client_anchor".to_string()),
+            "the CLIENT's previous_response_id must survive to the wire — an anchorless send \
+             here is the silent context-amputation this test exists to prevent"
+        );
+        assert_eq!(
+            mock.last_frame_input_len(),
+            Some(1),
+            "the client's input is forwarded untouched — never re-planned"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_anchor_miss_is_surfaced_once_never_retried_or_stripped() {
+        let mock = MockWsUpstream::new(ScriptedTurn::previous_response_not_found(
+            "resp_client_dead",
+        ));
+        let base = mock.clone().spawn().await;
+        let executor = CodexWsExecutor::with_config(
+            never_called_fallback(),
+            3,
+            2,
+            Duration::from_secs(30),
+            false,
+        );
+        let account = test_account(base);
+        let ctx = ctx_with_session("client-anchor-miss");
+
+        let err = executor
+            .execute(
+                prepared(json!({
+                    "model": "m",
+                    "input": [item(7)],
+                    "previous_response_id": "resp_client_dead",
+                })),
+                &account,
+                &ctx,
+            )
+            .await
+            .err()
+            .expect("a dead client-owned anchor must surface");
+
+        assert!(
+            matches!(err, ExecError::Stream(ref message) if message.contains(ANCHOR_MISS_MARKER))
+        );
+        let frames = mock.frames();
+        assert_eq!(
+            frames.len(),
+            1,
+            "retrying the same client anchor can never heal and must not loop"
+        );
+        assert_eq!(
+            frames[0].previous_response_id.as_deref(),
+            Some("resp_client_dead"),
+            "the proxy must neither strip nor replace a client-owned anchor"
+        );
+        assert_eq!(frames[0].input_len, 1);
     }
 
     // ---- Task 2 (sub-agent identity): distinct codex threads must NOT share a socket -----------

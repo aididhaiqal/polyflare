@@ -140,7 +140,7 @@ impl Executor for StubExecutor {
                     format!(r#"{{"type":"response.created","response":{{"id":"{id}"}}}}"#);
                 let completed =
                     format!(r#"{{"type":"response.completed","response":{{"id":"{id}"}}}}"#);
-                Ok(Box::pin(stream::iter(vec![
+                Ok(ResponseStream::new(stream::iter(vec![
                     Ok::<Bytes, ExecError>(Bytes::from(format!("data: {created}\n\n"))),
                     Ok(Bytes::from(format!("data: {completed}\n\n"))),
                 ])))
@@ -206,6 +206,7 @@ fn build_state(
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         runtime: Default::default(),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
@@ -472,7 +473,13 @@ async fn failover_records_exactly_one_upstream_request_metric_entry() {
 
     assert_eq!(
         state.upstream_request_metrics.snapshot(),
-        vec![("B".to_string(), 200, 1)],
+        vec![(
+            "codex".to_string(),
+            "account".to_string(),
+            "B".to_string(),
+            200,
+            1,
+        )],
         "exactly ONE upstream_requests entry (the final outcome, account B) despite 2 internal \
          attempts — never one per attempt"
     );

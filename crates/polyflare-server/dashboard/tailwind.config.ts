@@ -20,9 +20,10 @@ export default {
         success: "hsl(var(--success))",
         warn: "hsl(var(--warn))",
         error: "hsl(var(--error))",
+        signal: "hsl(var(--signal))",
       },
       borderRadius: {
-        DEFAULT: "0.375rem",
+        DEFAULT: "0.5rem",
       },
     },
   },

@@ -78,7 +78,7 @@ mod tests {
     }
 
     fn ok_stream(chunks: Vec<Bytes>) -> ResponseStream {
-        Box::pin(stream::iter(chunks.into_iter().map(Ok::<Bytes, ExecError>)))
+        ResponseStream::new(stream::iter(chunks.into_iter().map(Ok::<Bytes, ExecError>)))
     }
 
     #[tokio::test]
@@ -157,7 +157,7 @@ mod tests {
             }))),
             Err(ExecError::Stream("connection reset".to_string())),
         ];
-        let stream: ResponseStream = Box::pin(stream::iter(chunks));
+        let stream = ResponseStream::new(stream::iter(chunks));
 
         let result = collect_anthropic_message(stream).await;
         assert!(result.is_err(), "a stream error must propagate as Err");

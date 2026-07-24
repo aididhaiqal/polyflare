@@ -95,6 +95,7 @@ async fn codex_egress_header_structure_matches_the_from_source_codex_rs_golden()
         base_url: base,
         bearer_token: "test-token".into(),
         chatgpt_account_id: None,
+        is_fedramp: false,
     };
     // The executor now FORWARDS `forward_headers` rather than synthesizing (the codex-lb
     // forward-native/synthesize-non-native split). The translated ingress path synthesizes via

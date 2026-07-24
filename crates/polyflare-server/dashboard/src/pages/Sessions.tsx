@@ -30,9 +30,11 @@ import clsx from "clsx";
 import type { SessionRowView, SessionsQueryParams } from "../lib/api";
 import { relTime } from "../lib/format";
 import { useSessions } from "../lib/queries";
+import { ShieldedAccount } from "../privacy/ScreenShield";
 import { Card } from "../ui/Card";
 import { Col, Grid } from "../ui/Grid";
 import { AlertTriangle, ChevronLeft, ChevronRight, Lock } from "../ui/icons";
+import { ProviderTag } from "../ui/ProviderTag";
 
 // Mirrors `lib/queries.ts`'s internal (non-exported) `LIST_REFETCH_MS` — kept in sync manually
 // since that constant isn't exported; used only for the live badge's honest "polling Ns" label.
@@ -86,6 +88,7 @@ function SessionStatePill({ state }: { state: string }) {
 export function Sessions() {
   const [searchParams, setSearchParams] = useSearchParams();
   const offset = Math.max(0, Number(searchParams.get("offset") ?? "0") || 0);
+  const sessionKey = searchParams.get("session_key") ?? "";
 
   // Ticks the header's "updated Xs ago" text + the per-row relative-time / stale derivation between
   // useSessions()'s 30s polls — same 5s-tick pattern Overview/Pools/Requests already use.
@@ -102,7 +105,11 @@ export function Sessions() {
     setSearchParams(params, { replace: true });
   }
 
-  const queryParams: SessionsQueryParams = { limit: PAGE_SIZE, offset };
+  const queryParams: SessionsQueryParams = {
+    limit: PAGE_SIZE,
+    offset: sessionKey ? 0 : offset,
+    session_key: sessionKey || undefined,
+  };
   const { data, isLoading, isFetching, isError, error, refetch, dataUpdatedAt } =
     useSessions(queryParams);
 
@@ -137,8 +144,8 @@ export function Sessions() {
   if (!data) return null;
 
   const rows = data.rows;
-  const pageStart = data.total > 0 ? offset + 1 : 0;
-  const pageEnd = offset + rows.length;
+  const pageStart = data.total > 0 ? (sessionKey ? 1 : offset + 1) : 0;
+  const pageEnd = (sessionKey ? 0 : offset) + rows.length;
   const hasPrev = offset > 0;
   const hasNext = offset + rows.length < data.total;
 
@@ -152,14 +159,34 @@ export function Sessions() {
             {dataUpdatedAt ? <> · updated {relTime(Math.floor(dataUpdatedAt / 1000), nowMs)}</> : null}
           </>
         }
-        actions={<LiveBadge isFetching={isFetching} />}
+        actions={
+          <div className="flex items-center gap-2">
+            {sessionKey && (
+              <button
+                type="button"
+                onClick={() => setSearchParams({}, { replace: true })}
+                className="rounded border border-border bg-card px-2.5 py-1 text-[10.5px] text-fg opacity-75 hover:opacity-100"
+              >
+                Show all sessions
+              </button>
+            )}
+            <LiveBadge isFetching={isFetching} />
+          </div>
+        }
       />
+
+      {sessionKey && (
+        <div className="rounded border border-accent/25 bg-accent/[0.06] px-3 py-2 text-[10.5px] text-fg">
+          Request session <span className="font-mono text-accent">{sessionKey.slice(0, 12)}</span>
+        </div>
+      )}
 
       {rows.length === 0 ? (
         <Card>
           <p className="text-[11px] text-fg opacity-50">
-            No sessions tracked yet — they&apos;ll appear here as soon as PolyFlare anchors a
-            conversation to an account.
+            {sessionKey
+              ? "That request session is no longer present in continuity history."
+              : "No sessions tracked yet — they’ll appear here as soon as PolyFlare anchors a conversation to an account."}
           </p>
         </Card>
       ) : (
@@ -170,7 +197,7 @@ export function Sessions() {
         </Grid>
       )}
 
-      {rows.length > 0 && (
+      {rows.length > 0 && !sessionKey && (
         <div className="flex items-center justify-between text-[10.5px] text-fg opacity-70">
           <span>
             Showing {pageStart}–{pageEnd} of {data.total.toLocaleString()} · most recent first
@@ -240,13 +267,16 @@ function SessionsTable({ rows, nowMs }: { rows: SessionRowView[]; nowMs: number 
   return (
     <Card>
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[720px] border-collapse text-[10.5px]">
+        <table className="w-full min-w-[900px] border-collapse text-[10.5px]">
           <thead>
             <tr className="border-b border-border">
               <th className={TABLE_HEAD_CLASS}>Session</th>
-              <th className={TABLE_HEAD_CLASS}>Owner</th>
+              <th className={TABLE_HEAD_CLASS}>Provider</th>
+              <th className={TABLE_HEAD_CLASS}>Target</th>
+              <th className={TABLE_HEAD_CLASS}>Model</th>
               <th className={TABLE_HEAD_CLASS}>State</th>
               <th className={TABLE_HEAD_CLASS}>Capabilities</th>
+              <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>Requests</th>
               <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>Last activity</th>
             </tr>
           </thead>
@@ -261,7 +291,7 @@ function SessionsTable({ rows, nowMs }: { rows: SessionRowView[]; nowMs: number 
       <div className="mt-2 flex items-center gap-1.5 rounded border border-dashed border-border bg-card px-2.5 py-1.5 text-[9.5px] text-fg opacity-60">
         <Lock className="h-3 w-3 shrink-0" strokeWidth={1.9} />
         Session keys are one-way hashes — no conversation content is stored. PolyFlare tracks only
-        which account each session is pinned to, its state, and timing.
+        provider and account-or-credential target served it, its state, and timing.
       </div>
     </Card>
   );
@@ -278,14 +308,28 @@ function SessionRow({ row: s, nowMs }: { row: SessionRowView; nowMs: number }) {
         <div className="mt-0.5 text-[9px] text-fg opacity-45">{s.key_strength}</div>
       </td>
       <td className="whitespace-nowrap px-2 py-1.5 align-top">
-        {s.owner_email ? (
-          <span className="text-fg opacity-90">{s.owner_email}</span>
+        <ProviderTag provider={s.provider} />
+      </td>
+      <td className="whitespace-nowrap px-2 py-1.5 align-top">
+        {s.target_label ? (
+          <ShieldedAccount
+            id={s.target_id ?? s.target_label}
+            label={s.target_label}
+            className="text-fg opacity-90"
+          />
         ) : (
           <span className="text-fg opacity-40">unowned</span>
         )}
+        <div className="mt-0.5 text-[9px] text-fg opacity-45">{s.target_kind}</div>
+      </td>
+      <td className="max-w-[180px] truncate px-2 py-1.5 align-top font-mono text-[9.5px] text-fg opacity-75">
+        {s.model ?? "—"}
       </td>
       <td className="px-2 py-1.5 align-top">
         <SessionStatePill state={s.state} />
+      </td>
+      <td className="whitespace-nowrap px-2 py-1.5 text-right align-top tabular-nums text-fg opacity-80">
+        {s.request_count}
       </td>
       <td className="px-2 py-1.5 align-top">
         {s.required_capabilities ? (

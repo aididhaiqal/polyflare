@@ -266,7 +266,10 @@ fn eligibility(s: &AccountSnapshot, now: i64, penalty_pct: f64) -> Eligibility<'
     // `penalty_pct == 0.0` (the config's `=0` disable lever, and `SelectionCtx`'s `Default`) is a
     // pure no-op: `in_flight * 0.0 == 0.0` for any `in_flight`, so this is a byte-for-byte
     // rollback to pre-C9 scoring.
-    let pressure_pct = s.in_flight as f64 * penalty_pct;
+    // Older/direct snapshot producers may only populate the request count. Count is therefore the
+    // minimum pressure, while request-size-aware runtime snapshots can contribute multiple units.
+    let request_pressure = s.in_flight_pressure.max(s.in_flight);
+    let pressure_pct = request_pressure.saturating_add(s.open_ws) as f64 * penalty_pct;
     Eligibility::Eligible(Candidate {
         snap: s,
         eff_used: (eff_used + pressure_pct).min(100.0),
@@ -450,7 +453,55 @@ fn weighted_pick(pool: &[Candidate<'_>], ctx: &SelectionCtx) -> Option<AccountId
         .iter()
         .map(Candidate::remaining_secondary_credits)
         .collect();
-    sample_weighted(pool, &weights, ctx)
+    affinity_or_weighted_pick(pool, &weights, ctx)
+}
+
+/// Session-family weighted rendezvous. Codex main and subagents share
+/// `session-id`/`prompt_cache_key` even though their thread ids differ, so this keeps anchorless
+/// work near the same upstream prompt cache without turning affinity into a hard owner pin.
+///
+/// Hard concurrency admission belongs to the server's atomic reservation layer. Applying another
+/// raw `min_load + 1` cutoff here can incorrectly evict a high-capacity account in favor of a Free
+/// account even while both remain safely below their explicit caps. Remaining quota stays in the
+/// rendezvous weight; live pressure remains a soft weight penalty.
+fn affinity_or_weighted_pick(
+    pool: &[Candidate<'_>],
+    weights: &[f64],
+    ctx: &SelectionCtx,
+) -> Option<AccountId> {
+    let Some(session_id) = ctx.session_id.as_deref() else {
+        return sample_weighted(pool, weights, ctx);
+    };
+    if pool.is_empty() {
+        return None;
+    }
+
+    pool.iter()
+        .zip(weights)
+        .filter(|(_, weight)| weight.is_finite() && **weight > 0.0)
+        .min_by(|(a, a_weight), (b, b_weight)| {
+            rendezvous_cost(session_id, a.snap.id.as_str(), **a_weight)
+                .total_cmp(&rendezvous_cost(session_id, b.snap.id.as_str(), **b_weight))
+                .then(a.snap.id.as_str().cmp(b.snap.id.as_str()))
+        })
+        .map(|(candidate, _)| candidate.snap.id.clone())
+        .or_else(|| sample_weighted(pool, weights, ctx))
+}
+
+fn rendezvous_cost(session_id: &str, account_id: &str, weight: f64) -> f64 {
+    // Stable FNV-1a rather than DefaultHasher (whose algorithm is intentionally unspecified).
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in session_id
+        .bytes()
+        .chain(std::iter::once(0xff))
+        .chain(account_id.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    // Weighted rendezvous: exponential race, lowest -ln(U)/weight wins.
+    let uniform = ((hash as f64) + 1.0) / ((u64::MAX as f64) + 2.0);
+    -uniform.ln() / weight
 }
 
 /// The shared pre-weighting pipeline for the "pool-first" strategies (capacity_weighted,
@@ -633,7 +684,7 @@ impl Selector for CacheAffinityTier {
             .iter()
             .map(|c| Self::tier_weight(c, tier, ctx.now))
             .collect();
-        sample_weighted(&pool, &weights, ctx)
+        affinity_or_weighted_pick(&pool, &weights, ctx)
     }
 
     fn name(&self) -> &'static str {
@@ -720,6 +771,7 @@ mod tests {
             session_id: None,
             tier: None,
             inflight_penalty_pct: 0.0,
+            request_pressure_units: 1,
         }
     }
 
@@ -743,6 +795,52 @@ mod tests {
         s.plan_type = plan.to_string();
         s.secondary_used_percent = secondary_used;
         s
+    }
+
+    #[test]
+    fn capacity_weighted_keeps_one_session_family_on_one_account_when_load_is_balanced() {
+        let sel = CapacityWeighted;
+        let pool = vec![snap("a", "pro", 20.0), snap("b", "pro", 20.0)];
+        let mut family = ctx(1_000, 1);
+        family.session_id = Some("shared-main-and-subagents".to_string());
+
+        let first = sel.pick(&pool, &family).unwrap();
+        for seed in 2..50 {
+            family.rng_seed = Some(seed);
+            assert_eq!(
+                sel.pick(&pool, &family),
+                Some(first.clone()),
+                "session affinity must be stable rather than depend on per-request RNG"
+            );
+        }
+    }
+
+    #[test]
+    fn session_family_affinity_does_not_treat_raw_load_as_quota_capacity() {
+        let sel = CapacityWeighted;
+        let pool = vec![snap("pro", "pro", 20.0), snap("free", "free", 20.0)];
+        let mut family = (0..1_000)
+            .map(|index| {
+                let mut candidate = ctx(1_000, 1);
+                candidate.session_id = Some(format!("capacity-family-{index}"));
+                candidate
+            })
+            .find(|candidate| sel.pick(&pool, candidate) == Some(AccountId::from("pro")))
+            .expect("at least one deterministic family maps to the Pro account");
+
+        let mut loaded = pool;
+        let preferred_snap = loaded
+            .iter_mut()
+            .find(|snapshot| snapshot.id.as_str() == "pro")
+            .unwrap();
+        preferred_snap.in_flight = 2;
+
+        family.rng_seed = Some(999);
+        assert_eq!(
+            sel.pick(&loaded, &family),
+            Some(AccountId::from("pro")),
+            "quota capacity and hard admission, not a raw min-load delta, govern availability"
+        );
     }
 
     #[test]
@@ -814,6 +912,7 @@ mod tests {
             session_id: None,
             tier: None,
             inflight_penalty_pct: 0.0,
+            request_pressure_units: 1,
         };
         assert_eq!(sel.pick(&[a, b], &c).unwrap().as_str(), "b");
     }
@@ -829,6 +928,7 @@ mod tests {
             session_id: None,
             tier: None,
             inflight_penalty_pct: 0.0,
+            request_pressure_units: 1,
         };
         assert!(sel.pick(&[a], &c).is_none());
     }
@@ -1323,6 +1423,7 @@ mod tests {
             session_id: None,
             tier: None,
             inflight_penalty_pct: 0.0,
+            request_pressure_units: 1,
         };
 
         let sel = CapacityWeighted;
@@ -1356,6 +1457,7 @@ mod tests {
             session_id: None,
             tier: None,
             inflight_penalty_pct: 0.0,
+            request_pressure_units: 1,
         };
 
         let sel = CapacityWeighted;
@@ -1470,6 +1572,7 @@ mod tests {
             session_id: None,
             tier: None,
             inflight_penalty_pct: 0.0,
+            request_pressure_units: 1,
         };
 
         let sel = CapacityWeighted;

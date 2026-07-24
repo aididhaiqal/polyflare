@@ -22,7 +22,7 @@ use polyflare_server::keys::sha256_hex;
 use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
 use polyflare_server::session_key::header_session_key;
 use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
-use polyflare_testkit::MockControlUpstream;
+use polyflare_testkit::{MockControlUpstream, MockOAuth};
 
 fn now() -> i64 {
     SystemTime::now()
@@ -77,6 +77,19 @@ async fn seed_account(store: &Store, cipher: &TokenCipher, id: &str, token: &str
 /// produces exactly `{mock_base}/codex/<path>` / `{mock_base}/wham/<path>`, matching
 /// `MockControlUpstream::spawn`'s own routes.
 async fn spawn_app(enforce_client_keys: bool, mock_base: &str) -> (String, Arc<AppState>) {
+    spawn_app_with_oauth(
+        enforce_client_keys,
+        mock_base,
+        "http://127.0.0.1:9".to_string(),
+    )
+    .await
+}
+
+async fn spawn_app_with_oauth(
+    enforce_client_keys: bool,
+    mock_base: &str,
+    oauth_url: String,
+) -> (String, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
     std::mem::forget(dir);
@@ -96,7 +109,7 @@ async fn spawn_app(enforce_client_keys: bool, mock_base: &str) -> (String, Arc<A
         continuity,
         store,
         cipher,
-        oauth: OAuthClient::new("http://127.0.0.1:9").unwrap(),
+        oauth: OAuthClient::new(oauth_url).unwrap(),
         upstream_base_url: format!("{mock_base}/codex"),
         anthropic_upstream_base_url: "http://127.0.0.1:9".to_string(),
         refresh_locks: Default::default(),
@@ -119,6 +132,7 @@ async fn spawn_app(enforce_client_keys: bool, mock_base: &str) -> (String, Arc<A
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -235,7 +249,7 @@ async fn sentinel_body_is_forwarded_but_never_reaches_the_request_log() {
 
 // -------------------------------------------------------------------------------------------
 // C11b Task 2: `control_route` bumps the content-free `upstream_request_metrics` counter,
-// keyed by `(account_id, status)`, exactly once per real control request — the CONTROL traffic
+// keyed by provider target and status, exactly once per real control request — the CONTROL traffic
 // class of the 3 request-completion wrapper sites.
 // -------------------------------------------------------------------------------------------
 
@@ -259,9 +273,195 @@ async fn control_request_records_upstream_request_metric() {
 
     assert_eq!(
         state.upstream_request_metrics.snapshot(),
-        vec![("acct-a".to_string(), 200, 1)],
+        vec![(
+            "codex".to_string(),
+            "account".to_string(),
+            "acct-a".to_string(),
+            200,
+            1,
+        )],
         "control_route must record exactly one upstream_requests entry for the served account"
     );
+}
+
+#[tokio::test]
+async fn successful_unary_control_request_holds_one_lease_and_clears_prior_health_errors() {
+    let mock = MockControlUpstream::new(200, r#"{"goal":"ok"}"#);
+    let mock_base = mock.clone().spawn().await;
+
+    let (base, state) = spawn_app(false, &mock_base).await;
+    seed_account(&state.store, &state.cipher, "acct-a", "tok-a").await;
+    let id = polyflare_core::AccountId::from("acct-a");
+    state.runtime.record_transient_error(&id, now());
+
+    let response = reqwest::Client::new()
+        .get(format!("{base}/thread/goal/get"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    assert_eq!(state.lease_metrics.acquired(), 1);
+    assert_eq!(
+        state.lease_metrics.released(),
+        1,
+        "the unary lease must be released after the full response has been buffered"
+    );
+    let mut snapshots = vec![polyflare_core::AccountSnapshot::new("acct-a")];
+    state.runtime.overlay(&mut snapshots, now());
+    assert_eq!(snapshots[0].in_flight, 0, "the unary lease must not leak");
+    assert_eq!(
+        snapshots[0].error_count, 0,
+        "a successful provider outcome clears stale health errors"
+    );
+}
+
+#[tokio::test]
+async fn unary_429_honors_retry_after_and_requests_immediate_usage_refresh() {
+    let mock = MockControlUpstream::new(
+        429,
+        r#"{"error":{"code":"rate_limit_exceeded","message":"ignored"}}"#,
+    )
+    .with_header("retry-after", "75");
+    let mock_base = mock.clone().spawn().await;
+
+    let (base, state) = spawn_app(false, &mock_base).await;
+    seed_account(&state.store, &state.cipher, "acct-a", "tok-a").await;
+    let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::unbounded_channel();
+    state.runtime.register_usage_refresh(refresh_tx);
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/memories/trace_summarize"))
+        .body(r#"{"trace":"x"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 429);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("75")
+    );
+
+    let id = polyflare_core::AccountId::from("acct-a");
+    let mut snapshots = vec![polyflare_core::AccountSnapshot::new("acct-a")];
+    state.runtime.overlay(&mut snapshots, now());
+    assert_eq!(snapshots[0].error_count, 1);
+    let last_error_at = snapshots[0].last_error_at.expect("429 error timestamp");
+    assert_eq!(
+        snapshots[0].cooldown_until,
+        Some(last_error_at + 75),
+        "the unary path must preserve Retry-After in the shared cooldown policy"
+    );
+    assert_eq!(
+        refresh_rx.try_recv().unwrap(),
+        id,
+        "capacity failures request an authoritative usage refresh"
+    );
+    assert_eq!(state.lease_metrics.acquired(), 1);
+    assert_eq!(state.lease_metrics.released(), 1);
+}
+
+#[tokio::test]
+async fn unary_5xx_penalizes_health_but_ordinary_request_4xx_is_neutral() {
+    let failing = MockControlUpstream::new(503, r#"{"error":{"message":"unavailable"}}"#);
+    let failing_base = failing.clone().spawn().await;
+    let (base, state) = spawn_app(false, &failing_base).await;
+    seed_account(&state.store, &state.cipher, "acct-a", "tok-a").await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{base}/agent-identities/jwks"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+
+    let id = polyflare_core::AccountId::from("acct-a");
+    let mut snapshots = vec![polyflare_core::AccountSnapshot::new("acct-a")];
+    state.runtime.overlay(&mut snapshots, now());
+    assert_eq!(
+        snapshots[0].error_count, 1,
+        "a unary provider 5xx is a transient account-health failure"
+    );
+
+    let request_error = MockControlUpstream::new(400, r#"{"error":{"message":"bad request"}}"#);
+    let request_error_base = request_error.clone().spawn().await;
+    let (base, state) = spawn_app(false, &request_error_base).await;
+    seed_account(&state.store, &state.cipher, "acct-a", "tok-a").await;
+    state.runtime.record_transient_error(&id, now());
+
+    let response = reqwest::Client::new()
+        .get(format!("{base}/agent-identities/jwks"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+
+    let mut snapshots = vec![polyflare_core::AccountSnapshot::new("acct-a")];
+    state.runtime.overlay(&mut snapshots, now());
+    assert_eq!(
+        snapshots[0].error_count, 1,
+        "an ordinary request-level 4xx must neither penalize nor clear account health"
+    );
+    assert_eq!(state.lease_metrics.acquired(), 1);
+    assert_eq!(state.lease_metrics.released(), 1);
+}
+
+#[tokio::test]
+async fn unary_quota_code_is_capacity_not_health_and_transport_loss_is_transient() {
+    let quota = MockControlUpstream::new(
+        400,
+        r#"{"error":{"code":"insufficient_quota","message":"ignored"}}"#,
+    );
+    let quota_base = quota.clone().spawn().await;
+    let (base, state) = spawn_app(false, &quota_base).await;
+    seed_account(&state.store, &state.cipher, "acct-a", "tok-a").await;
+    let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::unbounded_channel();
+    state.runtime.register_usage_refresh(refresh_tx);
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/alpha/search"))
+        .body(r#"{"query":"x"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+
+    let id = polyflare_core::AccountId::from("acct-a");
+    let mut snapshots = vec![polyflare_core::AccountSnapshot::new("acct-a")];
+    state.runtime.overlay(&mut snapshots, now());
+    assert_eq!(
+        snapshots[0].error_count, 0,
+        "quota exhaustion is capacity pressure, not an account-health error"
+    );
+    let remaining = snapshots[0]
+        .cooldown_until
+        .expect("quota cooldown")
+        .saturating_sub(now());
+    assert!(
+        (119..=polyflare_server::runtime_state::QUOTA_EXCEEDED_COOLDOWN_SECS).contains(&remaining)
+    );
+    assert_eq!(refresh_rx.try_recv().unwrap(), id);
+
+    let (base, state) = spawn_app(false, "http://127.0.0.1:9").await;
+    seed_account(&state.store, &state.cipher, "acct-a", "tok-a").await;
+    let response = reqwest::Client::new()
+        .get(format!("{base}/agent-identities/jwks"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+
+    let mut snapshots = vec![polyflare_core::AccountSnapshot::new("acct-a")];
+    state.runtime.overlay(&mut snapshots, now());
+    assert_eq!(
+        snapshots[0].error_count, 1,
+        "a unary transport loss is a transient account-health failure"
+    );
+    assert_eq!(state.lease_metrics.acquired(), 1);
+    assert_eq!(state.lease_metrics.released(), 1);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -320,6 +520,74 @@ async fn control_request_with_session_header_lands_on_the_owner_account() {
             .and_then(|v| v.to_str().ok()),
         Some("Bearer tok-b"),
         "the request landed on the session's OWNER account (acct-b), not a freshly-selected one"
+    );
+}
+
+#[tokio::test]
+async fn pooled_memory_summary_isolated_from_same_session_owner_in_another_pool() {
+    let mock = MockControlUpstream::new(200, r#"{"summary":"ok"}"#);
+    let mock_base = mock.clone().spawn().await;
+
+    let (base, state) = spawn_app(true, &mock_base).await;
+    seed_account(&state.store, &state.cipher, "acct-global", "tok-global").await;
+    seed_account(&state.store, &state.cipher, "acct-memory", "tok-memory").await;
+    state
+        .store
+        .accounts()
+        .update_pool("acct-memory", Some("memory"))
+        .await
+        .unwrap();
+    insert_key_for_raw(&state.store, "sk-pf-pooled-memory", "pooled-memory").await;
+
+    // The unscoped session belongs to acct-global. Pool scoping is part of the session identity,
+    // so the same inbound turn-state on /memory/... must not inherit this out-of-pool owner.
+    let headers_for_key = {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-codex-turn-state", "shared-turn-state".parse().unwrap());
+        h
+    };
+    let unscoped_key = header_session_key(&headers_for_key, None).unwrap();
+    let t = now();
+    state
+        .store
+        .continuity()
+        .ensure_session(&unscoped_key.value, "hard", t)
+        .await
+        .unwrap();
+    state
+        .store
+        .continuity()
+        .record_completion(
+            &unscoped_key.value,
+            "hard",
+            "acct-global",
+            "resp_global",
+            "fp",
+            1,
+            t,
+        )
+        .await
+        .unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/memory/memories/trace_summarize"))
+        .header("authorization", "Bearer sk-pf-pooled-memory")
+        .header("x-codex-turn-state", "shared-turn-state")
+        .body(r#"{"trace":"pool scoped"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let recorded = mock.last_request().expect("the mock received a request");
+    assert_eq!(recorded.path, "/codex/memories/trace_summarize");
+    assert_eq!(
+        recorded
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer tok-memory"),
+        "pooled memories must select only an account in the requested pool"
     );
 }
 
@@ -452,6 +720,182 @@ async fn thread_goal_set_clear_get_are_forwarded() {
     assert_eq!(resp.status(), 200);
     assert_eq!(mock.last_request().unwrap().path, "/codex/thread/goal/get");
     assert_eq!(mock.last_request().unwrap().method, "GET");
+}
+
+#[tokio::test]
+async fn image_and_opt_in_search_endpoints_forward_exact_paths_bodies_and_pool_scope() {
+    let mock = MockControlUpstream::new(200, r#"{"created":1,"data":[{"b64_json":"aW1hZ2U="}]}"#)
+        .with_header("content-type", "application/json")
+        .with_header("x-request-id", "upstream-aux-1");
+    let mock_base = mock.clone().spawn().await;
+
+    let (base, state) = spawn_app(true, &mock_base).await;
+    seed_account(&state.store, &state.cipher, "acct-a", "tok-a").await;
+    state
+        .store
+        .accounts()
+        .update_pool("acct-a", Some("creative"))
+        .await
+        .unwrap();
+    insert_key_for_raw(&state.store, "sk-pf-aux-test", "aux").await;
+
+    let client = reqwest::Client::new();
+    let cases = [
+        (
+            "/images/generations",
+            "/codex/images/generations",
+            r#"{"model":"gpt-image-1.5","prompt":"fox"}"#,
+        ),
+        (
+            "/images/edits",
+            "/codex/images/edits",
+            r#"{"model":"gpt-image-1.5","prompt":"hat","images":[{"image_url":"data:image/png;base64,Zm9v"}]}"#,
+        ),
+        (
+            "/alpha/search",
+            "/codex/alpha/search",
+            r#"{"id":"search-session","model":"gpt-5.6-sol","input":[]}"#,
+        ),
+        (
+            "/creative/images/generations",
+            "/codex/images/generations",
+            r#"{"model":"gpt-image-1.5","prompt":"pool fox"}"#,
+        ),
+        (
+            "/creative/alpha/search",
+            "/codex/alpha/search",
+            r#"{"id":"search-session","model":"gpt-5.6-sol","input":[]}"#,
+        ),
+    ];
+
+    for (client_path, upstream_path, request_body) in cases {
+        let response = client
+            .post(format!("{base}{client_path}"))
+            .header("authorization", "Bearer sk-pf-aux-test")
+            .header("content-type", "application/json")
+            .header("x-openai-originator", "codex_cli_rs")
+            .body(request_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{client_path}");
+        assert_eq!(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("upstream-aux-1")
+        );
+
+        let recorded = mock
+            .last_request()
+            .expect("auxiliary request reached upstream");
+        assert_eq!(recorded.path, upstream_path, "{client_path}");
+        assert_eq!(recorded.method, "POST");
+        assert_eq!(recorded.body.as_ref(), request_body.as_bytes());
+        assert_eq!(
+            recorded
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer tok-a"),
+            "the selected account bearer replaces the PolyFlare client key"
+        );
+        assert_eq!(
+            recorded
+                .headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+    }
+}
+
+#[tokio::test]
+async fn image_401_forces_one_refresh_and_retries_on_the_same_account() {
+    use axum::body::Bytes;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::any;
+    use std::sync::Mutex;
+
+    async fn upstream(
+        State(seen): State<Arc<Mutex<Vec<String>>>>,
+        headers: HeaderMap,
+        _body: Bytes,
+    ) -> Response {
+        let authorization = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        seen.lock().unwrap().push(authorization.clone());
+        if authorization == "Bearer refreshed-image-token" {
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                r#"{"created":1,"data":[{"b64_json":"aW1hZ2U="}]}"#,
+            )
+                .into_response()
+        } else {
+            (
+                StatusCode::UNAUTHORIZED,
+                [("content-type", "application/json")],
+                r#"{"error":{"code":"invalid_token"}}"#,
+            )
+                .into_response()
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream_app = axum::Router::new()
+        .route("/codex/{*path}", any(upstream))
+        .with_state(seen.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.unwrap();
+    });
+
+    let oauth = MockOAuth::ok(
+        "refreshed-image-token",
+        "refreshed-image-refresh",
+        "refreshed-image-id",
+    );
+    let oauth_handle = oauth.clone();
+    let oauth_url = oauth.spawn().await;
+    let (base, state) =
+        spawn_app_with_oauth(true, &format!("http://{upstream_addr}"), oauth_url).await;
+    seed_account(
+        &state.store,
+        &state.cipher,
+        "acct-a",
+        "rejected-image-token",
+    )
+    .await;
+    insert_key_for_raw(&state.store, "sk-pf-image-auth-test", "image-auth").await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/images/generations"))
+        .header("authorization", "Bearer sk-pf-image-auth-test")
+        .json(&serde_json::json!({
+            "model": "gpt-image-1.5",
+            "prompt": "fox"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(oauth_handle.hit_count(), 1);
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        [
+            "Bearer rejected-image-token".to_string(),
+            "Bearer refreshed-image-token".to_string()
+        ],
+        "the retry stays on the selected account and uses its refreshed bearer"
+    );
 }
 
 // -------------------------------------------------------------------------------------------

@@ -23,7 +23,7 @@ use crate::refresh_locks::RefreshLocks;
 
 /// Raised request-body limit: axum's `Json` extractor default (2 MB) 413s real
 /// OpenAI-Responses requests. 100 MB is generous for real Codex turns while bounded.
-const MAX_REQUEST_BODY_BYTES: usize = 100 * 1024 * 1024;
+pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 100 * 1024 * 1024;
 
 /// Shared server state: the per-provider executors, the account selector, the continuity engine,
 /// the store + at-rest cipher, the OAuth refresher, and the per-provider upstream base URLs.
@@ -80,8 +80,9 @@ pub struct AppState {
     /// `error_count`/`cooldown_until`/`last_error_at`/`last_selected_at` overlaid onto snapshots at
     /// selection time. In-memory only (churns per request); resets on restart.
     pub runtime: Arc<crate::runtime_state::RuntimeStates>,
-    /// Admin token gating every `/api/*` dashboard route (see `crate::auth::require_admin`), from
-    /// `POLYFLARE_ADMIN_TOKEN`. `None` ⇒ the dashboard API is disabled (503), not silently open.
+    /// Optional token gating every `/api/*` dashboard route (see `crate::auth::require_admin`).
+    /// `None` is opened only when the production builder resolves a loopback listener bind;
+    /// otherwise the dashboard API remains disabled (503).
     pub admin_token: Option<String>,
     /// Live-editable Settings subsystem Task 4: the atomic holder for the 10 formerly-static
     /// `AppState` fields this task REMOVES from this struct — `max_account_attempts`,
@@ -96,16 +97,21 @@ pub struct AppState {
     /// settings PATCH endpoint's `RuntimeSettings::set`, which re-validates through the SAME
     /// `clamp_<field>` fns the boot path uses.
     pub runtime_settings: Arc<RuntimeSettings>,
-    /// WS-downstream relay plan Task 2: selects the DOWNSTREAM (client-facing) WebSocket transport
-    /// (`POLYFLARE_WS_DOWNSTREAM`, resolved ONCE at startup by `crate::config::ServeConfig::from_env`
-    /// — never read per-request). Read only in `build_app` below to shape the router: when `true`,
+    /// Selects the client-facing WebSocket transport. Resolved once at startup from the persisted
+    /// `client_websocket_enabled` setting (with an environment/default bootstrap). Read only in
+    /// `build_app` below to shape the router: when `true`,
     /// the WS-handshake `GET /responses` (+ `/{pool}/responses`) routes to
-    /// `crate::ws_relay::responses_ws_handler` (which ACCEPTS the upgrade); when `false` (the
-    /// default), it keeps answering `426` via `crate::ingress::websocket_fallback_handler`,
-    /// byte-identical to before this flag existed. Defaults to `false` in every test/dev harness that
-    /// builds `AppState` directly (mirrors `enforce_client_keys`/`live_logs`), preserving the 426
-    /// default. See `docs/superpowers/specs/2026-07-20-ws-downstream-relay-design.md` §8.
+    /// `crate::ws_relay::responses_ws_handler` (which ACCEPTS the upgrade); when explicitly
+    /// disabled, it answers `426` via `crate::ingress::websocket_fallback_handler`. Production
+    /// configuration defaults this field to `true`; focused test harnesses may still construct
+    /// `false` directly when exercising the HTTP fallback.
     pub ws_downstream: bool,
+    /// Between-turns relay idle policy (honest-liveness work, 2026-07-24; see
+    /// `crate::ws_relay::WsRelayIdlePolicy`): keepalive ping cadence + idle budget for a parked
+    /// upstream socket. Resolved once at startup from `websocket_idle_ping_secs` and
+    /// `websocket_idle_budget_secs`; read only at
+    /// pump start (`crate::ws_relay::pump::run_pump`), never per-frame.
+    pub ws_relay_idle: crate::ws_relay::WsRelayIdlePolicy,
     /// Content-free live-log bus (see `crate::log_bus`): a broadcast channel + ring buffer fed
     /// from the `RequestLog` content-safety chokepoint (`crate::ingress`'s route wrappers). A
     /// later task exposes this over `/api/logs/stream`; present now so publishing starts
@@ -156,18 +162,16 @@ pub struct AppState {
     /// inside `crate::runtime_state::RuntimeStates::record_rate_limit`, the single 429 chokepoint.
     /// In-memory only; resets on restart.
     pub rate_limit_metrics: std::sync::Arc<crate::observability::RateLimitMetrics>,
-    /// WS-downstream relay Phase 2/3 Task 5: content-free counter of reconnect/move/residual-
-    /// anchor-miss events (see `crate::observability::RelayMetrics`), labeled by exactly three
-    /// fixed strings. Bumped from `crate::ws_relay::pump::run_pump`'s decision points (same-
-    /// account re-dial, cross-account move, same-account anchor-miss) via a handle threaded into
-    /// the pump from `crate::ws_relay::relay`. In-memory only; resets on restart.
+    /// WS-downstream relay Phase 2/3 Task 5: content-free counter of reconnect, move, anchor
+    /// recovery, and terminal anchor-miss events (see `crate::observability::RelayMetrics`), labeled
+    /// by exactly four fixed strings. Bumped from `crate::ws_relay::pump::run_pump`'s decision
+    /// points via a handle threaded into the pump from `crate::ws_relay::relay`. In-memory only;
+    /// resets on restart.
     pub relay_metrics: std::sync::Arc<crate::observability::RelayMetrics>,
-    /// D15 Task 3: the live upstream Codex model-catalog cache (see `crate::model_catalog`),
-    /// merged onto the static bootstrap floor with a TTL + single-flight, falling back airtight to
-    /// the floor on disable/no-accounts/fetch-failure. Read on the `/models` hot path via the sync
-    /// `cached_or_fallback()` (`crate::catalog::build_catalog`'s callers); warmed by a background
-    /// task in `serve` only when `POLYFLARE_MODEL_CATALOG_ENABLED` (default on). `/models` is
-    /// advertised metadata only — this field is never consulted by routing/selection.
+    /// Live upstream Codex model catalogs (see `crate::model_catalog`), cached per account and
+    /// projected into exact root/pool intersections with TTL + single-flight refresh. Startup and
+    /// periodic warmers keep active scopes hot; stale exact-scope or static-floor fallback remains
+    /// available on fetch failure. Known per-account support also feeds model eligibility.
     pub model_catalog: Arc<crate::model_catalog::ModelCatalogCache>,
 }
 
@@ -196,14 +200,13 @@ impl AppState {
     }
 }
 
-/// Construct the Codex-provider executor for `AppState.codex_executor`, selected by
-/// `POLYFLARE_WS_UPSTREAM` (`ws_upstream`, see `crate::config::ServeConfig`).
+/// Construct the Codex-provider executor for `AppState.codex_executor`.
 ///
-/// **`ws_upstream == false` (the default): `CodexExecutor` exactly as before this flag existed —
-/// zero behavior change.** This is the ONLY path every deployment and every existing test used
-/// prior to M5a; nothing about it is touched by this function's `true` branch.
+/// `http_requests_use_upstream_websocket` describes this boundary precisely: it only changes the
+/// upstream leg created for an HTTP `/responses` ingress request. It does not control the
+/// client-facing WebSocket relay.
 ///
-/// `ws_upstream == true`: wraps a `CodexWsExecutor` around a FRESH `CodexExecutor` as its
+/// When enabled, this wraps a `CodexWsExecutor` around a fresh `CodexExecutor` as its
 /// HTTP-SSE fallback. Per `SPEC-M5-WEBSOCKET.md` §6, HTTP-SSE "remains the fallback on every
 /// path" — but that fallback is entirely internal to `CodexWsExecutor` (a 426 at handshake time,
 /// scoped per-session/per-account-cooldown; see `polyflare_codex::ws::executor`'s module doc's
@@ -212,20 +215,18 @@ impl AppState {
 /// Constraints: "No new retry/failover machinery. M5a swaps the transport under today's
 /// behavior.").
 ///
-/// `ws_client_ping` (`POLYFLARE_WS_CLIENT_PING`, see `crate::config::ServeConfig`) selects the WS
-/// executor's client-keepalive-ping policy: `false` (the default) is codex-rs-faithful (no
-/// client-initiated ping); `true` opts into codex-lb-style keepalive pings for aggressive-NAT/
-/// middlebox deployments. It has NO effect when `ws_upstream` is `false` (the HTTP-SSE path has no
-/// WS socket to ping).
+/// `http_upstream_websocket_ping` selects that executor socket's active-turn keepalive policy. It
+/// has no effect when `http_requests_use_upstream_websocket` is false and is unrelated to the
+/// parked relay's idle ping setting.
 pub fn build_codex_executor(
-    ws_upstream: bool,
-    ws_client_ping: bool,
+    http_requests_use_upstream_websocket: bool,
+    http_upstream_websocket_ping: bool,
 ) -> Result<Arc<dyn Executor>, ExecError> {
     let http = CodexExecutor::new()?;
-    if ws_upstream {
+    if http_requests_use_upstream_websocket {
         Ok(Arc::new(CodexWsExecutor::new(
             Arc::new(http),
-            ws_client_ping,
+            http_upstream_websocket_ping,
         )))
     } else {
         Ok(Arc::new(http))
@@ -233,14 +234,58 @@ pub fn build_codex_executor(
 }
 
 pub fn build_app(state: Arc<AppState>) -> Router {
-    // The dashboard API: every route here sits behind `require_admin` (POLYFLARE_ADMIN_TOKEN via
-    // `Authorization: Bearer <token>`; unset ⇒ 503). Register only routes whose handlers exist
-    // today — later tasks add their own route lines to this same auth-gated router.
+    // The dashboard API: every route sits behind `require_admin`. A configured token is required;
+    // without one, only `build_app_for_bind` may install the startup-resolved loopback marker.
+    // Register only routes whose handlers exist today.
     let api = Router::new()
         .route("/api/whoami", get(crate::auth::whoami_handler))
         .route("/api/capabilities", get(crate::auth::capabilities_handler))
-        .route("/api/pools", get(crate::read_api::pools_handler))
+        .route(
+            "/api/pools",
+            get(crate::read_api::pools_handler).post(crate::write_api::create_pool_handler),
+        )
+        .route(
+            "/api/account-onboarding/codex",
+            post(crate::account_onboarding::start_handler),
+        )
+        .route(
+            "/api/account-onboarding/{id}",
+            get(crate::account_onboarding::status_handler),
+        )
+        .route(
+            "/api/account-onboarding/{id}/callback",
+            post(crate::account_onboarding::callback_handler),
+        )
         .route("/api/accounts", get(crate::read_api::accounts_handler))
+        .route(
+            "/api/providers",
+            get(crate::provider_api::list).post(crate::provider_api::create),
+        )
+        .route(
+            "/api/providers/{id}",
+            patch(crate::provider_api::patch_provider).delete(crate::provider_api::delete_provider),
+        )
+        .route(
+            "/api/providers/{id}/test",
+            post(crate::provider_api::test_provider),
+        )
+        .route(
+            "/api/providers/{id}/credentials",
+            post(crate::provider_api::create_credential),
+        )
+        .route(
+            "/api/provider-credentials/{id}",
+            patch(crate::provider_api::patch_credential)
+                .delete(crate::provider_api::delete_credential),
+        )
+        .route(
+            "/api/providers/{id}/models",
+            post(crate::provider_api::create_model),
+        )
+        .route(
+            "/api/provider-models/{id}",
+            patch(crate::provider_api::patch_model).delete(crate::provider_api::delete_model),
+        )
         .route(
             "/api/accounts/{id}",
             get(crate::read_api::account_detail_handler)
@@ -321,6 +366,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             "/memories/trace_summarize",
             post(crate::control::trace_summarize_handler),
         )
+        .route(
+            "/{pool}/memories/trace_summarize",
+            post(crate::control::pooled_trace_summarize_handler),
+        )
         // D14a: `POST /responses/compact` — a UNARY passthrough the real Codex CLI emits
         // (`codex-rs client.rs:159`), previously 404'd. Static seg 1 (`responses`) never collides
         // with `/{pool}/responses`'s param seg 1 (matchit prefers the static route), and seg 2
@@ -329,6 +378,28 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route(
             "/{pool}/responses/compact",
             post(crate::control::pooled_compact_handler),
+        )
+        // Current codex-rs stable extension endpoints. These are unary JSON requests, but still
+        // require the selected Codex account's bearer/account-id pairing and hard pool scope.
+        .route(
+            "/images/generations",
+            post(crate::control::image_generations_handler),
+        )
+        .route(
+            "/{pool}/images/generations",
+            post(crate::control::pooled_image_generations_handler),
+        )
+        .route("/images/edits", post(crate::control::image_edits_handler))
+        .route(
+            "/{pool}/images/edits",
+            post(crate::control::pooled_image_edits_handler),
+        )
+        // Standalone search is under-development/default-off in the vendored client. Routing the
+        // exact endpoint keeps explicitly enabled clients compatible without enabling the feature.
+        .route("/alpha/search", post(crate::control::alpha_search_handler))
+        .route(
+            "/{pool}/alpha/search",
+            post(crate::control::pooled_alpha_search_handler),
         );
     if state.enforce_client_keys {
         proxy = proxy.route_layer(axum::middleware::from_fn_with_state(
@@ -357,37 +428,50 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     // WS-downstream relay Task 2 (`POLYFLARE_WS_DOWNSTREAM` → `state.ws_downstream`): when ON, that
     // WS handshake is ACCEPTED — the GET routes to `crate::ws_relay::responses_ws_handler`, which
     // completes the upgrade (`101`) and relays to an upstream WS (Tasks 3-6). When OFF (the
-    // default), the GET keeps answering `426 Upgrade Required` via
+    // explicit rollback), the GET answers `426 Upgrade Required` via
     // `crate::ingress::websocket_fallback_handler` — a correctness shim so a `supports_websockets`
     // client degrades to HTTP-SSE (codex-rs's SOLE WS→HTTP fallback trigger) instead of hard-failing
     // on axum's default 405. Both `get(_)` branches produce the SAME `MethodRouter<Arc<AppState>>`
     // type (the handler is type-erased inside), so a single flag-selected value serves both paths.
-    // Default-off is byte-identical to before this flag existed. `/v1/messages` is the
+    // The off branch remains byte-identical to the pre-relay fallback. `/v1/messages` is the
     // Anthropic-format path — Codex never opens a WS there, so it's deliberately left without a GET.
     //
-    // D18 Task 4: this GET route is registered here, on the TOP-LEVEL (unlayered) router, NOT
-    // inside `proxy` above — a keyless WS-handshake probe must always degrade to 426 (or, with the
-    // relay on, upgrade), never be rejected with 401, regardless of whether client-key enforcement
-    // is on. `Router::merge` combines a GET-only `MethodRouter` for a path with a POST-only one for
-    // the same path (axum's `MethodRouter::merge_for_path` only panics on an actual method OVERLAP,
-    // e.g. two GETs for the same path — disjoint methods merge cleanly), so splitting GET and POST
-    // across the unlayered top-level router and the conditionally-layered `proxy` sub-router below
-    // is safe and is exactly axum's supported pattern for "some methods on this path are gated,
-    // others aren't."
-    let responses_ws_get = if state.ws_downstream {
-        get(crate::ws_relay::responses_ws_handler)
+    // When WS is OFF, the 426 compatibility shim stays keyless so a WS-capable client can discover
+    // HTTP fallback before presenting a proxy key. When WS is ON, however, this GET is a real
+    // account-consuming proxy request and MUST share POST's client-key gate. Otherwise enabling
+    // enforcement protects HTTP while leaving a keyless WebSocket bypass.
+    let (responses_ws_get, pooled_responses_ws_get) = if state.ws_downstream {
+        (
+            get(crate::ws_relay::responses_ws_handler),
+            get(crate::ws_relay::pooled_responses_ws_handler),
+        )
     } else {
-        get(websocket_fallback_handler)
+        (
+            get(websocket_fallback_handler),
+            get(websocket_fallback_handler),
+        )
     };
+    let mut ws_proxy = Router::new()
+        .route("/responses", responses_ws_get)
+        .route("/{pool}/responses", pooled_responses_ws_get);
+    if state.ws_downstream && state.enforce_client_keys {
+        ws_proxy = ws_proxy.route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::require_client_key,
+        ));
+    }
 
     Router::new()
-        .route("/responses", responses_ws_get.clone())
-        .route("/{pool}/responses", responses_ws_get)
+        .merge(ws_proxy)
         .merge(proxy)
         // Model catalog (read-only GETs): real Codex models (bootstrap floor for now) merged with
         // PolyFlare's synthetic aliases. Routing is by method+path, so these never conflict with
         // the `/v1/*` POSTs above.
         .route("/models", get(crate::catalog::codex_models_handler))
+        .route(
+            "/{pool}/models",
+            get(crate::catalog::pooled_codex_models_handler),
+        )
         .route(
             "/backend-api/codex/models",
             get(crate::catalog::codex_models_handler),
@@ -406,4 +490,17 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/dashboard/{*path}", get(crate::dashboard::dashboard_asset))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
+}
+
+/// Build the production router with dashboard access resolved from the actual listener bind.
+/// Existing test/embedding callers can keep using [`build_app`], whose tokenless behavior remains
+/// fail-closed unless they explicitly supply a bind through this function.
+pub fn build_app_for_bind(state: Arc<AppState>, bind_addr: &str) -> Router {
+    let local_open = crate::auth::local_dashboard_access(state.admin_token.as_deref(), bind_addr);
+    let app = build_app(state);
+    if local_open {
+        app.layer(axum::Extension(crate::auth::LocalDashboardAccess))
+    } else {
+        app
+    }
 }

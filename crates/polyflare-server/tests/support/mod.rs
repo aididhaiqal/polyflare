@@ -13,7 +13,7 @@ use std::time::Duration;
 use polyflare_codex::oauth::OAuthClient;
 use polyflare_codex::CodexExecutor;
 use polyflare_core::{CapacityWeighted, Continuity};
-use polyflare_server::app::{build_app, AppState};
+use polyflare_server::app::{build_app, build_app_for_bind, AppState};
 use polyflare_server::continuity::CodexContinuity;
 use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
 use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
@@ -49,6 +49,19 @@ pub fn account(id: &str) -> Account {
 /// side effects).
 #[allow(dead_code)]
 pub async fn spawn_live_logs(upstream_url: String, enabled: bool) -> (String, Arc<AppState>) {
+    spawn_live_logs_with_oauth_base(upstream_url, enabled, "http://127.0.0.1:9".to_string()).await
+}
+
+#[allow(dead_code)]
+pub async fn spawn_with_oauth_base(oauth_base_url: String) -> (String, Arc<AppState>) {
+    spawn_live_logs_with_oauth_base("http://127.0.0.1:9".to_string(), true, oauth_base_url).await
+}
+
+async fn spawn_live_logs_with_oauth_base(
+    upstream_url: String,
+    enabled: bool,
+    oauth_base_url: String,
+) -> (String, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
     let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
@@ -80,7 +93,7 @@ pub async fn spawn_live_logs(upstream_url: String, enabled: bool) -> (String, Ar
         continuity,
         store,
         cipher,
-        oauth: OAuthClient::new("http://127.0.0.1:9".to_string()).unwrap(),
+        oauth: OAuthClient::new(oauth_base_url).unwrap(),
         upstream_base_url: upstream_url,
         anthropic_upstream_base_url: "http://127.0.0.1:9".to_string(),
         refresh_locks: Default::default(),
@@ -103,6 +116,7 @@ pub async fn spawn_live_logs(upstream_url: String, enabled: bool) -> (String, Ar
             live_logs: enabled,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -132,10 +146,24 @@ pub async fn spawn(upstream_url: String) -> (String, Arc<AppState>) {
     spawn_live_logs(upstream_url, true).await
 }
 
-/// Like `spawn`, but with the dashboard disabled (`admin_token: None`) — for asserting the
-/// 503 "dashboard disabled" behavior.
+/// Like `spawn`, but without an admin token. The harness binds to loopback, so production bind
+/// posture opens the dashboard directly.
 #[allow(dead_code)]
 pub async fn spawn_without_admin_token(upstream_url: String) -> (String, Arc<AppState>) {
+    spawn_without_admin_token_for_bind(upstream_url, "127.0.0.1:0").await
+}
+
+/// Tokenless state resolved as if production were bound non-locally. The test listener itself
+/// remains loopback-only; only the startup access-policy input differs.
+#[allow(dead_code)]
+pub async fn spawn_remote_without_admin_token(upstream_url: String) -> (String, Arc<AppState>) {
+    spawn_without_admin_token_for_bind(upstream_url, "0.0.0.0:8080").await
+}
+
+async fn spawn_without_admin_token_for_bind(
+    upstream_url: String,
+    access_bind_addr: &str,
+) -> (String, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
     let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
@@ -190,6 +218,7 @@ pub async fn spawn_without_admin_token(upstream_url: String) -> (String, Arc<App
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -201,7 +230,7 @@ pub async fn spawn_without_admin_token(upstream_url: String) -> (String, Arc<App
 
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
     });
-    let app = build_app(state.clone());
+    let app = build_app_for_bind(state.clone(), access_bind_addr);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

@@ -98,6 +98,7 @@ async fn spawn_polyflare(store: Store, upstream: String) -> String {
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -189,6 +190,45 @@ async fn pooled_path_routes_only_to_that_pools_account() {
         Some("Bearer tok-b"),
         "pool-b path must route to the pool-b account"
     );
+}
+
+#[tokio::test]
+async fn one_account_routes_through_each_of_its_pool_memberships() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
+    let repo = store.accounts();
+    repo.insert(&account("shared", None), &tokens("tok-shared"), &cipher)
+        .await
+        .unwrap();
+    repo.replace_pools("shared", &["pool-a".to_string(), "pool-b".to_string()])
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+
+    let mock = MockUpstream::new(ok_events());
+    let handle = mock.clone();
+    let upstream = mock.spawn().await;
+    let pf = spawn_polyflare(store, upstream).await;
+    let client = reqwest::Client::new();
+
+    for pool in ["pool-a", "pool-b"] {
+        let resp = client
+            .post(format!("{pf}/{pool}/responses"))
+            .json(&serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "{pool} must route to the shared account"
+        );
+        assert_eq!(
+            handle.last_authorization().as_deref(),
+            Some("Bearer tok-shared")
+        );
+    }
 }
 
 #[tokio::test]

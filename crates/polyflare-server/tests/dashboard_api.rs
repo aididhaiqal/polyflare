@@ -1,11 +1,13 @@
-//! Dashboard auth gate: every `/api/*` route sits behind `POLYFLARE_ADMIN_TOKEN`
-//! (`Authorization: Bearer <token>`). No token configured ⇒ the dashboard API is disabled (503),
-//! not silently open.
+//! Dashboard auth gate: a configured `POLYFLARE_ADMIN_TOKEN` protects every `/api/*` route.
+//! Without one, loopback-bound deployments are open for zero-config local use while non-loopback
+//! deployments remain disabled.
 
 mod support;
 use futures_util::StreamExt;
 use polyflare_server::log_bus::LogEvent;
-use support::{spawn, spawn_live_logs, spawn_without_admin_token};
+use support::{
+    spawn, spawn_live_logs, spawn_remote_without_admin_token, spawn_without_admin_token,
+};
 
 #[tokio::test]
 async fn whoami_requires_admin_token() {
@@ -50,21 +52,33 @@ async fn capabilities_reports_live_logs_flag() {
 }
 
 #[tokio::test]
-async fn whoami_is_503_when_dashboard_disabled() {
+async fn whoami_is_open_without_a_token_on_loopback() {
     let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
     let (pf, _state) = spawn_without_admin_token(up).await; // admin_token = None
     let c = reqwest::Client::new();
 
-    let resp = c
+    let resp = c.get(format!("{pf}/api/whoami")).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "loopback dashboard should open directly"
+    );
+}
+
+#[tokio::test]
+async fn whoami_stays_disabled_without_a_token_on_non_loopback_bind() {
+    let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
+    let (pf, _state) = spawn_remote_without_admin_token(up).await;
+
+    let resp = reqwest::Client::new()
         .get(format!("{pf}/api/whoami"))
-        .header("authorization", "Bearer whatever")
         .send()
         .await
         .unwrap();
     assert_eq!(
         resp.status(),
         503,
-        "no POLYFLARE_ADMIN_TOKEN configured ⇒ dashboard disabled"
+        "remote management must never open implicitly"
     );
 }
 
@@ -136,11 +150,14 @@ async fn responses_request_persists_account_and_model_metrics() {
     let mock =
         polyflare_testkit::MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()]);
     let upstream = mock.spawn().await;
-    let (pf, _state) = spawn(upstream).await; // seeds active account "acct-1", admin_token = Some("secret")
+    let (pf, state) = spawn(upstream).await; // seeds active account "acct-1", admin_token = Some("secret")
+    let (_backfill, mut live_logs) = state.log_bus.subscribe();
 
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{pf}/responses"))
+        .header("session_id", "dashboard-session-a")
+        .header("x-openai-subagent", "review")
         .json(&serde_json::json!({"model": "gpt-5.6-sol", "input": "hi"}))
         .send()
         .await
@@ -148,12 +165,11 @@ async fn responses_request_persists_account_and_model_metrics() {
     assert_eq!(resp.status(), 200);
 
     // Drain the SSE response to completion — the persist happens after the handler returns the
-    // stream, so the client must finish reading it for the fire-and-forget persist task to have
-    // been spawned.
+    // stream, so the client must finish reading it for the persist operation to have been queued.
     let mut stream = resp.bytes_stream();
     while stream.next().await.is_some() {}
 
-    // The persist is a detached `tokio::spawn` task (see `spawn_persist_request_log`), so poll
+    // The persist is handled by the bounded background writer, so poll
     // `/api/requests` a few times rather than assuming the row is already there.
     let mut rows = Vec::new();
     for _ in 0..20 {
@@ -177,4 +193,31 @@ async fn responses_request_persists_account_and_model_metrics() {
     assert!(!rows.is_empty(), "expected a persisted request_log row");
     assert_eq!(rows[0]["account_id"], "acct-1");
     assert_eq!(rows[0]["model"], "gpt-5.6-sol");
+    assert!(
+        rows[0]["request_id"]
+            .as_str()
+            .is_some_and(|request_id| request_id.len() == 32),
+        "dashboard API should expose the generated 128-bit correlation id"
+    );
+    let request_id = rows[0]["request_id"].as_str().unwrap();
+    let session_key = rows[0]["session_key"]
+        .as_str()
+        .expect("request row should expose the derived session hash");
+    assert_eq!(session_key.len(), 64);
+    assert_eq!(rows[0]["subagent"], "review");
+    let live_event = tokio::time::timeout(std::time::Duration::from_secs(1), live_logs.recv())
+        .await
+        .expect("request event should reach the live log bus")
+        .expect("live log channel should stay open");
+    assert_eq!(
+        live_event.request_id.as_deref(),
+        Some(request_id),
+        "live logs and durable request history must expose the same correlation id"
+    );
+    assert_eq!(live_event.session_key.as_deref(), Some(session_key));
+    assert_eq!(live_event.subagent.as_deref(), Some("review"));
+    assert_eq!(
+        rows[0]["transport"], "sse",
+        "a streamed HTTP response should be identified as SSE in dashboard telemetry"
+    );
 }

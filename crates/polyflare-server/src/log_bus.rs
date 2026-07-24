@@ -50,6 +50,10 @@ pub struct LogEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
@@ -60,6 +64,13 @@ pub struct LogEvent {
     /// a bounded role slug, never conversation content. Same content-safety class as `model`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent: Option<String>,
+    /// PolyFlare-generated request correlation id. Present on request-completion events so an
+    /// operator can jump from the live console to the matching durable request row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// One-way SHA-256 continuity/session key. Present only when the request path derived one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
     pub kind: String,
     pub message: String,
 }
@@ -78,10 +89,14 @@ impl LogEvent {
             level,
             provider: None,
             account: None,
+            target_kind: None,
+            target_id: None,
             model: None,
             status: None,
             latency_ms: None,
             subagent: None,
+            request_id: None,
+            session_key: None,
             kind: kind.to_string(),
             message: message.into(),
         }

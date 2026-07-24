@@ -38,10 +38,83 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Extract the raw Codex session-family identifier used only for ephemeral routing affinity.
+///
+/// The same compatibility aliases are accepted by native HTTP parsing. Callers must not persist or
+/// log this raw value; durable continuity uses the hashed [`SessionKey`] instead.
+pub(crate) fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    header_str(headers, "session-id")
+        .or_else(|| header_str(headers, "session_id"))
+        .or_else(|| header_str(headers, "x-session-id"))
+}
+
 /// Decode a raw field as a string ONLY if it is a JSON string; any other type (or absent) yields
 /// `None` — the lenient equivalent of the old `Value::get(..).and_then(Value::as_str)`.
 fn raw_as_str(rv: Option<&RawValue>) -> Option<String> {
     rv.and_then(|r| serde_json::from_str::<String>(r.get()).ok())
+}
+
+const MAX_TURN_ID_BYTES: usize = 256;
+
+fn bounded_turn_id(value: Option<&str>) -> Option<&str> {
+    value.filter(|turn_id| !turn_id.is_empty() && turn_id.len() <= MAX_TURN_ID_BYTES)
+}
+
+fn turn_id_from_metadata_json(raw: &str) -> Option<String> {
+    let metadata: HashMap<String, &RawValue> = serde_json::from_str(raw).ok()?;
+    let turn_id = raw_as_str(metadata.get("turn_id").copied())?;
+    bounded_turn_id(Some(&turn_id)).map(str::to_string)
+}
+
+fn turn_id_from_client_metadata(raw: Option<&RawValue>) -> Option<String> {
+    let metadata: HashMap<String, &RawValue> = serde_json::from_str(raw?.get()).ok()?;
+    // Codex defines the full metadata blob as the canonical per-request source. The flat
+    // `turn_id` is only a compatibility projection, so prefer the blob when both are present.
+    if let Some(projected) = metadata.get("x-codex-turn-metadata").copied() {
+        let turn_id = if let Some(json_string) = raw_as_str(Some(projected)) {
+            turn_id_from_metadata_json(&json_string)
+        } else {
+            turn_id_from_metadata_json(projected.get())
+        };
+        if turn_id.is_some() {
+            return turn_id;
+        }
+    }
+    if let Some(turn_id) = raw_as_str(metadata.get("turn_id").copied()) {
+        if bounded_turn_id(Some(&turn_id)).is_some() {
+            return Some(turn_id);
+        }
+    }
+    None
+}
+
+fn logical_turn_key(
+    headers: &HeaderMap,
+    client_metadata: Option<&RawValue>,
+    pool: Option<&str>,
+) -> Option<String> {
+    // A reused WebSocket keeps the compatibility headers from its handshake, while every
+    // `response.create` carries fresh client metadata. Prefer the per-frame/per-request body so a
+    // stale handshake header cannot collapse later turns into the first turn's aggregate budget.
+    let projected = turn_id_from_client_metadata(client_metadata).or_else(|| {
+        header_str(headers, "x-codex-turn-metadata")
+            .and_then(|raw| turn_id_from_metadata_json(&raw))
+    });
+    let turn_id = projected?;
+    let session = header_str(headers, "session-id")
+        .or_else(|| header_str(headers, "session_id"))
+        .or_else(|| header_str(headers, "x-session-id"));
+    let thread =
+        header_str(headers, "thread-id").or_else(|| header_str(headers, "x-codex-thread-id"));
+    let encoded = serde_json::to_vec(&(
+        "codex-logical-turn-v1",
+        pool.unwrap_or_default(),
+        session.as_deref().unwrap_or_default(),
+        thread.as_deref().unwrap_or_default(),
+        turn_id,
+    ))
+    .expect("string tuple serializes");
+    Some(sha256_hex(&encoded))
 }
 
 /// Best-effort `reasoning.effort` string, tolerating any `reasoning` shape (the old graceful path:
@@ -59,7 +132,33 @@ pub struct InboundFacts {
     pub model: String,
     /// `reasoning.effort` (for the routing tier); the caller maps it to a `Tier`.
     pub effort: Option<String>,
+    /// The client-requested Responses API service tier (`priority`/`fast`/`flex`/etc.), when set.
+    pub service_tier: Option<String>,
     pub ctx: RequestCtx,
+}
+
+/// Coarse token estimate from the raw input JSON length and an optional requested output ceiling.
+/// Four bytes/token is intentionally approximate; actual terminal usage calibrates future pressure.
+/// The result is numeric, content-free, saturating, and bounded against adversarial field values.
+pub(crate) fn estimate_request_tokens(
+    input: Option<&RawValue>,
+    max_output_tokens: Option<&RawValue>,
+) -> u32 {
+    let output_tokens = max_output_tokens
+        .and_then(|raw| serde_json::from_str::<u64>(raw.get()).ok())
+        .unwrap_or(4_096);
+    estimate_tokens_from_json_len(input.map_or(0, |raw| raw.get().len()), output_tokens)
+}
+
+pub(crate) fn estimate_tokens_from_json_len(input_json_len: usize, output_tokens: u64) -> u32 {
+    const MAX_OUTPUT_TOKENS: u64 = 131_072;
+    const MAX_ESTIMATED_TOKENS: u64 = 1_000_000;
+    let input_tokens = (input_json_len as u64).div_ceil(4);
+    input_tokens
+        // Autoregressive output occupies upstream compute for materially longer than prompt
+        // prefill. Apply the same 4x factor that terminal reconciliation uses.
+        .saturating_add(output_tokens.min(MAX_OUTPUT_TOKENS).saturating_mul(4))
+        .min(MAX_ESTIMATED_TOKENS) as u32
 }
 
 /// Derive `(input_count, is_full_resend)` from the raw `input` value WITHOUT materializing its deep
@@ -115,8 +214,13 @@ fn input_shape(input: Option<&RawValue>) -> (u32, bool) {
 }
 
 /// The HARD-strength half of session-key derivation: hashes `x-codex-turn-state` (with an optional
-/// `prompt_cache_key` suffix isolating threads), else a session header (`session_id` /
-/// `x-session-id`, same suffix rule). Returns `None` when NEITHER header is present — deliberately
+/// Current Codex sends `session-id` + `thread-id`; older/custom clients may send `session_id`,
+/// `x-session-id`, or `x-codex-thread-id`. The durable owner identity is session + thread + pool.
+/// `x-codex-window-id` is deliberately excluded: Codex advances the window during compaction while
+/// the conversation owner must remain stable. Turn-state is used only when no durable session or
+/// thread identity is present.
+///
+/// Returns `None` when no durable identity header is present — deliberately
 /// does NOT fall through to the soft (`x-request-id` / content-hash) derivation, because that
 /// fallback exists to give every native `/responses` turn *some* stable key even absent a real
 /// session header; control requests have no such requirement (D17 plan, Global Constraints: "SOFT
@@ -124,44 +228,66 @@ fn input_shape(input: Option<&RawValue>) -> (u32, bool) {
 /// is exactly the fallback trigger, so a manufactured soft key here would spuriously report
 /// "session present" for a request that carries none).
 ///
-/// Byte-identical hashing to [`derive_session_key`]'s two Hard branches — [`derive_session_key`] is
-/// implemented in terms of this fn plus its own soft fallback, so a `/responses` turn and a control
-/// request presenting the SAME `x-codex-turn-state`/`session_id` header always hash to the same
-/// [`SessionKey::value`] and therefore resolve the same continuity-session row.
+/// [`parse_inbound_scoped`], compact, control, and the downstream WS relay all call this same
+/// function so transport changes cannot silently change owners.
 pub fn header_session_key(
     headers: &HeaderMap,
     prompt_cache_key: Option<&str>,
 ) -> Option<SessionKey> {
-    if let Some(ts) = header_str(headers, "x-codex-turn-state") {
+    header_session_key_scoped(headers, prompt_cache_key, None)
+}
+
+pub fn header_session_key_scoped(
+    headers: &HeaderMap,
+    prompt_cache_key: Option<&str>,
+    pool: Option<&str>,
+) -> Option<SessionKey> {
+    let session = header_str(headers, "session-id")
+        .or_else(|| header_str(headers, "session_id"))
+        .or_else(|| header_str(headers, "x-session-id"));
+    let thread =
+        header_str(headers, "thread-id").or_else(|| header_str(headers, "x-codex-thread-id"));
+
+    if session.is_some() || thread.is_some() {
+        let encoded = serde_json::to_vec(&(
+            "codex-conversation-v1",
+            pool.unwrap_or_default(),
+            session.as_deref().unwrap_or_default(),
+            thread.as_deref().unwrap_or_default(),
+        ))
+        .expect("string tuple serializes");
         return Some(SessionKey {
-            value: sha256_hex(format!("turn:{ts}").as_bytes()),
+            value: sha256_hex(&encoded),
             strength: KeyStrength::Hard,
         });
     }
-    if let Some(sess) =
-        header_str(headers, "session_id").or_else(|| header_str(headers, "x-session-id"))
-    {
-        let mut raw = sess;
-        if let Some(pck) = prompt_cache_key {
-            raw = format!("{raw}:{pck}");
-        }
+
+    if let Some(ts) = header_str(headers, "x-codex-turn-state") {
+        let encoded = serde_json::to_vec(&(
+            "codex-turn-v1",
+            pool.unwrap_or_default(),
+            ts.as_str(),
+            prompt_cache_key.unwrap_or_default(),
+        ))
+        .expect("string tuple serializes");
         return Some(SessionKey {
-            value: sha256_hex(format!("session:{raw}").as_bytes()),
+            value: sha256_hex(&encoded),
             strength: KeyStrength::Hard,
         });
     }
     None
 }
 
-/// Derive the session key: `x-codex-turn-state` ⇒ Hard; else a session header (+ `prompt_cache_key`
-/// isolating threads) ⇒ Hard; else a soft key from `x-request-id` / `prompt_cache_key` / a content
-/// hash of the raw `input`. Values are hashed so no raw header/content is stored.
+/// Derive the session key: current session/thread identity ⇒ Hard; else `x-codex-turn-state` ⇒
+/// Hard; else a soft key from `x-request-id` / `prompt_cache_key` / a content hash of the raw
+/// `input`. Values are hashed so no raw header/content is stored.
 fn derive_session_key(
     headers: &HeaderMap,
     prompt_cache_key: Option<&str>,
     input: Option<&RawValue>,
+    pool: Option<&str>,
 ) -> SessionKey {
-    if let Some(hard) = header_session_key(headers, prompt_cache_key) {
+    if let Some(hard) = header_session_key_scoped(headers, prompt_cache_key, pool) {
         return hard;
     }
     // Soft fallback: `x-request-id`, else `prompt_cache_key`, else a hash of the raw `input` text.
@@ -171,8 +297,10 @@ fn derive_session_key(
     let soft = header_str(headers, "x-request-id")
         .or_else(|| prompt_cache_key.map(str::to_string))
         .unwrap_or_else(|| input.map(|i| i.get().to_string()).unwrap_or_default());
+    let encoded = serde_json::to_vec(&("codex-soft-v1", pool.unwrap_or_default(), soft))
+        .expect("string tuple serializes");
     SessionKey {
-        value: sha256_hex(format!("soft:{soft}").as_bytes()),
+        value: sha256_hex(&encoded),
         strength: KeyStrength::Soft,
     }
 }
@@ -181,6 +309,16 @@ fn derive_session_key(
 /// only when the body is malformed — invalid JSON or a non-object root (the caller 400s). The
 /// `input` tree is never materialized.
 pub fn parse_inbound(headers: &HeaderMap, raw: &[u8]) -> Option<InboundFacts> {
+    parse_inbound_scoped(headers, raw, None)
+}
+
+/// Pool-aware form of [`parse_inbound`]. The pool is part of durable identity so the same client
+/// session cannot re-home an existing continuity row by reaching PolyFlare through another pool.
+pub fn parse_inbound_scoped(
+    headers: &HeaderMap,
+    raw: &[u8],
+    pool: Option<&str>,
+) -> Option<InboundFacts> {
     // Read the top-level object as a map of raw fields — ONE shallow scan (values stay raw, so the
     // deep `input` tree is never built and the body is never re-captured whole). A `HashMap` gives
     // last-wins on duplicate keys and captures a `null` value as raw `"null"`, both matching the old
@@ -196,22 +334,31 @@ pub fn parse_inbound(headers: &HeaderMap, raw: &[u8]) -> Option<InboundFacts> {
     let field = |k: &str| fields.get(k).copied();
 
     let (input_count, is_full_resend) = input_shape(field("input"));
+    let estimated_tokens = estimate_request_tokens(field("input"), field("max_output_tokens"));
     let prompt_cache_key = raw_as_str(field("prompt_cache_key"));
-    let session_key = derive_session_key(headers, prompt_cache_key.as_deref(), field("input"));
-    let session_id =
-        header_str(headers, "session_id").or_else(|| header_str(headers, "x-session-id"));
+    let generate = field("generate")
+        .and_then(|raw| serde_json::from_str::<bool>(raw.get()).ok())
+        .unwrap_or(true);
+    let session_key =
+        derive_session_key(headers, prompt_cache_key.as_deref(), field("input"), pool);
+    let session_id = session_id_from_headers(headers);
     let ctx = RequestCtx {
         session_id,
         session_key: Some(session_key),
+        logical_turn_key: generate
+            .then(|| logical_turn_key(headers, field("client_metadata"), pool))
+            .flatten(),
         client_previous_response_id: raw_as_str(field("previous_response_id")),
         is_full_resend,
         input_count,
+        estimated_tokens,
         subagent: header_str(headers, "x-openai-subagent"),
         conn_discriminator: header_str(headers, "x-codex-window-id"),
     };
     Some(InboundFacts {
         model: raw_as_str(field("model")).unwrap_or_default(),
         effort: effort_from_reasoning(field("reasoning")),
+        service_tier: raw_as_str(field("service_tier")),
         ctx,
     })
 }
@@ -252,6 +399,160 @@ mod tests {
     fn session_header_yields_hard_key() {
         let ctx = ctx_of(&hdr(&[("session_id", "sess-1")]), serde_json::json!({}));
         assert_eq!(ctx.session_key.unwrap().strength, KeyStrength::Hard);
+    }
+
+    #[test]
+    fn canonical_http_turn_metadata_yields_scoped_hashed_logical_turn_key() {
+        let metadata = serde_json::json!({
+            "turn_id": "turn-123",
+            "request_kind": "turn"
+        })
+        .to_string();
+        let headers = hdr(&[
+            ("session-id", "session-a"),
+            ("thread-id", "thread-a"),
+            ("x-codex-turn-metadata", &metadata),
+        ]);
+
+        let first = ctx_of(&headers, serde_json::json!({"input": "one"}));
+        let retry = ctx_of(&headers, serde_json::json!({"input": "two"}));
+        let key = first
+            .logical_turn_key
+            .expect("canonical turn metadata should produce a budget key");
+
+        assert_eq!(Some(key.clone()), retry.logical_turn_key);
+        assert_ne!(key, "turn-123", "raw turn ids must never leave parsing");
+        assert_eq!(key.len(), 64, "the key is a lowercase sha256 digest");
+    }
+
+    #[test]
+    fn websocket_client_metadata_yields_same_scoped_logical_turn_key() {
+        let headers = hdr(&[("session-id", "session-a"), ("thread-id", "thread-a")]);
+        let http_metadata = serde_json::json!({"turn_id": "turn-123"}).to_string();
+        let http = ctx_of(
+            &hdr(&[
+                ("session-id", "session-a"),
+                ("thread-id", "thread-a"),
+                ("x-codex-turn-metadata", &http_metadata),
+            ]),
+            serde_json::json!({"input": []}),
+        );
+        let ws = ctx_of(
+            &headers,
+            serde_json::json!({
+                "type": "response.create",
+                "input": [],
+                "client_metadata": {
+                    "turn_id": "turn-123"
+                }
+            }),
+        );
+
+        assert_eq!(http.logical_turn_key, ws.logical_turn_key);
+        assert!(ws.logical_turn_key.is_some());
+    }
+
+    #[test]
+    fn websocket_per_turn_metadata_overrides_stale_handshake_projection() {
+        let stale_headers = hdr(&[
+            ("session-id", "session-a"),
+            ("thread-id", "thread-a"),
+            (
+                "x-codex-turn-metadata",
+                r#"{"turn_id":"turn-from-handshake"}"#,
+            ),
+        ]);
+        let current_headers = hdr(&[
+            ("session-id", "session-a"),
+            ("thread-id", "thread-a"),
+            ("x-codex-turn-metadata", r#"{"turn_id":"turn-from-frame"}"#),
+        ]);
+        let expected = ctx_of(&current_headers, serde_json::json!({"input": []}));
+        let ws = ctx_of(
+            &stale_headers,
+            serde_json::json!({
+                "type": "response.create",
+                "input": [],
+                "client_metadata": {
+                    "turn_id": "stale-flat-projection",
+                    "x-codex-turn-metadata": "{\"turn_id\":\"turn-from-frame\"}"
+                }
+            }),
+        );
+
+        assert_eq!(ws.logical_turn_key, expected.logical_turn_key);
+    }
+
+    #[test]
+    fn websocket_malformed_or_absent_per_turn_metadata_falls_back_to_handshake_projection() {
+        let headers = hdr(&[
+            ("session-id", "session-a"),
+            ("thread-id", "thread-a"),
+            (
+                "x-codex-turn-metadata",
+                r#"{"turn_id":"turn-from-handshake"}"#,
+            ),
+        ]);
+        let expected = ctx_of(&headers, serde_json::json!({"input": []}));
+        let malformed = ctx_of(
+            &headers,
+            serde_json::json!({
+                "type": "response.create",
+                "input": [],
+                "client_metadata": {
+                    "x-codex-turn-metadata": "not-json"
+                }
+            }),
+        );
+        let absent = ctx_of(
+            &headers,
+            serde_json::json!({"type": "response.create", "input": []}),
+        );
+
+        assert_eq!(malformed.logical_turn_key, expected.logical_turn_key);
+        assert_eq!(absent.logical_turn_key, expected.logical_turn_key);
+    }
+
+    #[test]
+    fn generate_false_prewarm_does_not_claim_the_user_turn_budget() {
+        let headers = hdr(&[
+            ("session-id", "session-a"),
+            ("thread-id", "thread-a"),
+            ("x-codex-turn-metadata", r#"{"turn_id":"turn-123"}"#),
+        ]);
+        let prewarm = ctx_of(
+            &headers,
+            serde_json::json!({"type": "response.create", "generate": false, "input": []}),
+        );
+        let generation = ctx_of(
+            &headers,
+            serde_json::json!({"type": "response.create", "input": []}),
+        );
+
+        assert!(prewarm.logical_turn_key.is_none());
+        assert!(generation.logical_turn_key.is_some());
+    }
+
+    #[test]
+    fn missing_or_malformed_turn_metadata_has_no_logical_turn_key() {
+        assert!(ctx_of(&hdr(&[]), serde_json::json!({"input": []}))
+            .logical_turn_key
+            .is_none());
+        assert!(ctx_of(
+            &hdr(&[("x-codex-turn-metadata", "not-json")]),
+            serde_json::json!({"input": []})
+        )
+        .logical_turn_key
+        .is_none());
+        assert!(ctx_of(
+            &hdr(&[]),
+            serde_json::json!({
+                "input": [],
+                "client_metadata": {"turn_id": ""}
+            })
+        )
+        .logical_turn_key
+        .is_none());
     }
 
     #[test]
@@ -316,6 +617,33 @@ mod tests {
     }
 
     #[test]
+    fn pressure_estimate_distinguishes_tiny_and_large_inputs() {
+        let tiny = parse_inbound(
+            &HeaderMap::new(),
+            br#"{"model":"m","input":"hi","max_output_tokens":128}"#,
+        )
+        .unwrap();
+        let large_input = "x".repeat(200_000);
+        let large_body =
+            format!(r#"{{"model":"m","input":"{large_input}","max_output_tokens":32768}}"#);
+        let large = parse_inbound(&HeaderMap::new(), large_body.as_bytes()).unwrap();
+
+        assert!(tiny.ctx.estimated_tokens < 1_000);
+        assert!(large.ctx.estimated_tokens > 80_000);
+        assert!(large.ctx.estimated_tokens > tiny.ctx.estimated_tokens);
+    }
+
+    #[test]
+    fn pressure_estimate_bounds_hostile_output_ceiling() {
+        let facts = parse_inbound(
+            &HeaderMap::new(),
+            br#"{"model":"m","input":[],"max_output_tokens":18446744073709551615}"#,
+        )
+        .unwrap();
+        assert_eq!(facts.ctx.estimated_tokens, 524_289);
+    }
+
+    #[test]
     fn previous_response_id_is_extracted() {
         let ctx = ctx_of(
             &hdr(&[]),
@@ -331,17 +659,83 @@ mod tests {
     }
 
     #[test]
-    fn model_and_effort_are_extracted() {
+    fn model_effort_and_service_tier_are_extracted() {
         let facts = parse_inbound(
             &hdr(&[]),
-            &serde_json::to_vec(
-                &serde_json::json!({"model": "gpt-5.6-sol", "reasoning": {"effort": "high"}}),
-            )
+            &serde_json::to_vec(&serde_json::json!({
+                "model": "gpt-5.6-sol",
+                "reasoning": {"effort": "high"},
+                "service_tier": "priority"
+            }))
             .unwrap(),
         )
         .expect("valid body");
         assert_eq!(facts.model, "gpt-5.6-sol");
         assert_eq!(facts.effort.as_deref(), Some("high"));
+        assert_eq!(facts.service_tier.as_deref(), Some("priority"));
+    }
+
+    #[test]
+    fn current_codex_session_and_thread_headers_form_a_hard_stable_identity() {
+        let a = parse_inbound_scoped(
+            &hdr(&[
+                ("session-id", "session-a"),
+                ("thread-id", "thread-a"),
+                ("x-codex-window-id", "window-a:0"),
+            ]),
+            br#"{"model":"gpt-5.6-sol","prompt_cache_key":"session-a","input":[]}"#,
+            Some("premium"),
+        )
+        .expect("valid request");
+        let after_compaction = parse_inbound_scoped(
+            &hdr(&[
+                ("session-id", "session-a"),
+                ("thread-id", "thread-a"),
+                ("x-codex-window-id", "window-b:1"),
+            ]),
+            br#"{"model":"gpt-5.6-sol","prompt_cache_key":"session-a","input":[]}"#,
+            Some("premium"),
+        )
+        .expect("valid request");
+        let other_thread = parse_inbound_scoped(
+            &hdr(&[
+                ("session-id", "session-a"),
+                ("thread-id", "thread-b"),
+                ("x-codex-window-id", "window-a:0"),
+            ]),
+            br#"{"model":"gpt-5.6-sol","prompt_cache_key":"session-a","input":[]}"#,
+            Some("premium"),
+        )
+        .expect("valid request");
+        let other_pool = parse_inbound_scoped(
+            &hdr(&[
+                ("session-id", "session-a"),
+                ("thread-id", "thread-a"),
+                ("x-codex-window-id", "window-a:0"),
+            ]),
+            br#"{"model":"gpt-5.6-sol","prompt_cache_key":"session-a","input":[]}"#,
+            Some("standard"),
+        )
+        .expect("valid request");
+
+        let a_key = a.ctx.session_key.expect("session key");
+        assert_eq!(a_key.strength, KeyStrength::Hard);
+        assert_eq!(
+            a_key,
+            after_compaction.ctx.session_key.expect("session key"),
+            "window changes after compaction must not change durable owner identity"
+        );
+        assert_ne!(
+            a_key,
+            other_thread.ctx.session_key.expect("session key"),
+            "subagent/thread identities must remain isolated"
+        );
+        assert_ne!(
+            a_key,
+            other_pool.ctx.session_key.expect("session key"),
+            "a session routed through another pool must not re-home the original pool"
+        );
+        assert_eq!(a.ctx.session_id.as_deref(), Some("session-a"));
     }
 
     #[test]
@@ -457,13 +851,13 @@ mod tests {
         // to the identical `SessionKey.value` so they resolve the same continuity-session row.
         let h = hdr(&[("x-codex-turn-state", "ts-abc")]);
         let via_header_fn = header_session_key(&h, None).unwrap();
-        let via_full_derive = derive_session_key(&h, None, None);
+        let via_full_derive = derive_session_key(&h, None, None, None);
         assert_eq!(via_header_fn.value, via_full_derive.value);
         assert_eq!(via_header_fn.strength, KeyStrength::Hard);
 
         let h2 = hdr(&[("session_id", "sess-1")]);
         let via_header_fn2 = header_session_key(&h2, Some("thread-1")).unwrap();
-        let via_full_derive2 = derive_session_key(&h2, Some("thread-1"), None);
+        let via_full_derive2 = derive_session_key(&h2, Some("thread-1"), None, None);
         assert_eq!(via_header_fn2.value, via_full_derive2.value);
     }
 
@@ -492,16 +886,34 @@ mod tests {
     }
 
     #[test]
-    fn prompt_cache_key_isolates_session_thread() {
-        // Same session header, different prompt_cache_key ⇒ different (thread-isolated) hard keys.
+    fn current_thread_header_isolates_session_thread() {
+        // Current Codex supplies the durable thread identity explicitly. Prompt-cache keys may
+        // change independently and therefore must not override this header contract.
         let a = ctx_of(
-            &hdr(&[("session_id", "s")]),
+            &hdr(&[("session-id", "s"), ("thread-id", "thread-1")]),
+            serde_json::json!({"prompt_cache_key": "cache", "input": "hi"}),
+        );
+        let b = ctx_of(
+            &hdr(&[("session-id", "s"), ("thread-id", "thread-2")]),
+            serde_json::json!({"prompt_cache_key": "cache", "input": "hi"}),
+        );
+        assert_ne!(a.session_key.unwrap().value, b.session_key.unwrap().value);
+    }
+
+    #[test]
+    fn prompt_cache_key_isolates_soft_fallback_without_identity_headers() {
+        let a = ctx_of(
+            &hdr(&[]),
             serde_json::json!({"prompt_cache_key": "thread-1", "input": "hi"}),
         );
         let b = ctx_of(
-            &hdr(&[("session_id", "s")]),
+            &hdr(&[]),
             serde_json::json!({"prompt_cache_key": "thread-2", "input": "hi"}),
         );
-        assert_ne!(a.session_key.unwrap().value, b.session_key.unwrap().value);
+        let a = a.session_key.expect("soft session key");
+        let b = b.session_key.expect("soft session key");
+        assert_eq!(a.strength, KeyStrength::Soft);
+        assert_eq!(b.strength, KeyStrength::Soft);
+        assert_ne!(a.value, b.value);
     }
 }

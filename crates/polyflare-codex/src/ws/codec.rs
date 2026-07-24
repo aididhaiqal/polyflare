@@ -66,11 +66,12 @@ pub enum FrameClass {
     /// than needing a separate "unknown" variant that callers would have to treat identically to
     /// `Event` anyway.
     Event,
-    /// A terminal frame: `response.completed` / `response.failed` / `response.incomplete`. The
-    /// stream ends after this one (`Poll::Ready(None)`, Task 5) — still re-framed as SSE and passed
-    /// through first, since even a terminal *failure* frame carries content the client's own
-    /// stream parser needs to see (e.g. a quota/context-window `response.failed`).
-    Terminal,
+    /// The only successful terminal frame. Its response id may advance socket-local continuation.
+    Completed,
+    /// A terminal upstream failure. Forwarded to the client, but never reusable as continuation.
+    Failed,
+    /// A terminal incomplete response. Forwarded to the client, but never reusable as continuation.
+    Incomplete,
     /// The wrapped WS-only error envelope (ground truth §3/§5) with
     /// `error.code == "previous_response_not_found"` — the dead-anchor case. **Recoverable**: Task 7
     /// strips the anchor and resends full history on the same socket; this must never reach the
@@ -222,7 +223,7 @@ fn envelope_retry_after(headers: &Value) -> Option<i64> {
 /// Classify one already-received, already-parsed frame.
 ///
 /// Frame-type dispatch first (ground truth §3): the three terminal event-type strings become
-/// [`FrameClass::Terminal`]; anything else falls through to [`FrameClass::Event`] EXCEPT the
+/// distinct terminal variants; anything else falls through to [`FrameClass::Event`] EXCEPT the
 /// WS-only wrapped error envelope (`"type":"error"`), which gets its own branch.
 ///
 /// Inside that branch, **`error.code` is inspected before `status` is mapped to anything** — the
@@ -235,7 +236,9 @@ pub fn classify(frame: &Value) -> FrameClass {
     let frame_type = frame.get("type").and_then(Value::as_str).unwrap_or("");
 
     match frame_type {
-        "response.completed" | "response.failed" | "response.incomplete" => FrameClass::Terminal,
+        "response.completed" => FrameClass::Completed,
+        "response.failed" => FrameClass::Failed,
+        "response.incomplete" => FrameClass::Incomplete,
         "error" => {
             let error_code = frame.pointer("/error/code").and_then(Value::as_str);
             let code = error_code.unwrap_or("");
@@ -526,9 +529,9 @@ mod tests {
     // ---- classify: terminal frames ---------------------------------------------------------
 
     #[test]
-    fn classify_maps_response_completed_to_terminal() {
+    fn classify_maps_response_completed_to_successful_terminal() {
         let frame = json!({"type": "response.completed", "response": {"id": "resp_1"}});
-        assert!(matches!(classify(&frame), FrameClass::Terminal));
+        assert!(matches!(classify(&frame), FrameClass::Completed));
     }
 
     #[test]
@@ -537,13 +540,13 @@ mod tests {
             "type": "response.failed",
             "response": {"error": {"code": "context_window_exceeded", "message": "too long"}}
         });
-        assert!(matches!(classify(&frame), FrameClass::Terminal));
+        assert!(matches!(classify(&frame), FrameClass::Failed));
     }
 
     #[test]
     fn classify_maps_response_incomplete_to_terminal() {
         let frame = json!({"type": "response.incomplete", "response": {"id": "resp_1"}});
-        assert!(matches!(classify(&frame), FrameClass::Terminal));
+        assert!(matches!(classify(&frame), FrameClass::Incomplete));
     }
 
     // ---- classify: the load-bearing anchor-miss discrimination -----------------------------

@@ -46,6 +46,18 @@ async fn metrics_with_admin_bearer_returns_prometheus_body() {
         body.contains("polyflare_account_inflight{account_id=\"acct-1\""),
         "missing per-account gauge line for the seeded account: {body}"
     );
+    assert!(
+        body.contains("polyflare_admission_waiters{work=\"request\",scope=\"owner\"} 0"),
+        "missing admission pressure family: {body}"
+    );
+    assert!(
+        body.contains("polyflare_account_inflight_pressure{account_id=\"acct-1\""),
+        "missing weighted account-pressure gauge: {body}"
+    );
+    assert!(
+        body.contains("polyflare_request_pressure_calibration_ratio 1"),
+        "missing request-pressure calibration gauge: {body}"
+    );
 }
 
 /// (b) A KEYLESS `GET /metrics` is rejected exactly the same way a keyless `GET /api/accounts`
@@ -71,20 +83,15 @@ async fn metrics_keyless_is_rejected_same_as_keyless_api_accounts() {
         "keyless /metrics must be rejected identically to keyless /api/accounts"
     );
 
-    // The admin-disabled posture (no POLYFLARE_ADMIN_TOKEN) also applies uniformly: 503, inherited
-    // from the same `require_admin` gate `/api/whoami` already proves this for in `dashboard_api.rs`.
+    // With no configured token on a loopback bind, the same local-open posture applies uniformly
+    // to `/metrics` and the dashboard API.
     let up2 = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
     let (pf2, _state2) = spawn_without_admin_token(up2).await;
-    let disabled_resp = c
-        .get(format!("{pf2}/metrics"))
-        .header("authorization", "Bearer whatever")
-        .send()
-        .await
-        .unwrap();
+    let disabled_resp = c.get(format!("{pf2}/metrics")).send().await.unwrap();
     assert_eq!(
         disabled_resp.status(),
-        503,
-        "no POLYFLARE_ADMIN_TOKEN configured ⇒ /metrics disabled, same as the rest of the dashboard API"
+        200,
+        "tokenless loopback /metrics should open with the rest of the local dashboard API"
     );
 }
 
@@ -179,7 +186,7 @@ async fn metrics_body_never_contains_seeded_email_or_secret_token() {
     // seeded email or token.
     assert!(
         body.contains(
-            "polyflare_upstream_requests_total{account_id=\"acct-leak-check\",status=\"200\"} 1"
+            "polyflare_upstream_requests_total{provider=\"codex\",target_kind=\"account\",target_id=\"acct-leak-check\",status=\"200\"} 1"
         ),
         "missing the seeded upstream_requests_total line: {body}"
     );
@@ -238,14 +245,16 @@ async fn metrics_reflect_live_lease_acquire_state() {
 }
 
 /// (e) C11b: driving a REAL successful `/responses` request through the admin-gated harness bumps
-/// `polyflare_upstream_requests_total{account_id="acct-1",status="200"}`, visible on the very next
+/// `polyflare_upstream_requests_total{provider="codex",target_kind="account",target_id="acct-1",status="200"}`,
+/// visible on the very next
 /// admin-keyed `/metrics` scrape — proving the handler reads `state.upstream_request_metrics`
 /// live, exactly like the existing lease/account gauge families above.
 #[tokio::test]
 async fn metrics_reflects_a_live_successful_responses_request_as_upstream_requests_total() {
     let up = polyflare_testkit::MockUpstream::new(vec![
         r#"{"type":"response.output_text.delta","delta":"hi"}"#.to_string(),
-        r#"{"type":"response.completed"}"#.to_string(),
+        r#"{"type":"response.completed","response":{"usage":{"input_tokens":100,"output_tokens":20}}}"#
+            .to_string(),
     ])
     .spawn()
     .await;
@@ -273,8 +282,18 @@ async fn metrics_reflects_a_live_successful_responses_request_as_upstream_reques
 
     assert!(body.contains("# TYPE polyflare_upstream_requests_total counter"));
     assert!(
-        body.contains("polyflare_upstream_requests_total{account_id=\"acct-1\",status=\"200\"} 1"),
+        body.contains(
+            "polyflare_upstream_requests_total{provider=\"codex\",target_kind=\"account\",target_id=\"acct-1\",status=\"200\"} 1"
+        ),
         "the driven /responses request should be visible as an upstream_requests_total sample: {body}"
+    );
+    assert!(
+        body.contains("polyflare_request_pressure_samples_total 1"),
+        "terminal usage must calibrate future request pressure: {body}"
+    );
+    assert!(
+        body.contains("polyflare_request_pressure_equivalent_tokens_total 180"),
+        "the calibration must use authoritative terminal compute-equivalent tokens: {body}"
     );
 }
 
@@ -303,8 +322,8 @@ async fn metrics_reflects_a_live_429_as_rate_limit_hits_total() {
         .unwrap();
     assert_eq!(
         resp.status(),
-        502,
-        "the only account 429ing with no failover target surfaces as a generic 502"
+        429,
+        "the only account 429ing with no failover target preserves the actionable upstream status"
     );
 
     let body = c

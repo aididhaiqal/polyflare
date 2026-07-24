@@ -58,6 +58,28 @@ pub struct SessionWithOwner {
     pub last_activity_at: i64,
 }
 
+/// A provider-aware session summary for the operator dashboard. Unlike
+/// [`SessionWithOwner`], this treats the content-free `request_log.session_key` ledger as the
+/// canonical inventory, so stateless custom-provider sessions that intentionally do not create
+/// continuity ownership rows remain visible.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DashboardSessionRow {
+    pub session_key: String,
+    pub key_strength: String,
+    pub owning_account_id: Option<String>,
+    pub owner_label: Option<String>,
+    pub provider: String,
+    pub target_kind: String,
+    pub provider_credential_id: Option<String>,
+    pub model: Option<String>,
+    pub state: String,
+    pub required_capabilities: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_activity_at: i64,
+    pub request_count: i64,
+}
+
 const SELECT_SESSIONS_WITH_OWNER: &str = "SELECT s.session_key, s.key_strength, \
     s.owning_account_id, a.email AS owner_email, s.state, s.required_capabilities, \
     s.created_at, s.updated_at, s.last_activity_at \
@@ -65,6 +87,59 @@ const SELECT_SESSIONS_WITH_OWNER: &str = "SELECT s.session_key, s.key_strength, 
     LEFT JOIN accounts a ON a.id = s.owning_account_id \
     ORDER BY s.last_activity_at DESC \
     LIMIT ? OFFSET ?";
+
+const DASHBOARD_SESSIONS_CTE: &str = "WITH all_sessions AS ( \
+        SELECT session_key FROM continuity_sessions \
+        UNION \
+        SELECT session_key FROM request_log \
+        WHERE session_key IS NOT NULL AND session_key != '' \
+    ), log_agg AS ( \
+        SELECT session_key, MIN(requested_at) AS created_at, \
+               MAX(requested_at) AS last_activity_at, COUNT(*) AS request_count \
+        FROM request_log \
+        WHERE session_key IS NOT NULL AND session_key != '' \
+        GROUP BY session_key \
+    ), latest AS ( \
+        SELECT session_key, provider, target_kind, account_id, provider_credential_id, model, \
+               ROW_NUMBER() OVER ( \
+                   PARTITION BY session_key ORDER BY requested_at DESC, id DESC \
+               ) AS row_rank \
+        FROM request_log \
+        WHERE session_key IS NOT NULL AND session_key != '' \
+    ) ";
+
+const DASHBOARD_SESSIONS_SELECT: &str = "SELECT x.session_key, \
+    COALESCE(s.key_strength, 'derived') AS key_strength, \
+    CASE WHEN COALESCE(l.target_kind, 'account') = 'credential' \
+         THEN NULL ELSE COALESCE(l.account_id, s.owning_account_id) END AS owning_account_id, \
+    CASE WHEN COALESCE(l.target_kind, 'account') = 'credential' \
+         THEN pc.label ELSE a.email END AS owner_label, \
+    COALESCE(l.provider, a.provider, 'codex') AS provider, \
+    COALESCE(l.target_kind, \
+             CASE WHEN l.provider_credential_id IS NOT NULL THEN 'credential' ELSE 'account' END) \
+        AS target_kind, \
+    l.provider_credential_id, l.model, \
+    CASE WHEN COALESCE(l.target_kind, 'account') = 'credential' \
+         THEN 'stateless' ELSE COALESCE(s.state, 'observed') END AS state, \
+    s.required_capabilities, \
+    CASE WHEN g.created_at IS NULL THEN COALESCE(s.created_at, 0) \
+         WHEN s.created_at IS NULL THEN g.created_at \
+         WHEN g.created_at < s.created_at THEN g.created_at ELSE s.created_at END AS created_at, \
+    CASE WHEN g.last_activity_at IS NULL THEN COALESCE(s.updated_at, 0) \
+         WHEN s.updated_at IS NULL THEN g.last_activity_at \
+         WHEN g.last_activity_at > s.updated_at THEN g.last_activity_at ELSE s.updated_at END \
+        AS updated_at, \
+    CASE WHEN g.last_activity_at IS NULL THEN COALESCE(s.last_activity_at, 0) \
+         WHEN s.last_activity_at IS NULL THEN g.last_activity_at \
+         WHEN g.last_activity_at > s.last_activity_at THEN g.last_activity_at \
+         ELSE s.last_activity_at END AS last_activity_at, \
+    COALESCE(g.request_count, 0) AS request_count \
+    FROM all_sessions x \
+    LEFT JOIN continuity_sessions s ON s.session_key = x.session_key \
+    LEFT JOIN log_agg g ON g.session_key = x.session_key \
+    LEFT JOIN latest l ON l.session_key = x.session_key AND l.row_rank = 1 \
+    LEFT JOIN accounts a ON a.id = COALESCE(l.account_id, s.owning_account_id) \
+    LEFT JOIN provider_credentials pc ON pc.id = l.provider_credential_id ";
 
 /// CRUD over the continuity state machine. Cheap to construct (clones the pool handle).
 pub struct ContinuityRepo {
@@ -112,11 +187,76 @@ impl ContinuityRepo {
             .await
     }
 
+    /// Exact content-free session lookup for request/log drilldown. Returns the same public
+    /// owner-joined shape as the paginated list, without exposing internal anchor/fingerprint data.
+    pub async fn find_session_with_owner(
+        &self,
+        session_key: &str,
+    ) -> Result<Option<SessionWithOwner>, sqlx::Error> {
+        sqlx::query_as::<_, SessionWithOwner>(
+            "SELECT s.session_key, s.key_strength, s.owning_account_id, \
+             a.email AS owner_email, s.state, s.required_capabilities, \
+             s.created_at, s.updated_at, s.last_activity_at \
+             FROM continuity_sessions s \
+             LEFT JOIN accounts a ON a.id = s.owning_account_id \
+             WHERE s.session_key = ?",
+        )
+        .bind(session_key)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     /// Total count of `continuity_sessions` rows (for the `{total, rows}` pagination envelope).
     pub async fn count_sessions(&self) -> Result<i64, sqlx::Error> {
         let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM continuity_sessions")
             .fetch_one(&self.pool)
             .await?;
+        Ok(count)
+    }
+
+    /// Lists both stateful built-in sessions and stateless custom-provider sessions using the
+    /// latest request row to identify the actual upstream provider and serving target.
+    pub async fn list_dashboard_sessions(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<DashboardSessionRow>, sqlx::Error> {
+        let sql = format!(
+            "{DASHBOARD_SESSIONS_CTE}{DASHBOARD_SESSIONS_SELECT} \
+             ORDER BY last_activity_at DESC, x.session_key ASC LIMIT ? OFFSET ?"
+        );
+        sqlx::query_as::<_, DashboardSessionRow>(&sql)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// Exact provider-aware session lookup used by request/log drill-down.
+    pub async fn find_dashboard_session(
+        &self,
+        session_key: &str,
+    ) -> Result<Option<DashboardSessionRow>, sqlx::Error> {
+        let sql =
+            format!("{DASHBOARD_SESSIONS_CTE}{DASHBOARD_SESSIONS_SELECT} WHERE x.session_key = ?");
+        sqlx::query_as::<_, DashboardSessionRow>(&sql)
+            .bind(session_key)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    /// Counts the union of continuity-owned and request-observed session keys.
+    pub async fn count_dashboard_sessions(&self) -> Result<i64, sqlx::Error> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM ( \
+                SELECT session_key FROM continuity_sessions \
+                UNION \
+                SELECT session_key FROM request_log \
+                WHERE session_key IS NOT NULL AND session_key != '' \
+             )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         Ok(count)
     }
 
@@ -602,11 +742,79 @@ mod tests {
         assert_eq!(rows[2].owning_account_id.as_deref(), Some("B"));
         assert_eq!(rows[2].owner_email.as_deref(), Some("b@example.com"));
 
+        let exact = repo
+            .find_session_with_owner("skA")
+            .await
+            .unwrap()
+            .expect("exact session should exist");
+        assert_eq!(exact.owner_email.as_deref(), Some("a@example.com"));
+        assert!(repo
+            .find_session_with_owner("missing")
+            .await
+            .unwrap()
+            .is_none());
+
         // (c) the NO-owner row survives the LEFT JOIN: owner_email == None, owning_account_id ==
         // None (an INNER JOIN would silently drop this row instead).
         assert_eq!(rows[1].owning_account_id, None);
         assert_eq!(rows[1].owner_email, None);
         assert_eq!(rows[1].state, "fresh");
+    }
+
+    #[tokio::test]
+    async fn dashboard_sessions_include_stateless_custom_provider_targets() {
+        let s = store().await;
+        sqlx::query(
+            "INSERT INTO custom_providers \
+             (id, slug, display_name, base_url, stateless_responses, created_at, updated_at) \
+             VALUES ('provider-1', 'sakana', 'Sakana', 'https://api.sakana.ai/v1', 1, 1, 1)",
+        )
+        .execute(s.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_credentials \
+             (id, provider_id, label, api_key_enc, created_at, updated_at) \
+             VALUES ('credential-1', 'provider-1', 'Fugu primary', X'00', 1, 1)",
+        )
+        .execute(s.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO request_log \
+             (requested_at, provider, method, path, aliased, status, duration_ms, session_key, \
+              target_kind, provider_credential_id, model) \
+             VALUES (100, 'sakana', 'POST', '/responses', 0, 200, 50, 'session-fugu', \
+                     'credential', 'credential-1', 'fugu-ultra'), \
+                    (200, 'sakana', 'POST', '/responses', 0, 200, 40, 'session-fugu', \
+                     'credential', 'credential-1', 'fugu-ultra')",
+        )
+        .execute(s.pool())
+        .await
+        .unwrap();
+
+        let repo = s.continuity();
+        assert_eq!(repo.count_dashboard_sessions().await.unwrap(), 1);
+        let rows = repo.list_dashboard_sessions(10, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.session_key, "session-fugu");
+        assert_eq!(row.provider, "sakana");
+        assert_eq!(row.target_kind, "credential");
+        assert_eq!(row.provider_credential_id.as_deref(), Some("credential-1"));
+        assert_eq!(row.owner_label.as_deref(), Some("Fugu primary"));
+        assert_eq!(row.model.as_deref(), Some("fugu-ultra"));
+        assert_eq!(row.state, "stateless");
+        assert_eq!(row.request_count, 2);
+        assert_eq!(row.created_at, 100);
+        assert_eq!(row.last_activity_at, 200);
+
+        let exact = repo
+            .find_dashboard_session("session-fugu")
+            .await
+            .unwrap()
+            .expect("custom session should be addressable");
+        assert_eq!(exact.provider, "sakana");
     }
 
     // ---- S3(a) directive 3: the affinity TTL prunes ---------------------------------------------

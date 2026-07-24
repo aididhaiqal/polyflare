@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 
 use polyflare_core::AccountId;
-use polyflare_store::{Account, AccountRepo, TokenCipher};
+use polyflare_store::{Account, AccountRepo, PlainTokens, TokenCipher};
 
 use crate::app::AppState;
 use crate::runtime_state::RuntimeStates;
@@ -144,6 +144,25 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+fn usage_request(
+    http: &reqwest::Client,
+    upstream_base: &str,
+    account: &Account,
+    tokens: &PlainTokens,
+) -> reqwest::RequestBuilder {
+    let mut request = http
+        .get(usage_url(upstream_base))
+        .header("Authorization", format!("Bearer {}", tokens.access_token))
+        .header("Accept", "application/json");
+    if let Some(chatgpt_account_id) = &account.chatgpt_account_id {
+        request = request.header("chatgpt-account-id", chatgpt_account_id);
+    }
+    if polyflare_codex::oauth::is_fedramp_account(&tokens.id_token) {
+        request = request.header("x-openai-fedramp", "true");
+    }
+    request
+}
+
 /// Refresh one account's usage: fetch `/wham/usage`, persist the present windows, update the
 /// routing gate (only if the account is in a usage-controlled status), and — B8 Task 3 — run the
 /// FULL usage-driven health-tier evaluation (`RuntimeStates::evaluate_with_usage`; see that
@@ -165,14 +184,9 @@ async fn refresh_account(
         Some(t) => t,
         None => return Ok(()),
     };
-    let mut req = http
-        .get(usage_url(upstream_base))
-        .header("Authorization", format!("Bearer {}", tokens.access_token))
-        .header("Accept", "application/json");
-    if let Some(cid) = &account.chatgpt_account_id {
-        req = req.header("chatgpt-account-id", cid);
-    }
-    let resp = req.send().await?;
+    let resp = usage_request(http, upstream_base, account, &tokens)
+        .send()
+        .await?;
     if !resp.status().is_success() {
         return Ok(());
     }
@@ -287,6 +301,81 @@ pub fn spawn_usage_refresh(state: Arc<AppState>) {
             return;
         }
     };
+    let (cooldown_tx, mut cooldown_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::runtime_state::RoutingCooldownWrite>();
+    state.runtime.register_cooldown_persistence(cooldown_tx);
+    let cooldown_store = state.store.clone();
+    tokio::spawn(async move {
+        while let Some(write) = cooldown_rx.recv().await {
+            if let Err(error) = cooldown_store
+                .accounts()
+                .record_routing_cooldown(
+                    write.account_id.as_str(),
+                    write.cooldown_until,
+                    write.reason,
+                    write.updated_at,
+                )
+                .await
+            {
+                tracing::warn!(
+                    account_id = %write.account_id,
+                    error = %error,
+                    "could not persist restart-safe routing cooldown"
+                );
+            }
+        }
+    });
+    let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::unbounded_channel::<AccountId>();
+    state.runtime.register_usage_refresh(refresh_tx);
+
+    // Protocol-level 429/quota failures should not wait up to ten minutes for routing capacity to
+    // catch up. Coalesce any burst already queued and refresh each affected account once.
+    let immediate_state = state.clone();
+    let immediate_http = http.clone();
+    tokio::spawn(async move {
+        while let Some(first_id) = refresh_rx.recv().await {
+            let mut ids = std::collections::HashSet::from([first_id]);
+            while let Ok(id) = refresh_rx.try_recv() {
+                ids.insert(id);
+            }
+            let repo = immediate_state.store.accounts();
+            for id in ids {
+                loop {
+                    if let Ok(Some(account)) = repo.get(id.as_str()).await {
+                        if account.provider == "codex" {
+                            if let Err(e) = refresh_account(
+                                &repo,
+                                &immediate_state.cipher,
+                                &immediate_http,
+                                &immediate_state.upstream_base_url,
+                                &account,
+                                &immediate_state.runtime,
+                                immediate_state.runtime_settings.soft_drain_enabled(),
+                                &immediate_state.log_bus,
+                                &immediate_state.health_tier_metrics,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    account_id = %account.id,
+                                    error = %e,
+                                    "immediate usage refresh failed after capacity signal"
+                                );
+                            }
+                        }
+                    }
+                    if !immediate_state.runtime.finish_usage_refresh(&id) {
+                        break;
+                    }
+                }
+            }
+            let _ = immediate_state
+                .account_cache
+                .snapshots(&immediate_state.store)
+                .await;
+        }
+    });
+
     tokio::spawn(async move {
         loop {
             let repo = state.store.accounts();
@@ -364,6 +453,44 @@ mod tests {
         assert_eq!(
             usage_url("https://example.test"),
             "https://example.test/backend-api/wham/usage"
+        );
+    }
+
+    #[test]
+    fn usage_request_uses_one_selected_account_identity_tuple() {
+        let mut selected = account("acct-fedramp", "codex", "active");
+        selected.chatgpt_account_id = Some("chatgpt-fedramp".to_string());
+        let tokens = PlainTokens {
+            access_token: "selected-access".to_string(),
+            refresh_token: "unused-refresh".to_string(),
+            id_token: concat!(
+                "eyJhbGciOiJub25lIn0.",
+                "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lz",
+                "X2ZlZHJhbXAiOnRydWV9fQ.sig"
+            )
+            .to_string(),
+        };
+        let request = usage_request(
+            &reqwest::Client::new(),
+            "https://chatgpt.com/backend-api/codex",
+            &selected,
+            &tokens,
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer selected-access"
+        );
+        assert_eq!(
+            request.headers().get("chatgpt-account-id").unwrap(),
+            "chatgpt-fedramp"
+        );
+        assert_eq!(request.headers().get("x-openai-fedramp").unwrap(), "true");
+        assert_eq!(
+            request.headers().get_all("x-openai-fedramp").iter().count(),
+            1
         );
     }
 

@@ -26,7 +26,10 @@ use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER,
 };
 
-use polyflare_core::{Account, ExecError, Executor, PreparedRequest, RequestCtx, ResponseStream};
+use polyflare_core::{
+    Account, ExecError, Executor, PreparedRequest, RequestCtx, ResponseMetadata, ResponseStream,
+    UpstreamHttpError,
+};
 
 /// Parse the numeric-seconds form of `Retry-After` (the form the Codex/OpenAI backend sends on a
 /// 429). The HTTP-date form is ignored (returns `None` ⇒ the caller falls back to exponential
@@ -83,12 +86,14 @@ fn looks_like_code_token(s: &str) -> bool {
 /// as an error in the caller — a missing code is always a valid, silent outcome.
 fn extract_error_code(body: &[u8]) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    if let Some(code) = value
-        .get("error")
-        .and_then(|e| e.get("code"))
-        .and_then(|c| c.as_str())
-    {
-        return Some(code.to_string());
+    if let Some(error) = value.get("error") {
+        for field in ["code", "type"] {
+            if let Some(code) = error.get(field).and_then(|c| c.as_str()) {
+                if looks_like_code_token(code) {
+                    return Some(code.to_string());
+                }
+            }
+        }
     }
     if let Some(detail) = value.get("detail").and_then(|d| d.as_str()) {
         if looks_like_code_token(detail) {
@@ -96,6 +101,34 @@ fn extract_error_code(body: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+fn safe_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "connection"
+                    | "content-length"
+                    | "content-encoding"
+                    | "transfer-encoding"
+                    | "keep-alive"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+                    | "te"
+                    | "trailer"
+                    | "upgrade"
+                    | "set-cookie"
+            )
+        })
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 // Pins the exact aws-lc-rs version (see workspace Cargo.toml) that rustls's `aws_lc_rs` feature
@@ -186,10 +219,21 @@ impl Executor for CodexExecutor {
             .map_err(|e| ExecError::Upstream(e.to_string()))?;
         headers.insert(AUTHORIZATION, bearer);
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        // FedRAMP routing is part of the selected account identity tuple, never a client-owned
+        // passthrough. Remove a stale forwarded value first; only the selected account's claim may
+        // restore the header.
+        headers.remove(HeaderName::from_static("x-openai-fedramp"));
+        if account.is_fedramp {
+            headers.insert(
+                HeaderName::from_static("x-openai-fedramp"),
+                HeaderValue::from_static("true"),
+            );
+        }
         // Pair the SELECTED account's ChatGPT id with its Bearer, exactly as the real Codex CLI
         // does (`ChatGPT-Account-ID`). `insert` (replace) so a client's forwarded value for a
         // DIFFERENT account can never survive next to our overridden Bearer — a mismatched
         // (token, account) pair is precisely what the backend rejects.
+        headers.remove(HeaderName::from_static("chatgpt-account-id"));
         if let Some(account_id) = &account.chatgpt_account_id {
             headers.insert(
                 HeaderName::from_static("chatgpt-account-id"),
@@ -223,19 +267,24 @@ impl Executor for CodexExecutor {
             .send()
             .await
             .map_err(|e| ExecError::Upstream(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let response_headers = safe_response_headers(resp.headers());
 
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
             let retry_after = retry_after_secs(resp.headers());
             // Bounded read of the error body to extract the code ONLY (content-safety: the
             // message/detail prose is read into `buf` transiently here and then never touched
             // again — not stored, not logged, not placed anywhere on `ExecError`).
             let buf = read_bounded_error_body(resp).await;
             let error_code = extract_error_code(&buf);
-            return Err(ExecError::UpstreamStatus(polyflare_core::FailureSignal {
-                status,
-                retry_after,
-                error_code,
+            return Err(ExecError::UpstreamHttp(UpstreamHttpError {
+                signal: polyflare_core::FailureSignal {
+                    status,
+                    retry_after,
+                    error_code,
+                },
+                headers: response_headers,
+                body: bytes::Bytes::from(buf),
             }));
         }
 
@@ -243,6 +292,35 @@ impl Executor for CodexExecutor {
             .bytes_stream()
             .map(|chunk| chunk.map_err(|e| ExecError::Stream(e.to_string())));
 
-        Ok(Box::pin(stream))
+        Ok(ResponseStream::with_metadata(
+            stream,
+            ResponseMetadata {
+                status,
+                headers: response_headers,
+            },
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_error_code;
+
+    #[test]
+    fn extracts_code_or_code_like_type_without_reading_message() {
+        assert_eq!(
+            extract_error_code(br#"{"error":{"code":"insufficient_quota","message":"ignored"}}"#)
+                .as_deref(),
+            Some("insufficient_quota")
+        );
+        assert_eq!(
+            extract_error_code(br#"{"error":{"type":"usage_not_included","message":"ignored"}}"#)
+                .as_deref(),
+            Some("usage_not_included")
+        );
+        assert_eq!(
+            extract_error_code(br#"{"error":{"type":"not prose allowed","message":"ignored"}}"#),
+            None
+        );
     }
 }

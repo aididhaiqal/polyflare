@@ -46,7 +46,9 @@ fn store_account(id: &str) -> Account {
 
 #[tokio::test]
 async fn large_request_body_is_not_rejected_with_413() {
-    let mock = MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()]);
+    let mock = MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()])
+        .with_response_header("x-request-id", "upstream-large-body")
+        .with_response_header("x-codex-turn-state", "turn-large-body");
     let handle = mock.clone();
     let upstream = mock.spawn().await;
 
@@ -104,6 +106,7 @@ async fn large_request_body_is_not_rejected_with_413() {
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -140,8 +143,44 @@ async fn large_request_body_is_not_rejected_with_413() {
         200,
         "large body must not be rejected with 413"
     );
+    assert_eq!(
+        resp.headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("upstream-large-body")
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-codex-turn-state")
+            .and_then(|value| value.to_str().ok()),
+        Some("turn-large-body")
+    );
 
     let last_body = handle.last_body().unwrap();
     assert_eq!(last_body["model"], "gpt-5.6-sol");
     assert_eq!(last_body["input"].as_str().unwrap().len(), 2_500_000);
+
+    // Current Codex enables request compression by default and ChatGPT-authenticated Responses
+    // traffic uses zstd. PolyFlare must parse the decompressed request for routing, then forward
+    // valid JSON bytes upstream without replaying the stale content-encoding/content-length.
+    let compressed_payload = serde_json::json!({
+        "model": "gpt-5.6-sol",
+        "input": [{"role": "user", "content": "compressed"}],
+    });
+    let wire = serde_json::to_vec(&compressed_payload).unwrap();
+    let compressed = zstd::stream::encode_all(std::io::Cursor::new(wire), 1).unwrap();
+    let resp = client
+        .post(format!("http://{addr}/responses"))
+        .header("content-type", "application/json")
+        .header("content-encoding", "zstd")
+        .body(compressed)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "zstd Codex request must be accepted");
+    assert_eq!(
+        handle.last_body().unwrap(),
+        compressed_payload,
+        "the upstream receives the decoded JSON request"
+    );
 }

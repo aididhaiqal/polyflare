@@ -34,7 +34,7 @@ impl Executor for ErrorFirstExecutor {
         _ctx: &RequestCtx,
     ) -> Result<ResponseStream, ExecError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::pin(stream::once(async {
+        Ok(ResponseStream::new(stream::once(async {
             Err(ExecError::Stream("connection reset".into()))
         })))
     }
@@ -46,6 +46,7 @@ fn core_account(base_url: String) -> Account {
         base_url,
         bearer_token: "tok".into(),
         chatgpt_account_id: None,
+        is_fedramp: false,
     }
 }
 

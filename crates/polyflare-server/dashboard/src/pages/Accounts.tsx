@@ -10,9 +10,8 @@
 //                                stays visible as a secondary muted detail alongside it)
 //   provider chip            <- a.provider (via ui/ProviderTag)
 //   email / plan / pool      <- a.email, a.plan_type, a.pool (null -> "unpooled")
-//   5-hour / weekly bars     <- a.five_hour / a.weekly (WindowView | null — Claude accounts have no
-//                                five_hour window; rendered as a dash row, not omitted, so the card
-//                                shape stays a stable 2-row grid across accounts)
+//   5-hour / weekly bars     <- a.five_hour / a.weekly (WindowView | null — limits the provider
+//                                does not report are omitted instead of rendered as fake rows)
 //   token-health footer      <- a.token_health {access_state, access_expires_at}
 //   24h request count        <- a.request_count_24h
 //   kebab menu               <- AccountRowMenu (pause/resume, routing_policy, security_work_
@@ -31,8 +30,19 @@ import clsx from "clsx";
 
 import type { AccountView, TokenHealthView, WindowView } from "../lib/api";
 import { compactNum, countdown, pct } from "../lib/format";
+import {
+  quotaDisplayLabel,
+  quotaDisplayPercent,
+  quotaWindowIsPresent,
+} from "../lib/quotaDisplay";
 import { useAccounts } from "../lib/queries";
 import { useAccountActions, type AccountActionsApi } from "../lib/useAccountActions";
+import { useQuotaDisplayPreference } from "../preferences/QuotaDisplayPreference";
+import {
+  routePseudonym,
+  ShieldedAccount,
+  useScreenShield,
+} from "../privacy/ScreenShield";
 import { ActionMenu } from "../ui/ActionMenu";
 import { Card } from "../ui/Card";
 import {
@@ -45,9 +55,11 @@ import {
   Pause,
   Pencil,
   Play,
+  Plus,
   ShieldCheck,
   Trash2,
 } from "../ui/icons";
+import { CodexOnboardingDialog } from "../ui/CodexOnboardingDialog";
 import { providerBrandKey, ProviderTag } from "../ui/ProviderTag";
 import { StatusPill, statusTone, type StatusTone } from "../ui/StatusPill";
 
@@ -69,10 +81,10 @@ function matchesProvider(provider: string, filter: ProviderFilter): boolean {
 const ALL_POOLS = "__all_pools__";
 const UNPOOLED = "__unpooled__";
 
-function matchesPool(pool: string | null, filter: string): boolean {
+function matchesPool(pools: string[], filter: string): boolean {
   if (filter === ALL_POOLS) return true;
-  if (filter === UNPOOLED) return pool === null;
-  return pool === filter;
+  if (filter === UNPOOLED) return pools.length === 0;
+  return pools.includes(filter);
 }
 
 /** Shared tone->fill-color map for every usage bar on this page (status dot, 5-hour/weekly bars,
@@ -114,6 +126,7 @@ export function Accounts() {
   const view: ViewMode = searchParams.get("view") === "list" ? "list" : "cards";
   const [providerFilter, setProviderFilter] = useState<ProviderFilter>("all");
   const [poolFilter, setPoolFilter] = useState<string>(ALL_POOLS);
+  const [addOpen, setAddOpen] = useState(false);
 
   // Ticks countdowns (quota-window resets, token-expiry countdowns) between the 30s useAccounts()
   // poll — same pattern Overview.tsx uses for its own countdown/relative-time math.
@@ -168,14 +181,12 @@ export function Accounts() {
   const activeCount = accounts.filter((a) => statusTone(a.status) === "ok").length;
   const reauthCount = accounts.filter((a) => statusTone(a.status) === "error").length;
 
-  const namedPools = Array.from(
-    new Set(accounts.filter((a) => a.pool !== null).map((a) => a.pool as string)),
-  ).sort();
-  const hasUnpooled = accounts.some((a) => a.pool === null);
+  const namedPools = Array.from(new Set(accounts.flatMap((a) => a.pools))).sort();
+  const hasUnpooled = accounts.some((a) => a.pools.length === 0);
   const poolCount = namedPools.length + (hasUnpooled ? 1 : 0);
 
   const filtered = accounts.filter(
-    (a) => matchesProvider(a.provider, providerFilter) && matchesPool(a.pool, poolFilter),
+    (a) => matchesProvider(a.provider, providerFilter) && matchesPool(a.pools, poolFilter),
   );
 
   return (
@@ -184,6 +195,7 @@ export function Accounts() {
         subtitle={`${totalAccounts} ${totalAccounts === 1 ? "account" : "accounts"} · ${activeCount} active · ${reauthCount} reauth · ${poolCount} ${poolCount === 1 ? "pool" : "pools"}`}
         actions={
           <div className="flex flex-wrap items-center gap-2">
+            <button type="button" onClick={() => setAddOpen(true)} className="flex items-center gap-1.5 rounded bg-accent px-2.5 py-1 text-[10.5px] font-semibold text-white"><Plus className="h-3 w-3" />Add account</button>
             <div className="flex shrink-0 overflow-hidden rounded border border-border bg-card text-[10.5px]">
               {PROVIDER_FILTERS.map((f) => (
                 <button
@@ -243,7 +255,7 @@ export function Accounts() {
 
       {accounts.length === 0 ? (
         <Card>
-          <p className="text-[11px] text-fg opacity-50">No accounts configured yet.</p>
+          <div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-[12px] font-semibold text-fg">No accounts configured yet</p><p className="mt-1 text-[11px] text-fg opacity-50">Connect a Codex account to begin routing requests.</p></div><button type="button" onClick={() => setAddOpen(true)} className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-[11px] font-semibold text-white"><Plus className="h-3.5 w-3.5" />Add account</button></div>
         </Card>
       ) : filtered.length === 0 ? (
         <Card>
@@ -259,6 +271,8 @@ export function Accounts() {
         <AccountsTable accounts={filtered} nowMs={nowMs} actions={actions} />
       )}
 
+      <CodexOnboardingDialog open={addOpen} onOpenChange={setAddOpen} />
+
       {actions.dialogs}
     </div>
   );
@@ -272,8 +286,10 @@ export function Accounts() {
 
 function AccountRowMenu({ account: a, actions }: { account: AccountView; actions: AccountActionsApi }) {
   const paused = a.status === "paused";
+  const { active } = useScreenShield();
+  const displayLabel = active ? routePseudonym(a.id) : a.alias ?? a.id;
   return (
-    <ActionMenu label={`Actions for ${a.alias ?? a.id}`}>
+    <ActionMenu label={`Actions for ${displayLabel}`}>
       <ActionMenu.Item
         icon={paused ? Play : Pause}
         onSelect={() => actions.patch.mutate({ id: a.id, body: { status: paused ? "active" : "paused" } })}
@@ -300,17 +316,21 @@ function AccountRowMenu({ account: a, actions }: { account: AccountView; actions
       >
         {a.security_work_authorized ? "Revoke trusted access" : "Grant trusted access"}
       </ActionMenu.Item>
-      <ActionMenu.Item icon={Pencil} onSelect={() => actions.openRename({ id: a.id, alias: a.alias })}>
+      <ActionMenu.Item
+        icon={Pencil}
+        disabled={active}
+        onSelect={() => actions.openRename({ id: a.id, alias: a.alias })}
+      >
         Rename…
       </ActionMenu.Item>
-      <ActionMenu.Item icon={Layers} onSelect={() => actions.openSetPool({ id: a.id, pool: a.pool })}>
-        Set pool…
+      <ActionMenu.Item icon={Layers} onSelect={() => actions.openSetPool({ id: a.id, pools: a.pools })}>
+        Manage pools…
       </ActionMenu.Item>
       <ActionMenu.Separator />
       <ActionMenu.Item
         icon={Trash2}
         danger
-        onSelect={() => actions.openDelete({ id: a.id, label: a.alias ?? a.id })}
+        onSelect={() => actions.openDelete({ id: a.id, label: displayLabel })}
       >
         Delete…
       </ActionMenu.Item>
@@ -383,9 +403,7 @@ function PoolSelect({
 // Card view
 // ---------------------------------------------------------------------------------------------
 
-/** One 5-hour/weekly row inside an account card: label, risk-toned bar, `used%  ·  countdown`. A
- * `null` window (upstream isn't reporting it — e.g. Claude has no five_hour window) renders as a
- * dash row rather than being omitted, so every card keeps the same 2-row shape. */
+/** One reported quota row inside an account card: label, risk-toned bar, and reset countdown. */
 function CardUsageRow({
   label,
   window,
@@ -395,6 +413,7 @@ function CardUsageRow({
   window: WindowView | null;
   nowMs: number;
 }) {
+  const { mode } = useQuotaDisplayPreference();
   if (!window) {
     return (
       <div className="flex items-center gap-2 text-[9.5px]">
@@ -405,17 +424,18 @@ function CardUsageRow({
     );
   }
   const clamped = Math.max(0, Math.min(100, window.used_percent));
+  const displayed = quotaDisplayPercent(clamped, mode);
   return (
     <div className="flex items-center gap-2 text-[9.5px]">
       <span className="w-11 shrink-0 text-fg opacity-60">{label}</span>
       <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
         <div
           className={clsx("h-full rounded-full", TONE_BAR_CLASS[usageRiskTone(clamped)])}
-          style={{ width: `${clamped}%` }}
+          style={{ width: `${displayed}%` }}
         />
       </div>
       <span className="shrink-0 whitespace-nowrap text-right text-fg opacity-70">
-        {pct(clamped)} · {countdown(window.reset_at, nowMs)}
+        {pct(displayed)} {quotaDisplayLabel(mode)} · {countdown(window.reset_at, nowMs)}
         {window.stale && <span className="text-warn"> · stale</span>}
       </span>
     </div>
@@ -433,6 +453,7 @@ function AccountCard({
 }) {
   const tone = statusTone(a.status);
   const token = tokenHealthLabel(a.token_health, nowMs);
+  const { active } = useScreenShield();
 
   return (
     // The kebab is a SIBLING overlay, not nested inside the `<Link>` (an interactive control can't
@@ -445,19 +466,34 @@ function AccountCard({
           {/* pr-7 keeps the StatusPill clear of the kebab overlaid at the card's top-right corner */}
           <div className="flex items-center gap-1.5 pr-7">
             <span className={clsx("h-[7px] w-[7px] shrink-0 rounded-full", TONE_BAR_CLASS[tone])} />
-            <span className="truncate text-[12.5px] font-semibold text-fg">{a.alias ?? a.id}</span>
+            <ShieldedAccount
+              id={a.id}
+              label={a.alias ?? a.id}
+              className="truncate text-[12.5px] font-semibold text-fg"
+            />
             <ProviderTag provider={a.provider} />
             <StatusPill status={a.status} className="ml-auto shrink-0" />
           </div>
 
           <div className="truncate text-[10px] text-fg opacity-60">
-            {a.alias && <span className="opacity-60">{a.id} · </span>}
-            {a.email} · <span className="font-medium text-fg opacity-90">{a.plan_type}</span> · pool{" "}
-            <span className="font-medium text-fg opacity-90">{a.pool ?? "unpooled"}</span>
+            {active ? (
+              <span className="opacity-60">identity shielded · </span>
+            ) : (
+              <>
+                {a.alias && <span className="opacity-60">{a.id} · </span>}
+                {a.email} ·{" "}
+              </>
+            )}
+            <span className="font-medium text-fg opacity-90">{a.plan_type}</span> · pool{" "}
+            <span className="font-medium text-fg opacity-90">
+              {a.pools.length > 0 ? a.pools.join(", ") : "unpooled"}
+            </span>
           </div>
 
           <div className="flex flex-col gap-1">
-            <CardUsageRow label="5-hour" window={a.five_hour} nowMs={nowMs} />
+            {quotaWindowIsPresent(a.five_hour) && (
+              <CardUsageRow label="5-hour" window={a.five_hour} nowMs={nowMs} />
+            )}
             <CardUsageRow label="Weekly" window={a.weekly} nowMs={nowMs} />
           </div>
 
@@ -487,17 +523,19 @@ function AccountCard({
 // ---------------------------------------------------------------------------------------------
 
 function ListUsageCell({ window }: { window: WindowView | null }) {
+  const { mode } = useQuotaDisplayPreference();
   if (!window) return <span className="text-fg opacity-40">—</span>;
   const clamped = Math.max(0, Math.min(100, window.used_percent));
+  const displayed = quotaDisplayPercent(clamped, mode);
   return (
     <div className="flex items-center gap-1.5">
       <div className="h-[5px] w-[46px] shrink-0 overflow-hidden rounded-full bg-muted">
         <div
           className={clsx("h-full rounded-full", TONE_BAR_CLASS[usageRiskTone(clamped)])}
-          style={{ width: `${clamped}%` }}
+          style={{ width: `${displayed}%` }}
         />
       </div>
-      <span className="text-fg opacity-70">{pct(clamped)}</span>
+      <span className="text-fg opacity-70">{pct(displayed)}</span>
     </div>
   );
 }
@@ -515,10 +553,18 @@ function AccountsTable({
   actions: AccountActionsApi;
 }) {
   const navigate = useNavigate();
+  const { active } = useScreenShield();
+  const { mode } = useQuotaDisplayPreference();
+  const showFiveHour = accounts.some((account) => quotaWindowIsPresent(account.five_hour));
   return (
     <Card>
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[760px] border-collapse text-[10.5px]">
+        <table
+          className={clsx(
+            "w-full border-collapse text-[10.5px]",
+            showFiveHour ? "min-w-[760px]" : "min-w-[680px]",
+          )}
+        >
           <thead>
             <tr className="border-b border-border">
               <th className={TABLE_HEAD_CLASS}>Account</th>
@@ -526,8 +572,10 @@ function AccountsTable({
               <th className={TABLE_HEAD_CLASS}>Pool</th>
               <th className={TABLE_HEAD_CLASS}>Plan</th>
               <th className={TABLE_HEAD_CLASS}>Status</th>
-              <th className={TABLE_HEAD_CLASS}>5-hour</th>
-              <th className={TABLE_HEAD_CLASS}>Weekly</th>
+              {showFiveHour && (
+                <th className={TABLE_HEAD_CLASS}>5-hour {quotaDisplayLabel(mode)}</th>
+              )}
+              <th className={TABLE_HEAD_CLASS}>Weekly {quotaDisplayLabel(mode)}</th>
               <th className={TABLE_HEAD_CLASS}>Token</th>
               <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>Reqs 24h</th>
               <th className={TABLE_HEAD_CLASS}>
@@ -561,20 +609,26 @@ function AccountsTable({
                         TONE_BAR_CLASS[tone],
                       )}
                     />
-                    {a.alias ?? a.id}
-                    {a.alias && <span className="ml-1.5 text-fg opacity-40">({a.id})</span>}
+                    <ShieldedAccount id={a.id} label={a.alias ?? a.id} />
+                    {!active && a.alias && (
+                      <span className="ml-1.5 text-fg opacity-40">({a.id})</span>
+                    )}
                   </td>
                   <td className="px-2 py-1.5">
                     <ProviderTag provider={a.provider} />
                   </td>
-                  <td className="px-2 py-1.5 text-fg opacity-60">{a.pool ?? "unpooled"}</td>
+                  <td className="px-2 py-1.5 text-fg opacity-60">
+                    {a.pools.length > 0 ? a.pools.join(", ") : "unpooled"}
+                  </td>
                   <td className="px-2 py-1.5 text-fg opacity-80">{a.plan_type}</td>
                   <td className="px-2 py-1.5">
                     <StatusPill status={a.status} />
                   </td>
-                  <td className="px-2 py-1.5">
-                    <ListUsageCell window={a.five_hour} />
-                  </td>
+                  {showFiveHour && (
+                    <td className="px-2 py-1.5">
+                      <ListUsageCell window={a.five_hour} />
+                    </td>
+                  )}
                   <td className="px-2 py-1.5">
                     <ListUsageCell window={a.weekly} />
                   </td>

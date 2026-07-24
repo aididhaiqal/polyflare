@@ -105,6 +105,7 @@ async fn spawn_polyflare(store: Store, upstream: String) -> String {
             live_logs: false,
         })),
         ws_downstream: false,
+        ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),
@@ -231,6 +232,7 @@ async fn responses_request_completion_event_is_content_safe() {
         "aliased=false",
         "status=200",
         "duration_ms=",
+        "request_id=",
     ] {
         assert!(line.contains(expected), "missing `{expected}` in: {line}");
     }
