@@ -2,16 +2,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
+use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::IntoResponse;
-use axum::routing::any;
+use axum::routing::{any, get};
 use axum::Router;
+use futures_util::{SinkExt, StreamExt};
 use polyflare_codex::oauth::OAuthClient;
 use polyflare_core::{CapacityWeighted, Continuity};
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::continuity::CodexContinuity;
-use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
+use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields, SettingValue};
 use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
 
 fn now() -> i64 {
@@ -61,6 +63,44 @@ async fn spawn_upstream() -> (String, Capture) {
     let capture = Capture::default();
     let app = Router::new()
         .route("/backend-api/{*path}", any(upstream_handler))
+        .with_state(capture.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), capture)
+}
+
+#[derive(Clone, Default)]
+struct WsCapture(Arc<Mutex<Vec<(HeaderMap, Uri)>>>);
+
+async fn remote_control_ws_handler(
+    State(capture): State<WsCapture>,
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    uri: Uri,
+) -> impl IntoResponse {
+    capture.0.lock().unwrap().push((headers, uri));
+    ws.protocols(["codex-remote-v2"])
+        .on_upgrade(remote_control_ws_echo)
+}
+
+async fn remote_control_ws_echo(mut socket: WebSocket) {
+    if let Some(Ok(AxumMessage::Text(text))) = socket.recv().await {
+        let _ = socket
+            .send(AxumMessage::Text(format!("upstream:{text}").into()))
+            .await;
+    }
+}
+
+async fn spawn_ws_upstream() -> (String, WsCapture) {
+    let capture = WsCapture::default();
+    let app = Router::new()
+        .route(
+            "/backend-api/wham/remote/control/server",
+            get(remote_control_ws_handler),
+        )
         .with_state(capture.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -238,6 +278,7 @@ async fn wham_usage_returns_capacity_weighted_pool_as_canonical_codex_limit() {
 
     let rows = request_rows(&state, 1).await;
     assert_eq!(rows[0].path, "chatgpt_backend_synthetic_wham/usage");
+    assert_eq!(rows[0].provider, "chatgpt_backend");
     assert_eq!(rows[0].status, 200);
 }
 
@@ -308,13 +349,56 @@ async fn pool_scoped_usage_includes_only_members_of_the_named_pool() {
 }
 
 #[tokio::test]
-async fn unmodified_backend_route_is_transparently_forwarded_and_safely_observed() {
+async fn explicitly_disabled_backend_passthrough_does_not_contact_upstream() {
+    let (upstream, capture) = spawn_upstream().await;
+    let (base, state) = spawn_polyflare(&upstream).await;
+    state
+        .runtime_settings
+        .set(
+            "chatgpt_backend_passthrough_enabled",
+            SettingValue::Bool(false),
+        )
+        .unwrap();
+    let response = reqwest::Client::new()
+        .patch(format!("{base}/backend-api/wham/settings/user"))
+        .header("authorization", "Bearer must-not-leave-polyflare")
+        .body("body-must-not-leave-polyflare")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(payload["error"]["code"], "backend_passthrough_disabled");
+    assert!(
+        capture.0.lock().unwrap().is_none(),
+        "disabled passthrough must not contact the upstream"
+    );
+
+    let rows = request_rows(&state, 1).await;
+    assert_eq!(
+        rows[0].path,
+        "chatgpt_backend_passthrough_wham/settings/user"
+    );
+    assert_eq!(rows[0].provider, "chatgpt_backend");
+    assert_eq!(rows[0].status, 404);
+}
+
+#[tokio::test]
+async fn enabled_backend_route_is_transparently_forwarded_and_safely_observed() {
     const AUTH_SECRET: &str = "Bearer auth-secret-must-not-be-logged";
     const BODY_SECRET: &str = "body-secret-must-not-be-logged";
     const QUERY_SECRET: &str = "query-secret-must-not-be-logged";
 
     let (upstream, capture) = spawn_upstream().await;
     let (base, state) = spawn_polyflare(&upstream).await;
+    state
+        .runtime_settings
+        .set(
+            "chatgpt_backend_passthrough_enabled",
+            SettingValue::Bool(true),
+        )
+        .unwrap();
     let response = reqwest::Client::new()
         .patch(format!(
             "{base}/backend-api/wham/settings/user?mode=fast&opaque={QUERY_SECRET}"
@@ -355,6 +439,7 @@ async fn unmodified_backend_route_is_transparently_forwarded_and_safely_observed
         "chatgpt_backend_passthrough_wham/settings/user"
     );
     assert_eq!(rows[0].status, 207);
+    assert_eq!(rows[0].provider, "chatgpt_backend");
     assert_eq!(rows[0].account_id, None);
     let debug = format!("{rows:?}");
     for secret in [AUTH_SECRET, BODY_SECRET, QUERY_SECRET] {
@@ -363,4 +448,81 @@ async fn unmodified_backend_route_is_transparently_forwarded_and_safely_observed
             "request telemetry leaked a secret: {debug}"
         );
     }
+}
+
+#[tokio::test]
+async fn remote_control_websocket_upgrades_relays_and_logs_as_backend_traffic() {
+    const FRAME_SECRET: &str = "remote-frame-must-not-be-logged";
+    const AUTH_SECRET: &str = "Bearer remote-token-must-not-be-logged";
+    const QUERY_SECRET: &str = "remote-query-must-not-be-logged";
+
+    let (upstream, capture) = spawn_ws_upstream().await;
+    let (base, state) = spawn_polyflare(&upstream).await;
+    for downstream_path in [
+        "/backend-api/wham/remote/control/server",
+        "/work/backend-api/wham/remote/control/server",
+    ] {
+        let ws_url = format!(
+            "{}{downstream_path}?installation_id={QUERY_SECRET}",
+            base.replacen("http://", "ws://", 1)
+        );
+        let mut request =
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(ws_url)
+                .unwrap();
+        request
+            .headers_mut()
+            .insert("authorization", AUTH_SECRET.parse().unwrap());
+        request
+            .headers_mut()
+            .insert("x-codex-protocol-version", "2".parse().unwrap());
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", "codex-remote-v2".parse().unwrap());
+
+        let (mut socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(
+            response.headers()["sec-websocket-protocol"],
+            "codex-remote-v2"
+        );
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                FRAME_SECRET.into(),
+            ))
+            .await
+            .unwrap();
+        let reply = socket.next().await.unwrap().unwrap();
+        assert_eq!(
+            reply.into_text().unwrap(),
+            format!("upstream:{FRAME_SECRET}")
+        );
+        socket.close(None).await.unwrap();
+    }
+
+    let captures = capture.0.lock().unwrap().clone();
+    assert_eq!(captures.len(), 2);
+    let expected_query = format!("installation_id={QUERY_SECRET}");
+    for (headers, uri) in captures {
+        assert_eq!(headers["authorization"], AUTH_SECRET);
+        assert_eq!(headers["x-codex-protocol-version"], "2");
+        assert_eq!(headers["sec-websocket-protocol"], "codex-remote-v2");
+        assert_eq!(uri.query(), Some(expected_query.as_str()));
+    }
+
+    let rows = request_rows(&state, 2).await;
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        assert_eq!(
+            row.path,
+            "chatgpt_backend_passthrough_wham/remote/control/server"
+        );
+        assert_eq!(row.provider, "chatgpt_backend");
+        assert_eq!(row.status, 101);
+        assert_eq!(row.transport.as_deref(), Some("ws"));
+        assert_eq!(row.upstream_transport.as_deref(), Some("ws"));
+    }
+    let debug = format!("{rows:?}");
+    assert!(!debug.contains(FRAME_SECRET));
+    assert!(!debug.contains(AUTH_SECRET));
+    assert!(!debug.contains(QUERY_SECRET));
 }

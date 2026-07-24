@@ -7,6 +7,7 @@ import clsx from "clsx";
 const PROVIDER_CLASSES: Record<string, string> = {
   codex: "bg-codex/15 text-codex",
   claude: "bg-claude/15 text-claude",
+  backend: "bg-signal/15 text-signal",
 };
 
 /** Canonical brand key for provider styling/labels. The backend's WIRE value for the Anthropic
@@ -18,7 +19,9 @@ const PROVIDER_CLASSES: Record<string, string> = {
  * Claude brand color/label instead of silently falling into the neutral "unknown provider" style —
  * import this rather than re-deriving the mapping at each call site. */
 export function providerBrandKey(provider: string): string {
-  return provider === "anthropic" ? "claude" : provider;
+  if (provider === "anthropic") return "claude";
+  if (provider === "chatgpt_backend") return "backend";
+  return provider;
 }
 
 export function ProviderTag({ provider, className }: { provider: string; className?: string }) {

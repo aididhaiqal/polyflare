@@ -24,7 +24,7 @@ import { AlertTriangle } from "../ui/icons";
 import { Switch } from "../ui/Switch";
 
 // ---------------------------------------------------------------------------------------------
-// Grouping — the 10 live keys bucketed by area, per the task brief. `SettingsContent` looks each
+// Grouping — live keys bucketed by area. `SettingsContent` looks each
 // key up in the `GET /api/settings` response; an absent key is skipped, never fabricated.
 // ---------------------------------------------------------------------------------------------
 
@@ -46,7 +46,10 @@ const LIVE_SECTIONS: SectionDef[] = [
   },
   { title: "Streaming", keys: ["stream_idle_timeout", "soft_drain_enabled"] },
   { title: "Retention", keys: ["request_log_retention_days", "usage_history_retention_days"] },
-  { title: "Flags", keys: ["live_logs"] },
+  {
+    title: "Flags",
+    keys: ["live_logs", "chatgpt_backend_passthrough_enabled"],
+  },
 ];
 
 const WEBSOCKET_KEYS = [

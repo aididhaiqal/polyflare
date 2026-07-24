@@ -307,8 +307,9 @@ Its pages cover:
   protocol outcome.
 - **Sessions** — group main and subagent activity by content-free session key.
 - **Reports** — time-series totals and account/model/provider breakdowns.
-- **Settings** — live runtime settings, restart-only configuration, and the browser-local choice
-  to display quota as remaining or used.
+- **Settings** — live runtime settings (including the ChatGPT backend passthrough rollback
+  control), restart-only configuration, and the browser-local choice to display quota as remaining
+  or used.
 - **Keys** — create and revoke caller API keys.
 - **Live logs** — content-safe server events delivered over SSE.
 
@@ -389,7 +390,7 @@ A Responses-compatible client should use the PolyFlare origin as its base URL, w
 ```toml
 model_provider = "polyflare"
 # Codex account usage, status, plugins, connectors, and other ChatGPT backend calls use this
-# separate global base. PolyFlare synthesizes only /wham/usage and transparently forwards the rest.
+# separate global base. PolyFlare synthesizes /wham/usage and forwards the remaining backend routes.
 chatgpt_base_url = "http://127.0.0.1:8080/backend-api"
 
 [model_providers.polyflare]
@@ -403,10 +404,14 @@ requires_openai_auth = true
 `chatgpt_base_url` is how stock codex-rs reads the Usage screen and `/status`; it is independent of
 the model-provider base URL. PolyFlare returns its capacity-weighted pool as the canonical Codex
 quota at `/backend-api/wham/usage`. Every other `/backend-api/*` request uses the client's existing
-ChatGPT authorization and is forwarded directly to the fixed ChatGPT backend without account
-selection or token decryption. Requests records these operations under normalized
-`chatgpt_backend_synthetic_*` or `chatgpt_backend_passthrough_*` paths so new Codex backend usage is
-visible without logging credentials, query values, dynamic resource IDs, or bodies.
+ChatGPT authorization when **Settings → ChatGPT backend passthrough** is enabled. Passthrough is
+enabled by default; the setting is a live rollback control that can disable it without restarting
+PolyFlare. These requests go directly to the fixed ChatGPT backend without account selection or
+token decryption. Request history records these operations with a distinct `backend` provider tag
+and normalized `chatgpt_backend_synthetic_*` or `chatgpt_backend_passthrough_*` paths so new Codex
+backend usage is visible without being presented as model-response traffic or logging credentials,
+query values, dynamic resource IDs, frame contents, or bodies. Reports uses the same distinction
+for its `Operation` breakdown.
 
 To target a pool, include the pool in the provider base URL:
 

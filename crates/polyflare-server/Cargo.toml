@@ -24,6 +24,7 @@ serde_json = { workspace = true }
 clap = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 # /api/logs/stream: adapts the log bus's broadcast::Receiver into a Stream for the SSE body.
 tokio-stream = { version = "0.1", features = ["sync"] }
 # B5 Task 4: the keepalive recovery-wait combinator (`ingress.rs::layer2_wait_stream`) — its
@@ -63,17 +64,6 @@ futures-util = { workspace = true }
 sqlx = { workspace = true }
 tempfile = { workspace = true }
 zeroize = { workspace = true }
-# ws_vs_sse_probe example: a WebSocket client for the Codex backend POC. Pinned to the same
-# rustls 0.23 the workspace uses so it reuses the installed aws-lc-rs crypto provider.
-#
-# M5a deflate adoption: bumped from 0.26 to 0.28.0 (the same `[patch.crates-io]`-redirected
-# OpenAI fork `polyflare-codex` now pins — see workspace root `Cargo.toml`) SPECIFICALLY so
-# `ws_deflate_probe.rs` can build a real `WebSocketConfig` with `permessage_deflate` enabled and
-# thereby actually exercise decode support live, mirroring `ws::conn::WsConn::connect` instead of
-# hand-writing the `Sec-WebSocket-Extensions` header (which the fork's client handshake now
-# rejects with `InvalidHeader` unless the response's confirmed extension matches a real client
-# config — see `.superpowers/sdd/m5a-deflate-forks-report.md`).
-tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 # `tungstenite::extensions::{ExtensionsConfig, compression::deflate::DeflateConfig}` /
 # `tungstenite::protocol::WebSocketConfig` for `ws_deflate_probe.rs` — same versions/forks as
 # `polyflare-codex`'s direct dependency.

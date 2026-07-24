@@ -239,7 +239,7 @@ export function useReports(params: ReportsParams) {
   });
 }
 
-/** `GET /api/settings` — the Settings page's full running-config payload (10 live fields + every
+/** `GET /api/settings` — the Settings page's full running-config payload (live fields + every
  * restart-only/fixed field, 27 total). 60s stale/refetch — the same cadence `useReports` uses:
  * config drifts only on an admin edit (which invalidates this key directly, see
  * `useUpdateSettings`) or a restart, so there's no value polling it as often as the live
@@ -538,7 +538,7 @@ export function useDeleteAccount() {
   });
 }
 
-/** `PATCH /api/settings` — live-edit one or more of the 10 live tunables (Settings page). Same
+/** `PATCH /api/settings` — live-edit one or more live tunables (Settings page). Same
  * mutation shape as `usePatchAccount`: on success, invalidates `["settings"]` so the page refetches
  * the CLAMPED canonical value the backend actually stored (never just optimistically keeps the raw
  * submitted one — a `9999` submitted for a field clamped to `300` should show `300`, not `9999`).
