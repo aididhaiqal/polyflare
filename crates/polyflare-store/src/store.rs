@@ -16,6 +16,7 @@ use crate::continuity_repo::ContinuityRepo;
 use crate::onboarding_repo::OnboardingRepo;
 use crate::provider_repo::ProviderRepo;
 use crate::request_log_repo::{RequestLogRecord, RequestLogRepo, RequestProtocolOutcome};
+use crate::reset_credit_repo::ResetCreditRepo;
 use crate::settings_repo::SettingsRepo;
 use crate::translation_repo::TranslationRepo;
 use crate::StoreError;
@@ -216,6 +217,10 @@ impl Store {
     /// still valid — any write advances it and forces the next read to rebuild.
     pub fn account_generation(&self) -> u64 {
         self.account_generation.load(Ordering::Acquire)
+    }
+
+    pub fn reset_credits(&self) -> ResetCreditRepo {
+        ResetCreditRepo::new(self.pool.clone())
     }
 
     /// The current token/identity-write generation (see `token_generation` field). The server's

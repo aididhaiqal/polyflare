@@ -8,6 +8,7 @@ pub mod control_forward;
 pub mod executor;
 pub mod login;
 pub mod oauth;
+pub mod reset_credits;
 pub mod ws;
 
 pub use codex_version::CodexVersionCache;
@@ -19,5 +20,9 @@ pub use login::{run_login, LoginError};
 pub use oauth::{
     classify_failure, decode_claims, should_refresh, token_exp, Claims, FailureClass, OAuthClient,
     OAuthError, Refreshed, RefreshedTokens,
+};
+pub use reset_credits::{
+    consume_reset_credit, fetch_reset_credits, ConsumeResetCreditResponse, ResetCreditItem,
+    ResetCreditsError, ResetCreditsResponse,
 };
 pub use ws::{CodexWsExecutor, WsConn, WsRelayContract};

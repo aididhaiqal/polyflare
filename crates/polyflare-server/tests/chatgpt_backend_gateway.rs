@@ -5,7 +5,7 @@ use axum::body::Bytes;
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
@@ -40,13 +40,41 @@ async fn upstream_handler(
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
-) -> impl IntoResponse {
+) -> Response {
+    let path = uri.path().to_string();
     *capture.0.lock().unwrap() = Some(CapturedRequest {
         method,
         uri,
         headers,
         body,
     });
+    if path == "/backend-api/wham/rate-limit-reset-credits" {
+        return axum::Json(serde_json::json!({
+            "available_count": 1,
+            "credits": [{
+                "id": "credit-upstream",
+                "reset_type": "rate_limit_reset",
+                "status": "available",
+                "granted_at": "2026-07-01T00:00:00Z",
+                "expires_at": "2026-08-01T00:00:00Z",
+                "title": "Full reset",
+                "description": "Reset active rate-limit windows"
+            }]
+        }))
+        .into_response();
+    }
+    if path == "/backend-api/wham/rate-limit-reset-credits/consume" {
+        return axum::Json(serde_json::json!({
+            "code": "reset",
+            "windows_reset": 2,
+            "credit": {
+                "id": "credit-upstream",
+                "status": "redeemed",
+                "redeemed_at": "2026-07-25T02:00:00Z"
+            }
+        }))
+        .into_response();
+    }
     (
         StatusCode::MULTI_STATUS,
         [
@@ -57,6 +85,7 @@ async fn upstream_handler(
         ],
         "upstream-body",
     )
+        .into_response()
 }
 
 async fn spawn_upstream() -> (String, Capture) {
@@ -277,17 +306,9 @@ async fn wham_usage_returns_capacity_weighted_pool_as_canonical_codex_limit() {
         payload["rate_limit"]["secondary_window"]["reset_at"],
         reset_at
     );
-    assert_eq!(
-        payload["additional_rate_limits"][0]["limit_name"],
-        "PolyFlare overall pool"
-    );
-    assert_eq!(
-        payload["additional_rate_limits"][0]["metered_feature"],
-        "polyflare_pool"
-    );
-    assert_eq!(
-        payload["additional_rate_limits"][0]["rate_limit"], payload["rate_limit"],
-        "the named bucket must describe the same aggregate as the canonical compatibility limit"
+    assert!(
+        payload.get("additional_rate_limits").is_none(),
+        "main-limit replacement must avoid presenting the same pool as both Codex and PolyFlare usage"
     );
     assert_eq!(payload["rate_limit_reset_credits"]["available_count"], 0);
     assert!(
@@ -299,6 +320,124 @@ async fn wham_usage_returns_capacity_weighted_pool_as_canonical_codex_limit() {
     assert_eq!(rows[0].path, "chatgpt_backend_synthetic_wham/usage");
     assert_eq!(rows[0].provider, "chatgpt_backend");
     assert_eq!(rows[0].status, 200);
+}
+
+#[tokio::test]
+async fn codex_api_path_style_reads_the_same_aggregate_usage() {
+    let (upstream, capture) = spawn_upstream().await;
+    let (base, state) = spawn_polyflare(&upstream).await;
+    let reset_at = now() + 86_400;
+    seed_quota(&state, "pro", "pro", 25.0, reset_at).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{base}/api/codex/usage"))
+        .header("authorization", "Bearer local-codex-auth")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(payload["plan_type"], "pro");
+    assert_eq!(
+        payload["rate_limit"]["secondary_window"]["used_percent"],
+        25
+    );
+    assert_eq!(
+        payload["rate_limit"]["secondary_window"]["reset_at"],
+        reset_at
+    );
+    assert!(
+        capture.0.lock().unwrap().is_none(),
+        "the Codex API path style must use the synthetic fleet meter"
+    );
+}
+
+#[tokio::test]
+async fn native_codex_can_list_and_consume_an_aggregated_reset_credit() {
+    let (upstream, _capture) = spawn_upstream().await;
+    let (base, state) = spawn_polyflare(&upstream).await;
+    let reset_at = now() + 5 * 24 * 3_600;
+    seed_quota(&state, "reset-account", "plus", 90.0, reset_at).await;
+    sqlx::query("UPDATE accounts SET chatgpt_account_id = ? WHERE id = ?")
+        .bind("workspace-reset")
+        .bind("reset-account")
+        .execute(state.store.pool())
+        .await
+        .unwrap();
+    state
+        .store
+        .reset_credits()
+        .replace_snapshot(
+            "reset-account",
+            1,
+            now(),
+            &[polyflare_store::ResetCredit {
+                account_id: "reset-account".to_string(),
+                credit_id: "credit-upstream".to_string(),
+                reset_type: Some("rate_limit_reset".to_string()),
+                status: Some("available".to_string()),
+                granted_at: Some(now() - 100),
+                expires_at: Some(now() + 7 * 24 * 3_600),
+                title: Some("Full reset".to_string()),
+                description: None,
+                redeem_started_at: None,
+                redeemed_at: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let listed = client
+        .get(format!("{base}/backend-api/wham/rate-limit-reset-credits"))
+        .header("authorization", "Bearer local-client")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 200);
+    let listed: serde_json::Value = listed.json().await.unwrap();
+    assert_eq!(listed["available_count"], 1);
+    let opaque_id = listed["credits"][0]["id"].as_str().unwrap().to_string();
+    assert_ne!(opaque_id, "credit-upstream");
+
+    let usage = client
+        .get(format!("{base}/backend-api/wham/usage"))
+        .header("authorization", "Bearer local-client")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(usage.status(), 200);
+    let usage: serde_json::Value = usage.json().await.unwrap();
+    assert_eq!(usage["rate_limit_reset_credits"]["available_count"], 1);
+
+    let consumed = client
+        .post(format!(
+            "{base}/backend-api/wham/rate-limit-reset-credits/consume"
+        ))
+        .header("authorization", "Bearer local-client")
+        .json(&serde_json::json!({
+            "redeem_request_id": "codex-request-1",
+            "credit_id": opaque_id
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(consumed.status(), 200);
+    assert_eq!(
+        consumed.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({"code": "reset", "windows_reset": 2})
+    );
+
+    let ledger = state
+        .store
+        .reset_credits()
+        .get_request("reset-account", "codex-request-1", now(), 86_400)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.credit_id, "credit-upstream");
+    assert_eq!(ledger.result_code.as_deref(), Some("reset"));
 }
 
 #[tokio::test]
@@ -382,6 +521,10 @@ async fn pool_scoped_usage_includes_only_members_of_the_named_pool() {
         .accounts()
         .replace_pools("other-account", &["other".to_string()])
         .await
+        .unwrap();
+    state
+        .runtime_settings
+        .set("wham_usage_replace_main_limit", SettingValue::Bool(false))
         .unwrap();
 
     let response = reqwest::Client::new()

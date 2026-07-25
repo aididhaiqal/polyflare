@@ -48,7 +48,11 @@ const LIVE_SECTIONS: SectionDef[] = [
   { title: "Retention", keys: ["request_log_retention_days", "usage_history_retention_days"] },
   {
     title: "Flags",
-    keys: ["live_logs", "chatgpt_backend_passthrough_enabled"],
+    keys: [
+      "live_logs",
+      "chatgpt_backend_passthrough_enabled",
+      "wham_usage_replace_main_limit",
+    ],
   },
 ];
 

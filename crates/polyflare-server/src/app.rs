@@ -324,6 +324,18 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             "/api/accounts/{id}/trends",
             get(crate::read_api::account_trends_handler),
         )
+        .route(
+            "/api/accounts/{id}/reset-credit",
+            post(crate::reset_credits::account_redeem_handler),
+        )
+        .route(
+            "/api/reset-credits/plan",
+            get(crate::reset_credits::plan_handler),
+        )
+        .route(
+            "/api/reset-credits/redeem",
+            post(crate::reset_credits::fleet_redeem_handler),
+        )
         .route("/api/requests", get(crate::read_api::requests_handler))
         .route("/api/sessions", get(crate::read_api::sessions_handler))
         .route("/api/pace", get(crate::read_api::pace_handler))
@@ -515,6 +527,34 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route(
             "/{pool}/backend-api/wham/usage",
             get(crate::chatgpt_backend::pooled_usage_handler),
+        )
+        .route(
+            "/backend-api/wham/rate-limit-reset-credits",
+            get(crate::reset_credits::native_list_handler),
+        )
+        .route(
+            "/backend-api/wham/rate-limit-reset-credits/consume",
+            post(crate::reset_credits::native_consume_handler),
+        )
+        .route(
+            "/{pool}/backend-api/wham/rate-limit-reset-credits",
+            get(crate::reset_credits::pooled_native_list_handler),
+        )
+        .route(
+            "/{pool}/backend-api/wham/rate-limit-reset-credits/consume",
+            post(crate::reset_credits::pooled_native_consume_handler),
+        )
+        .route(
+            "/api/codex/rate-limit-reset-credits",
+            get(crate::reset_credits::native_list_handler),
+        )
+        .route(
+            "/api/codex/usage",
+            get(crate::chatgpt_backend::usage_handler),
+        )
+        .route(
+            "/api/codex/rate-limit-reset-credits/consume",
+            post(crate::reset_credits::native_consume_handler),
         )
         .route(
             "/backend-api/wham/remote/control/server",

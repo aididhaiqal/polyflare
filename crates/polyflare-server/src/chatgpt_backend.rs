@@ -145,6 +145,8 @@ fn wham_usage_payload(
     secondary_reset_at: i64,
     now: i64,
     pool: Option<&str>,
+    replace_main_limit: bool,
+    available_reset_credits: i64,
 ) -> serde_json::Value {
     let mut rate_limit = serde_json::Map::new();
     let limit_reached = quota.secondary.used_percent >= 100.0
@@ -177,22 +179,24 @@ fn wham_usage_payload(
             "PolyFlare overall pool".to_string(),
         ),
     };
-    let additional_rate_limits = serde_json::json!([{
-        "limit_name": limit_name,
-        "metered_feature": metered_feature,
-        "rate_limit": rate_limit.clone(),
-    }]);
-
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         // The field is mandatory in codex-rs's WHAM schema. Aggregation weights still come from
         // every member's real plan/capacity; this value is display/protocol metadata only.
         "plan_type": "pro",
         "rate_limit": rate_limit,
-        "additional_rate_limits": additional_rate_limits,
-        // Pool quota cannot truthfully promise that an individual account reset credit resets the
-        // aggregate. Suppress the reset action instead of exposing a misleading operation.
-        "rate_limit_reset_credits": {"available_count": 0},
-    })
+        // The native reset-credit detail/consume routes map each opaque fleet credit back to its
+        // owning account. The aggregate count is therefore actionable rather than a fake pool
+        // coupon; stale/ineligible account snapshots are excluded by the planner.
+        "rate_limit_reset_credits": {"available_count": available_reset_credits.max(0)},
+    });
+    if !replace_main_limit {
+        payload["additional_rate_limits"] = serde_json::json!([{
+            "limit_name": limit_name,
+            "metered_feature": metered_feature,
+            "rate_limit": payload["rate_limit"].clone(),
+        }]);
+    }
+    payload
 }
 
 async fn usage_route(state: Arc<AppState>, pool: Option<String>, headers: HeaderMap) -> Response {
@@ -224,6 +228,12 @@ async fn usage_route(state: Arc<AppState>, pool: Option<String>, headers: Header
                 );
                 match (quota, secondary_reset_at) {
                     (Some(quota), Some(secondary_reset_at)) => {
+                        let available_reset_credits =
+                            crate::reset_credits::available_count_for_scope(
+                                &state,
+                                pool.as_deref(),
+                            )
+                            .await;
                         let primary_reset_at = quota.primary.as_ref().and_then(|_| {
                             crate::pool_quota::conservative_reset_at(
                                 &snapshots,
@@ -239,6 +249,8 @@ async fn usage_route(state: Arc<AppState>, pool: Option<String>, headers: Header
                             secondary_reset_at,
                             unix_now(),
                             pool.as_deref(),
+                            state.runtime_settings.wham_usage_replace_main_limit(),
+                            available_reset_credits,
                         ))
                         .into_response()
                     }

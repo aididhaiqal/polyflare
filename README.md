@@ -1,41 +1,93 @@
 # PolyFlare
 
-PolyFlare is a self-hosted, multi-account and multi-provider gateway for AI coding clients. It
-presents OpenAI Responses-compatible and Anthropic Messages-compatible endpoints, selects a healthy
-backend for each request, preserves conversation continuity, and records content-safe operational
-telemetry in an embedded SQLite store.
+![PolyFlare routes multiple AI account and provider streams through one observable gateway](docs/assets/polyflare-hero.webp)
 
-The project is designed for a single operator or team using accounts and API credentials they own.
-Its default local setup is deliberately simple: start one Rust binary, open the embedded dashboard,
-add accounts or providers, and point a compatible client at `http://127.0.0.1:8080`.
+> **One local gateway for every coding model, account, and provider you operate.**
 
-## What PolyFlare provides
+PolyFlare is a self-hosted routing plane for AI coding clients. It presents OpenAI
+Responses-compatible and Anthropic Messages-compatible endpoints, places each request on a healthy
+backend, preserves conversation continuity, and turns fleet behavior into useful operational
+telemetry.
 
-- Multiple OAuth-backed Codex accounts with live quota, health, cooldown, and routing state.
-- Named pools, with an account able to belong to more than one pool.
-- Capacity-aware session placement and configurable routing strategies.
-- Durable ownership for anchored conversations so a response ID never moves to the wrong account.
-- Native downstream WebSocket support, upstream WebSocket support, and HTTP/SSE fallback.
-- Bounded failover, starvation recovery, stream deadlines, and admission control.
-- Native Anthropic Messages routing plus editable bidirectional Messages/Responses translation.
-- Responses- and Anthropic-compatible custom providers with credential pools and model catalogs.
-- Provider-aware request history, usage, cost, TTFT, latency, throughput, sessions, and reports.
-- An embedded dashboard with live SSE updates and polling fallback.
-- Prometheus metrics and structured, content-safe process logs.
-- Encrypted storage for OAuth tokens and custom-provider API keys.
+It is designed for a single operator or team using accounts and API credentials they own. The
+default experience stays deliberately small: one Rust binary, one embedded SQLite store, and one
+dashboard at `http://127.0.0.1:8080/dashboard`.
+
+| Route intelligently | Keep conversations intact | See the whole fleet | Own the control plane |
+|---|---|---|---|
+| Balance across accounts, pools, credentials, quota, and health. | Pin anchored turns to the account and connection that own their state. | Inspect quota, TTFT, latency, throughput, cost, sessions, failures, and reset credits. | Run locally with encrypted secrets, content-safe logs, and no hosted coordinator. |
+
+**[Quick start](#quick-start)** · **[Dashboard](#dashboard)** ·
+**[Configure Codex](#configure-a-client)** · **[Providers](#providers-and-models)** ·
+**[API](#api-surface)** · **[Security](#authentication-and-network-posture)**
+
+## Why PolyFlare
+
+PolyFlare combines the pieces that normally end up scattered across shell scripts, proxy
+configuration, and provider dashboards:
+
+- **Fleet routing** — multiple OAuth-backed Codex accounts, custom-provider credentials, named
+  multi-membership pools, live quota, health, cooldowns, and configurable selection strategies.
+- **Continuity safety** — durable response-anchor ownership, stable session families, bounded
+  failover, starvation recovery, stream deadlines, and admission control.
+- **Protocol reach** — native Responses and Anthropic Messages ingress, downstream WebSockets,
+  HTTP/SSE fallback, and editable bidirectional protocol translation.
+- **Model control** — Responses- and Anthropic-compatible providers, selective model discovery,
+  credential pools, model profiles, and provider-aware routing.
+- **Operational clarity** — live dashboard updates, request/session history, quota, cost, TTFT,
+  latency, throughput, reports, Prometheus metrics, and content-safe structured logs.
+- **Local ownership** — encrypted OAuth tokens and provider keys in an embedded store with no
+  external control-plane dependency.
+
+## Quick start
+
+```sh
+git clone <your-polyflare-repository>
+cd polyflare
+cargo build --release --bin polyflare
+./target/release/polyflare serve
+```
+
+Then open [`http://127.0.0.1:8080/dashboard`](http://127.0.0.1:8080/dashboard), add a Codex account
+or custom provider, and point your client at `http://127.0.0.1:8080`.
+
+For development, use `cargo run --bin polyflare -- serve`. For the managed local rebuild/restart
+workflow, use `scripts/polyflare-service restart`. See [Install and run](#install-and-run) for the
+full service, data-directory, and backup details.
 
 ## How requests flow
 
-```text
-Codex / Responses client ─┐
-                          ├─> PolyFlare ingress
-Claude / Messages client ─┘       │
-                                  ├─ authenticate caller when client keys are enabled
-                                  ├─ resolve model, provider, pool, session, and capability
-                                  ├─ enforce continuity ownership and admission limits
-                                  ├─ select an eligible account or provider credential
-                                  ├─ relay by WebSocket or HTTP/SSE
-                                  └─ observe terminal usage and update health + telemetry
+```mermaid
+flowchart LR
+    subgraph Clients
+        Codex["Codex / Responses client"]
+        Claude["Claude / Messages client"]
+    end
+
+    subgraph PolyFlare["PolyFlare routing plane"]
+        Ingress["Protocol-aware ingress"]
+        Scope["Auth · model · pool · capability"]
+        Continuity["Continuity and admission"]
+        Select["Health + capacity selection"]
+        Relay["WebSocket · HTTP/SSE · translation"]
+        Observe["Usage · health · telemetry"]
+        Ingress --> Scope --> Continuity --> Select --> Relay
+        Relay --> Observe
+    end
+
+    subgraph Fleet["Owned upstream fleet"]
+        CodexAccounts["Codex accounts"]
+        AnthropicAccounts["Anthropic accounts"]
+        CustomProviders["Custom providers + credential pools"]
+    end
+
+    Codex --> Ingress
+    Claude --> Ingress
+    Relay --> CodexAccounts
+    Relay --> AnthropicAccounts
+    Relay --> CustomProviders
+    Observe -. feedback .-> Select
+    Observe --> Dashboard["Dashboard · SQLite · Prometheus"]
 ```
 
 A request first resolves its protocol and target:
@@ -100,11 +152,91 @@ Accounts also have a routing policy:
 - `burn_first` is preferred before neutral accounts.
 - `preserve` is held back while less protected capacity is available.
 
+## Earned reset credits
+
+Eligible Codex accounts can earn one-use rate-limit reset credits. PolyFlare discovers these
+credits in the background, keeps each upstream credit attached to its owning account, and presents
+them as one fleet reserve without pretending the credits are interchangeable.
+
+The dashboard **Reset credits** page is the main operator surface. It shows every eligible
+account's banked credits, weekly usage, natural-reset clock, earliest credit-expiry clock, estimated
+weekly capacity recovery, and an explainable recommendation. The Accounts list and account-detail
+page also show the reserve for each account.
+
+Recommendations account for both plan size and timing:
+
+- Estimated recovery is the account's plan-weighted weekly capacity multiplied by its current
+  weekly usage.
+- Recovery is discounted as the natural weekly reset approaches.
+- A natural reset within one hour recommends waiting.
+- A credit expiring before the natural reset is marked for use before expiry.
+- High weekly usage with meaningful time remaining is recommended for immediate redemption.
+- Stale usage, stale credit discovery, paused accounts, and incomplete reset evidence never
+  recommend spending.
+
+```mermaid
+flowchart LR
+    Discover["Discover earned credits"] --> Evidence{"Usage and credit evidence fresh?"}
+    Evidence -- No --> Unavailable["Do not recommend"]
+    Evidence -- Yes --> Value["Estimate capacity recovered"]
+    Value --> Timing{"Natural reset soon?"}
+    Timing -- Yes --> Wait["Wait for free refill"]
+    Timing -- No --> Expiry{"Credit expires first?"}
+    Expiry -- Yes --> Before["Redeem before expiry"]
+    Expiry -- No --> Demand{"High-value recovery?"}
+    Demand -- Yes --> Now["Redeem now"]
+    Demand -- No --> Hold["Hold in reserve"]
+    Before --> Confirm["Operator or Codex confirms"]
+    Now --> Confirm
+    Confirm --> Safe["Lease · pin · consume · refresh"]
+```
+
+Within one account, PolyFlare selects the available credit expiring soonest. **Redeem best** spends
+only a credit the optimizer currently recommends. A manually reviewed multi-account selection is
+executed sequentially and returns a result for every account; it is never launched as a parallel
+“redeem all.”
+
+Redemption is designed for safe retries:
+
+1. PolyFlare fetches the account's live upstream credit state again before spending.
+2. It acquires a durable per-account lease, preventing concurrent operators from racing.
+3. Native caller IDs are pinned to one account, account caller IDs are pinned to one upstream
+   credit, and fleet caller IDs are pinned to the exact reviewed account sequence.
+4. Repeating the same ID replays the stored terminal result or retries the same pinned upstream
+   operation; it cannot silently select a different account, credit, or expanded fleet.
+5. A successful or safe terminal consume result triggers an immediate authoritative usage refresh.
+
+If a fleet run is only partially confirmed, the dashboard retains the original request ID and
+account list in a recovery panel. Retrying that panel replays completed accounts and retries only
+the same unresolved operations; starting a new redemption stays disabled until the operator either
+recovers the exact operation to terminal outcomes.
+
+PolyFlare does not automatically redeem credits unattended. The optimizer recommends; the operator
+or a stock Codex client explicitly chooses to spend.
+
 ## Continuity and response-anchor safety
 
 Codex conversations can carry `previous_response_id`, turn state, session identifiers, and
 connection-local incremental state. Treating those values as freely movable request metadata can
 break a conversation when the next request lands on a different account or socket.
+
+```mermaid
+sequenceDiagram
+    participant C as Coding client
+    participant P as PolyFlare
+    participant A as Owning account
+    participant B as Other healthy account
+
+    C->>P: First turn (session metadata)
+    P->>A: Select and relay
+    A-->>P: response.completed + response ID
+    P-->>C: Stream completion
+    Note over P,A: Persist session and anchor ownership
+    C->>P: Next turn + previous_response_id
+    P->>P: Resolve hard owner
+    P->>A: Relay to the same owner
+    Note over P,B: Capacity preference cannot move an anchored turn
+```
 
 PolyFlare maintains a content-free continuity state machine:
 
@@ -526,16 +658,16 @@ the model-provider base URL. PolyFlare returns its capacity-weighted pool as the
 quota at `/backend-api/wham/usage`. Synthetic usage is not a public status endpoint: it requires a
 valid PolyFlare client key when client-key enforcement is active, and otherwise requires an
 authenticated client request. The capacity-weighted aggregate remains the canonical Codex limit
-for compatibility and is also advertised through WHAM's `additional_rate_limits` contract as
-**PolyFlare overall pool**, matching the named usage buckets Codex uses for model-specific limits.
-A pool-scoped URL uses a corresponding label such as **PolyFlare work pool**. Modern Codex clients
-may display both the canonical compatibility windows and their explicitly named pool
-representation. Every other `/backend-api/*` request uses the client's existing
-ChatGPT authorization when **Settings → ChatGPT backend passthrough** is enabled. Passthrough is
-enabled by default; the setting is a live rollback control that can disable it without restarting
-PolyFlare. These requests go directly to the fixed ChatGPT backend without account selection or
-token decryption. Request history records these operations with a distinct `backend` provider tag
-and normalized `chatgpt_backend_synthetic_*` or `chatgpt_backend_passthrough_*` paths so new Codex
+for compatibility. **Settings → Replace main Codex usage** is enabled by default, so Codex receives
+that aggregate as one canonical meter instead of presenting the same exhausted pool twice as
+“Codex” and a named pool. Disable the live setting to additionally advertise the aggregate through
+WHAM's `additional_rate_limits` contract as **PolyFlare overall pool** or, for a pool-scoped URL,
+**PolyFlare work pool**. Every other `/backend-api/*` request uses the client's existing ChatGPT
+authorization when **Settings → ChatGPT backend passthrough** is enabled. Passthrough is enabled by
+default; the setting is a live rollback control that can disable it without restarting PolyFlare.
+These requests go directly to the fixed ChatGPT backend without account selection or token
+decryption. Request history records these operations with a distinct `backend` provider tag and
+normalized `chatgpt_backend_synthetic_*` or `chatgpt_backend_passthrough_*` paths so new Codex
 backend usage is visible without being presented as model-response traffic or logging credentials,
 query values, dynamic resource IDs, frame contents, or bodies. Reports uses the same distinction
 for its `Operation` breakdown.
@@ -557,6 +689,12 @@ requires_openai_auth = true
 Because `chatgpt_base_url` is a top-level Codex setting, it appears before the provider table. A
 pool-scoped usage URL reports only that pool; unchanged ChatGPT backend calls still pass through
 with the client's own identity.
+
+Stock Codex reset-credit reads and consumes also work through PolyFlare. The ChatGPT path style
+uses `/backend-api/wham/rate-limit-reset-credits` and `/consume`; the Codex API path style uses
+`/api/codex/rate-limit-reset-credits` and `/consume`, with aggregate usage available at
+`/api/codex/usage`. PolyFlare returns opaque fleet credit IDs so a selected credit remains bound to
+the correct account. Pool-scoped ChatGPT paths expose only credits owned by members of that pool.
 
 The repository also includes `scripts/codex-polyflare`, which creates an isolated client
 configuration for local development:
@@ -689,6 +827,14 @@ matrix and invariants.
 |---|---|
 | `GET /models`, `GET /v1/models` | Root model discovery. |
 | `GET /{pool}/models` | Pool-safe model discovery. |
+| `GET /backend-api/wham/rate-limit-reset-credits` | Stock Codex reset-credit details for the aggregate fleet. |
+| `POST /backend-api/wham/rate-limit-reset-credits/consume` | Consume one opaque fleet credit with a caller idempotency key. |
+| `GET /api/codex/usage` | Codex API path-style alias for the synthetic aggregate usage meter. |
+| `GET /api/codex/rate-limit-reset-credits` | Codex API path-style reset-credit details. |
+| `POST /api/codex/rate-limit-reset-credits/consume` | Codex API path-style reset-credit consume. |
+| `GET /api/reset-credits/plan` | Admin-gated ranked fleet reset plan. |
+| `POST /api/reset-credits/redeem` | Admin-gated sequential selected-account redemption. |
+| `POST /api/accounts/{id}/reset-credit` | Admin-gated single-account redemption. |
 | `GET /metrics` | Prometheus exposition, admin-gated. |
 | `GET /dashboard` | Embedded operator dashboard. |
 | `/api/*` | Admin-gated account, pool, provider, request, report, settings, and key APIs. |

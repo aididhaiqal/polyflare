@@ -26,6 +26,8 @@ import {
   patchProviderEnabled,
   patchProviderModel,
   patchSettings,
+  redeemAccountResetCredit,
+  redeemFleetResetCredits,
   startCodexOnboarding,
   syncProviderModels,
   testProvider,
@@ -47,6 +49,7 @@ import {
   type PoolView,
   type RequestsQueryParams,
   type RequestsView,
+  type ResetPlanView,
   type ReportsView,
   type SessionsQueryParams,
   type SessionsView,
@@ -71,6 +74,7 @@ export const queryKeys = {
   accountTrends: (id: string) => ["accounts", id, "trends"] as const,
   pools: ["pools"] as const,
   pace: ["pace"] as const,
+  resetCredits: ["reset-credits"] as const,
   requests: (params: RequestsQueryParams) => ["requests", params] as const,
   sessions: (params: SessionsQueryParams) => ["sessions", params] as const,
   reports: (params: ReportsParams) => ["reports", params] as const,
@@ -148,6 +152,74 @@ export function usePace() {
     queryFn: api.pace,
     refetchInterval: LIST_REFETCH_MS,
     staleTime: LIST_REFETCH_MS,
+  });
+}
+
+export function useResetCreditPlan() {
+  return useQuery<ResetPlanView>({
+    queryKey: queryKeys.resetCredits,
+    queryFn: api.resetCreditPlan,
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+}
+
+export function useRedeemAccountResetCredit() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: ({
+      accountId,
+      redeemRequestId,
+      requireRecommended = false,
+    }: {
+      accountId: string;
+      redeemRequestId: string;
+      requireRecommended?: boolean;
+    }) => redeemAccountResetCredit(accountId, redeemRequestId, requireRecommended),
+    onSuccess: (result) => {
+      qc.invalidateQueries({ queryKey: queryKeys.resetCredits });
+      qc.invalidateQueries({ queryKey: queryKeys.accounts });
+      qc.invalidateQueries({ queryKey: queryKeys.overview });
+      qc.invalidateQueries({ queryKey: queryKeys.pace });
+      toast({
+        title: "Reset credit redeemed",
+        description: `${result.windows_reset} rate-limit window${result.windows_reset === 1 ? "" : "s"} reset`,
+        variant: "success",
+      });
+    },
+    onError: (e) =>
+      toast({ title: "Reset failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+export function useRedeemFleetResetCredits() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: ({
+      accountIds,
+      redeemRequestId,
+    }: {
+      accountIds: string[];
+      redeemRequestId: string;
+    }) => redeemFleetResetCredits(accountIds, redeemRequestId),
+    onSuccess: (response) => {
+      qc.invalidateQueries({ queryKey: queryKeys.resetCredits });
+      qc.invalidateQueries({ queryKey: queryKeys.accounts });
+      qc.invalidateQueries({ queryKey: queryKeys.overview });
+      qc.invalidateQueries({ queryKey: queryKeys.pace });
+      toast({
+        title: `${response.results.length} reset${response.results.length === 1 ? "" : "s"} completed`,
+        description:
+          response.errors.length > 0
+            ? `${response.errors.length} account${response.errors.length === 1 ? "" : "s"} could not be reset`
+            : "Fleet capacity is refreshing now",
+        variant: response.errors.length > 0 ? "error" : "success",
+      });
+    },
+    onError: (e) =>
+      toast({ title: "Fleet reset failed", description: mutationErrorText(e), variant: "error" }),
   });
 }
 

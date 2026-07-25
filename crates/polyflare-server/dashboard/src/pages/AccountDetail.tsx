@@ -9,8 +9,8 @@
 // pool, alias, pause/resume, delete) via the shared `useAccountActions()` hook (Task 7,
 // `../lib/useAccountActions`) — each wired control calls `actions.patch.mutate({id, body})` directly
 // or opens one of the hook's confirmation dialogs. Controls with no backing field in this MVP schema
-// (limit warm-up, rate-limit reset credits, force probe, re-authenticate, export auth) remain plain
-// disabled placeholders — see task-7-report.md/task-8-report.md for the full mapping and reasoning.
+// Limit warm-up, force probe, and credential export remain unavailable until they have explicit
+// backend operations. Rate-limit reset credits are live through the reset-credit optimizer.
 //
 // Field mapping (see read_api.rs::AccountDetailView / src/lib/api.ts's mirror):
 //   rail rows                 <- useAccounts() (AccountView[] — DOES have an `alias` field; Task 4b
@@ -41,9 +41,8 @@
 //                                 identity.pool, EDITABLE (opens actions.openSetPool); limit
 //                                 warm-up: NO backend field — rendered as a static "not tracked"
 //                                 chip instead of a fabricated switch state.
-//                                 Rate-limit resets: NO backend concept at all (grepped the store —
-//                                 no reset-credit table/field exists) — rendered as an explanatory
-//                                 placeholder, no invented counts/expiries.
+//                                 Rate-limit resets: live optimizer candidate, banked count,
+//                                 recommendation, reason, and idempotent account consume.
 //                                 Operations: Pause/Resume and Delete are EDITABLE (wired to
 //                                 actions.patch / actions.openDelete); Force probe/Re-authenticate/
 //                                 Export auth remain plain disabled buttons — no backend for them.
@@ -65,6 +64,7 @@ import {
   type AccountView,
   type DepletionForecast,
   type Point,
+  type ResetPlanCandidateView,
   type RiskLevel,
   type TokenHealthView,
   type UsageWindowView,
@@ -75,7 +75,13 @@ import {
   quotaDisplayPercent,
   quotaWindowIsPresent,
 } from "../lib/quotaDisplay";
-import { useAccount, useAccountTrends, useAccounts } from "../lib/queries";
+import {
+  useAccount,
+  useAccountTrends,
+  useAccounts,
+  useRedeemAccountResetCredit,
+  useResetCreditPlan,
+} from "../lib/queries";
 import { useAccountActions, type AccountActionsApi } from "../lib/useAccountActions";
 import { useQuotaDisplayPreference } from "../preferences/QuotaDisplayPreference";
 import {
@@ -85,11 +91,13 @@ import {
 } from "../privacy/ScreenShield";
 import { Card } from "../ui/Card";
 import { CodexOnboardingDialog } from "../ui/CodexOnboardingDialog";
+import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { Col, Grid } from "../ui/Grid";
 import {
   AlertTriangle,
   ChevronLeft,
   ChevronRight,
+  Coins,
   Flame,
   Key,
   Layers,
@@ -97,6 +105,7 @@ import {
   Pause,
   Pencil,
   Play,
+  RotateCcw,
   Route,
   Search,
   ShieldCheck,
@@ -562,12 +571,18 @@ function DetailContent({
     .sort((a, b) => (WINDOW_ORDER[a.window] ?? 99) - (WINDOW_ORDER[b.window] ?? 99));
   const hasFiveHourWindow = quotaRows.some((row) => row.window === "five_hour");
   const actions = useAccountActions();
+  const resetPlan = useResetCreditPlan();
+  const redeemReset = useRedeemAccountResetCredit();
   const navigate = useNavigate();
   const { active } = useScreenShield();
   const { mode: quotaMode } = useQuotaDisplayPreference();
   const [reauthOpen, setReauthOpen] = useState(false);
+  const [resetRequestId, setResetRequestId] = useState<string | null>(null);
   const weekly = quotaRows.find((row) => row.window === "weekly") ?? quotaRows[0] ?? null;
   const weeklyDisplay = weekly ? quotaDisplayPercent(weekly.used_percent, quotaMode) : null;
+  const resetCandidate = resetPlan.data?.candidates.find(
+    (candidate) => candidate.account_id === identity.id,
+  );
 
   return (
     <div className="flex flex-col gap-4">
@@ -695,6 +710,10 @@ function DetailContent({
             routingPolicy={detail.routing_policy}
             trustedAccess={detail.security_work_authorized}
             pools={identity.pools}
+            reset={resetCandidate}
+            resetLoading={resetPlan.isLoading}
+            resetBusy={redeemReset.isPending}
+            onRedeemReset={() => setResetRequestId(crypto.randomUUID())}
             actions={actions}
             onReauthenticate={() => setReauthOpen(true)}
             onDeleted={() => navigate("/accounts")}
@@ -704,6 +723,28 @@ function DetailContent({
 
       {actions.dialogs}
       <CodexOnboardingDialog open={reauthOpen} onOpenChange={setReauthOpen} />
+      <ConfirmDialog
+        open={resetRequestId !== null}
+        onOpenChange={(open) => !open && !redeemReset.isPending && setResetRequestId(null)}
+        title="Redeem this account's reset?"
+        description={
+          resetCandidate ? (
+            <>
+              This spends one of {resetCandidate.available_credits} banked credits. PolyFlare will
+              verify the live upstream state before redeeming it.
+            </>
+          ) : undefined
+        }
+        confirmLabel={redeemReset.isPending ? "Redeeming…" : "Redeem reset"}
+        busy={redeemReset.isPending}
+        onConfirm={() => {
+          if (!resetRequestId) return;
+          redeemReset.mutate(
+            { accountId: identity.id, redeemRequestId: resetRequestId },
+            { onSuccess: () => setResetRequestId(null) },
+          );
+        }}
+      />
     </div>
   );
 }
@@ -973,9 +1014,28 @@ function LegendSwatch({ colorClass, label }: { colorClass: string; label: string
 // (per the task brief, which names that mockup specifically for this panel over the master-detail
 // mockup's flatter version), now with the in-scope controls (routing policy, trusted access, pool,
 // pause/resume, delete) live and wired to the shared `useAccountActions()` hook. Controls with no
-// backend field (limit warm-up, rate-limit resets, force probe, re-authenticate, export auth) stay
-// plain disabled placeholders — no event handler, real HTML `disabled` attribute.
+// backend field (limit warm-up, force probe, export auth) stay unavailable. Reset reserve is backed
+// by the optimizer plan and idempotent consume endpoint.
 // ---------------------------------------------------------------------------------------------
+
+function resetRecommendationLabel(candidate: ResetPlanCandidateView): string {
+  switch (candidate.recommendation) {
+    case "redeem_now":
+      return "Recommended now";
+    case "redeem_before_expiry":
+      return "Redeem before expiry";
+    case "wait_for_natural_reset":
+      return "Natural reset is better";
+    case "low_benefit":
+      return "Low recovery value";
+    case "hold":
+      return "Hold in reserve";
+    case "unavailable":
+      return "Needs fresh usage";
+    case "no_credit":
+      return "No credit";
+  }
+}
 
 function ActionsCard({
   id,
@@ -984,6 +1044,10 @@ function ActionsCard({
   routingPolicy,
   trustedAccess,
   pools,
+  reset,
+  resetLoading,
+  resetBusy,
+  onRedeemReset,
   actions,
   onReauthenticate,
   onDeleted,
@@ -994,6 +1058,10 @@ function ActionsCard({
   routingPolicy: string;
   trustedAccess: boolean;
   pools: string[];
+  reset?: ResetPlanCandidateView;
+  resetLoading: boolean;
+  resetBusy: boolean;
+  onRedeemReset: () => void;
   actions: AccountActionsApi;
   onReauthenticate: () => void;
   onDeleted: () => void;
@@ -1017,7 +1085,7 @@ function ActionsCard({
         </span>
       </div>
 
-      <div className="mt-4 grid grid-cols-1 gap-5 lg:grid-cols-2">
+      <div className="mt-4 grid grid-cols-1 gap-3 xl:grid-cols-3">
         {/* Configuration */}
         <div className="flex flex-col gap-3 rounded-lg border border-border/70 bg-bg/35 p-3">
           <div className="text-[9px] font-semibold uppercase tracking-wide text-fg opacity-50">
@@ -1078,6 +1146,61 @@ function ActionsCard({
               server default
             </span>
           </ConfigRow>
+        </div>
+
+        <div className="flex flex-col gap-3 rounded-lg border border-accent/20 bg-[linear-gradient(145deg,hsl(var(--bg)/0.35),hsl(var(--accent)/0.055))] p-3">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-[9px] font-semibold uppercase tracking-wide text-fg opacity-50">
+              Reset reserve
+            </div>
+            <Coins className="h-3.5 w-3.5 text-signal" />
+          </div>
+          {resetLoading ? (
+            <div className="h-20 animate-pulse rounded-md bg-muted/65" />
+          ) : reset && reset.available_credits > 0 ? (
+            <>
+              <div className="flex items-baseline gap-2">
+                <span className="text-3xl font-bold tracking-tight text-fg tabular-nums">
+                  {reset.available_credits}
+                </span>
+                <span className="text-[10px] text-fg opacity-50">
+                  banked credit{reset.available_credits === 1 ? "" : "s"}
+                </span>
+              </div>
+              <div className="rounded-md border border-border/70 bg-bg/45 px-2.5 py-2">
+                <div className="text-[9.5px] font-semibold text-accent">
+                  {resetRecommendationLabel(reset)}
+                </div>
+                <p className="mt-1 text-[9.5px] leading-relaxed text-fg opacity-55">
+                  {reset.reason}
+                </p>
+              </div>
+              <div className="mt-auto flex items-center justify-between gap-2">
+                <Link
+                  to="/reset-credits"
+                  className="text-[10px] font-medium text-accent no-underline hover:underline"
+                >
+                  Open fleet optimizer
+                </Link>
+                <button
+                  type="button"
+                  disabled={resetBusy || reset.recommendation === "unavailable"}
+                  onClick={onRedeemReset}
+                  className="flex items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-[10px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-35"
+                >
+                  <RotateCcw className="h-3 w-3" />
+                  Redeem one
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className="flex flex-1 flex-col justify-center rounded-md border border-dashed border-border px-3 py-4 text-center">
+              <span className="text-[11px] font-semibold text-fg">No banked resets</span>
+              <span className="mt-1 text-[9.5px] text-fg opacity-45">
+                Discovery runs once per minute for eligible Codex accounts.
+              </span>
+            </div>
+          )}
         </div>
 
         {/* Operations + Danger */}
