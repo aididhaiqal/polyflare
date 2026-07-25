@@ -556,6 +556,14 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
     // Rewrite a turn whose history the target platform provably cannot decrypt
     // (`invalid_encrypted_content`) at most once per turn — see `reasoning_transform`.
     let mut reasoning_transform_attempted = false;
+    // True once any NON-lifecycle upstream frame (actual output — deltas, items, terminals) has
+    // crossed downstream this turn. Lifecycle frames (`response.created`/`response.in_progress`)
+    // carry no content and codex-rs treats a repeated `created` as a state overwrite, so a
+    // transform-replay is safe while ONLY lifecycle frames were forwarded — which is the live
+    // 2026-07-25 shape: the backend emits `response.created` ~4s BEFORE failing the undecryptable
+    // reasoning item, so gating the transform on `client_visible_upstream_for_turn` made it never
+    // fire (first live test: 3 upstream 400s then budget kill, zero transform replays).
+    let mut upstream_output_visible_for_turn = false;
     let mut client_visible_upstream_for_turn = false;
     // If the socket/pump disappears with a turn still active, preserve an explicit failed row
     // rather than silently losing the request. Client-side teardown defaults to nginx-style 499;
@@ -612,6 +620,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                             reactive_auth_attempted = false;
                             reasoning_transform_attempted = false;
                             client_visible_upstream_for_turn = false;
+                            upstream_output_visible_for_turn = false;
                         }
                         let redialed = send_client_text(
                             &mut upstream,
@@ -842,7 +851,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                 if sig.error_code.as_deref()
                                     == Some(INVALID_ENCRYPTED_CONTENT_CODE)
                                     && !reasoning_transform_attempted
-                                    && !client_visible_upstream_for_turn
+                                    && !upstream_output_visible_for_turn
                                 {
                                     reasoning_transform_attempted = true;
                                     let transformed = in_flight
@@ -1097,6 +1106,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                     break;
                                 }
                                 client_visible_upstream_for_turn = true;
+                                if !is_lifecycle_frame(&text) {
+                                    upstream_output_visible_for_turn = true;
+                                }
                                 let mut terminal_seen = false;
                                 if let Some(mut turn) = turn_telemetry.take() {
                                     if let Some(terminal) = turn.observe(&text) {
@@ -1265,6 +1277,21 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
         )
         .await;
     }
+}
+
+/// True when an upstream frame is a pure LIFECYCLE event — `response.created` or
+/// `response.in_progress` — the content-free preamble every real Codex turn emits before any
+/// output (`classify_frame`'s scan treats exactly these two as non-decisive for the same reason).
+/// Reads ONLY the `type` field; malformed JSON is conservatively NOT lifecycle (treated as
+/// output, disabling any replay).
+fn is_lifecycle_frame(frame: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(frame) else {
+        return false;
+    };
+    matches!(
+        value.get("type").and_then(serde_json::Value::as_str),
+        Some("response.created" | "response.in_progress")
+    )
 }
 
 /// True when `frame` is a generating `response.create` carrying a top-level
