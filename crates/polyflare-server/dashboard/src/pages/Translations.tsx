@@ -17,6 +17,7 @@ import {
   useTestTranslationRoute,
   useTranslationRoutes,
   useProviders,
+  useBuiltinModels,
 } from "../lib/queries";
 import {
   duplicateTranslationRoute,
@@ -66,6 +67,7 @@ export function Translations() {
   const remove = useDeleteTranslationRoute();
   const testMatch = useTestTranslationRoute();
   const providers = useProviders();
+  const builtinModelsQuery = useBuiltinModels();
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<TranslationRouteView | null>(null);
   const [testModel, setTestModel] = useState("claude-opus-4-1-20250805");
@@ -118,6 +120,7 @@ export function Translations() {
         <RouteEditor
           state={editor}
           providers={providers.data ?? []}
+          builtinModels={builtinModelsQuery.data?.models ?? {}}
           pending={save.isPending}
           onChange={setEditor}
           onCancel={() => setEditor(null)}
@@ -470,6 +473,7 @@ function IconButton({
 function RouteEditor({
   state,
   providers,
+  builtinModels,
   pending,
   onChange,
   onCancel,
@@ -477,6 +481,8 @@ function RouteEditor({
 }: {
   state: EditorState;
   providers: CustomProviderView[];
+  /** Model names per built-in provider id; empty for a provider with no catalog. */
+  builtinModels: Record<string, string[]>;
   pending: boolean;
   onChange: (state: EditorState) => void;
   onCancel: () => void;
@@ -506,6 +512,25 @@ function RouteEditor({
     state.draft.target_kind === "custom_provider"
       ? providers.find((provider) => provider.id === state.draft.target_provider_id)
       : undefined;
+
+  // What the chosen target is known to accept. A custom provider resolves a route by EITHER its
+  // public or upstream name and only while the model is enabled (see
+  // ingress::resolve_translation_custom_target), so both names are offered and disabled ones are
+  // not. Built-in names come from the live catalog the proxy already keeps warm.
+  const knownModels: string[] = selectedCustomProvider
+    ? selectedCustomProvider.models
+        .filter((model) => model.enabled)
+        .flatMap((model) =>
+          model.upstream_model && model.upstream_model !== model.public_model
+            ? [model.public_model, model.upstream_model]
+            : [model.public_model],
+        )
+    : (builtinModels[state.draft.target_provider_id] ?? []);
+  const typedModel = state.draft.target_model.trim();
+  // Advisory only. A model can be valid before this process has seen it — a fresh release, or a
+  // catalog that has not synced — so an unrecognized name is flagged, never blocked.
+  const modelIsUnknown =
+    typedModel.length > 0 && knownModels.length > 0 && !knownModels.includes(typedModel);
   return (
     <Card className="gap-4 border-accent/25">
       <div className="flex items-start justify-between gap-3">
@@ -619,23 +644,32 @@ function RouteEditor({
           <span className={LABEL}>Target model</span>
           <input
             className={`${INPUT} font-mono`}
-            list={selectedCustomProvider ? "translation-target-models" : undefined}
+            list={knownModels.length > 0 ? "translation-target-models" : undefined}
             value={state.draft.target_model}
             onChange={(event) => patch({ target_model: event.target.value })}
             placeholder="gpt-5.6-sol"
             required
             maxLength={192}
           />
-          {selectedCustomProvider && (
+          {knownModels.length > 0 && (
             <datalist id="translation-target-models">
-              {selectedCustomProvider.models
-                .filter((model) => model.enabled)
-                .map((model) => (
-                  <option key={model.id} value={model.public_model}>
-                    {model.display_name}
-                  </option>
-                ))}
+              {knownModels.map((model) => (
+                <option key={model} value={model} />
+              ))}
             </datalist>
+          )}
+          {modelIsUnknown && (
+            <span className="mt-1 flex items-start gap-1 text-[9px] text-fg opacity-55">
+              <AlertTriangle className="mt-px h-3 w-3 shrink-0" />
+              {selectedCustomProvider
+                ? "Not an enabled model on this provider. Requests will fail unless it is added or synced."
+                : "Not in the current catalog. Fine for a model this proxy has not seen yet."}
+            </span>
+          )}
+          {knownModels.length === 0 && state.draft.target_kind === "builtin_provider" && (
+            <span className="mt-1 block text-[9px] text-fg opacity-45">
+              No catalog for this provider yet — type the model name.
+            </span>
           )}
         </label>
         <label>

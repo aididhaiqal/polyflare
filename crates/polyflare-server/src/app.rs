@@ -299,6 +299,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
                 .delete(crate::provider_api::delete_credential),
         )
         .route(
+            "/api/translations/builtin-models",
+            get(crate::translation_api::builtin_models),
+        )
+        .route(
             "/api/providers/{id}/models",
             post(crate::provider_api::create_model),
         )

@@ -296,3 +296,50 @@ async fn translation_targets_report_who_can_actually_serve_them() {
     assert_eq!(unmatched["matched"], false);
     assert!(unmatched["target_capacity"].is_null());
 }
+
+/// The route editor should suggest real model names rather than leave the field blank, but the
+/// suggestion set must be honest: Codex has a live catalog, Anthropic has none, and neither is
+/// allowed to become a whitelist the operator cannot type past.
+#[tokio::test]
+async fn builtin_model_suggestions_report_only_what_is_actually_known() {
+    let upstream = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
+    let (pf, _state) = spawn(upstream).await;
+    let client = reqwest::Client::new();
+
+    let unauthenticated = client
+        .get(format!("{pf}/api/translations/builtin-models"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), 401);
+
+    let view: serde_json::Value = client
+        .get(format!("{pf}/api/translations/builtin-models"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let codex = view["models"]["codex"]
+        .as_array()
+        .expect("codex key present");
+    assert!(
+        !codex.is_empty(),
+        "codex falls back to the compiled-in floor, so it is never empty: {codex:?}"
+    );
+    assert!(
+        codex.iter().all(|model| model.is_string()),
+        "suggestions are plain model names: {codex:?}"
+    );
+
+    // Nothing fetches Anthropic's /v1/models today. Reporting an empty list is the truthful
+    // answer; a hardcoded list would silently rot into wrong suggestions.
+    assert_eq!(
+        view["models"]["anthropic"],
+        serde_json::json!([]),
+        "anthropic has no catalog yet and must not invent one"
+    );
+}

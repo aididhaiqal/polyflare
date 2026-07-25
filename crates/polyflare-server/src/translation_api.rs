@@ -305,6 +305,36 @@ async fn capacity_for_routes(state: &AppState, routes: &[RouteView]) -> TargetCa
     out
 }
 
+/// Model names a built-in target is known to accept, for the route editor.
+///
+/// Suggestions, never a whitelist: a model can be valid before this process has seen it — a fresh
+/// upstream release, or a catalog that has not refreshed yet — so the editor offers these and still
+/// accepts anything typed. Restricting the field would block a legitimate value.
+#[derive(Serialize)]
+struct BuiltinModelsView {
+    /// Keyed by built-in provider id (`codex`, `anthropic`). An empty list means "no catalog for
+    /// this provider yet", which is the honest answer rather than a guess.
+    models: HashMap<String, Vec<String>>,
+}
+
+/// `GET /api/translations/builtin-models` — what the built-in targets currently advertise.
+///
+/// Codex comes from the live `/models` cache the proxy already keeps warm, read synchronously so
+/// opening the editor never triggers upstream I/O. Anthropic has no catalog: nothing in PolyFlare
+/// fetches its `/v1/models` today, so it reports empty rather than a hardcoded list that would rot.
+pub async fn builtin_models(State(state): State<Arc<AppState>>) -> Response {
+    let mut models = HashMap::new();
+    let codex: Vec<String> = state
+        .model_catalog
+        .cached_or_fallback()
+        .into_iter()
+        .map(|model| model.slug)
+        .collect();
+    models.insert(Provider::Codex.to_string(), codex);
+    models.insert(Provider::Anthropic.to_string(), Vec::new());
+    Json(BuiltinModelsView { models }).into_response()
+}
+
 #[derive(Serialize)]
 struct RoutesView {
     routes: Vec<RouteView>,

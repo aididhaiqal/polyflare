@@ -866,6 +866,12 @@ export type TranslationRouteInput = Omit<
   "id" | "created_at" | "updated_at"
 >;
 
+/** Model names each built-in target advertises. Suggestions for the editor, not a whitelist. */
+export interface BuiltinModelsView {
+  /** Keyed by built-in provider id; an empty list means no catalog exists for it yet. */
+  models: Record<string, string[]>;
+}
+
 export interface TranslationTestResult {
   matched: boolean;
   route: TranslationRouteView | null;
@@ -1181,6 +1187,7 @@ export const api = {
   keys: () => fetchJson<ApiKeysView>("/api/keys"),
   providers: () => fetchJson<CustomProviderView[]>("/api/providers"),
   translations: () => fetchJson<TranslationRoutesView>("/api/translations"),
+  builtinModels: () => fetchJson<BuiltinModelsView>("/api/translations/builtin-models"),
   capabilities: () => fetchJson<CapabilitiesView>("/api/capabilities"),
   whoami: () => fetchJson<WhoamiView>("/api/whoami"),
 };

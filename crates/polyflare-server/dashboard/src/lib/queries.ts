@@ -56,6 +56,7 @@ import {
   type SettingsView,
   type TrendsView,
   type TranslationRouteInput,
+  type BuiltinModelsView,
   type TranslationRoutesView,
 } from "./api";
 import { requestRefreshInterval } from "./requestLive";
@@ -82,6 +83,7 @@ export const queryKeys = {
   keys: ["keys"] as const,
   providers: ["providers"] as const,
   translations: ["translations"] as const,
+  builtinModels: ["builtin-models"] as const,
   capabilities: ["capabilities"] as const,
 };
 
@@ -353,6 +355,15 @@ export function useProviders() {
     queryFn: api.providers,
     staleTime: 30_000,
     refetchInterval: 30_000,
+  });
+}
+
+export function useBuiltinModels() {
+  return useQuery<BuiltinModelsView>({
+    queryKey: queryKeys.builtinModels,
+    queryFn: api.builtinModels,
+    // The upstream catalog moves on the order of releases, not minutes.
+    staleTime: 300_000,
   });
 }
 
