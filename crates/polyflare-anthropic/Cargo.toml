@@ -17,6 +17,12 @@ rand = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }
 
+[features]
+# Exposes `AnthropicOAuthClient::with_endpoints` so a DEPENDENT crate's tests can point the client
+# at a mock token endpoint. Never enabled by a production build: `polyflare-server` turns it on
+# through its dev-dependencies only, so `cargo build --release` cannot reach the override.
+test-endpoints = []
+
 [dev-dependencies]
 tokio = { workspace = true }
 polyflare-testkit = { path = "../polyflare-testkit" }

@@ -7,9 +7,13 @@
 
 use std::time::Duration;
 
+use polyflare_anthropic::oauth::{
+    classify_failure as classify_anthropic_failure, AnthropicOAuthClient,
+    OAuthError as AnthropicOAuthError,
+};
 use polyflare_codex::oauth::{classify_failure, is_fedramp_account, OAuthClient, OAuthError};
 use polyflare_core::{Account, AccountId};
-use polyflare_store::{PlainTokens, Store, TokenCipher};
+use polyflare_store::{AuthMode, PlainTokens, Store, TokenCipher};
 
 use crate::refresh_locks::RefreshLocks;
 
@@ -25,6 +29,12 @@ pub struct ReactiveAuth {
     oauth: OAuthClient,
     refresh_locks: RefreshLocks,
     codex_base_url: String,
+    anthropic_base_url: String,
+    /// Built from the reviewed Anthropic contract at construction. `None` if that construction
+    /// failed (an endpoint outside the allowlist), in which case an Anthropic OAuth account simply
+    /// cannot be refreshed — the request fails rather than falling back to another provider's
+    /// auth server.
+    anthropic_oauth: Option<AnthropicOAuthClient>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +50,7 @@ impl ReactiveAuth {
         oauth: OAuthClient,
         refresh_locks: RefreshLocks,
         codex_base_url: String,
+        anthropic_base_url: String,
     ) -> Self {
         Self {
             store,
@@ -47,7 +58,20 @@ impl ReactiveAuth {
             oauth,
             refresh_locks,
             codex_base_url,
+            anthropic_base_url,
+            anthropic_oauth: AnthropicOAuthClient::new().ok(),
         }
+    }
+
+    /// Point Anthropic refreshes at a mock token endpoint. Test-only (see the crate's
+    /// `test-endpoints` dev-dependency feature); production always uses the reviewed contract.
+    #[cfg(test)]
+    pub(crate) fn with_anthropic_token_url(mut self, token_url: String) -> Self {
+        self.anthropic_oauth = Some(AnthropicOAuthClient::with_endpoints(
+            polyflare_anthropic::CONTRACT.authorize_url.to_string(),
+            token_url,
+        ));
+        self
     }
 
     /// Refresh once after `rejected_access_token` receives a 401. Concurrent callers for the same
@@ -63,8 +87,8 @@ impl ReactiveAuth {
         let repo = self.store.accounts();
         let lock = self.refresh_locks.handle(picked);
         let _guard = lock.lock().await;
-        let (stored_account, stored_tokens) = repo
-            .get_with_tokens(picked.as_str(), &self.cipher)
+        let (stored_account, stored_tokens, auth) = repo
+            .get_with_tokens_and_auth(picked.as_str(), &self.cipher)
             .await
             .map_err(|_| ReactiveAuthError::Internal)?
             .ok_or(ReactiveAuthError::Internal)?;
@@ -72,14 +96,44 @@ impl ReactiveAuth {
             return Err(ReactiveAuthError::AccountUnavailable);
         }
 
+        // Which auth server (if any) may be asked to rotate THIS account's credentials. Dispatching
+        // on the stored mode rather than the ingress path is what stops an Anthropic account being
+        // refreshed against OpenAI's token endpoint, or a static API key being "refreshed" at all.
+        let mode = auth.mode();
+        let base_url = match mode {
+            AuthMode::CodexOauth => self.codex_base_url.clone(),
+            AuthMode::AnthropicOauth => self.anthropic_base_url.clone(),
+            // A static bearer has no refresh token and no auth server. A 401 on one is a real
+            // credential problem the operator must fix, so surface it instead of retrying.
+            AuthMode::StaticBearer | AuthMode::Unknown => {
+                return Err(ReactiveAuthError::AccountUnavailable)
+            }
+        };
+
+        // A peer already rotated this account's token while we waited on the lock: adopt theirs
+        // rather than burning a second refresh (and, with a rotating server, invalidating theirs).
         if stored_tokens.access_token != rejected_access_token {
             return Ok(Some(Account {
                 id: stored_account.id,
-                base_url: self.codex_base_url.clone(),
+                base_url,
                 bearer_token: stored_tokens.access_token.clone(),
                 chatgpt_account_id: stored_account.chatgpt_account_id,
-                is_fedramp: is_fedramp_account(&stored_tokens.id_token),
+                is_fedramp: mode == AuthMode::CodexOauth
+                    && is_fedramp_account(&stored_tokens.id_token),
             }));
+        }
+
+        if mode == AuthMode::AnthropicOauth {
+            return self
+                .refresh_anthropic(
+                    picked,
+                    &stored_account,
+                    &stored_tokens,
+                    &auth,
+                    base_url,
+                    now,
+                )
+                .await;
         }
 
         let refreshed = match self.oauth.refresh(&stored_tokens.refresh_token).await {
@@ -144,6 +198,106 @@ impl ReactiveAuth {
             is_fedramp: is_fedramp_account(&new.id_token),
         }))
     }
+
+    /// The Anthropic half of [`Self::refresh_after_unauthorized`]. Called with the per-account lock
+    /// already held.
+    ///
+    /// Differs from the Codex path in three ways the provider forces: the access token is opaque so
+    /// its expiry comes from the response and must be persisted with it; the persisted grant is
+    /// replayed so a refresh can never widen it; and an omitted `refresh_token` means "keep yours"
+    /// rather than "you now have none".
+    async fn refresh_anthropic(
+        &self,
+        picked: &AccountId,
+        stored_account: &polyflare_store::Account,
+        stored_tokens: &PlainTokens,
+        auth: &polyflare_store::UpstreamAuth,
+        base_url: String,
+        now: i64,
+    ) -> Result<Option<Account>, ReactiveAuthError> {
+        let repo = self.store.accounts();
+        // No usable client means no refresh. Falling back to any other auth server would send this
+        // account's refresh token somewhere it does not belong.
+        let Some(client) = self.anthropic_oauth.as_ref() else {
+            return Err(ReactiveAuthError::AccountUnavailable);
+        };
+
+        let granted = auth.granted_scopes.clone().unwrap_or_default();
+        let refreshed = match client
+            .refresh(&stored_tokens.refresh_token, &granted, now)
+            .await
+        {
+            Ok(refreshed) => refreshed,
+            Err(AnthropicOAuthError::Endpoint { status, code }) => {
+                match classify_anthropic_failure(status, code.as_deref()).status() {
+                    Some(status) => {
+                        let _ = repo.update_status(picked.as_str(), status).await;
+                        return Err(ReactiveAuthError::AccountUnavailable);
+                    }
+                    // Transient: leave the stored credentials untouched and let the original 401
+                    // surface. Discarding a working refresh token here would force an avoidable
+                    // browser re-login for what may be a momentary upstream blip.
+                    None => return Ok(None),
+                }
+            }
+            Err(_) => return Ok(None),
+        };
+
+        let new = PlainTokens {
+            access_token: refreshed.access_token,
+            refresh_token: refreshed.refresh_token,
+            // Anthropic issues no id_token; the column keeps its empty placeholder.
+            id_token: String::new(),
+        };
+        let mut persisted = false;
+        for attempt in 1..=PERSIST_MAX_ATTEMPTS {
+            match repo
+                .update_oauth_tokens(
+                    picked.as_str(),
+                    &new,
+                    &self.cipher,
+                    now,
+                    refreshed.access_token_expires_at,
+                )
+                .await
+            {
+                Ok(()) => {
+                    persisted = true;
+                    break;
+                }
+                Err(error) if attempt < PERSIST_MAX_ATTEMPTS => {
+                    tracing::warn!(
+                        attempt,
+                        error = %error,
+                        "persist of reactively refreshed Anthropic tokens failed; retrying"
+                    );
+                    tokio::time::sleep(PERSIST_RETRY_BACKOFF).await;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "failed to persist reactively refreshed Anthropic tokens after \
+                         {PERSIST_MAX_ATTEMPTS} attempts"
+                    );
+                }
+            }
+        }
+        // Fail closed: upstream may have rotated the refresh token, so a token we could not store
+        // is one that will not survive a restart. Using it now would hide an account we have
+        // already lost the ability to refresh.
+        if !persisted {
+            return Err(ReactiveAuthError::Internal);
+        }
+
+        Ok(Some(Account {
+            id: stored_account.id.clone(),
+            base_url,
+            bearer_token: new.access_token.clone(),
+            // Anthropic accounts carry no ChatGPT companion identity and are never FedRAMP-routed.
+            chatgpt_account_id: None,
+            is_fedramp: false,
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +359,7 @@ mod tests {
             OAuthClient::new(oauth_url).unwrap(),
             RefreshLocks::default(),
             "https://example.test/backend-api/codex".to_string(),
+            "https://example.test/anthropic".to_string(),
         );
         let catalog_plane = auth.clone();
         let data_plane = auth.clone();
@@ -295,6 +450,7 @@ mod tests {
             OAuthClient::new(oauth_url).unwrap(),
             RefreshLocks::default(),
             "https://example.test/backend-api/codex".to_string(),
+            "https://example.test/anthropic".to_string(),
         );
 
         let result = auth
@@ -310,5 +466,213 @@ mod tests {
             .unwrap();
         assert_eq!(stored.access_token, "old-access");
         assert_eq!(stored.refresh_token, "old-refresh");
+    }
+}
+
+#[cfg(test)]
+mod anthropic_refresh_tests {
+    use super::*;
+    use polyflare_store::{Account as StoreAccount, NewUpstreamAuth};
+    use polyflare_testkit::{AnthropicOAuthResponse, MockAnthropicOAuth};
+
+    fn anthropic_account(id: &str) -> StoreAccount {
+        StoreAccount {
+            id: id.to_string(),
+            chatgpt_account_id: None,
+            chatgpt_user_id: None,
+            email: "operator@example.test".to_string(),
+            alias: None,
+            workspace_id: None,
+            workspace_label: None,
+            seat_type: None,
+            plan_type: "max".to_string(),
+            routing_policy: "normal".to_string(),
+            last_refresh: 1,
+            created_at: 1,
+            status: "active".to_string(),
+            deactivation_reason: None,
+            reset_at: None,
+            blocked_at: None,
+            security_work_authorized: false,
+            provider: "anthropic".to_string(),
+            pool: None,
+        }
+    }
+
+    /// A store holding one Anthropic subscription-OAuth account, plus a `ReactiveAuth` whose
+    /// Anthropic refreshes go to `mock`.
+    async fn fixture(
+        dir: &tempfile::TempDir,
+        mock: MockAnthropicOAuth,
+    ) -> (Store, TokenCipher, ReactiveAuth) {
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[3u8; 32]).unwrap();
+        store
+            .accounts()
+            .upsert_anthropic_oauth(
+                &anthropic_account("acct-anthropic"),
+                &PlainTokens {
+                    access_token: "old-access".to_string(),
+                    refresh_token: "old-refresh".to_string(),
+                    id_token: String::new(),
+                },
+                &cipher,
+                &NewUpstreamAuth {
+                    upstream_identity: "seat-1".to_string(),
+                    access_token_expires_at: Some(100),
+                    oauth_contract_version: "anthropic-oauth-2026-07".to_string(),
+                    granted_scopes: "user:inference".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let token_url = mock.spawn().await;
+        let auth = ReactiveAuth::new(
+            store.clone(),
+            cipher.clone(),
+            polyflare_codex::oauth::OAuthClient::new("https://unused.test").unwrap(),
+            RefreshLocks::default(),
+            "https://example.test/backend-api/codex".to_string(),
+            "https://api.anthropic.test".to_string(),
+        )
+        .with_anthropic_token_url(token_url);
+        (store, cipher, auth)
+    }
+
+    #[tokio::test]
+    async fn anthropic_401_refreshes_against_anthropic_and_persists_the_new_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockAnthropicOAuth::ok("new-access", "new-refresh");
+        let (store, cipher, auth) = fixture(&dir, mock.clone()).await;
+
+        let refreshed = auth
+            .refresh_after_unauthorized(&AccountId::from("acct-anthropic"), "old-access", 1_000)
+            .await
+            .unwrap()
+            .expect("a successful refresh yields a usable account");
+
+        assert_eq!(refreshed.bearer_token, "new-access");
+        // The Anthropic base URL, never the Codex one.
+        assert_eq!(refreshed.base_url, "https://api.anthropic.test");
+        assert_eq!(refreshed.chatgpt_account_id, None);
+        assert!(!refreshed.is_fedramp);
+
+        // The persisted grant was replayed verbatim — a refresh never widens what was authorized.
+        assert_eq!(mock.last_body().unwrap()["scope"], "user:inference");
+        assert_eq!(mock.last_body().unwrap()["grant_type"], "refresh_token");
+
+        let (_, tokens, stored) = store
+            .accounts()
+            .get_with_tokens_and_auth("acct-anthropic", &cipher)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tokens.access_token, "new-access");
+        assert_eq!(tokens.refresh_token, "new-refresh");
+        // 1_000 + expires_in(3600). A rotation that left the OLD expiry would make the refresh
+        // gate read a stale deadline for a brand-new token.
+        assert_eq!(stored.access_token_expires_at, Some(4_600));
+    }
+
+    #[tokio::test]
+    async fn concurrent_401s_for_one_anthropic_account_refresh_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockAnthropicOAuth::ok("new-access", "new-refresh");
+        let (_store, _cipher, auth) = fixture(&dir, mock.clone()).await;
+
+        let first_plane = auth.clone();
+        let second_plane = auth.clone();
+        let account = AccountId::from("acct-anthropic");
+        let (first_account, second_account) = (account.clone(), account.clone());
+        let (first, second) = tokio::join!(
+            first_plane.refresh_after_unauthorized(&first_account, "old-access", 1_000),
+            second_plane.refresh_after_unauthorized(&second_account, "old-access", 1_000),
+        );
+
+        for result in [first, second] {
+            assert_eq!(
+                result
+                    .unwrap()
+                    .expect("both callers get a bearer")
+                    .bearer_token,
+                "new-access"
+            );
+        }
+        // The waiter adopts the rotated token instead of refreshing again — a second refresh would
+        // invalidate the first one's freshly issued credentials on a rotating server.
+        assert_eq!(mock.hit_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_grant_error_marks_the_account_for_reauth() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _cipher, auth) =
+            fixture(&dir, MockAnthropicOAuth::error(400, "invalid_grant")).await;
+
+        let result = auth
+            .refresh_after_unauthorized(&AccountId::from("acct-anthropic"), "old-access", 1_000)
+            .await;
+        assert!(matches!(result, Err(ReactiveAuthError::AccountUnavailable)));
+        assert_eq!(
+            store
+                .accounts()
+                .get("acct-anthropic")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "reauth_required"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_leaves_the_stored_credentials_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockAnthropicOAuth::from_response(AnthropicOAuthResponse::Error {
+            status: 503,
+            code: None,
+        });
+        let (store, cipher, auth) = fixture(&dir, mock).await;
+
+        let result = auth
+            .refresh_after_unauthorized(&AccountId::from("acct-anthropic"), "old-access", 1_000)
+            .await;
+        // `Ok(None)`: the original 401 stays visible; the account is NOT condemned.
+        assert!(result.unwrap().is_none());
+
+        let account = store
+            .accounts()
+            .get("acct-anthropic")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.status, "active", "a 5xx must not force a re-login");
+        let tokens = store
+            .accounts()
+            .decrypt_tokens("acct-anthropic", &cipher)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tokens.refresh_token, "old-refresh", "the grant is intact");
+    }
+
+    #[tokio::test]
+    async fn a_static_bearer_account_is_never_refreshed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockAnthropicOAuth::ok("must-not-be-used", "must-not-be-used");
+        let (store, _cipher, auth) = fixture(&dir, mock.clone()).await;
+        // Demote the account to a static API key, as a legacy Anthropic row would be.
+        sqlx::query("UPDATE accounts SET auth_mode = 'static_bearer' WHERE id = 'acct-anthropic'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let result = auth
+            .refresh_after_unauthorized(&AccountId::from("acct-anthropic"), "old-access", 1_000)
+            .await;
+
+        assert!(matches!(result, Err(ReactiveAuthError::AccountUnavailable)));
+        // An API key has no refresh token; asking any auth server to rotate one is meaningless.
+        assert_eq!(mock.hit_count(), 0, "no token endpoint may be contacted");
     }
 }

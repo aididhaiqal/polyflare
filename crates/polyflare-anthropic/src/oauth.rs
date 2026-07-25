@@ -274,10 +274,11 @@ impl AnthropicOAuthClient {
         })
     }
 
-    /// Point the client at a test server. Compiled only for tests, so no production configuration
-    /// path — environment variable, config file, or API field — can redirect an authorization code
-    /// or refresh token away from the allowlisted Anthropic hosts.
-    #[cfg(test)]
+    /// Point the client at a test server. Compiled only under `cfg(test)` or the `test-endpoints`
+    /// feature, so no production configuration path — environment variable, config file, or API
+    /// field — can redirect an authorization code or refresh token away from the allowlisted
+    /// Anthropic hosts.
+    #[cfg(any(test, feature = "test-endpoints"))]
     pub fn with_endpoints(authorize_url: String, token_url: String) -> Self {
         Self {
             http: reqwest::Client::new(),

@@ -822,6 +822,7 @@ pub(crate) async fn force_refresh_after_unauthorized(
         state.oauth.clone(),
         state.refresh_locks.clone(),
         state.upstream_base_url_for(Provider::Codex).to_string(),
+        state.upstream_base_url_for(Provider::Anthropic).to_string(),
     )
     .refresh_after_unauthorized(picked, rejected_access_token, now)
     .await

@@ -683,6 +683,11 @@ impl HttpModelSource {
             oauth,
             refresh_locks,
             base_url.clone(),
+            // Codex model discovery never selects an Anthropic account, so there is no Anthropic
+            // base URL to give. Empty rather than a copy of the Codex one: if this path ever does
+            // start resolving Anthropic accounts, the resulting relative URL fails loudly instead
+            // of silently aiming an Anthropic account at the Codex host.
+            String::new(),
         );
         Ok(Self {
             client,

@@ -59,6 +59,10 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 polyflare-testkit = { path = "../polyflare-testkit" }
+# Enables `AnthropicOAuthClient::with_endpoints` for the refresh tests. A dev-dependency only, so
+# the feature is absent from `cargo build --release` and no production path can redirect a refresh
+# token away from the allowlisted Anthropic hosts.
+polyflare-anthropic = { path = "../polyflare-anthropic", features = ["test-endpoints"] }
 reqwest = { workspace = true }
 futures-util = { workspace = true }
 sqlx = { workspace = true }
