@@ -381,7 +381,14 @@ pub struct AdmissionLimits {
     pub account_open_ws: u32,
     pub owner_recovery_reserve: u32,
     pub owner_recovery_pressure_reserve: u32,
+    /// How long a REQUEST may queue for capacity. Long is correct here: a queued turn resumes
+    /// normally once capacity frees, and the client is waiting on a response it expects to be slow.
     pub wait_timeout: Duration,
+    /// How long a SOCKET handshake may queue for capacity — deliberately much shorter than
+    /// `wait_timeout`. A client holds a connect open with its own deadline, so a long queue does
+    /// not buy patience, it just hangs the handshake until the client cancels. See
+    /// `RuntimeStates::acquire_pinned_open_ws`.
+    pub socket_wait_timeout: Duration,
 }
 
 impl Default for AdmissionLimits {
@@ -396,6 +403,9 @@ impl Default for AdmissionLimits {
             owner_recovery_reserve: 1,
             owner_recovery_pressure_reserve: 4,
             wait_timeout: Duration::from_secs(10),
+            // Comfortably inside the observed ~15s client connect deadline, leaving room to be
+            // refused and fall back rather than cancelled mid-handshake.
+            socket_wait_timeout: Duration::from_secs(3),
         }
     }
 }
@@ -1529,12 +1539,22 @@ impl RuntimeStates {
         }
     }
 
+    /// Admit one open WebSocket for a pinned owner.
+    ///
+    /// **Bounded by [`AdmissionLimits::socket_wait_timeout`], NOT the request `wait_timeout`**
+    /// (2026-07-25 live): a handshake is not a turn. The client is holding a TCP connect open with
+    /// its own deadline (~15s observed), so queueing a handshake behind a long request window does
+    /// not "wait for capacity" — it hangs the client until IT gives up, which is what produced six
+    /// cancelled handshakes after the request window was raised to 90s (metrics:
+    /// `admission_rejected_total{work="websocket",reason="cancelled"}`, ~15s each, zero acquired).
+    /// A socket that cannot be admitted promptly must be refused promptly, so the client can retry
+    /// or fall back to HTTP while it still has patience left.
     pub async fn acquire_pinned_open_ws(
         self: &Arc<Self>,
         id: &AccountId,
         now: i64,
     ) -> Option<WsSocketGuard> {
-        let deadline = tokio::time::Instant::now() + self.admission_limits.wait_timeout;
+        let deadline = tokio::time::Instant::now() + self.admission_limits.socket_wait_timeout;
         let mut wait: Option<AdmissionWaitGuard<'_>> = None;
         loop {
             let changed = self.admission_changed.notified();
@@ -1810,7 +1830,9 @@ impl RuntimeStates {
         ctx: &SelectionCtx,
         now: i64,
     ) -> Option<(AccountId, WsSocketGuard)> {
-        let deadline = tokio::time::Instant::now() + self.admission_limits.wait_timeout;
+        // Socket admission, not request admission — see `acquire_pinned_open_ws`'s doc: a queued
+        // handshake outlives the client's own connect deadline and simply hangs it.
+        let deadline = tokio::time::Instant::now() + self.admission_limits.socket_wait_timeout;
         let mut wait: Option<AdmissionWaitGuard<'_>> = None;
         loop {
             let changed = self.admission_changed.notified();
@@ -3123,6 +3145,50 @@ mod tests {
         assert_eq!(lane.waits, 1);
         assert_eq!(lane.timeouts, 1);
         assert_eq!(lane.acquired_after_wait, 0);
+    }
+
+    /// A handshake must be refused on the SOCKET window, never held on the long REQUEST window
+    /// (2026-07-25 live regression): raising `wait_timeout` to 90s made queued handshakes hang past
+    /// the client's own connect deadline, producing six cancelled handshakes and zero admissions.
+    #[tokio::test]
+    async fn a_queued_handshake_is_refused_on_the_socket_window_not_the_request_window() {
+        let runtime = Arc::new(RuntimeStates::with_admission_limits(AdmissionLimits {
+            account_open_ws: 1,
+            owner_recovery_reserve: 0,
+            // Deliberately lopsided: a request may queue ~forever, a socket may not.
+            wait_timeout: Duration::from_secs(90),
+            socket_wait_timeout: Duration::from_millis(150),
+            ..AdmissionLimits::default()
+        }));
+        let owner = AccountId::from("owner");
+
+        let held = runtime
+            .acquire_pinned_open_ws(&owner, 1_000)
+            .await
+            .expect("the first socket is admitted");
+
+        let started = tokio::time::Instant::now();
+        let queued = runtime.acquire_pinned_open_ws(&owner, 1_000).await;
+        let waited = started.elapsed();
+
+        assert!(
+            queued.is_none(),
+            "the second handshake must be refused while the only slot is held"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "it must be refused on the 150ms SOCKET window, not held on the 90s request window \
+             (waited {waited:?}) — holding it past the client's connect deadline is what turned \
+             a full account into a hung client"
+        );
+        drop(held);
+        assert!(
+            runtime
+                .acquire_pinned_open_ws(&owner, 1_000)
+                .await
+                .is_some(),
+            "capacity frees normally once the held socket is released"
+        );
     }
 
     #[tokio::test]

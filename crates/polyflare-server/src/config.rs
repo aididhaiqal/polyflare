@@ -978,6 +978,14 @@ fn admission_limits_from_env() -> crate::runtime_state::AdmissionLimits {
                 .and_then(|raw| raw.trim().parse::<u64>().ok())
                 .unwrap_or(defaults.wait_timeout.as_millis() as u64),
         ),
+        // Separate from the request window ON PURPOSE — raising the request window to 90s made
+        // handshakes hang until clients cancelled them. See `AdmissionLimits::socket_wait_timeout`.
+        socket_wait_timeout: Duration::from_millis(
+            std::env::var("POLYFLARE_ADMISSION_SOCKET_WAIT_TIMEOUT_MS")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+                .unwrap_or(defaults.socket_wait_timeout.as_millis() as u64),
+        ),
     }
 }
 
