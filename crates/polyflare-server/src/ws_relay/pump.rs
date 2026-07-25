@@ -113,6 +113,7 @@ use polyflare_core::{Account, AccountId, FailureSignal, Provider, SessionKey};
 use crate::app::AppState;
 
 use super::redial::RedialOutcome;
+use super::reasoning_transform::{strip_unverifiable_reasoning, INVALID_ENCRYPTED_CONTENT_CODE};
 use super::signal::{classify_upstream_signal, UpstreamSignal};
 use super::sniff::sniff_completed_id;
 use super::telemetry::{start_turn, WsRoutingOutcome, WsTurnTelemetry, WsTurnTerminal};
@@ -552,6 +553,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
     // Retry a mid-session 401 at most once, and only before any upstream frame from this turn has
     // crossed the downstream boundary.
     let mut reactive_auth_attempted = false;
+    // Rewrite a turn whose history the target platform provably cannot decrypt
+    // (`invalid_encrypted_content`) at most once per turn — see `reasoning_transform`.
+    let mut reasoning_transform_attempted = false;
     let mut client_visible_upstream_for_turn = false;
     // If the socket/pump disappears with a turn still active, preserve an explicit failed row
     // rather than silently losing the request. Client-side teardown defaults to nginx-style 499;
@@ -606,6 +610,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                             turn_telemetry = Some(next_turn);
                             active_turn_key = logical_turn_key.clone();
                             reactive_auth_attempted = false;
+                            reasoning_transform_attempted = false;
                             client_visible_upstream_for_turn = false;
                         }
                         let redialed = send_client_text(
@@ -823,6 +828,81 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                 // cross-account move dials a replacement, so the open-WS hard cap
                                 // measures real sockets rather than briefly allowing old + new.
                                 drop(upstream.take());
+                                // Cross-provider poisoned history: the target platform has just
+                                // PROVEN it cannot decrypt a reasoning envelope in this turn's
+                                // history (`invalid_encrypted_content` — foreign-minted `rs_*`
+                                // items after a fugu↔codex switch; the 2026-07-25 tether-thread
+                                // bricking). A raw replay can never succeed, and a resend
+                                // advisory would make the client resend the SAME poisoned
+                                // history. Instead: rewrite the buffered frame ONCE per turn
+                                // (envelopes out, plaintext summaries kept as assistant text —
+                                // see `reasoning_transform`) and replay it on a fresh
+                                // same-account socket. Any failure below falls through to the
+                                // generic forward-and-bench path with the original error frame.
+                                if sig.error_code.as_deref()
+                                    == Some(INVALID_ENCRYPTED_CONTENT_CODE)
+                                    && !reasoning_transform_attempted
+                                    && !client_visible_upstream_for_turn
+                                {
+                                    reasoning_transform_attempted = true;
+                                    let transformed = in_flight
+                                        .as_deref()
+                                        .and_then(strip_unverifiable_reasoning);
+                                    if let Some(frame) = transformed {
+                                        refund_active_turn_attempt(&state, &turn_telemetry);
+                                        if let RedialOutcome::Connected(conn) =
+                                            super::redial_for_scope(
+                                                &state,
+                                                &headers,
+                                                &account,
+                                                &relay_contract,
+                                                pool.as_deref(),
+                                            )
+                                            .await
+                                        {
+                                            if !try_consume_active_turn_attempt(
+                                                &state,
+                                                &turn_telemetry,
+                                            ) {
+                                                in_flight = None;
+                                                if !surface_attempt_budget_exhausted(
+                                                    &mut downstream,
+                                                    &mut turn_telemetry,
+                                                    &state,
+                                                    &account.id,
+                                                )
+                                                .await
+                                                {
+                                                    break;
+                                                }
+                                                continue;
+                                            }
+                                            let mut conn = *conn;
+                                            let anchored =
+                                                is_anchored_generating_frame(&frame);
+                                            if conn.send_text(frame.clone()).await.is_ok() {
+                                                in_flight = Some(frame);
+                                                upstream = Some(conn);
+                                                if anchored {
+                                                    relay_metrics
+                                                        .record("anchored_send_after_redial");
+                                                    anchored_redial_pending = true;
+                                                }
+                                                relay_metrics
+                                                    .record("reasoning_transform_replay");
+                                                relay_metrics.record("reconnect_same_account");
+                                                reconnects_since_progress += 1;
+                                                if reconnects_since_progress
+                                                    > MAX_RECONNECTS_WITHOUT_PROGRESS
+                                                {
+                                                    unfinished_status = StatusCode::BAD_GATEWAY;
+                                                    break;
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
                                 if sig.status == 401
                                     && !reactive_auth_attempted
                                     && !client_visible_upstream_for_turn

@@ -192,6 +192,29 @@ impl ScriptedTurn {
         }
     }
 
+    /// The wrapped error envelope for `invalid_encrypted_content` — the live-captured shape of a
+    /// cross-platform reasoning-envelope rejection (2026-07-25: fugu-minted `rs_*` items replayed
+    /// to the codex backend after a mid-thread provider switch):
+    /// ```json
+    /// {"type":"error","error":{"type":"invalid_request_error","code":"invalid_encrypted_content",
+    ///  "message":"The encrypted content for item rs_... could not be verified. ..."},"status":400}
+    /// ```
+    /// As with [`ScriptedTurn::previous_response_not_found`], the echoed item id is realism only —
+    /// callers must assert on the `code` alone.
+    pub fn invalid_encrypted_content(item_id: impl Into<String>) -> Self {
+        let item_id = item_id.into();
+        ScriptedTurn::ErrorEnvelope {
+            status: 400,
+            code: "invalid_encrypted_content".to_string(),
+            message: format!(
+                "The encrypted content for item {item_id} could not be verified. Reason: \
+                 Encrypted content could not be decrypted or parsed."
+            ),
+            error_extra: vec![("type".to_string(), "invalid_request_error".to_string())],
+            headers: Vec::new(),
+        }
+    }
+
     /// The wrapped error envelope, pre-filled for a 429 carrying `Retry-After` inside the
     /// envelope's own `headers` map (ground truth §3's `"headers":{...}` field) rather than a real
     /// HTTP response header — this is the shape Task 7's 429 test parses `retry_after` out of.
