@@ -432,6 +432,14 @@ pub struct AccountSnapshot {
     /// Every named routing group this account can serve. `pool` remains the backward-compatible
     /// primary label; routing membership checks use this complete set.
     pub pools: Vec<String>,
+    /// Whether this account's upstream credential is a subscription-OAuth grant rather than an API
+    /// key or static bearer.
+    ///
+    /// Load-bearing for routing, not just reporting: a subscription grant authorizes a specific
+    /// first-party client shape, so such an account may serve ONLY byte-faithful pass-through of a
+    /// genuine client request. Traffic PolyFlare synthesized by translating another protocol must
+    /// never be sent on one — see the ingress `MessagesTraffic` filter.
+    pub subscription_oauth: bool,
 }
 
 impl AccountSnapshot {
@@ -462,6 +470,10 @@ impl AccountSnapshot {
             provider: Provider::Codex,
             pool: None,
             pools: Vec::new(),
+            // Defaults to the RESTRICTIVE-for-nobody value: a snapshot that has not been told
+            // otherwise is an ordinary credential, eligible for every path. The assembler sets the
+            // true value; only a real subscription grant narrows what an account may serve.
+            subscription_oauth: false,
         }
     }
 }

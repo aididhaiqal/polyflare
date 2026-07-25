@@ -384,3 +384,227 @@ async fn get_with_tokens_returns_account_and_decrypted_tokens_in_one_call() {
         "absent id → None"
     );
 }
+
+/// An Anthropic subscription-OAuth candidate row (no ChatGPT identity columns).
+fn anthropic_account(id: &str, pool: Option<&str>) -> Account {
+    Account {
+        id: id.to_string(),
+        chatgpt_account_id: None,
+        chatgpt_user_id: None,
+        email: "operator@example.test".to_string(),
+        alias: None,
+        workspace_id: None,
+        workspace_label: None,
+        seat_type: None,
+        plan_type: "max".to_string(),
+        routing_policy: "normal".to_string(),
+        last_refresh: 1_700_000_000,
+        created_at: 1_700_000_000,
+        status: "active".to_string(),
+        deactivation_reason: None,
+        reset_at: None,
+        blocked_at: None,
+        security_work_authorized: false,
+        provider: "anthropic".to_string(),
+        pool: pool.map(str::to_string),
+    }
+}
+
+fn new_auth(identity: &str, expires_at: i64) -> polyflare_store::NewUpstreamAuth {
+    polyflare_store::NewUpstreamAuth {
+        upstream_identity: identity.to_string(),
+        access_token_expires_at: Some(expires_at),
+        oauth_contract_version: "anthropic-oauth-2026-07".to_string(),
+        granted_scopes: "user:inference".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn anthropic_oauth_relogin_updates_the_same_seat_and_preserves_operator_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[4u8; 32]).unwrap();
+    let repo = store.accounts();
+
+    let first = repo
+        .upsert_anthropic_oauth(
+            &anthropic_account("acct-anthropic", Some("team-a")),
+            &PlainTokens {
+                access_token: "access-1".into(),
+                refresh_token: "refresh-1".into(),
+                id_token: String::new(),
+            },
+            &cipher,
+            &new_auth("seat-uuid-1", 1_700_003_600),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first, "acct-anthropic");
+
+    // Operator-local configuration set after onboarding.
+    repo.update_alias("acct-anthropic", Some("primary"))
+        .await
+        .unwrap();
+    repo.update_routing_policy("acct-anthropic", "preserve")
+        .await
+        .unwrap();
+    repo.update_status("acct-anthropic", "reauth_required")
+        .await
+        .unwrap();
+
+    // Re-login: SAME upstream identity, but a freshly generated row id (as a CLI login would send).
+    let again = repo
+        .upsert_anthropic_oauth(
+            &anthropic_account("acct-different-id", None),
+            &PlainTokens {
+                access_token: "access-2".into(),
+                refresh_token: "refresh-2".into(),
+                id_token: String::new(),
+            },
+            &cipher,
+            &new_auth("seat-uuid-1", 1_700_007_200),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        again, "acct-anthropic",
+        "re-login must target the existing seat, not insert a second row"
+    );
+    assert_eq!(repo.list().await.unwrap().len(), 1);
+
+    let account = repo.get("acct-anthropic").await.unwrap().unwrap();
+    assert_eq!(account.status, "active", "re-login clears reauth_required");
+    assert_eq!(
+        account.alias.as_deref(),
+        Some("primary"),
+        "alias is local config"
+    );
+    assert_eq!(
+        account.routing_policy, "preserve",
+        "routing policy is local config, not a property of the grant"
+    );
+    assert_eq!(
+        repo.list_pools("acct-anthropic").await.unwrap(),
+        vec!["team-a".to_string()],
+        "an omitted pool preserves existing membership"
+    );
+
+    let auth = repo.upstream_auth("acct-anthropic").await.unwrap().unwrap();
+    assert_eq!(auth.mode(), polyflare_store::AuthMode::AnthropicOauth);
+    assert!(auth.mode().is_refreshable());
+    assert_eq!(auth.upstream_identity.as_deref(), Some("seat-uuid-1"));
+    assert_eq!(auth.access_token_expires_at, Some(1_700_007_200));
+    assert_eq!(auth.scopes(), vec!["user:inference"]);
+
+    let tokens = repo
+        .decrypt_tokens("acct-anthropic", &cipher)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tokens.access_token, "access-2");
+    assert_eq!(tokens.refresh_token, "refresh-2");
+}
+
+#[tokio::test]
+async fn upstream_identity_lookup_is_provider_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[4u8; 32]).unwrap();
+    let repo = store.accounts();
+
+    repo.upsert_anthropic_oauth(
+        &anthropic_account("acct-anthropic", None),
+        &sample_tokens(),
+        &cipher,
+        &new_auth("shared-identity", 1_700_003_600),
+    )
+    .await
+    .unwrap();
+
+    let found = repo
+        .find_by_upstream_identity("anthropic", "shared-identity")
+        .await
+        .unwrap();
+    assert_eq!(
+        found,
+        Some((
+            "acct-anthropic".to_string(),
+            polyflare_store::AuthMode::AnthropicOauth
+        ))
+    );
+    // The same identity string under another provider is a different seat entirely.
+    assert!(repo
+        .find_by_upstream_identity("codex", "shared-identity")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn rotating_oauth_tokens_writes_the_matching_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[4u8; 32]).unwrap();
+    let repo = store.accounts();
+
+    repo.upsert_anthropic_oauth(
+        &anthropic_account("acct-anthropic", None),
+        &sample_tokens(),
+        &cipher,
+        &new_auth("seat-uuid-1", 1_700_003_600),
+    )
+    .await
+    .unwrap();
+
+    repo.update_oauth_tokens(
+        "acct-anthropic",
+        &PlainTokens {
+            access_token: "rotated-access".into(),
+            refresh_token: "rotated-refresh".into(),
+            id_token: String::new(),
+        },
+        &cipher,
+        1_700_010_000,
+        Some(1_700_013_600),
+    )
+    .await
+    .unwrap();
+
+    let (_, tokens, auth) = repo
+        .get_with_tokens_and_auth("acct-anthropic", &cipher)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tokens.access_token, "rotated-access");
+    // An opaque Anthropic token carries no decodable expiry, so a rotation that failed to advance
+    // this column would leave the refresh gate reading the OLD deadline for a NEW token.
+    assert_eq!(auth.access_token_expires_at, Some(1_700_013_600));
+    assert_eq!(auth.granted_scopes.as_deref(), Some("user:inference"));
+}
+
+#[tokio::test]
+async fn legacy_rows_are_static_bearers_and_are_never_refreshable() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[4u8; 32]).unwrap();
+    let repo = store.accounts();
+
+    // `insert` is the legacy path: it writes no auth columns, so the row takes the column defaults.
+    repo.insert(&sample_account("acct-codex"), &sample_tokens(), &cipher)
+        .await
+        .unwrap();
+    let auth = repo.upstream_auth("acct-codex").await.unwrap().unwrap();
+    assert_eq!(auth.mode(), polyflare_store::AuthMode::CodexOauth);
+    assert_eq!(auth.upstream_identity, None);
+    assert_eq!(auth.access_token_expires_at, None);
+
+    // The schema itself refuses an auth mode this version does not define, so a typo or a bad
+    // migration cannot quietly produce a row whose credential contract is undefined.
+    let rejected =
+        sqlx::query("UPDATE accounts SET auth_mode = 'some_future_mode' WHERE id = 'acct-codex'")
+            .execute(store.pool())
+            .await;
+    assert!(rejected.is_err(), "auth_mode is constrained by a CHECK");
+    let auth = repo.upstream_auth("acct-codex").await.unwrap().unwrap();
+    assert_eq!(auth.mode(), polyflare_store::AuthMode::CodexOauth);
+}

@@ -606,3 +606,142 @@ async fn oauth_handler(
         ),
     }
 }
+
+/// A scriptable mock of the Anthropic OAuth token endpoint (`POST /v1/oauth/token`).
+///
+/// Separate from [`MockOAuth`] because the two providers' contracts genuinely differ: Anthropic
+/// returns an opaque access token with `expires_in`, a `scope` grant that may be narrower than
+/// requested, and an `account` identity block — and it has no `id_token` at all. Test infra only.
+#[derive(Clone)]
+pub struct MockAnthropicOAuth {
+    response: Arc<AnthropicOAuthResponse>,
+    bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+    hit_count: Arc<AtomicUsize>,
+}
+
+/// The scripted response for a [`MockAnthropicOAuth`].
+#[derive(Clone)]
+pub enum AnthropicOAuthResponse {
+    Ok {
+        access_token: String,
+        /// `None` models a non-rotating refresh: the field is omitted entirely, and the caller is
+        /// expected to keep the refresh token it already holds.
+        refresh_token: Option<String>,
+        expires_in: Option<i64>,
+        /// `None` omits `scope`, meaning "granted exactly what you asked for".
+        scope: Option<String>,
+        account_uuid: Option<String>,
+        email: Option<String>,
+    },
+    Error {
+        status: u16,
+        code: Option<String>,
+    },
+}
+
+impl MockAnthropicOAuth {
+    /// A successful, rotating exchange/refresh with an account identity.
+    pub fn ok(access_token: impl Into<String>, refresh_token: impl Into<String>) -> Self {
+        Self::from_response(AnthropicOAuthResponse::Ok {
+            access_token: access_token.into(),
+            refresh_token: Some(refresh_token.into()),
+            expires_in: Some(3600),
+            scope: Some("user:inference".to_string()),
+            account_uuid: Some("acct-uuid-1".to_string()),
+            email: Some("operator@example.test".to_string()),
+        })
+    }
+
+    pub fn from_response(response: AnthropicOAuthResponse) -> Self {
+        Self {
+            response: Arc::new(response),
+            bodies: Arc::new(Mutex::new(Vec::new())),
+            hit_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn error(status: u16, code: impl Into<String>) -> Self {
+        Self::from_response(AnthropicOAuthResponse::Error {
+            status,
+            code: Some(code.into()),
+        })
+    }
+
+    pub fn error_no_code(status: u16) -> Self {
+        Self::from_response(AnthropicOAuthResponse::Error { status, code: None })
+    }
+
+    pub fn last_body(&self) -> Option<serde_json::Value> {
+        self.bodies.lock().unwrap().last().cloned()
+    }
+
+    pub fn bodies(&self) -> Vec<serde_json::Value> {
+        self.bodies.lock().unwrap().clone()
+    }
+
+    pub fn hit_count(&self) -> usize {
+        self.hit_count.load(Ordering::SeqCst)
+    }
+
+    /// Bind an ephemeral port, serve in a background task, and return the token endpoint URL.
+    pub async fn spawn(self) -> String {
+        let app = Router::new()
+            .route("/v1/oauth/token", post(anthropic_oauth_handler))
+            .with_state(self);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/v1/oauth/token")
+    }
+}
+
+async fn anthropic_oauth_handler(
+    State(mock): State<MockAnthropicOAuth>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    mock.hit_count.fetch_add(1, Ordering::SeqCst);
+    mock.bodies.lock().unwrap().push(body);
+    // Same rationale as `oauth_handler`: a small delay makes concurrent single-flight races
+    // actually overlap instead of serializing by luck.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    match &*mock.response {
+        AnthropicOAuthResponse::Ok {
+            access_token,
+            refresh_token,
+            expires_in,
+            scope,
+            account_uuid,
+            email,
+        } => {
+            let mut payload = serde_json::json!({
+                "access_token": access_token,
+                "token_type": "Bearer",
+            });
+            if let Some(refresh_token) = refresh_token {
+                payload["refresh_token"] = serde_json::json!(refresh_token);
+            }
+            if let Some(expires_in) = expires_in {
+                payload["expires_in"] = serde_json::json!(expires_in);
+            }
+            if let Some(scope) = scope {
+                payload["scope"] = serde_json::json!(scope);
+            }
+            if let Some(uuid) = account_uuid {
+                payload["account"] = serde_json::json!({
+                    "uuid": uuid,
+                    "email_address": email,
+                });
+            }
+            (StatusCode::OK, Json(payload))
+        }
+        AnthropicOAuthResponse::Error { status, code } => (
+            StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(match code {
+                Some(code) => serde_json::json!({ "error": code }),
+                None => serde_json::json!({}),
+            }),
+        ),
+    }
+}

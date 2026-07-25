@@ -15,8 +15,8 @@ pub mod store;
 pub mod translation_repo;
 
 pub use account::{
-    Account, AccountRepo, AccountSettingsUpdate, EncryptedTokens, PlainTokens, UsageSnapshot,
-    WindowUsage,
+    Account, AccountRepo, AccountSettingsUpdate, AuthMode, EncryptedTokens, NewUpstreamAuth,
+    PlainTokens, UpstreamAuth, UsageSnapshot, WindowUsage,
 };
 pub use api_key_repo::{ApiKeyRepo, ApiKeyRow};
 pub use continuity_repo::{ContinuityRepo, SessionRow};

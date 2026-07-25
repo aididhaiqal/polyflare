@@ -27,6 +27,7 @@ fn unix_now() -> i64 {
 pub async fn assemble_snapshots(store: &Store) -> Result<Vec<AccountSnapshot>, StoreError> {
     let repo = store.accounts();
     let accounts = repo.list().await?;
+    let auth_modes = repo.list_auth_modes().await?;
     let mut snapshots = Vec::with_capacity(accounts.len());
     for account in accounts {
         // The `provider` column is NOT NULL with a DB-level default and only this crate's
@@ -69,6 +70,14 @@ pub async fn assemble_snapshots(store: &Store) -> Result<Vec<AccountSnapshot>, S
         snap.plan_type = account.plan_type;
         snap.security_work_authorized = account.security_work_authorized;
         snap.provider = provider;
+        // An account whose auth mode this binary cannot identify is treated as a subscription
+        // grant: that is the restrictive reading, and guessing the permissive one would risk
+        // sending synthesized traffic on a credential that never authorized it.
+        snap.subscription_oauth = !matches!(
+            auth_modes.get(&account.id),
+            Some(polyflare_store::AuthMode::CodexOauth)
+                | Some(polyflare_store::AuthMode::StaticBearer)
+        );
         snap.pools = repo.list_pools(&account.id).await?;
         snap.pool = account.pool.or_else(|| snap.pools.first().cloned());
         snapshots.push(snap);
@@ -126,6 +135,45 @@ pub fn filter_by_provider_and_pool(
         .collect()
 }
 
+/// What kind of client traffic a `/v1/messages` request carries.
+///
+/// The two paths share `messages_handler_native`, but they are NOT interchangeable with respect to
+/// which accounts may serve them, so the distinction is a parameter rather than a comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessagesTraffic {
+    /// A genuine Claude client request, admitted by `claude_wire::admit_native_request` and
+    /// forwarded byte-for-byte with only the credential swapped.
+    ClaudeNative,
+    /// A request PolyFlare synthesized by translating another protocol (e.g. an OpenAI-Responses
+    /// client served from an Anthropic pool). The bytes are ours, not a first-party client's.
+    Translated,
+}
+
+/// Narrow candidates to those whose credential may serve this kind of traffic.
+///
+/// A subscription-OAuth grant authorizes a specific first-party client shape. Serving translated
+/// traffic on one would mean presenting PolyFlare-synthesized bytes as that client — so those
+/// accounts are excluded from translated traffic entirely. API-key and static-bearer accounts have
+/// no such constraint and serve both.
+///
+/// This is the structural expression of "the translator is for API-key accounts only". It lives in
+/// selection rather than in a check at egress so that a translated request can never reach a
+/// subscription account at all: the account is not a candidate in the first place, and the request
+/// fails with "no eligible account" instead of being sent on a credential that did not permit it.
+pub fn filter_by_traffic_eligibility(
+    snapshots: &[AccountSnapshot],
+    traffic: MessagesTraffic,
+) -> Vec<AccountSnapshot> {
+    match traffic {
+        MessagesTraffic::ClaudeNative => snapshots.to_vec(),
+        MessagesTraffic::Translated => snapshots
+            .iter()
+            .filter(|s| !s.subscription_oauth)
+            .cloned()
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +220,56 @@ mod tests {
         account.pools.push("p2".to_string());
         assert_eq!(filter_by_pool(&[account.clone()], Some("p1")).len(), 1);
         assert_eq!(filter_by_pool(&[account], Some("p2")).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod traffic_eligibility_tests {
+    use super::*;
+
+    fn account(id: &str, subscription_oauth: bool) -> AccountSnapshot {
+        let mut snap = AccountSnapshot::new(id);
+        snap.provider = Provider::Anthropic;
+        snap.subscription_oauth = subscription_oauth;
+        snap
+    }
+
+    #[test]
+    fn translated_traffic_never_selects_a_subscription_oauth_account() {
+        let candidates = vec![
+            account("api-key-account", false),
+            account("subscription-account", true),
+        ];
+
+        // Native pass-through may use either: a real client request is exactly what a subscription
+        // grant authorizes, and an API-key account serves it happily too.
+        let native = filter_by_traffic_eligibility(&candidates, MessagesTraffic::ClaudeNative);
+        assert_eq!(native.len(), 2);
+
+        // Translated traffic may use only the API-key account.
+        let translated = filter_by_traffic_eligibility(&candidates, MessagesTraffic::Translated);
+        assert_eq!(
+            translated
+                .iter()
+                .map(|s| s.id.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["api-key-account".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_subscription_only_pool_starves_translated_traffic_rather_than_serving_it() {
+        let candidates = vec![
+            account("subscription-a", true),
+            account("subscription-b", true),
+        ];
+        // An empty candidate set makes the request fail with "no eligible account". That is the
+        // intended outcome: failing the request is correct, sending it on a credential that never
+        // authorized this client shape is not.
+        assert!(filter_by_traffic_eligibility(&candidates, MessagesTraffic::Translated).is_empty());
+        assert_eq!(
+            filter_by_traffic_eligibility(&candidates, MessagesTraffic::ClaudeNative).len(),
+            2
+        );
     }
 }

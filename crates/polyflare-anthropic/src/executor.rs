@@ -37,21 +37,53 @@ impl Executor for AnthropicExecutor {
         _ctx: &RequestCtx,
     ) -> Result<ResponseStream, ExecError> {
         let url = format!("{}/v1/messages", account.base_url.trim_end_matches('/'));
-        // No Anthropic ingress path forwards raw bytes today (the native + aliased `/v1/messages`
-        // paths both build a JSON body), so this serializes `body` via `.json()`. When Anthropic
-        // native raw-forwarding is added, add a `raw_body` branch here — mirroring the Codex
-        // executor's CONDITIONAL content-type insert to avoid duplicating a forwarded header.
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&account.bearer_token)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            // Anthropic paths never set `raw_body`, so `body` is always `Some` here (invariant).
-            .json(
+
+        let mut request = self.client.post(&url);
+
+        // `forward_headers` is the admitted Claude request's allowlisted envelope (built by
+        // `claude_wire::outbound_headers`, which already replaced the caller's credential with this
+        // account's). When present it is authoritative: applying it first, and only then filling in
+        // defaults for what it did NOT set, keeps the client's own protocol envelope byte-faithful
+        // instead of overwriting it with ours.
+        let has = |name: &str| -> bool {
+            req.forward_headers
+                .iter()
+                .any(|(key, _)| key.eq_ignore_ascii_case(name))
+        };
+        let forwards_auth = has("authorization");
+        let forwards_version = has("anthropic-version");
+        let forwards_content_type = has("content-type");
+        for (name, value) in &req.forward_headers {
+            request = request.header(name, value);
+        }
+        if !forwards_auth {
+            request = request.bearer_auth(&account.bearer_token);
+        }
+        if !forwards_version {
+            request = request.header("anthropic-version", ANTHROPIC_VERSION);
+        }
+
+        // Raw bytes forward verbatim — no parse/re-serialize round-trip, so the body the upstream
+        // receives is byte-identical to what the client sent (key-order, spacing, and unicode
+        // escaping included). Anything that mutated the body sets `body` instead, and the
+        // `raw_body.is_none() => body.is_some()` invariant makes one of the two always present.
+        request = match req.raw_body.as_ref() {
+            Some(raw) => {
+                // Only set content-type when the forwarded envelope did not already carry it;
+                // setting it twice would emit a duplicate header.
+                if !forwards_content_type {
+                    request = request.header("content-type", "application/json");
+                }
+                request.body(raw.clone())
+            }
+            None => request.json(
                 req.body
                     .as_ref()
                     .expect("PreparedRequest: raw_body None ⇒ body Some"),
-            )
+            ),
+        };
+
+        let resp = request
             .send()
             .await
             .map_err(|e| ExecError::Upstream(e.to_string()))?;

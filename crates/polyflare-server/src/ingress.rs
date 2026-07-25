@@ -34,7 +34,9 @@ use crate::reactive_auth::{
     ReactiveAuth, ReactiveAuthError, PERSIST_MAX_ATTEMPTS, PERSIST_RETRY_BACKOFF,
 };
 use crate::session_key::parse_inbound_scoped;
-use crate::snapshot::filter_by_provider_and_pool;
+use crate::snapshot::{
+    filter_by_provider_and_pool, filter_by_traffic_eligibility, MessagesTraffic,
+};
 use crate::starvation;
 use crate::translate_stream::wrap_translating_stream;
 use crate::usage_capture;
@@ -2366,6 +2368,9 @@ async fn execute_anthropic_translation(
                 pool,
                 translated,
                 model_alias.target_model.clone(),
+                // These bytes are PolyFlare's, not a first-party client's, so subscription-OAuth
+                // accounts are not eligible to serve them.
+                MessagesTraffic::Translated,
             )
             .await;
             outcome.provider_slug = Some(Provider::Anthropic.to_string());
@@ -3351,7 +3356,16 @@ async fn messages_route(
         (None, Some((provider, provider_model))) => {
             messages_handler_custom_native(state, &headers, body, provider, provider_model).await
         }
-        _ => messages_handler_native(state, pool.as_deref(), body, model).await,
+        _ => {
+            messages_handler_native(
+                state,
+                pool.as_deref(),
+                body,
+                model,
+                MessagesTraffic::ClaudeNative,
+            )
+            .await
+        }
     };
     let provider = outcome
         .provider_slug
@@ -3425,6 +3439,7 @@ async fn messages_handler_native(
     pool: Option<&str>,
     body: serde_json::Value,
     model: String,
+    traffic: MessagesTraffic,
 ) -> (Response, RouteOutcome) {
     let now = unix_now();
     let estimated_tokens = estimate_materialized_request_tokens(&body, "messages", "max_tokens");
@@ -3463,7 +3478,10 @@ async fn messages_handler_native(
     };
     // M4a has no cross-format translator (that's M4b): `/v1/messages` may only ever pick an
     // Anthropic-provider account — the exact mirror of `/responses`'s Codex-only filter above.
-    let mut snapshots = filter_by_provider_and_pool(&snapshots, Provider::Anthropic, pool);
+    let snapshots = filter_by_provider_and_pool(&snapshots, Provider::Anthropic, pool);
+    // A subscription-OAuth grant may serve only byte-faithful pass-through of a genuine client
+    // request; translated traffic never becomes a candidate for one.
+    let mut snapshots = filter_by_traffic_eligibility(&snapshots, traffic);
     state.runtime.overlay(&mut snapshots, now);
     let selector = state.selector_for(pool);
     let sel_ctx = SelectionCtx {

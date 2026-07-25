@@ -84,6 +84,8 @@ pub async fn start_handler(
         finished_at: None,
         account_id: None,
         error_code: None,
+        // Codex uses the fixed registered loopback redirect, so there is nothing per-flow to record.
+        redirect_uri: None,
     };
     if state.store.onboarding().create(&flow).await.is_err() {
         return safe_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error");

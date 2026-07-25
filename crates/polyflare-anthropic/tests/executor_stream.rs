@@ -75,3 +75,90 @@ async fn executor_surfaces_upstream_error_status() {
         "expected UpstreamStatus(404), got {err:?}"
     );
 }
+
+/// An admitted Claude request must reach upstream byte-identically, with the caller's credential
+/// replaced and nothing else touched. This is the whole value proposition of the pass-through
+/// path: no parse/re-serialize round-trip means no way for PolyFlare to perturb the request.
+#[tokio::test]
+async fn admitted_claude_request_forwards_raw_bytes_and_the_clients_envelope() {
+    let mock = MockUpstream::new(vec![r#"{"type":"message_stop"}"#.to_string()]);
+    let handle = mock.clone();
+    let base = mock.spawn().await;
+
+    // Key order and spacing here are deliberately NOT what serde would emit on a round-trip.
+    let raw = br#"{"model":"claude-sonnet-4-6","max_tokens":4096,"messages":[{"role":"user","content":"x"}],"stream":true}"#;
+
+    let inbound: Vec<(String, String)> = vec![
+        ("accept", "application/json"),
+        ("content-type", "application/json"),
+        ("anthropic-version", "2023-06-01"),
+        ("anthropic-beta", "claude-code-20250219,oauth-2025-04-20"),
+        ("user-agent", "claude-cli/2.1.218 (external, sdk-ts)"),
+        ("x-app", "cli"),
+        (
+            "x-claude-code-session-id",
+            "c38f98c8-7c2a-4e93-aa3d-a79df7a7015f",
+        ),
+        ("x-stainless-package-version", "0.94.0"),
+        ("authorization", "Bearer CALLER-SECRET"),
+        ("cookie", "session=should-not-travel"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+
+    let envelope = polyflare_anthropic::admit_native_request(
+        &inbound,
+        &serde_json::from_slice::<serde_json::Value>(raw).unwrap(),
+    )
+    .expect("a real Claude Code request is admitted");
+    assert_eq!(envelope.cli_version, "2.1.218");
+
+    let executor = AnthropicExecutor::new().unwrap();
+    let account = Account {
+        id: "acct-anthropic".into(),
+        base_url: base,
+        bearer_token: "ACCOUNT-TOKEN".into(),
+        chatgpt_account_id: None,
+        is_fedramp: false,
+    };
+    let req = PreparedRequest {
+        body: None,
+        model: "claude-sonnet-4-6".into(),
+        forward_headers: polyflare_anthropic::outbound_headers(&inbound, "ACCOUNT-TOKEN"),
+        raw_body: Some(bytes::Bytes::from_static(raw)),
+    };
+
+    let mut stream = executor
+        .execute(req, &account, &RequestCtx::default())
+        .await
+        .unwrap();
+    while stream.next().await.is_some() {}
+
+    let headers = handle.last_headers().unwrap();
+    // The account substitution happened, and the caller's own credential never left the proxy.
+    assert_eq!(
+        headers.get("authorization").unwrap(),
+        "Bearer ACCOUNT-TOKEN"
+    );
+    assert!(headers.get("cookie").is_none(), "cookies must not travel");
+    // The client's protocol envelope survived verbatim — including beta order.
+    assert_eq!(
+        headers.get("anthropic-beta").unwrap(),
+        "claude-code-20250219,oauth-2025-04-20"
+    );
+    assert_eq!(
+        headers.get("user-agent").unwrap(),
+        "claude-cli/2.1.218 (external, sdk-ts)"
+    );
+    assert_eq!(
+        headers.get("x-claude-code-session-id").unwrap(),
+        "c38f98c8-7c2a-4e93-aa3d-a79df7a7015f",
+        "the client's own session id is forwarded, never regenerated"
+    );
+    // Exactly one content-type, despite the executor also having a default for it.
+    assert_eq!(headers.get_all("content-type").iter().count(), 1);
+    assert_eq!(headers.get_all("anthropic-version").iter().count(), 1);
+    // And the body is the client's bytes, not a re-serialization of them.
+    assert_eq!(handle.last_body().unwrap()["model"], "claude-sonnet-4-6");
+}

@@ -80,6 +80,104 @@ impl EncryptedTokens {
     }
 }
 
+/// How an account's upstream credential is obtained and renewed.
+///
+/// This is deliberately explicit rather than inferred from `provider`: an Anthropic row may hold
+/// either a refreshable subscription-OAuth grant or a static API key, and the two must never be
+/// treated alike. Only an OAuth mode may be refreshed, and only [`AuthMode::AnthropicOauth`] is
+/// eligible for the Claude-native egress path.
+///
+/// An unrecognized column value decodes to [`AuthMode::Unknown`] rather than a default, so a binary
+/// reading a row written by a newer one fails closed instead of assuming a refreshable grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    /// OpenAI/Codex authorization-code grant; refreshed against the OpenAI auth server.
+    CodexOauth,
+    /// Anthropic subscription authorization-code grant; refreshed against the Anthropic token
+    /// endpoint. Carries a raw expiry because Anthropic access tokens are opaque (no JWT `exp`).
+    AnthropicOauth,
+    /// A long-lived API key or operator-supplied bearer. Never refreshed.
+    StaticBearer,
+    /// An `auth_mode` this binary does not recognize.
+    Unknown,
+}
+
+impl AuthMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthMode::CodexOauth => "codex_oauth",
+            AuthMode::AnthropicOauth => "anthropic_oauth",
+            AuthMode::StaticBearer => "static_bearer",
+            AuthMode::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "codex_oauth" => AuthMode::CodexOauth,
+            "anthropic_oauth" => AuthMode::AnthropicOauth,
+            "static_bearer" => AuthMode::StaticBearer,
+            _ => AuthMode::Unknown,
+        }
+    }
+
+    /// Whether this mode holds a refresh token that may be exchanged for a new access token.
+    /// `Unknown` is deliberately not refreshable.
+    pub fn is_refreshable(self) -> bool {
+        matches!(self, AuthMode::CodexOauth | AuthMode::AnthropicOauth)
+    }
+}
+
+/// The upstream-credential columns for one account, decoded from the same row as [`Account`].
+///
+/// These live outside [`Account`] on purpose. `Account` is the wide snapshot row constructed at
+/// dozens of call sites that have no business asserting a credential contract; the auth columns are
+/// needed only on the refresh and egress paths, which read them explicitly.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UpstreamAuth {
+    /// Provider-scoped identity of the upstream seat — what a re-login targets. Not a credential.
+    /// `None` for legacy rows never onboarded through OAuth, and for Codex rows the 0025 migration
+    /// left unset because their `chatgpt_account_id` was ambiguous.
+    pub upstream_identity: Option<String>,
+    /// Raw `auth_mode` column. Use [`UpstreamAuth::mode`] rather than comparing strings.
+    pub auth_mode: String,
+    /// Access-token expiry in unix seconds, as reported by the token endpoint. `None` when the mode
+    /// carries no expiry (static bearer) or the endpoint did not report one.
+    pub access_token_expires_at: Option<i64>,
+    /// Which reviewed OAuth-contract profile this account was onboarded under.
+    pub oauth_contract_version: Option<String>,
+    /// Space-separated scopes the authorization server actually granted. Refresh replays exactly
+    /// these; it never widens the grant.
+    pub granted_scopes: Option<String>,
+}
+
+/// The upstream-credential facts a fresh OAuth login produces, as insert/update input.
+#[derive(Debug, Clone)]
+pub struct NewUpstreamAuth {
+    /// Provider-scoped identity of the seat that authorized this grant.
+    pub upstream_identity: String,
+    /// Absolute expiry (unix seconds) computed from the token response's `expires_in`.
+    pub access_token_expires_at: Option<i64>,
+    /// The reviewed OAuth-contract profile this login ran under.
+    pub oauth_contract_version: String,
+    /// Space-separated scopes the authorization server granted (which may be narrower than asked).
+    pub granted_scopes: String,
+}
+
+impl UpstreamAuth {
+    pub fn mode(&self) -> AuthMode {
+        AuthMode::parse(&self.auth_mode)
+    }
+
+    /// The granted scopes as a list, in stored order.
+    pub fn scopes(&self) -> Vec<&str> {
+        self.granted_scopes
+            .as_deref()
+            .map(|s| s.split_whitespace().collect())
+            .unwrap_or_default()
+    }
+}
+
 /// The latest usage percentage + reset for one window of an account. `window_minutes` is the
 /// window's DURATION (so a consumer can tell a 5h window from a weekly one regardless of which
 /// slot it was stored in), and `recorded_at` is when this row was written (so a consumer can tell
@@ -161,6 +259,20 @@ const SELECT_ACCOUNT_WITH_TOKENS: &str = "SELECT id, chatgpt_account_id, chatgpt
     alias, workspace_id, workspace_label, seat_type, plan_type, routing_policy, last_refresh, \
     created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
     provider, pool, access_token_enc, refresh_token_enc, id_token_enc FROM accounts WHERE id = ?";
+
+/// As [`SELECT_ACCOUNT_WITH_TOKENS`], plus the [`UpstreamAuth`] columns — the refresh/egress hot
+/// path resolves account + tokens + credential contract in one round-trip.
+const SELECT_ACCOUNT_WITH_TOKENS_AND_AUTH: &str =
+    "SELECT id, chatgpt_account_id, chatgpt_user_id, email, \
+    alias, workspace_id, workspace_label, seat_type, plan_type, routing_policy, last_refresh, \
+    created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
+    provider, pool, access_token_enc, refresh_token_enc, id_token_enc, \
+    upstream_identity, auth_mode, access_token_expires_at, oauth_contract_version, granted_scopes \
+    FROM accounts WHERE id = ?";
+
+/// The [`UpstreamAuth`] columns alone, by account id.
+const SELECT_UPSTREAM_AUTH: &str = "SELECT upstream_identity, auth_mode, access_token_expires_at, \
+    oauth_contract_version, granted_scopes FROM accounts WHERE id = ?";
 
 /// CRUD over the `accounts` table. Cheap to construct (clones the pool handle + generation Arcs).
 pub struct AccountRepo {
@@ -385,6 +497,126 @@ impl AccountRepo {
         Ok(account_id)
     }
 
+    /// Persist an Anthropic subscription-OAuth login, keyed by the provider-scoped upstream
+    /// identity so a re-login updates the existing seat instead of inserting a duplicate row.
+    ///
+    /// Re-login rotates credentials and clears a `reauth_required` status, but never rewrites the
+    /// operator's own settings (alias, routing policy, security capability) — those are deliberate
+    /// local configuration, not properties of the upstream grant. A supplied pool retags the
+    /// account; an omitted pool preserves existing membership.
+    pub async fn upsert_anthropic_oauth(
+        &self,
+        candidate: &Account,
+        tokens: &PlainTokens,
+        cipher: &TokenCipher,
+        auth: &NewUpstreamAuth,
+    ) -> Result<String, StoreError> {
+        let enc = EncryptedTokens::encrypt(tokens, cipher)?;
+        let mut tx = self.pool.begin().await?;
+
+        let existing_id = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM accounts WHERE provider = ? AND upstream_identity = ?",
+        )
+        .bind(&candidate.provider)
+        .bind(&auth.upstream_identity)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let account_id = if let Some(id) = existing_id {
+            sqlx::query(
+                "UPDATE accounts SET access_token_enc = ?, refresh_token_enc = ?, \
+                 id_token_enc = ?, last_refresh = ?, access_token_expires_at = ?, \
+                 auth_mode = ?, oauth_contract_version = ?, granted_scopes = ?, \
+                 status = CASE WHEN status = 'reauth_required' THEN 'active' ELSE status END \
+                 WHERE id = ?",
+            )
+            .bind(enc.access_token_enc.as_slice())
+            .bind(enc.refresh_token_enc.as_slice())
+            .bind(enc.id_token_enc.as_slice())
+            .bind(candidate.last_refresh)
+            .bind(auth.access_token_expires_at)
+            .bind(AuthMode::AnthropicOauth.as_str())
+            .bind(&auth.oauth_contract_version)
+            .bind(&auth.granted_scopes)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+            if let Some(pool) = candidate.pool.as_deref() {
+                sqlx::query("UPDATE accounts SET pool = ? WHERE id = ?")
+                    .bind(pool)
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM account_pool_memberships WHERE account_id = ?")
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "INSERT INTO account_pool_memberships (account_id, pool) VALUES (?, ?)",
+                )
+                .bind(&id)
+                .bind(pool)
+                .execute(&mut *tx)
+                .await?;
+            }
+            id
+        } else {
+            sqlx::query(
+                "INSERT INTO accounts (id, chatgpt_account_id, chatgpt_user_id, email, alias, \
+                    workspace_id, workspace_label, seat_type, plan_type, routing_policy, \
+                    access_token_enc, refresh_token_enc, id_token_enc, last_refresh, created_at, \
+                    status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
+                    provider, pool, upstream_identity, auth_mode, access_token_expires_at, \
+                    oauth_contract_version, granted_scopes) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&candidate.id)
+            .bind(candidate.chatgpt_account_id.as_deref())
+            .bind(candidate.chatgpt_user_id.as_deref())
+            .bind(&candidate.email)
+            .bind(candidate.alias.as_deref())
+            .bind(candidate.workspace_id.as_deref())
+            .bind(candidate.workspace_label.as_deref())
+            .bind(candidate.seat_type.as_deref())
+            .bind(&candidate.plan_type)
+            .bind(&candidate.routing_policy)
+            .bind(enc.access_token_enc.as_slice())
+            .bind(enc.refresh_token_enc.as_slice())
+            .bind(enc.id_token_enc.as_slice())
+            .bind(candidate.last_refresh)
+            .bind(candidate.created_at)
+            .bind(&candidate.status)
+            .bind(candidate.deactivation_reason.as_deref())
+            .bind(candidate.reset_at)
+            .bind(candidate.blocked_at)
+            .bind(candidate.security_work_authorized)
+            .bind(&candidate.provider)
+            .bind(candidate.pool.as_deref())
+            .bind(&auth.upstream_identity)
+            .bind(AuthMode::AnthropicOauth.as_str())
+            .bind(auth.access_token_expires_at)
+            .bind(&auth.oauth_contract_version)
+            .bind(&auth.granted_scopes)
+            .execute(&mut *tx)
+            .await?;
+            if let Some(pool) = candidate.pool.as_deref() {
+                sqlx::query(
+                    "INSERT INTO account_pool_memberships (account_id, pool) VALUES (?, ?)",
+                )
+                .bind(&candidate.id)
+                .bind(pool)
+                .execute(&mut *tx)
+                .await?;
+            }
+            candidate.id.clone()
+        };
+
+        tx.commit().await?;
+        self.bump_generation();
+        self.bump_token_generation();
+        Ok(account_id)
+    }
+
     /// Fetch one account's metadata by id.
     pub async fn get(&self, id: &str) -> Result<Option<Account>, StoreError> {
         let account = sqlx::query_as::<_, Account>(SELECT_ACCOUNT_BY_ID)
@@ -421,6 +653,108 @@ impl AccountRepo {
             }
             None => Ok(None),
         }
+    }
+
+    /// Every account's auth mode in ONE query, for snapshot assembly.
+    ///
+    /// Batched deliberately: selection needs the credential contract of every candidate on each
+    /// cache refresh, and a per-account read would add a round-trip per account to that path.
+    pub async fn list_auth_modes(&self) -> Result<HashMap<String, AuthMode>, StoreError> {
+        let rows =
+            sqlx::query_as::<_, (String, String)>("SELECT id, auth_mode FROM accounts ORDER BY id")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, mode)| (id, AuthMode::parse(&mode)))
+            .collect())
+    }
+
+    /// Fetch one account's upstream-credential contract.
+    pub async fn upstream_auth(&self, id: &str) -> Result<Option<UpstreamAuth>, StoreError> {
+        Ok(sqlx::query_as::<_, UpstreamAuth>(SELECT_UPSTREAM_AUTH)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    /// Account + decrypted tokens + credential contract in a SINGLE SELECT. The refresh path needs
+    /// all three together (which endpoint to call, whether refresh is even legal, when the token
+    /// expires), and reading them separately would race a concurrent rotation across three reads.
+    pub async fn get_with_tokens_and_auth(
+        &self,
+        id: &str,
+        cipher: &TokenCipher,
+    ) -> Result<Option<(Account, PlainTokens, UpstreamAuth)>, StoreError> {
+        let row = sqlx::query(SELECT_ACCOUNT_WITH_TOKENS_AND_AUTH)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => {
+                let account = Account::from_row(&row)?;
+                let enc = EncryptedTokens::from_row(&row)?;
+                let auth = UpstreamAuth::from_row(&row)?;
+                let tokens = PlainTokens {
+                    access_token: cipher.decrypt(&enc.access_token_enc)?,
+                    refresh_token: cipher.decrypt(&enc.refresh_token_enc)?,
+                    id_token: cipher.decrypt(&enc.id_token_enc)?,
+                };
+                Ok(Some((account, tokens, auth)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Find the account holding a provider-scoped upstream identity — the re-login target lookup.
+    /// Returns `(account_id, auth_mode)`; the identity itself is never a credential, but the mode
+    /// tells a caller whether re-login would be replacing an OAuth grant or a static bearer.
+    pub async fn find_by_upstream_identity(
+        &self,
+        provider: &str,
+        upstream_identity: &str,
+    ) -> Result<Option<(String, AuthMode)>, StoreError> {
+        let row = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, auth_mode FROM accounts WHERE provider = ? AND upstream_identity = ?",
+        )
+        .bind(provider)
+        .bind(upstream_identity)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(id, mode)| (id, AuthMode::parse(&mode))))
+    }
+
+    /// Persist rotated OAuth credentials together with the expiry the token endpoint reported.
+    ///
+    /// Separate from [`update_tokens`] because that method cannot express expiry, and an Anthropic
+    /// access token is opaque — its expiry exists ONLY in the token response. Writing tokens
+    /// without the matching expiry would leave the refresh gate reading a stale deadline for a
+    /// freshly rotated credential.
+    ///
+    /// [`update_tokens`]: Self::update_tokens
+    pub async fn update_oauth_tokens(
+        &self,
+        id: &str,
+        tokens: &PlainTokens,
+        cipher: &TokenCipher,
+        last_refresh: i64,
+        access_token_expires_at: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let enc = EncryptedTokens::encrypt(tokens, cipher)?;
+        sqlx::query(
+            "UPDATE accounts SET access_token_enc = ?, refresh_token_enc = ?, \
+             id_token_enc = ?, last_refresh = ?, access_token_expires_at = ? WHERE id = ?",
+        )
+        .bind(enc.access_token_enc.as_slice())
+        .bind(enc.refresh_token_enc.as_slice())
+        .bind(enc.id_token_enc.as_slice())
+        .bind(last_refresh)
+        .bind(access_token_expires_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        self.bump_token_generation();
+        Ok(())
     }
 
     /// List all accounts' metadata, ordered by id.
@@ -1039,6 +1373,20 @@ impl AccountRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrecognized_auth_mode_decodes_as_unknown_and_is_not_refreshable() {
+        assert_eq!(AuthMode::parse("codex_oauth"), AuthMode::CodexOauth);
+        assert_eq!(AuthMode::parse("anthropic_oauth"), AuthMode::AnthropicOauth);
+        assert_eq!(AuthMode::parse("static_bearer"), AuthMode::StaticBearer);
+        // The DB CHECK stops this being written today, but a row from a NEWER binary (whose CHECK
+        // admits more modes) must never be mistaken for a refreshable grant by an older one.
+        assert_eq!(AuthMode::parse("some_future_mode"), AuthMode::Unknown);
+        assert!(!AuthMode::Unknown.is_refreshable());
+        assert!(!AuthMode::StaticBearer.is_refreshable());
+        assert!(AuthMode::CodexOauth.is_refreshable());
+        assert!(AuthMode::AnthropicOauth.is_refreshable());
+    }
 
     #[tokio::test]
     async fn usage_history_since_returns_bounded_rows_ordered_ascending() {

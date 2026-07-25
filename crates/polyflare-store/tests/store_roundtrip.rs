@@ -224,3 +224,200 @@ async fn ensure_session_reattaching_matches_ensure_then_set_state() {
     assert_eq!(b.created_at, a.created_at);
     assert_eq!(b.key_strength, a.key_strength);
 }
+
+/// Reverse migration 0025 on an already-migrated database so the next `Store::open` re-runs it
+/// against whatever rows the test seeded. Mirrors the 0021/0016 pattern.
+async fn revert_migration_0025(pool: &sqlx::SqlitePool) {
+    sqlx::query("DROP INDEX accounts_provider_upstream_identity_idx")
+        .execute(pool)
+        .await
+        .unwrap();
+    for column in [
+        "upstream_identity",
+        "auth_mode",
+        "access_token_expires_at",
+        "oauth_contract_version",
+        "granted_scopes",
+    ] {
+        sqlx::query(&format!("ALTER TABLE accounts DROP COLUMN {column}"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    // Restore the pre-0025 onboarding-flow table, CHECK constraint and all.
+    sqlx::query("DROP TABLE account_onboarding_flows")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE account_onboarding_flows (
+            id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL CHECK (provider = 'codex'),
+            oauth_state TEXT NOT NULL UNIQUE,
+            verifier_enc BLOB NOT NULL,
+            initial_pool TEXT,
+            status TEXT NOT NULL CHECK (status IN ('pending','exchanging','completed','failed')),
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            finished_at INTEGER,
+            account_id TEXT,
+            error_code TEXT,
+            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE SET NULL
+        )",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 25")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Insert a pre-0025 account row directly (the repository would write the new columns).
+async fn seed_pre_0025_account(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    provider: &str,
+    chatgpt_account_id: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO accounts (id, chatgpt_account_id, email, plan_type, routing_policy, \
+         access_token_enc, refresh_token_enc, id_token_enc, last_refresh, created_at, status, \
+         security_work_authorized, provider) \
+         VALUES (?, ?, ?, 'pro', 'normal', X'01', X'02', X'03', 0, 0, 'active', 0, ?)",
+    )
+    .bind(id)
+    .bind(chatgpt_account_id)
+    .bind(format!("{id}@example.test"))
+    .bind(provider)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn migration_0025_backfills_identity_and_auth_mode_without_wedging_on_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("store.db");
+    let store = Store::open(&db_path).await.unwrap();
+    revert_migration_0025(store.pool()).await;
+
+    // A unique Codex identity, two Codex rows SHARING one identity (historically possible — no
+    // unique constraint ever enforced it), and a legacy Anthropic row with no ChatGPT identity.
+    seed_pre_0025_account(store.pool(), "codex-unique", "codex", Some("acct-unique")).await;
+    seed_pre_0025_account(store.pool(), "codex-dupe-a", "codex", Some("acct-shared")).await;
+    seed_pre_0025_account(store.pool(), "codex-dupe-b", "codex", Some("acct-shared")).await;
+    seed_pre_0025_account(store.pool(), "anthropic-legacy", "anthropic", None).await;
+    // A pending Codex onboarding flow must survive the table rebuild.
+    sqlx::query(
+        "INSERT INTO account_onboarding_flows (id, provider, oauth_state, verifier_enc, \
+         initial_pool, status, created_at, expires_at) \
+         VALUES ('flow-legacy', 'codex', 'state-legacy', X'AA', 'team-a', 'pending', 5, 900)",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    store.pool().close().await;
+    drop(store);
+
+    // Re-running 0025 must succeed rather than fail on the duplicate identity.
+    let upgraded = Store::open(&db_path).await.unwrap();
+
+    let rows: Vec<(String, Option<String>, String)> =
+        sqlx::query_as("SELECT id, upstream_identity, auth_mode FROM accounts ORDER BY id")
+            .fetch_all(upgraded.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            // The legacy Anthropic row keeps static-bearer behavior — it predates subscription
+            // OAuth, so calling it refreshable would be a lie.
+            (
+                "anthropic-legacy".to_string(),
+                None,
+                "static_bearer".to_string()
+            ),
+            // Both halves of the duplicate stay unset for operator resolution; neither is merged
+            // or deleted, and both remain fully usable accounts.
+            ("codex-dupe-a".to_string(), None, "codex_oauth".to_string()),
+            ("codex-dupe-b".to_string(), None, "codex_oauth".to_string()),
+            (
+                "codex-unique".to_string(),
+                Some("acct-unique".to_string()),
+                "codex_oauth".to_string()
+            ),
+        ]
+    );
+
+    // `chatgpt_account_id` is copied, never repurposed: the Codex companion header still resolves.
+    let chatgpt_id: Option<String> =
+        sqlx::query_scalar("SELECT chatgpt_account_id FROM accounts WHERE id = 'codex-dupe-a'")
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+    assert_eq!(chatgpt_id.as_deref(), Some("acct-shared"));
+
+    // The rebuilt flow table carries its row forward and now admits Anthropic.
+    let flow: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT flow_provider, status, redirect_uri FROM account_onboarding_flows \
+         WHERE id = 'flow-legacy'",
+    )
+    .fetch_one(upgraded.pool())
+    .await
+    .unwrap();
+    assert_eq!(flow, ("codex".to_string(), "pending".to_string(), None));
+    sqlx::query(
+        "INSERT INTO account_onboarding_flows (id, flow_provider, oauth_state, verifier_enc, \
+         status, created_at, expires_at, redirect_uri) \
+         VALUES ('flow-anthropic', 'anthropic', 'state-a', X'BB', 'pending', 5, 900, \
+                 'http://127.0.0.1:54321/callback')",
+    )
+    .execute(upgraded.pool())
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn migration_0025_unique_index_rejects_a_second_row_for_one_upstream_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+
+    seed_pre_0025_account(store.pool(), "anthropic-a", "anthropic", None).await;
+    seed_pre_0025_account(store.pool(), "anthropic-b", "anthropic", None).await;
+    seed_pre_0025_account(store.pool(), "codex-a", "codex", None).await;
+    let set_identity = |id: &'static str, provider: &'static str| {
+        let pool = store.pool().clone();
+        async move {
+            sqlx::query(
+                "UPDATE accounts SET upstream_identity = 'seat-1', provider = ? WHERE id = ?",
+            )
+            .bind(provider)
+            .bind(id)
+            .execute(&pool)
+            .await
+        }
+    };
+
+    set_identity("anthropic-a", "anthropic").await.unwrap();
+    // Same identity under a DIFFERENT provider is a different seat — allowed.
+    set_identity("codex-a", "codex").await.unwrap();
+    // Same identity under the SAME provider is the same seat — rejected, so re-login updates the
+    // existing row instead of silently creating a second account holding the same grant.
+    let conflict = set_identity("anthropic-b", "anthropic").await;
+    assert!(
+        conflict.is_err(),
+        "a duplicate (provider, upstream_identity) must be rejected"
+    );
+
+    // The rejected row keeps its NULL identity and is otherwise untouched — a conflict must not
+    // partially apply. NULL is exempt from the partial index, so many such rows coexist.
+    let unset: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE upstream_identity IS NULL ORDER BY id")
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(unset, vec!["anthropic-b".to_string()]);
+}

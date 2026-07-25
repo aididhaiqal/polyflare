@@ -9,6 +9,9 @@ use crate::StoreError;
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct OnboardingFlow {
     pub id: String,
+    /// `codex` | `anthropic`. Stored in the `flow_provider` column (migration 0025 retired the
+    /// original `provider` column, whose CHECK constraint pinned every flow to Codex) and read back
+    /// under this name by the repository's SELECTs.
     pub provider: String,
     pub oauth_state: String,
     pub verifier_enc: Vec<u8>,
@@ -19,6 +22,11 @@ pub struct OnboardingFlow {
     pub finished_at: Option<i64>,
     pub account_id: Option<String>,
     pub error_code: Option<String>,
+    /// The exact `redirect_uri` sent on the authorize request. The token endpoint compares it
+    /// byte-for-byte on exchange, and an Anthropic loopback flow binds an OS-assigned port that is
+    /// only known once the callback listener is bound — so it cannot be reconstructed later.
+    /// `None` for Codex flows, which use a fixed registered redirect.
+    pub redirect_uri: Option<String>,
 }
 
 #[derive(Clone)]
@@ -33,8 +41,9 @@ impl OnboardingRepo {
 
     pub async fn create(&self, flow: &OnboardingFlow) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO account_onboarding_flows (id, provider, oauth_state, verifier_enc, \
-             initial_pool, status, created_at, expires_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+            "INSERT INTO account_onboarding_flows (id, flow_provider, oauth_state, verifier_enc, \
+             initial_pool, status, created_at, expires_at, redirect_uri) \
+             VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
         )
         .bind(&flow.id)
         .bind(&flow.provider)
@@ -43,6 +52,7 @@ impl OnboardingRepo {
         .bind(flow.initial_pool.as_deref())
         .bind(flow.created_at)
         .bind(flow.expires_at)
+        .bind(flow.redirect_uri.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -50,8 +60,8 @@ impl OnboardingRepo {
 
     pub async fn get(&self, id: &str) -> Result<Option<OnboardingFlow>, StoreError> {
         Ok(sqlx::query_as::<_, OnboardingFlow>(
-            "SELECT id, provider, oauth_state, verifier_enc, initial_pool, status, created_at, \
-             expires_at, finished_at, account_id, error_code \
+            "SELECT id, flow_provider AS provider, oauth_state, verifier_enc, initial_pool, status, \
+             created_at, expires_at, finished_at, account_id, error_code, redirect_uri \
              FROM account_onboarding_flows WHERE id = ?",
         )
         .bind(id)
@@ -74,8 +84,8 @@ impl OnboardingRepo {
         .rows_affected();
         let flow = if changed == 1 {
             sqlx::query_as::<_, OnboardingFlow>(
-                "SELECT id, provider, oauth_state, verifier_enc, initial_pool, status, created_at, \
-                 expires_at, finished_at, account_id, error_code \
+                "SELECT id, flow_provider AS provider, oauth_state, verifier_enc, initial_pool, status, \
+                 created_at, expires_at, finished_at, account_id, error_code, redirect_uri \
                  FROM account_onboarding_flows WHERE id = ?",
             )
             .bind(id)
@@ -186,6 +196,7 @@ mod tests {
             finished_at: None,
             account_id: None,
             error_code: None,
+            redirect_uri: None,
         };
         store.onboarding().create(&flow).await.unwrap();
         let raw: Vec<u8> = sqlx::query_scalar(
@@ -228,6 +239,7 @@ mod tests {
             finished_at: None,
             account_id: None,
             error_code: None,
+            redirect_uri: None,
         };
         store.onboarding().create(&flow).await.unwrap();
         assert!(store
@@ -259,6 +271,7 @@ mod tests {
             finished_at: None,
             account_id: None,
             error_code: None,
+            redirect_uri: None,
         };
         store.onboarding().create(&flow).await.unwrap();
         let result = store
