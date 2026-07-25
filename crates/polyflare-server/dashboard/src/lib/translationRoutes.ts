@@ -1,4 +1,23 @@
-import type { TranslationRouteInput, TranslationRouteView } from "./api";
+import type {
+  TargetCapacityView,
+  TranslationRouteInput,
+  TranslationRouteView,
+} from "./api";
+
+/**
+ * Why a route target cannot serve a translated request, phrased for the operator.
+ *
+ * A route can be enabled, well-formed and matching and still be unservable: a subscription grant
+ * authorizes one first-party client shape, so selection excludes those accounts from translated
+ * traffic. Saying only "0 accounts" would leave the operator hunting; name the cause.
+ */
+export function unservableReason(capacity: TargetCapacityView): string {
+  if (capacity.barred_subscription > 0) {
+    const n = capacity.barred_subscription;
+    return `${n} subscription account${n === 1 ? "" : "s"} on this target can serve only native client traffic.`;
+  }
+  return "No account or credential on this target can serve it.";
+}
 
 export function emptyTranslationRoute(priority = 100): TranslationRouteInput {
   return {

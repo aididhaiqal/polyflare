@@ -5,9 +5,11 @@ import type {
   CustomProviderView,
   TranslationMatchKind,
   TranslationReasoningEffort,
+  TargetCapacityView,
   TranslationRouteInput,
   TranslationRouteView,
 } from "../lib/api";
+import { targetCapacityKey } from "../lib/api";
 import { latency, relTime } from "../lib/format";
 import {
   useDeleteTranslationRoute,
@@ -21,6 +23,7 @@ import {
   emptyTranslationRoute,
   nextTranslationPriority,
   routeInputFrom,
+  unservableReason,
 } from "../lib/translationRoutes";
 import { Card } from "../ui/Card";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
@@ -109,23 +112,7 @@ export function Translations() {
         </button>
       </div>
 
-      <Card className="relative gap-4 border-accent/20 bg-[linear-gradient(112deg,hsl(var(--card))_0%,hsl(var(--accent)/0.06)_52%,hsl(var(--signal)/0.05)_100%)]">
-        <div className="flex flex-wrap items-center gap-2 text-[10px] font-semibold">
-          <ProtocolNode label="Anthropic Messages" detail="/v1/messages" tone="signal" />
-          <ArrowRight className="h-4 w-4 text-fg opacity-30" />
-          <ProtocolNode
-            label={`${enabledCount} active matcher${enabledCount === 1 ? "" : "s"}`}
-            detail="first priority wins"
-            tone="accent"
-          />
-          <ArrowRight className="h-4 w-4 text-fg opacity-30" />
-          <ProtocolNode label="OpenAI Responses" detail="/responses · either direction" tone="success" />
-        </div>
-        <p className="text-[10px] leading-5 text-fg opacity-55">
-          No enabled match means native same-protocol routing. Lower priority values run first;
-          route ID provides a stable tie-break.
-        </p>
-      </Card>
+      <RoutingFork enabledCount={enabledCount} />
 
       {editor && (
         <RouteEditor
@@ -171,6 +158,7 @@ export function Translations() {
                       : providers.data?.find((provider) => provider.id === route.target_provider_id)
                           ?.display_name ?? "Unavailable custom provider"
                   }
+                  capacity={translations.data?.target_capacity?.[targetCapacityKey(route)]}
                   pending={save.isPending || remove.isPending}
                   onToggle={(enabled) =>
                     save.mutate({ id: route.id, route: { ...routeInputFrom(route), enabled } })
@@ -183,7 +171,8 @@ export function Translations() {
             </div>
           ) : (
             <div className="px-4 py-10 text-center text-[11px] text-fg opacity-50">
-              No routes. Claude requests will use native Anthropic routing.
+              No routes yet. Every request keeps its own protocol, and a real Claude client is
+              forwarded byte for byte.
             </div>
           )}
         </Card>
@@ -244,15 +233,33 @@ export function Translations() {
               )}
             >
               {testMatch.data.route ? (
-                <div className="flex items-start gap-2">
-                  <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  <span>
-                    Matches <strong>{testMatch.data.route.name}</strong> →{" "}
-                    <span className="font-mono">{testMatch.data.route.target_model}</span>
-                  </span>
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex items-start gap-2">
+                    <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>
+                      Rewritten by <strong>{testMatch.data.route.name}</strong> →{" "}
+                      <span className="font-mono">{testMatch.data.route.target_model}</span>
+                    </span>
+                  </div>
+                  {testMatch.data.target_capacity &&
+                    testMatch.data.target_capacity.eligible === 0 && (
+                      <div className="flex items-start gap-2 text-error">
+                        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                        <span>
+                          {unservableReason(testMatch.data.target_capacity)} This request would fail
+                          with no eligible account.
+                        </span>
+                      </div>
+                    )}
                 </div>
               ) : (
-                "No match. This model will use native Anthropic routing."
+                <div className="flex items-start gap-2">
+                  <ArrowRight className="mt-0.5 h-3.5 w-3.5 shrink-0 opacity-50" />
+                  <span>
+                    Not rewritten. The request keeps its own protocol, and a real Claude client is
+                    forwarded byte for byte.
+                  </span>
+                </div>
               )}
             </div>
           )}
@@ -267,7 +274,7 @@ export function Translations() {
           if (!open) setDeleteTarget(null);
         }}
         title={`Delete ${deleteTarget?.name ?? "translation route"}?`}
-        description="Matching requests will fall through to the next route or native Anthropic routing."
+        description="Matching requests fall through to the next route, or stop being rewritten at all and pass through on their own protocol."
         confirmLabel="Delete route"
         danger
         busy={remove.isPending}
@@ -280,31 +287,73 @@ export function Translations() {
   );
 }
 
-function ProtocolNode({
-  label,
-  detail,
-  tone,
-}: {
-  label: string;
-  detail: string;
-  tone: "signal" | "accent" | "success";
-}) {
-  const tones = {
-    signal: "border-signal/25 bg-signal/[0.07] text-signal",
-    accent: "border-accent/25 bg-accent/[0.07] text-accent",
-    success: "border-success/25 bg-success/[0.07] text-success",
-  };
+/**
+ * What happens to an incoming request — the page's thesis.
+ *
+ * Drawn as a fork rather than a pipeline because that is what the router actually does: a request
+ * either matches a route and is rewritten into another protocol, or it matches nothing and keeps
+ * its own. The second branch is not a gap. For a real Claude client it is the better outcome, since
+ * an unrewritten request is forwarded byte for byte, so it gets equal weight here.
+ */
+function RoutingFork({ enabledCount }: { enabledCount: number }) {
   return (
-    <div className={clsx("min-w-40 rounded-lg border px-3 py-2", tones[tone])}>
-      <div>{label}</div>
-      <div className="mt-0.5 font-mono text-[8.5px] opacity-60">{detail}</div>
-    </div>
+    <Card className="gap-3 border-accent/20">
+      <div className="text-[8px] font-bold uppercase tracking-[0.2em] text-fg opacity-40">
+        What happens to an incoming request
+      </div>
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+        <div className="rounded-lg border border-accent/25 bg-accent/[0.06] px-3 py-2.5">
+          <div className="flex items-center gap-1.5 text-[10px] font-semibold text-accent">
+            <FlaskConical className="h-3.5 w-3.5" />
+            Matches a route
+          </div>
+          <p className="mt-1 text-[10px] leading-5 text-fg opacity-60">
+            Rewritten into the target&apos;s protocol and sent there.{" "}
+            {enabledCount === 0
+              ? "No routes are enabled, so nothing takes this branch."
+              : `${enabledCount} enabled ${enabledCount === 1 ? "route" : "routes"}; lowest priority wins, route ID breaks ties.`}
+          </p>
+        </div>
+        <div className="rounded-lg border border-border bg-bg/35 px-3 py-2.5">
+          <div className="flex items-center gap-1.5 text-[10px] font-semibold text-fg">
+            <ArrowRight className="h-3.5 w-3.5 opacity-50" />
+            Matches nothing
+          </div>
+          <p className="mt-1 text-[10px] leading-5 text-fg opacity-60">
+            Keeps its own protocol. A real Claude client is forwarded byte for byte, with only the
+            credential swapped.
+          </p>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+/** Whether a route's target can serve it, shown where the route is read. */
+function CapacityBadge({ capacity }: { capacity: TargetCapacityView | undefined }) {
+  if (!capacity) return null;
+  if (capacity.eligible > 0) {
+    return (
+      <span className="text-[9px] text-fg opacity-45">
+        {capacity.eligible} can serve
+      </span>
+    );
+  }
+  return (
+    <span
+      className="flex items-center gap-1 rounded bg-error/10 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wide text-error"
+      title={unservableReason(capacity)}
+    >
+      <AlertTriangle className="h-3 w-3" />
+      Nothing can serve this
+    </span>
   );
 }
 
 function RouteRow({
   route,
   targetLabel,
+  capacity,
   pending,
   onToggle,
   onEdit,
@@ -313,6 +362,7 @@ function RouteRow({
 }: {
   route: TranslationRouteView;
   targetLabel: string;
+  capacity: TargetCapacityView | undefined;
   pending: boolean;
   onToggle: (enabled: boolean) => void;
   onEdit: () => void;
@@ -350,13 +400,20 @@ function RouteRow({
         <div className="truncate font-mono text-[10.5px] font-semibold text-fg">
           {route.target_model}
         </div>
-        <div className="mt-1 text-[9px] text-fg opacity-45">
-          {route.source_protocol === "anthropic_messages"
-            ? "Anthropic Messages"
-            : "OpenAI Responses"}{" "}
-          → {targetLabel}
-          {route.reasoning_effort ? ` · ${route.reasoning_effort} effort` : ""}
+        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[9px] text-fg opacity-45">
+          <span>
+            {route.source_protocol === "anthropic_messages"
+              ? "Anthropic Messages"
+              : "OpenAI Responses"}{" "}
+            → {targetLabel}
+            {route.reasoning_effort ? ` · ${route.reasoning_effort} effort` : ""}
+          </span>
         </div>
+        {route.enabled && (
+          <div className="mt-1 flex items-center">
+            <CapacityBadge capacity={capacity} />
+          </div>
+        )}
       </div>
       <div className="flex items-center justify-between gap-1 lg:justify-end">
         <Switch

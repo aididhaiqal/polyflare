@@ -94,6 +94,16 @@ struct AccountView {
     status: String,
     plan_type: String,
     routing_policy: String,
+    /// How this account's upstream credential works: `codex_oauth` | `anthropic_oauth` |
+    /// `static_bearer`. Non-secret metadata — it names the credential CONTRACT, never the
+    /// credential. Load-bearing for the operator: an `anthropic_oauth` grant authorizes one
+    /// first-party client shape, so it serves native client traffic only and is excluded from
+    /// translated routes.
+    auth_mode: String,
+    /// Whether this account may serve a request PolyFlare synthesized by translating another
+    /// protocol. Derived from `auth_mode` rather than restated by hand, so the dashboard and the
+    /// router can never disagree about eligibility.
+    serves_translated: bool,
     security_work_authorized: bool,
     reset_at: Option<i64>,
     /// 5h window (may be null).
@@ -131,6 +141,10 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         Ok(pools) => pools,
         Err(_) => return Response::error(),
     };
+    let auth_modes = match repo.list_auth_modes().await {
+        Ok(modes) => modes,
+        Err(_) => return Response::error(),
+    };
     let request_counts = match state
         .store
         .request_log()
@@ -143,6 +157,10 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
     let mut views = Vec::with_capacity(accounts.len());
     for account in accounts {
         let usage = usage_by_account.remove(&account.id).unwrap_or_default();
+        let auth_mode = auth_modes
+            .get(&account.id)
+            .copied()
+            .unwrap_or(polyflare_store::AuthMode::Unknown);
         let resolved = resolve(&usage, now);
         let mut usage_windows = Vec::with_capacity(2);
         if let Some(w) = &resolved.five_hour {
@@ -202,6 +220,13 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
             status: account.status,
             plan_type: account.plan_type,
             routing_policy: account.routing_policy,
+            auth_mode: auth_mode.as_str().to_string(),
+            // Mirrors the router's own rule: only a subscription grant is barred from translated
+            // traffic. An unrecognized mode fails closed as not-eligible, exactly as selection does.
+            serves_translated: matches!(
+                auth_mode,
+                polyflare_store::AuthMode::CodexOauth | polyflare_store::AuthMode::StaticBearer
+            ),
             security_work_authorized: account.security_work_authorized,
             reset_at: account.reset_at,
             five_hour: resolved.five_hour.map(Into::into),

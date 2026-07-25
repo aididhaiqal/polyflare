@@ -1,11 +1,14 @@
 //! Authenticated management API for bidirectional protocol translation routes.
 
+use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use polyflare_core::Provider;
 use polyflare_store::{
     NewTranslationRoute, TranslatedRequestRow, TranslationRoute, TranslationRouteUpdate,
 };
@@ -203,14 +206,114 @@ impl From<TranslatedRequestRow> for TranslatedRequestView {
     }
 }
 
+/// Whether a route's target can actually serve a TRANSLATED request right now.
+///
+/// A route can be enabled, well-formed, and matching, and still have nothing able to serve it: a
+/// subscription-OAuth grant authorizes one first-party client shape, so those accounts are excluded
+/// from translated traffic during selection and such a request fails with "no eligible account".
+/// That rule is invisible in the route definition, so the API states it per target.
+#[derive(Debug, Clone, Copy, Serialize)]
+struct TargetCapacityView {
+    /// Accounts (built-in target) or enabled credentials (custom target) able to serve translated
+    /// traffic for this target.
+    eligible: i64,
+    /// Accounts that belong to this target but may serve only native client traffic. Non-zero here
+    /// with `eligible == 0` is the trap: the route looks healthy and cannot run.
+    barred_subscription: i64,
+}
+
+/// Serviceability of one route target, keyed `"{target_kind}:{target_provider_id}"`.
+///
+/// Returned as a map rather than a field on each route so a target shared by several routes is
+/// computed once, and so `RouteView`'s pure `From<TranslationRoute>` conversion stays free of
+/// async state lookups.
+type TargetCapacityMap = HashMap<String, TargetCapacityView>;
+
+fn target_key(target_kind: &str, target_provider_id: &str) -> String {
+    format!("{target_kind}:{target_provider_id}")
+}
+
+/// Count what can serve translated traffic for one target.
+///
+/// Built-in targets resolve to accounts and honor the subscription-OAuth exclusion. Custom targets
+/// resolve to provider credentials, which are API keys — never subscription grants — so nothing is
+/// ever barred there.
+async fn target_capacity(
+    state: &AppState,
+    target_kind: &str,
+    target_provider_id: &str,
+) -> TargetCapacityView {
+    match target_kind {
+        "builtin_provider" => {
+            let Ok(provider) = Provider::from_str(target_provider_id) else {
+                return TargetCapacityView {
+                    eligible: 0,
+                    barred_subscription: 0,
+                };
+            };
+            let Ok(snapshots) = state.account_cache.snapshots(&state.store).await else {
+                return TargetCapacityView {
+                    eligible: 0,
+                    barred_subscription: 0,
+                };
+            };
+            let mine = snapshots.iter().filter(|s| s.provider == provider);
+            let (mut eligible, mut barred) = (0, 0);
+            for snapshot in mine {
+                if snapshot.subscription_oauth {
+                    barred += 1;
+                } else {
+                    eligible += 1;
+                }
+            }
+            TargetCapacityView {
+                eligible,
+                barred_subscription: barred,
+            }
+        }
+        "custom_provider" => {
+            let eligible = state
+                .store
+                .providers()
+                .list_credentials(target_provider_id)
+                .await
+                .map(|credentials| credentials.iter().filter(|c| c.enabled).count() as i64)
+                .unwrap_or(0);
+            TargetCapacityView {
+                eligible,
+                barred_subscription: 0,
+            }
+        }
+        _ => TargetCapacityView {
+            eligible: 0,
+            barred_subscription: 0,
+        },
+    }
+}
+
+/// Capacity for every distinct target among `routes`, computed once per target.
+async fn capacity_for_routes(state: &AppState, routes: &[RouteView]) -> TargetCapacityMap {
+    let mut out = TargetCapacityMap::new();
+    for route in routes {
+        let key = target_key(&route.target_kind, &route.target_provider_id);
+        if out.contains_key(&key) {
+            continue;
+        }
+        let capacity = target_capacity(state, &route.target_kind, &route.target_provider_id).await;
+        out.insert(key, capacity);
+    }
+    out
+}
+
 #[derive(Serialize)]
 struct RoutesView {
     routes: Vec<RouteView>,
     recent_requests: Vec<TranslatedRequestView>,
+    target_capacity: TargetCapacityMap,
 }
 
 pub async fn list(State(state): State<Arc<AppState>>) -> Response {
-    let routes = match state.store.translations().list().await {
+    let routes: Vec<RouteView> = match state.store.translations().list().await {
         Ok(routes) => routes.into_iter().map(RouteView::from).collect(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -218,9 +321,11 @@ pub async fn list(State(state): State<Arc<AppState>>) -> Response {
         Ok(rows) => rows.into_iter().map(TranslatedRequestView::from).collect(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
+    let target_capacity = capacity_for_routes(&state, &routes).await;
     Json(RoutesView {
         routes,
         recent_requests,
+        target_capacity,
     })
     .into_response()
 }
@@ -308,6 +413,10 @@ pub struct TestInput {
 struct TestView {
     matched: bool,
     route: Option<RouteView>,
+    /// Serviceability of the matched route's target. `None` when nothing matched — in which case
+    /// the request is NOT translated at all: a native client request falls through to the
+    /// same-protocol path, where a real Claude client is forwarded byte-for-byte.
+    target_capacity: Option<TargetCapacityView>,
 }
 
 pub async fn test_match(
@@ -323,11 +432,21 @@ pub async fn test_match(
         .resolve(&input.source_protocol, input.model.trim())
         .await
     {
-        Ok(route) => Json(TestView {
-            matched: route.is_some(),
-            route: route.map(RouteView::from),
-        })
-        .into_response(),
+        Ok(route) => {
+            let route = route.map(RouteView::from);
+            let capacity = match route.as_ref() {
+                Some(route) => Some(
+                    target_capacity(&state, &route.target_kind, &route.target_provider_id).await,
+                ),
+                None => None,
+            };
+            Json(TestView {
+                matched: route.is_some(),
+                route,
+                target_capacity: capacity,
+            })
+            .into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

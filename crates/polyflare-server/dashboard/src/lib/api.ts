@@ -125,6 +125,10 @@ export interface AccountView {
   status: string;
   plan_type: string;
   routing_policy: string;
+  /** How the upstream credential works: "codex_oauth" | "anthropic_oauth" | "static_bearer". */
+  auth_mode: string;
+  /** Whether this account may serve a request translated from another protocol. */
+  serves_translated: boolean;
   security_work_authorized: boolean;
   reset_at: number | null;
   five_hour: WindowView | null;
@@ -834,9 +838,27 @@ export interface TranslatedRequestView {
   duration_ms: number;
 }
 
+/** Who can actually serve a translated request for one route target. */
+export interface TargetCapacityView {
+  /** Accounts (built-in target) or enabled credentials (custom target) able to serve it. */
+  eligible: number;
+  /** Accounts on this target that may serve only native client traffic. */
+  barred_subscription: number;
+}
+
 export interface TranslationRoutesView {
   routes: TranslationRouteView[];
   recent_requests: TranslatedRequestView[];
+  /** Keyed `"{target_kind}:{target_provider_id}"`. */
+  target_capacity: Record<string, TargetCapacityView>;
+}
+
+/** The key used to look a route's target up in `target_capacity`. */
+export function targetCapacityKey(route: {
+  target_kind: string;
+  target_provider_id: string;
+}): string {
+  return `${route.target_kind}:${route.target_provider_id}`;
 }
 
 export type TranslationRouteInput = Omit<
@@ -847,6 +869,8 @@ export type TranslationRouteInput = Omit<
 export interface TranslationTestResult {
   matched: boolean;
   route: TranslationRouteView | null;
+  /** Null when nothing matched — the request is not translated at all. */
+  target_capacity: TargetCapacityView | null;
 }
 
 // ---------------------------------------------------------------------------------------------
