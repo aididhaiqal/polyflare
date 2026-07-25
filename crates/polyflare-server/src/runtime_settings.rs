@@ -1,11 +1,11 @@
-//! Live-editable Settings subsystem Task 2: `RuntimeSettings`, an atomic holder for the 11
+//! Live-editable Settings subsystem Task 2: `RuntimeSettings`, an atomic holder for the 12
 //! live-editable settings. Task 1's pure `clamp_<field>` fns (`crate::config`) are the
 //! single source of truth for each field's bound; `set` re-validates every write through the SAME
 //! fns the boot path (`ServeConfig::from_env`) uses — never a second copy of a bound that can
 //! drift. A later task wires this into `AppState` + the settings PATCH endpoint; this module only
 //! holds the live values and validates writes.
 //!
-//! **Ordering:** every load/store is `Ordering::Relaxed` — each of the 11 fields is an
+//! **Ordering:** every load/store is `Ordering::Relaxed` — each of the 12 fields is an
 //! independently atomic cell with no cross-field invariant that needs a stronger ordering, save
 //! one: `starvation_heartbeat`'s clamp reads the CURRENT `starvation_wait_budget` atomic (via
 //! [`RuntimeSettings::starvation_wait_budget`]) at the moment of the `set` call, not the value
@@ -71,6 +71,7 @@ pub struct RuntimeSettings {
     usage_history_retention_days: AtomicU32,
     live_logs: AtomicBool,
     chatgpt_backend_passthrough_enabled: AtomicBool,
+    wham_usage_replace_main_limit: AtomicBool,
     // Restart-required settings are immutable snapshots of what this process actually applied at
     // boot. PATCH persists a configured value for the next boot but deliberately does not mutate
     // these fields, allowing GET /api/settings to report an honest pending-restart state.
@@ -124,6 +125,7 @@ impl RuntimeSettings {
             usage_history_retention_days: AtomicU32::new(cfg.usage_history_retention_days),
             live_logs: AtomicBool::new(cfg.live_logs),
             chatgpt_backend_passthrough_enabled: AtomicBool::new(true),
+            wham_usage_replace_main_limit: AtomicBool::new(true),
             client_websocket_enabled: cfg.client_websocket_enabled,
             http_requests_use_upstream_websocket: cfg.http_requests_use_upstream_websocket,
             http_upstream_websocket_ping: cfg.http_upstream_websocket_ping,
@@ -156,6 +158,7 @@ impl RuntimeSettings {
             usage_history_retention_days: AtomicU32::new(f.usage_history_retention_days),
             live_logs: AtomicBool::new(f.live_logs),
             chatgpt_backend_passthrough_enabled: AtomicBool::new(true),
+            wham_usage_replace_main_limit: AtomicBool::new(true),
             client_websocket_enabled: true,
             http_requests_use_upstream_websocket: false,
             http_upstream_websocket_ping: false,
@@ -207,6 +210,10 @@ impl RuntimeSettings {
     pub fn chatgpt_backend_passthrough_enabled(&self) -> bool {
         self.chatgpt_backend_passthrough_enabled
             .load(Ordering::Relaxed)
+    }
+
+    pub fn wham_usage_replace_main_limit(&self) -> bool {
+        self.wham_usage_replace_main_limit.load(Ordering::Relaxed)
     }
 
     pub fn client_websocket_enabled(&self) -> bool {
@@ -306,6 +313,12 @@ impl RuntimeSettings {
                     .store(b, Ordering::Relaxed);
                 Ok(b.to_string())
             }
+            "wham_usage_replace_main_limit" => {
+                let b = expect_bool(key, raw)?;
+                self.wham_usage_replace_main_limit
+                    .store(b, Ordering::Relaxed);
+                Ok(b.to_string())
+            }
             _ => Err(SettingsError::UnknownKey(key.to_string())),
         }
     }
@@ -322,9 +335,10 @@ impl RuntimeSettings {
 /// that at apply time, exactly as it does for a live PATCH.
 pub fn parse_setting_value(key: &str, s: &str) -> Option<SettingValue> {
     match key {
-        "soft_drain_enabled" | "live_logs" | "chatgpt_backend_passthrough_enabled" => {
-            s.parse::<bool>().ok().map(SettingValue::Bool)
-        }
+        "soft_drain_enabled"
+        | "live_logs"
+        | "chatgpt_backend_passthrough_enabled"
+        | "wham_usage_replace_main_limit" => s.parse::<bool>().ok().map(SettingValue::Bool),
         "inflight_penalty_pct" => s.parse::<f64>().ok().map(SettingValue::F64),
         "max_account_attempts"
         | "starvation_wait_budget"
@@ -670,6 +684,17 @@ mod tests {
     }
 
     #[test]
+    fn wham_usage_main_limit_replacement_defaults_on_and_can_be_disabled_live() {
+        let rs = RuntimeSettings::new(&test_config());
+        assert!(rs.wham_usage_replace_main_limit());
+        let stored = rs
+            .set("wham_usage_replace_main_limit", SettingValue::Bool(false))
+            .unwrap();
+        assert_eq!(stored, "false");
+        assert!(!rs.wham_usage_replace_main_limit());
+    }
+
+    #[test]
     fn set_unknown_key_is_rejected() {
         let rs = RuntimeSettings::new(&test_config());
         let err = rs
@@ -742,6 +767,10 @@ mod tests {
             Some(SettingValue::Bool(true))
         );
         assert_eq!(
+            parse_setting_value("wham_usage_replace_main_limit", "false"),
+            Some(SettingValue::Bool(false))
+        );
+        assert_eq!(
             parse_setting_value("inflight_penalty_pct", "12.5"),
             Some(SettingValue::F64(12.5))
         );
@@ -793,6 +822,18 @@ mod tests {
         );
         overlay_persisted_settings(&rs, &overlay);
         assert!(!rs.chatgpt_backend_passthrough_enabled());
+    }
+
+    #[test]
+    fn overlay_persisted_settings_can_restore_named_wham_limit_display() {
+        let rs = RuntimeSettings::new(&test_config());
+        let mut overlay = HashMap::new();
+        overlay.insert(
+            "wham_usage_replace_main_limit".to_string(),
+            "false".to_string(),
+        );
+        overlay_persisted_settings(&rs, &overlay);
+        assert!(!rs.wham_usage_replace_main_limit());
     }
 
     #[test]

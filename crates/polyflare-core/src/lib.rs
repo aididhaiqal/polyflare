@@ -5,6 +5,7 @@ pub mod depletion;
 pub mod format;
 pub mod pricing;
 pub mod provider;
+pub mod reset_credit;
 pub mod select;
 pub mod traits;
 pub mod translate;

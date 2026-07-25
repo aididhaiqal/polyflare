@@ -258,6 +258,52 @@ export interface PoolView {
   strategy: string;
 }
 
+export type ResetCreditRecommendation =
+  | "redeem_now"
+  | "redeem_before_expiry"
+  | "hold"
+  | "wait_for_natural_reset"
+  | "low_benefit"
+  | "no_credit"
+  | "unavailable";
+
+export interface ResetPlanCandidateView {
+  account_id: string;
+  email: string;
+  alias: string | null;
+  plan_type: string;
+  pools: string[];
+  weekly_used_percent: number;
+  weekly_reset_at: number | null;
+  available_credits: number;
+  earliest_credit_expires_at: number | null;
+  snapshot_fetched_at: number | null;
+  recoverable_credits: number;
+  time_weighted_value: number;
+  recommendation: ResetCreditRecommendation;
+  reason: string;
+}
+
+export interface ResetPlanView {
+  generated_at: number;
+  total_credits: number;
+  accounts_with_credits: number;
+  recommended_now: number;
+  candidates: ResetPlanCandidateView[];
+}
+
+export interface ResetRedeemResult {
+  account_id: string;
+  code: string;
+  windows_reset: number;
+  redeemed_at: number | null;
+}
+
+export interface FleetResetRedeemResponse {
+  results: ResetRedeemResult[];
+  errors: Array<{ account_id: string; message: string }>;
+}
+
 /** `read_api.rs::RequestRowView` — one row of `GET /api/requests`. */
 export interface RequestRowView {
   id: number;
@@ -1058,6 +1104,38 @@ export function testTranslationRoute(input: {
   });
 }
 
+export function redeemAccountResetCredit(
+  id: string,
+  redeemRequestId: string,
+  requireRecommended = false,
+): Promise<ResetRedeemResult> {
+  return fetchJson<ResetRedeemResult>(
+    `/api/accounts/${encodeURIComponent(id)}/reset-credit`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        redeem_request_id: redeemRequestId,
+        require_recommended: requireRecommended,
+      }),
+    },
+  );
+}
+
+export function redeemFleetResetCredits(
+  accountIds: string[],
+  redeemRequestId: string,
+): Promise<FleetResetRedeemResponse> {
+  return fetchJson<FleetResetRedeemResponse>("/api/reset-credits/redeem", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      redeem_request_id: redeemRequestId,
+      account_ids: accountIds,
+    }),
+  });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Thin per-endpoint helpers (queries.ts wraps these in useQuery).
 // ---------------------------------------------------------------------------------------------
@@ -1070,6 +1148,7 @@ export const api = {
   accountTrends: (id: string) =>
     fetchJson<TrendsView>(`/api/accounts/${encodeURIComponent(id)}/trends`),
   pools: () => fetchJson<PoolView[]>("/api/pools"),
+  resetCreditPlan: () => fetchJson<ResetPlanView>("/api/reset-credits/plan"),
   pace: () => fetchJson<PaceResponse>("/api/pace"),
   requests: (qs: string) => fetchJson<RequestsView>(`/api/requests${qs}`),
   sessions: (qs: string) => fetchJson<SessionsView>(`/api/sessions${qs}`),

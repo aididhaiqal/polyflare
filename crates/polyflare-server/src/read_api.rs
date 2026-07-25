@@ -1819,6 +1819,15 @@ const FIELD_SPECS: &[FieldSpec] = &[
         max: None,
         default: "true",
     },
+    FieldSpec {
+        key: "wham_usage_replace_main_limit",
+        class: "live",
+        kind: "bool",
+        coercion: Some(FieldKind::Bool),
+        min: None,
+        max: None,
+        default: "true",
+    },
     // --- restart-only (10; five WebSocket values are editable for the next boot) ---
     FieldSpec {
         key: "routing_strategy",
@@ -2038,6 +2047,7 @@ pub(crate) const LIVE_KEYS_ORDER: &[&str] = &[
     "usage_history_retention_days",
     "live_logs",
     "chatgpt_backend_passthrough_enabled",
+    "wham_usage_replace_main_limit",
 ];
 
 /// A live field's current value, stringified. Durations emit the whole-seconds number (e.g.
@@ -2058,6 +2068,7 @@ fn live_value(rs: &crate::runtime_settings::RuntimeSettings, key: &str) -> Strin
         "chatgpt_backend_passthrough_enabled" => {
             rs.chatgpt_backend_passthrough_enabled().to_string()
         }
+        "wham_usage_replace_main_limit" => rs.wham_usage_replace_main_limit().to_string(),
         _ => unreachable!("live_value called with a non-live key: {key}"),
     }
 }
@@ -2115,7 +2126,7 @@ fn restart_or_fixed_value(state: &AppState, key: &str) -> Option<String> {
     }
 }
 
-/// One config field as the Settings page consumes it. The 10 `class: "live"` fields carry their
+/// One config field as the Settings page consumes it. The 12 `class: "live"` fields carry their
 /// current `RuntimeSettings` value + clamp bounds; the rest are informational (see `FIELD_SPECS`'s
 /// doc). `admin_token`'s `value` is always `None` (never the token string — presence only).
 #[derive(Serialize)]
@@ -2147,6 +2158,7 @@ fn setting_label(key: &'static str) -> &'static str {
         "websocket_idle_ping_secs" => "Parked WebSocket ping interval",
         "websocket_idle_budget_secs" => "Parked WebSocket idle budget",
         "chatgpt_backend_passthrough_enabled" => "ChatGPT backend passthrough",
+        "wham_usage_replace_main_limit" => "Replace main Codex usage",
         _ => "",
     }
 }
@@ -2170,6 +2182,9 @@ fn setting_description(key: &'static str) -> &'static str {
         }
         "chatgpt_backend_passthrough_enabled" => {
             "Enabled by default. Forward non-usage ChatGPT backend HTTP and WebSocket routes with the client's own credentials; disable as a live rollback."
+        }
+        "wham_usage_replace_main_limit" => {
+            "Use the PolyFlare pool aggregate as the single main Codex usage meter. Disable to also show a separate named PolyFlare pool meter."
         }
         _ => "",
     }

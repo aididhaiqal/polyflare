@@ -27,6 +27,7 @@ pub mod provider_api;
 pub mod reactive_auth;
 pub mod read_api;
 pub mod refresh_locks;
+pub mod reset_credits;
 pub mod retention;
 pub mod runtime_settings;
 pub mod runtime_state;

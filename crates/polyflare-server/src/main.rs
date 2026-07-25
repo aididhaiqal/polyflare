@@ -331,6 +331,9 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // Runtime usage-refresh loop: keeps each Codex account's rate-limit windows (5h + weekly) and
     // routing gate live, instead of the frozen numbers the importer left.
     polyflare_server::usage_refresh::spawn_usage_refresh(state.clone());
+    // Reset-credit discovery is deliberately independent of routing usage health: failures never
+    // bench an account, while successful consumes trigger the usage poller's immediate refresh.
+    polyflare_server::reset_credits::spawn_reset_credit_refresh(state.clone());
     // C12: hourly age-retention pruning over `request_log` + `usage_history` (disabled by default
     // via POLYFLARE_*_RETENTION_DAYS=0; see `polyflare_server::retention`).
     polyflare_server::retention::spawn_retention_prune(state.clone());

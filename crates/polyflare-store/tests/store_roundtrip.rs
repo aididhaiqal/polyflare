@@ -190,6 +190,42 @@ async fn migration_0021_classifies_legacy_usage_without_inventing_new_token_fact
 }
 
 #[tokio::test]
+async fn migration_0028_preserves_legacy_native_requests_with_unknown_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("store.db");
+    let store = Store::open(&db_path).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO reset_credit_native_requests \
+         (redeem_request_id, account_id, requested_credit_id, created_at, pool_scope) \
+         VALUES ('legacy-native', 'deleted-account', 'credit-a', 100, 'alpha')",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE reset_credit_native_requests DROP COLUMN pool_scope")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 28")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    store.pool().close().await;
+    drop(store);
+
+    let upgraded = Store::open(&db_path).await.unwrap();
+    let row: (String, Option<String>) = sqlx::query_as(
+        "SELECT redeem_request_id, pool_scope FROM reset_credit_native_requests \
+         WHERE redeem_request_id = 'legacy-native'",
+    )
+    .fetch_one(upgraded.pool())
+    .await
+    .unwrap();
+    assert_eq!(row, ("legacy-native".into(), None));
+}
+
+#[tokio::test]
 async fn ensure_session_reattaching_matches_ensure_then_set_state() {
     // The folded UPSERT must be behavior-equivalent to `ensure_session` + `set_state("reattaching")`:
     // a new key is created directly in `reattaching`; a re-call keeps it reattaching with created_at

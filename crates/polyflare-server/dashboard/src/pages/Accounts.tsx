@@ -28,14 +28,19 @@ import * as Select from "@radix-ui/react-select";
 import * as Tabs from "@radix-ui/react-tabs";
 import clsx from "clsx";
 
-import type { AccountView, TokenHealthView, WindowView } from "../lib/api";
+import type {
+  AccountView,
+  ResetPlanCandidateView,
+  TokenHealthView,
+  WindowView,
+} from "../lib/api";
 import { compactNum, countdown, pct } from "../lib/format";
 import {
   quotaDisplayLabel,
   quotaDisplayPercent,
   quotaWindowIsPresent,
 } from "../lib/quotaDisplay";
-import { useAccounts } from "../lib/queries";
+import { useAccounts, useResetCreditPlan } from "../lib/queries";
 import { useAccountActions, type AccountActionsApi } from "../lib/useAccountActions";
 import { useQuotaDisplayPreference } from "../preferences/QuotaDisplayPreference";
 import {
@@ -119,6 +124,7 @@ function tokenHealthLabel(
 
 export function Accounts() {
   const { data, isLoading, isError, error, refetch } = useAccounts();
+  const resetPlan = useResetCreditPlan();
   // One shared instance for the whole list — both the card grid and the table pass this down to
   // their row-level `AccountRowMenu`, and its dialogs render exactly once below.
   const actions = useAccountActions();
@@ -187,6 +193,12 @@ export function Accounts() {
 
   const filtered = accounts.filter(
     (a) => matchesProvider(a.provider, providerFilter) && matchesPool(a.pools, poolFilter),
+  );
+  const resetByAccount = new Map(
+    (resetPlan.data?.candidates ?? []).map((candidate) => [
+      candidate.account_id,
+      candidate,
+    ] as const),
   );
 
   return (
@@ -264,11 +276,22 @@ export function Accounts() {
       ) : view === "cards" ? (
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
           {filtered.map((a) => (
-            <AccountCard key={a.id} account={a} nowMs={nowMs} actions={actions} />
+            <AccountCard
+              key={a.id}
+              account={a}
+              reset={resetByAccount.get(a.id)}
+              nowMs={nowMs}
+              actions={actions}
+            />
           ))}
         </div>
       ) : (
-        <AccountsTable accounts={filtered} nowMs={nowMs} actions={actions} />
+        <AccountsTable
+          accounts={filtered}
+          resetByAccount={resetByAccount}
+          nowMs={nowMs}
+          actions={actions}
+        />
       )}
 
       <CodexOnboardingDialog open={addOpen} onOpenChange={setAddOpen} />
@@ -444,10 +467,12 @@ function CardUsageRow({
 
 function AccountCard({
   account: a,
+  reset,
   nowMs,
   actions,
 }: {
   account: AccountView;
+  reset?: ResetPlanCandidateView;
   nowMs: number;
   actions: AccountActionsApi;
 }) {
@@ -472,6 +497,19 @@ function AccountCard({
               className="truncate text-[12.5px] font-semibold text-fg"
             />
             <ProviderTag provider={a.provider} />
+            {reset && reset.available_credits > 0 && (
+              <span
+                className={clsx(
+                  "shrink-0 rounded-full border px-1.5 py-0.5 text-[8.5px] font-semibold",
+                  reset.recommendation === "redeem_now" ||
+                    reset.recommendation === "redeem_before_expiry"
+                    ? "border-accent/30 bg-accent/[0.08] text-accent"
+                    : "border-border bg-muted/60 text-fg opacity-65",
+                )}
+              >
+                {reset.available_credits} reset{reset.available_credits === 1 ? "" : "s"}
+              </span>
+            )}
             <StatusPill status={a.status} className="ml-auto shrink-0" />
           </div>
 
@@ -545,10 +583,12 @@ const TABLE_HEAD_CLASS =
 
 function AccountsTable({
   accounts,
+  resetByAccount,
   nowMs,
   actions,
 }: {
   accounts: AccountView[];
+  resetByAccount: Map<string, ResetPlanCandidateView>;
   nowMs: number;
   actions: AccountActionsApi;
 }) {
@@ -577,6 +617,7 @@ function AccountsTable({
               )}
               <th className={TABLE_HEAD_CLASS}>Weekly {quotaDisplayLabel(mode)}</th>
               <th className={TABLE_HEAD_CLASS}>Token</th>
+              <th className={TABLE_HEAD_CLASS}>Reset reserve</th>
               <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>Reqs 24h</th>
               <th className={TABLE_HEAD_CLASS}>
                 <span className="sr-only">Actions</span>
@@ -587,6 +628,7 @@ function AccountsTable({
             {accounts.map((a) => {
               const tone = statusTone(a.status);
               const token = tokenHealthLabel(a.token_health, nowMs);
+              const reset = resetByAccount.get(a.id);
               const go = () => navigate(`/accounts/${encodeURIComponent(a.id)}`);
               return (
                 <tr
@@ -634,6 +676,23 @@ function AccountsTable({
                   </td>
                   <td className={clsx("whitespace-nowrap px-2 py-1.5", token.className)}>
                     {token.text}
+                  </td>
+                  <td className="whitespace-nowrap px-2 py-1.5">
+                    {reset && reset.available_credits > 0 ? (
+                      <span
+                        className={clsx(
+                          "rounded-full border px-1.5 py-0.5 text-[8.5px] font-semibold",
+                          reset.recommendation === "redeem_now" ||
+                            reset.recommendation === "redeem_before_expiry"
+                            ? "border-accent/30 bg-accent/[0.08] text-accent"
+                            : "border-border bg-muted/60 text-fg opacity-65",
+                        )}
+                      >
+                        {reset.available_credits} banked
+                      </span>
+                    ) : (
+                      <span className="text-fg opacity-35">—</span>
+                    )}
                   </td>
                   <td className="px-2 py-1.5 text-right tabular-nums text-fg opacity-80">
                     {compactNum(a.request_count_24h)}

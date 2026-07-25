@@ -179,16 +179,16 @@ async fn refresh_account(
     soft_drain_enabled: bool,
     log_bus: &crate::log_bus::LogBus,
     health_tier_metrics: &crate::observability::HealthTierMetrics,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     let tokens = match repo.decrypt_tokens(&account.id, cipher).await? {
         Some(t) => t,
-        None => return Ok(()),
+        None => return Ok(false),
     };
     let resp = usage_request(http, upstream_base, account, &tokens)
         .send()
         .await?;
     if !resp.status().is_success() {
-        return Ok(());
+        return Ok(false);
     }
     let payload: UsagePayload = resp.json().await?;
     let rl = payload.rate_limit.ok_or_else(|| {
@@ -274,7 +274,34 @@ async fn refresh_account(
         );
     }
 
-    Ok(())
+    Ok(true)
+}
+
+/// Fetch and persist authoritative usage for one account on a safety-sensitive request path.
+///
+/// `Ok(false)` means no trustworthy usage was obtained (for example, missing tokens or a
+/// non-success upstream response). Callers must fail closed rather than spending from cached data.
+pub(crate) async fn refresh_account_now(state: &AppState, account_id: &str) -> Result<bool, ()> {
+    let repo = state.store.accounts();
+    let account = repo
+        .get(account_id)
+        .await
+        .map_err(|_| ())?
+        .filter(|account| account.provider == "codex")
+        .ok_or(())?;
+    refresh_account(
+        &repo,
+        &state.cipher,
+        &state.control_client,
+        &state.upstream_base_url,
+        &account,
+        &state.runtime,
+        state.runtime_settings.soft_drain_enabled(),
+        &state.log_bus,
+        &state.health_tier_metrics,
+    )
+    .await
+    .map_err(|_| ())
 }
 
 /// B8 review Finding 1: the poller's error-driven health-tier evaluation for ONE NON-codex account.

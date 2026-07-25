@@ -17,6 +17,7 @@ import { Overview } from "./pages/Overview";
 import { Pools } from "./pages/Pools";
 import { Providers } from "./pages/Providers";
 import { Reports } from "./pages/Reports";
+import { ResetCredits } from "./pages/ResetCredits";
 import { Requests } from "./pages/Requests";
 import { Sessions } from "./pages/Sessions";
 import { Settings } from "./pages/Settings";
@@ -57,6 +58,7 @@ export function App() {
                 <Route path="accounts" element={<Accounts />} />
                 <Route path="accounts/:id" element={<AccountDetail />} />
                 <Route path="pools" element={<Pools />} />
+                <Route path="reset-credits" element={<ResetCredits />} />
                 <Route path="providers" element={<Providers />} />
                 <Route path="translations" element={<Translations />} />
                 <Route path="requests" element={<Requests />} />

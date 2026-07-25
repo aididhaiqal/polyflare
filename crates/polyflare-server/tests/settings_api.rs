@@ -83,6 +83,37 @@ async fn patch_chatgpt_backend_passthrough_disable_applies_live_and_persists() {
 }
 
 #[tokio::test]
+async fn patch_wham_usage_main_limit_override_applies_live_and_persists() {
+    let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
+    let (pf, state) = spawn(up).await;
+    let c = reqwest::Client::new();
+
+    assert!(state.runtime_settings.wham_usage_replace_main_limit());
+    let resp = c
+        .patch(format!("{pf}/api/settings"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({
+            "wham_usage_replace_main_limit": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(!state.runtime_settings.wham_usage_replace_main_limit());
+    assert_eq!(
+        state
+            .store
+            .settings()
+            .get_all()
+            .await
+            .unwrap()
+            .get("wham_usage_replace_main_limit")
+            .map(String::as_str),
+        Some("false")
+    );
+}
+
+#[tokio::test]
 async fn patch_inflight_penalty_pct_clamps_to_fifty_and_persists_the_clamped_value() {
     let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
     let (pf, state) = spawn(up).await;
@@ -284,6 +315,7 @@ async fn get_returns_every_field_with_the_correct_class() {
         "usage_history_retention_days",
         "live_logs",
         "chatgpt_backend_passthrough_enabled",
+        "wham_usage_replace_main_limit",
     ];
     for key in live_keys {
         let f = find_field(&body, key);
@@ -324,6 +356,10 @@ async fn get_returns_every_field_with_the_correct_class() {
     );
     assert_eq!(
         find_field(&body, "chatgpt_backend_passthrough_enabled")["default"],
+        "true"
+    );
+    assert_eq!(
+        find_field(&body, "wham_usage_replace_main_limit")["default"],
         "true"
     );
 

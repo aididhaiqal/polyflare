@@ -10,6 +10,7 @@ pub mod import;
 pub mod onboarding_repo;
 pub mod provider_repo;
 pub mod request_log_repo;
+pub mod reset_credit_repo;
 pub mod settings_repo;
 pub mod store;
 pub mod translation_repo;
@@ -31,6 +32,10 @@ pub use request_log_repo::{
     RecentErrorRow, ReportBreakdownRow, ReportBucket, ReportMetrics, RequestAggregate,
     RequestBucket, RequestLogRecord, RequestLogRepo, RequestLogRow, RequestProtocolOutcome,
     RequestsFilter, TranslatedRequestRow,
+};
+pub use reset_credit_repo::{
+    ResetCredit, ResetCreditRedeemRequest, ResetCreditRedeemResult, ResetCreditRepo,
+    ResetCreditSnapshot,
 };
 pub use settings_repo::SettingsRepo;
 pub use store::{RequestUsageUpdate, Store};
