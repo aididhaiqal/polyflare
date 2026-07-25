@@ -371,6 +371,11 @@ const MODEL_CATALOG_STARTUP_WARM_BUDGET: Duration = Duration::from_secs(2);
 /// releases the process promptly, long enough to be free next to a turn's own latency.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// After turns are drained and axum has been told to stop, how long to let it settle its tracked
+/// connections before closing the remainder. Only a stuck plain-HTTP request needs this; once no
+/// turn is in flight there is nothing left worth waiting on.
+const FORCE_CLOSE_GRACE: Duration = Duration::from_millis(500);
+
 /// Bind the serving socket with `SO_REUSEPORT` (+ `SO_REUSEADDR`) so a replacement process can bind
 /// the same address while this one drains — the handover property this whole path exists for.
 ///
@@ -497,26 +502,27 @@ where
     }
 }
 
-/// Stop accepting new connections when `shutdown` resolves, then leave the process alive exactly as
-/// long as work is still streaming — no longer.
+/// Hold the process alive for exactly as long as work is still streaming, then let it go.
 ///
-/// `in_flight` reports the process-wide in-flight **turn** count (`LeaseMetrics::current`). Waiting
-/// on that, rather than on handlers ending, is the whole trick: a relay WS connection stays open
-/// BETWEEN turns (idle budget up to 25 min), so waiting for handlers would wait effectively
-/// forever and the old fixed 10s ceiling instead force-closed live turns — the 2026-07-25
-/// message-loss mechanism. Once zero turns are in flight, closing the remaining idle sockets is the
-/// existing honest-close contract: the client sees its socket die between turns, reconnects (onto
-/// the replacement process, which is already accepting thanks to `SO_REUSEPORT`), and full-resends
-/// natively. Nothing is lost because nothing was in flight.
+/// `in_flight` reports the process-wide in-flight **turn** count (`LeaseMetrics::current`).
 ///
-/// `drain_timeout` is now a pathological-case ceiling, not the expected path.
+/// **Why the shutdown signal is withheld from axum rather than raced against it** (2026-07-25, found
+/// by live mid-turn restart, twice): `axum::serve`'s graceful shutdown does not track an UPGRADED
+/// WebSocket, and when its future resolves it tears the upgraded connections down. So neither
+/// "return when the serve future resolves" nor "keep waiting after it resolves" can save a streaming
+/// relay turn — by then the socket is already gone. The only ordering that works is to not tell axum
+/// to shut down until the turns are finished: on the signal, poll until the in-flight count reaches
+/// zero (or `drain_timeout` elapses), and only then resolve the future axum is waiting on.
 ///
-/// **The server future resolving is NOT the end of the drain** (2026-07-25 live finding): an
-/// UPGRADED WebSocket runs in its own task that `axum::serve`'s graceful shutdown does not track,
-/// so the serve future completes as soon as the accept loop and plain-HTTP connections are done —
-/// while relay turns are still streaming. Returning there killed a live turn 2 seconds into the
-/// drain. Both conditions must hold before this returns: the serve future resolved AND the
-/// in-flight turn count reached zero (or the ceiling fired).
+/// Consequence, deliberately accepted: the listener keeps accepting during that window, so a late
+/// connection can land on the outgoing process. It is a fully functional server one deploy behind,
+/// and `SO_REUSEPORT` means the replacement is accepting too — a split for a few seconds, versus
+/// killing a turn and losing the user's message (the mechanism behind 2026-07-25's data loss). The
+/// ceiling bounds the window even if new turns keep arriving.
+///
+/// Once no turn is in flight, closing the remaining idle sockets is the existing honest-close
+/// contract: the client sees its socket die BETWEEN turns, reconnects (onto the replacement), and
+/// full-resends natively. Nothing is lost because nothing was in flight.
 async fn serve_with_bounded_shutdown<F, C>(
     listener: tokio::net::TcpListener,
     app: axum::Router,
@@ -528,60 +534,54 @@ where
     F: Future<Output = ()> + Send + 'static,
     C: Fn() -> u64 + Send + 'static,
 {
-    let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let drain_verdict = timed_out.clone();
     let graceful_shutdown = async move {
         shutdown.await;
-        let _ = drain_started_tx.send(());
-    };
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(graceful_shutdown)
-        .into_future();
-    tokio::pin!(server);
-
-    // The ceiling is measured from the shutdown SIGNAL, shared so whichever path observes it first
-    // (the serve future resolving, or the poll loop) bounds itself against the same instant.
-    let drain_started_at: Arc<std::sync::OnceLock<tokio::time::Instant>> =
-        Arc::new(std::sync::OnceLock::new());
-    let signal_seen = drain_started_at.clone();
-    let in_flight = Arc::new(in_flight);
-    let poll_in_flight = in_flight.clone();
-
-    let drain_deadline = async move {
-        if drain_started_rx.await.is_err() {
-            std::future::pending::<()>().await;
-        }
-        let started = *signal_seen.get_or_init(tokio::time::Instant::now);
+        let started = tokio::time::Instant::now();
         loop {
-            if poll_in_flight() == 0 {
-                return DrainOutcome::Drained;
+            if in_flight() == 0 {
+                return;
             }
             if started.elapsed() >= drain_timeout {
-                return DrainOutcome::TimedOut;
+                drain_verdict.store(true, AtomicOrdering::Relaxed);
+                return;
             }
             tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
         }
     };
-    tokio::pin!(drain_deadline);
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            graceful_shutdown.await;
+            let _ = signalled_tx.send(());
+        })
+        .into_future();
+    tokio::pin!(server);
 
-    tokio::select! {
-        result = &mut server => {
-            // Accept loop + tracked HTTP connections are done, but UPGRADED WebSockets are not
-            // tracked by axum's graceful shutdown, so relay turns may still be streaming. Keep the
-            // process alive until they finish (bounded by the same ceiling) instead of killing them.
-            result?;
-            let started = *drain_started_at.get_or_init(tokio::time::Instant::now);
-            loop {
-                if in_flight() == 0 {
-                    return Ok(DrainOutcome::Drained);
-                }
-                if started.elapsed() >= drain_timeout {
-                    return Ok(DrainOutcome::TimedOut);
-                }
-                tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
-            }
+    // Once axum HAS been told to shut down, it still waits on its tracked connections — and a
+    // plain-HTTP request that never finishes would hold the process forever. Bound that tail.
+    let force_close = async move {
+        if signalled_rx.await.is_err() {
+            std::future::pending::<()>().await;
         }
-        outcome = &mut drain_deadline => Ok(outcome),
-    }
+        tokio::time::sleep(FORCE_CLOSE_GRACE).await;
+    };
+    tokio::pin!(force_close);
+
+    let forced = tokio::select! {
+        result = &mut server => {
+            result?;
+            false
+        }
+        _ = &mut force_close => true,
+    };
+    Ok(if forced || timed_out.load(AtomicOrdering::Relaxed) {
+        DrainOutcome::TimedOut
+    } else {
+        DrainOutcome::Drained
+    })
 }
 
 /// Stop accepting new connections on Ctrl-C (and SIGTERM on Unix), then let axum drain active
@@ -956,12 +956,22 @@ mod tests {
         );
 
         in_flight.store(0, Ordering::Relaxed);
+        let released_at = tokio::time::Instant::now();
         let outcome = tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .expect("the drain must end promptly once turns are idle, not sit out the 300s ceiling")
             .expect("join")
             .expect("io");
-        assert_eq!(outcome, DrainOutcome::Drained);
+        assert!(
+            released_at.elapsed() < Duration::from_secs(3),
+            "the drain must release within a poll interval + force-close grace of the last turn \
+             finishing, not linger toward the 300s ceiling (took {:?})",
+            released_at.elapsed()
+        );
+        // `TimedOut` is the honest label here: the turns drained cleanly, but this test's
+        // deliberately hung plain-HTTP request still had to be force-closed after the grace. The
+        // property under test is the release TIMING above, not the label.
+        assert_eq!(outcome, DrainOutcome::TimedOut);
         request.abort();
     }
 
@@ -1034,7 +1044,7 @@ mod tests {
             .expect("the hanging request must enter its handler");
         shutdown_tx.send(()).unwrap();
 
-        let outcome = tokio::time::timeout(Duration::from_secs(1), server)
+        let outcome = tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .expect("bounded shutdown must return")
             .expect("server task must not panic")
