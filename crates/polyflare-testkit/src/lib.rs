@@ -14,7 +14,7 @@ use axum::extract::{DefaultBodyLimit, Json, State};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, post};
+use axum::routing::{any, get, post};
 use axum::Router;
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
@@ -744,4 +744,131 @@ async fn anthropic_oauth_handler(
             }),
         ),
     }
+}
+
+/// A scriptable mock of Anthropic's `GET /v1/models`.
+///
+/// Serves pages in order, echoing a `last_id` cursor so a client that follows pagination reaches
+/// them all. Test infra only.
+#[derive(Clone)]
+pub struct MockAnthropicModels {
+    pages: Arc<Vec<Vec<String>>>,
+    /// Report `has_more` on the final page WITHOUT a cursor — the shape that would spin a client
+    /// which retries on `has_more` alone.
+    dangling_has_more: bool,
+    error_status: Option<u16>,
+    request_count: Arc<AtomicUsize>,
+    last_authorization: Arc<Mutex<Option<String>>>,
+    last_version: Arc<Mutex<Option<String>>>,
+}
+
+impl MockAnthropicModels {
+    /// Serve these pages in order.
+    pub fn paged(pages: Vec<Vec<String>>) -> Self {
+        Self {
+            pages: Arc::new(pages),
+            dangling_has_more: false,
+            error_status: None,
+            request_count: Arc::new(AtomicUsize::new(0)),
+            last_authorization: Arc::new(Mutex::new(None)),
+            last_version: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// One page that claims more results but supplies no cursor to reach them.
+    pub fn has_more_without_cursor(ids: Vec<String>) -> Self {
+        let mut mock = Self::paged(vec![ids]);
+        mock.dangling_has_more = true;
+        mock
+    }
+
+    pub fn error(status: u16) -> Self {
+        let mut mock = Self::paged(Vec::new());
+        mock.error_status = Some(status);
+        mock
+    }
+
+    pub fn request_count(&self) -> usize {
+        self.request_count.load(Ordering::SeqCst)
+    }
+
+    pub fn last_authorization(&self) -> Option<String> {
+        self.last_authorization.lock().unwrap().clone()
+    }
+
+    pub fn last_version_header(&self) -> Option<String> {
+        self.last_version.lock().unwrap().clone()
+    }
+
+    /// Bind an ephemeral port and return the BASE url (the client appends `/v1/models`).
+    pub async fn spawn(self) -> String {
+        let app = Router::new()
+            .route("/v1/models", get(anthropic_models_handler))
+            .with_state(self);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+}
+
+async fn anthropic_models_handler(
+    State(mock): State<MockAnthropicModels>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let index = mock.request_count.fetch_add(1, Ordering::SeqCst);
+    *mock.last_authorization.lock().unwrap() = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    *mock.last_version.lock().unwrap() = headers
+        .get("anthropic-version")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    if let Some(status) = mock.error_status {
+        return (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(serde_json::json!({ "error": { "message": "denied" } })),
+        );
+    }
+
+    // Page selection follows the cursor when given, so a client that ignores it is visible as a
+    // repeated first page rather than silently "working".
+    let page_index = match params.get("after_id") {
+        Some(cursor) => mock
+            .pages
+            .iter()
+            .position(|page| page.last().map(String::as_str) == Some(cursor.as_str()))
+            .map(|found| found + 1)
+            .unwrap_or(index),
+        None => 0,
+    };
+    let empty: Vec<String> = Vec::new();
+    let page = mock.pages.get(page_index).unwrap_or(&empty);
+    let is_last = page_index + 1 >= mock.pages.len();
+    let has_more = if mock.dangling_has_more {
+        true
+    } else {
+        !is_last
+    };
+    let last_id = if mock.dangling_has_more {
+        serde_json::Value::Null
+    } else {
+        page.last()
+            .map(|id| serde_json::json!(id))
+            .unwrap_or(serde_json::Value::Null)
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "data": page.iter().map(|id| serde_json::json!({"type": "model", "id": id})).collect::<Vec<_>>(),
+            "has_more": has_more,
+            "last_id": last_id,
+        })),
+    )
 }

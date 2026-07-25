@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use polyflare_core::Provider;
+use polyflare_core::{AccountId, Provider};
 use polyflare_store::{
     NewTranslationRoute, TranslatedRequestRow, TranslationRoute, TranslationRouteUpdate,
 };
@@ -331,8 +331,67 @@ pub async fn builtin_models(State(state): State<Arc<AppState>>) -> Response {
         .map(|model| model.slug)
         .collect();
     models.insert(Provider::Codex.to_string(), codex);
-    models.insert(Provider::Anthropic.to_string(), Vec::new());
+    models.insert(
+        Provider::Anthropic.to_string(),
+        anthropic_models(&state).await,
+    );
     Json(BuiltinModelsView { models }).into_response()
+}
+
+/// Anthropic's advertised models, refreshed at most once per catalog TTL.
+///
+/// Returns the cache immediately when it is fresh, so opening the editor is normally free. A cold
+/// or stale cache costs one upstream call on this request; a failure keeps whatever was cached and
+/// returns that, because a momentary upstream error should not blank the operator's list.
+///
+/// With no active Anthropic account there is nothing to authenticate with, so the answer is an
+/// empty list — the truthful "no catalog yet", not a hardcoded set that would rot.
+async fn anthropic_models(state: &AppState) -> Vec<String> {
+    if state.model_catalog.anthropic_is_fresh() {
+        return state.model_catalog.anthropic_cached();
+    }
+    let Some(account_id) = active_anthropic_account_id(state).await else {
+        return state.model_catalog.anthropic_cached();
+    };
+    let now = now();
+    let Ok((account, _)) =
+        crate::ingress::resolve_core_account(state, &AccountId::from(account_id), now).await
+    else {
+        return state.model_catalog.anthropic_cached();
+    };
+
+    // Reuses the shared outbound client rather than adding one to AppState: this is a plain
+    // authenticated GET with its own timeout, and a second pool would buy nothing.
+    match polyflare_anthropic::models::fetch_model_ids(
+        &state.control_client,
+        &account.base_url,
+        &account.bearer_token,
+    )
+    .await
+    {
+        Ok(ids) => {
+            state.model_catalog.store_anthropic(ids);
+        }
+        Err(error) => {
+            // Content-free: a status or transport class, never a token or a model payload.
+            tracing::debug!(
+                target: "polyflare_server::catalog",
+                %error,
+                "anthropic model catalog refresh failed; serving the cached list"
+            );
+        }
+    }
+    state.model_catalog.anthropic_cached()
+}
+
+/// One active Anthropic account to authenticate the catalog call with. Any will do: Anthropic
+/// advertises the same models to every account, so there is no per-account intersection here.
+async fn active_anthropic_account_id(state: &AppState) -> Option<String> {
+    let snapshots = state.account_cache.snapshots(&state.store).await.ok()?;
+    snapshots
+        .iter()
+        .find(|snapshot| snapshot.status == "active" && snapshot.provider == Provider::Anthropic)
+        .map(|snapshot| snapshot.id.to_string())
 }
 
 #[derive(Serialize)]

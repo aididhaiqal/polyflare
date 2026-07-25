@@ -335,11 +335,12 @@ async fn builtin_model_suggestions_report_only_what_is_actually_known() {
         "suggestions are plain model names: {codex:?}"
     );
 
-    // Nothing fetches Anthropic's /v1/models today. Reporting an empty list is the truthful
-    // answer; a hardcoded list would silently rot into wrong suggestions.
+    // Anthropic's catalog is fetched from a live account. With none onboarded there is nothing to
+    // authenticate with, so the truthful answer is an empty list rather than a hardcoded set that
+    // would rot — the harness seeds only a Codex account.
     assert_eq!(
         view["models"]["anthropic"],
         serde_json::json!([]),
-        "anthropic has no catalog yet and must not invent one"
+        "with no Anthropic account there is no catalog to report"
     );
 }

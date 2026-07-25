@@ -5,6 +5,7 @@ pub mod claude_wire;
 pub mod collect;
 pub mod errors;
 pub mod executor;
+pub mod models;
 pub mod oauth;
 pub mod oauth_contract;
 pub mod reverse;

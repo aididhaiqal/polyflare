@@ -137,6 +137,19 @@ pub struct ModelCatalogCache {
     /// The static bootstrap floor. Always present in every returned catalog; a merge never removes
     /// a floor slug even when upstream omits it.
     floor: Vec<UpstreamModel>,
+    /// The Anthropic catalog, cached beside the Codex one.
+    ///
+    /// Deliberately a plain TTL cell rather than the account-scoped machinery above: Anthropic
+    /// advertises the same models to every account, so there is no per-account intersection to
+    /// compute and no floor to merge — an unwarmed cache is genuinely empty, and saying so is more
+    /// useful than inventing a bootstrap list that would rot.
+    anthropic: RwLock<Option<CachedAnthropic>>,
+}
+
+/// Anthropic model IDs plus when they were fetched.
+struct CachedAnthropic {
+    models: Vec<String>,
+    fetched_at: Instant,
 }
 
 impl ModelCatalogCache {
@@ -151,7 +164,44 @@ impl ModelCatalogCache {
             refresh_lock: tokio::sync::Mutex::new(()),
             source,
             floor,
+            anthropic: RwLock::new(None),
         }
+    }
+
+    /// The cached Anthropic model IDs. Zero-I/O and never blocking; empty when never warmed.
+    pub fn anthropic_cached(&self) -> Vec<String> {
+        self.anthropic
+            .read()
+            .expect("anthropic catalog lock poisoned")
+            .as_ref()
+            .map(|cached| cached.models.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether a warm Anthropic catalog is still inside its TTL.
+    pub fn anthropic_is_fresh(&self) -> bool {
+        self.anthropic
+            .read()
+            .expect("anthropic catalog lock poisoned")
+            .as_ref()
+            .is_some_and(|cached| cached.fetched_at.elapsed() < self.ttl)
+    }
+
+    /// Replace the cached Anthropic catalog.
+    ///
+    /// Only a NON-EMPTY result overwrites a warm cache: an upstream that briefly answers with
+    /// nothing should not blank a list the operator was relying on a moment ago.
+    pub fn store_anthropic(&self, models: Vec<String>) {
+        if models.is_empty() && !self.anthropic_cached().is_empty() {
+            return;
+        }
+        *self
+            .anthropic
+            .write()
+            .expect("anthropic catalog lock poisoned") = Some(CachedAnthropic {
+            models,
+            fetched_at: Instant::now(),
+        });
     }
 
     /// The refresh cadence — a background warmer should re-call `get_or_refresh` on this interval

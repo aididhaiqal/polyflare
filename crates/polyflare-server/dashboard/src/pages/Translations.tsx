@@ -668,7 +668,7 @@ function RouteEditor({
           )}
           {knownModels.length === 0 && state.draft.target_kind === "builtin_provider" && (
             <span className="mt-1 block text-[9px] text-fg opacity-45">
-              No catalog for this provider yet — type the model name.
+              No models known yet — onboard an account for this provider, or type the name.
             </span>
           )}
         </label>
