@@ -3284,4 +3284,111 @@ mod relay_through {
             "a transient-429 retry-in-place must never bump move_cross_account, got: {snapshot:?}"
         );
     }
+
+    /// Phase 1 of the cross-provider reasoning transform (plan 2026-07-25-103202): a turn whose
+    /// history carries a foreign platform's sealed reasoning envelope is rejected upstream with
+    /// `invalid_encrypted_content` (the 2026-07-25 tether-thread bricking, live-captured shape).
+    /// The pump must NOT surface that error or advise a resend (the client would resend the same
+    /// poisoned history forever) — it must rewrite the buffered frame ONCE (reasoning envelopes
+    /// out, plaintext summaries preserved as assistant text), re-dial the same account, and
+    /// replay, so the client sees only the clean completion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_encrypted_content_replays_transformed_frame() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::invalid_encrypted_content("rs_foreign_1"),
+            ScriptedTurn::normal(vec![]),
+        ])
+        .capturing_raw_frames();
+        let mock_base = mock.clone().spawn().await;
+
+        let (base, _state) =
+            spawn_with_pinned_account("acct-reasoning-transform", &mock_base).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake must succeed");
+
+        // ONE client frame carrying a foreign sealed reasoning item alongside ordinary history.
+        let frame = serde_json::json!({
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"role": "user", "content": "hello"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_foreign_1",
+                    "summary": [{"type": "summary_text", "text": "weighed two approaches"}],
+                    "encrypted_content": "gAAAA-foreign-sealed",
+                },
+            ],
+        })
+        .to_string();
+        ws.send(TMessage::Text(frame.clone().into())).await.unwrap();
+
+        // The client sees the completion directly — never the wrapped 400, never a forged
+        // resend advisory.
+        let reply = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("the transformed replay must complete within the timeout, not hang")
+            .expect("a reply")
+            .expect("no ws error");
+        let TMessage::Text(reply) = reply else {
+            panic!("expected a text frame back from the relay");
+        };
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            v["type"], "response.completed",
+            "the client must see only the clean completion of the transformed replay, got: {v:?}"
+        );
+
+        assert!(
+            mock.handshake_count() >= 2,
+            "the pump must re-dial after the intercepted invalid_encrypted_content (handshakes: {})",
+            mock.handshake_count()
+        );
+
+        // Socket 1 got the original frame; socket 2 must get the TRANSFORMED frame: envelope and
+        // reasoning item gone, the summary preserved as assistant message text, other items and
+        // fields intact.
+        let mut raw = mock.raw_frames();
+        for _ in 0..50 {
+            raw = mock.raw_frames();
+            if raw.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            raw.len(),
+            2,
+            "exactly one replay, no client resend: {raw:?}"
+        );
+        assert_eq!(
+            raw[0], frame,
+            "socket 1 receives the original frame verbatim"
+        );
+        let replayed: serde_json::Value = serde_json::from_str(&raw[1]).unwrap();
+        let replayed_text = raw[1].as_str();
+        assert!(
+            !replayed_text.contains("encrypted_content"),
+            "the sealed envelope must be gone from the replay"
+        );
+        assert!(
+            !replayed_text.contains("rs_foreign_1"),
+            "the foreign reasoning item must be gone from the replay"
+        );
+        assert!(
+            replayed_text.contains("weighed two approaches"),
+            "the plaintext summary must survive as message text"
+        );
+        let input = replayed["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2, "user message + summary replacement");
+        assert_eq!(input[0]["role"], "user", "ordinary history untouched");
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(
+            replayed["model"], "gpt-5.6-sol",
+            "envelope fields untouched"
+        );
+    }
 }
