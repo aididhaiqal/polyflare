@@ -3670,6 +3670,69 @@ mod relay_through {
         );
     }
 
+    /// The REAL preamble the backend sends, which the earlier scripted fixtures omitted: a
+    /// `codex.rate_limits` quota frame arrives between the lifecycle frames. It carries no model
+    /// output, so it must not count as client-visible output — treating it as output is what
+    /// silently disabled BOTH poisoned-history recoveries in production (2026-07-25 13:36, session
+    /// 9fcbea9c: correct error code, anchored turn, and zero recovery events) while every scripted
+    /// test still passed.
+    #[tokio::test]
+    async fn a_rate_limit_frame_in_the_preamble_does_not_block_poisoned_history_recovery() {
+        let mock = MockWsUpstream::scripted(vec![ScriptedTurn::ErrorAfterEvents {
+            events: vec![
+                r#"{"type":"response.created","response":{"id":"resp_doomed"}}"#.to_string(),
+                // Quota metadata, exactly as the live backend interleaves it.
+                r#"{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":12.5}}}"#
+                    .to_string(),
+                r#"{"type":"response.in_progress"}"#.to_string(),
+            ],
+            status: 400,
+            code: "invalid_encrypted_content".to_string(),
+            message: "The encrypted content for item rs_075fc70b could not be verified."
+                .to_string(),
+        }])
+        .capturing_raw_frames();
+        let mock_base = mock.clone().spawn().await;
+        let (base, _state) = spawn_with_pinned_account("acct-ratelimit-preamble", &mock_base).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake must succeed");
+
+        ws.send(TMessage::Text(
+            serde_json::json!({
+                "type": "response.create",
+                "model": "gpt-5.6-sol",
+                "previous_response_id": "resp_fugu_minted",
+                "input": [{"role": "user", "content": "continue"}],
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+        let advisory = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let TMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                match v["type"].as_str().unwrap_or_default() {
+                    "response.created" | "response.in_progress" | "codex.rate_limits" => continue,
+                    _ => break v,
+                }
+            }
+        })
+        .await
+        .expect("recovery must still run after a rate-limit preamble");
+
+        assert_eq!(
+            advisory["error"]["code"], "websocket_connection_limit_reached",
+            "a quota frame must not suppress the resend advisory: {advisory:?}"
+        );
+    }
+
     /// The replay-safety boundary stands: once actual OUTPUT (a delta) has crossed downstream, a
     /// transform-replay could duplicate content the client already consumed — the error must be
     /// surfaced verbatim instead, exactly like any other post-output upstream error.

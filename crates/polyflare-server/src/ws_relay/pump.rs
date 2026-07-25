@@ -1337,7 +1337,18 @@ fn is_lifecycle_frame(frame: &str) -> bool {
     };
     matches!(
         value.get("type").and_then(serde_json::Value::as_str),
-        Some("response.created" | "response.in_progress")
+        // `codex.rate_limits` is quota METADATA, not model output: it is the frame
+        // `rewrite_rate_limit_frames` (above) rewrites with pool-synthesized numbers, and the real
+        // backend emits it near the start of every turn — before any content. Omitting it here is
+        // what kept BOTH poisoned-history recoveries from ever running in production while the
+        // scripted tests passed: the mock emitted only `response.created`/`in_progress`, so the
+        // flag stayed clear, but live traffic tripped it before the error arrived (2026-07-25
+        // 13:36, session 9fcbea9c — right error code, zero recoveries).
+        //
+        // Replaying after one cannot duplicate consumed content, for the same reason a repeated
+        // `response.created` is safe: the client treats rate-limit numbers as state to overwrite,
+        // and the replay simply carries fresher ones.
+        Some("response.created" | "response.in_progress" | "codex.rate_limits")
     )
 }
 
