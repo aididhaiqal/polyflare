@@ -95,6 +95,9 @@ enum AttemptBehavior {
     /// `execute()` succeeds and the stream yields ONE real content byte, then a mid-stream
     /// `ExecError::Stream` — the commit-barrier case.
     ByteThenDrop,
+    /// A pre-relay 400 carrying `invalid_encrypted_content`: the upstream proving it cannot decrypt
+    /// a reasoning envelope in the request's history (a cross-provider thread switch).
+    InvalidEncryptedContent,
 }
 
 /// A test-only `Executor` keyed by `Account.id`: each account has a FIFO queue of
@@ -105,6 +108,9 @@ enum AttemptBehavior {
 struct FailoverStubExecutor {
     behaviors: Mutex<HashMap<String, VecDeque<AttemptBehavior>>>,
     calls: Mutex<Vec<String>>,
+    /// Each attempt's request body as the executor actually received it, so a test can assert what
+    /// a retry sent (e.g. that a poisoned reasoning item was stripped before the resend).
+    bodies: Mutex<Vec<String>>,
 }
 
 impl FailoverStubExecutor {
@@ -124,6 +130,10 @@ impl FailoverStubExecutor {
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
+
+    fn bodies(&self) -> Vec<String> {
+        self.bodies.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -138,6 +148,17 @@ impl Executor for FailoverStubExecutor {
             .lock()
             .unwrap()
             .push(account.id.as_str().to_string());
+        self.bodies
+            .lock()
+            .unwrap()
+            .push(match _req.raw_body.as_ref() {
+                Some(raw) => String::from_utf8_lossy(raw).to_string(),
+                None => _req
+                    .body
+                    .as_ref()
+                    .map(|b| b.to_string())
+                    .unwrap_or_default(),
+            });
         let behavior = {
             let mut map = self.behaviors.lock().unwrap();
             match map.get_mut(account.id.as_str()) {
@@ -147,6 +168,13 @@ impl Executor for FailoverStubExecutor {
             }
         };
         match behavior {
+            AttemptBehavior::InvalidEncryptedContent => {
+                Err(ExecError::UpstreamStatus(polyflare_core::FailureSignal {
+                    status: 400,
+                    retry_after: None,
+                    error_code: Some("invalid_encrypted_content".to_string()),
+                }))
+            }
             AttemptBehavior::Success => {
                 let id = format!("resp_{}", account.id);
                 let created =
@@ -716,5 +744,84 @@ async fn failover_releases_as_lease_before_b_is_picked_and_holds_bs_lease_while_
     assert_eq!(
         snaps[1].in_flight, 0,
         "B's lease releases once its stream is fully drained and dropped — no leak"
+    );
+}
+
+/// HTTP-path cross-provider recovery (2026-07-25 live gap): the relay's reasoning transform only
+/// ever saw the WS frame, so when the client fell back to HTTP after a transport drop, a thread
+/// carrying another platform's sealed reasoning envelope died with `invalid_encrypted_content` and
+/// no recovery. The HTTP ingress must now do the same one-shot repair on the SAME account: strip the
+/// foreign reasoning items (keeping their plaintext summary as assistant text) and resend once.
+#[tokio::test]
+async fn http_invalid_encrypted_content_retries_once_with_reasoning_stripped() {
+    let (store, cipher, _dir) = spawn_store().await;
+    store
+        .accounts()
+        .insert(&account("A", false), &tokens("tokA"), &cipher)
+        .await
+        .unwrap();
+    let exec = Arc::new(FailoverStubExecutor::new());
+    // Attempt 1 is the upstream proving the history is undecryptable; attempt 2 must be the
+    // transformed resend and must succeed.
+    exec.script(
+        "A",
+        vec![
+            AttemptBehavior::InvalidEncryptedContent,
+            AttemptBehavior::Success,
+        ],
+    );
+    let state = build_state(store, cipher, exec.clone());
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+    let body = Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"role": "user", "content": "hello"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_foreign_http",
+                    "summary": [{"type": "summary_text", "text": "weighed two approaches"}],
+                    "encrypted_content": "gAAAAA-foreign-sealed",
+                },
+            ],
+        }))
+        .unwrap(),
+    );
+    let resp = responses_handler_impl_for_test(state, None, headers, body, 3).await;
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "the transformed resend must succeed instead of surfacing the 400"
+    );
+    let bodies = exec.bodies();
+    assert_eq!(
+        bodies.len(),
+        2,
+        "exactly one retry — the original attempt plus the transformed resend, got: {bodies:?}"
+    );
+    assert!(
+        bodies[0].contains("encrypted_content"),
+        "attempt 1 must carry the client's original poisoned history verbatim"
+    );
+    assert!(
+        !bodies[1].contains("encrypted_content") && !bodies[1].contains("rs_foreign_http"),
+        "attempt 2 must have the foreign reasoning envelope stripped, got: {}",
+        bodies[1]
+    );
+    assert!(
+        bodies[1].contains("weighed two approaches"),
+        "the plaintext summary must survive into the resend, got: {}",
+        bodies[1]
+    );
+    assert_eq!(
+        exec.calls(),
+        vec!["A".to_string(), "A".to_string()],
+        "the repair retries the SAME account (nothing about the account was unhealthy)"
     );
 }
