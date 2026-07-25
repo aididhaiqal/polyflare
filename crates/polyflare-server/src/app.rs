@@ -270,6 +270,18 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             get(crate::provider_api::list).post(crate::provider_api::create),
         )
         .route(
+            "/api/translations",
+            get(crate::translation_api::list).post(crate::translation_api::create),
+        )
+        .route(
+            "/api/translations/test",
+            post(crate::translation_api::test_match),
+        )
+        .route(
+            "/api/translations/{id}",
+            patch(crate::translation_api::update).delete(crate::translation_api::delete),
+        )
+        .route(
             "/api/providers/{id}",
             patch(crate::provider_api::patch_provider).delete(crate::provider_api::delete_provider),
         )

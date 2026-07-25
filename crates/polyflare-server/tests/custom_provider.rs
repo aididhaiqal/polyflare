@@ -1300,6 +1300,7 @@ async fn provider_management_never_returns_api_key() {
         .await
         .unwrap();
     let provider_id = provider["id"].as_str().unwrap();
+    assert_eq!(provider["wire_api"], "responses");
     let response = client
         .post(format!("{base}/api/providers/{provider_id}/credentials"))
         .header("authorization", "Bearer secret")
@@ -1329,6 +1330,23 @@ async fn provider_management_never_returns_api_key() {
         .await
         .expect("management mutations return the dashboard's JSON envelope");
     assert_eq!(patched, serde_json::json!({ "ok": true }));
+
+    let anthropic_provider: serde_json::Value = client
+        .post(format!("{base}/api/providers"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({
+            "slug": "anthropic-compatible",
+            "display_name": "Anthropic Compatible",
+            "base_url": "https://example.com/v1",
+            "wire_api": "anthropic_messages"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(anthropic_provider["wire_api"], "anthropic_messages");
 }
 
 #[tokio::test]

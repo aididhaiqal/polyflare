@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+#
+# Build and manage one detached local PolyFlare process.
+#
+# Usage:
+#   scripts/polyflare-service build
+#   scripts/polyflare-service start
+#   scripts/polyflare-service stop
+#   scripts/polyflare-service restart
+#   scripts/polyflare-service status
+#   scripts/polyflare-service logs
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+BUILD_BINARY="${POLYFLARE_SERVICE_BUILD_BINARY:-$REPO_ROOT/target/release/polyflare}"
+BINARY="${POLYFLARE_SERVICE_BINARY:-$HOME/.local/bin/polyflare}"
+DATA_DIR="${POLYFLARE_DATA_DIR:-$HOME/.polyflare}"
+STATE_DIR="${POLYFLARE_SERVICE_STATE_DIR:-$DATA_DIR/run}"
+PID_FILE="$STATE_DIR/polyflare.pid"
+LOG_FILE="${POLYFLARE_SERVICE_LOG:-$STATE_DIR/polyflare.log}"
+SERVICE_URL="${POLYFLARE_SERVICE_URL:-http://127.0.0.1:8080}"
+BIND_VALUE="${POLYFLARE_BIND:-}"
+SERVICE_PORT="${POLYFLARE_SERVICE_PORT:-${BIND_VALUE##*:}}"
+SERVICE_PORT="${SERVICE_PORT:-8080}"
+STOP_TIMEOUT_SECS="${POLYFLARE_SERVICE_STOP_TIMEOUT_SECS:-20}"
+START_TIMEOUT_SECS="${POLYFLARE_SERVICE_START_TIMEOUT_SECS:-20}"
+USE_LAUNCHD="${POLYFLARE_SERVICE_USE_LAUNCHD:-auto}"
+LAUNCHD_LABEL="${POLYFLARE_SERVICE_LAUNCHD_LABEL:-com.polyflare.server}"
+
+die() {
+  printf 'polyflare-service: %s\n' "$*" >&2
+  exit 1
+}
+
+[[ "$SERVICE_PORT" =~ ^[0-9]+$ ]] &&
+  (( SERVICE_PORT >= 1 && SERVICE_PORT <= 65535 )) ||
+  die "service port must be an integer from 1 to 65535"
+[[ "$STOP_TIMEOUT_SECS" =~ ^[0-9]+$ ]] && (( STOP_TIMEOUT_SECS >= 1 )) ||
+  die "stop timeout must be a positive integer"
+[[ "$START_TIMEOUT_SECS" =~ ^[0-9]+$ ]] && (( START_TIMEOUT_SECS >= 1 )) ||
+  die "start timeout must be a positive integer"
+
+process_command() {
+  ps -p "$1" -o command= 2>/dev/null || true
+}
+
+is_polyflare_process() {
+  if [[ "${POLYFLARE_SERVICE_TEST_ALLOW_ANY_PROCESS:-0}" == "1" ]]; then
+    return 0
+  fi
+  local command
+  command="$(process_command "$1")"
+  [[ "$command" == *"/polyflare "* || "$command" == *"/polyflare" || "$command" == *"polyflare serve"* ]]
+}
+
+pid_is_running() {
+  kill -0 "$1" 2>/dev/null
+}
+
+pid_from_file() {
+  [[ -f "$PID_FILE" ]] || return 1
+  local pid
+  pid="$(tr -d '[:space:]' <"$PID_FILE")"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  if ! pid_is_running "$pid"; then
+    rm -f "$PID_FILE"
+    return 1
+  fi
+  printf '%s\n' "$pid"
+}
+
+listener_pid() {
+  command -v lsof >/dev/null 2>&1 || return 1
+  local pids
+  pids="$(lsof -nP -tiTCP:"$SERVICE_PORT" -sTCP:LISTEN 2>/dev/null | sort -u || true)"
+  [[ -n "$pids" ]] || return 1
+  [[ "$pids" != *$'\n'* ]] || die "multiple processes listen on port $SERVICE_PORT; stop them manually"
+  printf '%s\n' "$pids"
+}
+
+managed_or_verified_pid() {
+  local pid
+  if pid="$(pid_from_file)"; then
+    is_polyflare_process "$pid" ||
+      die "PID file points to non-PolyFlare process $pid; refusing to signal it"
+    printf '%s\n' "$pid"
+    return 0
+  fi
+  if pid="$(listener_pid)"; then
+    is_polyflare_process "$pid" ||
+      die "port $SERVICE_PORT is owned by a non-PolyFlare process ($pid); refusing to signal it"
+    printf '%s\n' "$pid"
+    return 0
+  fi
+  return 1
+}
+
+build_release() {
+  if [[ "${POLYFLARE_SERVICE_SKIP_BUILD:-0}" != "1" ]]; then
+    printf 'Building PolyFlare release binary...\n'
+    (
+      cd "$REPO_ROOT"
+      cargo build --release --bin polyflare
+    )
+  fi
+  [[ -x "$BUILD_BINARY" ]] || die "release build artifact is not executable: $BUILD_BINARY"
+
+  if [[ "$BUILD_BINARY" == "$BINARY" ]]; then
+    return
+  fi
+
+  local binary_dir temp_binary
+  binary_dir="$(dirname -- "$BINARY")"
+  temp_binary="${BINARY}.tmp.$$"
+  mkdir -p "$binary_dir"
+  if ! install -m 755 "$BUILD_BINARY" "$temp_binary"; then
+    rm -f "$temp_binary"
+    die "could not stage release binary at $temp_binary"
+  fi
+  if ! mv -f "$temp_binary" "$BINARY"; then
+    rm -f "$temp_binary"
+    die "could not atomically install release binary at $BINARY"
+  fi
+  printf 'Installed PolyFlare at %s\n' "$BINARY"
+}
+
+stop_service() {
+  local pid
+  if ! pid="$(managed_or_verified_pid)"; then
+    printf 'PolyFlare is not running on port %s.\n' "$SERVICE_PORT"
+    rm -f "$PID_FILE"
+    return
+  fi
+
+  printf 'Stopping PolyFlare (PID %s) gracefully...\n' "$pid"
+  if ! kill -TERM "$pid" 2>/dev/null; then
+    if ! pid_is_running "$pid"; then
+      rm -f "$PID_FILE"
+      printf 'PolyFlare stopped.\n'
+      return
+    fi
+    die "could not signal PolyFlare PID $pid"
+  fi
+  local waited=0
+  while pid_is_running "$pid"; do
+    if (( waited >= STOP_TIMEOUT_SECS )); then
+      die "PID $pid did not exit after ${STOP_TIMEOUT_SECS}s; inspect $LOG_FILE"
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  rm -f "$PID_FILE"
+  printf 'PolyFlare stopped.\n'
+}
+
+health_is_ready() {
+  command -v curl >/dev/null 2>&1 || return 1
+  curl --fail --silent --show-error --max-time 1 "$SERVICE_URL/dashboard" >/dev/null 2>&1
+}
+
+launchd_target() {
+  printf 'gui/%s/%s\n' "$(id -u)" "$LAUNCHD_LABEL"
+}
+
+launchd_is_loaded() {
+  [[ "$USE_LAUNCHD" != "0" ]] || return 1
+  command -v launchctl >/dev/null 2>&1 || return 1
+  launchctl print "$(launchd_target)" >/dev/null 2>&1
+}
+
+launchd_pid() {
+  launchctl print "$(launchd_target)" 2>/dev/null |
+    awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }'
+}
+
+restart_launchd_service() {
+  local target pid waited=0
+  target="$(launchd_target)"
+  printf 'Restarting PolyFlare launch service %s...\n' "$LAUNCHD_LABEL"
+  launchctl kickstart -k "$target"
+  rm -f "$PID_FILE"
+  while (( waited < START_TIMEOUT_SECS )); do
+    pid="$(launchd_pid)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && pid_is_running "$pid" && health_is_ready; then
+      mkdir -p "$STATE_DIR"
+      printf '%s\n' "$pid" >"$PID_FILE"
+      printf 'PolyFlare is ready (PID %s): %s/dashboard\n' "$pid" "$SERVICE_URL"
+      printf 'Managed by launchd: %s\n' "$LAUNCHD_LABEL"
+      return
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  die "launch service did not become ready after ${START_TIMEOUT_SECS}s"
+}
+
+start_service() {
+  local existing
+  if existing="$(managed_or_verified_pid)"; then
+    die "PolyFlare is already running (PID $existing); use restart"
+  fi
+  [[ -x "$BINARY" ]] || die "release binary is missing; run '$0 build' first"
+
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  touch "$LOG_FILE"
+  printf 'Starting PolyFlare at %s...\n' "$SERVICE_URL"
+  nohup "$BINARY" serve >>"$LOG_FILE" 2>&1 </dev/null &
+  local pid=$!
+  printf '%s\n' "$pid" >"$PID_FILE"
+
+  local waited=0
+  while (( waited < START_TIMEOUT_SECS )); do
+    if ! pid_is_running "$pid"; then
+      rm -f "$PID_FILE"
+      tail -n 30 "$LOG_FILE" >&2 || true
+      die "PolyFlare exited before becoming ready"
+    fi
+    if health_is_ready; then
+      printf 'PolyFlare is ready (PID %s): %s/dashboard\n' "$pid" "$SERVICE_URL"
+      printf 'Logs: %s\n' "$LOG_FILE"
+      return
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  kill -TERM "$pid" 2>/dev/null || true
+  local cleanup_waited=0
+  while pid_is_running "$pid" && (( cleanup_waited < STOP_TIMEOUT_SECS )); do
+    sleep 1
+    cleanup_waited=$((cleanup_waited + 1))
+  done
+  rm -f "$PID_FILE"
+  die "PolyFlare did not become ready after ${START_TIMEOUT_SECS}s; inspect $LOG_FILE"
+}
+
+status_service() {
+  local pid
+  if pid="$(managed_or_verified_pid)"; then
+    printf 'PolyFlare is running (PID %s) at %s\n' "$pid" "$SERVICE_URL"
+    printf 'Logs: %s\n' "$LOG_FILE"
+    return
+  fi
+  printf 'PolyFlare is not running on port %s.\n' "$SERVICE_PORT"
+  return 1
+}
+
+case "${1:-restart}" in
+  build)
+    build_release
+    ;;
+  start)
+    build_release
+    start_service
+    ;;
+  stop)
+    stop_service
+    ;;
+  restart)
+    build_release
+    if launchd_is_loaded; then
+      restart_launchd_service
+    else
+      stop_service
+      start_service
+    fi
+    ;;
+  status)
+    status_service
+    ;;
+  logs)
+    mkdir -p "$STATE_DIR"
+    touch "$LOG_FILE"
+    exec tail -n 100 -f "$LOG_FILE"
+    ;;
+  *)
+    die "usage: $0 {build|start|stop|restart|status|logs}"
+    ;;
+esac

@@ -4,6 +4,7 @@
 pub mod collect;
 pub mod errors;
 pub mod executor;
+pub mod reverse;
 pub mod translate;
 
 pub use collect::MessageCollector;
@@ -12,4 +13,5 @@ pub use errors::{
     AnthropicErrorType, StatusClass,
 };
 pub use executor::AnthropicExecutor;
+pub use reverse::ResponsesToAnthropic;
 pub use translate::AnthropicToResponses;

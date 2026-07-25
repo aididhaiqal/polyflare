@@ -17,6 +17,7 @@ use crate::onboarding_repo::OnboardingRepo;
 use crate::provider_repo::ProviderRepo;
 use crate::request_log_repo::{RequestLogRecord, RequestLogRepo, RequestProtocolOutcome};
 use crate::settings_repo::SettingsRepo;
+use crate::translation_repo::TranslationRepo;
 use crate::StoreError;
 
 /// Maximum number of non-critical persistence operations waiting behind SQLite. A full queue
@@ -269,6 +270,11 @@ impl Store {
     /// nothing here for a generation counter to invalidate.
     pub fn settings(&self) -> SettingsRepo {
         SettingsRepo::new(self.pool.clone())
+    }
+
+    /// Operator-managed Anthropic Messages translation routes.
+    pub fn translations(&self) -> TranslationRepo {
+        TranslationRepo::new(self.pool.clone())
     }
 
     /// Queue a content-safe request outcome without spawning a task per request.

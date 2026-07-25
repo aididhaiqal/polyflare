@@ -27,7 +27,6 @@ use polyflare_core::Provider;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::alias::synthetic_models;
 use crate::app::AppState;
 use crate::model_catalog::UpstreamModel;
 
@@ -37,7 +36,6 @@ pub fn model_slug_is_reserved(state: &AppState, slug: &str) -> bool {
         .cached_or_fallback()
         .iter()
         .any(|model| model.slug == slug)
-        || synthetic_models().iter().any(|model| model.id == slug)
 }
 
 #[derive(Clone, Copy)]

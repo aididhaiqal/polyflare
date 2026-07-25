@@ -1,4 +1,4 @@
-//! Generic OpenAI Responses-compatible custom-provider transport.
+//! Generic custom-provider transport for OpenAI Responses and Anthropic Messages wire APIs.
 //!
 //! Custom providers are model-routed and API-key-backed. They deliberately do not participate in
 //! subscription-account continuity: stateless providers receive a materialized request with
@@ -203,7 +203,11 @@ fn validate_provider_url(
 }
 
 fn validate_endpoint(provider: &CustomProvider) -> Result<reqwest::Url, &'static str> {
-    validate_provider_url(provider, "responses")
+    match provider.wire_api.as_str() {
+        "responses" => validate_provider_url(provider, "responses"),
+        "anthropic_messages" => validate_provider_url(provider, "messages"),
+        _ => Err("unsupported provider wire protocol"),
+    }
 }
 
 fn parse_url_host_ip(host: &str) -> Option<IpAddr> {
@@ -615,11 +619,18 @@ pub async fn discover_models(
     let request_timeout = Duration::from_millis(
         u64::try_from(provider.stream_idle_timeout_ms.max(1_000)).unwrap_or(300_000),
     );
-    let response = client
+    let mut request = client
         .get(endpoint)
-        .bearer_auth(&secret.0)
         .header(header::ACCEPT, "application/json")
-        .timeout(request_timeout)
+        .timeout(request_timeout);
+    request = if provider.wire_api == "anthropic_messages" {
+        request
+            .header("x-api-key", &secret.0)
+            .header("anthropic-version", "2023-06-01")
+    } else {
+        request.bearer_auth(&secret.0)
+    };
+    let response = request
         .send()
         .await
         .map_err(|_| "provider model discovery failed")?;
@@ -738,6 +749,66 @@ fn apply_model_profile(
     Ok(revision)
 }
 
+fn apply_anthropic_model_profile(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    model: &ProviderModel,
+) -> Result<Option<String>, (StatusCode, &'static str)> {
+    let revision = profile_revision(model);
+    if revision.is_none() {
+        return Ok(None);
+    }
+    if object
+        .get("system")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "system must be a string for this model profile",
+        ));
+    }
+    match model.instruction_mode.as_str() {
+        "none" if model.instruction_text.is_empty() => {}
+        "append" => {
+            let system = object
+                .get("system")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let transformed = if system.is_empty() {
+                model.instruction_text.clone()
+            } else {
+                format!("{system}{PROFILE_SEPARATOR}{}", model.instruction_text)
+            };
+            object.insert("system".into(), transformed.into());
+        }
+        "replace" => {
+            object.insert("system".into(), model.instruction_text.clone().into());
+        }
+        _ => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid provider model profile",
+            ));
+        }
+    }
+    let overrides: ProfileRequestOverrides = serde_json::from_str(&model.request_overrides_json)
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid provider model profile",
+            )
+        })?;
+    if overrides.reasoning_effort.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "reasoning effort is unavailable for Anthropic Messages providers",
+        ));
+    }
+    if let Some(max_output_tokens) = overrides.max_output_tokens {
+        object.insert("max_tokens".into(), max_output_tokens.into());
+    }
+    Ok(revision)
+}
+
 fn copy_response_headers(
     source: &reqwest::header::HeaderMap,
     target: &mut axum::http::response::Builder,
@@ -795,10 +866,14 @@ pub async fn execute(
         "model".into(),
         serde_json::Value::String(model.upstream_model.clone()),
     );
-    if provider.stateless_responses {
+    if provider.wire_api == "responses" && provider.stateless_responses {
         object.remove("previous_response_id");
     }
-    outcome.profile_revision = match apply_model_profile(object, &model) {
+    outcome.profile_revision = match if provider.wire_api == "anthropic_messages" {
+        apply_anthropic_model_profile(object, &model)
+    } else {
+        apply_model_profile(object, &model)
+    } {
         Ok(revision) => revision,
         Err((status, message)) => return ((status, message).into_response(), outcome),
     };
@@ -860,12 +935,25 @@ pub async fn execute(
         outcome.credential_id = Some(credential.id.clone());
         let mut request = client
             .post(endpoint.clone())
-            .bearer_auth(&secret.0)
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "text/event-stream")
             .body(encoded.clone());
-        if let Some(value) = inbound_headers.get("openai-beta") {
-            request = request.header("openai-beta", value);
+        if provider.wire_api == "anthropic_messages" {
+            request = request.header("x-api-key", &secret.0).header(
+                "anthropic-version",
+                inbound_headers
+                    .get("anthropic-version")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("2023-06-01"),
+            );
+            if let Some(value) = inbound_headers.get("anthropic-beta") {
+                request = request.header("anthropic-beta", value);
+            }
+        } else {
+            request = request.bearer_auth(&secret.0);
+            if let Some(value) = inbound_headers.get("openai-beta") {
+                request = request.header("openai-beta", value);
+            }
         }
         let upstream = match send_with_header_timeout(request, idle_timeout).await {
             Ok(response) => response,
@@ -972,6 +1060,75 @@ pub async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn anthropic_provider() -> CustomProvider {
+        CustomProvider {
+            id: "anthropic-compatible".into(),
+            slug: "anthropic-compatible".into(),
+            display_name: "Anthropic compatible".into(),
+            base_url: "https://example.com/v1".into(),
+            wire_api: "anthropic_messages".into(),
+            enabled: true,
+            stateless_responses: false,
+            allow_private_hosts: false,
+            connect_timeout_ms: 1_000,
+            stream_idle_timeout_ms: 1_000,
+            request_max_retries: 0,
+            max_concurrency: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn anthropic_provider_uses_messages_endpoint_and_protocol_profile_fields() {
+        let provider = anthropic_provider();
+        assert_eq!(
+            validate_endpoint(&provider).unwrap().as_str(),
+            "https://example.com/v1/messages"
+        );
+        let model = ProviderModel {
+            id: "m".into(),
+            provider_id: provider.id,
+            public_model: "claude-profile".into(),
+            upstream_model: "claude-upstream".into(),
+            display_name: "Claude".into(),
+            context_window: None,
+            max_output_tokens: None,
+            supports_tools: true,
+            supports_vision: true,
+            supports_parallel_tool_calls: true,
+            supports_web_search: false,
+            supports_reasoning_summaries: false,
+            reasoning_levels_json: "[]".into(),
+            model_info_json: None,
+            instruction_mode: "append".into(),
+            instruction_text: "Provider guidance".into(),
+            request_overrides_json: r#"{"max_output_tokens":123}"#.into(),
+            input_per_million: None,
+            cached_input_per_million: None,
+            output_per_million: None,
+            visible_in_codex: true,
+            visible_in_openai: true,
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let mut body = serde_json::json!({"system":"Client guidance"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(apply_anthropic_model_profile(&mut body, &model)
+            .unwrap()
+            .is_some());
+        assert!(body["system"]
+            .as_str()
+            .unwrap()
+            .contains("Provider guidance"));
+        assert_eq!(body["max_tokens"], 123);
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("max_output_tokens").is_none());
+    }
 
     #[tokio::test]
     async fn error_body_reader_stops_at_limit_without_waiting_for_eof() {

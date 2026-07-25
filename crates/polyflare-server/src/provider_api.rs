@@ -270,6 +270,8 @@ pub struct CreateProvider {
     slug: String,
     display_name: String,
     base_url: String,
+    #[serde(default = "default_wire_api")]
+    wire_api: String,
     #[serde(default)]
     enabled: Option<bool>,
     #[serde(default)]
@@ -285,6 +287,10 @@ pub struct CreateProvider {
     max_concurrency: Option<i64>,
 }
 
+fn default_wire_api() -> String {
+    "responses".into()
+}
+
 pub async fn create(
     State(state): State<Arc<AppState>>,
     Json(input): Json<CreateProvider>,
@@ -292,6 +298,7 @@ pub async fn create(
     if !valid_slug(&input.slug)
         || !valid_label(&input.display_name)
         || !validate_base_url(&input.base_url, input.allow_private_hosts)
+        || !matches!(input.wire_api.as_str(), "responses" | "anthropic_messages")
     {
         return (StatusCode::BAD_REQUEST, "invalid provider configuration").into_response();
     }
@@ -301,7 +308,7 @@ pub async fn create(
         slug: input.slug,
         display_name: input.display_name.trim().to_string(),
         base_url: input.base_url.trim_end_matches('/').to_string(),
-        wire_api: "responses".into(),
+        wire_api: input.wire_api,
         enabled: input.enabled.unwrap_or(true),
         stateless_responses: input.stateless_responses.unwrap_or(true),
         allow_private_hosts: input.allow_private_hosts,

@@ -29,6 +29,10 @@ async fn open_creates_schema() {
         names.iter().any(|n| n == "usage_history"),
         "tables: {names:?}"
     );
+    assert!(
+        names.iter().any(|n| n == "translation_routes"),
+        "tables: {names:?}"
+    );
     assert!(db_path.exists(), "the DB file must be created on disk");
 }
 

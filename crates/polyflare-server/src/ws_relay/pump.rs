@@ -317,18 +317,20 @@ async fn try_relay_custom_frame(
     if object.get("type").and_then(serde_json::Value::as_str) != Some("response.create") {
         return CustomFrameDisposition::Native;
     }
-    let Some(model) = object.get("model").and_then(serde_json::Value::as_str) else {
+    let Some(model) = object
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    else {
         return CustomFrameDisposition::Native;
     };
-    // Custom providers are a root-only route and native/translation slugs always win. Keep this
-    // preflight identical to HTTP ingress so a pooled or reserved request stays on the native WS
-    // path instead of being intercepted and silently changed to HTTP.
-    if pool.is_some() || crate::catalog::model_slug_is_reserved(state, model) {
-        return CustomFrameDisposition::Native;
-    }
-    let (provider, provider_model) = match state.store.providers().resolve_model(model).await {
-        Ok(Some(route)) => route,
-        Ok(None) => return CustomFrameDisposition::Native,
+    let translated = match state
+        .store
+        .translations()
+        .resolve("openai_responses", &model)
+        .await
+    {
+        Ok(route) => route.is_some(),
         Err(_) => {
             let _ = downstream
                 .send(Message::Text(
@@ -338,6 +340,12 @@ async fn try_relay_custom_frame(
             return CustomFrameDisposition::Failed;
         }
     };
+    // Custom providers are a root-only route and native/translation slugs always win. Keep this
+    // preflight identical to HTTP ingress so a pooled or reserved request stays on the native WS
+    // path instead of being intercepted and silently changed to HTTP.
+    if !translated && (pool.is_some() || crate::catalog::model_slug_is_reserved(state, &model)) {
+        return CustomFrameDisposition::Native;
+    }
 
     if object.get("generate").and_then(serde_json::Value::as_bool) == Some(false) {
         let completed = serde_json::json!({
@@ -358,9 +366,58 @@ async fn try_relay_custom_frame(
 
     object.remove("type");
     object.remove("generate");
+    // Streaming is implicit in the Responses WebSocket protocol, but this branch bridges the
+    // turn onto an HTTP endpoint and relays `data:` SSE frames back to the socket. Without an
+    // explicit `stream: true`, protocol translators (and conforming custom providers) may return
+    // one buffered JSON document, which contains no SSE lines and leaves the WS client waiting
+    // forever for a terminal event.
+    object.insert("stream".into(), serde_json::Value::Bool(true));
     let encoded = match serde_json::to_vec(&body) {
         Ok(encoded) => encoded,
         Err(_) => return CustomFrameDisposition::Failed,
+    };
+    if translated {
+        let response = crate::ingress::responses_translation_route_for_ws(
+            state.clone(),
+            pool.map(str::to_string),
+            headers.clone(),
+            Bytes::from(encoded),
+        )
+        .await;
+        let status = response.status();
+        if !status.is_success() {
+            let frame = custom_ws_error_frame(status);
+            return if downstream.send(Message::Text(frame.into())).await.is_ok() {
+                CustomFrameDisposition::Relayed
+            } else {
+                CustomFrameDisposition::Failed
+            };
+        }
+        return if relay_custom_sse_body(downstream, response.into_body()).await {
+            CustomFrameDisposition::Relayed
+        } else {
+            CustomFrameDisposition::Failed
+        };
+    }
+    let (provider, provider_model) = match state.store.providers().resolve_model(&model).await {
+        Ok(Some(route)) if route.0.wire_api == "responses" => route,
+        Ok(Some(_)) => {
+            let _ = downstream
+                .send(Message::Text(
+                    custom_ws_error_frame(StatusCode::BAD_REQUEST).into(),
+                ))
+                .await;
+            return CustomFrameDisposition::Failed;
+        }
+        Ok(None) => return CustomFrameDisposition::Native,
+        Err(_) => {
+            let _ = downstream
+                .send(Message::Text(
+                    custom_ws_error_frame(StatusCode::INTERNAL_SERVER_ERROR).into(),
+                ))
+                .await;
+            return CustomFrameDisposition::Failed;
+        }
     };
     let response = crate::ingress::responses_custom_route_for_ws(
         state.clone(),

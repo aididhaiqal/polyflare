@@ -444,6 +444,19 @@ pub struct RecentErrorRow {
     pub requested_at: i64,
 }
 
+/// A compact, content-safe translated-request row for the translation-routes dashboard.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct TranslatedRequestRow {
+    pub requested_at: i64,
+    pub request_id: Option<String>,
+    pub path: String,
+    pub provider: String,
+    pub status: i64,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub duration_ms: i64,
+}
+
 /// Repository over the `request_log` table.
 pub struct RequestLogRepo {
     pool: SqlitePool,
@@ -610,6 +623,21 @@ impl RequestLogRepo {
             .fetch_one(&self.pool)
             .await?;
         Ok(n)
+    }
+
+    /// Recent requests whose protocol was translated before upstream dispatch.
+    pub async fn recent_translated(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<TranslatedRequestRow>, StoreError> {
+        Ok(sqlx::query_as::<_, TranslatedRequestRow>(
+            "SELECT requested_at, request_id, path, provider, status, model, reasoning_effort, duration_ms \
+             FROM request_log WHERE aliased = 1 AND path IN ('/v1/messages', '/responses') \
+             ORDER BY requested_at DESC, id DESC LIMIT ?",
+        )
+        .bind(limit.clamp(1, 50))
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// Aggregate one account's lifetime request count and API-token total entirely in SQLite.
@@ -2197,6 +2225,37 @@ mod tests {
         let limited = repo.recent_errors(1).await.unwrap();
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].status, 429);
+    }
+
+    #[tokio::test]
+    async fn recent_translated_returns_both_protocol_directions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        repo.insert(&rec("codex", "/responses", 200, Some("native")))
+            .await
+            .unwrap();
+        let mut translated = rec("codex", "/v1/messages", 200, Some("gpt-5.6-sol"));
+        translated.aliased = true;
+        translated.request_id = Some("translation-request".into());
+        translated.reasoning_effort = Some("high".into());
+        translated.duration_ms = 321;
+        repo.insert(&translated).await.unwrap();
+        let mut reverse = rec("anthropic", "/responses", 200, Some("claude-sonnet"));
+        reverse.aliased = true;
+        reverse.request_id = Some("reverse-translation".into());
+        repo.insert(&reverse).await.unwrap();
+
+        let rows = repo.recent_translated(8).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].request_id.as_deref(), Some("reverse-translation"));
+        assert_eq!(rows[0].path, "/responses");
+        assert_eq!(rows[0].provider, "anthropic");
+        assert_eq!(rows[1].request_id.as_deref(), Some("translation-request"));
+        assert_eq!(rows[1].model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(rows[1].reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(rows[1].duration_ms, 321);
     }
 
     /// `prune_older_than` deletes ONLY rows with `requested_at < cutoff`, leaving rows at/after the

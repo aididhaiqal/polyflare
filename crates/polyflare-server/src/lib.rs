@@ -36,6 +36,7 @@ pub mod sse;
 pub mod starvation;
 pub mod token_cache;
 pub mod translate_stream;
+pub mod translation_api;
 pub mod usage_capture;
 pub mod usage_refresh;
 pub mod usage_windows;

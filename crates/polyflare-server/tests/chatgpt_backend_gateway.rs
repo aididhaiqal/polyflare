@@ -277,6 +277,18 @@ async fn wham_usage_returns_capacity_weighted_pool_as_canonical_codex_limit() {
         payload["rate_limit"]["secondary_window"]["reset_at"],
         reset_at
     );
+    assert_eq!(
+        payload["additional_rate_limits"][0]["limit_name"],
+        "PolyFlare overall pool"
+    );
+    assert_eq!(
+        payload["additional_rate_limits"][0]["metered_feature"],
+        "polyflare_pool"
+    );
+    assert_eq!(
+        payload["additional_rate_limits"][0]["rate_limit"], payload["rate_limit"],
+        "the named bucket must describe the same aggregate as the canonical compatibility limit"
+    );
     assert_eq!(payload["rate_limit_reset_credits"]["available_count"], 0);
     assert!(
         capture.0.lock().unwrap().is_none(),
@@ -383,6 +395,18 @@ async fn pool_scoped_usage_includes_only_members_of_the_named_pool() {
     assert_eq!(
         payload["rate_limit"]["secondary_window"]["used_percent"],
         20
+    );
+    assert_eq!(
+        payload["additional_rate_limits"][0]["limit_name"],
+        "PolyFlare work pool"
+    );
+    assert_eq!(
+        payload["additional_rate_limits"][0]["metered_feature"],
+        "polyflare_pool_work"
+    );
+    assert_eq!(
+        payload["additional_rate_limits"][0]["rate_limit"],
+        payload["rate_limit"]
     );
 }
 

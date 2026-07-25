@@ -17,8 +17,8 @@ add accounts or providers, and point a compatible client at `http://127.0.0.1:80
 - Durable ownership for anchored conversations so a response ID never moves to the wrong account.
 - Native downstream WebSocket support, upstream WebSocket support, and HTTP/SSE fallback.
 - Bounded failover, starvation recovery, stream deadlines, and admission control.
-- Native Anthropic Messages routing plus selected Messages-to-Responses translation aliases.
-- Generic OpenAI Responses-compatible custom providers with credential pools and model catalogs.
+- Native Anthropic Messages routing plus editable bidirectional Messages/Responses translation.
+- Responses- and Anthropic-compatible custom providers with credential pools and model catalogs.
 - Provider-aware request history, usage, cost, TTFT, latency, throughput, sessions, and reports.
 - An embedded dashboard with live SSE updates and polling fallback.
 - Prometheus metrics and structured, content-safe process logs.
@@ -40,11 +40,12 @@ Claude / Messages client ─┘       │
 
 A request first resolves its protocol and target:
 
-- `POST /responses` uses the native Responses path. A configured custom-model slug is resolved
-  before the built-in account fleet.
-- `POST /v1/messages` uses an Anthropic account for an ordinary Anthropic model. Recognized Claude
-  family aliases are translated to their mapped Codex target and translated back to Anthropic
-  response events.
+- `POST /responses` uses the native Responses path unless an enabled route maps the requested
+  model to an Anthropic account fleet or Anthropic-compatible custom provider.
+- `POST /v1/messages` uses the native Messages path unless an enabled route maps the requested
+  model to a Codex account fleet or Responses-compatible custom provider.
+- Cross-protocol routes translate both the request and streamed response. Same-protocol custom
+  models stay on the direct path and do not pay the translation cost.
 - `/{pool}/responses` and `/{pool}/v1/messages` apply the same behavior within one named pool.
   Custom models are intentionally root-scoped and are not resolved through a named account pool.
 
@@ -174,13 +175,32 @@ replaces only selected-account authentication and identity, and supports HTTP/SS
 transport.
 
 The built-in Anthropic path accepts `/v1/messages`, sends Anthropic-native HTTP requests through
-Anthropic accounts, and supports streaming and non-streaming responses. Selected Claude family
-names can also be translated to Responses requests and routed through Codex models. These aliases
-are routing rules only; they are intentionally hidden from model-discovery pickers.
+Anthropic accounts, and supports streaming and non-streaming responses. The **Translations**
+dashboard page manages routes in both directions. A route declares the client protocol, model
+matcher, built-in or custom target, and target model. The target provider's declared wire API is
+the protocol authority: same-protocol routes are rejected, and a missing, disabled, or
+protocol-changed target fails clearly instead of silently selecting another provider. Routes
+support case-insensitive exact, prefix, and contains matching, deterministic priority, optional
+Responses reasoning effort, enable/disable, duplication, and server-backed matcher tests.
 
-### Generic Responses-compatible providers
+Migration `0023` seeds the former Opus, Sonnet, and Haiku behavior as ordinary editable routes on
+both existing and new databases:
 
-The Providers dashboard page can register any service that accepts:
+| Match | Codex target | Effort |
+|---|---|---|
+| contains `opus` | `gpt-5.6-sol` | `high` |
+| contains `sonnet` | `gpt-5.6-terra` | `medium` |
+| contains `haiku` | `gpt-5.6-luna` | `low` |
+
+These routes are not model-catalog entries and remain hidden from Codex and generic OpenAI model
+pickers. Pool-scoped Messages requests apply the same global route rules, then select the mapped
+Codex account only from that pool. A reverse route from a Responses client similarly selects an
+Anthropic account only from the requested pool.
+
+### Custom providers
+
+The Providers dashboard page records the provider's native API. A Responses-compatible provider
+accepts:
 
 ```text
 POST {base_url}/responses
@@ -188,6 +208,21 @@ Authorization: Bearer <provider credential>
 Content-Type: application/json
 Accept: text/event-stream
 ```
+
+An Anthropic-compatible provider accepts:
+
+```text
+POST {base_url}/messages
+x-api-key: <provider credential>
+anthropic-version: 2023-06-01
+Content-Type: application/json
+Accept: text/event-stream
+```
+
+Model discovery uses `{base_url}/models` with the matching authentication scheme. Direct traffic
+uses the provider's native protocol. Cross-protocol traffic requires an explicit translation
+route, so adding an Anthropic provider cannot accidentally make raw Responses JSON reach its
+Messages endpoint (or vice versa).
 
 Each provider controls:
 
@@ -401,6 +436,36 @@ For development:
 cargo run --bin polyflare -- serve
 ```
 
+For a one-command release rebuild and graceful local restart:
+
+```sh
+scripts/polyflare-service restart
+# The default action is also restart:
+scripts/polyflare-service
+```
+
+The service helper builds before stopping the current instance, atomically installs the release
+artifact at `$HOME/.local/bin/polyflare`, verifies that any process it signals is PolyFlare, waits
+for the server's graceful drain, starts the installed binary independently of the terminal, and
+checks `/dashboard` before reporting success. It stores its PID and log under
+`$POLYFLARE_DATA_DIR/run` (default `$HOME/.polyflare/run`):
+
+```sh
+scripts/polyflare-service status
+scripts/polyflare-service logs
+scripts/polyflare-service stop
+scripts/polyflare-service start
+scripts/polyflare-service build
+```
+
+`start` also builds and installs first. Override `POLYFLARE_SERVICE_BINARY` to use a different
+install/launch path, or `POLYFLARE_SERVICE_BUILD_BINARY` to use a different build artifact.
+`POLYFLARE_SERVICE_URL` and `POLYFLARE_SERVICE_PORT` select a non-default listener.
+On macOS, `restart` automatically uses the loaded `com.polyflare.server` launch agent so its
+`KeepAlive` policy does not race the helper's detached fallback. Set
+`POLYFLARE_SERVICE_USE_LAUNCHD=0` to force detached-process management, or override
+`POLYFLARE_SERVICE_LAUNCHD_LABEL` for a differently named launch agent.
+
 The default bind is `127.0.0.1:8080`. The default data directory is
 `$HOME/.polyflare`, containing:
 
@@ -460,7 +525,12 @@ requires_openai_auth = true
 the model-provider base URL. PolyFlare returns its capacity-weighted pool as the canonical Codex
 quota at `/backend-api/wham/usage`. Synthetic usage is not a public status endpoint: it requires a
 valid PolyFlare client key when client-key enforcement is active, and otherwise requires an
-authenticated client request. Every other `/backend-api/*` request uses the client's existing
+authenticated client request. The capacity-weighted aggregate remains the canonical Codex limit
+for compatibility and is also advertised through WHAM's `additional_rate_limits` contract as
+**PolyFlare overall pool**, matching the named usage buckets Codex uses for model-specific limits.
+A pool-scoped URL uses a corresponding label such as **PolyFlare work pool**. Modern Codex clients
+may display both the canonical compatibility windows and their explicitly named pool
+representation. Every other `/backend-api/*` request uses the client's existing
 ChatGPT authorization when **Settings → ChatGPT backend passthrough** is enabled. Passthrough is
 enabled by default; the setting is a live rollback control that can disable it without restarting
 PolyFlare. These requests go directly to the fixed ChatGPT backend without account selection or
@@ -599,8 +669,8 @@ WebSocket variables are listed in [WebSockets, SSE, and idle behavior](#websocke
 | `GET /responses` | Responses WebSocket upgrade when enabled. |
 | `POST /{pool}/responses` | Pool-scoped Responses routing. |
 | `GET /{pool}/responses` | Pool-scoped Responses WebSocket upgrade. |
-| `POST /v1/messages` | Root Anthropic Messages routing or alias translation. |
-| `POST /{pool}/v1/messages` | Pool-scoped Messages routing or alias translation. |
+| `POST /v1/messages` | Root Anthropic Messages routing or configured route translation. |
+| `POST /{pool}/v1/messages` | Pool-scoped Messages routing or configured route translation. |
 | `POST /responses/compact` | Account-aware compaction. |
 | `POST /{pool}/responses/compact` | Pool-scoped compaction. |
 | `POST /images/generations` | Account-aware image generation forwarding. |
@@ -740,8 +810,8 @@ The workspace is organized as:
 ## Scope and limitations
 
 - PolyFlare is intended for credentials and accounts you are authorized to use.
-- Generic custom providers currently use the Responses HTTP/SSE contract. Provider-specific
-  protocols require an adapter rather than only a dashboard entry.
+- Custom providers support the OpenAI Responses and Anthropic Messages HTTP/SSE contracts.
+  Other wire protocols still require an adapter rather than only a dashboard entry.
 - Custom-provider models are root-scoped; named pools scope built-in account fleets.
 - Native Anthropic account onboarding and refresh are not exposed by the current dashboard flow.
 - Realtime call creation and its account-matched sideband WebSocket are intentionally not exposed.

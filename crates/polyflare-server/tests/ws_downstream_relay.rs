@@ -151,8 +151,8 @@ mod relay_through {
         RuntimeSettings, RuntimeSettingsFields, SettingValue,
     };
     use polyflare_store::{
-        Account as StoreAccount, NewCustomProvider, NewProviderModel, PlainTokens, Store,
-        TokenCipher,
+        Account as StoreAccount, NewCustomProvider, NewProviderModel, NewTranslationRoute,
+        PlainTokens, Store, TokenCipher,
     };
     use polyflare_testkit::{MockOAuth, MockWsUpstream, ScriptedTurn};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -626,6 +626,180 @@ mod relay_through {
         );
         assert_eq!(row.transport.as_deref(), Some("websocket"));
         assert_eq!(row.upstream_transport.as_deref(), Some("http_sse"));
+    }
+
+    #[tokio::test]
+    async fn responses_translation_ws_frame_bridges_to_custom_anthropic_provider() {
+        use std::sync::Mutex;
+
+        let mock = polyflare_testkit::MockUpstream::new(vec![
+            r#"{"type":"message_start","message":{"id":"msg-ws","model":"claude-upstream","usage":{"input_tokens":3}}}"#.into(),
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#.into(),
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"anthropic over ws"}}"#.into(),
+            r#"{"type":"content_block_stop","index":0}"#.into(),
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}"#.into(),
+            r#"{"type":"message_stop"}"#.into(),
+        ]);
+        let custom_handle = mock.clone();
+        let custom_base = mock.spawn().await;
+
+        let codex_upstream = MockWsUpstream::new(ScriptedTurn::normal(Vec::new()));
+        let codex_base = codex_upstream.clone().spawn().await;
+        let (base, state) =
+            spawn_with_pinned_account("acct-anthropic-translation-ws", &codex_base).await;
+        let timestamp = now();
+        state
+            .store
+            .providers()
+            .create_provider(&NewCustomProvider {
+                id: "provider-anthropic-translation-ws".into(),
+                slug: "anthropic-translation-ws".into(),
+                display_name: "Anthropic translation WS".into(),
+                base_url: format!("{custom_base}/v1"),
+                wire_api: "anthropic_messages".into(),
+                enabled: true,
+                stateless_responses: false,
+                allow_private_hosts: true,
+                connect_timeout_ms: 1_000,
+                stream_idle_timeout_ms: 10_000,
+                request_max_retries: 0,
+                max_concurrency: Some(2),
+                created_at: timestamp,
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .providers()
+            .create_credential(
+                "credential-anthropic-translation-ws",
+                "provider-anthropic-translation-ws",
+                "primary",
+                "secret",
+                1.0,
+                Some(2),
+                timestamp,
+                &state.cipher,
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .providers()
+            .create_model(&NewProviderModel {
+                id: "model-anthropic-translation-ws".into(),
+                provider_id: "provider-anthropic-translation-ws".into(),
+                public_model: "claude-public".into(),
+                upstream_model: "claude-upstream".into(),
+                display_name: "Claude custom".into(),
+                context_window: Some(200_000),
+                max_output_tokens: Some(8_192),
+                supports_tools: true,
+                supports_vision: true,
+                supports_parallel_tool_calls: true,
+                supports_web_search: false,
+                supports_reasoning_summaries: false,
+                reasoning_levels_json: "[]".into(),
+                model_info_json: None,
+                instruction_mode: "none".into(),
+                instruction_text: String::new(),
+                request_overrides_json: "{}".into(),
+                input_per_million: None,
+                cached_input_per_million: None,
+                output_per_million: None,
+                visible_in_codex: true,
+                visible_in_openai: true,
+                enabled: true,
+                created_at: timestamp,
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .translations()
+            .create(&NewTranslationRoute {
+                id: "responses-to-custom-anthropic-ws".into(),
+                name: "Responses to custom Anthropic over WS".into(),
+                enabled: true,
+                source_protocol: "openai_responses".into(),
+                match_kind: "exact".into(),
+                model_pattern: "claude-ws-alias".into(),
+                target_kind: "custom_provider".into(),
+                target_provider_id: "provider-anthropic-translation-ws".into(),
+                target_model: "claude-public".into(),
+                reasoning_effort: None,
+                priority: 1,
+                created_at: timestamp,
+            })
+            .await
+            .unwrap();
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        ws.send(TMessage::Text(
+            serde_json::json!({
+                "type": "response.create",
+                "model": "claude-ws-alias",
+                "input": [{"role": "user", "content": "hello"}],
+                "max_output_tokens": 333
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+        let mut delta = None;
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_in_turn = received.clone();
+        let terminal_result = tokio::time::timeout(Duration::from_secs(2), async move {
+            loop {
+                let TMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                received_in_turn.lock().unwrap().push(value.clone());
+                if value["type"] == "response.output_text.delta" {
+                    delta = value["delta"].as_str().map(str::to_string);
+                } else if value["type"] == "response.completed" {
+                    break (value, delta);
+                } else if value["type"] == "error" {
+                    panic!("translation route returned an error frame: {value}");
+                }
+            }
+        })
+        .await;
+        let terminal = match terminal_result {
+            Ok(terminal) => terminal,
+            Err(_) => {
+                state.store.flush_background_writes().await.unwrap();
+                let request_rows = state.store.request_log().list(10, 0).await.unwrap();
+                panic!(
+                "translated Anthropic turn timed out; upstream requests={}, codex frames={}, downstream frames={:?}, request rows={request_rows:?}",
+                    usize::from(custom_handle.last_body().is_some()),
+                    codex_upstream.frames().len(),
+                    received.lock().unwrap().as_slice()
+                );
+            }
+        };
+        let (terminal, delta) = terminal;
+
+        assert_eq!(delta.as_deref(), Some("anthropic over ws"));
+        assert_eq!(
+            terminal["response"]["id"], "",
+            "custom Anthropic responses cannot satisfy a later Responses anchor"
+        );
+        assert_eq!(terminal["response"]["usage"]["input_tokens"], 3);
+        assert_eq!(terminal["response"]["usage"]["output_tokens"], 4);
+        let captured = custom_handle.last_body().unwrap();
+        assert_eq!(captured["model"], "claude-upstream");
+        assert_eq!(captured["max_tokens"], 333);
+        assert_eq!(captured["messages"][0]["role"], "user");
+        assert!(
+            codex_upstream.frames().is_empty(),
+            "a matched translation route must never leak the frame to Codex"
+        );
     }
 
     #[tokio::test]

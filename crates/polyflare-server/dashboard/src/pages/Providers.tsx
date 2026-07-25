@@ -66,8 +66,8 @@ export function Providers() {
         <div>
           <h1 className="text-lg font-semibold text-fg">Model providers</h1>
           <p className="mt-0.5 text-[11px] text-fg opacity-60">
-            Add Responses-compatible providers, credential pools, and models to the main PolyFlare
-            catalog.
+            Add Responses- or Anthropic-compatible providers, credential pools, and models to the
+            main PolyFlare catalog.
           </p>
         </div>
         <button
@@ -125,6 +125,11 @@ export function Providers() {
                   </div>
                   <div className="mt-1 truncate font-mono text-[9.5px] text-fg opacity-45">
                     {provider.base_url}
+                  </div>
+                  <div className="mt-1 text-[8px] font-bold uppercase tracking-wide text-signal">
+                    {provider.wire_api === "anthropic_messages"
+                      ? "Anthropic Messages"
+                      : "OpenAI Responses"}
                   </div>
                 </div>
                 <div className="text-right text-[9px] text-fg opacity-45">
@@ -1050,6 +1055,7 @@ function ProviderForm({
     providerSlug: "sakana",
     baseUrl: "https://api.sakana.ai/v1",
     apiKey: "",
+    wireApi: "responses" as "responses" | "anthropic_messages",
   });
 
   function submit(event: FormEvent) {
@@ -1059,6 +1065,7 @@ function ProviderForm({
         slug: form.providerSlug,
         display_name: form.providerName,
         base_url: form.baseUrl,
+        wire_api: form.wireApi,
         stateless_responses: true,
         stream_idle_timeout_ms: form.providerSlug === "sakana" ? 7_200_000 : 300_000,
         request_max_retries: form.providerSlug === "sakana" ? 4 : 1,
@@ -1100,6 +1107,7 @@ function ProviderForm({
                 providerSlug: "openrouter",
                 baseUrl: "https://openrouter.ai/api/v1",
                 apiKey: form.apiKey,
+                wireApi: "responses",
               })
             }
             className="rounded border border-signal/30 px-2 py-1 text-[8.5px] font-semibold text-signal"
@@ -1114,6 +1122,7 @@ function ProviderForm({
                 providerSlug: "sakana",
                 baseUrl: "https://api.sakana.ai/v1",
                 apiKey: form.apiKey,
+                wireApi: "responses",
               })
             }
             className="rounded border border-border px-2 py-1 text-[8.5px] font-semibold text-fg opacity-60"
@@ -1122,12 +1131,30 @@ function ProviderForm({
           </button>
         </div>
       </div>
-      <form onSubmit={submit} className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+      <form onSubmit={submit} className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-5">
         {field("providerName", "Provider name")}
         {field("providerSlug", "Provider slug")}
         {field("baseUrl", "Base URL", "url")}
+        <label className="flex min-w-0 flex-col gap-1.5">
+          <span className="text-[9px] font-bold uppercase tracking-wide text-fg opacity-50">
+            Native API
+          </span>
+          <select
+            className={INPUT}
+            value={form.wireApi}
+            onChange={(event) =>
+              setForm((current) => ({
+                ...current,
+                wireApi: event.target.value as "responses" | "anthropic_messages",
+              }))
+            }
+          >
+            <option value="responses">OpenAI Responses</option>
+            <option value="anthropic_messages">Anthropic Messages</option>
+          </select>
+        </label>
         {field("apiKey", "API key", "password")}
-        <div className="flex items-end md:col-span-2 xl:col-span-4">
+        <div className="flex items-end md:col-span-2 xl:col-span-5">
           <button
             type="submit"
             disabled={pending}

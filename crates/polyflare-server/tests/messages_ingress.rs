@@ -12,7 +12,10 @@ use polyflare_core::{CapacityWeighted, Continuity, Executor};
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::continuity::CodexContinuity;
 use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
-use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
+use polyflare_store::{
+    Account, NewCustomProvider, NewProviderModel, NewTranslationRoute, PlainTokens, Store,
+    TokenCipher, TranslationRouteUpdate,
+};
 use polyflare_testkit::MockUpstream;
 
 fn now() -> i64 {
@@ -184,6 +187,414 @@ async fn messages_relays_to_the_anthropic_executor() {
     assert_eq!(
         handle.last_body().unwrap()["model"],
         "claude-3-5-legacy-model"
+    );
+}
+
+#[tokio::test]
+async fn responses_route_can_translate_to_anthropic_and_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[21u8; 32]).unwrap();
+    store
+        .accounts()
+        .insert(&anthropic_account("anthropic-1"), &tokens(), &cipher)
+        .await
+        .unwrap();
+    store
+        .translations()
+        .create(&NewTranslationRoute {
+            id: "responses-to-anthropic".into(),
+            name: "Responses to Anthropic".into(),
+            enabled: true,
+            source_protocol: "openai_responses".into(),
+            match_kind: "exact".into(),
+            model_pattern: "claude-test".into(),
+            target_kind: "builtin_provider".into(),
+            target_provider_id: "anthropic".into(),
+            target_model: "claude-test-upstream".into(),
+            reasoning_effort: None,
+            priority: 1,
+            created_at: now(),
+        })
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+
+    let mock = MockUpstream::new(vec![
+        r#"{"type":"message_start","message":{"model":"claude-test-upstream","usage":{"input_tokens":5}}}"#.into(),
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#.into(),
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#.into(),
+        r#"{"type":"content_block_stop","index":0}"#.into(),
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#.into(),
+        r#"{"type":"message_stop"}"#.into(),
+    ]);
+    let handle = mock.clone();
+    let upstream = mock.spawn().await;
+    let pf = spawn_polyflare(store, upstream).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({
+            "model": "claude-test",
+            "instructions": "Be concise",
+            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+            "max_output_tokens": 321,
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("response.output_text.delta"));
+    assert!(body.contains("response.completed"));
+    assert!(body.contains("\"total_tokens\":7"));
+
+    let forwarded = handle.last_body().unwrap();
+    assert_eq!(forwarded["model"], "claude-test-upstream");
+    assert_eq!(forwarded["system"], "Be concise");
+    assert_eq!(forwarded["max_tokens"], 321);
+    assert_eq!(forwarded["stream"], true);
+
+    let buffered = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({
+            "model": "claude-test",
+            "input": "hi again",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(buffered.status(), 200);
+    assert_eq!(
+        buffered
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let buffered: serde_json::Value = buffered.json().await.unwrap();
+    assert_eq!(buffered["status"], "completed");
+    assert_eq!(buffered["output"][0]["content"][0]["text"], "hello");
+}
+
+#[tokio::test]
+async fn messages_route_can_translate_to_a_custom_responses_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[21u8; 32]).unwrap();
+    let mock = MockUpstream::new(vec![
+        r#"{"type":"response.created","response":{"id":"resp_1","model":"custom-upstream"}}"#.into(),
+        r#"{"type":"response.output_item.added","item":{"id":"item_1","type":"message","role":"assistant"}}"#.into(),
+        r#"{"type":"response.content_part.added","item_id":"item_1","part":{"type":"output_text","text":""}}"#.into(),
+        r#"{"type":"response.output_text.delta","item_id":"item_1","delta":"custom hello"}"#.into(),
+        r#"{"type":"response.output_text.done","item_id":"item_1","text":"custom hello"}"#.into(),
+        r#"{"type":"response.completed","response":{"id":"resp_1","model":"custom-upstream","status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}"#.into(),
+    ]);
+    let handle = mock.clone();
+    let upstream = mock.spawn().await;
+    store
+        .providers()
+        .create_provider(&NewCustomProvider {
+            id: "provider-custom-responses".into(),
+            slug: "custom-responses".into(),
+            display_name: "Custom Responses".into(),
+            base_url: upstream,
+            wire_api: "responses".into(),
+            enabled: true,
+            stateless_responses: true,
+            allow_private_hosts: true,
+            connect_timeout_ms: 1_000,
+            stream_idle_timeout_ms: 10_000,
+            request_max_retries: 0,
+            max_concurrency: None,
+            created_at: now(),
+        })
+        .await
+        .unwrap();
+    store
+        .providers()
+        .create_credential(
+            "credential-custom-responses",
+            "provider-custom-responses",
+            "primary",
+            "custom-secret",
+            1.0,
+            None,
+            now(),
+            &cipher,
+        )
+        .await
+        .unwrap();
+    store
+        .providers()
+        .create_model(&NewProviderModel {
+            id: "model-custom-responses".into(),
+            provider_id: "provider-custom-responses".into(),
+            public_model: "custom-public".into(),
+            upstream_model: "custom-upstream".into(),
+            display_name: "Custom".into(),
+            context_window: None,
+            max_output_tokens: Some(4096),
+            supports_tools: true,
+            supports_vision: true,
+            supports_parallel_tool_calls: true,
+            supports_web_search: false,
+            supports_reasoning_summaries: false,
+            reasoning_levels_json: "[]".into(),
+            model_info_json: None,
+            instruction_mode: "none".into(),
+            instruction_text: String::new(),
+            request_overrides_json: "{}".into(),
+            input_per_million: None,
+            cached_input_per_million: None,
+            output_per_million: None,
+            visible_in_codex: true,
+            visible_in_openai: true,
+            enabled: true,
+            created_at: now(),
+        })
+        .await
+        .unwrap();
+    store
+        .translations()
+        .create(&NewTranslationRoute {
+            id: "messages-to-custom".into(),
+            name: "Messages to custom".into(),
+            enabled: true,
+            source_protocol: "anthropic_messages".into(),
+            match_kind: "exact".into(),
+            model_pattern: "custom-claude-alias".into(),
+            target_kind: "custom_provider".into(),
+            target_provider_id: "provider-custom-responses".into(),
+            target_model: "custom-public".into(),
+            reasoning_effort: None,
+            priority: 1,
+            created_at: now(),
+        })
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+    let pf = spawn_polyflare(store, "http://127.0.0.1:9".into()).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{pf}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "custom-claude-alias",
+            "messages": [{"role":"user","content":"hello"}],
+            "max_tokens": 777,
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("custom hello"));
+    assert_eq!(
+        handle.last_authorization().as_deref(),
+        Some("Bearer custom-secret")
+    );
+    let forwarded = handle.last_body().unwrap();
+    assert_eq!(forwarded["model"], "custom-upstream");
+    assert_eq!(forwarded["max_output_tokens"], 777);
+    assert!(forwarded.get("store").is_none());
+}
+
+#[tokio::test]
+async fn responses_route_can_translate_to_a_custom_anthropic_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[21u8; 32]).unwrap();
+    let mock = MockUpstream::new(vec![
+        r#"{"type":"message_start","message":{"model":"anthropic-upstream","usage":{"input_tokens":3}}}"#.into(),
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#.into(),
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"anthropic custom"}}"#.into(),
+        r#"{"type":"content_block_stop","index":0}"#.into(),
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#.into(),
+        r#"{"type":"message_stop"}"#.into(),
+    ]);
+    let handle = mock.clone();
+    let upstream = mock.spawn().await;
+    store
+        .providers()
+        .create_provider(&NewCustomProvider {
+            id: "provider-custom-anthropic".into(),
+            slug: "custom-anthropic".into(),
+            display_name: "Custom Anthropic".into(),
+            base_url: format!("{upstream}/v1"),
+            wire_api: "anthropic_messages".into(),
+            enabled: true,
+            stateless_responses: false,
+            allow_private_hosts: true,
+            connect_timeout_ms: 1_000,
+            stream_idle_timeout_ms: 10_000,
+            request_max_retries: 0,
+            max_concurrency: None,
+            created_at: now(),
+        })
+        .await
+        .unwrap();
+    store
+        .providers()
+        .create_credential(
+            "credential-custom-anthropic",
+            "provider-custom-anthropic",
+            "primary",
+            "anthropic-secret",
+            1.0,
+            None,
+            now(),
+            &cipher,
+        )
+        .await
+        .unwrap();
+    store
+        .providers()
+        .create_model(&NewProviderModel {
+            id: "model-custom-anthropic".into(),
+            provider_id: "provider-custom-anthropic".into(),
+            public_model: "anthropic-public".into(),
+            upstream_model: "anthropic-upstream".into(),
+            display_name: "Anthropic Custom".into(),
+            context_window: None,
+            max_output_tokens: Some(4096),
+            supports_tools: true,
+            supports_vision: true,
+            supports_parallel_tool_calls: true,
+            supports_web_search: false,
+            supports_reasoning_summaries: false,
+            reasoning_levels_json: "[]".into(),
+            model_info_json: None,
+            instruction_mode: "none".into(),
+            instruction_text: String::new(),
+            request_overrides_json: "{}".into(),
+            input_per_million: None,
+            cached_input_per_million: None,
+            output_per_million: None,
+            visible_in_codex: true,
+            visible_in_openai: true,
+            enabled: true,
+            created_at: now(),
+        })
+        .await
+        .unwrap();
+    store
+        .translations()
+        .create(&NewTranslationRoute {
+            id: "responses-to-custom-anthropic".into(),
+            name: "Responses to custom Anthropic".into(),
+            enabled: true,
+            source_protocol: "openai_responses".into(),
+            match_kind: "exact".into(),
+            model_pattern: "anthropic-alias".into(),
+            target_kind: "custom_provider".into(),
+            target_provider_id: "provider-custom-anthropic".into(),
+            target_model: "anthropic-public".into(),
+            reasoning_effort: None,
+            priority: 1,
+            created_at: now(),
+        })
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+    let pf = spawn_polyflare(store, "http://127.0.0.1:9".into()).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({
+            "model": "anthropic-alias",
+            "input": "hello",
+            "max_output_tokens": 222,
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("anthropic custom"));
+    let headers = handle.last_headers().unwrap();
+    assert_eq!(
+        headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok()),
+        Some("anthropic-secret")
+    );
+    assert_eq!(
+        headers
+            .get("anthropic-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2023-06-01")
+    );
+    assert!(headers.get("authorization").is_none());
+    let forwarded = handle.last_body().unwrap();
+    assert_eq!(forwarded["model"], "anthropic-upstream");
+    assert_eq!(forwarded["max_tokens"], 222);
+}
+
+#[tokio::test]
+async fn disabling_a_seeded_translation_route_restores_native_anthropic_routing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[21u8; 32]).unwrap();
+    store
+        .accounts()
+        .insert(&anthropic_account("anthropic-1"), &tokens(), &cipher)
+        .await
+        .unwrap();
+    let route = store
+        .translations()
+        .get("default-anthropic-opus")
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .translations()
+        .update(
+            &route.id,
+            &TranslationRouteUpdate {
+                name: route.name,
+                enabled: false,
+                source_protocol: route.source_protocol,
+                match_kind: route.match_kind,
+                model_pattern: route.model_pattern,
+                target_kind: route.target_kind,
+                target_provider_id: route.target_provider_id,
+                target_model: route.target_model,
+                reasoning_effort: route.reasoning_effort,
+                priority: route.priority,
+                updated_at: now(),
+            },
+        )
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+
+    let mock = MockUpstream::new(vec![
+        r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"native"}}"#
+            .to_string(),
+        r#"{"type":"message_stop"}"#.to_string(),
+    ]);
+    let handle = mock.clone();
+    let upstream = mock.spawn().await;
+    let pf = spawn_polyflare(store, upstream).await;
+    let response = reqwest::Client::new()
+        .post(format!("{pf}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-opus-4-1-20250805",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        handle.last_body().unwrap()["model"],
+        "claude-opus-4-1-20250805"
     );
 }
 

@@ -144,6 +144,7 @@ fn wham_usage_payload(
     primary_reset_at: Option<i64>,
     secondary_reset_at: i64,
     now: i64,
+    pool: Option<&str>,
 ) -> serde_json::Value {
     let mut rate_limit = serde_json::Map::new();
     let limit_reached = quota.secondary.used_percent >= 100.0
@@ -166,12 +167,28 @@ fn wham_usage_payload(
         "secondary_window".to_string(),
         wham_window(&quota.secondary, secondary_reset_at, now),
     );
+    let (metered_feature, limit_name) = match pool {
+        Some(pool) => (
+            format!("polyflare_pool_{pool}"),
+            format!("PolyFlare {pool} pool"),
+        ),
+        None => (
+            "polyflare_pool".to_string(),
+            "PolyFlare overall pool".to_string(),
+        ),
+    };
+    let additional_rate_limits = serde_json::json!([{
+        "limit_name": limit_name,
+        "metered_feature": metered_feature,
+        "rate_limit": rate_limit.clone(),
+    }]);
 
     serde_json::json!({
         // The field is mandatory in codex-rs's WHAM schema. Aggregation weights still come from
         // every member's real plan/capacity; this value is display/protocol metadata only.
         "plan_type": "pro",
         "rate_limit": rate_limit,
+        "additional_rate_limits": additional_rate_limits,
         // Pool quota cannot truthfully promise that an individual account reset credit resets the
         // aggregate. Suppress the reset action instead of exposing a misleading operation.
         "rate_limit_reset_credits": {"available_count": 0},
@@ -221,6 +238,7 @@ async fn usage_route(state: Arc<AppState>, pool: Option<String>, headers: Header
                             primary_reset_at,
                             secondary_reset_at,
                             unix_now(),
+                            pool.as_deref(),
                         ))
                         .into_response()
                     }
