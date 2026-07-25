@@ -112,11 +112,11 @@ use polyflare_core::{Account, AccountId, FailureSignal, Provider, SessionKey};
 
 use crate::app::AppState;
 
-use super::reasoning_transform::{strip_unverifiable_reasoning, INVALID_ENCRYPTED_CONTENT_CODE};
 use super::redial::RedialOutcome;
 use super::signal::{classify_upstream_signal, UpstreamSignal};
 use super::sniff::sniff_completed_id;
 use super::telemetry::{start_turn, WsRoutingOutcome, WsTurnTelemetry, WsTurnTerminal};
+use crate::reasoning_transform::{strip_unverifiable_reasoning, INVALID_ENCRYPTED_CONTENT_CODE};
 
 /// How many CONSECUTIVE re-dials (eager cap re-dial, client-send re-dial, an exhaustion-move, or
 /// this task's mid-turn in-flight replay) are tolerated without a single forwarded `response.completed` in

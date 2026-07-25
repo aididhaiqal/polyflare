@@ -52,6 +52,36 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// The upstream `error.code` a failed attempt carried, if it carried one. Reads ONLY the bounded
+/// code field the failover classifier already keys off — never `message`, never the body.
+fn watchdog_error_code(error: &WatchdogError) -> Option<String> {
+    match error {
+        WatchdogError::Upstream(Some(signal)) => signal.error_code.clone(),
+        WatchdogError::UpstreamHttp(response) => response.signal.error_code.clone(),
+        _ => None,
+    }
+}
+
+/// A copy of `prepared` whose `/responses` body carries no foreign reasoning envelopes, or `None`
+/// when there was nothing to strip (so the caller never burns a pointless retry).
+///
+/// Handles both body representations: the native pass-through keeps the client's verbatim bytes in
+/// `raw_body`, while translated/recovered requests carry a materialized `body`. Whichever holds the
+/// request is the one rewritten — the other is left exactly as it was, preserving the executor's
+/// existing "raw bytes win" contract.
+fn prepared_with_stripped_reasoning(mut prepared: Prepared) -> Option<Prepared> {
+    use crate::reasoning_transform::strip_unverifiable_reasoning_body;
+    if let Some(raw) = prepared.req.raw_body.as_ref() {
+        let stripped = strip_unverifiable_reasoning_body(raw)?;
+        prepared.req.raw_body = Some(stripped.into());
+        return Some(prepared);
+    }
+    let body = prepared.req.body.as_ref()?;
+    let stripped = strip_unverifiable_reasoning_body(&serde_json::to_vec(body).ok()?)?;
+    prepared.req.body = Some(serde_json::from_slice(&stripped).ok()?);
+    Some(prepared)
+}
+
 /// Millisecond-resolution counterpart of [`unix_now`] — used ONLY by [`layer2_wait_stream`]'s
 /// budget-deadline math (B5 Task 4 adversarial review, FIX 1). `unix_now()`'s whole-second
 /// granularity is fine for durable `reset_at`/`cooldown_until` timestamps, but truncating a
@@ -2789,6 +2819,54 @@ async fn responses_handler_impl_with_max_attempts(
                 Some(in_flight),
             )
             .await;
+            // Cross-provider poisoned history on the HTTP path (2026-07-25 live): the client fell
+            // back to HTTP after a transport drop and the turn died with `invalid_encrypted_content`
+            // — the relay's transform only ever saw the WS frame. Same one-shot recovery, same
+            // account: rewrite the body (foreign reasoning envelopes out, plaintext summaries kept)
+            // and retry once. Nothing was relayed yet (this is a pre-stream error), so a retry
+            // cannot duplicate output. `None` from the transform means there is nothing to fix.
+            if provider == Provider::Codex
+                && execution
+                    .as_ref()
+                    .err()
+                    .and_then(watchdog_error_code)
+                    .as_deref()
+                    == Some(crate::reasoning_transform::INVALID_ENCRYPTED_CONTENT_CODE)
+            {
+                if let Some(retry) =
+                    prepared_with_stripped_reasoning(prepared_for_auth_retry.clone())
+                {
+                    state
+                        .runtime
+                        .refund_logical_turn_attempt(ctx.logical_turn_key.as_deref());
+                    if let Some(retry_lease) = state
+                        .runtime
+                        .acquire_pinned_in_flight_weighted(
+                            &id,
+                            unix_now(),
+                            &state.lease_metrics,
+                            sel_ctx.request_pressure_units,
+                        )
+                        .await
+                    {
+                        state.relay_metrics.record("reasoning_transform_http_retry");
+                        execution = execute_with_watchdog_tracked(
+                            state.executor_for(provider).as_ref(),
+                            state.continuity.clone(),
+                            retry,
+                            &account,
+                            id.clone(),
+                            ctx.clone(),
+                            state.runtime.clone(),
+                            state.runtime_settings.stream_idle_timeout(),
+                            max_attempts,
+                            commit.clone(),
+                            Some(retry_lease),
+                        )
+                        .await;
+                    }
+                }
+            }
             let unauthorized = matches!(
                 &execution,
                 Err(WatchdogError::Upstream(Some(signal))) if signal.status == 401

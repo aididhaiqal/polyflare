@@ -26,6 +26,7 @@ pub mod posture;
 pub mod provider_api;
 pub mod reactive_auth;
 pub mod read_api;
+pub mod reasoning_transform;
 pub mod refresh_locks;
 pub mod reset_credits;
 pub mod retention;

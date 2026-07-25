@@ -59,7 +59,6 @@ use crate::app::AppState;
 
 mod owner;
 mod pump;
-mod reasoning_transform;
 mod redial;
 mod session;
 mod signal;

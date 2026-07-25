@@ -441,6 +441,36 @@ pub fn clamp_starvation_heartbeat_secs(raw: u32, budget_secs: u32) -> u32 {
 /// A well-formed value above `MAX` (`3600`s = 1h — an absurd upper bound no genuine upstream
 /// response should ever legitimately need to stay silent for) clamps DOWN to `MAX` — never
 /// silently accepted as-is, never treated as malformed.
+/// `POLYFLARE_SHUTDOWN_DRAIN_TIMEOUT_SECS` — the CEILING on how long a shutdown waits for
+/// in-flight turns to finish before closing them anyway. Not the expected path: the drain returns
+/// the instant the in-flight turn count reaches zero (see `serve_with_bounded_shutdown`), so this
+/// only bounds a pathological turn that never terminates.
+///
+/// Default `300`s: comfortably longer than the slowest observed real turn (~110s of reasoning),
+/// where the previous fixed `10`s ceiling force-closed live turns and — because the Codex client
+/// only persists a message once its turn completes — destroyed user messages on every deploy
+/// (2026-07-25). `0` means "do not wait", the explicit no-drain lever; malformed values take the
+/// default; a well-formed value above `3600` (1h) clamps DOWN, since a shutdown that hangs an hour
+/// is a bug, not a configuration.
+pub fn shutdown_drain_timeout_from_env() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 300;
+    let secs = match std::env::var("POLYFLARE_SHUTDOWN_DRAIN_TIMEOUT_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(n) => clamp_shutdown_drain_timeout_secs(n),
+            Err(_) => DEFAULT_SECS,
+        },
+        Err(_) => DEFAULT_SECS,
+    };
+    std::time::Duration::from_secs(secs)
+}
+
+/// The pure bound [`shutdown_drain_timeout_from_env`] applies: `0` passes through (the no-drain
+/// lever), anything above `3600` clamps to `3600`. Extracted for the same one-source-of-truth
+/// reason as [`clamp_max_account_attempts`].
+pub fn clamp_shutdown_drain_timeout_secs(raw: u64) -> u64 {
+    raw.min(3600)
+}
+
 pub fn stream_idle_timeout_secs_from_env() -> u64 {
     let default = crate::ingress::DEFAULT_STREAM_IDLE_TIMEOUT.as_secs();
     match std::env::var("POLYFLARE_STREAM_IDLE_TIMEOUT_SECS") {
@@ -947,6 +977,14 @@ fn admission_limits_from_env() -> crate::runtime_state::AdmissionLimits {
                 .ok()
                 .and_then(|raw| raw.trim().parse::<u64>().ok())
                 .unwrap_or(defaults.wait_timeout.as_millis() as u64),
+        ),
+        // Separate from the request window ON PURPOSE — raising the request window to 90s made
+        // handshakes hang until clients cancelled them. See `AdmissionLimits::socket_wait_timeout`.
+        socket_wait_timeout: Duration::from_millis(
+            std::env::var("POLYFLARE_ADMISSION_SOCKET_WAIT_TIMEOUT_MS")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+                .unwrap_or(defaults.socket_wait_timeout.as_millis() as u64),
         ),
     }
 }

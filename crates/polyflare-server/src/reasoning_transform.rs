@@ -33,14 +33,54 @@ pub(crate) const INVALID_ENCRYPTED_CONTENT_CODE: &str = "invalid_encrypted_conte
 /// The caller must NOT retry on `None` — there is nothing left to fix.
 pub(crate) fn strip_unverifiable_reasoning(frame: &str) -> Option<String> {
     let mut value: Value = serde_json::from_str(frame).ok()?;
-    let object = value.as_object_mut()?;
-    if object.get("type").and_then(Value::as_str) != Some("response.create") {
+    {
+        let object = value.as_object_mut()?;
+        if object.get("type").and_then(Value::as_str) != Some("response.create") {
+            return None;
+        }
+        if object.get("generate").and_then(Value::as_bool) == Some(false) {
+            return None;
+        }
+    }
+    if !strip_reasoning_from_input(&mut value) {
         return None;
     }
-    if object.get("generate").and_then(Value::as_bool) == Some(false) {
+    Some(value.to_string())
+}
+
+/// The HTTP-ingress twin of [`strip_unverifiable_reasoning`], for a `/responses` REQUEST BODY.
+///
+/// Needed because the same poisoned history reaches upstream over BOTH transports: the WS relay
+/// carries a `response.create` frame, while the HTTP path sends a bare Responses body with no
+/// `type` field — so the frame-shape guard above would reject it. Observed live 2026-07-25: after a
+/// transport drop the client fell back to HTTP and the turn 400'd with `invalid_encrypted_content`
+/// on a path the relay-only transform never saw.
+///
+/// Same contract: `Some(bytes)` when at least one `reasoning` item was removed (its plaintext
+/// summary preserved in place as an assistant message), `None` when there is nothing to fix.
+pub(crate) fn strip_unverifiable_reasoning_body(body: &[u8]) -> Option<Vec<u8>> {
+    let mut value: Value = serde_json::from_slice(body).ok()?;
+    if !value.is_object() {
         return None;
     }
-    let input = object.get_mut("input")?.as_array_mut()?;
+    if !strip_reasoning_from_input(&mut value) {
+        return None;
+    }
+    serde_json::to_vec(&value).ok()
+}
+
+/// Rewrite `value["input"]` in place, dropping every `reasoning` item and re-inserting any plaintext
+/// summary it carried as an ordinary assistant message. Returns whether anything was removed.
+///
+/// The single source of truth for BOTH transports' transforms — the WS frame and the HTTP body
+/// differ only in their envelope, never in how a poisoned `input` array must be repaired.
+fn strip_reasoning_from_input(value: &mut Value) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let Some(input) = object.get_mut("input").and_then(Value::as_array_mut) else {
+        return false;
+    };
 
     let mut transformed_any = false;
     let mut rewritten: Vec<Value> = Vec::with_capacity(input.len());
@@ -50,8 +90,7 @@ pub(crate) fn strip_unverifiable_reasoning(frame: &str) -> Option<String> {
             continue;
         }
         transformed_any = true;
-        let summary = reasoning_summary_text(&item);
-        if let Some(text) = summary {
+        if let Some(text) = reasoning_summary_text(&item) {
             rewritten.push(json!({
                 "type": "message",
                 "role": "assistant",
@@ -65,11 +104,7 @@ pub(crate) fn strip_unverifiable_reasoning(frame: &str) -> Option<String> {
         // and it is undecryptable here by definition.
     }
     *input = rewritten;
-
-    if !transformed_any {
-        return None;
-    }
-    Some(value.to_string())
+    transformed_any
 }
 
 /// The concatenated non-empty `summary_text` blocks of one reasoning item, or `None` when the
@@ -169,6 +204,43 @@ mod tests {
         let value: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["input"].as_array().unwrap().len(), 1);
         assert!(!out.contains("encrypted_content"));
+    }
+
+    /// The HTTP body has no `type: response.create` envelope — the frame-shaped guard must not
+    /// reject it (the 2026-07-25 gap: the client fell back to HTTP and got no repair at all).
+    #[test]
+    fn http_bodies_are_transformed_without_a_frame_envelope() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "store": false,
+            "input": [
+                {"role": "user", "content": "hi"},
+                reasoning_item("rs_http", Some("prior chain"), "gAAAA-sealed"),
+            ],
+        })
+        .to_string();
+
+        assert!(
+            strip_unverifiable_reasoning(&body).is_none(),
+            "the WS entrypoint must still require a response.create frame"
+        );
+
+        let out = strip_unverifiable_reasoning_body(body.as_bytes()).expect("must transform");
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        let input = value["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2, "user message + summary replacement");
+        assert_eq!(input[1]["role"], "assistant");
+        assert!(!String::from_utf8_lossy(&out).contains("encrypted_content"));
+        assert!(String::from_utf8_lossy(&out).contains("prior chain"));
+        assert_eq!(value["model"], "gpt-5.6-sol", "other fields untouched");
+    }
+
+    #[test]
+    fn http_bodies_without_reasoning_are_none() {
+        let body = json!({"model": "m", "input": [{"role": "user", "content": "hi"}]}).to_string();
+        assert!(strip_unverifiable_reasoning_body(body.as_bytes()).is_none());
+        assert!(strip_unverifiable_reasoning_body(b"not json").is_none());
+        assert!(strip_unverifiable_reasoning_body(b"[1,2,3]").is_none());
     }
 
     #[test]
