@@ -837,6 +837,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                 // cross-account move dials a replacement, so the open-WS hard cap
                                 // measures real sockets rather than briefly allowing old + new.
                                 drop(upstream.take());
+                                relay_metrics.record("upstream_error_signal");
                                 // Cross-provider poisoned history: the target platform has just
                                 // PROVEN it cannot decrypt a reasoning envelope in this turn's
                                 // history (`invalid_encrypted_content` — foreign-minted `rs_*`
@@ -850,6 +851,23 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                 // generic forward-and-bench path with the original error frame.
                                 if sig.error_code.as_deref()
                                     == Some(INVALID_ENCRYPTED_CONTENT_CODE)
+                                {
+                                    // Content-free diagnosis counters (2026-07-25: two live
+                                    // failures with ZERO replays — these name the gate that
+                                    // rejects, since frames can never be logged).
+                                    relay_metrics.record("invalid_encrypted_content_seen");
+                                    if reasoning_transform_attempted {
+                                        relay_metrics.record("rt_skip_already_attempted");
+                                    }
+                                    if upstream_output_visible_for_turn {
+                                        relay_metrics.record("rt_skip_output_visible");
+                                    }
+                                    if in_flight.is_none() {
+                                        relay_metrics.record("rt_skip_no_inflight");
+                                    }
+                                }
+                                if sig.error_code.as_deref()
+                                    == Some(INVALID_ENCRYPTED_CONTENT_CODE)
                                     && !reasoning_transform_attempted
                                     && !upstream_output_visible_for_turn
                                 {
@@ -857,6 +875,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                     let transformed = in_flight
                                         .as_deref()
                                         .and_then(strip_unverifiable_reasoning);
+                                    if transformed.is_none() {
+                                        relay_metrics.record("rt_transform_none");
+                                    }
                                     if let Some(frame) = transformed {
                                         refund_active_turn_attempt(&state, &turn_telemetry);
                                         if let RedialOutcome::Connected(conn) =
