@@ -62,6 +62,8 @@ fn account(id: &str, status: &str) -> polyflare_store::Account {
         reset_at: None,
         blocked_at: None,
         security_work_authorized: false,
+        usage_cap_percent: None,
+        usage_cap_override: false,
         provider: "codex".to_string(),
         pool: None,
     }

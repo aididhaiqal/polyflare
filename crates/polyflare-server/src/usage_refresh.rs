@@ -747,6 +747,8 @@ mod tests {
             reset_at: None,
             blocked_at: None,
             security_work_authorized: false,
+            usage_cap_percent: None,
+            usage_cap_override: false,
             provider: provider.to_string(),
             pool: None,
         }

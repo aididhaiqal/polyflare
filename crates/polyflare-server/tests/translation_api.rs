@@ -203,6 +203,8 @@ async fn translation_targets_report_who_can_actually_serve_them() {
                 reset_at: None,
                 blocked_at: None,
                 security_work_authorized: false,
+                usage_cap_percent: None,
+                usage_cap_override: false,
                 provider: "anthropic".into(),
                 pool: None,
             },

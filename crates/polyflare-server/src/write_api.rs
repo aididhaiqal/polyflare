@@ -82,6 +82,13 @@ pub struct AccountPatch {
     /// double-Option shape.
     #[serde(default, deserialize_with = "double_option")]
     alias: Option<Option<String>>,
+    /// Stop routing to this account once either quota window reaches this percent (0 < p <= 100).
+    /// `null` clears the ceiling; absent leaves it unchanged.
+    #[serde(default, deserialize_with = "double_option")]
+    usage_cap_percent: Option<Option<f64>>,
+    /// Ignore the ceiling for now without clearing it.
+    #[serde(default)]
+    usage_cap_override: Option<bool>,
 }
 
 fn bad_request(msg: &'static str) -> Response {
@@ -152,6 +159,12 @@ pub async fn patch_account_handler(
         (None, pools) => pools,
         (Some(_), Some(_)) => unreachable!("pool/pools conflict validated above"),
     };
+    // Mirror migration 0029's CHECK: validate BEFORE applying, so a bad ceiling never half-lands.
+    if let Some(Some(cap)) = patch.usage_cap_percent {
+        if !(cap.is_finite() && cap > 0.0 && cap <= 100.0) {
+            return bad_request("usage_cap_percent must be a number in (0, 100] or null");
+        }
+    }
     let alias = patch.alias.map(|alias| {
         alias.and_then(|value| {
             let trimmed = value.trim();
@@ -164,6 +177,8 @@ pub async fn patch_account_handler(
         status: patch.status,
         security_work_authorized: patch.security_work_authorized,
         alias,
+        usage_cap_percent: patch.usage_cap_percent,
+        usage_cap_override: patch.usage_cap_override,
     };
     match repo.update_settings_atomic(&id, update).await {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),

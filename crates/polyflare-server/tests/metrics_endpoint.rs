@@ -122,6 +122,8 @@ async fn metrics_body_never_contains_seeded_email_or_secret_token() {
         reset_at: None,
         blocked_at: None,
         security_work_authorized: false,
+        usage_cap_percent: None,
+        usage_cap_override: false,
         provider: "codex".to_string(),
         pool: None,
     };

@@ -32,6 +32,12 @@ pub struct Account {
     pub reset_at: Option<i64>,
     pub blocked_at: Option<i64>,
     pub security_work_authorized: bool,
+    /// Stop routing to this account once EITHER quota window reaches this percentage, reserving
+    /// the remainder. `None` (the default for every pre-0029 row) is uncapped — today's behaviour.
+    pub usage_cap_percent: Option<f64>,
+    /// Operator escape hatch: ignore `usage_cap_percent` for now WITHOUT losing the configured
+    /// ceiling, so a capped account can be deliberately burned further.
+    pub usage_cap_override: bool,
     /// 'codex' | 'anthropic' — which backend pool this account belongs to.
     pub provider: String,
     /// Named account pool slug, or `None` (unpooled). Unpooled accounts are reachable only via the
@@ -233,24 +239,29 @@ pub struct AccountSettingsUpdate {
     pub status: Option<String>,
     pub security_work_authorized: Option<bool>,
     pub alias: Option<Option<String>>,
+    /// The routing ceiling, in percent. `Some(Some(p))` sets it, `Some(None)` clears it back to
+    /// uncapped, `None` leaves it unchanged — the same double-Option shape `alias`/`pool` use.
+    pub usage_cap_percent: Option<Option<f64>>,
+    /// Bypass the ceiling without clearing it.
+    pub usage_cap_override: Option<bool>,
 }
 
 /// Full column list for `SELECT`ing an `Account` (must match the `FromRow` field order/names).
 const SELECT_ACCOUNT_BY_ID: &str = "SELECT id, chatgpt_account_id, chatgpt_user_id, email, \
     alias, workspace_id, workspace_label, seat_type, plan_type, routing_policy, last_refresh, \
     created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
-    provider, pool FROM accounts WHERE id = ?";
+    usage_cap_percent, usage_cap_override, provider, pool FROM accounts WHERE id = ?";
 
 const SELECT_ALL_ACCOUNTS: &str = "SELECT id, chatgpt_account_id, chatgpt_user_id, email, \
     alias, workspace_id, workspace_label, seat_type, plan_type, routing_policy, last_refresh, \
     created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
-    provider, pool FROM accounts ORDER BY id";
+    usage_cap_percent, usage_cap_override, provider, pool FROM accounts ORDER BY id";
 
 const SELECT_ACCOUNT_BY_CHATGPT_ID: &str =
     "SELECT id, chatgpt_account_id, chatgpt_user_id, email, \
     alias, workspace_id, workspace_label, seat_type, plan_type, routing_policy, last_refresh, \
     created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
-    provider, pool FROM accounts WHERE chatgpt_account_id = ?";
+    usage_cap_percent, usage_cap_override, provider, pool FROM accounts WHERE chatgpt_account_id = ?";
 
 /// The account row + its three token blobs in ONE row, so the request hot path resolves an account
 /// with a single SELECT instead of `get` + `decrypt_tokens` (two round-trips for the same row).
@@ -258,7 +269,7 @@ const SELECT_ACCOUNT_BY_CHATGPT_ID: &str =
 const SELECT_ACCOUNT_WITH_TOKENS: &str = "SELECT id, chatgpt_account_id, chatgpt_user_id, email, \
     alias, workspace_id, workspace_label, seat_type, plan_type, routing_policy, last_refresh, \
     created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
-    provider, pool, access_token_enc, refresh_token_enc, id_token_enc FROM accounts WHERE id = ?";
+    usage_cap_percent, usage_cap_override, provider, pool, access_token_enc, refresh_token_enc, id_token_enc FROM accounts WHERE id = ?";
 
 /// As [`SELECT_ACCOUNT_WITH_TOKENS`], plus the [`UpstreamAuth`] columns — the refresh/egress hot
 /// path resolves account + tokens + credential contract in one round-trip.
@@ -266,7 +277,7 @@ const SELECT_ACCOUNT_WITH_TOKENS_AND_AUTH: &str =
     "SELECT id, chatgpt_account_id, chatgpt_user_id, email, \
     alias, workspace_id, workspace_label, seat_type, plan_type, routing_policy, last_refresh, \
     created_at, status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
-    provider, pool, access_token_enc, refresh_token_enc, id_token_enc, \
+    usage_cap_percent, usage_cap_override, provider, pool, access_token_enc, refresh_token_enc, id_token_enc, \
     upstream_identity, auth_mode, access_token_expires_at, oauth_contract_version, granted_scopes \
     FROM accounts WHERE id = ?";
 
@@ -334,8 +345,9 @@ impl AccountRepo {
                 workspace_id, workspace_label, seat_type, plan_type, routing_policy, \
                 access_token_enc, refresh_token_enc, id_token_enc, \
                 last_refresh, created_at, status, deactivation_reason, \
-                reset_at, blocked_at, security_work_authorized, provider, pool\
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                reset_at, blocked_at, security_work_authorized, usage_cap_percent, usage_cap_override, \
+                provider, pool\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(account.id.as_str())
         .bind(account.chatgpt_account_id.as_deref())
@@ -357,6 +369,8 @@ impl AccountRepo {
         .bind(account.reset_at)
         .bind(account.blocked_at)
         .bind(account.security_work_authorized)
+        .bind(account.usage_cap_percent)
+        .bind(account.usage_cap_override)
         .bind(account.provider.as_str())
         .bind(account.pool.as_deref())
         .execute(&mut *tx)
@@ -951,6 +965,20 @@ impl AccountRepo {
                 .execute(&mut *tx)
                 .await?;
         }
+        if let Some(cap) = update.usage_cap_percent {
+            sqlx::query("UPDATE accounts SET usage_cap_percent = ? WHERE id = ?")
+                .bind(cap)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let Some(override_on) = update.usage_cap_override {
+            sqlx::query("UPDATE accounts SET usage_cap_override = ? WHERE id = ?")
+                .bind(override_on)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
 
         tx.commit().await?;
         self.bump_generation();
@@ -1414,6 +1442,8 @@ mod tests {
             reset_at: None,
             blocked_at: None,
             security_work_authorized: false,
+            usage_cap_percent: None,
+            usage_cap_override: false,
             provider: "codex".to_string(),
             pool: None,
         };
@@ -1528,6 +1558,8 @@ mod tests {
             reset_at: None,
             blocked_at: None,
             security_work_authorized: false,
+            usage_cap_percent: None,
+            usage_cap_override: false,
             provider: "codex".to_string(),
             pool: None,
         };
@@ -1886,6 +1918,8 @@ mod tests {
             reset_at: None,
             blocked_at: None,
             security_work_authorized: false,
+            usage_cap_percent: None,
+            usage_cap_override: false,
             provider: "codex".to_string(),
             pool: None,
         };

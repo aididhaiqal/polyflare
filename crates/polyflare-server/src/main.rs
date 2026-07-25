@@ -729,6 +729,9 @@ async fn accounts_login(
             reset_at: None,
             blocked_at: None,
             security_work_authorized: false,
+            // CLI-onboarded accounts start uncapped, same as the OAuth path.
+            usage_cap_percent: None,
+            usage_cap_override: false,
             provider: "codex".to_string(),
             pool: pool.clone(),
         };

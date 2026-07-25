@@ -228,6 +228,41 @@ fn eligibility(s: &AccountSnapshot, now: i64, penalty_pct: f64) -> Eligibility<'
         }
     }
 
+    // Operator usage ceiling: stop selecting this account once EITHER window reaches the configured
+    // percent, reserving the remainder. Evaluated HERE — after the recovery arms above — so it
+    // reads post-recovery usage: an account whose window just reset is at 0% again and becomes
+    // selectable, exactly like the upstream-declared exhaustion it mirrors.
+    //
+    // Reported as a Cooldown on that window's reset when one is known, so the existing
+    // starvation/wait machinery treats a ceiling as simply a lower quota; HardBlocked when nothing
+    // is known to wait for. A ceiling NEVER benches the account or writes health state — it is a
+    // routing preference, not a failure.
+    if !s.usage_cap_override {
+        if let Some(cap) = s.usage_cap_percent {
+            let five_hour_capped = eff_used >= cap;
+            let weekly_capped = eff_secondary_used >= cap;
+            if five_hour_capped || weekly_capped {
+                // Prefer the reset of a window that is actually over the cap; the five-hour window
+                // recovers sooner, so it wins when both are.
+                let recover_at = if five_hour_capped {
+                    s.five_hour_quota
+                        .as_ref()
+                        .and_then(|w| w.reset_at)
+                        .or_else(|| s.weekly_quota.as_ref().and_then(|w| w.reset_at))
+                } else {
+                    s.weekly_quota.as_ref().and_then(|w| w.reset_at)
+                };
+                return match recover_at {
+                    Some(reset) => Eligibility::InBackoff {
+                        recover_at: reset,
+                        kind: BackoffKind::Cooldown,
+                    },
+                    None => Eligibility::HardBlocked,
+                };
+            }
+        }
+    }
+
     // Cooldown gate (logic.py:464-469): if the cooldown has expired, clear it AND the error state
     // (error_count/last_error_at); if it is still active, InBackoff/Cooldown on `cooldown_until`.
     // Applies to recovered accounts too — this is what makes recovery-does-not-admit-early hold: a
@@ -795,6 +830,92 @@ mod tests {
         s.plan_type = plan.to_string();
         s.secondary_used_percent = secondary_used;
         s
+    }
+
+    /// The operator ceiling: an account at or past its configured percent stops being selected,
+    /// even though nothing about it is unhealthy — its remaining quota is being reserved.
+    #[test]
+    fn a_capped_account_is_skipped_while_an_uncapped_peer_serves() {
+        let sel = CapacityWeighted;
+        let mut capped = snap("capped", "pro", 60.0);
+        capped.usage_cap_percent = Some(50.0);
+        capped.weekly_quota = Some(crate::QuotaWindowSnapshot {
+            used_percent: 60.0,
+            window_minutes: Some(10_080),
+            reset_at: Some(9_000),
+            recorded_at: 0,
+            stale: false,
+        });
+        let open = snap("open", "pro", 60.0);
+
+        assert_eq!(
+            sel.pick(&[capped.clone(), open.clone()], &ctx(0, 7))
+                .map(|id| id.as_str().to_string()),
+            Some("open".to_string()),
+            "the capped account must be skipped in favour of its uncapped peer"
+        );
+
+        // ...and the ceiling is a routing preference, not a health verdict: it reports as a wait
+        // on the window's reset, exactly like a lower quota would.
+        match eligibility(&capped, 0, 0.0) {
+            Eligibility::InBackoff { recover_at, kind } => {
+                assert_eq!(recover_at, 9_000);
+                assert!(matches!(kind, BackoffKind::Cooldown));
+            }
+            _ => panic!("a capped account with a known reset must wait on its window reset"),
+        }
+    }
+
+    /// The admin override restores a capped account without clearing its configured ceiling.
+    #[test]
+    fn the_override_restores_a_capped_account() {
+        let sel = CapacityWeighted;
+        let mut capped = snap("capped", "pro", 60.0);
+        capped.usage_cap_percent = Some(50.0);
+        capped.usage_cap_override = true;
+        assert!(
+            matches!(eligibility(&capped, 0, 0.0), Eligibility::Eligible { .. }),
+            "an overridden ceiling must not gate the account"
+        );
+        assert!(
+            sel.pick(&[capped], &ctx(0, 7)).is_some(),
+            "and it must be selectable again"
+        );
+    }
+
+    /// Below the ceiling nothing changes, and the ceiling watches BOTH windows — a five-hour
+    /// window over the cap gates even when the weekly one is nearly empty.
+    #[test]
+    fn the_ceiling_watches_both_windows_and_leaves_under_cap_accounts_alone() {
+        let mut under = snap("under", "pro", 40.0);
+        under.usage_cap_percent = Some(50.0);
+        assert!(
+            matches!(eligibility(&under, 0, 0.0), Eligibility::Eligible { .. }),
+            "an account below its ceiling is untouched"
+        );
+
+        let mut five_hour_over = snap("five", "pro", 5.0);
+        five_hour_over.usage_cap_percent = Some(50.0);
+        five_hour_over.used_percent = 55.0;
+        assert!(
+            !matches!(
+                eligibility(&five_hour_over, 0, 0.0),
+                Eligibility::Eligible { .. }
+            ),
+            "the five-hour window must gate too, not just the weekly one"
+        );
+    }
+
+    /// With no reset epoch anywhere there is nothing to wait for, so the ceiling hard-blocks rather
+    /// than inventing a recovery time.
+    #[test]
+    fn a_capped_account_without_a_known_reset_is_hard_blocked() {
+        let mut capped = snap("capped", "pro", 80.0);
+        capped.usage_cap_percent = Some(50.0);
+        assert!(matches!(
+            eligibility(&capped, 0, 0.0),
+            Eligibility::HardBlocked
+        ));
     }
 
     #[test]

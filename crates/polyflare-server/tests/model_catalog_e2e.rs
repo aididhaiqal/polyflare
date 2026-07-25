@@ -207,6 +207,8 @@ fn account(id: &str) -> Account {
         reset_at: None,
         blocked_at: None,
         security_work_authorized: false,
+        usage_cap_percent: None,
+        usage_cap_override: false,
         provider: "codex".to_string(),
         pool: None,
     }

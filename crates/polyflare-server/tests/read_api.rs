@@ -39,6 +39,8 @@ fn account(id: &str, email: &str, pool: Option<&str>) -> Account {
         reset_at: Some(1_783_900_000),
         blocked_at: None,
         security_work_authorized: false,
+        usage_cap_percent: None,
+        usage_cap_override: false,
         provider: "codex".to_string(),
         pool: pool.map(str::to_string),
     }
