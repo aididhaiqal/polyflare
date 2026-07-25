@@ -112,8 +112,8 @@ use polyflare_core::{Account, AccountId, FailureSignal, Provider, SessionKey};
 
 use crate::app::AppState;
 
-use super::redial::RedialOutcome;
 use super::reasoning_transform::{strip_unverifiable_reasoning, INVALID_ENCRYPTED_CONTENT_CODE};
+use super::redial::RedialOutcome;
 use super::signal::{classify_upstream_signal, UpstreamSignal};
 use super::sniff::sniff_completed_id;
 use super::telemetry::{start_turn, WsRoutingOutcome, WsTurnTelemetry, WsTurnTerminal};

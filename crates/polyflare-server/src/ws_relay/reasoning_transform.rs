@@ -126,19 +126,30 @@ mod tests {
     fn summarized_reasoning_becomes_assistant_text_and_envelope_is_gone() {
         let frame = frame_with_input(vec![
             json!({"role": "user", "content": "hello"}),
-            reasoning_item("rs_foreign_1", Some("weighed two approaches"), "gAAAA-sealed"),
+            reasoning_item(
+                "rs_foreign_1",
+                Some("weighed two approaches"),
+                "gAAAA-sealed",
+            ),
             json!({"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{}"}),
         ]);
         let out = strip_unverifiable_reasoning(&frame).expect("must transform");
         assert!(!out.contains("encrypted_content"), "envelope must be gone");
-        assert!(!out.contains("rs_foreign_1"), "reasoning item id must be gone");
+        assert!(
+            !out.contains("rs_foreign_1"),
+            "reasoning item id must be gone"
+        );
         assert!(
             out.contains("weighed two approaches"),
             "summary text must survive as message content"
         );
         let value: Value = serde_json::from_str(&out).unwrap();
         let input = value["input"].as_array().unwrap();
-        assert_eq!(input.len(), 3, "replacement stays in place, others preserved");
+        assert_eq!(
+            input.len(),
+            3,
+            "replacement stays in place, others preserved"
+        );
         assert_eq!(input[1]["type"], "message");
         assert_eq!(input[1]["role"], "assistant");
         assert_eq!(input[2]["type"], "function_call", "tool history untouched");

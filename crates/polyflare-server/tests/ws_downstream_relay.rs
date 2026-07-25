@@ -3301,7 +3301,8 @@ mod relay_through {
         .capturing_raw_frames();
         let mock_base = mock.clone().spawn().await;
 
-        let (base, _state) = spawn_with_pinned_account("acct-reasoning-transform", &mock_base).await;
+        let (base, _state) =
+            spawn_with_pinned_account("acct-reasoning-transform", &mock_base).await;
 
         let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
             .await
@@ -3357,8 +3358,15 @@ mod relay_through {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(raw.len(), 2, "exactly one replay, no client resend: {raw:?}");
-        assert_eq!(raw[0], frame, "socket 1 receives the original frame verbatim");
+        assert_eq!(
+            raw.len(),
+            2,
+            "exactly one replay, no client resend: {raw:?}"
+        );
+        assert_eq!(
+            raw[0], frame,
+            "socket 1 receives the original frame verbatim"
+        );
         let replayed: serde_json::Value = serde_json::from_str(&raw[1]).unwrap();
         let replayed_text = raw[1].as_str();
         assert!(
@@ -3378,6 +3386,9 @@ mod relay_through {
         assert_eq!(input[0]["role"], "user", "ordinary history untouched");
         assert_eq!(input[1]["type"], "message");
         assert_eq!(input[1]["role"], "assistant");
-        assert_eq!(replayed["model"], "gpt-5.6-sol", "envelope fields untouched");
+        assert_eq!(
+            replayed["model"], "gpt-5.6-sol",
+            "envelope fields untouched"
+        );
     }
 }
