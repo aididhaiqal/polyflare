@@ -3733,6 +3733,105 @@ mod relay_through {
         );
     }
 
+    /// The exact production preamble, captured from the live relay diagnostic on 2026-07-25
+    /// 13:49 (session 9fcbea9c): `output_visible_by="codex.response.metadata"`, an
+    /// UNANCHORED in-flight frame, transform not yet attempted.
+    ///
+    /// `codex.response.metadata` appears nowhere in this repository — the backend emits frame
+    /// types we have never enumerated, which is exactly why the guard tests the `codex.` namespace
+    /// rather than a hand-maintained list. Both previously-observed metadata frames are included
+    /// so a future narrowing of that rule fails here.
+    #[tokio::test]
+    async fn unknown_codex_metadata_frames_do_not_block_the_reasoning_transform() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::ErrorAfterEvents {
+                events: vec![
+                    r#"{"type":"response.created","response":{"id":"resp_doomed"}}"#.to_string(),
+                    // The frame that actually closed the recovery window in production.
+                    r#"{"type":"codex.response.metadata","metadata":{"model":"gpt-5.6-sol"}}"#
+                        .to_string(),
+                    r#"{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":12.5}}}"#
+                        .to_string(),
+                    r#"{"type":"response.in_progress"}"#.to_string(),
+                ],
+                status: 400,
+                code: "invalid_encrypted_content".to_string(),
+                message: "The encrypted content for item rs_075fc70b could not be verified."
+                    .to_string(),
+            },
+            ScriptedTurn::normal(vec![]),
+        ])
+        .capturing_raw_frames();
+        let mock_base = mock.clone().spawn().await;
+        let (base, _state) = spawn_with_pinned_account("acct-unknown-metadata", &mock_base).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake must succeed");
+
+        // UNANCHORED, with the poisoned reasoning item inline — the shape the live client sends.
+        ws.send(TMessage::Text(
+            serde_json::json!({
+                "type": "response.create",
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {"role": "user", "content": "earlier"},
+                    {
+                        "type": "reasoning",
+                        "id": "rs_075fc70b",
+                        "summary": [{"type": "summary_text", "text": "compared two designs"}],
+                        "encrypted_content": "gAAAA-fugu-sealed",
+                    },
+                    {"role": "user", "content": "continue"},
+                ],
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let TMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let kind = v["type"].as_str().unwrap_or_default().to_string();
+                if kind.starts_with("codex.")
+                    || kind == "response.created"
+                    || kind == "response.in_progress"
+                {
+                    continue;
+                }
+                match kind.as_str() {
+                    "response.completed" => break v,
+                    other => panic!(
+                        "metadata frames must not suppress the transform; client saw {other}: {v:?}"
+                    ),
+                }
+            }
+        })
+        .await
+        .expect("the transformed replay must complete the poisoned turn");
+        assert_eq!(completed["type"], "response.completed");
+
+        let mut raw = mock.raw_frames();
+        for _ in 0..50 {
+            raw = mock.raw_frames();
+            if raw.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(raw.len(), 2, "one transformed replay: {raw:?}");
+        assert!(
+            !raw[1].contains("encrypted_content") && raw[1].contains("compared two designs"),
+            "the replay must be sanitized, keeping the plaintext summary: {}",
+            raw[1]
+        );
+    }
+
     /// The replay-safety boundary stands: once actual OUTPUT (a delta) has crossed downstream, a
     /// transform-replay could duplicate content the client already consumed — the error must be
     /// surfaced verbatim instead, exactly like any other post-output upstream error.

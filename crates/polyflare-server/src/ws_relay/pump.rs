@@ -1178,7 +1178,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                     break;
                                 }
                                 client_visible_upstream_for_turn = true;
-                                if !is_lifecycle_frame(&text) {
+                                if !is_non_output_frame(&text) {
                                     if !upstream_output_visible_for_turn {
                                         output_visible_by = Some(frame_type_name(&text));
                                     }
@@ -1376,25 +1376,28 @@ fn frame_type_name(frame: &str) -> String {
         .unwrap_or_else(|| "<untyped>".to_string())
 }
 
-fn is_lifecycle_frame(frame: &str) -> bool {
+fn is_non_output_frame(frame: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(frame) else {
+        // Unparseable: cannot prove it carried nothing, so conservatively treat it as output.
         return false;
     };
-    matches!(
-        value.get("type").and_then(serde_json::Value::as_str),
-        // `codex.rate_limits` is quota METADATA, not model output: it is the frame
-        // `rewrite_rate_limit_frames` (above) rewrites with pool-synthesized numbers, and the real
-        // backend emits it near the start of every turn — before any content. Omitting it here is
-        // what kept BOTH poisoned-history recoveries from ever running in production while the
-        // scripted tests passed: the mock emitted only `response.created`/`in_progress`, so the
-        // flag stayed clear, but live traffic tripped it before the error arrived (2026-07-25
-        // 13:36, session 9fcbea9c — right error code, zero recoveries).
-        //
-        // Replaying after one cannot duplicate consumed content, for the same reason a repeated
-        // `response.created` is safe: the client treats rate-limit numbers as state to overwrite,
-        // and the replay simply carries fresher ones.
-        Some("response.created" | "response.in_progress" | "codex.rate_limits")
-    )
+    let Some(frame_type) = value.get("type").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    // The `codex.` namespace is BACKEND METADATA, never model output: quota numbers
+    // (`codex.rate_limits`, rewritten a few lines above) and per-response bookkeeping
+    // (`codex.response.metadata`). Matched by PREFIX deliberately. Enumerating individual types
+    // is what failed twice on 2026-07-25: the whitelist was extended to `codex.rate_limits`, and
+    // production then tripped on `codex.response.metadata` — a type that appears NOWHERE in this
+    // repository. The backend ships frames we have not seen, so the rule has to be about the
+    // namespace rather than a list we maintain by hand.
+    //
+    // Model output is the `response.*` content stream (deltas, output items, terminals); those
+    // still count, so a replay can never duplicate content the client already consumed. Replaying
+    // after a metadata frame can only re-deliver metadata, which the client overwrites as state —
+    // the same argument that already makes a repeated `response.created` safe.
+    frame_type.starts_with("codex.")
+        || matches!(frame_type, "response.created" | "response.in_progress")
 }
 
 /// True when `frame` is a generating `response.create` carrying a top-level
