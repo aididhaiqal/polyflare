@@ -3391,4 +3391,155 @@ mod relay_through {
             "envelope fields untouched"
         );
     }
+
+    /// The LIVE 2026-07-25 shape that made the first transform revision never fire: the backend
+    /// emits `response.created` (and `in_progress`) BEFORE failing the undecryptable reasoning
+    /// item ~4s in. Lifecycle frames carry no content, so the transform must still replay — gating
+    /// on "any client-visible frame" (instead of actual OUTPUT) reproduced the untransformed
+    /// 3×400-then-budget-kill failure in production.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_encrypted_content_after_lifecycle_frames_still_replays() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::ErrorAfterEvents {
+                events: vec![
+                    r#"{"type":"response.created","response":{"id":"resp_doomed"}}"#.to_string(),
+                    r#"{"type":"response.in_progress"}"#.to_string(),
+                ],
+                status: 400,
+                code: "invalid_encrypted_content".to_string(),
+                message: "The encrypted content for item rs_foreign_1 could not be verified."
+                    .to_string(),
+            },
+            ScriptedTurn::normal(vec![]),
+        ])
+        .capturing_raw_frames();
+        let mock_base = mock.clone().spawn().await;
+
+        let (base, _state) =
+            spawn_with_pinned_account("acct-transform-lifecycle", &mock_base).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake must succeed");
+
+        let frame = serde_json::json!({
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"role": "user", "content": "hello"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_foreign_1",
+                    "summary": [{"type": "summary_text", "text": "weighed two approaches"}],
+                    "encrypted_content": "gAAAA-foreign-sealed",
+                },
+            ],
+        })
+        .to_string();
+        ws.send(TMessage::Text(frame.clone().into())).await.unwrap();
+
+        // The client may see the doomed turn's lifecycle preamble (content-free), but NEVER the
+        // wrapped error — the next terminal it sees must be the transformed replay's completion.
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let TMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                match v["type"].as_str().unwrap_or_default() {
+                    "response.created" | "response.in_progress" | "codex.rate_limits" => continue,
+                    "response.completed" => break v,
+                    other => panic!(
+                        "client must never see the error after a lifecycle-only preamble, got \
+                         frame type {other}: {v:?}"
+                    ),
+                }
+            }
+        })
+        .await
+        .expect("the transformed replay must complete, not hang");
+        assert_eq!(completed["type"], "response.completed");
+
+        let mut raw = mock.raw_frames();
+        for _ in 0..50 {
+            raw = mock.raw_frames();
+            if raw.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(raw.len(), 2, "one transformed replay: {raw:?}");
+        assert!(
+            !raw[1].contains("encrypted_content") && raw[1].contains("weighed two approaches"),
+            "socket 2 must receive the TRANSFORMED frame"
+        );
+    }
+
+    /// The replay-safety boundary stands: once actual OUTPUT (a delta) has crossed downstream, a
+    /// transform-replay could duplicate content the client already consumed — the error must be
+    /// surfaced verbatim instead, exactly like any other post-output upstream error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_encrypted_content_after_output_is_surfaced_verbatim() {
+        let mock = MockWsUpstream::scripted(vec![ScriptedTurn::ErrorAfterEvents {
+            events: vec![
+                r#"{"type":"response.created","response":{"id":"resp_doomed"}}"#.to_string(),
+                r#"{"type":"response.output_text.delta","delta":"partial"}"#.to_string(),
+            ],
+            status: 400,
+            code: "invalid_encrypted_content".to_string(),
+            message: "The encrypted content for item rs_foreign_1 could not be verified."
+                .to_string(),
+        }])
+        .capturing_raw_frames();
+        let mock_base = mock.clone().spawn().await;
+
+        let (base, _state) = spawn_with_pinned_account("acct-transform-output", &mock_base).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake must succeed");
+
+        let frame = serde_json::json!({
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"role": "user", "content": "hello"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_foreign_1",
+                    "summary": [{"type": "summary_text", "text": "weighed two approaches"}],
+                    "encrypted_content": "gAAAA-foreign-sealed",
+                },
+            ],
+        })
+        .to_string();
+        ws.send(TMessage::Text(frame.clone().into())).await.unwrap();
+
+        let error_frame = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let TMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                match v["type"].as_str().unwrap_or_default() {
+                    "error" => break v,
+                    "response.completed" => {
+                        panic!("a post-output turn must never be silently replayed")
+                    }
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("the post-output error must be surfaced, not hang");
+        assert_eq!(
+            error_frame["error"]["code"], "invalid_encrypted_content",
+            "the error must reach the client verbatim after output was visible"
+        );
+        assert_eq!(
+            mock.raw_frames().len(),
+            1,
+            "no transform-replay may be sent after visible output"
+        );
+    }
 }
