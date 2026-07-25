@@ -772,3 +772,127 @@ async fn messages_aliased_to_codex_returns_503_when_no_codex_account_is_seeded()
         .unwrap();
     assert_eq!(resp.status(), 503);
 }
+
+/// A real Claude Code request must reach upstream byte-identically, with only the credential
+/// swapped. This is the end-to-end proof of the pass-through path: the model name here is
+/// deliberately unaliased so the native path (not a translation) handles it.
+#[tokio::test]
+async fn a_real_claude_client_request_is_forwarded_byte_for_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[21u8; 32]).unwrap();
+    store
+        .accounts()
+        .insert(&anthropic_account("anthropic-1"), &tokens(), &cipher)
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+
+    let mock = MockUpstream::new(vec![r#"{"type":"message_stop"}"#.to_string()]);
+    let handle = mock.clone();
+    let upstream = mock.spawn().await;
+    let pf = spawn_polyflare(store, upstream).await;
+
+    // Key order and spacing are deliberately NOT what serde_json would emit on a round-trip, so a
+    // parse/re-serialize anywhere in the path would visibly change these bytes.
+    let raw = concat!(
+        r#"{"model":"claude-3-5-legacy-model","max_tokens":4096,"#,
+        r#""messages":[{"role":"user","content":"hi"}],"stream":true}"#
+    );
+
+    let resp = reqwest::Client::new()
+        .post(format!("{pf}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+        .header("user-agent", "claude-cli/2.1.218 (external, sdk-ts)")
+        .header("x-app", "cli")
+        .header(
+            "x-claude-code-session-id",
+            "c38f98c8-7c2a-4e93-aa3d-a79df7a7015f",
+        )
+        .header("x-stainless-package-version", "0.94.0")
+        .header("authorization", "Bearer CALLER-SECRET")
+        .header("cookie", "session=should-not-travel")
+        .body(raw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let _ = resp.bytes().await.unwrap();
+
+    let upstream_headers = handle.last_headers().unwrap();
+    // The caller's credential was replaced by the selected account's, not forwarded.
+    assert_eq!(upstream_headers.get("authorization").unwrap(), "Bearer tok");
+    assert!(upstream_headers.get("cookie").is_none());
+    // The client's own protocol envelope survived, including beta order and session id.
+    assert_eq!(
+        upstream_headers.get("anthropic-beta").unwrap(),
+        "claude-code-20250219,oauth-2025-04-20"
+    );
+    assert_eq!(
+        upstream_headers.get("x-claude-code-session-id").unwrap(),
+        "c38f98c8-7c2a-4e93-aa3d-a79df7a7015f"
+    );
+    assert_eq!(
+        upstream_headers.get("user-agent").unwrap(),
+        "claude-cli/2.1.218 (external, sdk-ts)"
+    );
+    assert_eq!(upstream_headers.get_all("content-type").iter().count(), 1);
+    assert_eq!(
+        handle.last_body().unwrap()["model"],
+        "claude-3-5-legacy-model"
+    );
+}
+
+/// The same request WITHOUT Claude Code's markers is still served — it simply takes the
+/// materialized path instead of byte pass-through, and none of the client's headers travel.
+#[tokio::test]
+async fn a_generic_sdk_request_is_served_without_borrowing_the_claude_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[21u8; 32]).unwrap();
+    store
+        .accounts()
+        .insert(&anthropic_account("anthropic-1"), &tokens(), &cipher)
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+
+    let mock = MockUpstream::new(vec![r#"{"type":"message_stop"}"#.to_string()]);
+    let handle = mock.clone();
+    let upstream = mock.spawn().await;
+    let pf = spawn_polyflare(store, upstream).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{pf}/v1/messages"))
+        .header("user-agent", "anthropic-sdk-python/0.40.0")
+        .header("x-stainless-package-version", "0.40.0")
+        .json(&serde_json::json!({
+            "model": "claude-3-5-legacy-model",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let _ = resp.bytes().await.unwrap();
+
+    let upstream_headers = handle.last_headers().unwrap();
+    assert_eq!(upstream_headers.get("authorization").unwrap(), "Bearer tok");
+    // A non-Claude client's identity is NOT forwarded: PolyFlare must not dress arbitrary traffic
+    // up in a first-party envelope, and it does not invent one either.
+    assert!(upstream_headers.get("x-claude-code-session-id").is_none());
+    assert_eq!(
+        upstream_headers
+            .get("user-agent")
+            .map(|v| v.to_str().unwrap()),
+        None,
+        "the generic client's own user-agent is not relayed"
+    );
+    assert_eq!(
+        handle.last_body().unwrap()["model"],
+        "claude-3-5-legacy-model"
+    );
+}

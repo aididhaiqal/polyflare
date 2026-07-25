@@ -2371,6 +2371,8 @@ async fn execute_anthropic_translation(
                 // These bytes are PolyFlare's, not a first-party client's, so subscription-OAuth
                 // accounts are not eligible to serve them.
                 MessagesTraffic::Translated,
+                // Nothing to forward verbatim: the body was synthesized by the translator.
+                None,
             )
             .await;
             outcome.provider_slug = Some(Provider::Anthropic.to_string());
@@ -3201,7 +3203,7 @@ async fn decode_responses_body(
 pub async fn messages_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    body: Bytes,
 ) -> Response {
     messages_route(state, None, headers, body).await
 }
@@ -3212,7 +3214,7 @@ pub async fn pooled_messages_handler(
     State(state): State<Arc<AppState>>,
     Path(pool): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    body: Bytes,
 ) -> Response {
     messages_route(state, Some(pool), headers, body).await
 }
@@ -3221,9 +3223,16 @@ async fn messages_route(
     state: Arc<AppState>,
     pool: Option<String>,
     headers: HeaderMap,
-    body: serde_json::Value,
+    raw_body: Bytes,
 ) -> Response {
     let start = Instant::now();
+    // The raw bytes are retained alongside the parsed value so an admitted Claude request can be
+    // forwarded verbatim (see `PreparedRequest::raw_body`); routing still needs the parsed model
+    // and alias. Parsing here also preserves the 400 the `Json` extractor used to produce.
+    let body = match serde_json::from_slice::<serde_json::Value>(&raw_body) {
+        Ok(body) => body,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response(),
+    };
     maybe_capture_fingerprint(&state, "POST", "/v1/messages", &headers);
     // Keep the bounded background-writer handle before `state` moves into a sub-handler.
     let log_store = state.store.clone();
@@ -3363,6 +3372,7 @@ async fn messages_route(
                 body,
                 model,
                 MessagesTraffic::ClaudeNative,
+                Some((&headers, &raw_body)),
             )
             .await
         }
@@ -3430,6 +3440,27 @@ async fn messages_route(
     response
 }
 
+/// Adapts axum's `HeaderMap` to `polyflare_anthropic`'s `HeaderSource`, so the admission and
+/// allowlist rules stay in the provider crate and depend on no HTTP framework type.
+///
+/// A header whose value is not valid UTF-8 reads as absent. That is deliberate: such a value could
+/// not be forwarded verbatim anyway, and treating it as missing makes admission fail closed rather
+/// than admit a request on a header nobody could actually inspect.
+struct ClientHeaders<'a>(&'a HeaderMap);
+
+impl polyflare_anthropic::HeaderSource for ClientHeaders<'_> {
+    fn get(&self, name: &str) -> Option<&str> {
+        self.0.get(name).and_then(|value| value.to_str().ok())
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.0
+            .keys()
+            .map(|name| name.as_str().to_string())
+            .collect()
+    }
+}
+
 /// The native Anthropic-Messages ingress path: no alias applies, so this relays straight to an
 /// Anthropic-provider account. Continuity is a no-op here (SPEC-M4 §3.7: the Anthropic backend has
 /// no `previous_response_id`-style anchor), so every request is `Disarmed` and
@@ -3440,6 +3471,10 @@ async fn messages_handler_native(
     body: serde_json::Value,
     model: String,
     traffic: MessagesTraffic,
+    // The client's original headers and bytes, when this request came from a real client rather
+    // than the translator. `None` on the translated path — there is nothing of the client's left
+    // to forward once the body has been rebuilt in another protocol's shape.
+    client_wire: Option<(&HeaderMap, &Bytes)>,
 ) -> (Response, RouteOutcome) {
     let now = unix_now();
     let estimated_tokens = estimate_materialized_request_tokens(&body, "messages", "max_tokens");
@@ -3456,14 +3491,44 @@ async fn messages_handler_native(
         estimated_tokens,
         ..Default::default()
     };
-    // Native Anthropic path: the AnthropicExecutor does not use `forward_headers` (that field is
-    // the Codex egress identity set), so there is nothing to forward here.
-    let req = PreparedRequest {
-        // No raw pass-through on the Anthropic wire path ⇒ the materialized body is what's sent.
-        body: Some(body),
-        model,
-        forward_headers: vec![],
-        raw_body: None,
+    // Try to admit this as genuine Claude Code traffic. When it qualifies, the client's own bytes
+    // and protocol envelope are forwarded verbatim and PolyFlare's only edit is the credential the
+    // executor attaches — no parse/re-serialize round-trip can perturb the request.
+    //
+    // A rejection is NOT an error: an ordinary Anthropic SDK client is perfectly welcome on this
+    // path, it simply gets the materialized body instead of byte pass-through, and (via the
+    // eligibility filter above) can only be served by an API-key account.
+    let admitted = client_wire.and_then(|(headers, raw)| {
+        polyflare_anthropic::admit_native_request(&ClientHeaders(headers), &body)
+            .ok()
+            .map(|envelope| (envelope, headers, raw))
+    });
+
+    let req = match admitted {
+        Some((envelope, headers, raw)) => {
+            // Content-free compatibility observation: which client shape we admitted, never what
+            // it asked. Outcome 7 turns this into persisted telemetry; for now it is a trace line.
+            tracing::debug!(
+                target: "polyflare_server::request",
+                claude_client_shape = %envelope.shape_key(),
+                "admitted native Claude request for byte pass-through"
+            );
+            PreparedRequest {
+                body: None,
+                model,
+                forward_headers: polyflare_anthropic::forwarded_client_headers(&ClientHeaders(
+                    headers,
+                )),
+                raw_body: Some(raw.clone()),
+            }
+        }
+        None => PreparedRequest {
+            // Not byte-forwardable ⇒ the materialized body is what's sent.
+            body: Some(body),
+            model,
+            forward_headers: vec![],
+            raw_body: None,
+        },
     };
     let ctx = RequestCtx::default();
 

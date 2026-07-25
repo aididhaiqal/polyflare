@@ -125,7 +125,9 @@ async fn admitted_claude_request_forwards_raw_bytes_and_the_clients_envelope() {
     let req = PreparedRequest {
         body: None,
         model: "claude-sonnet-4-6".into(),
-        forward_headers: polyflare_anthropic::outbound_headers(&inbound, "ACCOUNT-TOKEN"),
+        // Exactly what ingress builds: the client's allowlisted envelope and NO credential. The
+        // executor is what attaches the selected account's bearer.
+        forward_headers: polyflare_anthropic::forwarded_client_headers(&inbound),
         raw_body: Some(bytes::Bytes::from_static(raw)),
     };
 

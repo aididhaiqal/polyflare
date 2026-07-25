@@ -11,7 +11,7 @@ pub mod reverse;
 pub mod translate;
 
 pub use claude_wire::{
-    admit_native_request, outbound_headers, AdmissionError, ClaudeEnvelope, HeaderSource,
+    admit_native_request, forwarded_client_headers, AdmissionError, ClaudeEnvelope, HeaderSource,
 };
 pub use collect::MessageCollector;
 pub use errors::{

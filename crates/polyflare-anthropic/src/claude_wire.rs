@@ -12,7 +12,7 @@
 //!    SDK call, a translated request, a hand-rolled HTTP client — is rejected here and must take a
 //!    different path. This is what keeps subscription-OAuth accounts serving only the client shape
 //!    they were authorized for.
-//! 2. **Egress is an allowlist, not a denylist.** [`outbound_headers`] names every header that may
+//! 2. **Egress is an allowlist, not a denylist.** [`forwarded_client_headers`] names every header that may
 //!    reach upstream. A header nobody explicitly allowed is dropped, so a future client header —
 //!    or an attacker-supplied one — cannot ride along by default.
 //!
@@ -274,25 +274,25 @@ const FORWARDED_HEADERS: &[&str] = &[
     ATTESTATION_HEADER,
 ];
 
-/// Build the outbound header list for an admitted request: the allowlisted client headers, plus
-/// the selected account's bearer.
+/// The allowlisted client headers to forward for an admitted request.
 ///
 /// Everything not named in [`FORWARDED_HEADERS`] is dropped — including the caller's own
 /// `authorization` and any cookie, `host`, `content-length`, or hop-by-hop header. Dropping
 /// `content-length`/`host` matters beyond hygiene: they describe the ORIGINAL connection and would
 /// be wrong for the upstream one.
-pub fn outbound_headers(inbound: &impl HeaderSource, bearer_token: &str) -> Vec<(String, String)> {
-    let mut out = Vec::with_capacity(FORWARDED_HEADERS.len() + 1);
+///
+/// No credential is added here, because at ingress there is not yet one to add: the account is
+/// chosen later, by selection. The executor attaches the selected account's bearer to whatever this
+/// returns. That ordering is also why dropping the caller's `authorization` is not merely tidy —
+/// leaving it in would make the executor treat the request as already authorized and skip the
+/// substitution entirely, forwarding the caller's own credential upstream.
+pub fn forwarded_client_headers(inbound: &impl HeaderSource) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(FORWARDED_HEADERS.len());
     for name in FORWARDED_HEADERS {
         if let Some(value) = inbound.get(name) {
             out.push(((*name).to_string(), value.to_string()));
         }
     }
-    // The account substitution: the caller's credential never reaches upstream.
-    out.push((
-        "authorization".to_string(),
-        format!("Bearer {bearer_token}"),
-    ));
     out
 }
 
@@ -465,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn egress_replaces_the_caller_credential_and_drops_everything_unlisted() {
+    fn egress_drops_the_caller_credential_and_everything_unlisted() {
         let mut inbound = claude_headers();
         // Headers a caller might add that must NOT reach upstream.
         inbound.push(("cookie".into(), "session=abc".into()));
@@ -475,16 +475,12 @@ mod tests {
         inbound.push(("x-forwarded-for".into(), "10.0.0.1".into()));
         inbound.push(("x-some-future-header".into(), "surprise".into()));
 
-        let out = outbound_headers(&inbound, "ACCOUNT-TOKEN");
+        let out = forwarded_client_headers(&inbound);
         let names: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
 
-        assert_eq!(
-            out.iter()
-                .find(|(k, _)| k == "authorization")
-                .map(|(_, v)| v.as_str()),
-            Some("Bearer ACCOUNT-TOKEN")
-        );
-        // The caller's own credential is gone, not merely reordered.
+        // No credential at all: the account is not chosen yet, and leaving the caller's own
+        // `authorization` here would make the executor skip the substitution and forward it.
+        assert!(!names.contains(&"authorization"));
         assert!(!out.iter().any(|(_, v)| v.contains("CALLER-SECRET")));
         for dropped in [
             "cookie",
@@ -522,7 +518,7 @@ mod tests {
         inbound.push((ATTESTATION_HEADER.into(), "opaque-blob".into()));
         let envelope = admit_native_request(&inbound, &claude_body()).unwrap();
         assert_eq!(envelope.attestation.as_deref(), Some("opaque-blob"));
-        let out = outbound_headers(&inbound, "token");
+        let out = forwarded_client_headers(&inbound);
         assert_eq!(
             out.iter()
                 .find(|(k, _)| k == ATTESTATION_HEADER)
@@ -531,7 +527,7 @@ mod tests {
         );
 
         // When the client sends none, PolyFlare does not fabricate one.
-        let without = outbound_headers(&claude_headers(), "token");
+        let without = forwarded_client_headers(&claude_headers());
         assert!(!without.iter().any(|(k, _)| k == ATTESTATION_HEADER));
     }
 
