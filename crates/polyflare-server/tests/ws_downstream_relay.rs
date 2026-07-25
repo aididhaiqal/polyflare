@@ -3475,6 +3475,201 @@ mod relay_through {
         );
     }
 
+    /// An ANCHORED turn carries none of the poisoned history — the undecryptable `rs_*` item is in
+    /// the server-side chain `previous_response_id` names — so there is nothing in the frame to
+    /// rewrite. Rebuilding that history server-side is forbidden (the parrot incident), so the
+    /// client must be told to resend it in full. Live signature: 2026-07-25 13:18, session
+    /// 9fcbea9c, which failed with the right error code and zero transform replays.
+    #[tokio::test]
+    async fn invalid_encrypted_content_on_an_anchored_turn_asks_the_client_to_resend() {
+        let mock = MockWsUpstream::scripted(vec![ScriptedTurn::ErrorAfterEvents {
+            events: vec![
+                r#"{"type":"response.created","response":{"id":"resp_doomed"}}"#.to_string(),
+                r#"{"type":"response.in_progress"}"#.to_string(),
+            ],
+            status: 400,
+            code: "invalid_encrypted_content".to_string(),
+            message: "The encrypted content for item rs_075fc70b could not be verified."
+                .to_string(),
+        }])
+        .capturing_raw_frames();
+        let mock_base = mock.clone().spawn().await;
+        let (base, _state) = spawn_with_pinned_account("acct-anchored-poison", &mock_base).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake must succeed");
+
+        // An anchored turn: only the NEW input travels; the poisoned reasoning item lives upstream.
+        let frame = serde_json::json!({
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "previous_response_id": "resp_fugu_minted",
+            "input": [{"role": "user", "content": "continue"}],
+        })
+        .to_string();
+        ws.send(TMessage::Text(frame.into())).await.unwrap();
+
+        let advisory = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let TMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                match v["type"].as_str().unwrap_or_default() {
+                    "response.created" | "response.in_progress" | "codex.rate_limits" => continue,
+                    _ => break v,
+                }
+            }
+        })
+        .await
+        .expect("the client must be told to resend, not left hanging");
+
+        // The one envelope codex-rs classifies as retryable, so its in-place retry arrives as a
+        // FULL anchorless resend. The raw `invalid_encrypted_content` would map to a
+        // non-retryable InvalidRequest and wedge the turn instead.
+        assert_eq!(advisory["type"], "error");
+        assert_eq!(advisory["status"], 409);
+        assert_eq!(
+            advisory["error"]["code"], "websocket_connection_limit_reached",
+            "must be the retryable shape, not the raw upstream code: {advisory:?}"
+        );
+
+        // Crucially: NO replay was attempted. Replaying an anchored frame would re-reference the
+        // same poisoned chain and burn another attempt for nothing.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            mock.raw_frames().len(),
+            1,
+            "an anchored poisoned turn must not be replayed: {:?}",
+            mock.raw_frames()
+        );
+    }
+
+    /// The complete two-stage recovery: an anchored poisoned turn is bounced back to the client,
+    /// and the full history it resends — which DOES carry the reasoning items inline — is then
+    /// sanitized by the transform and completes. This is the path that unbricks a thread which
+    /// switched platforms mid-conversation.
+    #[tokio::test]
+    async fn anchored_resend_then_transform_recovers_the_thread() {
+        let poisoned = |item: &str| ScriptedTurn::ErrorAfterEvents {
+            events: vec![r#"{"type":"response.created","response":{"id":"resp_x"}}"#.to_string()],
+            status: 400,
+            code: "invalid_encrypted_content".to_string(),
+            message: format!("The encrypted content for item {item} could not be verified."),
+        };
+        let mock = MockWsUpstream::scripted(vec![
+            // Turn 1: the anchored attempt.
+            poisoned("rs_075fc70b"),
+            // Turn 2: the client's full resend — still poisoned, now inline.
+            poisoned("rs_075fc70b"),
+            // Turn 3: the transformed replay succeeds.
+            ScriptedTurn::normal(vec![]),
+        ])
+        .capturing_raw_frames();
+        let mock_base = mock.clone().spawn().await;
+        let (base, _state) = spawn_with_pinned_account("acct-anchored-recover", &mock_base).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake must succeed");
+
+        ws.send(TMessage::Text(
+            serde_json::json!({
+                "type": "response.create",
+                "model": "gpt-5.6-sol",
+                "previous_response_id": "resp_fugu_minted",
+                "input": [{"role": "user", "content": "continue"}],
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+        // Stage 1: absorb the resend advisory.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let TMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if v["type"] == "error" {
+                    assert_eq!(v["error"]["code"], "websocket_connection_limit_reached");
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("stage 1 must produce the resend advisory");
+
+        // Stage 2: codex-rs's retry — full history, no anchor, reasoning items now INLINE.
+        ws.send(TMessage::Text(
+            serde_json::json!({
+                "type": "response.create",
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {"role": "user", "content": "earlier"},
+                    {
+                        "type": "reasoning",
+                        "id": "rs_075fc70b",
+                        "summary": [{"type": "summary_text", "text": "compared two designs"}],
+                        "encrypted_content": "gAAAA-fugu-sealed",
+                    },
+                    {"role": "user", "content": "continue"},
+                ],
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let TMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                match v["type"].as_str().unwrap_or_default() {
+                    "response.created" | "response.in_progress" | "codex.rate_limits" => continue,
+                    "response.completed" => break v,
+                    other => panic!("stage 2 must not surface {other}: {v:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the transformed replay must complete the thread");
+        assert_eq!(completed["type"], "response.completed");
+
+        let mut raw = mock.raw_frames();
+        for _ in 0..50 {
+            raw = mock.raw_frames();
+            if raw.len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            raw.len(),
+            3,
+            "anchored try, full resend, transformed replay: {raw:?}"
+        );
+        assert!(
+            raw[0].contains("previous_response_id"),
+            "frame 1 is the anchored attempt"
+        );
+        assert!(
+            raw[1].contains("encrypted_content"),
+            "frame 2 is the client's still-poisoned full resend"
+        );
+        assert!(
+            !raw[2].contains("encrypted_content") && raw[2].contains("compared two designs"),
+            "frame 3 must be sanitized, keeping the plaintext summary: {}",
+            raw[2]
+        );
+    }
+
     /// The replay-safety boundary stands: once actual OUTPUT (a delta) has crossed downstream, a
     /// transform-replay could duplicate content the client already consumed — the error must be
     /// surfaced verbatim instead, exactly like any other post-output upstream error.

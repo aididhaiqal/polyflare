@@ -841,18 +841,65 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                 // PROVEN it cannot decrypt a reasoning envelope in this turn's
                                 // history (`invalid_encrypted_content` — foreign-minted `rs_*`
                                 // items after a fugu↔codex switch; the 2026-07-25 tether-thread
-                                // bricking). A raw replay can never succeed, and a resend
-                                // advisory would make the client resend the SAME poisoned
-                                // history. Instead: rewrite the buffered frame ONCE per turn
-                                // (envelopes out, plaintext summaries kept as assistant text —
-                                // see `reasoning_transform`) and replay it on a fresh
-                                // same-account socket. Any failure below falls through to the
+                                // bricking). A raw replay can never succeed. Two remedies, chosen
+                                // by where the poison actually lives — see the anchored branch
+                                // below, then the rewrite. Any failure falls through to the
                                 // generic forward-and-bench path with the original error frame.
                                 if sig.error_code.as_deref()
                                     == Some(INVALID_ENCRYPTED_CONTENT_CODE)
                                     && !reasoning_transform_attempted
                                     && !upstream_output_visible_for_turn
                                 {
+                                    // ANCHORED frame: the poisoned `rs_*` item is NOT in this
+                                    // frame at all. It lives in the server-side response chain
+                                    // `previous_response_id` points at, so there is nothing here
+                                    // to rewrite (`strip_unverifiable_reasoning` would find no
+                                    // `input` reasoning items and return `None`), and a replay
+                                    // would re-reference the identical poison — the live
+                                    // 2026-07-25 13:18 signature: right error code, output not
+                                    // yet visible, and still zero transform replays.
+                                    //
+                                    // PolyFlare must not rebuild that history itself: replaying
+                                    // an anchored turn anchorless from server state silently
+                                    // restarts the conversation with only its suffix (the
+                                    // 2026-07-23 parrot incident). The only party holding the
+                                    // full history is the client, so make IT resend, exactly as
+                                    // the anchor-miss arm does. The resent frame carries the
+                                    // reasoning items INLINE, which is precisely the shape the
+                                    // rewrite below can sanitize on the next pass.
+                                    //
+                                    // Deliberately does NOT consume `reasoning_transform_attempted`:
+                                    // this is the setup for the rewrite, not an attempt at it.
+                                    // `anchor_resend_pending` is what bounds it to one advisory,
+                                    // and it is shared with the anchor-miss arm so the two can
+                                    // never ping-pong a client between them.
+                                    let anchored = in_flight
+                                        .as_deref()
+                                        .is_some_and(is_anchored_generating_frame);
+                                    if anchored && !anchor_resend_pending {
+                                        let forged = client_resend_error_frame();
+                                        if downstream
+                                            .send(Message::Text(forged.clone().into()))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                        client_visible_upstream_for_turn = true;
+                                        if let Some(mut turn) = turn_telemetry.take() {
+                                            if let Some(terminal) = turn.observe(&forged) {
+                                                turn.finish(&state, &account.id, terminal).await;
+                                            } else {
+                                                turn_telemetry = Some(turn);
+                                            }
+                                        }
+                                        // The client's turn is over; its retry is a fresh
+                                        // anchorless `response.create`. Never replay this frame.
+                                        in_flight = None;
+                                        anchor_resend_pending = true;
+                                        relay_metrics.record("reasoning_anchor_client_resend");
+                                        continue;
+                                    }
                                     reasoning_transform_attempted = true;
                                     let transformed = in_flight
                                         .as_deref()
