@@ -16,7 +16,26 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 BUILD_BINARY="${POLYFLARE_SERVICE_BUILD_BINARY:-$REPO_ROOT/target/release/polyflare}"
 BINARY="${POLYFLARE_SERVICE_BINARY:-$HOME/.local/bin/polyflare}"
-DATA_DIR="${POLYFLARE_DATA_DIR:-$HOME/.polyflare}"
+# Which database this deploy touches.
+#
+# A LINKED WORKTREE gets its own scratch database, because a worktree binary carrying an unmerged
+# migration must never migrate the shared live store: on 2026-07-25 a worktree deploy applied a
+# migration whose source existed only on an unmerged branch, and recovering it meant scanning the
+# deployed binary for the embedded SQL and brute-forcing the end offset until the checksum matched
+# the ledger. Only the primary checkout owns ~/.polyflare. An explicit POLYFLARE_DATA_DIR always
+# wins, so deliberately pointing a worktree at the live store stays possible.
+if [[ -n "${POLYFLARE_DATA_DIR:-}" ]]; then
+  DATA_DIR="$POLYFLARE_DATA_DIR"
+  DATA_DIR_ORIGIN="POLYFLARE_DATA_DIR"
+elif _git_dir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" &&
+  _common_dir="$(cd "$REPO_ROOT" && cd "$(git rev-parse --git-common-dir 2>/dev/null)" && pwd)" &&
+  [[ "$_git_dir" != "$_common_dir" ]]; then
+  DATA_DIR="$REPO_ROOT/.polyflare-worktree"
+  DATA_DIR_ORIGIN="linked worktree (isolated from the live store)"
+else
+  DATA_DIR="$HOME/.polyflare"
+  DATA_DIR_ORIGIN="primary checkout"
+fi
 STATE_DIR="${POLYFLARE_SERVICE_STATE_DIR:-$DATA_DIR/run}"
 PID_FILE="$STATE_DIR/polyflare.pid"
 LOG_FILE="${POLYFLARE_SERVICE_LOG:-$STATE_DIR/polyflare.log}"
@@ -32,6 +51,11 @@ LAUNCHD_LABEL="${POLYFLARE_SERVICE_LAUNCHD_LABEL:-com.polyflare.server}"
 die() {
   printf 'polyflare-service: %s\n' "$*" >&2
   exit 1
+}
+
+# Say which database this command will touch, before it touches it.
+announce_target() {
+  printf 'Data directory: %s (%s)\n' "$DATA_DIR" "$DATA_DIR_ORIGIN"
 }
 
 [[ "$SERVICE_PORT" =~ ^[0-9]+$ ]] &&
@@ -196,6 +220,61 @@ restart_launchd_service() {
   die "launch service did not become ready after ${START_TIMEOUT_SECS}s"
 }
 
+# Report which migrations a start would apply, and snapshot the database first.
+#
+# `sqlx::migrate!` embeds every .sql in the migrations directory and applies whatever the database
+# is missing, silently and irreversibly, as a side effect of the process starting. That is fine when
+# you know what is pending and have a copy; it is how an unfinished draft reaches production when you
+# do not. This makes both explicit at the one moment it matters.
+guard_migrations() {
+  local db="$DATA_DIR/store.db"
+  local migrations_dir="$REPO_ROOT/crates/polyflare-store/migrations"
+  [[ -d "$migrations_dir" ]] || return 0
+
+  if [[ ! -f "$db" ]]; then
+    printf 'Database %s does not exist yet; it will be created and fully migrated.\n' "$db"
+    return 0
+  fi
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    printf 'WARNING: sqlite3 not found, so pending migrations cannot be listed or backed up.\n' >&2
+    printf 'WARNING: starting anyway will apply any pending migration to %s.\n' "$db" >&2
+    return 0
+  fi
+
+  local applied pending=()
+  applied="$(sqlite3 "$db" 'SELECT version FROM _sqlx_migrations;' 2>/dev/null || true)"
+  local file base version
+  for file in "$migrations_dir"/*.sql; do
+    [[ -e "$file" ]] || continue
+    base="$(basename -- "$file")"
+    version="${base%%_*}"
+    # Strip leading zeros so 0025 compares equal to the ledger's 25.
+    version="$((10#$version))"
+    if ! grep -qx -- "$version" <<<"$applied"; then
+      pending+=("$base")
+    fi
+  done
+
+  if (( ${#pending[@]} == 0 )); then
+    return 0
+  fi
+
+  printf '\n%s pending migration(s) will be applied to %s:\n' "${#pending[@]}" "$db"
+  printf '  %s\n' "${pending[@]}"
+
+  local stamp backup_dir backup
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  backup_dir="$DATA_DIR/backups"
+  backup="$backup_dir/store-pre-migration-$stamp.db"
+  mkdir -p "$backup_dir"
+  # `.backup` rather than cp: the database runs in WAL mode, so copying the file alone can capture a
+  # torn state that omits committed transactions still living in the -wal.
+  if ! sqlite3 "$db" ".backup '$backup'" 2>/dev/null; then
+    die "could not back up $db before migrating; refusing to apply ${#pending[@]} migration(s)"
+  fi
+  printf 'Backed up to %s\n\n' "$backup"
+}
+
 start_service() {
   local existing
   if existing="$(managed_or_verified_pid)"; then
@@ -253,14 +332,20 @@ case "${1:-restart}" in
     build_release
     ;;
   start)
+    announce_target
     build_release
+    guard_migrations
     start_service
     ;;
   stop)
     stop_service
     ;;
   restart)
+    announce_target
     build_release
+    # Runs before EITHER restart path: a launchd kickstart re-execs the binary without going through
+    # start_service, so the guard cannot live in there alone.
+    guard_migrations
     if launchd_is_loaded; then
       restart_launchd_service
     else
@@ -269,6 +354,7 @@ case "${1:-restart}" in
     fi
     ;;
   status)
+    announce_target
     status_service
     ;;
   logs)

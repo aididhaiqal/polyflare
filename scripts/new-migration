@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+#
+# Create a store migration with a collision-proof version.
+#
+#   scripts/new-migration reset_credit_expiry
+#
+# Versions are UTC timestamps (`20260725T143012` -> `20260725143012`) rather than the next integer.
+# Sequential numbering is a single global namespace: two worktrees each asking "what is the next
+# number?" both get the same answer, and on 2026-07-25 two unrelated migrations both claimed 0025 —
+# a build error and a guaranteed VersionMismatch crash-loop on the next deploy. A timestamp encodes
+# WHEN a migration was authored instead of HOW MANY exist, so parallel branches cannot collide.
+#
+# sqlx reads the version as the integer before the first underscore, so timestamps sort after the
+# legacy 0001-0028 files and need no renumbering of anything that already shipped.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+MIGRATIONS_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)/crates/polyflare-store/migrations"
+
+die() {
+  printf 'new-migration: %s\n' "$*" >&2
+  exit 1
+}
+
+name="${1:-}"
+[[ -n "$name" ]] || die "usage: $0 <snake_case_name>"
+[[ "$name" =~ ^[a-z0-9_]+$ ]] ||
+  die "name must be lower-case letters, digits and underscores: got '$name'"
+[[ -d "$MIGRATIONS_DIR" ]] || die "migrations directory not found: $MIGRATIONS_DIR"
+
+version="$(date -u +%Y%m%d%H%M%S)"
+file="$MIGRATIONS_DIR/${version}_${name}.sql"
+[[ -e "$file" ]] && die "already exists: $file"
+
+# A same-second duplicate is the one collision a timestamp cannot rule out.
+for existing in "$MIGRATIONS_DIR"/*.sql; do
+  [[ -e "$existing" ]] || continue
+  [[ "$(basename -- "$existing")" == "${version}_"* ]] &&
+    die "version $version is already taken by $(basename -- "$existing"); wait a second and retry"
+done
+
+cat >"$file" <<EOF
+-- ${name//_/ }
+--
+-- Forward-only. Describe WHY this change is needed and what it preserves; the schema shows what.
+-- Every pre-existing row must keep working: back-fill rather than rewrite, and leave ambiguous data
+-- unset for an operator to resolve instead of guessing.
+EOF
+
+printf 'Created %s\n' "$file"
+printf 'Applied on the next service start; scripts/polyflare-service backs the DB up first.\n'

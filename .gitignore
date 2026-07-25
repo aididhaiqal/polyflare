@@ -4,3 +4,6 @@
 /.superpowers/
 /poc/claude-agent-sdk-bridge/node_modules/
 /poc/claude-agent-sdk-bridge/capture.json
+# Per-worktree scratch database (scripts/polyflare-service keeps a linked worktree off the
+# shared live store).
+/.polyflare-worktree/
