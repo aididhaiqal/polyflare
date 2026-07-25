@@ -278,6 +278,7 @@ export interface RequestRowView {
   model: string | null;
   upstream_model: string | null;
   upstream_transport: string | null;
+  profile_revision: string | null;
   reasoning_effort: string | null;
   service_tier: string | null;
   transport: string | null;
@@ -634,6 +635,12 @@ export interface ProviderModelView {
   supports_web_search: boolean;
   supports_reasoning_summaries: boolean;
   reasoning_levels: string[];
+  instruction_mode: "none" | "append" | "replace";
+  instruction_text: string;
+  request_overrides: {
+    reasoning_effort?: string;
+    max_output_tokens?: number;
+  };
   input_per_million: number | null;
   cached_input_per_million: number | null;
   output_per_million: number | null;
@@ -663,6 +670,7 @@ export interface CreateProviderBody {
   slug: string;
   display_name: string;
   base_url: string;
+  wire_api?: "responses" | "anthropic_messages";
   stateless_responses?: boolean;
   allow_private_hosts?: boolean;
   connect_timeout_ms?: number;
@@ -676,12 +684,19 @@ export interface CreateProviderModelBody {
   upstream_model: string;
   display_name: string;
   context_window?: number;
+  max_output_tokens?: number;
   supports_tools?: boolean;
   supports_vision?: boolean;
   supports_parallel_tool_calls?: boolean;
   supports_web_search?: boolean;
   supports_reasoning_summaries?: boolean;
   reasoning_levels?: string[];
+  instruction_mode?: "none" | "append" | "replace";
+  instruction_text?: string;
+  request_overrides?: {
+    reasoning_effort?: string;
+    max_output_tokens?: number;
+  };
   input_per_million?: number;
   cached_input_per_million?: number;
   output_per_million?: number;
@@ -697,9 +712,34 @@ export type UpdateProviderModelBody = Partial<
 
 export interface ProviderModelSyncResult {
   discovered: number;
+  selected: number;
   imported: number;
   skipped_existing: number;
   skipped_conflicts: number;
+}
+
+export interface ProviderDiscoveredModelView {
+  upstream_model: string;
+  suggested_public_model: string;
+  display_name: string;
+  context_window: number | null;
+  max_output_tokens: number | null;
+  supports_tools: boolean;
+  supports_vision: boolean;
+  supports_parallel_tool_calls: boolean;
+  supports_web_search: boolean;
+  supports_reasoning: boolean;
+  supports_reasoning_summaries: boolean;
+  reasoning_levels: string[];
+  input_per_million: number | null;
+  cached_input_per_million: number | null;
+  output_per_million: number | null;
+  state: "available" | "configured" | "conflict";
+}
+
+export interface ProviderModelDiscoveryResult {
+  discovered: number;
+  models: ProviderDiscoveredModelView[];
 }
 
 export interface ProviderTestResult {
@@ -709,6 +749,58 @@ export interface ProviderTestResult {
   model: string;
   credential_id: string | null;
   latency_ms: number;
+}
+
+export type TranslationMatchKind = "exact" | "prefix" | "contains";
+export type TranslationReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
+
+export interface TranslationRouteView {
+  id: string;
+  name: string;
+  enabled: boolean;
+  source_protocol: "anthropic_messages" | "openai_responses";
+  match_kind: TranslationMatchKind;
+  model_pattern: string;
+  target_kind: "builtin_provider" | "custom_provider";
+  target_provider_id: string;
+  target_model: string;
+  reasoning_effort: TranslationReasoningEffort | null;
+  priority: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface TranslatedRequestView {
+  requested_at: number;
+  request_id: string | null;
+  path: "/v1/messages" | "/responses";
+  provider: string;
+  status: number;
+  model: string | null;
+  reasoning_effort: string | null;
+  duration_ms: number;
+}
+
+export interface TranslationRoutesView {
+  routes: TranslationRouteView[];
+  recent_requests: TranslatedRequestView[];
+}
+
+export type TranslationRouteInput = Omit<
+  TranslationRouteView,
+  "id" | "created_at" | "updated_at"
+>;
+
+export interface TranslationTestResult {
+  matched: boolean;
+  route: TranslationRouteView | null;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -855,10 +947,24 @@ export function createProviderModel(
   });
 }
 
-export function syncProviderModels(id: string): Promise<ProviderModelSyncResult> {
+export function discoverProviderModels(id: string): Promise<ProviderModelDiscoveryResult> {
+  return fetchJson<ProviderModelDiscoveryResult>(
+    `/api/providers/${encodeURIComponent(id)}/models/discover`,
+    { method: "POST" },
+  );
+}
+
+export function syncProviderModels(
+  id: string,
+  modelIds: string[],
+): Promise<ProviderModelSyncResult> {
   return fetchJson<ProviderModelSyncResult>(
     `/api/providers/${encodeURIComponent(id)}/models/sync`,
-    { method: "POST" },
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model_ids: modelIds }),
+    },
   );
 }
 
@@ -914,6 +1020,44 @@ export function deleteProviderModel(id: string): Promise<OkResponse> {
   });
 }
 
+export function createTranslationRoute(
+  body: TranslationRouteInput,
+): Promise<TranslationRouteView> {
+  return fetchJson<TranslationRouteView>("/api/translations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export function updateTranslationRoute(
+  id: string,
+  body: TranslationRouteInput,
+): Promise<TranslationRouteView> {
+  return fetchJson<TranslationRouteView>(`/api/translations/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export function deleteTranslationRoute(id: string): Promise<OkResponse> {
+  return fetchJson<OkResponse>(`/api/translations/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export function testTranslationRoute(input: {
+  source_protocol: "anthropic_messages" | "openai_responses";
+  model: string;
+}): Promise<TranslationTestResult> {
+  return fetchJson<TranslationTestResult>("/api/translations/test", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Thin per-endpoint helpers (queries.ts wraps these in useQuery).
 // ---------------------------------------------------------------------------------------------
@@ -933,6 +1077,7 @@ export const api = {
   settings: () => fetchJson<SettingsView>("/api/settings"),
   keys: () => fetchJson<ApiKeysView>("/api/keys"),
   providers: () => fetchJson<CustomProviderView[]>("/api/providers"),
+  translations: () => fetchJson<TranslationRoutesView>("/api/translations"),
   capabilities: () => fetchJson<CapabilitiesView>("/api/capabilities"),
   whoami: () => fetchJson<WhoamiView>("/api/whoami"),
 };

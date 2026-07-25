@@ -24,6 +24,7 @@ fn rec(
         model: None,
         upstream_model: None,
         upstream_transport: None,
+        profile_revision: None,
         reasoning_effort: None,
         service_tier: None,
         transport: None,
@@ -95,6 +96,7 @@ async fn round_trips_every_field() {
     r.model = Some("fugu-ultra".into());
     r.upstream_model = Some("fugu-ultra-v1.1".into());
     r.upstream_transport = Some("http_sse".into());
+    r.profile_revision = Some("0123456789abcdef".into());
     r.orchestration_input_tokens = Some(100);
     r.orchestration_output_tokens = Some(25);
     r.orchestration_cached_input_tokens = Some(40);
@@ -118,6 +120,7 @@ async fn round_trips_every_field() {
     assert_eq!(row.model.as_deref(), Some("fugu-ultra"));
     assert_eq!(row.upstream_model.as_deref(), Some("fugu-ultra-v1.1"));
     assert_eq!(row.upstream_transport.as_deref(), Some("http_sse"));
+    assert_eq!(row.profile_revision.as_deref(), Some("0123456789abcdef"));
     assert_eq!(row.orchestration_input_tokens, Some(100));
     assert_eq!(row.orchestration_output_tokens, Some(25));
     assert_eq!(row.orchestration_cached_input_tokens, Some(40));
@@ -129,4 +132,35 @@ async fn round_trips_every_field() {
     let reports = repo.reports_totals(0, Some("sakana")).await.unwrap();
     assert_eq!(reports.orchestration_tokens, 125);
     assert_eq!(reports.orchestration_cached_tokens, 40);
+}
+
+#[tokio::test]
+async fn account_totals_are_aggregated_in_sql_without_loading_history_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let repo = store.request_log();
+
+    let mut legacy = rec(1, "codex", "/responses", 200, 10);
+    legacy.account_id = Some("account-a".into());
+    legacy.total_tokens = Some(100);
+    repo.insert(&legacy).await.unwrap();
+
+    let mut split = rec(2, "codex", "/responses", 200, 10);
+    split.account_id = Some("account-a".into());
+    split.input_tokens = Some(10);
+    split.output_tokens = Some(5);
+    repo.insert(&split).await.unwrap();
+
+    let mut missing_usage = rec(3, "codex", "/responses", 500, 10);
+    missing_usage.account_id = Some("account-a".into());
+    repo.insert(&missing_usage).await.unwrap();
+
+    let mut other = rec(4, "codex", "/responses", 200, 10);
+    other.account_id = Some("account-b".into());
+    other.total_tokens = Some(999);
+    repo.insert(&other).await.unwrap();
+
+    let totals = repo.account_totals("account-a").await.unwrap();
+    assert_eq!(totals.request_count, 3);
+    assert_eq!(totals.total_tokens, 115);
 }

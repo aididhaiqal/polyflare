@@ -135,6 +135,13 @@ fn account(id: &str, plan_type: &str) -> Account {
 }
 
 async fn spawn_polyflare(upstream_root: &str) -> (String, Arc<AppState>) {
+    spawn_polyflare_with_enforcement(upstream_root, false).await
+}
+
+async fn spawn_polyflare_with_enforcement(
+    upstream_root: &str,
+    enforce_client_keys: bool,
+) -> (String, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
     std::mem::forget(dir);
@@ -185,7 +192,7 @@ async fn spawn_polyflare(upstream_root: &str) -> (String, Arc<AppState>) {
         rate_limit_metrics: polyflare_server::observability::RateLimitMetrics::new(),
         relay_metrics: polyflare_server::observability::RelayMetrics::new(),
         model_catalog: polyflare_server::model_catalog::floor_only_model_catalog(),
-        enforce_client_keys: false,
+        enforce_client_keys,
     });
     let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -270,6 +277,18 @@ async fn wham_usage_returns_capacity_weighted_pool_as_canonical_codex_limit() {
         payload["rate_limit"]["secondary_window"]["reset_at"],
         reset_at
     );
+    assert_eq!(
+        payload["additional_rate_limits"][0]["limit_name"],
+        "PolyFlare overall pool"
+    );
+    assert_eq!(
+        payload["additional_rate_limits"][0]["metered_feature"],
+        "polyflare_pool"
+    );
+    assert_eq!(
+        payload["additional_rate_limits"][0]["rate_limit"], payload["rate_limit"],
+        "the named bucket must describe the same aggregate as the canonical compatibility limit"
+    );
     assert_eq!(payload["rate_limit_reset_credits"]["available_count"], 0);
     assert!(
         capture.0.lock().unwrap().is_none(),
@@ -315,6 +334,37 @@ async fn wham_usage_requires_client_auth_and_fails_closed_without_fresh_pool_evi
 }
 
 #[tokio::test]
+async fn remotely_enforced_wham_usage_requires_a_valid_polyflare_client_key() {
+    let (upstream, _capture) = spawn_upstream().await;
+    let (base, state) = spawn_polyflare_with_enforcement(&upstream, true).await;
+    let reset_at = now() + 86_400;
+    seed_quota(&state, "pro", "pro", 10.0, reset_at).await;
+
+    let unknown = reqwest::Client::new()
+        .get(format!("{base}/backend-api/wham/usage"))
+        .header("authorization", "Bearer merely-non-empty")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unknown.status(),
+        StatusCode::UNAUTHORIZED,
+        "remote posture must not expose aggregate capacity to an arbitrary bearer"
+    );
+
+    let key = polyflare_server::keys::create_key(&state.store, Some("usage-test"), now())
+        .await
+        .unwrap();
+    let valid = reqwest::Client::new()
+        .get(format!("{base}/backend-api/wham/usage"))
+        .header("authorization", format!("Bearer {}", key.raw))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(valid.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn pool_scoped_usage_includes_only_members_of_the_named_pool() {
     let (upstream, _capture) = spawn_upstream().await;
     let (base, state) = spawn_polyflare(&upstream).await;
@@ -345,6 +395,18 @@ async fn pool_scoped_usage_includes_only_members_of_the_named_pool() {
     assert_eq!(
         payload["rate_limit"]["secondary_window"]["used_percent"],
         20
+    );
+    assert_eq!(
+        payload["additional_rate_limits"][0]["limit_name"],
+        "PolyFlare work pool"
+    );
+    assert_eq!(
+        payload["additional_rate_limits"][0]["metered_feature"],
+        "polyflare_pool_work"
+    );
+    assert_eq!(
+        payload["additional_rate_limits"][0]["rate_limit"],
+        payload["rate_limit"]
     );
 }
 

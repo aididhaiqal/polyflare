@@ -83,7 +83,12 @@ use serde_json::{json, Value};
 ///
 /// The response-side translator (`AnthropicToResponses`, §3.5 inverted) is a separate concern from
 /// this module doc's scope — see the file-level doc comment above.
+#[cfg(test)]
 fn map_request(body: Value) -> Value {
+    map_request_with_contract(body, true)
+}
+
+fn map_request_with_contract(body: Value, codex_contract: bool) -> Value {
     let model = body.get("model").cloned().unwrap_or(Value::Null);
     let system = body.get("system").cloned();
     let messages = body
@@ -101,13 +106,13 @@ fn map_request(body: Value) -> Value {
     // So the client's `stream`/`max_tokens` are deliberately NOT forwarded: PolyFlare always streams
     // upstream (and only ever speaks SSE to the client — see `ingress`), and the Anthropic token cap
     // has no Codex equivalent, so it is dropped rather than sent as the rejected `max_output_tokens`.
-    let mut out = json!({
-        "model": model,
-        "input": map_messages(&messages),
-        "store": false,
-        "stream": true,
-    });
+    let mut out = json!({"model": model, "input": map_messages(&messages), "stream": true});
     let map = out.as_object_mut().expect("json! object literal");
+    if codex_contract {
+        map.insert("store".to_string(), Value::Bool(false));
+    } else if let Some(max_tokens) = body.get("max_tokens") {
+        map.insert("max_output_tokens".to_string(), max_tokens.clone());
+    }
     if let Some(sys) = system {
         map.insert("instructions".to_string(), sys);
     }
@@ -356,6 +361,7 @@ struct BlockState {
 /// `AnthropicToResponses::new()` — never reuse one across requests.
 #[derive(Default)]
 pub struct AnthropicToResponses {
+    codex_contract: bool,
     /// Anthropic's `message_start` must be emitted exactly once per turn, on the first
     /// `response.created`/`response.in_progress` seen (SPEC-M4 §3.5 inverted: OpenAI sends both
     /// back-to-back with the same response snapshot; Anthropic has only one start event).
@@ -381,6 +387,15 @@ pub struct AnthropicToResponses {
 
 impl AnthropicToResponses {
     pub fn new() -> Self {
+        Self {
+            codex_contract: true,
+            ..Self::default()
+        }
+    }
+
+    /// Generic OpenAI Responses-compatible upstream. Unlike Codex backend-api, this preserves
+    /// `max_tokens` as `max_output_tokens` and does not force `store:false`.
+    pub fn new_generic() -> Self {
         Self::default()
     }
 
@@ -715,7 +730,7 @@ fn map_usage_from_openai(openai: &Value) -> Value {
 
 impl Translator for AnthropicToResponses {
     fn translate_request(&mut self, body: Value) -> Value {
-        map_request(body)
+        map_request_with_contract(body, self.codex_contract)
     }
 
     fn translate_response_event(&mut self, event: Value) -> Vec<Value> {

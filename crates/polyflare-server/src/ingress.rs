@@ -11,18 +11,19 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 
-use polyflare_anthropic::AnthropicToResponses;
+use polyflare_anthropic::{AnthropicToResponses, ResponsesToAnthropic};
 use polyflare_codex::oauth::{
     classify_failure, is_fedramp_account, should_refresh, token_exp, OAuthError,
 };
 use polyflare_core::{
-    Account, AccountId, AccountSnapshot, BackoffKind, Continuity, ContinuityDirective,
+    Account, AccountId, AccountSnapshot, BackoffKind, Continuity, ContinuityDirective, ExecError,
     FailureSignal, NoopContinuity, Prepared, PreparedRequest, Provider, RecoveryPlan, RequestCtx,
-    ResponseStream, SelectionCtx, Selector, SessionKey, Tier, Translator, WatchdogArm,
+    ResponseMetadata, ResponseStream, SelectionCtx, Selector, SessionKey, Tier, Translator,
+    WatchdogArm,
 };
 use polyflare_store::{CustomProvider, PlainTokens, ProviderModel, RequestLogRecord, Store};
 
-use crate::alias::{self, ModelAlias};
+use crate::alias::{ModelAlias, TranslationTarget};
 use crate::app::AppState;
 use crate::collect_message::collect_anthropic_message;
 use crate::config;
@@ -381,6 +382,8 @@ fn derive_alias_prompt_cache_key(body: &serde_json::Value) -> String {
 /// Every field here is a routing-level scalar or a stable row id — never request/response content.
 #[derive(Default)]
 struct RouteOutcome {
+    /// Whether ingress crossed wire protocols before contacting the selected target.
+    aliased: bool,
     /// The account selected to serve (or attempted for) this request, when selection got that far.
     account_id: Option<String>,
     /// Actual upstream provider. Built-in paths leave this unset and use their fixed provider.
@@ -388,6 +391,7 @@ struct RouteOutcome {
     provider_credential_id: Option<String>,
     upstream_model: Option<String>,
     upstream_transport: Option<String>,
+    profile_revision: Option<String>,
     custom_pricing: Option<(f64, f64, f64)>,
     /// The requested (native path) or resolved target (translated/aliased path) model string.
     model: Option<String>,
@@ -437,6 +441,123 @@ fn stream_response(stream: ResponseStream) -> Response {
     builder
         .body(Body::from_stream(stream))
         .expect("valid response")
+}
+
+fn response_into_stream(response: Response) -> ResponseStream {
+    let (parts, body) = response.into_parts();
+    let metadata = ResponseMetadata {
+        status: parts.status.as_u16(),
+        headers: parts
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect(),
+    };
+    ResponseStream::with_metadata(
+        body.into_data_stream()
+            .map(|chunk| chunk.map_err(|error| ExecError::Stream(error.to_string()))),
+        metadata,
+    )
+}
+
+async fn collect_responses_response(mut stream: ResponseStream) -> Result<serde_json::Value, ()> {
+    let mut line_buffer = Vec::new();
+    let mut terminal = None;
+    while let Some(chunk) = stream.next().await {
+        line_buffer.extend_from_slice(&chunk.map_err(|_| ())?);
+        while let Some(position) = line_buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line = line_buffer.drain(..=position).collect::<Vec<_>>();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let text = String::from_utf8_lossy(&line);
+            let Some(payload) = text.strip_prefix("data:") else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(payload.trim()) else {
+                continue;
+            };
+            if matches!(
+                event.get("type").and_then(|value| value.as_str()),
+                Some("response.completed" | "response.incomplete")
+            ) {
+                terminal = event.get("response").cloned();
+            } else if event.get("type").and_then(|value| value.as_str()) == Some("error") {
+                return Err(());
+            }
+        }
+    }
+    terminal.ok_or(())
+}
+
+fn json_responses_response(value: serde_json::Value) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        Json(value),
+    )
+        .into_response()
+}
+
+async fn resolve_translation_custom_target(
+    state: &AppState,
+    provider_id: &str,
+    model: &str,
+    expected_wire_api: &str,
+) -> Result<(CustomProvider, ProviderModel), Response> {
+    let provider = state
+        .store
+        .providers()
+        .get_provider(provider_id)
+        .await
+        .map_err(|_| internal_error())?
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "translation target provider no longer exists",
+            )
+                .into_response()
+        })?;
+    if !provider.enabled {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "translation target provider is disabled",
+        )
+            .into_response());
+    }
+    if provider.wire_api != expected_wire_api {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "translation target provider protocol changed",
+        )
+            .into_response());
+    }
+    let models = state
+        .store
+        .providers()
+        .list_models(provider_id)
+        .await
+        .map_err(|_| internal_error())?;
+    let provider_model = models
+        .into_iter()
+        .find(|candidate| {
+            candidate.enabled
+                && (candidate.public_model == model || candidate.upstream_model == model)
+        })
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "translation target model is unavailable",
+            )
+                .into_response()
+        })?;
+    Ok((provider, provider_model))
 }
 
 fn upstream_http_error_response(error: &WatchdogError) -> Option<Response> {
@@ -1777,7 +1898,7 @@ fn apply_captured_usage(
     model: Option<&str>,
     custom_pricing: Option<(f64, f64, f64)>,
     captured: usage_capture::CapturedUsage,
-) {
+) -> Option<tokio::sync::oneshot::Receiver<bool>> {
     let u = captured.usage.unwrap_or_default();
     let cost = if let Some((input_price, cached_price, output_price)) = custom_pricing {
         u.input_tokens.zip(u.output_tokens).map(|(input, output)| {
@@ -1813,7 +1934,7 @@ fn apply_captured_usage(
                 )
             })
     };
-    if let Err(e) = store.enqueue_request_usage(polyflare_store::RequestUsageUpdate {
+    match store.enqueue_request_usage_with_receipt(polyflare_store::RequestUsageUpdate {
         request_id: request_id.to_string(),
         input_tokens: u.input_tokens,
         output_tokens: u.output_tokens,
@@ -1829,11 +1950,15 @@ fn apply_captured_usage(
         duration_ms: captured.duration_ms,
         protocol_outcome: captured.protocol_outcome,
     }) {
-        tracing::warn!(
-            target: "polyflare_server::request",
-            error = %e,
-            "request usage queue failed"
-        );
+        Ok(receipt) => Some(receipt),
+        Err(e) => {
+            tracing::warn!(
+                target: "polyflare_server::request",
+                error = %e,
+                "request usage queue failed"
+            );
+            None
+        }
     }
 }
 
@@ -1865,6 +1990,15 @@ pub(crate) async fn responses_custom_route_for_ws(
         Some((provider, model)),
     )
     .await
+}
+
+pub(crate) async fn responses_translation_route_for_ws(
+    state: Arc<AppState>,
+    pool: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    responses_route_with_transport(state, pool, headers, body, Some("websocket"), None).await
 }
 
 async fn responses_route_with_transport(
@@ -1899,6 +2033,10 @@ async fn responses_route_with_transport(
     if response.status().is_success()
         && outcome.account_id.is_some()
         && outcome.provider_credential_id.is_none()
+        && outcome
+            .provider_slug
+            .as_deref()
+            .is_none_or(|slug| slug == "codex")
     {
         if let Ok(snapshots) = quota_state
             .account_cache
@@ -1943,7 +2081,7 @@ async fn responses_route_with_transport(
             .provider_slug
             .clone()
             .unwrap_or_else(|| Provider::Codex.to_string()),
-        aliased: false,
+        aliased: outcome.aliased,
         status: response.status(),
         duration_ms: start.elapsed().as_millis() as u64,
         account_id: outcome.account_id,
@@ -1961,6 +2099,7 @@ async fn responses_route_with_transport(
         upstream_transport: outcome
             .upstream_transport
             .or_else(|| Some("http_sse".to_string())),
+        profile_revision: outcome.profile_revision,
         reasoning_effort: outcome.reasoning_effort,
         // Not yet known at this chokepoint (SPEC-M4a has no per-account subscription-tier read
         // wired here today).
@@ -1980,6 +2119,10 @@ async fn responses_route_with_transport(
     };
     log.emit();
     log_bus.publish(log.to_log_event());
+    let mut finalized_event = log.to_log_event();
+    finalized_event.kind = "request_finalized".to_string();
+    finalized_event.message = "request telemetry finalized".to_string();
+    let finalized_log_bus = log_bus.clone();
     // C11b Task 2: the content-free `upstream_requests` counter, keyed by the SAME
     // `(account_id, status)` pair `log` already carries — bumped exactly once per client request
     // (the final outcome only; per-attempt retries are `FailoverMetrics`, never double-counted
@@ -2023,13 +2166,22 @@ async fn responses_route_with_transport(
             {
                 pressure_runtime.record_actual_pressure(estimated_tokens, actual_tokens);
             }
-            apply_captured_usage(
+            let receipt = apply_captured_usage(
                 &store,
                 &request_id,
                 model.as_deref(),
                 custom_pricing,
                 captured,
             );
+            if let Some(receipt) = receipt {
+                finalized_event.ts_ms = crate::log_bus::now_ms();
+                finalized_event.latency_ms = captured.duration_ms;
+                tokio::spawn(async move {
+                    if matches!(receipt.await, Ok(true)) {
+                        finalized_log_bus.publish(finalized_event);
+                    }
+                });
+            }
         },
     );
     Response::from_parts(parts, Body::from_stream(wrapped))
@@ -2168,6 +2320,7 @@ async fn execute_custom_model(
     outcome.provider_credential_id = custom.credential_id;
     outcome.upstream_model = Some(custom.upstream_model);
     outcome.upstream_transport = Some(custom.upstream_transport);
+    outcome.profile_revision = custom.profile_revision;
     outcome.custom_pricing = match (
         custom.input_per_million,
         custom.cached_input_per_million,
@@ -2175,6 +2328,156 @@ async fn execute_custom_model(
     ) {
         (Some(input), Some(cached), Some(output)) => Some((input, cached, output)),
         _ => None,
+    };
+    (response, outcome)
+}
+
+async fn execute_anthropic_translation(
+    state: Arc<AppState>,
+    pool: Option<&str>,
+    headers: &HeaderMap,
+    raw: &Bytes,
+    model_alias: ModelAlias,
+) -> (Response, RouteOutcome) {
+    let client_body = match serde_json::from_slice::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(object)) => serde_json::Value::Object(object),
+        _ => {
+            return (
+                (StatusCode::BAD_REQUEST, "invalid JSON body").into_response(),
+                RouteOutcome::default(),
+            )
+        }
+    };
+    let client_wants_stream = client_body
+        .get("stream")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let mut translator = ResponsesToAnthropic::new();
+    let mut translated = translator.translate_request(client_body);
+    translated["model"] = serde_json::Value::String(model_alias.target_model.clone());
+    // Both built-in and custom Anthropic executors must stream so the inverse adapter sees the
+    // event lifecycle. A non-streaming Responses client is buffered after translation below.
+    translated["stream"] = serde_json::Value::Bool(true);
+
+    let (response, mut outcome) = match &model_alias.target {
+        TranslationTarget::Builtin(Provider::Anthropic) => {
+            let (response, mut outcome) = messages_handler_native(
+                state.clone(),
+                pool,
+                translated,
+                model_alias.target_model.clone(),
+            )
+            .await;
+            outcome.provider_slug = Some(Provider::Anthropic.to_string());
+            (response, outcome)
+        }
+        TranslationTarget::Custom(provider_id) => {
+            if pool.is_some() {
+                return (
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "custom translation targets are root-scoped",
+                    )
+                        .into_response(),
+                    RouteOutcome {
+                        aliased: true,
+                        model: Some(model_alias.target_model),
+                        ..Default::default()
+                    },
+                );
+            }
+            let (provider, provider_model) = match resolve_translation_custom_target(
+                &state,
+                provider_id,
+                &model_alias.target_model,
+                "anthropic_messages",
+            )
+            .await
+            {
+                Ok(target) => target,
+                Err(response) => {
+                    return (
+                        response,
+                        RouteOutcome {
+                            aliased: true,
+                            model: Some(model_alias.target_model),
+                            ..Default::default()
+                        },
+                    )
+                }
+            };
+            let encoded = match serde_json::to_vec(&translated) {
+                Ok(encoded) => Bytes::from(encoded),
+                Err(_) => {
+                    return (
+                        internal_error(),
+                        RouteOutcome {
+                            aliased: true,
+                            model: Some(model_alias.target_model),
+                            ..Default::default()
+                        },
+                    )
+                }
+            };
+            let (response, custom) = crate::custom_provider::execute(
+                &state.store,
+                &state.cipher,
+                provider,
+                provider_model,
+                headers,
+                &encoded,
+            )
+            .await;
+            let outcome = RouteOutcome {
+                provider_slug: Some(custom.provider_slug),
+                provider_credential_id: custom.credential_id,
+                upstream_model: Some(custom.upstream_model),
+                upstream_transport: Some(custom.upstream_transport),
+                profile_revision: custom.profile_revision,
+                custom_pricing: match (
+                    custom.input_per_million,
+                    custom.cached_input_per_million,
+                    custom.output_per_million,
+                ) {
+                    (Some(input), Some(cached), Some(output)) => Some((input, cached, output)),
+                    _ => None,
+                },
+                model: Some(model_alias.target_model.clone()),
+                ..Default::default()
+            };
+            (response, outcome)
+        }
+        _ => {
+            return (
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "translation target protocol is invalid",
+                )
+                    .into_response(),
+                RouteOutcome {
+                    aliased: true,
+                    model: Some(model_alias.target_model),
+                    ..Default::default()
+                },
+            )
+        }
+    };
+    outcome.aliased = true;
+    outcome.model = Some(model_alias.target_model);
+    if !response.status().is_success() {
+        return (response, outcome);
+    }
+    let translated_stream = wrap_translating_stream(
+        response_into_stream(response),
+        Box::new(translator) as Box<dyn Translator>,
+    );
+    let response = if client_wants_stream {
+        stream_response(translated_stream)
+    } else {
+        match collect_responses_response(translated_stream).await {
+            Ok(response) => json_responses_response(response),
+            Err(_) => (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
+        }
     };
     (response, outcome)
 }
@@ -2230,6 +2533,47 @@ async fn responses_handler_impl_with_max_attempts(
         ..Default::default()
     };
 
+    let translation_route = match state
+        .store
+        .translations()
+        .resolve("openai_responses", &model)
+        .await
+    {
+        Ok(route) => route,
+        Err(_) => return (internal_error(), outcome),
+    };
+    if let Some(route) = translation_route {
+        let target = match (
+            route.target_kind.as_str(),
+            route.target_provider_id.as_str(),
+        ) {
+            ("builtin_provider", "anthropic") => TranslationTarget::Builtin(Provider::Anthropic),
+            ("custom_provider", provider_id) => TranslationTarget::Custom(provider_id.to_string()),
+            _ => {
+                return (
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        "translation target protocol is invalid",
+                    )
+                        .into_response(),
+                    outcome,
+                )
+            }
+        };
+        return execute_anthropic_translation(
+            state,
+            pool,
+            &headers,
+            &raw,
+            ModelAlias {
+                target,
+                target_model: route.target_model,
+                reasoning_effort: route.reasoning_effort,
+            },
+        )
+        .await;
+    }
+
     if let Some((provider, provider_model)) = resolved_custom_route {
         return execute_custom_model(&state, &headers, &raw, provider, provider_model, outcome)
             .await;
@@ -2239,7 +2583,7 @@ async fn responses_handler_impl_with_max_attempts(
     // continuity selection so API-key providers never enter OAuth ownership machinery.
     if pool.is_none() && !crate::catalog::model_slug_is_reserved(&state, &model) {
         match state.store.providers().resolve_model(&model).await {
-            Ok(Some((provider, provider_model))) => {
+            Ok(Some((provider, provider_model))) if provider.wire_api == "responses" => {
                 return execute_custom_model(
                     &state,
                     &headers,
@@ -2249,6 +2593,16 @@ async fn responses_handler_impl_with_max_attempts(
                     outcome,
                 )
                 .await;
+            }
+            Ok(Some(_)) => {
+                return (
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "this model requires a protocol translation route",
+                    )
+                        .into_response(),
+                    outcome,
+                )
             }
             Ok(None) => {}
             Err(_) => return (internal_error(), outcome),
@@ -2832,8 +3186,8 @@ async fn decode_responses_body(
     }
 }
 
-/// The `/v1/messages` ingress entrypoint. A client `model` string that `alias::lookup_alias` maps
-/// to a Codex target (SPEC-M4 §3.6 — the M4b headline feature) takes the cross-provider translated
+/// The `/v1/messages` ingress entrypoint. A client `model` string that a persisted translation
+/// route maps to a Codex target takes the cross-provider translated
 /// path; everything else (no alias, or an alias whose target is itself Anthropic) takes the native
 /// same-format path, unchanged. Also a thin timing + content-safe logging wrapper (mirrors
 /// `responses_handler` above) — see `crate::observability` for the content-safety constraint.
@@ -2879,23 +3233,130 @@ async fn messages_route(
         .unwrap_or_default()
         .to_string();
 
-    // Resolved once, up front: which provider this request structurally targets, and whether
-    // that's via a model alias — both are decided entirely by `lookup_alias`, independent of
-    // whether the downstream relay itself succeeds.
-    let alias = alias::lookup_alias(&model);
-    let aliased_to_codex = matches!(&alias, Some(a) if a.target_provider == Provider::Codex);
-    let provider = if aliased_to_codex {
-        Provider::Codex
+    // Resolve once against the persisted operator rules. A read failure fails closed with 500:
+    // silently taking the native Anthropic path could send a request to the wrong provider.
+    let alias = match state
+        .store
+        .translations()
+        .resolve("anthropic_messages", &model)
+        .await
+    {
+        Ok(route) => route.and_then(|route| {
+            let target = match (
+                route.target_kind.as_str(),
+                route.target_provider_id.as_str(),
+            ) {
+                ("builtin_provider", "codex") => Some(TranslationTarget::Builtin(Provider::Codex)),
+                ("custom_provider", provider_id) => {
+                    Some(TranslationTarget::Custom(provider_id.to_string()))
+                }
+                _ => None,
+            }?;
+            Some(ModelAlias {
+                target,
+                target_model: route.target_model,
+                reasoning_effort: route.reasoning_effort,
+            })
+        }),
+        Err(error) => {
+            tracing::error!(
+                target: "polyflare_server::request",
+                %error,
+                "translation route resolution failed"
+            );
+            let response = StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            let outcome = RouteOutcome {
+                model: Some(model.clone()),
+                ..Default::default()
+            };
+            let request_id = format!("{:032x}", rand::random::<u128>());
+            let log = RequestLog {
+                method: "POST",
+                path: "/v1/messages".to_string(),
+                provider: Provider::Anthropic.to_string(),
+                aliased: false,
+                status: response.status(),
+                duration_ms: start.elapsed().as_millis() as u64,
+                account_id: None,
+                target_kind: Some("account".to_string()),
+                provider_credential_id: None,
+                model: outcome.model,
+                upstream_model: None,
+                upstream_transport: None,
+                profile_revision: None,
+                reasoning_effort: None,
+                service_tier: None,
+                transport: Some(response_transport(&response).to_string()),
+                ttft_ms: None,
+                total_tokens: None,
+                cached_tokens: None,
+                subagent: None,
+                request_id: Some(request_id),
+                session_key: None,
+            };
+            log.emit();
+            log_bus.publish(log.to_log_event());
+            queue_persist_request_log(&log_store, log.record(unix_now()));
+            return response;
+        }
+    };
+    let native_custom = if alias.is_none() && pool.is_none() {
+        match state.store.providers().resolve_model(&model).await {
+            Ok(Some((provider, provider_model))) if provider.wire_api == "anthropic_messages" => {
+                Some((provider, provider_model))
+            }
+            Ok(_) => None,
+            Err(_) => return internal_error(),
+        }
     } else {
-        Provider::Anthropic
+        None
+    };
+    let aliased = alias.is_some();
+    let builtin_provider = match alias.as_ref().map(|alias| &alias.target) {
+        Some(TranslationTarget::Builtin(provider)) => *provider,
+        _ => Provider::Anthropic,
     };
 
-    let (response, outcome) = match alias {
-        Some(model_alias) if model_alias.target_provider == Provider::Codex => {
+    let (response, outcome) = match (alias, native_custom) {
+        (Some(model_alias), _)
+            if model_alias.target == TranslationTarget::Builtin(Provider::Codex) =>
+        {
             messages_handler_codex_aliased(state, pool.as_deref(), body, model_alias).await
+        }
+        (
+            Some(
+                model_alias @ ModelAlias {
+                    target: TranslationTarget::Custom(_),
+                    ..
+                },
+            ),
+            _,
+        ) => {
+            if pool.is_some() {
+                (
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "custom translation targets are root-scoped",
+                    )
+                        .into_response(),
+                    RouteOutcome {
+                        model: Some(model_alias.target_model),
+                        ..Default::default()
+                    },
+                )
+            } else {
+                messages_handler_custom_responses(state, &headers, body, model_alias).await
+            }
+        }
+        (None, Some((provider, provider_model))) => {
+            messages_handler_custom_native(state, &headers, body, provider, provider_model).await
         }
         _ => messages_handler_native(state, pool.as_deref(), body, model).await,
     };
+    let provider = outcome
+        .provider_slug
+        .clone()
+        .unwrap_or_else(|| builtin_provider.to_string());
 
     // Live-usage-cost-capture Task 4: a fresh per-request correlation id — content-free (128
     // random bits, never derived from request/response data) — so the (later) stream-wrapper task
@@ -2904,16 +3365,26 @@ async fn messages_route(
     let log = RequestLog {
         method: "POST",
         path: "/v1/messages".to_string(),
-        provider: provider.to_string(),
-        aliased: aliased_to_codex,
+        provider,
+        aliased,
         status: response.status(),
         duration_ms: start.elapsed().as_millis() as u64,
         account_id: outcome.account_id,
-        target_kind: Some("account".to_string()),
-        provider_credential_id: None,
+        target_kind: Some(
+            if outcome.provider_credential_id.is_some() {
+                "credential"
+            } else {
+                "account"
+            }
+            .to_string(),
+        ),
+        provider_credential_id: outcome.provider_credential_id,
         model: outcome.model,
-        upstream_model: None,
-        upstream_transport: Some("http_sse".to_string()),
+        upstream_model: outcome.upstream_model,
+        upstream_transport: outcome
+            .upstream_transport
+            .or_else(|| Some("http_sse".to_string())),
+        profile_revision: outcome.profile_revision,
         reasoning_effort: outcome.reasoning_effort,
         // Not yet known at this chokepoint.
         service_tier: None,
@@ -3095,6 +3566,122 @@ async fn messages_handler_native(
         Err(e) => {
             record_failure(&state, &health_id, &e, unix_now()).await;
             surface_watchdog_error(&e)
+        }
+    };
+    (response, outcome)
+}
+
+async fn messages_handler_custom_native(
+    state: Arc<AppState>,
+    headers: &HeaderMap,
+    body: serde_json::Value,
+    provider: CustomProvider,
+    provider_model: ProviderModel,
+) -> (Response, RouteOutcome) {
+    let encoded = match serde_json::to_vec(&body) {
+        Ok(encoded) => Bytes::from(encoded),
+        Err(_) => return (internal_error(), RouteOutcome::default()),
+    };
+    execute_custom_model(
+        &state,
+        headers,
+        &encoded,
+        provider,
+        provider_model,
+        RouteOutcome {
+            model: body
+                .get("model")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn messages_handler_custom_responses(
+    state: Arc<AppState>,
+    headers: &HeaderMap,
+    body: serde_json::Value,
+    model_alias: ModelAlias,
+) -> (Response, RouteOutcome) {
+    let TranslationTarget::Custom(provider_id) = &model_alias.target else {
+        return (internal_error(), RouteOutcome::default());
+    };
+    let (provider, provider_model) = match resolve_translation_custom_target(
+        &state,
+        provider_id,
+        &model_alias.target_model,
+        "responses",
+    )
+    .await
+    {
+        Ok(target) => target,
+        Err(response) => {
+            return (
+                response,
+                RouteOutcome {
+                    model: Some(model_alias.target_model),
+                    reasoning_effort: model_alias.reasoning_effort,
+                    ..Default::default()
+                },
+            )
+        }
+    };
+    let client_wants_stream = body
+        .get("stream")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let mut translator = AnthropicToResponses::new_generic();
+    let mut translated = translator.translate_request(body);
+    translated["model"] = serde_json::Value::String(model_alias.target_model.clone());
+    if let Some(effort) = &model_alias.reasoning_effort {
+        translated["reasoning"] = serde_json::json!({"effort": effort});
+    }
+    let encoded = match serde_json::to_vec(&translated) {
+        Ok(encoded) => Bytes::from(encoded),
+        Err(_) => return (internal_error(), RouteOutcome::default()),
+    };
+    let (response, custom) = crate::custom_provider::execute(
+        &state.store,
+        &state.cipher,
+        provider,
+        provider_model,
+        headers,
+        &encoded,
+    )
+    .await;
+    let outcome = RouteOutcome {
+        provider_slug: Some(custom.provider_slug),
+        provider_credential_id: custom.credential_id,
+        upstream_model: Some(custom.upstream_model),
+        upstream_transport: Some(custom.upstream_transport),
+        profile_revision: custom.profile_revision,
+        custom_pricing: match (
+            custom.input_per_million,
+            custom.cached_input_per_million,
+            custom.output_per_million,
+        ) {
+            (Some(input), Some(cached), Some(output)) => Some((input, cached, output)),
+            _ => None,
+        },
+        model: Some(model_alias.target_model),
+        reasoning_effort: model_alias.reasoning_effort,
+        ..Default::default()
+    };
+    if !response.status().is_success() {
+        return (response, outcome);
+    }
+    let translated_stream = wrap_translating_stream(
+        response_into_stream(response),
+        Box::new(translator) as Box<dyn Translator>,
+    );
+    let response = if client_wants_stream {
+        stream_response(translated_stream)
+    } else {
+        match collect_anthropic_message(translated_stream).await {
+            Ok(message) => json_message_response(message),
+            Err(_) => (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
         }
     };
     (response, outcome)
@@ -3574,6 +4161,7 @@ mod tests {
                 model: Some("gpt-5.6-sol".into()),
                 upstream_model: None,
                 upstream_transport: Some("http_sse".into()),
+                profile_revision: None,
                 reasoning_effort: None,
                 service_tier: None,
                 transport: Some("http".into()),

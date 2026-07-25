@@ -12,8 +12,12 @@ pub mod provider_repo;
 pub mod request_log_repo;
 pub mod settings_repo;
 pub mod store;
+pub mod translation_repo;
 
-pub use account::{Account, AccountRepo, EncryptedTokens, PlainTokens, UsageSnapshot, WindowUsage};
+pub use account::{
+    Account, AccountRepo, AccountSettingsUpdate, EncryptedTokens, PlainTokens, UsageSnapshot,
+    WindowUsage,
+};
 pub use api_key_repo::{ApiKeyRepo, ApiKeyRow};
 pub use continuity_repo::{ContinuityRepo, SessionRow};
 pub use crypto::TokenCipher;
@@ -26,10 +30,13 @@ pub use provider_repo::{
 pub use request_log_repo::{
     RecentErrorRow, ReportBreakdownRow, ReportBucket, ReportMetrics, RequestAggregate,
     RequestBucket, RequestLogRecord, RequestLogRepo, RequestLogRow, RequestProtocolOutcome,
-    RequestsFilter,
+    RequestsFilter, TranslatedRequestRow,
 };
 pub use settings_repo::SettingsRepo;
 pub use store::{RequestUsageUpdate, Store};
+pub use translation_repo::{
+    NewTranslationRoute, TranslationRepo, TranslationRoute, TranslationRouteUpdate,
+};
 
 /// Errors surfaced by the store, crypto, and importer.
 #[derive(Debug, thiserror::Error)]

@@ -299,7 +299,9 @@ export function Overview() {
   });
   const requestsQuery = useRequests({
     limit: 12,
-    provider: providerParam,
+    // The dashboard's request-ledger surfaces default to model traffic. Backend operations remain
+    // available through the explicit Backend filter without contaminating routing heartbeat data.
+    provider: providerParam ?? "model",
   });
 
   const updateOverviewFilter = (key: "range" | "provider", value: string) => {
@@ -2655,7 +2657,11 @@ function requestInvestigationHref(
   if (range !== "24h") params.set("range", range);
   params.set(
     "provider",
-    providerFilter === "all" ? providerBrandKey(row.provider) : providerFilter,
+    providerFilter === "all"
+      ? backendRequestDisplay(row)
+        ? "chatgpt_backend"
+        : providerBrandKey(row.provider)
+      : providerFilter,
   );
   if (row.account_id) params.set("account", row.account_id);
   if (row.model) params.set("model", row.model);
@@ -2677,7 +2683,11 @@ function RecentRequestsCard(
 
   const { rows, accounts, providerFilter, range, nowMs } = props;
   const accountById = new Map(accounts.map((account) => [account.id, account]));
-  const filteredRows = rows.filter((row) => matchesFilter(row.provider, providerFilter));
+  const filteredRows = rows.filter((row) => {
+    if (providerFilter === "all") return true;
+    if (backendRequestDisplay(row)) return providerFilter === "chatgpt_backend";
+    return matchesFilter(row.provider, providerFilter);
+  });
   const visibleRows = filteredRows.slice(0, 6);
   const latestRow = filteredRows.reduce<RequestRowView | null>(
     (latest, row) => latest === null || row.requested_at > latest.requested_at ? row : latest,

@@ -13,10 +13,13 @@ import {
   createProvider,
   createProviderCredential,
   createProviderModel,
+  createTranslationRoute,
   deleteAccount,
   deleteProvider,
   deleteProviderCredential,
   deleteProviderModel,
+  deleteTranslationRoute,
+  discoverProviderModels,
   patchAccount,
   patchKey,
   patchProviderCredentialEnabled,
@@ -26,6 +29,8 @@ import {
   startCodexOnboarding,
   syncProviderModels,
   testProvider,
+  testTranslationRoute,
+  updateTranslationRoute,
   type AccountDetailView,
   type AccountPatchBody,
   type AccountView,
@@ -47,6 +52,8 @@ import {
   type SessionsView,
   type SettingsView,
   type TrendsView,
+  type TranslationRouteInput,
+  type TranslationRoutesView,
 } from "./api";
 import { requestRefreshInterval } from "./requestLive";
 import { useToast } from "../ui/Toast";
@@ -70,6 +77,7 @@ export const queryKeys = {
   settings: ["settings"] as const,
   keys: ["keys"] as const,
   providers: ["providers"] as const,
+  translations: ["translations"] as const,
   capabilities: ["capabilities"] as const,
 };
 
@@ -276,6 +284,70 @@ export function useProviders() {
   });
 }
 
+export function useTranslationRoutes() {
+  return useQuery<TranslationRoutesView>({
+    queryKey: queryKeys.translations,
+    queryFn: api.translations,
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  });
+}
+
+export function useSaveTranslationRoute() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (input: { id?: string; route: TranslationRouteInput }) =>
+      input.id
+        ? updateTranslationRoute(input.id, input.route)
+        : createTranslationRoute(input.route),
+    onSuccess: (_, input) => {
+      qc.invalidateQueries({ queryKey: queryKeys.translations });
+      toast({
+        title: input.id ? "Translation route updated" : "Translation route created",
+        variant: "success",
+      });
+    },
+    onError: (e) =>
+      toast({
+        title: "Translation route failed",
+        description: mutationErrorText(e),
+        variant: "error",
+      }),
+  });
+}
+
+export function useDeleteTranslationRoute() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: deleteTranslationRoute,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.translations });
+      toast({ title: "Translation route deleted", variant: "success" });
+    },
+    onError: (e) =>
+      toast({
+        title: "Translation route delete failed",
+        description: mutationErrorText(e),
+        variant: "error",
+      }),
+  });
+}
+
+export function useTestTranslationRoute() {
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: testTranslationRoute,
+    onError: (e) =>
+      toast({
+        title: "Matcher test failed",
+        description: mutationErrorText(e),
+        variant: "error",
+      }),
+  });
+}
+
 export function useCreateProviderBundle() {
   const qc = useQueryClient();
   const { toast } = useToast();
@@ -360,17 +432,31 @@ export function useSyncProviderModels() {
   const qc = useQueryClient();
   const { toast } = useToast();
   return useMutation({
-    mutationFn: (id: string) => syncProviderModels(id),
+    mutationFn: (input: { providerId: string; modelIds: string[] }) =>
+      syncProviderModels(input.providerId, input.modelIds),
     onSuccess: (result) => {
       qc.invalidateQueries({ queryKey: queryKeys.providers });
       toast({
         title: `${result.imported} model${result.imported === 1 ? "" : "s"} imported`,
-        description: `${result.discovered} discovered · ${result.skipped_existing} already configured · ${result.skipped_conflicts} conflicts`,
+        description: `${result.selected} selected · ${result.skipped_existing} already configured · ${result.skipped_conflicts} conflicts`,
         variant: "success",
       });
     },
     onError: (e) =>
-      toast({ title: "Model discovery failed", description: mutationErrorText(e), variant: "error" }),
+      toast({ title: "Model import failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+export function useDiscoverProviderModels() {
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (id: string) => discoverProviderModels(id),
+    onError: (e) =>
+      toast({
+        title: "Model discovery failed",
+        description: mutationErrorText(e),
+        variant: "error",
+      }),
   });
 }
 

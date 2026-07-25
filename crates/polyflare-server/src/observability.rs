@@ -21,7 +21,7 @@
 //! one struct so there is a single content-safety chokepoint for both the ephemeral event and the
 //! durable row. The constraint above binds the persisted record identically.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -52,6 +52,8 @@ pub struct RequestLog {
     pub model: Option<String>,
     pub upstream_model: Option<String>,
     pub upstream_transport: Option<String>,
+    /// Content-free revision of the applied custom model profile. Never the instruction text.
+    pub profile_revision: Option<String>,
     /// `reasoning.effort` for this request, when known (native facts or the alias's override).
     pub reasoning_effort: Option<String>,
     /// The recorded request service tier, when known. Native Responses traffic carries the
@@ -81,11 +83,25 @@ pub struct RequestLog {
     pub session_key: Option<String>,
 }
 
+fn bounded_identifier(value: Option<&str>, max_bytes: usize) -> Option<String> {
+    value
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= max_bytes
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric()
+                        || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':' | b'~')
+                })
+        })
+        .map(str::to_owned)
+}
+
 impl RequestLog {
     /// Emit this request's completion event. Uses an explicit `target` (rather than the default
     /// module path) so callers — including tests — can isolate this specific event from any
     /// other crate's unrelated `tracing` traffic.
     pub fn emit(&self) {
+        let subagent = bounded_identifier(self.subagent.as_deref(), 64);
         tracing::info!(
             target: "polyflare_server::request",
             method = self.method,
@@ -95,8 +111,9 @@ impl RequestLog {
             status = self.status.as_u16(),
             duration_ms = self.duration_ms,
             request_id = self.request_id.as_deref().unwrap_or(""),
-            agent = self.subagent.as_deref().unwrap_or("main"),
+            agent = subagent.as_deref().unwrap_or("main"),
             session_key = self.session_key.as_deref().unwrap_or(""),
+            profile_revision = self.profile_revision.as_deref().unwrap_or(""),
             "request completed"
         );
     }
@@ -119,16 +136,17 @@ impl RequestLog {
             account_id: self.account_id.clone(),
             target_kind: self.target_kind.clone(),
             provider_credential_id: self.provider_credential_id.clone(),
-            model: self.model.clone(),
-            upstream_model: self.upstream_model.clone(),
+            model: bounded_identifier(self.model.as_deref(), 192),
+            upstream_model: bounded_identifier(self.upstream_model.as_deref(), 192),
             upstream_transport: self.upstream_transport.clone(),
-            reasoning_effort: self.reasoning_effort.clone(),
-            service_tier: self.service_tier.clone(),
+            profile_revision: self.profile_revision.clone(),
+            reasoning_effort: bounded_identifier(self.reasoning_effort.as_deref(), 32),
+            service_tier: bounded_identifier(self.service_tier.as_deref(), 32),
             transport: self.transport.clone(),
             ttft_ms: self.ttft_ms,
             total_tokens: self.total_tokens,
             cached_tokens: self.cached_tokens,
-            subagent: self.subagent.clone(),
+            subagent: bounded_identifier(self.subagent.as_deref(), 64),
             // The six 0005 usage/cost columns are not yet populated on this path — they are filled
             // post-insert by `RequestLogRepo::update_usage`, wired by the (later) stream-wrapper
             // task, which correlates its update back to this row via `request_id`.
@@ -173,10 +191,10 @@ impl RequestLog {
             account: target_id.clone(),
             target_kind: self.target_kind.clone(),
             target_id,
-            model: self.model.clone(),
+            model: bounded_identifier(self.model.as_deref(), 192),
             status: Some(status),
             latency_ms: Some(self.duration_ms as i64),
-            subagent: self.subagent.clone(),
+            subagent: bounded_identifier(self.subagent.as_deref(), 64),
             request_id: self.request_id.clone(),
             session_key: self.session_key.clone(),
             kind: "request".to_string(),
@@ -674,6 +692,35 @@ impl UpstreamRequestMetrics {
             })
             .collect()
     }
+
+    /// Remove and suppress stale per-target series from the next scrape after an account or
+    /// custom-provider credential is deleted. Empty/unowned and backend-global targets remain.
+    pub fn snapshot_for_active_targets(
+        &self,
+        account_ids: &HashSet<String>,
+        credential_ids: &HashSet<String>,
+    ) -> Vec<(String, String, String, u16, u64)> {
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        map.retain(|(_, target_kind, target_id, _), _| {
+            target_id.is_empty()
+                || match target_kind.as_str() {
+                    "account" => account_ids.contains(target_id),
+                    "credential" => credential_ids.contains(target_id),
+                    _ => true,
+                }
+        });
+        map.iter()
+            .map(|((provider, target_kind, target_id, status), count)| {
+                (
+                    provider.clone(),
+                    target_kind.clone(),
+                    target_id.clone(),
+                    *status,
+                    *count,
+                )
+            })
+            .collect()
+    }
 }
 
 /// C11b Task 1: a process-global, content-free counter of 429 rate-limit writebacks, labeled by a
@@ -828,6 +875,7 @@ mod tests {
                 model: None,
                 upstream_model: None,
                 upstream_transport: None,
+                profile_revision: None,
                 reasoning_effort: None,
                 service_tier: None,
                 transport: None,
@@ -885,9 +933,7 @@ mod tests {
 
     /// Task 3 (sub-agent identity): `RequestLog::record`/`RequestLog::to_log_event` — the two
     /// content-safety chokepoints feeding the persisted `request_log` table and the live-log-bus —
-    /// carry `subagent` through unchanged, exactly like `account_id`/`model` already do. `emit()`'s
-    /// tracing event is untouched by this field (see `request_completion_event_carries_only_safe_fields`
-    /// above — `account_id`/`model`/`subagent` are deliberately NOT part of that narrower event).
+    /// carry valid bounded `subagent`/`model` identifiers through alongside `account_id`.
     #[test]
     fn record_and_to_log_event_carry_subagent_like_model_and_account_id() {
         let log = RequestLog {
@@ -903,6 +949,7 @@ mod tests {
             model: Some("gpt-5.6-sol".to_string()),
             upstream_model: None,
             upstream_transport: Some("http_sse".to_string()),
+            profile_revision: None,
             reasoning_effort: None,
             service_tier: None,
             transport: Some("http".to_string()),
@@ -956,6 +1003,7 @@ mod tests {
             model: None,
             upstream_model: None,
             upstream_transport: None,
+            profile_revision: None,
             reasoning_effort: None,
             service_tier: None,
             transport: None,
@@ -969,6 +1017,56 @@ mod tests {
 
         assert_eq!(log.record(0).subagent, None);
         assert_eq!(log.to_log_event().subagent, None);
+    }
+
+    #[test]
+    fn arbitrary_client_metadata_is_dropped_at_every_telemetry_sink() {
+        let sentinel = "operator secret sentence that is not an identifier";
+        let log = RequestLog {
+            method: "POST",
+            path: "/responses".to_string(),
+            provider: "codex".to_string(),
+            aliased: false,
+            status: StatusCode::BAD_REQUEST,
+            duration_ms: 10,
+            account_id: None,
+            target_kind: Some("account".to_string()),
+            provider_credential_id: None,
+            model: Some(sentinel.to_string()),
+            upstream_model: Some(sentinel.to_string()),
+            upstream_transport: Some("http_sse".to_string()),
+            profile_revision: None,
+            reasoning_effort: Some(sentinel.to_string()),
+            service_tier: Some(sentinel.to_string()),
+            transport: Some("http".to_string()),
+            ttft_ms: None,
+            total_tokens: None,
+            cached_tokens: None,
+            subagent: Some(sentinel.to_string()),
+            request_id: Some("test-id".to_string()),
+            session_key: None,
+        };
+
+        let record = log.record(0);
+        assert_eq!(record.model, None);
+        assert_eq!(record.upstream_model, None);
+        assert_eq!(record.reasoning_effort, None);
+        assert_eq!(record.service_tier, None);
+        assert_eq!(record.subagent, None);
+
+        let event = log.to_log_event();
+        assert_eq!(event.model, None);
+        assert_eq!(event.subagent, None);
+        assert!(!event.message.contains(sentinel));
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let dispatch =
+            tracing::Dispatch::new(Capture(captured.clone(), "polyflare_server::request"));
+        tracing::dispatcher::with_default(&dispatch, || log.emit());
+        let lines = captured.lock().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].contains(sentinel));
+        assert!(lines[0].contains("agent=main"));
     }
 
     /// Live-usage-cost-capture Task 4: `RequestLog::record` copies `request_id` through into the
@@ -989,6 +1087,7 @@ mod tests {
             model: None,
             upstream_model: None,
             upstream_transport: None,
+            profile_revision: None,
             reasoning_effort: None,
             service_tier: None,
             transport: None,
@@ -1406,6 +1505,36 @@ mod tests {
                     1,
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn upstream_request_metrics_prunes_deleted_target_labels() {
+        let m = UpstreamRequestMetrics::new();
+        m.record_target("codex", "account", Some("live-account"), 200);
+        m.record_target("codex", "account", Some("deleted-account"), 200);
+        m.record_target("openrouter", "credential", Some("live-credential"), 200);
+        m.record_target("openrouter", "credential", Some("deleted-credential"), 500);
+        m.record_target("chatgpt_backend", "backend", None, 200);
+
+        let accounts = HashSet::from(["live-account".to_string()]);
+        let credentials = HashSet::from(["live-credential".to_string()]);
+        let mut snapshot = m.snapshot_for_active_targets(&accounts, &credentials);
+        snapshot.sort();
+
+        assert_eq!(snapshot.len(), 3);
+        assert!(snapshot.iter().any(|entry| entry.2 == "live-account"));
+        assert!(snapshot.iter().any(|entry| entry.2 == "live-credential"));
+        assert!(snapshot
+            .iter()
+            .any(|entry| entry.1 == "backend" && entry.2.is_empty()));
+        assert!(!snapshot
+            .iter()
+            .any(|entry| entry.2 == "deleted-account" || entry.2 == "deleted-credential"));
+        assert_eq!(
+            m.snapshot().len(),
+            3,
+            "stale labels must be removed from the retained map, not only hidden once"
         );
     }
 

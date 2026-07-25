@@ -119,6 +119,9 @@ export function RequestDetailPanel({
           {row.upstream_model && row.upstream_model !== row.model && (
             <DetailField label="Upstream model" value={row.upstream_model} mono />
           )}
+          {row.profile_revision && (
+            <DetailField label="Profile revision" value={row.profile_revision} mono />
+          )}
           <DetailField label="Upstream wire" value={row.upstream_transport ?? "—"} />
           {orchestration > 0 && (
             <DetailField

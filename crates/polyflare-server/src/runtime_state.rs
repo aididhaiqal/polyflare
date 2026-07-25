@@ -355,7 +355,11 @@ pub struct RuntimeStates {
     /// while that refresh was outstanding and one follow-up pass is required.
     usage_refresh_pending: Mutex<HashMap<AccountId, bool>>,
     usage_refresh_coalesced: AtomicU64,
-    cooldown_persist_tx: RwLock<Option<tokio::sync::mpsc::UnboundedSender<RoutingCooldownWrite>>>,
+    cooldown_persist_tx: RwLock<Option<tokio::sync::mpsc::UnboundedSender<AccountId>>>,
+    /// Latest durable cooldown write per account. The channel above carries at most one wakeup
+    /// per key; repeated rate-limit/quota signals overwrite this value instead of growing an
+    /// unbounded queue while SQLite is slow.
+    cooldown_persist_pending: Mutex<HashMap<AccountId, RoutingCooldownWrite>>,
     admission_limits: AdmissionLimits,
     admission_changed: tokio::sync::Notify,
     admission_metrics: AdmissionMetrics,
@@ -405,6 +409,7 @@ impl Default for RuntimeStates {
             usage_refresh_pending: Mutex::new(HashMap::new()),
             usage_refresh_coalesced: AtomicU64::new(0),
             cooldown_persist_tx: RwLock::new(None),
+            cooldown_persist_pending: Mutex::new(HashMap::new()),
             admission_limits: AdmissionLimits::default(),
             admission_changed: tokio::sync::Notify::new(),
             admission_metrics: AdmissionMetrics::default(),
@@ -602,7 +607,7 @@ pub struct PressureCalibrationSnapshot {
     pub actual_pressure_tokens: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutingCooldownWrite {
     pub account_id: AccountId,
     pub cooldown_until: i64,
@@ -773,10 +778,7 @@ impl RuntimeStates {
             .unwrap_or_else(|e| e.into_inner()) = Some(tx);
     }
 
-    pub fn register_cooldown_persistence(
-        &self,
-        tx: tokio::sync::mpsc::UnboundedSender<RoutingCooldownWrite>,
-    ) {
+    pub fn register_cooldown_persistence(&self, tx: tokio::sync::mpsc::UnboundedSender<AccountId>) {
         *self
             .cooldown_persist_tx
             .write()
@@ -784,16 +786,70 @@ impl RuntimeStates {
     }
 
     fn persist_cooldown(&self, write: RoutingCooldownWrite) {
+        let account_id = write.account_id.clone();
+        let should_wake = self
+            .cooldown_persist_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(account_id.clone(), write)
+            .is_none();
+        if !should_wake {
+            return;
+        }
         if let Some(tx) = self
             .cooldown_persist_tx
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
-            if tx.send(write).is_err() {
-                tracing::warn!("routing cooldown persistence worker is unavailable");
+            if tx.send(account_id.clone()).is_ok() {
+                return;
             }
+            self.cooldown_persist_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&account_id);
+            tracing::warn!("routing cooldown persistence worker is unavailable");
+        } else {
+            self.cooldown_persist_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&account_id);
         }
+    }
+
+    pub(crate) fn pending_cooldown(&self, account_id: &AccountId) -> Option<RoutingCooldownWrite> {
+        self.cooldown_persist_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(account_id)
+            .cloned()
+    }
+
+    pub(crate) fn pending_cooldowns(&self) -> Vec<RoutingCooldownWrite> {
+        self.cooldown_persist_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Complete one durable cooldown write. The exact snapshot is removed only when no newer
+    /// coalesced value replaced it while SQLite was busy. Returns `true` when another pass is
+    /// required for that account.
+    pub(crate) fn finish_cooldown_persist(&self, persisted: &RoutingCooldownWrite) -> bool {
+        let mut pending = self
+            .cooldown_persist_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if pending
+            .get(&persisted.account_id)
+            .is_some_and(|current| current == persisted)
+        {
+            pending.remove(&persisted.account_id);
+        }
+        pending.contains_key(&persisted.account_id)
     }
 
     /// Ask the background poller to refresh one account immediately after a protocol-level
@@ -2110,7 +2166,7 @@ mod tests {
     }
 
     #[test]
-    fn cooldown_persistence_does_not_drop_writes_at_the_old_queue_capacity() {
+    fn cooldown_persistence_coalesces_repeated_writes_per_account() {
         let rs = RuntimeStates::new();
         let id = AccountId::from("a");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2120,14 +2176,49 @@ mod tests {
             rs.record_quota_exceeded(&id, now);
         }
 
-        let mut received = 0;
-        while rx.try_recv().is_ok() {
-            received += 1;
-        }
+        assert_eq!(rx.try_recv().unwrap(), id);
         assert_eq!(
-            received, 600,
-            "persistence must not silently lose writes when the former 256-item queue would fill"
+            rx.try_recv().unwrap_err(),
+            tokio::sync::mpsc::error::TryRecvError::Empty,
+            "only one wakeup may be queued for repeated writes to one account"
         );
+        let latest = rs
+            .pending_cooldown(&AccountId::from("a"))
+            .expect("the latest write remains pending");
+        assert_eq!(latest.updated_at, 599);
+        assert_eq!(latest.cooldown_until, 599 + QUOTA_EXCEEDED_COOLDOWN_SECS);
+        assert_eq!(latest.reason, "quota");
+    }
+
+    #[test]
+    fn cooldown_persistence_keeps_failed_write_pending_and_preserves_newer_value() {
+        let rs = RuntimeStates::new();
+        let id = AccountId::from("a");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rs.register_cooldown_persistence(tx);
+
+        rs.record_quota_exceeded(&id, 10);
+        assert_eq!(rx.try_recv().unwrap(), id);
+        let first = rs.pending_cooldown(&AccountId::from("a")).unwrap();
+        assert_eq!(first.updated_at, 10);
+
+        rs.record_quota_exceeded(&AccountId::from("a"), 20);
+        assert_eq!(
+            rx.try_recv().unwrap_err(),
+            tokio::sync::mpsc::error::TryRecvError::Empty,
+            "an in-progress key stays coalesced"
+        );
+        assert!(
+            rs.finish_cooldown_persist(&first),
+            "persisting the stale snapshot must leave the newer value pending"
+        );
+        let second = rs.pending_cooldown(&AccountId::from("a")).unwrap();
+        assert_eq!(second.updated_at, 20);
+        assert!(
+            !rs.finish_cooldown_persist(&second),
+            "persisting the current snapshot must clear the pending key"
+        );
+        assert!(rs.pending_cooldown(&AccountId::from("a")).is_none());
     }
 
     #[test]

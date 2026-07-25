@@ -20,6 +20,7 @@ import { Reports } from "./pages/Reports";
 import { Requests } from "./pages/Requests";
 import { Sessions } from "./pages/Sessions";
 import { Settings } from "./pages/Settings";
+import { Translations } from "./pages/Translations";
 import { Shell } from "./shell/Shell";
 import { ToastProvider } from "./ui/Toast";
 
@@ -57,6 +58,7 @@ export function App() {
                 <Route path="accounts/:id" element={<AccountDetail />} />
                 <Route path="pools" element={<Pools />} />
                 <Route path="providers" element={<Providers />} />
+                <Route path="translations" element={<Translations />} />
                 <Route path="requests" element={<Requests />} />
                 <Route path="sessions" element={<Sessions />} />
                 <Route path="reports" element={<Reports />} />

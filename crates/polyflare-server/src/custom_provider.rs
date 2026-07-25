@@ -1,4 +1,4 @@
-//! Generic OpenAI Responses-compatible custom-provider transport.
+//! Generic custom-provider transport for OpenAI Responses and Anthropic Messages wire APIs.
 //!
 //! Custom providers are model-routed and API-key-backed. They deliberately do not participate in
 //! subscription-account continuity: stateless providers receive a materialized request with
@@ -8,23 +8,38 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::IpAddr;
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use polyflare_store::{CustomProvider, ProviderCredential, ProviderModel, Store, TokenCipher};
+use sha2::{Digest, Sha256};
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_MODEL_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DISCOVERED_MODELS: usize = 1_000;
+const PROFILE_SEPARATOR: &str = "\n\n--- PolyFlare model profile ---\n";
+const HTTP_CLIENT_DNS_TTL: Duration = Duration::from_secs(300);
 
-static HTTP_CLIENTS: LazyLock<Mutex<HashMap<(String, i64), reqwest::Client>>> =
+struct CachedHttpClient {
+    client: reqwest::Client,
+    expires_at: Instant,
+}
+
+static HTTP_CLIENTS: LazyLock<Mutex<HashMap<(String, i64), CachedHttpClient>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static IN_FLIGHT: LazyLock<Mutex<HashMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn evict_provider_client(provider_id: &str) {
+    HTTP_CLIENTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .retain(|(cached_provider_id, _), _| cached_provider_id != provider_id);
+}
 
 #[derive(Debug, Clone)]
 pub struct CustomRouteOutcome {
@@ -33,12 +48,24 @@ pub struct CustomRouteOutcome {
     pub public_model: String,
     pub upstream_model: String,
     pub upstream_transport: String,
+    pub profile_revision: Option<String>,
     pub input_per_million: Option<f64>,
     pub cached_input_per_million: Option<f64>,
     pub output_per_million: Option<f64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileRequestOverrides {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DiscoveredProviderModel {
     pub upstream_model: String,
     pub display_name: String,
@@ -48,8 +75,13 @@ pub struct DiscoveredProviderModel {
     pub supports_vision: bool,
     pub supports_parallel_tool_calls: bool,
     pub supports_web_search: bool,
+    pub supports_reasoning: bool,
     pub supports_reasoning_summaries: bool,
     pub reasoning_levels: Vec<String>,
+    pub input_per_million: Option<f64>,
+    pub cached_input_per_million: Option<f64>,
+    pub output_per_million: Option<f64>,
+    #[serde(skip_serializing)]
     pub model_info: Option<serde_json::Value>,
 }
 
@@ -80,14 +112,25 @@ async fn http_client(
     provider: &CustomProvider,
     endpoint: &reqwest::Url,
 ) -> Result<reqwest::Client, &'static str> {
+    http_client_at(provider, endpoint, Instant::now()).await
+}
+
+async fn http_client_at(
+    provider: &CustomProvider,
+    endpoint: &reqwest::Url,
+    now: Instant,
+) -> Result<reqwest::Client, &'static str> {
     let cache_key = (provider.id.clone(), provider.updated_at);
-    if let Some(client) = HTTP_CLIENTS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get(&cache_key)
-        .cloned()
     {
-        return Ok(client);
+        let mut clients = HTTP_CLIENTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(cached) = clients.get(&cache_key) {
+            if cached.expires_at > now {
+                return Ok(cached.client.clone());
+            }
+        }
+        clients.remove(&cache_key);
     }
 
     let timeout_ms = u64::try_from(provider.connect_timeout_ms.max(100)).unwrap_or(10_000);
@@ -116,10 +159,17 @@ async fn http_client(
     }
 
     let client = builder.build().map_err(|_| "provider HTTP client failed")?;
-    HTTP_CLIENTS
+    let mut clients = HTTP_CLIENTS
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(cache_key, client.clone());
+        .unwrap_or_else(|error| error.into_inner());
+    clients.retain(|(provider_id, _), _| provider_id != &provider.id);
+    clients.insert(
+        cache_key,
+        CachedHttpClient {
+            client: client.clone(),
+            expires_at: now + HTTP_CLIENT_DNS_TTL,
+        },
+    );
     Ok(client)
 }
 
@@ -153,7 +203,11 @@ fn validate_provider_url(
 }
 
 fn validate_endpoint(provider: &CustomProvider) -> Result<reqwest::Url, &'static str> {
-    validate_provider_url(provider, "responses")
+    match provider.wire_api.as_str() {
+        "responses" => validate_provider_url(provider, "responses"),
+        "anthropic_messages" => validate_provider_url(provider, "messages"),
+        _ => Err("unsupported provider wire protocol"),
+    }
 }
 
 fn parse_url_host_ip(host: &str) -> Option<IpAddr> {
@@ -167,21 +221,54 @@ fn parse_url_host_ip(host: &str) -> Option<IpAddr> {
 fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
-            !(ip.is_private()
+            let [a, b, c, d] = ip.octets();
+            let shared = a == 100 && b & 0b1100_0000 == 0b0100_0000;
+            let protocol_assignment = a == 192 && b == 0 && c == 0 && d != 9 && d != 10;
+            let benchmarking = a == 198 && b & 0xfe == 18;
+            let reserved = a & 0xf0 == 0xf0 && !ip.is_broadcast();
+            !(a == 0
+                || ip.is_private()
+                || shared
                 || ip.is_loopback()
                 || ip.is_link_local()
-                || ip.is_broadcast()
+                || protocol_assignment
                 || ip.is_documentation()
-                || ip.is_unspecified())
+                || benchmarking
+                || reserved
+                || ip.is_broadcast()
+                || ip.is_multicast())
         }
         IpAddr::V6(ip) => {
             if let Some(mapped) = ip.to_ipv4_mapped() {
                 return is_public_ip(IpAddr::V4(mapped));
             }
-            !(ip.is_loopback()
-                || ip.is_unspecified()
+            let segments = ip.segments();
+            let address = u128::from_be_bytes(ip.octets());
+            let ietf_protocol_assignment = matches!(
+                segments,
+                [0x2001, second, _, _, _, _, _, _] if second < 0x200
+            ) && !(address
+                == 0x2001_0001_0000_0000_0000_0000_0000_0001
+                || address == 0x2001_0001_0000_0000_0000_0000_0000_0002
+                || matches!(segments, [0x2001, 3, _, _, _, _, _, _])
+                || matches!(segments, [0x2001, 4, 0x112, _, _, _, _, _])
+                || matches!(
+                    segments,
+                    [0x2001, second, _, _, _, _, _, _] if (0x20..=0x3f).contains(&second)
+                ));
+            let documentation = matches!(segments, [0x2001, 0xdb8, _, _, _, _, _, _])
+                || matches!(segments, [first, _, _, _, _, _, _, _] if first & 0xfff0 == 0x3ff0);
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || matches!(segments, [0x64, 0xff9b, 1, _, _, _, _, _])
+                || matches!(segments, [0x100, 0, 0, 0, _, _, _, _])
+                || ietf_protocol_assignment
+                || matches!(segments, [0x2002, _, _, _, _, _, _, _])
+                || documentation
+                || matches!(segments, [0x5f00, _, _, _, _, _, _, _])
                 || ip.is_unique_local()
-                || ip.is_unicast_link_local())
+                || ip.is_unicast_link_local()
+                || ip.is_multicast())
         }
     }
 }
@@ -238,6 +325,37 @@ fn retryable_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
+async fn read_bounded_error_body(
+    response: reqwest::Response,
+    limit: usize,
+    idle_timeout: Duration,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(limit);
+    let mut stream = response.bytes_stream();
+    while body.len() < limit {
+        let Ok(Some(Ok(chunk))) = tokio::time::timeout(idle_timeout, stream.next()).await else {
+            break;
+        };
+        let remaining = limit - body.len();
+        let take = chunk.len().min(remaining);
+        body.extend_from_slice(&chunk[..take]);
+        if take == remaining {
+            break;
+        }
+    }
+    body
+}
+
+async fn send_with_header_timeout(
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+) -> Result<reqwest::Response, ()> {
+    match tokio::time::timeout(timeout, request.send()).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(_)) | Err(_) => Err(()),
+    }
+}
+
 async fn mark_pre_stream_failure(store: &Store, credential_id: &str, status: StatusCode) {
     let now = unix_now();
     let (health, cooldown) =
@@ -256,10 +374,10 @@ async fn mark_pre_stream_failure(store: &Store, credential_id: &str, status: Sta
 
 fn valid_discovered_model_id(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 96
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && value.len() <= 192
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':' | b'~')
+        })
 }
 
 fn reasoning_levels(value: &serde_json::Value) -> Vec<String> {
@@ -296,6 +414,16 @@ fn optional_positive_i64(value: Option<&serde_json::Value>) -> Option<i64> {
     value
         .and_then(serde_json::Value::as_i64)
         .filter(|value| *value > 0)
+}
+
+fn per_token_price_to_per_million(value: Option<&serde_json::Value>) -> Option<f64> {
+    let price = value.and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|value| value.parse::<f64>().ok()))
+    })?;
+    let per_million = price * 1_000_000.0;
+    (price.is_finite() && price >= 0.0 && per_million.is_finite()).then_some(per_million)
 }
 
 fn safe_model_info_extensions(model: &serde_json::Value) -> Option<serde_json::Value> {
@@ -351,6 +479,13 @@ fn parse_discovered_models(payload: &[u8]) -> Result<Vec<DiscoveredProviderModel
                     .unwrap_or(&serde_json::Value::Null),
             );
             if levels.is_empty() {
+                levels = reasoning_levels(
+                    row.get("reasoning")
+                        .and_then(|reasoning| reasoning.get("supported_efforts"))
+                        .unwrap_or(&serde_json::Value::Null),
+                );
+            }
+            if levels.is_empty() {
                 levels.extend(
                     known_reasoning_levels(id)
                         .iter()
@@ -359,12 +494,35 @@ fn parse_discovered_models(payload: &[u8]) -> Result<Vec<DiscoveredProviderModel
             }
             let modalities = row
                 .get("input_modalities")
+                .or_else(|| {
+                    row.get("architecture")
+                        .and_then(|architecture| architecture.get("input_modalities"))
+                })
                 .and_then(serde_json::Value::as_array);
             let supports_vision = modalities
                 .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("image")));
+            let supported_parameters = row
+                .get("supported_parameters")
+                .and_then(serde_json::Value::as_array);
+            let supports_reasoning =
+                supported_parameters.is_some_and(|parameters| {
+                    parameters.iter().any(|parameter| {
+                        matches!(
+                            parameter.as_str(),
+                            Some("reasoning" | "reasoning_effort" | "include_reasoning")
+                        )
+                    })
+                }) || row.get("reasoning").is_some_and(|value| !value.is_null());
             let supports_tools = row
                 .get("apply_patch_tool_type")
                 .map(|value| !value.is_null())
+                .or_else(|| {
+                    supported_parameters.map(|parameters| {
+                        parameters
+                            .iter()
+                            .any(|parameter| parameter.as_str() == Some("tools"))
+                    })
+                })
                 .unwrap_or(true);
             let supports_web_search = row
                 .get("supports_search_tool")
@@ -384,16 +542,26 @@ fn parse_discovered_models(payload: &[u8]) -> Result<Vec<DiscoveredProviderModel
                 upstream_model: id.to_string(),
                 display_name: row
                     .get("display_name")
+                    .or_else(|| row.get("name"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or(id)
                     .to_string(),
-                context_window: optional_positive_i64(row.get("context_window")).or_else(|| {
-                    optional_positive_i64(
-                        row.get("metadata")
-                            .and_then(|metadata| metadata.get("context_window")),
-                    )
-                }),
-                max_output_tokens: optional_positive_i64(row.get("max_output_tokens")),
+                context_window: optional_positive_i64(row.get("context_window"))
+                    .or_else(|| optional_positive_i64(row.get("context_length")))
+                    .or_else(|| {
+                        optional_positive_i64(
+                            row.get("metadata")
+                                .and_then(|metadata| metadata.get("context_window")),
+                        )
+                    }),
+                max_output_tokens: optional_positive_i64(row.get("max_output_tokens")).or_else(
+                    || {
+                        optional_positive_i64(
+                            row.get("top_provider")
+                                .and_then(|provider| provider.get("max_completion_tokens")),
+                        )
+                    },
+                ),
                 supports_tools,
                 supports_vision,
                 supports_parallel_tool_calls: row
@@ -401,8 +569,20 @@ fn parse_discovered_models(payload: &[u8]) -> Result<Vec<DiscoveredProviderModel
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(true),
                 supports_web_search,
+                supports_reasoning,
                 supports_reasoning_summaries,
                 reasoning_levels: levels,
+                input_per_million: per_token_price_to_per_million(
+                    row.get("pricing").and_then(|pricing| pricing.get("prompt")),
+                ),
+                cached_input_per_million: per_token_price_to_per_million(
+                    row.get("pricing")
+                        .and_then(|pricing| pricing.get("input_cache_read")),
+                ),
+                output_per_million: per_token_price_to_per_million(
+                    row.get("pricing")
+                        .and_then(|pricing| pricing.get("completion")),
+                ),
                 model_info: rich.then(|| safe_model_info_extensions(row)).flatten(),
             })
         })
@@ -439,11 +619,18 @@ pub async fn discover_models(
     let request_timeout = Duration::from_millis(
         u64::try_from(provider.stream_idle_timeout_ms.max(1_000)).unwrap_or(300_000),
     );
-    let response = client
+    let mut request = client
         .get(endpoint)
-        .bearer_auth(&secret.0)
         .header(header::ACCEPT, "application/json")
-        .timeout(request_timeout)
+        .timeout(request_timeout);
+    request = if provider.wire_api == "anthropic_messages" {
+        request
+            .header("x-api-key", &secret.0)
+            .header("anthropic-version", "2023-06-01")
+    } else {
+        request.bearer_auth(&secret.0)
+    };
+    let response = request
         .send()
         .await
         .map_err(|_| "provider model discovery failed")?;
@@ -471,6 +658,155 @@ pub async fn discover_models(
         .await;
     drop(lease);
     parse_discovered_models(&body)
+}
+
+fn profile_revision(model: &ProviderModel) -> Option<String> {
+    if model.instruction_mode == "none"
+        && model.instruction_text.is_empty()
+        && model.request_overrides_json == "{}"
+    {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(model.instruction_mode.as_bytes());
+    hasher.update([0]);
+    hasher.update(model.instruction_text.as_bytes());
+    hasher.update([0]);
+    hasher.update(model.request_overrides_json.as_bytes());
+    Some(hex::encode(&hasher.finalize()[..8]))
+}
+
+fn apply_model_profile(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    model: &ProviderModel,
+) -> Result<Option<String>, (StatusCode, &'static str)> {
+    let revision = profile_revision(model);
+    if revision.is_none() {
+        return Ok(None);
+    }
+
+    if object
+        .get("instructions")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "instructions must be a string for this model profile",
+        ));
+    }
+
+    match model.instruction_mode.as_str() {
+        "none" if model.instruction_text.is_empty() => {}
+        "append" => {
+            let instructions = match object.get("instructions") {
+                Some(serde_json::Value::String(value)) => value.as_str(),
+                None | Some(serde_json::Value::Null) => "",
+                Some(_) => unreachable!("profile instruction shape validated above"),
+            };
+            let transformed = if instructions.is_empty() {
+                model.instruction_text.clone()
+            } else {
+                format!(
+                    "{instructions}{PROFILE_SEPARATOR}{}",
+                    model.instruction_text
+                )
+            };
+            object.insert("instructions".into(), transformed.into());
+        }
+        "replace" => {
+            object.insert("instructions".into(), model.instruction_text.clone().into());
+        }
+        _ => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid provider model profile",
+            ));
+        }
+    }
+
+    let overrides: ProfileRequestOverrides = serde_json::from_str(&model.request_overrides_json)
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid provider model profile",
+            )
+        })?;
+    if let Some(effort) = overrides.reasoning_effort {
+        let reasoning = object
+            .entry("reasoning")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let Some(reasoning) = reasoning.as_object_mut() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "reasoning must be an object for this model profile",
+            ));
+        };
+        reasoning.insert("effort".into(), effort.into());
+    }
+    if let Some(max_output_tokens) = overrides.max_output_tokens {
+        object.insert("max_output_tokens".into(), max_output_tokens.into());
+    }
+    Ok(revision)
+}
+
+fn apply_anthropic_model_profile(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    model: &ProviderModel,
+) -> Result<Option<String>, (StatusCode, &'static str)> {
+    let revision = profile_revision(model);
+    if revision.is_none() {
+        return Ok(None);
+    }
+    if object
+        .get("system")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "system must be a string for this model profile",
+        ));
+    }
+    match model.instruction_mode.as_str() {
+        "none" if model.instruction_text.is_empty() => {}
+        "append" => {
+            let system = object
+                .get("system")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let transformed = if system.is_empty() {
+                model.instruction_text.clone()
+            } else {
+                format!("{system}{PROFILE_SEPARATOR}{}", model.instruction_text)
+            };
+            object.insert("system".into(), transformed.into());
+        }
+        "replace" => {
+            object.insert("system".into(), model.instruction_text.clone().into());
+        }
+        _ => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid provider model profile",
+            ));
+        }
+    }
+    let overrides: ProfileRequestOverrides = serde_json::from_str(&model.request_overrides_json)
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid provider model profile",
+            )
+        })?;
+    if overrides.reasoning_effort.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "reasoning effort is unavailable for Anthropic Messages providers",
+        ));
+    }
+    if let Some(max_output_tokens) = overrides.max_output_tokens {
+        object.insert("max_tokens".into(), max_output_tokens.into());
+    }
+    Ok(revision)
 }
 
 fn copy_response_headers(
@@ -507,6 +843,7 @@ pub async fn execute(
         public_model: model.public_model.clone(),
         upstream_model: model.upstream_model.clone(),
         upstream_transport: "http_sse".into(),
+        profile_revision: profile_revision(&model),
         input_per_million: model.input_per_million,
         cached_input_per_million: model.cached_input_per_million,
         output_per_million: model.output_per_million,
@@ -529,9 +866,17 @@ pub async fn execute(
         "model".into(),
         serde_json::Value::String(model.upstream_model.clone()),
     );
-    if provider.stateless_responses {
+    if provider.wire_api == "responses" && provider.stateless_responses {
         object.remove("previous_response_id");
     }
+    outcome.profile_revision = match if provider.wire_api == "anthropic_messages" {
+        apply_anthropic_model_profile(object, &model)
+    } else {
+        apply_model_profile(object, &model)
+    } {
+        Ok(revision) => revision,
+        Err((status, message)) => return ((status, message).into_response(), outcome),
+    };
     let encoded = match serde_json::to_vec(&body) {
         Ok(encoded) => encoded,
         Err(_) => {
@@ -564,6 +909,9 @@ pub async fn execute(
     let max_attempts = usize::try_from(provider.request_max_retries.saturating_add(1))
         .unwrap_or(1)
         .min(credentials.len().max(1));
+    let idle_timeout = Duration::from_millis(
+        u64::try_from(provider.stream_idle_timeout_ms.max(1_000)).unwrap_or(300_000),
+    );
     let mut last_response: Option<Response> = None;
 
     for _ in 0..max_attempts {
@@ -587,14 +935,27 @@ pub async fn execute(
         outcome.credential_id = Some(credential.id.clone());
         let mut request = client
             .post(endpoint.clone())
-            .bearer_auth(&secret.0)
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "text/event-stream")
             .body(encoded.clone());
-        if let Some(value) = inbound_headers.get("openai-beta") {
-            request = request.header("openai-beta", value);
+        if provider.wire_api == "anthropic_messages" {
+            request = request.header("x-api-key", &secret.0).header(
+                "anthropic-version",
+                inbound_headers
+                    .get("anthropic-version")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("2023-06-01"),
+            );
+            if let Some(value) = inbound_headers.get("anthropic-beta") {
+                request = request.header("anthropic-beta", value);
+            }
+        } else {
+            request = request.bearer_auth(&secret.0);
+            if let Some(value) = inbound_headers.get("openai-beta") {
+                request = request.header("openai-beta", value);
+            }
         }
-        let upstream = match request.send().await {
+        let upstream = match send_with_header_timeout(request, idle_timeout).await {
             Ok(response) => response,
             Err(_) => {
                 let _ = store
@@ -615,8 +976,7 @@ pub async fn execute(
         if !status.is_success() {
             mark_pre_stream_failure(store, &credential.id, status).await;
             let headers = upstream.headers().clone();
-            let mut bytes = upstream.bytes().await.unwrap_or_default().to_vec();
-            bytes.truncate(MAX_ERROR_BODY_BYTES);
+            let bytes = read_bounded_error_body(upstream, MAX_ERROR_BODY_BYTES, idle_timeout).await;
             let mut builder = Response::builder().status(status);
             copy_response_headers(&headers, &mut builder);
             last_response = Some(
@@ -638,9 +998,6 @@ pub async fn execute(
         let headers = upstream.headers().clone();
         let mut builder = Response::builder().status(status);
         copy_response_headers(&headers, &mut builder);
-        let idle_timeout = Duration::from_millis(
-            u64::try_from(provider.stream_idle_timeout_ms.max(1_000)).unwrap_or(300_000),
-        );
         let credential_id = credential.id.clone();
         let store = store.clone();
         let stream = async_stream::stream! {
@@ -704,6 +1061,260 @@ pub async fn execute(
 mod tests {
     use super::*;
 
+    fn anthropic_provider() -> CustomProvider {
+        CustomProvider {
+            id: "anthropic-compatible".into(),
+            slug: "anthropic-compatible".into(),
+            display_name: "Anthropic compatible".into(),
+            base_url: "https://example.com/v1".into(),
+            wire_api: "anthropic_messages".into(),
+            enabled: true,
+            stateless_responses: false,
+            allow_private_hosts: false,
+            connect_timeout_ms: 1_000,
+            stream_idle_timeout_ms: 1_000,
+            request_max_retries: 0,
+            max_concurrency: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn anthropic_provider_uses_messages_endpoint_and_protocol_profile_fields() {
+        let provider = anthropic_provider();
+        assert_eq!(
+            validate_endpoint(&provider).unwrap().as_str(),
+            "https://example.com/v1/messages"
+        );
+        let model = ProviderModel {
+            id: "m".into(),
+            provider_id: provider.id,
+            public_model: "claude-profile".into(),
+            upstream_model: "claude-upstream".into(),
+            display_name: "Claude".into(),
+            context_window: None,
+            max_output_tokens: None,
+            supports_tools: true,
+            supports_vision: true,
+            supports_parallel_tool_calls: true,
+            supports_web_search: false,
+            supports_reasoning_summaries: false,
+            reasoning_levels_json: "[]".into(),
+            model_info_json: None,
+            instruction_mode: "append".into(),
+            instruction_text: "Provider guidance".into(),
+            request_overrides_json: r#"{"max_output_tokens":123}"#.into(),
+            input_per_million: None,
+            cached_input_per_million: None,
+            output_per_million: None,
+            visible_in_codex: true,
+            visible_in_openai: true,
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let mut body = serde_json::json!({"system":"Client guidance"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(apply_anthropic_model_profile(&mut body, &model)
+            .unwrap()
+            .is_some());
+        assert!(body["system"]
+            .as_str()
+            .unwrap()
+            .contains("Provider guidance"));
+        assert_eq!(body["max_tokens"], 123);
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn error_body_reader_stops_at_limit_without_waiting_for_eof() {
+        async fn hanging_error() -> Response {
+            let stream = async_stream::stream! {
+                yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(vec![
+                    b'x';
+                    MAX_ERROR_BODY_BYTES + 1
+                ]));
+                std::future::pending::<()>().await;
+            };
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+
+        let app = axum::Router::new().route("/error", axum::routing::get(hanging_error));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}/error"))
+            .await
+            .unwrap();
+
+        let body = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_bounded_error_body(response, MAX_ERROR_BODY_BYTES, Duration::from_millis(100)),
+        )
+        .await
+        .expect("the bounded reader must not wait for the upstream body to finish");
+        assert_eq!(body.len(), MAX_ERROR_BODY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn error_body_reader_honors_idle_timeout_before_first_byte() {
+        async fn silent_error() -> Response {
+            let stream = async_stream::stream! {
+                std::future::pending::<()>().await;
+                #[allow(unreachable_code)]
+                yield Ok::<Bytes, std::convert::Infallible>(Bytes::new());
+            };
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+
+        let app = axum::Router::new().route("/error", axum::routing::get(silent_error));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}/error"))
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let body =
+            read_bounded_error_body(response, MAX_ERROR_BODY_BYTES, Duration::from_millis(50))
+                .await;
+        assert!(body.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the configured idle timeout must bound a silent error body"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_send_is_bounded_while_waiting_for_response_headers() {
+        async fn silent_headers() -> Response {
+            std::future::pending::<Response>().await
+        }
+
+        let app = axum::Router::new().route("/responses", axum::routing::post(silent_headers));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let request = reqwest::Client::new().post(format!("http://{address}/responses"));
+
+        let started = std::time::Instant::now();
+        let result = send_with_header_timeout(request, Duration::from_millis(50)).await;
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the provider stream-idle budget must also bound response headers"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_http_client_cache_replaces_stale_generations_and_can_be_evicted() {
+        let mut provider = CustomProvider {
+            id: "cache-replacement-test".into(),
+            slug: "cache-test".into(),
+            display_name: "Cache test".into(),
+            base_url: "http://127.0.0.1:9999/v1".into(),
+            wire_api: "responses".into(),
+            enabled: true,
+            stateless_responses: true,
+            allow_private_hosts: true,
+            connect_timeout_ms: 1000,
+            stream_idle_timeout_ms: 1000,
+            request_max_retries: 0,
+            max_concurrency: None,
+            created_at: 0,
+            updated_at: 1,
+        };
+        let endpoint = validate_endpoint(&provider).unwrap();
+        evict_provider_client(&provider.id);
+        http_client(&provider, &endpoint).await.unwrap();
+        provider.updated_at = 2;
+        http_client(&provider, &endpoint).await.unwrap();
+
+        let generations: Vec<_> = HTTP_CLIENTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .keys()
+            .filter(|(provider_id, _)| provider_id == &provider.id)
+            .cloned()
+            .collect();
+        assert_eq!(generations, vec![(provider.id.clone(), 2)]);
+
+        evict_provider_client(&provider.id);
+        assert!(HTTP_CLIENTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .keys()
+            .all(|(provider_id, _)| provider_id != &provider.id));
+    }
+
+    #[tokio::test]
+    async fn provider_http_client_cache_expires_so_dns_can_rotate() {
+        let provider = CustomProvider {
+            id: "cache-expiry-test".into(),
+            slug: "cache-expiry".into(),
+            display_name: "Cache expiry".into(),
+            base_url: "http://127.0.0.1:9999/v1".into(),
+            wire_api: "responses".into(),
+            enabled: true,
+            stateless_responses: true,
+            allow_private_hosts: true,
+            connect_timeout_ms: 1000,
+            stream_idle_timeout_ms: 1000,
+            request_max_retries: 0,
+            max_concurrency: None,
+            created_at: 0,
+            updated_at: 1,
+        };
+        let endpoint = validate_endpoint(&provider).unwrap();
+        let first_now = Instant::now();
+        evict_provider_client(&provider.id);
+        http_client_at(&provider, &endpoint, first_now)
+            .await
+            .unwrap();
+        let first_expiry = HTTP_CLIENTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&(provider.id.clone(), provider.updated_at))
+            .unwrap()
+            .expires_at;
+
+        http_client_at(
+            &provider,
+            &endpoint,
+            first_now + HTTP_CLIENT_DNS_TTL + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let refreshed_expiry = HTTP_CLIENTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&(provider.id.clone(), provider.updated_at))
+            .unwrap()
+            .expires_at;
+        assert!(
+            refreshed_expiry > first_expiry,
+            "an expired pinned client must be rebuilt so its hostname is resolved again"
+        );
+        evict_provider_client(&provider.id);
+    }
+
     #[test]
     fn endpoint_validation_rejects_private_hosts_by_default() {
         let provider = CustomProvider {
@@ -727,6 +1338,40 @@ mod tests {
         let mut mapped_loopback = provider;
         mapped_loopback.base_url = "https://[::ffff:127.0.0.1]/v1".into();
         assert!(validate_endpoint(&mapped_loopback).is_err());
+    }
+
+    #[test]
+    fn endpoint_validation_rejects_non_global_special_use_hosts() {
+        let mut provider = CustomProvider {
+            id: "p".into(),
+            slug: "special".into(),
+            display_name: "Special-use target".into(),
+            base_url: String::new(),
+            wire_api: "responses".into(),
+            enabled: true,
+            stateless_responses: true,
+            allow_private_hosts: false,
+            connect_timeout_ms: 1000,
+            stream_idle_timeout_ms: 1000,
+            request_max_retries: 0,
+            max_concurrency: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        for base_url in [
+            "https://100.64.0.1/v1",
+            "https://198.18.0.1/v1",
+            "https://224.0.0.1/v1",
+            "https://[ff02::1]/v1",
+            "https://[2001:db8::1]/v1",
+        ] {
+            provider.base_url = base_url.into();
+            assert!(
+                validate_endpoint(&provider).is_err(),
+                "{base_url} must not pass the public-provider SSRF boundary"
+            );
+        }
     }
 
     #[test]
