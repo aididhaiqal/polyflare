@@ -510,6 +510,13 @@ where
 /// natively. Nothing is lost because nothing was in flight.
 ///
 /// `drain_timeout` is now a pathological-case ceiling, not the expected path.
+///
+/// **The server future resolving is NOT the end of the drain** (2026-07-25 live finding): an
+/// UPGRADED WebSocket runs in its own task that `axum::serve`'s graceful shutdown does not track,
+/// so the serve future completes as soon as the accept loop and plain-HTTP connections are done —
+/// while relay turns are still streaming. Returning there killed a live turn 2 seconds into the
+/// drain. Both conditions must hold before this returns: the serve future resolved AND the
+/// in-flight turn count reached zero (or the ceiling fired).
 async fn serve_with_bounded_shutdown<F, C>(
     listener: tokio::net::TcpListener,
     app: axum::Router,
@@ -531,13 +538,21 @@ where
         .into_future();
     tokio::pin!(server);
 
+    // The ceiling is measured from the shutdown SIGNAL, shared so whichever path observes it first
+    // (the serve future resolving, or the poll loop) bounds itself against the same instant.
+    let drain_started_at: Arc<std::sync::OnceLock<tokio::time::Instant>> =
+        Arc::new(std::sync::OnceLock::new());
+    let signal_seen = drain_started_at.clone();
+    let in_flight = Arc::new(in_flight);
+    let poll_in_flight = in_flight.clone();
+
     let drain_deadline = async move {
         if drain_started_rx.await.is_err() {
             std::future::pending::<()>().await;
         }
-        let started = tokio::time::Instant::now();
+        let started = *signal_seen.get_or_init(tokio::time::Instant::now);
         loop {
-            if in_flight() == 0 {
+            if poll_in_flight() == 0 {
                 return DrainOutcome::Drained;
             }
             if started.elapsed() >= drain_timeout {
@@ -550,8 +565,20 @@ where
 
     tokio::select! {
         result = &mut server => {
+            // Accept loop + tracked HTTP connections are done, but UPGRADED WebSockets are not
+            // tracked by axum's graceful shutdown, so relay turns may still be streaming. Keep the
+            // process alive until they finish (bounded by the same ceiling) instead of killing them.
             result?;
-            Ok(DrainOutcome::Drained)
+            let started = *drain_started_at.get_or_init(tokio::time::Instant::now);
+            loop {
+                if in_flight() == 0 {
+                    return Ok(DrainOutcome::Drained);
+                }
+                if started.elapsed() >= drain_timeout {
+                    return Ok(DrainOutcome::TimedOut);
+                }
+                tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+            }
         }
         outcome = &mut drain_deadline => Ok(outcome),
     }
@@ -840,6 +867,44 @@ mod tests {
             "a non-reuseport bind must still fail on the same address — otherwise this test would \
              pass even if SO_REUSEPORT were never set"
         );
+    }
+
+    /// REGRESSION (2026-07-25 live): an upgraded WebSocket is invisible to axum's graceful
+    /// shutdown, so the serve future resolves while relay turns are still streaming. An earlier
+    /// revision returned `Drained` right there and killed a live turn 2 seconds into the drain —
+    /// exactly the message-loss mechanism this feature exists to remove. NO connections here, so
+    /// the serve future resolves immediately: the drain must STILL wait for the turn count.
+    #[tokio::test]
+    async fn a_resolved_serve_future_does_not_end_a_drain_with_turns_still_in_flight() {
+        let listener = bind_handover_listener("127.0.0.1:0").expect("handover bind");
+        let in_flight = Arc::new(AtomicU64::new(1));
+        let counter = in_flight.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_with_bounded_shutdown(
+            listener,
+            axum::Router::new(),
+            async move {
+                let _ = rx.await;
+            },
+            Duration::from_secs(300),
+            move || counter.load(Ordering::Relaxed),
+        ));
+
+        tx.send(()).expect("signal shutdown");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !server.is_finished(),
+            "the serve future resolving must NOT end the drain while a turn is in flight — an \
+             upgraded WS relay turn is exactly this case and killing it loses the user's message"
+        );
+
+        in_flight.store(0, Ordering::Relaxed);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("drain must end once turns are idle")
+            .expect("join")
+            .expect("io");
+        assert_eq!(outcome, DrainOutcome::Drained);
     }
 
     /// The new capability: the drain ends the moment in-flight TURNS reach zero, even though a
