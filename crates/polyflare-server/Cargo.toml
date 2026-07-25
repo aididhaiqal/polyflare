@@ -18,6 +18,9 @@ polyflare-codex = { path = "../polyflare-codex" }
 polyflare-anthropic = { path = "../polyflare-anthropic" }
 polyflare-store = { path = "../polyflare-store" }
 axum = { workspace = true }
+# SO_REUSEPORT on the serving socket (zero-downtime handover deploys; see main.rs
+# `bind_handover_listener`). Raw setsockopt only — no socket2 layer needed for one option.
+libc = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

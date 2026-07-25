@@ -340,15 +340,23 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = build_app_for_bind(state.clone(), &config.bind_addr);
 
-    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
+    // Handover-capable bind: `SO_REUSEPORT` lets a replacement process bind and accept while this
+    // one is still draining its last turns, so a deploy never refuses a connection and never races
+    // the dying process for the port.
+    let listener = bind_handover_listener(&config.bind_addr)?;
     println!("polyflare listening on {}", config.bind_addr);
+    let drain_timeout = config::shutdown_drain_timeout_from_env();
+    let lease_metrics = state.lease_metrics.clone();
     let drain_outcome =
-        serve_with_bounded_shutdown(listener, app, shutdown_signal(), SHUTDOWN_DRAIN_TIMEOUT)
-            .await?;
+        serve_with_bounded_shutdown(listener, app, shutdown_signal(), drain_timeout, move || {
+            lease_metrics.current()
+        })
+        .await?;
     if drain_outcome == DrainOutcome::TimedOut {
         tracing::warn!(
-            timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
-            "shutdown drain timed out; closing remaining connections"
+            timeout_secs = drain_timeout.as_secs(),
+            in_flight = state.lease_metrics.current(),
+            "shutdown drain ceiling reached with turns still in flight; closing them"
         );
     }
     polyflare_server::usage_refresh::flush_cooldown_persistence(&state).await?;
@@ -357,8 +365,107 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const MODEL_CATALOG_STARTUP_WARM_BUDGET: Duration = Duration::from_secs(2);
+
+/// How often the drain re-reads the in-flight turn count. Short enough that a finished turn
+/// releases the process promptly, long enough to be free next to a turn's own latency.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Bind the serving socket with `SO_REUSEPORT` (+ `SO_REUSEADDR`) so a replacement process can bind
+/// the same address while this one drains — the handover property this whole path exists for.
+///
+/// Hand-rolled over `libc` (already a workspace dependency) rather than adding `socket2`: the
+/// sequence is create -> setsockopt -> bind -> listen -> hand the fd to std, then to Tokio. Every
+/// failure is surfaced as the same `io::Error` a plain `TcpListener::bind` would have produced —
+/// never a silent fallback to a non-reuseport socket, which would reintroduce the `AddrInUse`
+/// deploy race this replaces.
+fn bind_handover_listener(bind_addr: &str) -> io::Result<tokio::net::TcpListener> {
+    use std::net::{SocketAddr, TcpListener as StdTcpListener};
+    use std::os::fd::FromRawFd;
+
+    let addr: SocketAddr = bind_addr
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid bind address"))?;
+    let domain = if addr.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+
+    // SAFETY: raw socket syscalls; the fd is adopted by `StdTcpListener` below (or closed on the
+    // error paths) so ownership is never ambiguous and never leaked.
+    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let listener = unsafe {
+        // Adopt the fd immediately: from here on every early return closes it via `Drop`.
+        let adopted = StdTcpListener::from_raw_fd(fd);
+        for option in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
+            let enable: libc::c_int = 1;
+            let rc = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                &enable as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let (storage, len) = socket_addr_to_raw(addr);
+        let rc = libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len);
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // 1024: the same order of magnitude as Tokio's own default backlog; a deploy's reconnect
+        // burst must never be refused for want of queue.
+        if libc::listen(fd, 1024) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        adopted
+    };
+    listener.set_nonblocking(true)?;
+    tokio::net::TcpListener::from_std(listener)
+}
+
+/// A `SocketAddr` as the raw `sockaddr_storage` + length pair `libc::bind` wants.
+fn socket_addr_to_raw(addr: std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    use std::net::SocketAddr;
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match addr {
+        SocketAddr::V4(v4) => {
+            let raw = storage_as_mut::<libc::sockaddr_in>(&mut storage);
+            raw.sin_family = libc::AF_INET as libc::sa_family_t;
+            raw.sin_port = v4.port().to_be();
+            raw.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+        SocketAddr::V6(v6) => {
+            let raw = storage_as_mut::<libc::sockaddr_in6>(&mut storage);
+            raw.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            raw.sin6_port = v6.port().to_be();
+            raw.sin6_addr.s6_addr = v6.ip().octets();
+            raw.sin6_flowinfo = v6.flowinfo();
+            raw.sin6_scope_id = v6.scope_id();
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    }
+}
+
+/// Reinterpret the zeroed `sockaddr_storage` as the concrete family struct being filled in.
+fn storage_as_mut<T>(storage: &mut libc::sockaddr_storage) -> &mut T {
+    // SAFETY: `sockaddr_storage` is defined to be large enough and aligned for every `sockaddr_*`
+    // family struct; the storage was zeroed by the caller.
+    unsafe { &mut *(storage as *mut libc::sockaddr_storage as *mut T) }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DrainOutcome {
@@ -390,16 +497,29 @@ where
     }
 }
 
-/// Stop accepting new connections when `shutdown` resolves, but never let long-lived streams keep
-/// the process alive forever. The timeout starts at the shutdown signal—not at server startup.
-async fn serve_with_bounded_shutdown<F>(
+/// Stop accepting new connections when `shutdown` resolves, then leave the process alive exactly as
+/// long as work is still streaming — no longer.
+///
+/// `in_flight` reports the process-wide in-flight **turn** count (`LeaseMetrics::current`). Waiting
+/// on that, rather than on handlers ending, is the whole trick: a relay WS connection stays open
+/// BETWEEN turns (idle budget up to 25 min), so waiting for handlers would wait effectively
+/// forever and the old fixed 10s ceiling instead force-closed live turns — the 2026-07-25
+/// message-loss mechanism. Once zero turns are in flight, closing the remaining idle sockets is the
+/// existing honest-close contract: the client sees its socket die between turns, reconnects (onto
+/// the replacement process, which is already accepting thanks to `SO_REUSEPORT`), and full-resends
+/// natively. Nothing is lost because nothing was in flight.
+///
+/// `drain_timeout` is now a pathological-case ceiling, not the expected path.
+async fn serve_with_bounded_shutdown<F, C>(
     listener: tokio::net::TcpListener,
     app: axum::Router,
     shutdown: F,
     drain_timeout: Duration,
+    in_flight: C,
 ) -> io::Result<DrainOutcome>
 where
     F: Future<Output = ()> + Send + 'static,
+    C: Fn() -> u64 + Send + 'static,
 {
     let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
     let graceful_shutdown = async move {
@@ -412,10 +532,18 @@ where
     tokio::pin!(server);
 
     let drain_deadline = async move {
-        if drain_started_rx.await.is_ok() {
-            tokio::time::sleep(drain_timeout).await;
-        } else {
+        if drain_started_rx.await.is_err() {
             std::future::pending::<()>().await;
+        }
+        let started = tokio::time::Instant::now();
+        loop {
+            if in_flight() == 0 {
+                return DrainOutcome::Drained;
+            }
+            if started.elapsed() >= drain_timeout {
+                return DrainOutcome::TimedOut;
+            }
+            tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
         }
     };
     tokio::pin!(drain_deadline);
@@ -425,7 +553,7 @@ where
             result?;
             Ok(DrainOutcome::Drained)
         }
-        _ = &mut drain_deadline => Ok(DrainOutcome::TimedOut),
+        outcome = &mut drain_deadline => Ok(outcome),
     }
 }
 
@@ -686,6 +814,106 @@ async fn keys_revoke(id: &str) -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The handover property: a SECOND process must be able to bind the address this one is serving,
+    /// so a replacement can accept while the old instance drains. The plain-bind assertion in the
+    /// same test proves `SO_REUSEPORT` is what makes it work (without it, the second bind is
+    /// `AddrInUse` — the crash-loop that hit two deploys on 2026-07-25).
+    #[tokio::test]
+    async fn two_handover_listeners_share_one_address() {
+        // Ephemeral port: bind :0 once, learn the port, then contend for it deliberately.
+        let first = bind_handover_listener("127.0.0.1:0").expect("first handover bind");
+        let addr = first.local_addr().expect("local addr").to_string();
+
+        let second = bind_handover_listener(&addr);
+        assert!(
+            second.is_ok(),
+            "a replacement process must be able to bind the serving address while the old one \
+             still holds it, got: {:?}",
+            second.err()
+        );
+
+        let plain = std::net::TcpListener::bind(&addr);
+        assert!(
+            plain.is_err(),
+            "a non-reuseport bind must still fail on the same address — otherwise this test would \
+             pass even if SO_REUSEPORT were never set"
+        );
+    }
+
+    /// The new capability: the drain ends the moment in-flight TURNS reach zero, even though a
+    /// connection is still open. A relay WS socket stays open between turns, so "wait for handlers
+    /// to end" would wait effectively forever and the old fixed 10s ceiling instead force-closed
+    /// live turns — the 2026-07-25 message-loss mechanism. A hanging handler here stands in for
+    /// that still-open socket: axum's graceful shutdown cannot resolve, so ONLY the idle check can
+    /// end this drain.
+    #[tokio::test]
+    async fn drain_ends_when_turns_go_idle_even_with_a_connection_still_open() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let handler_entered = entered.clone();
+        let app = axum::Router::new().route(
+            "/hold",
+            axum::routing::get(move || {
+                let handler_entered = handler_entered.clone();
+                async move {
+                    handler_entered.notify_one();
+                    std::future::pending::<&'static str>().await
+                }
+            }),
+        );
+        let listener = bind_handover_listener("127.0.0.1:0").expect("handover bind");
+        let addr = listener.local_addr().unwrap();
+        let in_flight = Arc::new(AtomicU64::new(1));
+        let counter = in_flight.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_with_bounded_shutdown(
+            listener,
+            app,
+            async move {
+                let _ = rx.await;
+            },
+            // A ceiling far beyond this test's runtime, so a pass can only come from the idle check.
+            Duration::from_secs(300),
+            move || counter.load(Ordering::Relaxed),
+        ));
+
+        let request = tokio::spawn(reqwest::get(format!("http://{addr}/hold")));
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("the held request must enter its handler");
+        tx.send(()).expect("signal shutdown");
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !server.is_finished(),
+            "a turn is still in flight — the drain must keep serving it rather than force-close"
+        );
+
+        in_flight.store(0, Ordering::Relaxed);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the drain must end promptly once turns are idle, not sit out the 300s ceiling")
+            .expect("join")
+            .expect("io");
+        assert_eq!(outcome, DrainOutcome::Drained);
+        request.abort();
+    }
+
+    #[test]
+    fn drain_timeout_clamps_and_defaults() {
+        assert_eq!(
+            config::clamp_shutdown_drain_timeout_secs(0),
+            0,
+            "no-drain lever"
+        );
+        assert_eq!(config::clamp_shutdown_drain_timeout_secs(300), 300);
+        assert_eq!(
+            config::clamp_shutdown_drain_timeout_secs(99_999),
+            3600,
+            "an hour-long shutdown is a bug, not a configuration"
+        );
+    }
 
     #[tokio::test]
     async fn startup_budget_detaches_slow_work_without_cancelling_it() {
@@ -730,6 +958,9 @@ mod tests {
                 let _ = shutdown_rx.await;
             },
             Duration::from_millis(50),
+            // A hanging HTTP handler holds no turn lease, so the ceiling — not the idle check — is
+            // what must bound this shutdown.
+            || 1,
         ));
 
         let request = tokio::spawn(reqwest::get(format!("http://{addr}/hold")));
