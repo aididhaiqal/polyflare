@@ -564,6 +564,11 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
     // reasoning item, so gating the transform on `client_visible_upstream_for_turn` made it never
     // fire (first live test: 3 upstream 400s then budget kill, zero transform replays).
     let mut upstream_output_visible_for_turn = false;
+    // Content-free diagnostic: the `type` of the first forwarded frame that counted as output this
+    // turn. Frame TYPE names only — a small fixed vocabulary, never payload — so it is safe to log.
+    // Exists because three rounds of poisoned-history fixes each passed their fixtures and each
+    // failed live, blind, purely because nothing recorded which frame closed the recovery window.
+    let mut output_visible_by: Option<String> = None;
     let mut client_visible_upstream_for_turn = false;
     // If the socket/pump disappears with a turn still active, preserve an explicit failed row
     // rather than silently losing the request. Client-side teardown defaults to nginx-style 499;
@@ -621,6 +626,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                             reasoning_transform_attempted = false;
                             client_visible_upstream_for_turn = false;
                             upstream_output_visible_for_turn = false;
+                            output_visible_by = None;
                         }
                         let redialed = send_client_text(
                             &mut upstream,
@@ -845,6 +851,25 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                 // by where the poison actually lives — see the anchored branch
                                 // below, then the rewrite. Any failure falls through to the
                                 // generic forward-and-bench path with the original error frame.
+                                // Content-free: an error code, three booleans, and a frame TYPE
+                                // name. Emitted whenever the upstream proves the history is
+                                // poisoned, so a declined recovery states its reason instead of
+                                // being silently invisible — the failure mode that cost three
+                                // blind fix rounds on 2026-07-25.
+                                if sig.error_code.as_deref() == Some(INVALID_ENCRYPTED_CONTENT_CODE)
+                                {
+                                    tracing::warn!(
+                                        target: "polyflare_server::relay",
+                                        transform_already_attempted = reasoning_transform_attempted,
+                                        output_visible = upstream_output_visible_for_turn,
+                                        output_visible_by = output_visible_by.as_deref().unwrap_or("-"),
+                                        in_flight_present = in_flight.is_some(),
+                                        in_flight_anchored = in_flight
+                                            .as_deref()
+                                            .is_some_and(is_anchored_generating_frame),
+                                        "poisoned-history recovery evaluated"
+                                    );
+                                }
                                 if sig.error_code.as_deref()
                                     == Some(INVALID_ENCRYPTED_CONTENT_CODE)
                                     && !reasoning_transform_attempted
@@ -1154,6 +1179,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                 }
                                 client_visible_upstream_for_turn = true;
                                 if !is_lifecycle_frame(&text) {
+                                    if !upstream_output_visible_for_turn {
+                                        output_visible_by = Some(frame_type_name(&text));
+                                    }
                                     upstream_output_visible_for_turn = true;
                                 }
                                 let mut terminal_seen = false;
@@ -1331,6 +1359,23 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
 /// output (`classify_frame`'s scan treats exactly these two as non-decisive for the same reason).
 /// Reads ONLY the `type` field; malformed JSON is conservatively NOT lifecycle (treated as
 /// output, disabling any replay).
+/// The `type` of a WS frame, for content-free diagnostics.
+///
+/// Returns ONLY the discriminator field — never a message, id, or payload — so the result is safe
+/// to log. Unparseable or type-less frames report a fixed placeholder rather than any of their
+/// bytes.
+fn frame_type_name(frame: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(frame)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "<untyped>".to_string())
+}
+
 fn is_lifecycle_frame(frame: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(frame) else {
         return false;
