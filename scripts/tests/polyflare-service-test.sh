@@ -155,3 +155,49 @@ if git -C "$(cd -- "$SCRIPT_DIR/../.." && pwd)" rev-parse --absolute-git-dir >/d
 fi
 
 printf 'polyflare-service migration/worktree guards OK\n'
+
+# --- The computed data dir must reach the SERVER, not just this script's bookkeeping. -------------
+ISO_DIR="$TEST_DIR/isolation"
+mkdir -p "$ISO_DIR"
+cat >"$FAKE_BUILD_BINARY" <<'PY'
+#!/usr/bin/env python3
+import http.server, os, signal, sys
+# Record the data dir the SERVER actually sees; a shell-only variable would leave this unset.
+with open(os.path.join(os.environ.get("POLYFLARE_DATA_DIR", "/tmp"), "seen-data-dir"), "w") as fh:
+    fh.write(os.environ.get("POLYFLARE_DATA_DIR", "<unset>"))
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+port = int(os.environ["POLYFLARE_SERVICE_PORT"])
+server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+signal.signal(signal.SIGTERM, lambda _s, _f: sys.exit(0))
+server.serve_forever()
+PY
+chmod +x "$FAKE_BUILD_BINARY"
+
+# Deliberately does NOT set POLYFLARE_DATA_DIR: the value the script COMPUTES is the one that has
+# to reach the server. Passing it in the caller's environment would prove nothing, since the binary
+# would inherit it whether or not this script exports anything.
+# The origin suffix contains nested parentheses, so strip from the FIRST " (" rather than matching
+# a trailing "(...)" group.
+computed_line="$({ "$SERVICE_SCRIPT" status 2>&1 || true; } | sed -n '1p')"
+computed_line="${computed_line#Data directory: }"
+computed_dir="${computed_line%% (*}"
+[[ -n "$computed_dir" ]] ||
+  { printf 'could not read the computed data directory from status\n' >&2; exit 1; }
+mkdir -p "$computed_dir"
+rm -f "$computed_dir/seen-data-dir"
+env -u POLYFLARE_DATA_DIR "$SERVICE_SCRIPT" start >/dev/null
+env -u POLYFLARE_DATA_DIR "$SERVICE_SCRIPT" stop >/dev/null 2>&1 || true
+[[ -f "$computed_dir/seen-data-dir" ]] ||
+  { printf 'the server never received the computed POLYFLARE_DATA_DIR (%s): isolation would be cosmetic — the script would move only its own pid/log/backup paths while the server opened ~/.polyflare\n' "$computed_dir" >&2; exit 1; }
+seen="$(cat "$computed_dir/seen-data-dir")"
+[[ "$seen" == "$computed_dir" ]] ||
+  { printf 'server saw data dir %s, expected %s\n' "$seen" "$computed_dir" >&2; exit 1; }
+rm -f "$computed_dir/seen-data-dir"
+
+printf 'polyflare-service data-dir isolation reaches the server OK\n'

@@ -19,6 +19,11 @@ The procedure, in order — no step is optional:
 2. **Full suite green from a clean tree:** `cargo test --workspace`. If the working tree has
    unrelated WIP that breaks the build, deploy from a worktree at the commit instead:
    `git worktree add <tmpdir> <commit>` with a shared `CARGO_TARGET_DIR`.
+   Note `scripts/polyflare-service` refuses a launchd restart from a linked worktree, because
+   launchd re-execs from its plist and would bring the service back on the live store while the
+   worktree carries unmerged code. When a worktree deploy is genuinely what you want, say so:
+   `POLYFLARE_ALLOW_WORKTREE_LIVE_DEPLOY=1`. Outside launchd, a worktree gets its own scratch
+   store and never touches `~/.polyflare`.
 3. **Keep a rollback binary:** `cp ~/.local/bin/polyflare ~/.local/bin/polyflare.bak-<short-sha>`.
 4. **Restart only when idle.** Wait for zero in-flight work before kickstarting — poll
    `curl -s localhost:8080/metrics | grep polyflare_lease_inflight` for `0` **and** no
@@ -36,7 +41,12 @@ crash-loops.
   the binary that applies it ever runs. If you polish the SQL afterwards, you have corrupted the
   live DB's reproducibility and someone has to recover the applied bytes by hand.
 - **Never reuse a migration number** that another in-flight branch or an untracked draft already
-  claims — duplicate versions fail the build and mismatch the ledger.
+  claims — duplicate versions fail the build and mismatch the ledger. Use
+  `scripts/new-migration <name>`, which stamps a UTC timestamp version instead of the next integer,
+  so two branches cannot collide. See `crates/polyflare-store/migrations/README.md`.
+- **Nothing unfinished goes in `migrations/`.** `sqlx::migrate!` embeds every `.sql` there and
+  applies it on the next boot; there is no staging area. `scripts/polyflare-service` lists what is
+  pending and snapshots the DB before starting, and refuses to start if that snapshot fails.
 - Migrations must be **additive** (`ADD COLUMN` with defaults, new tables, rename-to-legacy).
   A migration that renames or drops a column used by committed code breaks the service the moment
   it ships without its matching code.

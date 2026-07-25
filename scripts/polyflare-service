@@ -58,6 +58,24 @@ announce_target() {
   printf 'Data directory: %s (%s)\n' "$DATA_DIR" "$DATA_DIR_ORIGIN"
 }
 
+# A launchd-managed restart re-execs from the plist, whose environment this script cannot influence,
+# so the service comes back on the LIVE store no matter what DATA_DIR says. Deploying from a
+# worktree that way is a live deploy of an unmerged tree: sometimes the right call (AGENTS.md step
+# 2, when the primary checkout will not build), never something to do by accident.
+guard_worktree_live_deploy() {
+  [[ "$DATA_DIR_ORIGIN" == "linked worktree"* ]] || return 0
+  launchd_is_loaded || return 0
+  if [[ "${POLYFLARE_ALLOW_WORKTREE_LIVE_DEPLOY:-0}" == "1" ]]; then
+    printf 'Deploying an unmerged worktree to the LIVE launchd service (explicitly allowed).\n'
+    printf 'The service will use %s, NOT %s.\n\n' "$HOME/.polyflare" "$DATA_DIR"
+    return 0
+  fi
+  die "refusing to restart the live launchd service from a linked worktree.
+  launchd re-execs from its plist, so the service would come back on $HOME/.polyflare — the live
+  store — while this worktree carries unmerged code. Deploy from the primary checkout, or set
+  POLYFLARE_ALLOW_WORKTREE_LIVE_DEPLOY=1 to do it deliberately."
+}
+
 [[ "$SERVICE_PORT" =~ ^[0-9]+$ ]] &&
   (( SERVICE_PORT >= 1 && SERVICE_PORT <= 65535 )) ||
   die "service port must be an integer from 1 to 65535"
@@ -208,7 +226,10 @@ restart_launchd_service() {
   while (( waited < START_TIMEOUT_SECS )); do
     pid="$(launchd_pid)"
     if [[ "$pid" =~ ^[0-9]+$ ]] && pid_is_running "$pid" && health_is_ready; then
-      mkdir -p "$STATE_DIR"
+      # The server opens $DATA_DIR/store.db, so the directory must exist regardless of where STATE_DIR
+  # points; they are only nested by default.
+  mkdir -p "$DATA_DIR"
+  mkdir -p "$STATE_DIR"
       printf '%s\n' "$pid" >"$PID_FILE"
       printf 'PolyFlare is ready (PID %s): %s/dashboard\n' "$pid" "$SERVICE_URL"
       printf 'Managed by launchd: %s\n' "$LAUNCHD_LABEL"
@@ -286,7 +307,10 @@ start_service() {
   chmod 700 "$STATE_DIR" 2>/dev/null || true
   touch "$LOG_FILE"
   printf 'Starting PolyFlare at %s...\n' "$SERVICE_URL"
-  nohup "$BINARY" serve >>"$LOG_FILE" 2>&1 </dev/null &
+  # The server resolves its own store from POLYFLARE_DATA_DIR (config::data_dir_from_env), so this
+  # MUST be exported: computing DATA_DIR in the shell alone moves only this script's pid/log/backup
+  # paths and leaves the server opening ~/.polyflare — isolation that reads as real and is not.
+  POLYFLARE_DATA_DIR="$DATA_DIR" nohup "$BINARY" serve >>"$LOG_FILE" 2>&1 </dev/null &
   local pid=$!
   printf '%s\n' "$pid" >"$PID_FILE"
 
@@ -333,6 +357,7 @@ case "${1:-restart}" in
     ;;
   start)
     announce_target
+    guard_worktree_live_deploy
     build_release
     guard_migrations
     start_service
@@ -342,6 +367,7 @@ case "${1:-restart}" in
     ;;
   restart)
     announce_target
+    guard_worktree_live_deploy
     build_release
     # Runs before EITHER restart path: a launchd kickstart re-execs the binary without going through
     # start_service, so the guard cannot live in there alone.
