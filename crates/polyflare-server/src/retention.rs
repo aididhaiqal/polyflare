@@ -187,6 +187,8 @@ mod tests {
             reset_at: None,
             blocked_at: None,
             security_work_authorized: false,
+            usage_cap_percent: None,
+            usage_cap_override: false,
             provider: "codex".to_string(),
             pool: None,
         }
@@ -320,6 +322,7 @@ mod tests {
             cost_usd: None,
             latency_first_token_ms: None,
             protocol_outcome: None,
+            error_code: None,
         }
     }
 

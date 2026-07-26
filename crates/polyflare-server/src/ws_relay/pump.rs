@@ -522,6 +522,18 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
     let idle_policy = state.ws_relay_idle;
     let mut upstream: Option<WsConn> = Some(upstream_conn);
     let mut reconnects_since_progress: u32 = 0;
+    // PROACTIVE AGE ROTATION (2026-07-26). The backend retires a socket at ~60 minutes with
+    // `websocket_connection_limit_reached`. The pump intercepts that cap and re-dials, but a cap
+    // that lands MID-TURN after output has already been forwarded cannot be replayed, so it reaches
+    // the client as a 409 (first one captured live 2026-07-26 10:35, once terminal error codes were
+    // recorded). Retiring the socket OURSELVES while it is idle removes that exposure: the anchor
+    // dies either way — the only choice is whether it dies at a moment of our choosing (between
+    // turns, where the existing honest-close makes codex reconnect and full-resend silently) or at
+    // the server's, potentially mid-stream. `None` disables rotation entirely.
+    let rotate_after = state.ws_relay_idle.max_socket_age;
+    // When the CURRENT upstream socket was established, for proactive age rotation below. Reset on
+    // every (re)dial so a replacement starts its own clock.
+    let mut upstream_since = tokio::time::Instant::now();
     // Anchored-resume observability: set when an ANCHORED generating frame is (re)sent on a
     // freshly re-dialed upstream — the one situation where the connection-scoped anchor may or
     // may not have survived. A later forwarded `response.completed` while set counts a resume win
@@ -665,6 +677,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                 ) {
                                     account = refreshed_account;
                                     upstream = Some(refreshed_upstream);
+                                        upstream_since = tokio::time::Instant::now();
                                     in_flight = None;
                                     if !surface_attempt_budget_exhausted(
                                         &mut downstream,
@@ -688,6 +701,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                 }
                                 account = refreshed_account;
                                 upstream = Some(refreshed_upstream);
+                                        upstream_since = tokio::time::Instant::now();
                                 in_flight = Some(frame);
                                 relay_metrics.record("reconnect_same_account");
                                 reconnects_since_progress += 1;
@@ -752,7 +766,15 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                 if turn_active {
                     conn.recv_text().await
                 } else {
-                    conn.recv_text_idle(idle_policy.idle_budget, idle_policy.ping_interval).await
+                    // Between turns, wake at whichever comes first: the idle budget, or the
+                    // proactive rotation deadline (see `rotate_after` below).
+                    let idle_wait = match rotate_after {
+                        Some(max_age) => idle_policy
+                            .idle_budget
+                            .min(max_age.saturating_sub(upstream_since.elapsed())),
+                        None => idle_policy.idle_budget,
+                    };
+                    conn.recv_text_idle(idle_wait, idle_policy.ping_interval).await
                 }
             }, if upstream.is_some() => {
                 match up {
@@ -794,6 +816,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                 };
                                 account = next_account;
                                 upstream = Some(next_upstream);
+                                upstream_since = tokio::time::Instant::now();
                                 // Only a successful (possibly reactively refreshed) redial reaches
                                 // this point, so the reconnect counter cannot count teardowns.
                                 // This task: if a turn was in flight when the cap hit, replay it on the
@@ -985,6 +1008,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                             if conn.send_text(frame.clone()).await.is_ok() {
                                                 in_flight = Some(frame);
                                                 upstream = Some(conn);
+                                                upstream_since = tokio::time::Instant::now();
                                                 if anchored {
                                                     relay_metrics
                                                         .record("anchored_send_after_redial");
@@ -1024,6 +1048,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                         ) {
                                             account = refreshed_account;
                                             upstream = Some(refreshed_upstream);
+                                        upstream_since = tokio::time::Instant::now();
                                             in_flight = None;
                                             if !surface_attempt_budget_exhausted(
                                                 &mut downstream,
@@ -1048,6 +1073,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                         }
                                         account = refreshed_account;
                                         upstream = Some(refreshed_upstream);
+                                        upstream_since = tokio::time::Instant::now();
                                         relay_metrics.record("reconnect_same_account");
                                         reconnects_since_progress += 1;
                                         if reconnects_since_progress
@@ -1088,6 +1114,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                         }
                                         account = new_account; // same account (retry) or a NEW one (moved).
                                         upstream = Some(new_upstream);
+                                        upstream_since = tokio::time::Instant::now();
                                         reconnects_since_progress += 1;
                                         if reconnects_since_progress > MAX_RECONNECTS_WITHOUT_PROGRESS {
                                             unfinished_status = StatusCode::BAD_GATEWAY;
@@ -1288,6 +1315,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                             };
                             account = next_account;
                             upstream = Some(next_upstream);
+                                upstream_since = tokio::time::Instant::now();
                             if let Some(frame) = in_flight.clone() {
                                 if !try_consume_active_turn_attempt(&state, &turn_telemetry) {
                                     in_flight = None;
@@ -1330,7 +1358,16 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                             // and full-resends natively — silent, no failed attempt, exactly the
                             // direct-connection behavior. The counter label distinguishes the
                             // deliberate idle-budget let-go from a genuine upstream drop.
-                            relay_metrics.record(if idle_budget_expired {
+                            // A deliberate age rotation is neither a drop nor an idle let-go: the
+                            // socket was healthy and we chose the moment. Distinguishing it keeps
+                            // the drop counter an honest measure of the network.
+                            let rotated_for_age = idle_budget_expired
+                                && rotate_after.is_some_and(|max_age| {
+                                    upstream_since.elapsed() >= max_age
+                                });
+                            relay_metrics.record(if rotated_for_age {
+                                "honest_close_age_rotation"
+                            } else if idle_budget_expired {
                                 "honest_close_idle_budget"
                             } else {
                                 "honest_close_upstream_drop"
@@ -1369,6 +1406,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                 } else {
                     polyflare_store::RequestProtocolOutcome::TransportLost
                 },
+                // A teardown carries no upstream terminal frame, so there is no code to record —
+                // the transport simply ended. `protocol_outcome` above is the whole story here.
+                error_code: None,
             },
         )
         .await;

@@ -66,6 +66,8 @@ pub async fn assemble_snapshots(store: &Store) -> Result<Vec<AccountSnapshot>, S
         });
         snap.reset_at = account.reset_at;
         snap.cooldown_until = repo.routing_cooldown(&account.id).await?;
+        snap.usage_cap_percent = account.usage_cap_percent;
+        snap.usage_cap_override = account.usage_cap_override;
         snap.routing_policy = account.routing_policy;
         snap.plan_type = account.plan_type;
         snap.security_work_authorized = account.security_work_authorized;

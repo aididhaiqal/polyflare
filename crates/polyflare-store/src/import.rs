@@ -193,6 +193,10 @@ pub async fn import_from_codex_lb(
             reset_at: src.reset_at,
             blocked_at: src.blocked_at,
             security_work_authorized: src.security_work_authorized,
+            // Imported accounts start uncapped: a usage ceiling is an operator decision here,
+            // not something inherited from the source deployment.
+            usage_cap_percent: None,
+            usage_cap_override: false,
             provider: "codex".to_string(),
             pool: None,
         };

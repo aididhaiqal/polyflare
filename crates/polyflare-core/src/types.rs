@@ -401,6 +401,12 @@ pub struct AccountSnapshot {
     pub reset_at: Option<i64>,
     /// Per-account capacity override (credits); `None` ⇒ derive from `plan_type`.
     pub capacity_credits: Option<f64>,
+    /// Stop selecting this account once EITHER quota window reaches this percent, reserving the
+    /// remainder for later. `None` ⇒ uncapped (the behaviour before the ceiling existed).
+    pub usage_cap_percent: Option<f64>,
+    /// Ignore `usage_cap_percent` for now, without clearing it — the operator's deliberate
+    /// "keep burning this one" switch.
+    pub usage_cap_override: bool,
     /// normal | burn_first | preserve
     pub routing_policy: String,
     /// 0 healthy / 1 draining / 2 probing (defaulted 0 in M2b).
@@ -456,6 +462,8 @@ impl AccountSnapshot {
             weekly_quota: None,
             reset_at: None,
             capacity_credits: None,
+            usage_cap_percent: None,
+            usage_cap_override: false,
             routing_policy: "normal".to_string(),
             health_tier: 0,
             error_count: 0,

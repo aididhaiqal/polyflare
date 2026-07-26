@@ -271,6 +271,9 @@ async fn persist_refreshed(
         reset_at: None,
         blocked_at: None,
         security_work_authorized: false,
+        // A newly onboarded account starts uncapped; the ceiling is set deliberately later.
+        usage_cap_percent: None,
+        usage_cap_override: false,
         provider: "codex".into(),
         pool: initial_pool,
     };

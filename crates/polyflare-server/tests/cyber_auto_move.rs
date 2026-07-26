@@ -54,6 +54,8 @@ fn account(id: &str, security_work_authorized: bool) -> Account {
         reset_at: None,
         blocked_at: None,
         security_work_authorized,
+        usage_cap_percent: None,
+        usage_cap_override: false,
         provider: "codex".to_string(),
         pool: None,
     }

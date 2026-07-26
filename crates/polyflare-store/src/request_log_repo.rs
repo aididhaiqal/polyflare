@@ -221,6 +221,11 @@ pub struct RequestLogRecord {
     /// [`RequestLogRepo::update_usage`] after the response body drains; transports such as the
     /// downstream WebSocket relay that already know the terminal at insert time set it directly.
     pub protocol_outcome: Option<RequestProtocolOutcome>,
+    /// The upstream's own bounded reason for a non-completed terminal (`error.code` only, never
+    /// free text). Set by transports that know the terminal at insert time; HTTP-SSE fills it via
+    /// [`RequestLogRepo::update_usage`]'s sibling path. Without it a mid-stream failure is
+    /// indistinguishable from every other in the log.
+    pub error_code: Option<String>,
 }
 
 /// A persisted request-log row: a [`RequestLogRecord`] plus its surrogate primary key. `status` is
@@ -478,9 +483,9 @@ impl RequestLogRepo {
               total_tokens, cached_tokens, subagent, request_id, session_key, input_tokens, \
               output_tokens, cached_input_tokens, reasoning_tokens, orchestration_input_tokens, \
               orchestration_output_tokens, orchestration_cached_input_tokens, cost_usd, \
-              latency_first_token_ms, protocol_outcome) \
+              latency_first_token_ms, protocol_outcome, error_code) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                     ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.requested_at)
         .bind(&record.provider)
@@ -515,6 +520,7 @@ impl RequestLogRepo {
         .bind(record.cost_usd)
         .bind(record.latency_first_token_ms)
         .bind(record.protocol_outcome.map(RequestProtocolOutcome::as_str))
+        .bind(&record.error_code)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1234,6 +1240,7 @@ mod tests {
             cost_usd: None,
             latency_first_token_ms: None,
             protocol_outcome: None,
+            error_code: None,
         };
         repo.insert(&rec).await.unwrap();
 
@@ -1317,6 +1324,7 @@ mod tests {
             cost_usd: None,
             latency_first_token_ms: None,
             protocol_outcome: None,
+            error_code: None,
         }
     }
 
@@ -1576,6 +1584,7 @@ mod tests {
             cost_usd: None,
             latency_first_token_ms: None,
             protocol_outcome: None,
+            error_code: None,
         }
     }
 
@@ -1625,6 +1634,7 @@ mod tests {
             cost_usd: None,
             latency_first_token_ms: None,
             protocol_outcome: None,
+            error_code: None,
         }
     }
 
@@ -1861,6 +1871,7 @@ mod tests {
             cost_usd,
             latency_first_token_ms,
             protocol_outcome: None,
+            error_code: None,
         }
     }
 
@@ -2641,6 +2652,7 @@ mod tests {
             cost_usd: None,
             latency_first_token_ms: None,
             protocol_outcome: None,
+            error_code: None,
         }
     }
 

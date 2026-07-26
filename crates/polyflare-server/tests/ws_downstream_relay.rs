@@ -232,6 +232,8 @@ mod relay_through {
                     reset_at: None,
                     blocked_at: None,
                     security_work_authorized: false,
+                    usage_cap_percent: None,
+                    usage_cap_override: false,
                     provider: "codex".to_string(),
                     pool: None,
                 },
@@ -1121,6 +1123,8 @@ mod relay_through {
                         reset_at: None,
                         blocked_at: None,
                         security_work_authorized: false,
+                        usage_cap_percent: None,
+                        usage_cap_override: false,
                         provider: "codex".to_string(),
                         pool: None,
                     },
@@ -2435,6 +2439,8 @@ mod relay_through {
                     reset_at: None,
                     blocked_at: None,
                     security_work_authorized: true,
+                    usage_cap_percent: None,
+                    usage_cap_override: false,
                     provider: "codex".to_string(),
                     pool: None,
                 },
@@ -3058,6 +3064,8 @@ mod relay_through {
         let idle = polyflare_server::ws_relay::WsRelayIdlePolicy {
             ping_interval: Some(Duration::from_millis(100)),
             idle_budget: Duration::from_secs(30),
+            // Rotation off: these tests pin idle/drop behaviour, not age rotation.
+            max_socket_age: None,
         };
         let (base, _state) =
             spawn_with_pinned_account_and_idle("acct-keepalive", &mock_base, idle).await;
@@ -3123,6 +3131,8 @@ mod relay_through {
         let idle = polyflare_server::ws_relay::WsRelayIdlePolicy {
             ping_interval: Some(Duration::from_millis(50)),
             idle_budget: Duration::from_millis(300),
+            // Rotation off: these tests pin idle/drop behaviour, not age rotation.
+            max_socket_age: None,
         };
         let (base, state) =
             spawn_with_pinned_account_and_idle("acct-idle-budget", &mock_base, idle).await;
@@ -3292,6 +3302,75 @@ mod relay_through {
     /// poisoned history forever) — it must rewrite the buffered frame ONCE (reasoning envelopes
     /// out, plaintext summaries preserved as assistant text), re-dial the same account, and
     /// replay, so the client sees only the clean completion.
+    /// Proactive age rotation (2026-07-26): the relay retires a HEALTHY idle upstream once it
+    /// reaches `max_socket_age`, ahead of the backend's ~60-minute cap. The anchor dies either way;
+    /// rotating early only moves that loss to a harmless moment. A rotation must close BOTH legs —
+    /// the existing honest-close contract — so codex reconnects and full-resends silently, and it
+    /// must be labelled distinctly so the drop counter stays an honest measure of the network.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_healthy_idle_socket_is_rotated_before_the_server_cap() {
+        let mock = MockWsUpstream::scripted(vec![ScriptedTurn::normal(vec![])]);
+        let mock_base = mock.clone().spawn().await;
+        let (base, state) = spawn_with_pinned_account_and_idle(
+            "acct-age-rotation",
+            &mock_base,
+            polyflare_server::ws_relay::WsRelayIdlePolicy {
+                ping_interval: None,
+                // Long enough that the idle budget cannot be what ends this socket...
+                idle_budget: Duration::from_secs(300),
+                // ...while the rotation deadline is immediate.
+                max_socket_age: Some(Duration::from_millis(300)),
+            },
+        )
+        .await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake must succeed");
+        ws.send(TMessage::Text(
+            r#"{"type":"response.create","input":[]}"#.to_string().into(),
+        ))
+        .await
+        .unwrap();
+
+        // Drain the turn so the socket goes idle (rotation only ever fires between turns).
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(Ok(TMessage::Text(text))) = ws.next().await {
+                if text.contains("response.completed") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the turn must complete");
+
+        // The downstream must be closed BY US shortly after the rotation deadline, not left open
+        // lying about a dead anchor.
+        let closed = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(frame) = ws.next().await {
+                match frame {
+                    Ok(TMessage::Close(_)) | Err(_) => return true,
+                    _ => continue,
+                }
+            }
+            true
+        })
+        .await
+        .expect("the relay must retire the idle socket, not hold it to the server cap");
+        assert!(closed, "both legs must close on rotation");
+
+        let snapshot = state.relay_metrics.snapshot();
+        let rotations = snapshot
+            .iter()
+            .find(|(k, _)| k == "honest_close_age_rotation")
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
+        assert!(
+            rotations >= 1,
+            "the close must be labelled a deliberate rotation, not a network drop: {snapshot:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn invalid_encrypted_content_replays_transformed_frame() {
         let mock = MockWsUpstream::scripted(vec![

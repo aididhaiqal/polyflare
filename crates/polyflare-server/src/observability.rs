@@ -162,6 +162,8 @@ impl RequestLog {
             cost_usd: None,
             latency_first_token_ms: None,
             protocol_outcome: None,
+            // Set by callers that know the upstream's terminal reason (WS relay today).
+            error_code: None,
         }
     }
 

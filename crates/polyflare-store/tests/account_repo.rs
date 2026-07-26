@@ -21,6 +21,8 @@ fn sample_account(id: &str) -> Account {
         reset_at: None,
         blocked_at: None,
         security_work_authorized: true,
+        usage_cap_percent: None,
+        usage_cap_override: false,
         provider: "codex".to_string(),
         pool: None,
     }
@@ -405,6 +407,8 @@ fn anthropic_account(id: &str, pool: Option<&str>) -> Account {
         reset_at: None,
         blocked_at: None,
         security_work_authorized: false,
+        usage_cap_percent: None,
+        usage_cap_override: false,
         provider: "anthropic".to_string(),
         pool: pool.map(str::to_string),
     }
@@ -607,4 +611,63 @@ async fn legacy_rows_are_static_bearers_and_are_never_refreshable() {
     assert!(rejected.is_err(), "auth_mode is constrained by a CHECK");
     let auth = repo.upstream_auth("acct-codex").await.unwrap().unwrap();
     assert_eq!(auth.mode(), polyflare_store::AuthMode::CodexOauth);
+}
+
+/// The usage ceiling persists per account: unset by default (uncapped — the pre-0029 behaviour),
+/// settable, overridable, and clearable back to uncapped without losing anything else.
+#[tokio::test]
+async fn usage_ceiling_round_trips_and_defaults_to_uncapped() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[9u8; 32]).unwrap();
+    let repo = store.accounts();
+    repo.insert(&sample_account("acct"), &sample_tokens(), &cipher)
+        .await
+        .unwrap();
+
+    let fresh = repo.get("acct").await.unwrap().expect("account exists");
+    assert_eq!(
+        fresh.usage_cap_percent, None,
+        "a new account must be uncapped — the ceiling is opt-in"
+    );
+    assert!(!fresh.usage_cap_override);
+
+    repo.update_settings_atomic(
+        "acct",
+        polyflare_store::AccountSettingsUpdate {
+            pools: None,
+            routing_policy: None,
+            status: None,
+            security_work_authorized: None,
+            alias: None,
+            usage_cap_percent: Some(Some(50.0)),
+            usage_cap_override: Some(true),
+        },
+    )
+    .await
+    .unwrap();
+    let capped = repo.get("acct").await.unwrap().expect("account exists");
+    assert_eq!(capped.usage_cap_percent, Some(50.0));
+    assert!(capped.usage_cap_override, "the override persists too");
+
+    repo.update_settings_atomic(
+        "acct",
+        polyflare_store::AccountSettingsUpdate {
+            pools: None,
+            routing_policy: None,
+            status: None,
+            security_work_authorized: None,
+            alias: None,
+            usage_cap_percent: Some(None),
+            usage_cap_override: Some(false),
+        },
+    )
+    .await
+    .unwrap();
+    let cleared = repo.get("acct").await.unwrap().expect("account exists");
+    assert_eq!(
+        cleared.usage_cap_percent, None,
+        "null clears the ceiling back to uncapped"
+    );
+    assert!(!cleared.usage_cap_override);
 }

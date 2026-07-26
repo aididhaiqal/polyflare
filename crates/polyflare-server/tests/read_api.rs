@@ -39,6 +39,8 @@ fn account(id: &str, email: &str, pool: Option<&str>) -> Account {
         reset_at: Some(1_783_900_000),
         blocked_at: None,
         security_work_authorized: false,
+        usage_cap_percent: None,
+        usage_cap_override: false,
         provider: "codex".to_string(),
         pool: pool.map(str::to_string),
     }
@@ -119,6 +121,7 @@ async fn seed_store() -> Store {
             cost_usd: None,
             latency_first_token_ms: None,
             protocol_outcome: None,
+            error_code: None,
         })
         .await
         .unwrap();
@@ -326,6 +329,7 @@ async fn accounts_endpoint_carries_provider_pool_usage_token_health_and_request_
             cost_usd: None,
             latency_first_token_ms: None,
             protocol_outcome: None,
+            error_code: None,
         })
         .await
         .unwrap();
@@ -843,6 +847,7 @@ fn backend_filter_row(provider: &str, path: &str) -> RequestLogRecord {
         cost_usd: None,
         latency_first_token_ms: None,
         protocol_outcome: None,
+        error_code: None,
     }
 }
 
@@ -887,6 +892,7 @@ async fn seed_store_for_filters() -> Store {
         cost_usd: None,
         latency_first_token_ms: None,
         protocol_outcome: None,
+        error_code: None,
     })
     .await
     .unwrap();
@@ -924,6 +930,7 @@ async fn seed_store_for_filters() -> Store {
         cost_usd: None,
         latency_first_token_ms: None,
         protocol_outcome: None,
+        error_code: None,
     })
     .await
     .unwrap();
@@ -961,6 +968,7 @@ async fn seed_store_for_filters() -> Store {
         cost_usd: None,
         latency_first_token_ms: None,
         protocol_outcome: None,
+        error_code: None,
     })
     .await
     .unwrap();
@@ -1115,6 +1123,7 @@ fn req_row(status: u16, total_tokens: i64) -> RequestLogRecord {
         cost_usd: None,
         latency_first_token_ms: None,
         protocol_outcome: None,
+        error_code: None,
     }
 }
 
@@ -1249,6 +1258,7 @@ fn req_row_at(requested_at: i64, status: u16, total_tokens: i64) -> RequestLogRe
         cost_usd: None,
         latency_first_token_ms: None,
         protocol_outcome: None,
+        error_code: None,
     }
 }
 
@@ -1456,6 +1466,7 @@ async fn account_detail_request_totals_fall_back_to_input_plus_output_tokens() {
         cost_usd: None,
         latency_first_token_ms: None,
         protocol_outcome: None,
+        error_code: None,
     })
     .await
     .unwrap();
@@ -1494,6 +1505,7 @@ async fn account_detail_request_totals_fall_back_to_input_plus_output_tokens() {
         cost_usd: None,
         latency_first_token_ms: None,
         protocol_outcome: None,
+        error_code: None,
     })
     .await
     .unwrap();
@@ -1560,6 +1572,7 @@ async fn requests_endpoint_falls_back_to_input_output_tokens_and_latency_first_t
         cost_usd: None,
         latency_first_token_ms: Some(300),
         protocol_outcome: None,
+        error_code: None,
     })
     .await
     .unwrap();
@@ -2003,6 +2016,7 @@ fn report_endpoint_row(
         cost_usd: Some(cost_usd),
         latency_first_token_ms: None,
         protocol_outcome: None,
+        error_code: None,
     }
 }
 

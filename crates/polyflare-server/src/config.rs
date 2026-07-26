@@ -820,9 +820,21 @@ pub fn websocket_idle_policy_from_env() -> crate::ws_relay::WsRelayIdlePolicy {
         },
         None => default.idle_budget,
     };
+    // Proactive socket rotation ahead of the backend's ~60-minute cap. `0` disables it (accept the
+    // server's timing); any other value is clamped to a sane band — rotating more often than a
+    // minute is churn, and past the cap is pointless.
+    let max_socket_age = match std::env::var("POLYFLARE_WS_MAX_SOCKET_AGE_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(std::time::Duration::from_secs(secs.clamp(60, 3_600))),
+            Err(_) => default.max_socket_age,
+        },
+        Err(_) => default.max_socket_age,
+    };
     crate::ws_relay::WsRelayIdlePolicy {
         ping_interval,
         idle_budget,
+        max_socket_age,
     }
 }
 

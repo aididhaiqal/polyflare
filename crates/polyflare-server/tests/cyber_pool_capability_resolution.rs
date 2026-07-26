@@ -76,6 +76,8 @@ fn account(id: &str, pool: Option<&str>, security_work_authorized: bool) -> Acco
         reset_at: None,
         blocked_at: None,
         security_work_authorized,
+        usage_cap_percent: None,
+        usage_cap_override: false,
         provider: "codex".to_string(),
         pool: pool.map(|p| p.to_string()),
     }
