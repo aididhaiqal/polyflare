@@ -220,13 +220,19 @@ async fn responses_ws_upgrade(
     // upgrade, so it moves into the post-upgrade future unchanged.
     let session_key = ws_session_key(&headers, pool.as_deref());
     let session_id = crate::session_key::session_id_from_headers(&headers);
+    // The pin gate matches the THREAD id, not the session id (which stays above for owner
+    // affinity). Codex sends both as separate headers and one session can carry several threads,
+    // so comparing a thread pin against `session-id` was wrong twice over: the id an operator can
+    // actually see never matched (the pin silently did nothing), and a session id typed in its
+    // place would have diverted every thread in that session instead of the one asked for.
+    let thread_id = crate::session_key::thread_id_from_headers(&headers);
     // A thread pinned to SSE is answered 426 instead of being upgraded. 426 is codex-rs's only
     // WS->HTTP fallback trigger, so the client moves that ONE conversation to HTTP-SSE and leaves
     // every other thread on WebSocket. Checked before the upgrade and before any account is
     // resolved: a pinned thread must not consume a lease or an owner just to be told to use HTTP.
     if crate::sse_pins::is_pinned(
         &crate::sse_pins::pinned_threads(&state).await,
-        session_id.as_deref(),
+        thread_id.as_deref(),
     ) {
         return crate::ingress::websocket_fallback_handler().await;
     }

@@ -45,6 +45,49 @@ impl SettingsRepo {
         .await?;
         Ok(())
     }
+
+    /// Read-modify-write ONE setting atomically, returning the value the row now holds.
+    ///
+    /// `get_all` + [`Self::set`] is a lost-update race whenever a value is a collection edited in
+    /// place: two operators adding a different entry concurrently both read the old string, and
+    /// whichever writes second silently discards the other's addition. The transaction opens with
+    /// `BEGIN IMMEDIATE`, which takes SQLite's write lock BEFORE the read rather than trying to
+    /// upgrade a read lock at commit time, so the read and the write are serialized against any
+    /// other writer as one unit. (A plain deferred `BEGIN` would not lose the update under WAL, but
+    /// it would fail the second committer with `SQLITE_BUSY_SNAPSHOT` instead of serializing it.)
+    ///
+    /// `edit` receives the current raw value (`None` when the row does not exist yet) and returns
+    /// the replacement, or `None` to leave the row untouched — which is how a caller rejects its own
+    /// change (a validation failure) without writing. Callers carry the REASON for that rejection
+    /// out-of-band, so this signature stays free of caller-specific error types.
+    pub async fn mutate(
+        &self,
+        key: &str,
+        now: i64,
+        edit: impl FnOnce(Option<&str>) -> Option<String>,
+    ) -> Result<String, StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let current = current.map(|row| row.0);
+        let Some(next) = edit(current.as_deref()) else {
+            tx.rollback().await?;
+            return Ok(current.unwrap_or_default());
+        };
+        sqlx::query(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        )
+        .bind(key)
+        .bind(&next)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(next)
+    }
 }
 
 #[cfg(test)]
@@ -56,6 +99,47 @@ mod tests {
         let s = Store::open(&dir.path().join("s.db")).await.unwrap();
         std::mem::forget(dir);
         s
+    }
+
+    /// Two concurrent additions to the same collection-valued setting must BOTH survive. The
+    /// read-modify-write this replaced lost whichever addition committed first.
+    #[tokio::test]
+    async fn concurrent_mutations_do_not_lose_an_entry() {
+        let s = store().await;
+        let repo = s.settings();
+        repo.set("pins", "a", 1).await.unwrap();
+
+        let (left, right) = tokio::join!(
+            repo.mutate("pins", 2, |current| {
+                Some(format!("{}\nb", current.unwrap_or_default()))
+            }),
+            repo.mutate("pins", 3, |current| {
+                Some(format!("{}\nc", current.unwrap_or_default()))
+            }),
+        );
+        left.unwrap();
+        right.unwrap();
+
+        let stored = repo.get_all().await.unwrap();
+        let value = stored.get("pins").expect("row exists");
+        let entries: Vec<&str> = value.lines().collect();
+        assert!(entries.contains(&"a"), "the pre-existing entry survives");
+        assert!(entries.contains(&"b"), "the first addition survives");
+        assert!(
+            entries.contains(&"c"),
+            "the second addition survives — a lost update would drop one of b/c"
+        );
+    }
+
+    /// Returning `None` from the edit closure leaves the row exactly as it was.
+    #[tokio::test]
+    async fn a_rejected_mutation_writes_nothing() {
+        let s = store().await;
+        let repo = s.settings();
+        repo.set("pins", "a", 1).await.unwrap();
+        let unchanged = repo.mutate("pins", 2, |_| None).await.unwrap();
+        assert_eq!(unchanged, "a");
+        assert_eq!(repo.get_all().await.unwrap().get("pins").unwrap(), "a");
     }
 
     #[tokio::test]

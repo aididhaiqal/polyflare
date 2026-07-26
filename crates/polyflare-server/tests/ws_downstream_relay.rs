@@ -1207,6 +1207,76 @@ mod relay_through {
         (format!("ws://{addr}"), state)
     }
 
+    /// Attempt a downstream WS handshake carrying `session-id` + `thread-id`, returning the status
+    /// the server answered: `101` when it upgraded, `426` when the thread was diverted to HTTP-SSE.
+    async fn handshake_status(base: &str, session_id: &str, thread_id: &str) -> u16 {
+        let mut request = format!("{base}/responses").into_client_request().unwrap();
+        for (k, v) in [("session-id", session_id), ("thread-id", thread_id)] {
+            request.headers_mut().insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        match tokio_tungstenite::connect_async(request).await {
+            Ok((_ws, response)) => response.status().as_u16(),
+            // A non-101 answer arrives as `Http(response)`, not as a transport error.
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                response.status().as_u16()
+            }
+            Err(other) => panic!("unexpected handshake failure: {other}"),
+        }
+    }
+
+    /// **The assertion the SSE-pin feature shipped without.** A pin is a THREAD pin: Codex sends
+    /// `session-id` and `thread-id` as separate headers, and the gate must match the id an operator
+    /// can actually see. Until 2026-07-26 it compared the pin against the SESSION id, so pinning a
+    /// real thread id silently did nothing — the live pin
+    /// (`019f96f4-d4e8-7751-87c9-beba24bb3330`, a thread id) had never once fired — and pinning a
+    /// session id instead would have downgraded every thread underneath it.
+    ///
+    /// All three legs are asserted, because no single one of them fails under the old comparison:
+    /// the pinned thread must divert, a SIBLING thread on the same session must not, and a session
+    /// id equal to the pinned value must not divert anything.
+    #[tokio::test]
+    async fn a_pinned_thread_is_diverted_and_its_session_siblings_still_upgrade() {
+        let mock = MockWsUpstream::new(ScriptedTurn::normal(vec![]));
+        let mock_base = mock.clone().spawn().await;
+        let (base, state) = spawn_with_pinned_account("acct-pin", &mock_base).await;
+
+        // Unpinned, the thread upgrades like any other conversation.
+        assert_eq!(
+            handshake_status(&base, "session-shared", "thread-pinned").await,
+            101,
+            "an unpinned thread must upgrade"
+        );
+
+        // Written through the store rather than the pin API because this harness runs without an
+        // admin token; the key is the same row `sse_pins` reads, spelled out so a rename to the
+        // constant cannot silently decouple this test from the gate it guards.
+        state
+            .store
+            .settings()
+            .set("ws_transport_sse_pinned_threads", "thread-pinned", now())
+            .await
+            .expect("pin write");
+
+        assert_eq!(
+            handshake_status(&base, "session-shared", "thread-pinned").await,
+            426,
+            "the pinned THREAD must get 426 — codex-rs's sole WS->HTTP fallback trigger"
+        );
+        assert_eq!(
+            handshake_status(&base, "session-shared", "thread-other").await,
+            101,
+            "a sibling thread on the SAME session keeps WebSocket: a thread pin is not a session pin"
+        );
+        assert_eq!(
+            handshake_status(&base, "thread-pinned", "thread-other").await,
+            101,
+            "matching the pin against session-id would downgrade an entire session"
+        );
+    }
+
     /// **The real proof.** A REAL `tokio-tungstenite` client connects to the downstream `/responses`
     /// WS; a `response.create` text frame reaches the `MockWsUpstream` BYTE-VERBATIM (unsorted keys +
     /// doubled interior whitespace survive — a serde reparse would destroy both); the mock's

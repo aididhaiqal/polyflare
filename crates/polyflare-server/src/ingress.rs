@@ -1644,7 +1644,10 @@ async fn reroute_cyber_rejection(
     outcome.account_id = Some(fresh.as_str().to_string());
     let (account, provider) = match resolve_core_account(state, &fresh, now).await {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => {
+            bench_after_local_refusal(state, &fresh, now);
+            return r;
+        }
     };
     let health_id = fresh.clone(); // `fresh` is moved into the executor below.
                                    // TA6(b) Task 3: captured BEFORE `session_key` moves into `execute_recovery` below — the stamp
@@ -1659,7 +1662,8 @@ async fn reroute_cyber_rejection(
         &state.lease_metrics,
         sel_ctx.request_pressure_units,
     ) else {
-        return no_eligible();
+        bench_after_local_refusal(state, &fresh, now);
+        return admission_refused_on_reselect(fresh.as_str(), sel_ctx.request_pressure_units);
     };
     match execute_recovery_tracked(
         state.executor_for(provider).as_ref(),
@@ -1877,7 +1881,10 @@ async fn run_failover_loop(
         outcome.account_id = Some(fresh.as_str().to_string());
         let (account, provider) = match resolve_core_account(state, &fresh, now).await {
             Ok(a) => a,
-            Err(r) => return r,
+            Err(r) => {
+                bench_after_local_refusal(state, &fresh, now);
+                return r;
+            }
         };
         let health_id = fresh.clone(); // `fresh` is moved into the executor below.
         let commit = CommitWitness::new();
@@ -1896,7 +1903,12 @@ async fn run_failover_loop(
             &state.lease_metrics,
             sel_ctx.request_pressure_units,
         ) else {
-            return no_eligible();
+            // The loop's own `tried` set does not protect us here: this returns immediately rather
+            // than continuing to the next candidate, so without the bench a deterministic selector
+            // hands the NEXT request the same refused account and the failover loop reproduces the
+            // very stall it exists to escape.
+            bench_after_local_refusal(state, &fresh, now);
+            return admission_refused_on_reselect(fresh.as_str(), sel_ctx.request_pressure_units);
         };
         match execute_recovery_tracked(
             state.executor_for(provider).as_ref(),
@@ -3798,7 +3810,10 @@ async fn messages_handler_native(
     outcome.account_id = Some(picked.as_str().to_string());
     let (account, provider) = match resolve_core_account(&state, &picked, now).await {
         Ok(a) => a,
-        Err(r) => return (r, outcome),
+        Err(r) => {
+            bench_after_local_refusal(&state, &picked, now);
+            return (r, outcome);
+        }
     };
 
     let health_id = picked.clone(); // moved into the executor below.
@@ -4129,7 +4144,10 @@ async fn messages_handler_codex_aliased(
     outcome.account_id = Some(picked.as_str().to_string());
     let (account, provider) = match resolve_core_account(&state, &picked, now).await {
         Ok(a) => a,
-        Err(r) => return (r, outcome),
+        Err(r) => {
+            bench_after_local_refusal(&state, &picked, now);
+            return (r, outcome);
+        }
     };
 
     let health_id = picked.clone(); // moved into the executor below.

@@ -672,6 +672,73 @@ async fn test_seam_with_default_bound_still_fails_over() {
     assert_eq!(exec.calls(), vec!["A".to_string(), "B".to_string()]);
 }
 
+/// A failover target that a LOCAL gate refuses must be benched, or the loop reproduces the stall it
+/// exists to escape.
+///
+/// `run_failover_loop` does not continue to the next candidate when `try_acquire_in_flight_weighted`
+/// refuses — it returns a 503 straight to the client. Until 2026-07-26 it also wrote no routing
+/// health, so a deterministic selector handed the very next request the same refused account, and
+/// the refusal repeated for as long as the condition lasted (89 such 503s on one account on
+/// 2026-07-26, none of which benched it). Here B is saturated to its ordinary in-flight limit before
+/// the request runs, so A fails, B is selected, B's admission refuses, and the assertion is that B
+/// carries an error count afterwards — the signal that lets the selector route around it next time.
+#[tokio::test]
+async fn a_failover_target_refused_by_admission_is_benched() {
+    let (store, cipher, _dir) = spawn_store().await;
+    store
+        .accounts()
+        .insert(&account("A", false), &tokens("tokA"), &cipher)
+        .await
+        .unwrap();
+    store
+        .accounts()
+        .insert(&account("B", false), &tokens("tokB"), &cipher)
+        .await
+        .unwrap();
+    let exec = Arc::new(FailoverStubExecutor::new());
+    exec.script("A", vec![AttemptBehavior::Fail(429)]);
+    // B is scripted to succeed precisely so a reached-B run would return 200: the 503 below can
+    // only come from the admission gate, never from a scripted failure.
+    exec.script("B", vec![AttemptBehavior::Success]);
+    let state = build_state(store, cipher, exec.clone());
+
+    // Fill B's ORDINARY in-flight budget (limit minus the owner-recovery reserve) so the failover
+    // loop's non-waiting acquire on B cannot succeed.
+    let lease_metrics = polyflare_server::observability::LeaseMetrics::new();
+    let b = AccountId::from("B");
+    let held: Vec<_> = (0..3)
+        .map(|_| state.runtime.acquire_in_flight(&b, 0, &lease_metrics))
+        .collect();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+    let body =
+        Bytes::from(serde_json::to_vec(&serde_json::json!({"model": "m", "input": "hi"})).unwrap());
+    let resp = responses_handler_impl_for_test(state.clone(), None, headers, body, 3).await;
+    assert_eq!(
+        resp.status(),
+        503,
+        "B was selected but its admission refused, so the loop surfaces a 503"
+    );
+    assert_eq!(
+        exec.calls(),
+        vec!["A".to_string()],
+        "B must never have been executed — the refusal happens before the attempt"
+    );
+
+    let mut snaps = vec![AccountSnapshot::new("B")];
+    state.runtime.overlay(&mut snaps, 0);
+    assert!(
+        snaps[0].error_count >= 1,
+        "a locally refused failover target must be benched, else the next request picks it again"
+    );
+
+    drop(held);
+}
+
 /// C9 Task 2 (THE CRUX): `run_failover_loop`'s A(fail)->B(succeed) cycle releases A's in-flight
 /// lease before B is ever picked, and holds B's lease for the true lifetime of B's stream — no
 /// double-count, no leak on A.

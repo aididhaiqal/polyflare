@@ -48,6 +48,19 @@ pub(crate) fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
         .or_else(|| header_str(headers, "x-session-id"))
 }
 
+/// Extract the raw Codex THREAD identifier — the id a user can actually see on a conversation, and
+/// the one the SSE-pin API takes.
+///
+/// Codex sends `session-id` and `thread-id` as SEPARATE headers, and one session can carry several
+/// threads. The two are not interchangeable: matching a thread pin against the session id would
+/// both fail to fire on the id the operator actually typed AND, if they typed a session id instead,
+/// divert every thread in that session. Accepts the same `x-codex-thread-id` alias
+/// [`header_session_key_scoped`] does, so the pin gate and the durable key agree on what a thread
+/// is. Same non-persistence rule as [`session_id_from_headers`]: ephemeral routing only.
+pub(crate) fn thread_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    header_str(headers, "thread-id").or_else(|| header_str(headers, "x-codex-thread-id"))
+}
+
 /// Decode a raw field as a string ONLY if it is a JSON string; any other type (or absent) yields
 /// `None` — the lenient equivalent of the old `Value::get(..).and_then(Value::as_str)`.
 fn raw_as_str(rv: Option<&RawValue>) -> Option<String> {

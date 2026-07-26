@@ -67,8 +67,12 @@ pub(crate) fn serialize(pins: &BTreeSet<String>) -> String {
 }
 
 /// Whether this thread should be answered `426` instead of upgraded.
-pub(crate) fn is_pinned(pins: &BTreeSet<String>, session_id: Option<&str>) -> bool {
-    session_id.is_some_and(|id| pins.contains(id))
+///
+/// Takes the THREAD id. The parameter was named `session_id` until 2026-07-26 and was in fact
+/// called with one, which is how a thread pin came to be compared against the wrong header without
+/// anything looking obviously wrong at the call site.
+pub(crate) fn is_pinned(pins: &BTreeSet<String>, thread_id: Option<&str>) -> bool {
+    thread_id.is_some_and(|id| pins.contains(id))
 }
 
 /// Add an id, reporting whether the set changed. Refuses beyond [`MAX_PINS`].
@@ -94,20 +98,11 @@ pub(crate) async fn pinned_threads(state: &crate::app::AppState) -> BTreeSet<Str
     }
 }
 
-/// Persist a pin set.
-async fn store_pins(
-    state: &crate::app::AppState,
-    pins: &BTreeSet<String>,
-) -> Result<(), polyflare_store::StoreError> {
-    let now = std::time::SystemTime::now()
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    state
-        .store
-        .settings()
-        .set(SSE_PINS_KEY, &serialize(pins), now)
-        .await
+        .unwrap_or(0)
 }
 
 #[derive(serde::Serialize)]
@@ -139,19 +134,37 @@ pub async fn add(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let id = body.thread_id.trim().to_string();
-    let mut pins = pinned_threads(&state).await;
-    if let Err(message) = insert(&mut pins, &id) {
+    // Read-modify-write inside ONE transaction: two operators pinning different threads at the same
+    // time both used to read the old row and the second write silently dropped the first's entry.
+    // The rejection reason travels out-of-band because `mutate`'s contract is "return the new value
+    // or `None` to leave the row alone" — see `SettingsRepo::mutate`.
+    let mut rejection: Option<&'static str> = None;
+    let stored = state
+        .store
+        .settings()
+        .mutate(SSE_PINS_KEY, now_secs(), |current| {
+            let mut pins = parse(current.unwrap_or_default());
+            match insert(&mut pins, &id) {
+                Ok(_) => Some(serialize(&pins)),
+                Err(message) => {
+                    rejection = Some(message);
+                    None
+                }
+            }
+        })
+        .await;
+    if let Some(message) = rejection {
         return (
             axum::http::StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({ "error": message })),
         )
             .into_response();
     }
-    if store_pins(&state, &pins).await.is_err() {
+    let Ok(stored) = stored else {
         return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    };
     axum::Json(PinsView {
-        pinned_threads: pins.into_iter().collect(),
+        pinned_threads: parse(&stored).into_iter().collect(),
     })
     .into_response()
 }
@@ -162,13 +175,23 @@ pub async fn remove(
     axum::extract::Path(thread_id): axum::extract::Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let mut pins = pinned_threads(&state).await;
-    pins.remove(thread_id.trim());
-    if store_pins(&state, &pins).await.is_err() {
+    // Same transactional read-modify-write as `add`: an unpin concurrent with a pin must not
+    // resurrect the removed entry or drop the added one.
+    let id = thread_id.trim().to_string();
+    let stored = state
+        .store
+        .settings()
+        .mutate(SSE_PINS_KEY, now_secs(), |current| {
+            let mut pins = parse(current.unwrap_or_default());
+            pins.remove(&id);
+            Some(serialize(&pins))
+        })
+        .await;
+    let Ok(stored) = stored else {
         return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    };
     axum::Json(PinsView {
-        pinned_threads: pins.into_iter().collect(),
+        pinned_threads: parse(&stored).into_iter().collect(),
     })
     .into_response()
 }
