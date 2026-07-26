@@ -133,7 +133,19 @@ fn estimate_materialized_request_tokens(
     crate::session_key::estimate_tokens_from_json_len(input_len, output_tokens)
 }
 
-fn account_unavailable() -> Response {
+/// The 503 an account-resolution failure surfaces.
+///
+/// `reason` is a FIXED label identifying which gate refused, warned once per occurrence. Added
+/// 2026-07-26 after three separate investigations bottomed out at "a fast 503 with no explanation":
+/// 58 client-visible refusals on one session with every admission counter at zero, and no way to
+/// tell a non-active status from a failed token refresh. Content-free — a label and an account id,
+/// never a token, body, or upstream message.
+fn account_unavailable_because(reason: &'static str, account_id: &str) -> Response {
+    tracing::warn!(
+        reason,
+        account_id,
+        "account resolution refused the request (503)"
+    );
     (StatusCode::SERVICE_UNAVAILABLE, "account unavailable").into_response()
 }
 
@@ -146,6 +158,10 @@ pub(crate) fn internal_error() -> Response {
 /// `pub(crate)`: also the D17 control-endpoint account resolution's (`crate::control`) no-eligible-
 /// account response, so both paths return byte-identical 503s.
 pub(crate) fn no_eligible() -> Response {
+    tracing::warn!(
+        reason = "no_eligible_account",
+        "selection found no candidate (503)"
+    );
     (StatusCode::SERVICE_UNAVAILABLE, "no eligible account").into_response()
 }
 
@@ -742,7 +758,10 @@ pub(crate) async fn resolve_core_account(
         // marked the account non-active; `last_refresh` is unchanged on failure, so bail here rather
         // than re-hitting OAuth with our own now-dead token (which would re-mark it once per waiter).
         if fresh_account.status != "active" {
-            return Err(account_unavailable());
+            return Err(account_unavailable_because(
+                "status_not_active_at_refresh",
+                picked.as_str(),
+            ));
         }
         if should_refresh(
             token_exp(&fresh_tokens.access_token),
@@ -805,11 +824,17 @@ pub(crate) async fn resolve_core_account(
                     if let Some(status) = classify_failure(&code).status() {
                         let _ = repo.update_status(picked.as_str(), status).await;
                     }
-                    return Err(account_unavailable());
+                    return Err(account_unavailable_because(
+                        "oauth_refresh_rejected",
+                        picked.as_str(),
+                    ));
                 }
                 Err(OAuthError::Endpoint { code: None, .. }) | Err(OAuthError::MalformedJwt(_)) => {
                     let _ = repo.update_status(picked.as_str(), "reauth_required").await;
-                    return Err(account_unavailable());
+                    return Err(account_unavailable_because(
+                        "oauth_refresh_malformed",
+                        picked.as_str(),
+                    ));
                 }
                 Err(OAuthError::Transport(_)) => {}
             }
@@ -858,7 +883,9 @@ pub(crate) async fn force_refresh_after_unauthorized(
     .await
     .map_err(|error| match error {
         ReactiveAuthError::Internal => internal_error(),
-        ReactiveAuthError::AccountUnavailable => account_unavailable(),
+        ReactiveAuthError::AccountUnavailable => {
+            account_unavailable_because("reactive_auth_unavailable", "-")
+        }
     })
 }
 
