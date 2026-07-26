@@ -40,6 +40,7 @@ use axum::http::HeaderMap;
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use polyflare_codex::oauth::OAuthClient;
+use polyflare_core::AccountSnapshot;
 use polyflare_core::{
     Account, AccountId, CapacityWeighted, Continuity, ExecError, Executor, PreparedRequest,
     RequestCtx, ResponseStream,
@@ -417,6 +418,74 @@ async fn bounded_wait_never_exceeds_the_budget_even_if_the_account_never_recover
 /// the wait loop's first heartbeat tick). Fixed identically: re-anchor `reset_at` to a real, short
 /// window via `update_status_and_reset` immediately before the handler call, widened from 2s to 4s,
 /// with `heartbeat` shrunk from 300ms to 150ms.
+/// Layer 2 waits for an account to recover, re-selects it, and then still has to pass the
+/// non-waiting admission acquire. When that refuses, the stream emits a terminal in-band error —
+/// and until 2026-07-27 it wrote no routing health first, so the account stayed fully preferred and
+/// the next request queued behind the same refusal. The bench is what lets the pool route around it.
+#[tokio::test]
+async fn a_layer2_reselect_refused_by_admission_is_benched() {
+    let (store, cipher, _dir) = spawn_store().await;
+    let mut a = account("A", false, "rate_limited");
+    a.reset_at = Some(now() + 3600);
+    store
+        .accounts()
+        .insert(&a, &tokens("tokA"), &cipher)
+        .await
+        .unwrap();
+    let exec = Arc::new(RecordingExecutor::default());
+    let state = build_state(store, cipher, exec.clone());
+
+    let fire_at = now();
+    state
+        .store
+        .accounts()
+        .update_status_and_reset("A", "rate_limited", Some(fire_at + 2))
+        .await
+        .unwrap();
+
+    // Saturate A's ORDINARY in-flight budget for the whole wait, so the post-wait reselect finds A
+    // recovered but cannot admit it.
+    let lease_metrics = polyflare_server::observability::LeaseMetrics::new();
+    let a_id = AccountId::from("A");
+    let held: Vec<_> = (0..3)
+        .map(|_| {
+            state
+                .runtime
+                .acquire_in_flight(&a_id, fire_at, &lease_metrics)
+        })
+        .collect();
+
+    let probe = state.clone();
+    let resp = responses_handler_impl_for_test_with_starvation_timing(
+        state,
+        None,
+        json_headers(),
+        json_body(),
+        3,
+        Duration::from_secs(6),
+        Duration::from_millis(150),
+    )
+    .await;
+    let (_status, body) = tokio::time::timeout(Duration::from_secs(8), collect_body(resp))
+        .await
+        .expect("draining the body must not hang");
+
+    assert!(
+        exec.calls().is_empty(),
+        "admission refused before any upstream attempt: {body}"
+    );
+
+    let mut snaps = vec![AccountSnapshot::new("A")];
+    probe.runtime.overlay(&mut snaps, fire_at);
+    assert!(
+        snaps[0].error_count >= 1,
+        "a Layer-2 reselect refused by admission must be benched, else the next request waits on \
+         the same account and is refused again"
+    );
+
+    drop(held);
+}
+
 #[tokio::test]
 async fn re_snapshot_after_the_wait_serves_a_now_recovered_account() {
     let (store, cipher, _dir) = spawn_store().await;

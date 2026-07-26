@@ -1077,19 +1077,28 @@ async fn try_layer1_serve_now(
     outcome.account_id = Some(fresh.as_str().to_string());
     let (account, provider) = match resolve_core_account(state, &fresh, now).await {
         Ok(a) => a,
-        Err(r) => return Some(r),
+        Err(r) => {
+            bench_after_local_refusal(state, &fresh, now);
+            return Some(r);
+        }
     };
     let health_id = fresh.clone(); // `fresh` is moved into the executor below.
                                    // C9 Task 2: a real upstream attempt on `fresh` — same lease treatment as every other
                                    // streaming selection site (see `execute_recovery_tracked`'s call below, which is
                                    // `execute_recovery`'s exact behavior plus this one added, never-read `in_flight` capability —
                                    // see `execute_recovery`'s doc for why its own signature stays untouched).
-    let in_flight = state.runtime.try_acquire_in_flight_weighted(
+                                   // The `?` here returns `None`, which the caller reads as "Layer 1 declined" and falls through
+                                   // to Layer 2 / the 503 — an account-attributed local refusal like any other, so it benches too.
+                                   // Without this, serve-soonest keeps nominating the same refused account on every request.
+    let Some(in_flight) = state.runtime.try_acquire_in_flight_weighted(
         &fresh,
         now,
         &state.lease_metrics,
         sel_ctx.request_pressure_units,
-    )?;
+    ) else {
+        bench_after_local_refusal(state, &fresh, now);
+        return None;
+    };
     let response = match execute_recovery_tracked(
         state.executor_for(provider).as_ref(),
         state.continuity.clone(),
@@ -1491,6 +1500,7 @@ fn layer2_wait_stream(
         let (account, provider) = match resolve_core_account(&state, &fresh, fresh_now).await {
             Ok(a) => a,
             Err(_) => {
+                bench_after_local_refusal(&state, &fresh, fresh_now);
                 emit_starvation_signal(
                     &state,
                     &wait_target,
@@ -1516,6 +1526,7 @@ fn layer2_wait_stream(
                     sel_ctx.request_pressure_units,
                 )
         else {
+            bench_after_local_refusal(&state, &fresh, fresh_now);
             emit_starvation_signal(
                 &state,
                 &wait_target,

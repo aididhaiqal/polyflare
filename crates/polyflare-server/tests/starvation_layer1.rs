@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use polyflare_codex::oauth::OAuthClient;
+use polyflare_core::AccountSnapshot;
 use polyflare_core::{
     Account, AccountId, CapacityWeighted, Continuity, ExecError, Executor, PreparedRequest,
     RequestCtx, ResponseStream,
@@ -193,6 +194,71 @@ fn seed_error_backoff(state: &AppState, id: &str, last_error_at: i64) {
     for _ in 0..3 {
         state.runtime.record_transient_error(&aid, last_error_at);
     }
+}
+
+/// Layer 1 nominates the soonest-to-recover account, but its admission acquire is the non-waiting
+/// `try_acquire_in_flight_weighted`. When that refuses, Layer 1 returns `None` and the request
+/// falls through — and until 2026-07-27 it wrote no routing health on the way out, so serve-soonest
+/// nominated the SAME refused account on the next request and every one after it. `soonest_recover`
+/// is driven by `last_error_at`, so the bench is what eventually moves the nomination elsewhere.
+#[tokio::test]
+async fn a_layer1_candidate_refused_by_admission_is_benched() {
+    let (store, cipher, _dir) = spawn_store().await;
+    store
+        .accounts()
+        .insert(&account("A", false, "active"), &tokens("tokA"), &cipher)
+        .await
+        .unwrap();
+    store
+        .accounts()
+        .insert(&account("B", false, "active"), &tokens("tokB"), &cipher)
+        .await
+        .unwrap();
+    let exec = Arc::new(RecordingExecutor::default());
+    let state = build_state(store, cipher, exec.clone());
+
+    let t0 = now();
+    // Both in error backoff (count == 2 satisfies the Layer-1 guard); A recovers soonest, so A is
+    // the account Layer 1 nominates.
+    seed_error_backoff(&state, "A", t0);
+    seed_error_backoff(&state, "B", t0 + 10);
+    let seeded = 3;
+
+    // Fill A's ORDINARY in-flight budget so Layer 1's non-waiting acquire on A cannot succeed.
+    let lease_metrics = polyflare_server::observability::LeaseMetrics::new();
+    let a = AccountId::from("A");
+    let held: Vec<_> = (0..3)
+        .map(|_| state.runtime.acquire_in_flight(&a, t0, &lease_metrics))
+        .collect();
+
+    let probe = state.clone();
+    let pf = spawn_app(state).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "m", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        503,
+        "A was nominated but refused admission, and B is still in backoff"
+    );
+    assert!(
+        exec.calls().is_empty(),
+        "the refusal happens before any upstream attempt"
+    );
+
+    let mut snaps = vec![AccountSnapshot::new("A")];
+    probe.runtime.overlay(&mut snaps, t0);
+    assert!(
+        snaps[0].error_count > seeded,
+        "a Layer-1 candidate refused by admission must be benched, else serve-soonest keeps \
+         nominating it (error_count {} did not move past the seeded {seeded})",
+        snaps[0].error_count
+    );
+
+    drop(held);
 }
 
 /// (1) Empty eligible pool + 2 error-backoff accounts ⇒ served on the SOONEST one, no wait.

@@ -1250,9 +1250,11 @@ mod relay_through {
             "an unpinned thread must upgrade"
         );
 
-        // Written through the store rather than the pin API because this harness runs without an
-        // admin token; the key is the same row `sse_pins` reads, spelled out so a rename to the
-        // constant cannot silently decouple this test from the gate it guards.
+        // Written through the store, not the pin API: this harness runs with the dashboard
+        // disabled (`admin_token: None`), so `/api/ws/sse-pins` answers 503 here. The API's own
+        // accept-and-store leg is asserted in `tests/sse_pins.rs`
+        // (`the_pin_api_stores_what_the_handshake_gate_reads`), against the SAME literal key and
+        // the same round-tripped value, so the two halves cannot drift apart silently.
         state
             .store
             .settings()
