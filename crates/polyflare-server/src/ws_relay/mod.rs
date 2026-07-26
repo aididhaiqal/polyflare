@@ -85,6 +85,11 @@ pub(crate) use session::ws_session_key;
 /// `POLYFLARE_WS_IDLE_BUDGET_SECS`) — never read per-request.
 #[derive(Clone, Copy, Debug)]
 pub struct WsRelayIdlePolicy {
+    /// Retire an upstream socket THIS old at the next between-turns moment, ahead of the backend's
+    /// ~60-minute `websocket_connection_limit_reached` cap. The anchor is lost either way; rotating
+    /// early only chooses a harmless moment (idle) over a potentially harmful one (mid-stream, where
+    /// the cap cannot be replayed and surfaces to the client). `None` disables it.
+    pub max_socket_age: Option<std::time::Duration>,
     /// Keepalive ping cadence while parked between turns; `None` sends no pings (the socket then
     /// usually dies to intermediary idle-reaping and the honest close fires on detection).
     pub ping_interval: Option<std::time::Duration>,
@@ -100,6 +105,9 @@ impl Default for WsRelayIdlePolicy {
         Self {
             ping_interval: Some(std::time::Duration::from_secs(30)),
             idle_budget: std::time::Duration::from_secs(1500),
+            // 50 minutes: comfortably inside the ~60-minute server cap, leaving room for a long
+            // turn started just before the deadline to finish on the old socket.
+            max_socket_age: Some(std::time::Duration::from_secs(3000)),
         }
     }
 }
