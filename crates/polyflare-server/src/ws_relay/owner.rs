@@ -216,7 +216,7 @@ mod tests {
             .unwrap();
         store
             .continuity()
-            .record_completion(&key.value, "hard", owner, "resp_prior", "fp", 1, now)
+            .record_completion(&key.value, "hard", owner, None, "resp_prior", "fp", 1, now)
             .await
             .unwrap();
     }

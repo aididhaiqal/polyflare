@@ -329,6 +329,22 @@ pub enum TurnOutcome {
         input_fingerprint: String,
         input_count: u32,
         reasoning: Option<ReasoningItems>,
+        /// The owner this turn was routed UNDER — `ContinuityDirective::pin_account` as it stood
+        /// when the request was prepared — NOT the account in `account` (which is whoever actually
+        /// served it). The two differ exactly when a pinned-but-ineligible owner made ingress
+        /// re-pick over the full pool (`RouteDecision::Recover` + `RecoveryPlan::None`, the
+        /// anchorless spill), and that difference is what the affinity fence needs:
+        ///
+        /// - `None` — the turn was never pinned, so its completion legitimately establishes the
+        ///   session's owner (first pin, or an unowned pick).
+        /// - `Some(x)` where `x == account` — the turn ran on the pin it was routed under; the
+        ///   completion (re)asserts that owner, correcting any stale affinity row.
+        /// - `Some(x)` where `x != account` — a TEMPORARY spill. The turn is real (its anchor must
+        ///   be recorded against the account that produced it), but it must NOT move the session's
+        ///   `owning_account_id` off `x`; see `ContinuityRepo::record_completion`.
+        ///
+        /// Content-free: an account id, never conversation data.
+        expected_owner: Option<String>,
     },
     /// Watchdog fired; we recovered (Strategy A) or signaled the client (Strategy B).
     Recovered {

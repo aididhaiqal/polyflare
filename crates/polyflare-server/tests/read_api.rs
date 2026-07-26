@@ -135,6 +135,7 @@ async fn seed_store() -> Store {
             "sk-seed-owned",
             "hard",
             "codex-a",
+            None,
             "resp-seed",
             "fp-seed",
             1,
@@ -1775,11 +1776,29 @@ async fn sessions_endpoint_surfaces_owner_email_and_keeps_null_owner_rows() {
     let t1 = now() - 200;
     let t2 = now() - 100;
     continuity
-        .record_completion("sk-owned-a", "hard", "sess-a", "resp-a", "fp-a", 1, t0)
+        .record_completion(
+            "sk-owned-a",
+            "hard",
+            "sess-a",
+            None,
+            "resp-a",
+            "fp-a",
+            1,
+            t0,
+        )
         .await
         .unwrap();
     continuity
-        .record_completion("sk-owned-b", "soft", "sess-b", "resp-b", "fp-b", 1, t1)
+        .record_completion(
+            "sk-owned-b",
+            "soft",
+            "sess-b",
+            None,
+            "resp-b",
+            "fp-b",
+            1,
+            t1,
+        )
         .await
         .unwrap();
     // Fresh session, never completed a turn -> owning_account_id stays NULL.

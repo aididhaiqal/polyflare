@@ -220,5 +220,25 @@ async fn no_anchor_request_on_ineligible_owner_fails_over_not_500() {
         Some("Bearer tokB"),
         "turn 2 failed over to B, not the ineligible pinned owner A"
     );
+
+    // REGRESSION (2026-07-26 ownership oscillation): serving the spill on B must NOT hand B the
+    // session. Before the soft-affinity fence, `record_completion` wrote whichever account served
+    // the turn, so this spill silently re-homed the session to B; the next turn then pinned B, and
+    // when B was briefly ineligible it flipped back to A. One live session oscillated 1284/779
+    // between two accounts, and every request that reached the account WITHOUT the upstream
+    // conversation state was refused with a fast 503.
+    //
+    // The turn is served by B and its new anchor belongs to B, but ownership stays with A.
+    let owner: Option<String> = sqlx::query_scalar(
+        "SELECT owning_account_id FROM continuity_sessions WHERE owning_account_id IS NOT NULL",
+    )
+    .fetch_optional(state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        owner.as_deref(),
+        Some("A"),
+        "a temporary spill onto B must leave ownership with A; re-homing is `record_recovery`'s job"
+    );
     std::mem::forget(dir);
 }

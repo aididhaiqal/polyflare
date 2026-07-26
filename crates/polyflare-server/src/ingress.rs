@@ -3116,7 +3116,18 @@ async fn responses_handler_impl_with_max_attempts(
                             let fallback = Prepared {
                                 req: prepared.req,
                                 directive: ContinuityDirective {
-                                    pin_account: None,
+                                    // The ORIGINAL pin, deliberately carried through even though
+                                    // this attempt deliberately IGNORES it for routing (the
+                                    // account was already chosen above — `fresh` — so nothing
+                                    // downstream re-reads this field to route). It survives here
+                                    // ONLY so `execute_with_watchdog_tracked` can stamp it onto
+                                    // the turn as `expected_owner`: this spill must serve the turn
+                                    // on `fresh` WITHOUT handing `fresh` the session's ownership.
+                                    // Dropping it to `None` (as this did before) told the fence
+                                    // "unpinned turn", which is exactly how the spilling account
+                                    // used to steal the session and start an A/B ownership
+                                    // oscillation. See `ContinuityRepo::record_completion`.
+                                    pin_account: prepared.directive.pin_account.clone(),
                                     watchdog: prepared.directive.watchdog,
                                     recovery: RecoveryPlan::None,
                                     session_key: prepared.directive.session_key.clone(),

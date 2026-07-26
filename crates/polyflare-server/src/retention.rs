@@ -507,15 +507,33 @@ mod tests {
 
         let idle_ts = now - (CONTINUITY_TTL_DAYS + 1) * 86400;
         repo.ensure_session("idle", "soft", idle_ts).await.unwrap();
-        repo.record_completion("idle", "soft", "acct-1", "resp_idle", "fp", 1, idle_ts)
-            .await
-            .unwrap();
+        repo.record_completion(
+            "idle",
+            "soft",
+            "acct-1",
+            None,
+            "resp_idle",
+            "fp",
+            1,
+            idle_ts,
+        )
+        .await
+        .unwrap();
         repo.ensure_session("active", "soft", now - 10)
             .await
             .unwrap();
-        repo.record_completion("active", "soft", "acct-1", "resp_active", "fp", 1, now - 10)
-            .await
-            .unwrap();
+        repo.record_completion(
+            "active",
+            "soft",
+            "acct-1",
+            None,
+            "resp_active",
+            "fp",
+            1,
+            now - 10,
+        )
+        .await
+        .unwrap();
 
         run_retention_pass(&state).await;
 

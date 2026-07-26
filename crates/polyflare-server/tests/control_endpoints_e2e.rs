@@ -500,7 +500,7 @@ async fn control_request_with_session_header_lands_on_the_owner_account() {
     state
         .store
         .continuity()
-        .record_completion(&sk.value, "hard", "acct-b", "resp_owned", "fp", 1, t)
+        .record_completion(&sk.value, "hard", "acct-b", None, "resp_owned", "fp", 1, t)
         .await
         .unwrap();
 
@@ -563,6 +563,7 @@ async fn pooled_memory_summary_isolated_from_same_session_owner_in_another_pool(
             &unscoped_key.value,
             "hard",
             "acct-global",
+            None,
             "resp_global",
             "fp",
             1,

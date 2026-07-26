@@ -361,6 +361,7 @@ async fn compact_owner_affinity_is_derived_from_the_body_prompt_cache_key() {
             &sk.value,
             "soft",
             "acct-b",
+            None,
             "resp_compact_owned",
             "fp",
             1,

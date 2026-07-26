@@ -257,6 +257,14 @@ pub async fn execute_with_watchdog_tracked(
     consume_logical_turn_attempt(&runtime, &ctx, max_attempts)?;
     let Prepared { req, directive } = prepared;
     let session_key = directive.session_key.clone();
+    // The pin this turn is being routed UNDER — captured here, from the directive, so the eventual
+    // `TurnOutcome::Completed` can tell "this account owns the session" from "this account is a
+    // temporary spill for an owner that was briefly ineligible". It is deliberately NOT
+    // `account_id` (whoever actually serves the turn). See `TurnOutcome::Completed::expected_owner`.
+    let expected_owner = directive
+        .pin_account
+        .as_ref()
+        .map(|a| a.as_str().to_string());
     let (fp, count) = input_fingerprint_and_count(&req, &ctx);
 
     match directive.watchdog {
@@ -272,7 +280,11 @@ pub async fn execute_with_watchdog_tracked(
                 ctx,
                 account_id,
                 session_key,
-                OutcomeKind::Completed { fp, count },
+                OutcomeKind::Completed {
+                    fp,
+                    count,
+                    expected_owner,
+                },
                 runtime,
                 idle_timeout,
                 commit,
@@ -336,7 +348,11 @@ pub async fn execute_with_watchdog_tracked(
                                 ctx,
                                 account_id,
                                 session_key,
-                                OutcomeKind::Completed { fp, count },
+                                OutcomeKind::Completed {
+                                    fp,
+                                    count,
+                                    expected_owner,
+                                },
                                 runtime,
                                 idle_timeout,
                                 commit,
@@ -537,7 +553,14 @@ pub async fn signal_client_stream(
 
 #[derive(Clone)]
 enum OutcomeKind {
-    Completed { fp: String, count: u32 },
+    Completed {
+        fp: String,
+        count: u32,
+        /// The pin the turn was routed under — see `TurnOutcome::Completed::expected_owner`.
+        /// Carried from `execute_with_watchdog_tracked`'s directive through to `build_outcome`,
+        /// because by the time the stream ends the directive is long gone.
+        expected_owner: Option<String>,
+    },
     Recovered,
 }
 
@@ -551,13 +574,18 @@ fn build_outcome(
         return TurnOutcome::Failed { session_key };
     };
     match kind {
-        OutcomeKind::Completed { fp, count } => TurnOutcome::Completed {
+        OutcomeKind::Completed {
+            fp,
+            count,
+            expected_owner,
+        } => TurnOutcome::Completed {
             session_key,
             account,
             response_id,
             input_fingerprint: fp,
             input_count: count,
             reasoning: None,
+            expected_owner,
         },
         OutcomeKind::Recovered => TurnOutcome::Recovered {
             session_key,
@@ -1301,6 +1329,7 @@ mod tests {
             kind: OutcomeKind::Completed {
                 fp: String::new(),
                 count: 0,
+                expected_owner: None,
             },
             state: ObserveState::Streaming,
             runtime: Arc::new(RuntimeStates::new()),
@@ -1383,6 +1412,7 @@ mod tests {
             kind: OutcomeKind::Completed {
                 fp: String::new(),
                 count: 0,
+                expected_owner: None,
             },
             state: ObserveState::Streaming,
             runtime: rs.clone(),
@@ -1436,6 +1466,7 @@ mod tests {
             kind: OutcomeKind::Completed {
                 fp: String::new(),
                 count: 0,
+                expected_owner: None,
             },
             state: ObserveState::Streaming,
             runtime: rs.clone(),
@@ -1500,6 +1531,7 @@ mod tests {
             OutcomeKind::Completed {
                 fp: "fp".to_string(),
                 count: 1,
+                expected_owner: None,
             },
             runtime.clone(),
             Duration::ZERO,
@@ -1547,6 +1579,7 @@ mod tests {
                 OutcomeKind::Completed {
                     fp: String::new(),
                     count: 0,
+                    expected_owner: None,
                 },
                 runtime.clone(),
                 Duration::ZERO,
@@ -1585,6 +1618,7 @@ mod tests {
             OutcomeKind::Completed {
                 fp: String::new(),
                 count: 0,
+                expected_owner: None,
             },
             runtime.clone(),
             Duration::ZERO,
@@ -1623,6 +1657,7 @@ mod tests {
             kind: OutcomeKind::Completed {
                 fp: String::new(),
                 count: 0,
+                expected_owner: None,
             },
             state: ObserveState::Streaming,
             runtime: rs.clone(),
@@ -1901,6 +1936,7 @@ mod tests {
             OutcomeKind::Completed {
                 fp: String::new(),
                 count: 0,
+                expected_owner: None,
             },
             runtime.clone(),
             Duration::ZERO, // idle watchdog disabled: not under test here
@@ -1952,6 +1988,7 @@ mod tests {
             OutcomeKind::Completed {
                 fp: String::new(),
                 count: 0,
+                expected_owner: None,
             },
             runtime.clone(),
             Duration::ZERO, // idle watchdog disabled: not under test here
@@ -2035,6 +2072,7 @@ mod tests {
             OutcomeKind::Completed {
                 fp: String::new(),
                 count: 0,
+                expected_owner: None,
             },
             runtime.clone(),
             idle,
@@ -2188,6 +2226,7 @@ mod tests {
             OutcomeKind::Completed {
                 fp: String::new(),
                 count: 0,
+                expected_owner: None,
             },
             runtime.clone(),
             idle,
@@ -2242,6 +2281,7 @@ mod tests {
             OutcomeKind::Completed {
                 fp: String::new(),
                 count: 0,
+                expected_owner: None,
             },
             runtime.clone(),
             Duration::ZERO, // disabled
@@ -2321,6 +2361,7 @@ mod tests {
             OutcomeKind::Completed {
                 fp: String::new(),
                 count: 0,
+                expected_owner: None,
             },
             runtime,
             idle,

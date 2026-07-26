@@ -336,17 +336,41 @@ impl ContinuityRepo {
     /// Record a completed turn: pin owner + anchor + `state='anchored'`, and map the response id
     /// to its owner. Atomic (single transaction). The session row must already exist (prepare
     /// calls `ensure_session`); `INSERT OR IGNORE` guards a race.
+    ///
+    /// `expected_owner` is the pin the turn was ROUTED UNDER (`TurnOutcome::Completed`'s field of
+    /// the same name), which is not always `owning_account` — the account that actually served it.
+    /// It fences soft-affinity theft:
+    ///
+    /// - `None` ⇒ the turn was unpinned; its completion establishes `owning_account_id` (first pin).
+    /// - `Some(x)`, `x == owning_account` ⇒ the turn ran on its pin; write `owning_account_id`
+    ///   (this is what CORRECTS a stale affinity row back to the true owner).
+    /// - `Some(x)`, `x != owning_account` ⇒ a temporary spill (ingress re-picked over the full pool
+    ///   because the pinned owner was briefly ineligible and the turn carried no anchor to resume).
+    ///   Everything else is still written — the new anchor id, the fingerprint/count, `anchored`,
+    ///   the timestamps, and the `continuity_anchors` row mapping the NEW response to the account
+    ///   that actually produced it — but `owning_account_id` is left UNCHANGED. Without this fence
+    ///   a spilled turn silently steals ownership, the next turn pins the thief, and a session
+    ///   oscillates between two accounts (the 2026-07-22 codex-lb owner-conflict shape: one session
+    ///   resolving 1284 times to A and 779 to B, both via `source="session_row"`, with intermittent
+    ///   fast 503s because upstream conversation state lives on only one of them).
+    ///
+    /// The owner write stays inside the SAME single `UPDATE` (a `CASE WHEN`), so the fence can
+    /// never interleave with the anchor write.
     #[allow(clippy::too_many_arguments)]
     pub async fn record_completion(
         &self,
         session_key: &str,
         key_strength: &str,
         owning_account: &str,
+        expected_owner: Option<&str>,
         anchor_response_id: &str,
         input_fingerprint: &str,
         input_count: i64,
         now: i64,
     ) -> Result<(), StoreError> {
+        // Bound once, read by the `CASE WHEN` below: own the session row unless this turn was
+        // pinned somewhere else.
+        let claims_ownership = expected_owner.is_none_or(|expected| expected == owning_account);
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT OR IGNORE INTO continuity_sessions \
@@ -361,10 +385,13 @@ impl ContinuityRepo {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "UPDATE continuity_sessions SET owning_account_id = ?, anchor_response_id = ?, \
+            "UPDATE continuity_sessions SET \
+             owning_account_id = CASE WHEN ? THEN ? ELSE owning_account_id END, \
+             anchor_response_id = ?, \
              last_input_fingerprint = ?, last_input_count = ?, state = 'anchored', \
              updated_at = ?, last_activity_at = ? WHERE session_key = ?",
         )
+        .bind(claims_ownership)
         .bind(owning_account)
         .bind(anchor_response_id)
         .bind(input_fingerprint)
@@ -390,6 +417,13 @@ impl ContinuityRepo {
 
     /// Record a recovery. If a new anchor id was produced, re-home the owner + anchor + map it;
     /// otherwise just mark the session `anchored` again (Strategy B produced no new id).
+    ///
+    /// INVARIANT — this is the ONLY legitimate owner-mover, and its owner write is deliberately
+    /// UNCONDITIONAL (no `expected_owner` fence, unlike [`Self::record_completion`]). It is reached
+    /// only from ingress's deliberate recovery paths — the anchor was stripped and the conversation
+    /// was RE-ESTABLISHED from a full resend on the new account, so that account genuinely holds
+    /// the upstream state from here on. Do not add a fence here: doing so would strand a recovered
+    /// session pointing at an account that no longer has its conversation.
     pub async fn record_recovery(
         &self,
         session_key: &str,
@@ -590,7 +624,7 @@ mod tests {
         let repo = s.continuity();
 
         repo.ensure_session("sk1", "soft", 100).await.unwrap();
-        repo.record_completion("sk1", "soft", "A", "resp_1", "fp", 3, 200)
+        repo.record_completion("sk1", "soft", "A", None, "resp_1", "fp", 3, 200)
             .await
             .unwrap();
 
@@ -622,7 +656,7 @@ mod tests {
         seed_account(&s, "B").await;
         let repo = s.continuity();
         repo.ensure_session("sk3", "soft", 1).await.unwrap();
-        repo.record_completion("sk3", "soft", "A", "resp_1", "fp", 2, 2)
+        repo.record_completion("sk3", "soft", "A", None, "resp_1", "fp", 2, 2)
             .await
             .unwrap();
         repo.record_recovery("sk3", "B", Some("resp_2"), 3)
@@ -714,12 +748,12 @@ mod tests {
 
         // skA: owned by A, last_activity_at = 300 (most recent).
         repo.ensure_session("skA", "soft", 1).await.unwrap();
-        repo.record_completion("skA", "soft", "A", "respA", "fp", 1, 300)
+        repo.record_completion("skA", "soft", "A", None, "respA", "fp", 1, 300)
             .await
             .unwrap();
         // skB: owned by B, last_activity_at = 200 (oldest).
         repo.ensure_session("skB", "soft", 1).await.unwrap();
-        repo.record_completion("skB", "soft", "B", "respB", "fp", 1, 200)
+        repo.record_completion("skB", "soft", "B", None, "respB", "fp", 1, 200)
             .await
             .unwrap();
         // skNone: NEVER completed a turn -> owning_account_id stays NULL (a fresh session), with
@@ -830,14 +864,14 @@ mod tests {
 
         // old: last_activity_at 100 (< cutoff 200) — pruned, its anchor cascaded.
         repo.ensure_session("old", "soft", 1).await.unwrap();
-        repo.record_completion("old", "soft", "A", "resp_old", "fp", 1, 100)
+        repo.record_completion("old", "soft", "A", None, "resp_old", "fp", 1, 100)
             .await
             .unwrap();
         // edge: last_activity_at exactly the cutoff — survives (strict `<`).
         repo.ensure_session("edge", "soft", 200).await.unwrap();
         // live: last_activity_at 300 — survives, anchor still resolvable.
         repo.ensure_session("live", "soft", 1).await.unwrap();
-        repo.record_completion("live", "soft", "A", "resp_live", "fp", 1, 300)
+        repo.record_completion("live", "soft", "A", None, "resp_live", "fp", 1, 300)
             .await
             .unwrap();
 
@@ -866,10 +900,10 @@ mod tests {
         let repo = s.continuity();
         repo.ensure_session("sk", "soft", 1).await.unwrap();
         // Two completed turns: the old anchor (created 100) is superseded by the young one (300).
-        repo.record_completion("sk", "soft", "A", "resp_1", "fp", 1, 100)
+        repo.record_completion("sk", "soft", "A", None, "resp_1", "fp", 1, 100)
             .await
             .unwrap();
-        repo.record_completion("sk", "soft", "A", "resp_2", "fp", 2, 300)
+        repo.record_completion("sk", "soft", "A", None, "resp_2", "fp", 2, 300)
             .await
             .unwrap();
 

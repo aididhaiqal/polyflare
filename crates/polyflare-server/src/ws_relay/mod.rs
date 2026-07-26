@@ -466,6 +466,14 @@ async fn relay(
                             input_fingerprint: String::new(),
                             input_count: 0,
                             reasoning: None,
+                            // `None` = unfenced, deliberately (the soft-affinity fence on
+                            // `record_completion` is for the HTTP spill path). The relay's account
+                            // only ever changes through the exhaustion-move engine below, which
+                            // RE-ESTABLISHES the conversation on the new account — the same
+                            // "deliberate owner-mover" category as `record_recovery` — so the
+                            // account that produced this id must become the owner, per the
+                            // per-call-account note above.
+                            expected_owner: None,
                         },
                         &RequestCtx::default(),
                     )

@@ -1197,7 +1197,7 @@ mod tests {
         state
             .store
             .continuity()
-            .record_completion(&sk.value, "hard", "B", "resp_owned", "fp", 1, now)
+            .record_completion(&sk.value, "hard", "B", None, "resp_owned", "fp", 1, now)
             .await
             .unwrap();
 
@@ -1254,7 +1254,7 @@ mod tests {
         state
             .store
             .continuity()
-            .record_completion(&sk.value, "hard", "B", "resp_benched", "fp", 1, now)
+            .record_completion(&sk.value, "hard", "B", None, "resp_benched", "fp", 1, now)
             .await
             .unwrap();
         // Bench the owner "B" (a real cooldown — `RuntimeStates::overlay` applies `cooldown_until`
@@ -1318,7 +1318,16 @@ mod tests {
         state
             .store
             .continuity()
-            .record_completion(&owned_key.value, "hard", "B", "resp_other", "fp", 1, now)
+            .record_completion(
+                &owned_key.value,
+                "hard",
+                "B",
+                None,
+                "resp_other",
+                "fp",
+                1,
+                now,
+            )
             .await
             .unwrap();
 
@@ -1369,7 +1378,7 @@ mod tests {
         state
             .store
             .continuity()
-            .record_completion(&key.value, "soft", "P", "resp_p", "fp", 1, now)
+            .record_completion(&key.value, "soft", "P", None, "resp_p", "fp", 1, now)
             .await
             .unwrap();
 

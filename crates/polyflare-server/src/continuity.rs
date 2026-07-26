@@ -201,14 +201,34 @@ impl Continuity for CodexContinuity {
                 response_id,
                 input_fingerprint,
                 input_count,
+                expected_owner,
                 ..
             } => {
                 if let (Some(sk), Some(rid)) = (session_key, response_id) {
+                    // The soft-affinity fence (see `record_completion`'s doc): a turn that was
+                    // pinned to one account but SERVED by another is a temporary spill — it must
+                    // not move `owning_account_id`. Surface it, because a spill that keeps
+                    // recurring on the same session is the oscillation signature worth chasing
+                    // (the codex-lb `internal_soft_affinity_spillover` analog). Content-free: two
+                    // account ids and an already-hashed session key.
+                    if let Some(expected) = expected_owner
+                        .as_deref()
+                        .filter(|expected| *expected != account.as_str())
+                    {
+                        tracing::warn!(
+                            target: "continuity_soft_affinity_spillover",
+                            session = sk.value.as_str(),
+                            expected_owner = expected,
+                            served_by = account.as_str(),
+                            "turn spilled off its pinned owner; session ownership left unchanged"
+                        );
+                    }
                     self.repo
                         .record_completion(
                             &sk.value,
                             strength_str(sk.strength),
                             account.as_str(),
+                            expected_owner.as_deref(),
                             &rid,
                             &input_fingerprint,
                             input_count as i64,
@@ -420,7 +440,7 @@ mod tests {
             .unwrap();
         store
             .continuity()
-            .record_completion("skA", "soft", "A", "resp_1", "fp", 2, 1)
+            .record_completion("skA", "soft", "A", None, "resp_1", "fp", 2, 1)
             .await
             .unwrap();
 
@@ -462,6 +482,7 @@ mod tests {
             TurnOutcome::Completed {
                 session_key: Some(sk),
                 account: AccountId::from("A"),
+                expected_owner: None,
                 response_id: Some("resp_7".into()),
                 input_fingerprint: "fp".into(),
                 input_count: 2,
@@ -591,7 +612,7 @@ mod tests {
         // Turn 1 completed on A → anchor map resp_1→A, session row owner A.
         cont.repo.ensure_session("skS", "soft", 1).await.unwrap();
         cont.repo
-            .record_completion("skS", "soft", "A", "resp_1", "fp", 2, 1)
+            .record_completion("skS", "soft", "A", None, "resp_1", "fp", 2, 1)
             .await
             .unwrap();
         // Inject the stale-affinity drift: the session row now claims B.
@@ -638,7 +659,7 @@ mod tests {
         }
         cont.repo.ensure_session("skT", "soft", 1).await.unwrap();
         cont.repo
-            .record_completion("skT", "soft", "A", "resp_1", "fp", 2, 1)
+            .record_completion("skT", "soft", "A", None, "resp_1", "fp", 2, 1)
             .await
             .unwrap();
         sqlx::query(
@@ -656,6 +677,7 @@ mod tests {
                     strength: KeyStrength::Soft,
                 }),
                 account: AccountId::from("A"),
+                expected_owner: None,
                 response_id: Some("resp_2".into()),
                 input_fingerprint: "fp".into(),
                 input_count: 3,
@@ -693,7 +715,7 @@ mod tests {
         }
         cont.repo.ensure_session("skR", "soft", 1).await.unwrap();
         cont.repo
-            .record_completion("skR", "soft", "A", "resp_1", "fp", 2, 1)
+            .record_completion("skR", "soft", "A", None, "resp_1", "fp", 2, 1)
             .await
             .unwrap();
         let sk = polyflare_core::SessionKey {
