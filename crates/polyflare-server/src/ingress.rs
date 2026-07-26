@@ -1399,12 +1399,9 @@ fn layer2_wait_stream(
         };
         let mut fresh_snapshots =
             filter_by_provider_and_pool(&fresh_snapshots, pool_provider, pool.as_deref());
-        fresh_snapshots.retain(|snapshot| {
-            state
-                .model_catalog
-                .account_supports_model(snapshot.id.as_str(), &req.model)
-                != Some(false)
-        });
+        state
+            .model_catalog
+            .retain_accounts_supporting(&mut fresh_snapshots, &req.model);
         state.runtime.overlay(&mut fresh_snapshots, fresh_now);
 
         let fresh = match selector.pick(&fresh_snapshots, &fresh_sel_ctx) {
@@ -2675,12 +2672,9 @@ async fn responses_handler_impl_with_max_attempts(
     // M4a has no cross-format translator (that's M4b): `/responses` may only ever pick a
     // Codex-provider account. One pass also narrows to the requested pool (`None` = all accounts).
     let mut snapshots = filter_by_provider_and_pool(&snapshots, Provider::Codex, pool);
-    snapshots.retain(|snapshot| {
-        state
-            .model_catalog
-            .account_supports_model(snapshot.id.as_str(), &model_for_selection)
-            != Some(false)
-    });
+    state
+        .model_catalog
+        .retain_accounts_supporting(&mut snapshots, &model_for_selection);
     // Overlay live per-account routing state (error_count/cooldown/last_error) onto the filtered
     // slice so the selector's eligibility gates see real failure signal, not neutral defaults.
     state.runtime.overlay(&mut snapshots, now);
@@ -3945,12 +3939,9 @@ async fn messages_handler_codex_aliased(
     // The mirror of `/responses`'s Codex-only filter: an aliased-to-Codex turn may only ever pick
     // a Codex-provider account, regardless of what `/v1/messages` itself would otherwise select.
     let mut snapshots = filter_by_provider_and_pool(&snapshots, Provider::Codex, pool);
-    snapshots.retain(|snapshot| {
-        state
-            .model_catalog
-            .account_supports_model(snapshot.id.as_str(), &model_for_selection)
-            != Some(false)
-    });
+    state
+        .model_catalog
+        .retain_accounts_supporting(&mut snapshots, &model_for_selection);
     state.runtime.overlay(&mut snapshots, now);
     let selector = state.selector_for(pool);
     let sel_ctx = SelectionCtx {

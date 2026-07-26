@@ -429,6 +429,35 @@ impl ModelCatalogCache {
             .map(|models| models.contains(model))
     }
 
+    /// Filter `snapshots` down to the accounts that can serve `model` — but ONLY when the catalog
+    /// has positive evidence that at least one of them can.
+    ///
+    /// `account_supports_model` answers `Some(false)` for any account whose model list is known and
+    /// simply lacks the string. So an UNCATALOGUED model (a variant we have never enumerated —
+    /// codex has been observed sending shapes like `gpt-5.6-sol-premium…`) returns `Some(false)` for
+    /// every account, empties the candidate list, and the request is refused locally with
+    /// "no eligible account" though every account was healthy and would have served it. That fired
+    /// on a real `/responses/compact` turn on 2026-07-26 (reproduced on demand), and a refused
+    /// compaction is precisely what a large thread cannot afford.
+    ///
+    /// So: fail CLOSED on evidence (some account supports it ⇒ keep only those), fail OPEN on
+    /// ignorance (nobody claims it ⇒ let upstream be the authority on its own model names).
+    pub fn retain_accounts_supporting(
+        &self,
+        snapshots: &mut Vec<polyflare_core::AccountSnapshot>,
+        model: &str,
+    ) {
+        let anyone_supports = snapshots
+            .iter()
+            .any(|snapshot| self.account_supports_model(snapshot.id.as_str(), model) == Some(true));
+        if !anyone_supports {
+            return;
+        }
+        snapshots.retain(|snapshot| {
+            self.account_supports_model(snapshot.id.as_str(), model) != Some(false)
+        });
+    }
+
     fn fresh_scoped(&self, scope: &[String]) -> Option<ScopedCatalog> {
         let guard = self
             .scoped
@@ -1116,6 +1145,81 @@ mod tests {
         floor: Vec<UpstreamModel>,
     ) -> ModelCatalogCache {
         ModelCatalogCache::new(Box::new(SharedSource(stub.clone())), ttl, floor)
+    }
+
+    /// REGRESSION (live 2026-07-26): a model the catalog has never enumerated made
+    /// `account_supports_model` answer `Some(false)` for EVERY account, so the candidate list
+    /// emptied and a real `/responses/compact` turn was refused locally with "no eligible account"
+    /// while all five accounts were healthy. Evidence must narrow the field; ignorance must not
+    /// empty it.
+    #[tokio::test]
+    async fn an_uncatalogued_model_must_not_empty_the_candidate_list() {
+        struct PerAccount;
+        #[async_trait]
+        impl ModelSource for PerAccount {
+            async fn fetch(&self) -> Option<FetchedCatalog> {
+                None
+            }
+            async fn fetch_scoped(&self, account_ids: &[String]) -> Option<Vec<AccountCatalog>> {
+                Some(
+                    account_ids
+                        .iter()
+                        .map(|id| AccountCatalog {
+                            account_id: id.clone(),
+                            catalog: FetchedCatalog {
+                                models: if id == "acct-a" {
+                                    vec![model("gpt-5.6-sol", "Sol"), model("shared", "Shared")]
+                                } else {
+                                    vec![model("shared", "Shared")]
+                                },
+                                etag: Some(format!("\"{id}\"")),
+                            },
+                        })
+                        .collect(),
+                )
+            }
+        }
+
+        let cache = ModelCatalogCache::new(
+            Box::new(PerAccount),
+            Duration::from_secs(60),
+            default_floor(),
+        );
+        let scope = vec!["acct-a".to_string(), "acct-b".to_string()];
+        let _ = cache.get_or_refresh_scoped(&scope).await;
+
+        let snap = |id: &str| {
+            let mut s = polyflare_core::AccountSnapshot::new(id);
+            s.plan_type = "pro".to_string();
+            s
+        };
+
+        // Evidence narrows: only acct-a claims sol.
+        let mut only_a = vec![snap("acct-a"), snap("acct-b")];
+        cache.retain_accounts_supporting(&mut only_a, "gpt-5.6-sol");
+        assert_eq!(
+            only_a
+                .iter()
+                .map(|s| s.id.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["acct-a".to_string()],
+            "a model only one account supports must narrow to that account"
+        );
+
+        // Both claim `shared`.
+        let mut both = vec![snap("acct-a"), snap("acct-b")];
+        cache.retain_accounts_supporting(&mut both, "shared");
+        assert_eq!(both.len(), 2, "a commonly supported model keeps everyone");
+
+        // Ignorance must NOT empty the list — this is the bug.
+        let mut unknown = vec![snap("acct-a"), snap("acct-b")];
+        cache.retain_accounts_supporting(&mut unknown, "gpt-5.6-sol-premium-unenumerated-variant");
+        assert_eq!(
+            unknown.len(),
+            2,
+            "an uncatalogued model must leave every candidate in place and let upstream decide — \
+             emptying the list refuses a request every account could have served"
+        );
     }
 
     fn default_floor() -> Vec<UpstreamModel> {
