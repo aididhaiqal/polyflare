@@ -64,6 +64,22 @@ async fn spawn_live_logs_with_oauth_base(
     enabled: bool,
     oauth_base_url: String,
 ) -> (String, Arc<AppState>) {
+    spawn_live_logs_with_ws(upstream_url, enabled, oauth_base_url, false).await
+}
+
+/// As above, but able to enable the downstream WebSocket relay. Separate so every existing caller
+/// keeps the historical `ws_downstream: false` without restating it.
+#[allow(dead_code)]
+pub async fn spawn_ws_downstream(upstream_url: String) -> (String, Arc<AppState>) {
+    spawn_live_logs_with_ws(upstream_url, true, "http://127.0.0.1:9".to_string(), true).await
+}
+
+async fn spawn_live_logs_with_ws(
+    upstream_url: String,
+    enabled: bool,
+    oauth_base_url: String,
+    ws_downstream: bool,
+) -> (String, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
     let cipher = TokenCipher::from_key_bytes(&[7u8; 32]).unwrap();
@@ -117,7 +133,7 @@ async fn spawn_live_logs_with_oauth_base(
             usage_history_retention_days: 0,
             live_logs: enabled,
         })),
-        ws_downstream: false,
+        ws_downstream,
         ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),

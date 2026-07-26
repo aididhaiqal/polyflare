@@ -299,6 +299,14 @@ pub fn build_app(state: Arc<AppState>) -> Router {
                 .delete(crate::provider_api::delete_credential),
         )
         .route(
+            "/api/ws/sse-pins",
+            get(crate::sse_pins::list).post(crate::sse_pins::add),
+        )
+        .route(
+            "/api/ws/sse-pins/{thread_id}",
+            axum::routing::delete(crate::sse_pins::remove),
+        )
+        .route(
             "/api/translations/builtin-models",
             get(crate::translation_api::builtin_models),
         )

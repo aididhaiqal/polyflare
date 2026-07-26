@@ -35,6 +35,7 @@ pub mod runtime_state;
 pub mod session_key;
 pub mod snapshot;
 pub mod sse;
+pub mod sse_pins;
 pub mod starvation;
 pub mod token_cache;
 pub mod translate_stream;
