@@ -1196,3 +1196,30 @@ export const api = {
  * its own export since `usePace` (queries.ts) is written against a `fetchPace()`-shaped fetcher —
  * same underlying `fetchJson` call as every other endpoint above. */
 export const fetchPace = api.pace;
+
+/** Threads currently answered `426` at the WebSocket handshake, so that ONE conversation runs over
+ * HTTP-SSE while every other thread keeps WebSocket. Mirrors `sse_pins.rs`'s `PinsView`.
+ *
+ * The id is the Codex THREAD id, never the session id — one session can carry several threads, and
+ * pinning by session would divert all of them. See `sse_pins::is_pinned`. */
+export interface SsePinsView {
+  pinned_threads: string[];
+}
+
+export function fetchSsePins(): Promise<SsePinsView> {
+  return fetchJson<SsePinsView>("/api/ws/sse-pins");
+}
+
+export function addSsePin(threadId: string): Promise<SsePinsView> {
+  return fetchJson<SsePinsView>("/api/ws/sse-pins", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ thread_id: threadId }),
+  });
+}
+
+export function removeSsePin(threadId: string): Promise<SsePinsView> {
+  return fetchJson<SsePinsView>(`/api/ws/sse-pins/${encodeURIComponent(threadId)}`, {
+    method: "DELETE",
+  });
+}

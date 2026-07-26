@@ -764,3 +764,37 @@ export function useUpdateKey() {
     onError: (e) => toast({ title: "Update failed", description: mutationErrorText(e), variant: "error" }),
   });
 }
+
+// --- WebSocket transport pins -------------------------------------------------------------------
+import {
+  addSsePin,
+  fetchSsePins,
+  removeSsePin,
+  type SsePinsView,
+} from "./api";
+
+const ssePinsKey = ["ws", "sse-pins"] as const;
+
+export function useSsePins() {
+  return useQuery<SsePinsView>({ queryKey: ssePinsKey, queryFn: fetchSsePins });
+}
+
+export function useAddSsePin() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (threadId: string) => addSsePin(threadId),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ssePinsKey });
+    },
+  });
+}
+
+export function useRemoveSsePin() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (threadId: string) => removeSsePin(threadId),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ssePinsKey });
+    },
+  });
+}

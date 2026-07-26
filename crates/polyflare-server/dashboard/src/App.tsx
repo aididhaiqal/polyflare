@@ -22,6 +22,7 @@ import { Requests } from "./pages/Requests";
 import { Sessions } from "./pages/Sessions";
 import { Settings } from "./pages/Settings";
 import { Translations } from "./pages/Translations";
+import { Transport } from "./pages/Transport";
 import { Shell } from "./shell/Shell";
 import { ToastProvider } from "./ui/Toast";
 
@@ -61,6 +62,7 @@ export function App() {
                 <Route path="reset-credits" element={<ResetCredits />} />
                 <Route path="providers" element={<Providers />} />
                 <Route path="translations" element={<Translations />} />
+                <Route path="transport" element={<Transport />} />
                 <Route path="requests" element={<Requests />} />
                 <Route path="sessions" element={<Sessions />} />
                 <Route path="reports" element={<Reports />} />
