@@ -1418,6 +1418,16 @@ impl RuntimeStates {
             }
         };
         if !acquired {
+            // The one admission gate that used to refuse in total silence — no metric, no log —
+            // while two ingress reselect paths turn its `None` straight into a client-visible 503
+            // (see `ingress::admission_refused_on_reselect`). That blind spot is why the
+            // 2026-07-26 16:42-17:38 burst of 89 fast 503s could not be told apart from a
+            // selector-found-nothing refusal: both surfaced as the same unlabelled response with
+            // every admission counter reading zero. `NewRequest` is the correct lane — this is the
+            // non-waiting acquire used when routing has just RESELECTED an account, never the
+            // pinned-owner wait.
+            self.admission_metrics
+                .record_ineligible(AdmissionLane::NewRequest);
             return None;
         }
         metrics.record_acquire();
@@ -3360,6 +3370,38 @@ mod tests {
 
         drop(owner_recovery);
         drop(ordinary);
+    }
+
+    #[test]
+    fn a_refused_reselect_acquire_is_counted_not_silent() {
+        // Regression (2026-07-26): this gate used to return `None` with no metric and no log,
+        // while two ingress reselect paths turn that `None` straight into a client-visible 503.
+        // A burst of 89 such refusals on one account therefore left EVERY admission counter
+        // reading zero, which is exactly what made the incident indistinguishable from a
+        // selector-found-nothing refusal and cost hours of misdirected investigation.
+        let runtime = Arc::new(RuntimeStates::with_admission_limits(AdmissionLimits {
+            account_in_flight: 2,
+            owner_recovery_reserve: 1,
+            ..AdmissionLimits::default()
+        }));
+        let metrics = LeaseMetrics::new();
+        let account = AccountId::from("busy");
+        assert_eq!(admission_lane(&runtime, "request", "new").ineligible, 0);
+
+        let _held = runtime
+            .try_acquire_in_flight_weighted(&account, 1_000, &metrics, 1)
+            .expect("the first acquire fits inside the ordinary (non-reserved) limit");
+        assert!(
+            runtime
+                .try_acquire_in_flight_weighted(&account, 1_001, &metrics, 1)
+                .is_none(),
+            "the account is now at its ordinary in-flight limit"
+        );
+        assert_eq!(
+            admission_lane(&runtime, "request", "new").ineligible,
+            1,
+            "a refusal that becomes a client-visible 503 must leave a counter behind"
+        );
     }
 
     #[tokio::test]

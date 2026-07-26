@@ -149,6 +149,46 @@ fn account_unavailable_because(reason: &'static str, account_id: &str) -> Respon
     (StatusCode::SERVICE_UNAVAILABLE, "account unavailable").into_response()
 }
 
+/// The 503 a RESELECTED account's admission refusal surfaces.
+///
+/// `RuntimeStates::try_acquire_in_flight_weighted` is non-blocking: unlike the pinned-owner
+/// acquire (which waits `wait_timeout`) it gives up instantly, and both recovery arms below turn
+/// that into a client-visible 503. Until 2026-07-26 it shared `no_eligible`'s wording, so a
+/// "capacity refused this account" 503 was indistinguishable in the logs from a "selector found
+/// nothing at all" 503. The response BODY stays byte-identical to `no_eligible` — only the log line
+/// differs, so no client sees a behaviour change. Content-free: a label, an account id, and the
+/// integer pressure units the request asked for.
+fn admission_refused_on_reselect(account_id: &str, pressure_units: u32) -> Response {
+    tracing::warn!(
+        reason = "admission_refused_on_reselect",
+        account_id,
+        pressure_units,
+        "reselected account had no admission capacity (503)"
+    );
+    (StatusCode::SERVICE_UNAVAILABLE, "no eligible account").into_response()
+}
+
+/// Bench an account that a LOCAL gate just refused, so the selector stops handing it the next
+/// request.
+///
+/// Every locally-generated, account-attributed 503 (account resolution refused, reselect admission
+/// refused) used to leave routing health completely untouched: `record_failure` only writes on a
+/// `WatchdogError::Upstream`/`UpstreamHttp`, and all of these paths `return` long before it. So the
+/// account stayed exactly as preferred as it was a microsecond earlier, the very next request
+/// picked it again, and the loop had no exit — 89 fast 503s on one account between 16:42 and 17:38
+/// on 2026-07-26, none of which ever benched it. This is the missing exit: two refusals inside the
+/// 60s window drop the account to DRAINING so the health-tier pool stops preferring it, and a third
+/// trips the selector's `error_count >= 3` backoff gate — the pool moves on without a client retry.
+///
+/// Deliberately `record_transient_error` and not a cooldown or a status write: a local refusal is
+/// not evidence about the upstream account, only about our ability to serve it right now. The
+/// counter lives in memory, clears on the first success, and expires on its own (30s at three
+/// strikes, capped at 300s) — so a transient DB blip or a momentary capacity squeeze costs one
+/// backoff window, never a durable mark on the account.
+fn bench_after_local_refusal(state: &AppState, id: &AccountId, now: i64) {
+    let _ = state.runtime.record_transient_error(id, now);
+}
+
 /// `pub(crate)`: also reused by `crate::control::resolve_control_account`'s snapshot-read failure
 /// path, for a byte-identical generic 500.
 pub(crate) fn internal_error() -> Response {
@@ -2771,7 +2811,10 @@ async fn responses_handler_impl_with_max_attempts(
             outcome.account_id = Some(id.as_str().to_string());
             let (account, provider) = match resolve_core_account(&state, &id, now).await {
                 Ok(a) => a,
-                Err(r) => return (r, outcome),
+                Err(r) => {
+                    bench_after_local_refusal(&state, &id, now);
+                    return (r, outcome);
+                }
             };
             let health_id = id.clone(); // `id` is moved into the executor below.
                                         // C9 Task 2: the in-flight lease for this FIRST attempt on `id`. On success it
@@ -3045,7 +3088,10 @@ async fn responses_handler_impl_with_max_attempts(
                     let (account, provider) = match resolve_core_account(&state, &fresh, now).await
                     {
                         Ok(a) => a,
-                        Err(r) => return (r, outcome),
+                        Err(r) => {
+                            bench_after_local_refusal(&state, &fresh, now);
+                            return (r, outcome);
+                        }
                     };
                     let health_id = fresh.clone(); // `fresh` is moved into the executor below.
                                                    // C9 Task 2: the owner-ineligible recovery's reselected attempt on `fresh`
@@ -3057,7 +3103,14 @@ async fn responses_handler_impl_with_max_attempts(
                         &state.lease_metrics,
                         sel_ctx.request_pressure_units,
                     ) else {
-                        return (no_eligible(), outcome);
+                        bench_after_local_refusal(&state, &fresh, now);
+                        return (
+                            admission_refused_on_reselect(
+                                fresh.as_str(),
+                                sel_ctx.request_pressure_units,
+                            ),
+                            outcome,
+                        );
                     };
                     match execute_recovery_tracked(
                         state.executor_for(provider).as_ref(),
@@ -3111,7 +3164,10 @@ async fn responses_handler_impl_with_max_attempts(
                             let (account, provider) =
                                 match resolve_core_account(&state, &fresh, now).await {
                                     Ok(a) => a,
-                                    Err(r) => return (r, outcome),
+                                    Err(r) => {
+                                        bench_after_local_refusal(&state, &fresh, now);
+                                        return (r, outcome);
+                                    }
                                 };
                             let fallback = Prepared {
                                 req: prepared.req,
@@ -3146,7 +3202,14 @@ async fn responses_handler_impl_with_max_attempts(
                                 &state.lease_metrics,
                                 sel_ctx.request_pressure_units,
                             ) else {
-                                return (no_eligible(), outcome);
+                                bench_after_local_refusal(&state, &fresh, now);
+                                return (
+                                    admission_refused_on_reselect(
+                                        fresh.as_str(),
+                                        sel_ctx.request_pressure_units,
+                                    ),
+                                    outcome,
+                                );
                             };
                             match execute_with_watchdog_tracked(
                                 state.executor_for(provider).as_ref(),
