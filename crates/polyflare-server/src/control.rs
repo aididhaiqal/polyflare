@@ -202,12 +202,10 @@ async fn resolve_owner_affine_account_inner(
     };
     let mut snapshots = filter_by_provider_and_pool(&snapshots, Provider::Codex, pool);
     if let Some(model) = model {
-        snapshots.retain(|snapshot| {
-            state
-                .model_catalog
-                .account_supports_model(snapshot.id.as_str(), model)
-                != Some(false)
-        });
+        // Fails open when NO account claims the model — see `retain_accounts_supporting`.
+        state
+            .model_catalog
+            .retain_accounts_supporting(&mut snapshots, model);
     }
     state.runtime.overlay(&mut snapshots, now);
     let selector = state.selector_for(pool);
