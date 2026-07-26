@@ -53,6 +53,11 @@ pub(crate) struct WsTurnTerminal {
     pub usage: Option<ResponseUsage>,
     pub routing: WsRoutingOutcome,
     pub protocol_outcome: RequestProtocolOutcome,
+    /// The upstream's own reason for a non-completed terminal (`error.code` only — never the
+    /// message). Without this a mid-stream failure lands in the log indistinguishable from every
+    /// other, which is exactly what made the 2026-07-25 ~16s failure cluster take a whole evening
+    /// of timing inference to (not) explain.
+    pub error_code: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -149,18 +154,21 @@ impl WsTurnTelemetry {
         let value: Value = serde_json::from_str(frame).ok()?;
         match value.get("type").and_then(Value::as_str)? {
             "response.completed" => Some(WsTurnTerminal {
+                error_code: None,
                 status: StatusCode::OK,
                 usage: parse_response_usage(frame),
                 routing: WsRoutingOutcome::Completed,
                 protocol_outcome: RequestProtocolOutcome::Completed,
             }),
             "response.failed" => Some(WsTurnTerminal {
+                error_code: Self::terminal_error_code(&value),
                 status: StatusCode::BAD_GATEWAY,
                 usage: parse_response_usage(frame),
                 routing: WsRoutingOutcome::TerminalNoWriteback,
                 protocol_outcome: RequestProtocolOutcome::Failed,
             }),
             "response.incomplete" => Some(WsTurnTerminal {
+                error_code: Self::terminal_error_code(&value),
                 status: StatusCode::BAD_GATEWAY,
                 usage: None,
                 routing: WsRoutingOutcome::TerminalNoWriteback,
@@ -178,10 +186,32 @@ impl WsTurnTelemetry {
                     usage: None,
                     routing: WsRoutingOutcome::TerminalNoWriteback,
                     protocol_outcome: RequestProtocolOutcome::Failed,
+                    error_code: Self::wrapped_error_code(&value),
                 })
             }
             _ => None,
         }
+    }
+
+    /// The `error.code` of a terminal `response.failed` / `response.incomplete` frame.
+    ///
+    /// Content-free by construction: reads ONLY the bounded `code` discriminant (the same field
+    /// `signal::classify_upstream_signal` and `watchdog::classify_frame` already key off) and never
+    /// `message`, `param`, or any other free-text field.
+    fn terminal_error_code(value: &Value) -> Option<String> {
+        value
+            .pointer("/response/error/code")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// As [`terminal_error_code`], for the wrapped `{"type":"error","error":{...}}` envelope whose
+    /// code sits one level higher.
+    fn wrapped_error_code(value: &Value) -> Option<String> {
+        value
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .map(str::to_string)
     }
 
     /// Persist and publish the same observability shape as an HTTP-SSE completion.
@@ -271,6 +301,7 @@ impl WsTurnTelemetry {
         record.cost_usd = cost;
         record.latency_first_token_ms = log.ttft_ms;
         record.protocol_outcome = Some(terminal.protocol_outcome);
+        record.error_code = terminal.error_code.clone();
         crate::ingress::queue_persist_request_log(&state.store, record);
         if let Err(error) = state
             .store
@@ -299,6 +330,64 @@ impl WsTurnTelemetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The upstream tells us WHY a turn died; the log must keep that reason. Before this, every
+    /// mid-stream failure landed with an empty `error_code` and the only way to distinguish them
+    /// was to infer from timing (the 2026-07-25 ~16s cluster took an evening and still went
+    /// unexplained).
+    #[test]
+    fn a_terminal_failure_keeps_the_upstreams_reason() {
+        let headers = HeaderMap::new();
+        let mut turn = start_turn(
+            &headers,
+            r#"{"type":"response.create","model":"gpt-5.6-sol"}"#,
+            &super::super::session::ws_session_key(&headers, None),
+            None,
+        )
+        .expect("a generating frame starts a turn");
+
+        let terminal = turn
+            .observe(
+                r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"secret"}}}"#,
+            )
+            .expect("response.failed is terminal");
+        assert_eq!(
+            terminal.error_code.as_deref(),
+            Some("server_error"),
+            "the upstream's own code must survive into the record"
+        );
+
+        // Content-safety: the code is captured, the message is not — anywhere.
+        let debugged = format!("{:?}", terminal.error_code);
+        assert!(
+            !debugged.contains("secret"),
+            "only the bounded code may be retained, never the free-text message"
+        );
+    }
+
+    /// A wrapped `{"type":"error"}` envelope carries its code one level higher; both shapes must
+    /// be captured, and a clean completion must record none.
+    #[test]
+    fn wrapped_errors_and_completions_record_the_right_code() {
+        let headers = HeaderMap::new();
+        let key = super::super::session::ws_session_key(&headers, None);
+        let create = r#"{"type":"response.create","model":"gpt-5.6-sol"}"#;
+
+        let mut wrapped = start_turn(&headers, create, &key, None).expect("turn");
+        let terminal = wrapped
+            .observe(r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#)
+            .expect("wrapped error is terminal");
+        assert_eq!(terminal.error_code.as_deref(), Some("rate_limit_exceeded"));
+
+        let mut ok = start_turn(&headers, create, &key, None).expect("turn");
+        let done = ok
+            .observe(r#"{"type":"response.completed","response":{"id":"resp_1"}}"#)
+            .expect("completion is terminal");
+        assert_eq!(
+            done.error_code, None,
+            "a successful turn must not invent a failure reason"
+        );
+    }
 
     #[test]
     fn accounts_for_prewarm_but_ignores_non_create_frames() {

@@ -1369,6 +1369,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                 } else {
                     polyflare_store::RequestProtocolOutcome::TransportLost
                 },
+                // A teardown carries no upstream terminal frame, so there is no code to record —
+                // the transport simply ended. `protocol_outcome` above is the whole story here.
+                error_code: None,
             },
         )
         .await;

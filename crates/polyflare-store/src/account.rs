@@ -1983,6 +1983,7 @@ mod tests {
             cost_usd: None,
             latency_first_token_ms: None,
             protocol_outcome: None,
+            error_code: None,
         }
     }
 
