@@ -5,7 +5,6 @@ mod support;
 
 use support::spawn_ws_downstream;
 
-
 // NOTE: the end-to-end "pinned thread gets 426, others get 101" assertion is deliberately absent.
 // The shared test harness does not produce a GET /responses route this test can exercise
 // (405 regardless of the ws_downstream flag), which is a harness routing quirk unrelated to
