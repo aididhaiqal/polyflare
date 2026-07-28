@@ -20,6 +20,37 @@ use serde_json::{json, Value};
 /// platform (observed live 2026-07-25: fugu-minted `rs_*` items replayed to the codex backend).
 pub(crate) const INVALID_ENCRYPTED_CONTENT_CODE: &str = "invalid_encrypted_content";
 
+/// A validator rejection of an input item's SHAPE, seen when a `reasoning` item minted by another
+/// platform carries a `content` array the native API requires to be empty (observed live
+/// 2026-07-29: a thread moved sol -> kimi -> sol died with
+/// `Invalid 'input[363].content': array too long. Expected an array with maximum length 0`).
+pub(crate) const ARRAY_ABOVE_MAX_LENGTH_CODE: &str = "array_above_max_length";
+
+/// Whether `code` names an upstream rejection a BYTE-IDENTICAL resend can never clear, because the
+/// request's own history is what upstream is objecting to.
+///
+/// Both codes are the same defect reached through different doors: an item minted by one platform
+/// and replayed to another. The validator is deterministic, so retrying the same body is guaranteed
+/// to fail again — the only move that can work is rewriting the history, which is what
+/// [`strip_unverifiable_reasoning`] does. Without this, the thread is permanently stuck: the
+/// operation that would move it forward is the one that cannot run.
+///
+/// Deliberately matched on the CODE alone. [`polyflare_core::FailureSignal`] carries no message and
+/// no `param` path by design (content-safety: the message echoes request framing), so "any 400
+/// naming an `input[N]` item" — the broader rule this would ideally express — is not expressible
+/// here without leaking request-derived text into the signal. Widening the list is a one-line
+/// change when the next door turns up.
+///
+/// A false positive is cheap and self-limiting: both strip functions return `None` when the body
+/// carries no reasoning items, so a genuine client-side shape error never triggers a retry at all —
+/// it surfaces unchanged.
+pub(crate) fn is_unresendable_history_code(code: &str) -> bool {
+    matches!(
+        code,
+        INVALID_ENCRYPTED_CONTENT_CODE | ARRAY_ABOVE_MAX_LENGTH_CODE
+    )
+}
+
 /// Rewrite a buffered `response.create` client frame so it no longer carries reasoning envelopes.
 ///
 /// Returns `Some(frame)` with every `input` item of type `"reasoning"` removed; an item whose
@@ -132,6 +163,62 @@ fn reasoning_summary_text(item: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gate that decides whether a poisoned-history rewrite is even attempted. Until
+    /// 2026-07-29 it was a single `==` against `invalid_encrypted_content`, so the SAME poisoning
+    /// arriving as a shape rejection walked straight past it and the thread resent an identical
+    /// body to a deterministic validator forever.
+    #[test]
+    fn both_doors_to_poisoned_history_are_recognised() {
+        assert!(
+            is_unresendable_history_code(INVALID_ENCRYPTED_CONTENT_CODE),
+            "the original fugu -> codex door"
+        );
+        assert!(
+            is_unresendable_history_code(ARRAY_ABOVE_MAX_LENGTH_CODE),
+            "the sol -> kimi -> sol door: a foreign reasoning item carrying a `content` array the \
+             native validator requires to be empty"
+        );
+    }
+
+    /// The gate must stay narrow. A retryable or genuinely client-side failure has to keep its
+    /// ordinary path — a rewrite would silently mutate the user's request instead of surfacing it.
+    #[test]
+    fn ordinary_failures_do_not_trigger_a_history_rewrite() {
+        for code in [
+            "rate_limit_exceeded",
+            "insufficient_quota",
+            "invalid_grant",
+            "server_error",
+            "invalid_request_error",
+            "",
+        ] {
+            assert!(
+                !is_unresendable_history_code(code),
+                "{code} must not be treated as poisoned history"
+            );
+        }
+    }
+
+    /// The safety net behind the code gate: even when the gate fires, a body with no reasoning
+    /// items yields `None`, so a false positive costs nothing and the original error surfaces.
+    #[test]
+    fn a_body_without_reasoning_items_is_never_rewritten() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "hello"}
+                ]},
+            ],
+        })
+        .to_string();
+        assert!(
+            strip_unverifiable_reasoning_body(body.as_bytes()).is_none(),
+            "nothing to strip ⇒ no retry is burned and the upstream error stands"
+        );
+    }
 
     fn reasoning_item(id: &str, summary: Option<&str>, encrypted: &str) -> Value {
         let summary_blocks = match summary {

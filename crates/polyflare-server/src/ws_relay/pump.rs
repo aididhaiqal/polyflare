@@ -116,7 +116,7 @@ use super::redial::RedialOutcome;
 use super::signal::{classify_upstream_signal, UpstreamSignal};
 use super::sniff::sniff_completed_id;
 use super::telemetry::{start_turn, WsRoutingOutcome, WsTurnTelemetry, WsTurnTerminal};
-use crate::reasoning_transform::{strip_unverifiable_reasoning, INVALID_ENCRYPTED_CONTENT_CODE};
+use crate::reasoning_transform::{is_unresendable_history_code, strip_unverifiable_reasoning};
 use crate::session_key::parse_inbound_scoped;
 
 /// How many CONSECUTIVE re-dials (eager cap re-dial, client-send re-dial, an exhaustion-move, or
@@ -960,7 +960,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                 // poisoned, so a declined recovery states its reason instead of
                                 // being silently invisible — the failure mode that cost three
                                 // blind fix rounds on 2026-07-25.
-                                if sig.error_code.as_deref() == Some(INVALID_ENCRYPTED_CONTENT_CODE)
+                                if sig.error_code.as_deref().is_some_and(is_unresendable_history_code)
                                 {
                                     tracing::warn!(
                                         target: "polyflare_server::relay",
@@ -974,8 +974,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                         "poisoned-history recovery evaluated"
                                     );
                                 }
-                                if sig.error_code.as_deref()
-                                    == Some(INVALID_ENCRYPTED_CONTENT_CODE)
+                                if sig.error_code
+                                    .as_deref()
+                                    .is_some_and(is_unresendable_history_code)
                                 {
                                     // Content-free diagnosis counters (2026-07-25: two live
                                     // failures with ZERO replays — these name the gate that
@@ -991,8 +992,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                         relay_metrics.record("rt_skip_no_inflight");
                                     }
                                 }
-                                if sig.error_code.as_deref()
-                                    == Some(INVALID_ENCRYPTED_CONTENT_CODE)
+                                if sig.error_code
+                                    .as_deref()
+                                    .is_some_and(is_unresendable_history_code)
                                     && !reasoning_transform_attempted
                                     && !upstream_output_visible_for_turn
                                 {

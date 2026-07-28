@@ -3005,13 +3005,19 @@ async fn responses_handler_impl_with_max_attempts(
             // account: rewrite the body (foreign reasoning envelopes out, plaintext summaries kept)
             // and retry once. Nothing was relayed yet (this is a pre-stream error), so a retry
             // cannot duplicate output. `None` from the transform means there is nothing to fix.
+            //
+            // Gated on the CODE SET, not the one code: 2026-07-29 the same poisoning surfaced as
+            // `array_above_max_length` (a foreign `reasoning` item carrying a `content` array the
+            // native validator requires to be empty) and this branch never ran, so the thread was
+            // stuck resending an identical body to a deterministic validator. See
+            // `reasoning_transform::is_unresendable_history_code`.
             if provider == Provider::Codex
                 && execution
                     .as_ref()
                     .err()
                     .and_then(watchdog_error_code)
                     .as_deref()
-                    == Some(crate::reasoning_transform::INVALID_ENCRYPTED_CONTENT_CODE)
+                    .is_some_and(crate::reasoning_transform::is_unresendable_history_code)
             {
                 if let Some(retry) =
                     prepared_with_stripped_reasoning(prepared_for_auth_retry.clone())
