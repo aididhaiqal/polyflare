@@ -478,6 +478,8 @@ export interface ReportsView {
   totals: ReportTotalsView;
 }
 
+export type ReportTrafficScope = "all" | "model" | "backend";
+
 /** `read_api.rs::KpisView` — `OverviewView.kpis`. */
 export interface KpisView {
   requests: number;

@@ -2099,6 +2099,15 @@ async fn reports_endpoint_assembles_zero_filled_series_breakdown_and_totals() {
         .unwrap();
     assert_eq!(bad_dimension.status(), reqwest::StatusCode::BAD_REQUEST);
 
+    // Explicit-but-unknown scope -> 400.
+    let bad_scope = client
+        .get(format!("{pf}/api/reports?scope=bogus"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_scope.status(), reqwest::StatusCode::BAD_REQUEST);
+
     // Happy path.
     let v: serde_json::Value = client
         .get(format!("{pf}/api/reports?range=7d&dimension=model"))
@@ -2185,6 +2194,87 @@ async fn reports_endpoint_assembles_zero_filled_series_breakdown_and_totals() {
     assert_eq!(operation_breakdown.len(), 1);
     assert_eq!(operation_breakdown[0]["key"], "Model response");
     assert_eq!(operation_breakdown[0]["requests"], 3);
+}
+
+#[tokio::test]
+async fn reports_endpoint_supports_minute_range_and_logical_traffic_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let repo = store.request_log();
+    let insert_ts = now();
+
+    repo.insert(&report_endpoint_row(
+        insert_ts, "gpt-5.6", 200, 1_000, 400, 1.0,
+    ))
+    .await
+    .unwrap();
+
+    let mut legacy_backend = report_endpoint_row(insert_ts, "unused", 200, 50, 0, 0.0);
+    legacy_backend.path = "chatgpt_backend_passthrough_wham/usage".into();
+    legacy_backend.model = None;
+    repo.insert(&legacy_backend).await.unwrap();
+
+    let mut current_backend = report_endpoint_row(insert_ts, "unused", 200, 25, 0, 0.0);
+    current_backend.provider = "chatgpt_backend".into();
+    current_backend.path = "chatgpt_backend_synthetic_wham/usage".into();
+    current_backend.model = None;
+    repo.insert(&current_backend).await.unwrap();
+    std::mem::forget(dir);
+
+    let pf = spawn(store).await;
+    let client = reqwest::Client::new();
+
+    let model: serde_json::Value = client
+        .get(format!(
+            "{pf}/api/reports?range=1h&dimension=provider&scope=model"
+        ))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(model["totals"]["requests"], 1);
+    assert_eq!(model["totals"]["tokens"], 1_000);
+    assert_eq!(model["breakdown"].as_array().unwrap().len(), 1);
+    assert_eq!(model["breakdown"][0]["key"], "codex");
+
+    let buckets = model["time_series"].as_array().unwrap();
+    assert!(
+        (60..=62).contains(&buckets.len()),
+        "one minute buckets across the last hour, got {}",
+        buckets.len()
+    );
+    for pair in buckets.windows(2) {
+        assert_eq!(
+            pair[1]["ts"].as_i64().unwrap() - pair[0]["ts"].as_i64().unwrap(),
+            60
+        );
+    }
+    let expected_bucket_ts = (insert_ts / 60) * 60;
+    let populated = buckets
+        .iter()
+        .find(|bucket| bucket["ts"] == expected_bucket_ts)
+        .expect("the current minute bucket must be present");
+    assert_eq!(populated["requests"], 1);
+
+    let backend: serde_json::Value = client
+        .get(format!(
+            "{pf}/api/reports?range=1h&dimension=operation&scope=backend"
+        ))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(backend["totals"]["requests"], 2);
+    assert_eq!(backend["totals"]["tokens"], 75);
+    let operations = backend["breakdown"].as_array().unwrap();
+    assert_eq!(operations.len(), 2);
+    assert!(operations.iter().all(|row| row["key"] != "Model response"));
 }
 
 #[tokio::test]

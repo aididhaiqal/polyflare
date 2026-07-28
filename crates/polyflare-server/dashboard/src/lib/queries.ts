@@ -51,6 +51,7 @@ import {
   type RequestsQueryParams,
   type RequestsView,
   type ResetPlanView,
+  type ReportTrafficScope,
   type ReportsView,
   type SessionsQueryParams,
   type SessionsView,
@@ -299,36 +300,37 @@ export function useSessions(params: SessionsQueryParams = {}) {
   });
 }
 
-/** `GET /api/reports` query params — mirrors `read_api.rs::ReportsQuery`'s `range`/`dimension`/
- * `provider`, but `range`/`dimension` are required here (not optional, unlike the backend's own
- * Option<String> fields) since the Reports page's control bar always has a selected value — there
- * is no "absent" state to model client-side, the backend's absent-defaults-to-7d/model behavior is
- * simply never exercised by this hook. */
+/** `GET /api/reports` query params — mirrors `read_api.rs::ReportsQuery`. `range`/`dimension` are
+ * required here since every dashboard consumer has a selected value. `scope` remains optional so
+ * non-dashboard callers can retain the backend's compatibility default (`all`). */
 export interface ReportsParams {
   range: string;
   dimension: string;
   provider?: string;
+  scope?: ReportTrafficScope;
 }
 
-/** Serializes `ReportsParams` into a `?`-prefixed query string, omitting `provider` when unset.
- * Field order matches `read_api.rs::ReportsQuery` (`range,dimension,provider`). */
+/** Serializes `ReportsParams` into a `?`-prefixed query string, omitting optional values when unset.
+ * Field order matches `read_api.rs::ReportsQuery` (`range,dimension,provider,scope`). */
 function buildReportsQueryString(params: ReportsParams): string {
   const sp = new URLSearchParams();
   sp.set("range", params.range);
   sp.set("dimension", params.dimension);
   if (params.provider !== undefined) sp.set("provider", params.provider);
+  if (params.scope !== undefined) sp.set("scope", params.scope);
   return `?${sp.toString()}`;
 }
 
 /** `GET /api/reports` — the Reports page's composite analytics payload (time series + breakdown +
- * totals). 60s stale/refetch, not the 30s lists' cadence — reports drift slowly (bucketed
- * hourly/daily), so there's no value in polling as often as the live account/request lists do. */
+ * totals). Minute-resolution `1h` consumers refresh every 30s; hourly/daily reports retain their
+ * lower-frequency 60s cadence. */
 export function useReports(params: ReportsParams) {
+  const refreshMs = params.range === "1h" ? LIST_REFETCH_MS : 60_000;
   return useQuery<ReportsView>({
     queryKey: queryKeys.reports(params),
     queryFn: () => api.reports(buildReportsQueryString(params)),
-    staleTime: 60_000,
-    refetchInterval: 60_000,
+    staleTime: refreshMs,
+    refetchInterval: refreshMs,
   });
 }
 

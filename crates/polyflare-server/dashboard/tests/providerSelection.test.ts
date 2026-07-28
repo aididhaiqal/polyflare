@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  overviewProviderPulsePlan,
   parseProviderSelection,
   providerSelectionLabel,
   resolveProviderSelection,
@@ -34,4 +35,19 @@ test("legacy claude URL values normalize to the anthropic provider", () => {
     "anthropic",
     "chatgpt_backend",
   ]);
+});
+
+test("overview provider pulse remains model-scoped and is hidden for backend operations", () => {
+  assert.deepEqual(overviewProviderPulsePlan("all"), {
+    visible: true,
+    scope: "model",
+  });
+  assert.deepEqual(overviewProviderPulsePlan("codex"), {
+    visible: true,
+    scope: "model",
+  });
+  assert.deepEqual(overviewProviderPulsePlan("chatgpt_backend"), {
+    visible: false,
+    scope: "model",
+  });
 });

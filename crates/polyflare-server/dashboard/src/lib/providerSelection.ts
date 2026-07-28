@@ -2,6 +2,19 @@ export const MODEL_TRAFFIC_PROVIDER = "model";
 export const BACKEND_TRAFFIC_PROVIDER = "chatgpt_backend";
 export const NO_PROVIDER = "none";
 
+/** The provider pulse describes model-serving targets only. Backend control traffic has different
+ * identities and investigation links, so the Overview hides this panel rather than relabelling
+ * historical backend operations as Codex model traffic. */
+export function overviewProviderPulsePlan(providerFilter: string): {
+  visible: boolean;
+  scope: "model";
+} {
+  return {
+    visible: providerFilter !== BACKEND_TRAFFIC_PROVIDER,
+    scope: MODEL_TRAFFIC_PROVIDER,
+  };
+}
+
 function normalizeProvider(provider: string): string {
   return provider === "claude" ? "anthropic" : provider;
 }

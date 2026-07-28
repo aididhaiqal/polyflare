@@ -126,7 +126,9 @@ export function Reports() {
   const params: ReportsParams = {
     range,
     dimension,
-    provider: provider !== ALL ? provider : undefined,
+    provider:
+      provider !== ALL && provider !== "chatgpt_backend" ? provider : undefined,
+    scope: provider === "chatgpt_backend" ? "backend" : "model",
   };
 
   const { data, isLoading, isFetching, isError, error, refetch } = useReports(params);

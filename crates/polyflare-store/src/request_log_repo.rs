@@ -436,6 +436,17 @@ pub struct ReportBreakdownRow {
     pub metrics: ReportMetrics,
 }
 
+/// Which structural request-log traffic the Reports API is allowed to aggregate. `Model` and
+/// `Backend` use [`BACKEND_REQUEST_SQL`] rather than provider equality so historical gateway rows
+/// written before the dedicated `chatgpt_backend` provider identity remain correctly classified.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReportTrafficScope {
+    #[default]
+    All,
+    Model,
+    Backend,
+}
+
 /// Content-free provider/model performance rollup for the provider dashboard. `tier` is the
 /// bounded `"standard"`/`"priority"` classification derived from the recorded service tier.
 /// Throughput is weighted over valid per-request generation windows:
@@ -954,6 +965,14 @@ impl RequestLogRepo {
         )
     }
 
+    fn reports_scope_clause(scope: ReportTrafficScope) -> String {
+        match scope {
+            ReportTrafficScope::All => String::new(),
+            ReportTrafficScope::Model => format!(" AND NOT {BACKEND_REQUEST_SQL}"),
+            ReportTrafficScope::Backend => format!(" AND {BACKEND_REQUEST_SQL}"),
+        }
+    }
+
     /// Map one row of [`Self::reports_metric_select_list`] (in that exact order) to
     /// [`ReportMetrics`] — the single place all three `reports_*` methods share this conversion, so
     /// the column order only has to be kept in sync in one place.
@@ -988,14 +1007,27 @@ impl RequestLogRepo {
         since_ts: i64,
         provider: Option<&str>,
     ) -> Result<ReportMetrics, StoreError> {
+        self.reports_totals_scoped(since_ts, provider, ReportTrafficScope::All)
+            .await
+    }
+
+    /// [`Self::reports_totals`] with an explicit logical model/backend scope.
+    pub async fn reports_totals_scoped(
+        &self,
+        since_ts: i64,
+        provider: Option<&str>,
+        scope: ReportTrafficScope,
+    ) -> Result<ReportMetrics, StoreError> {
+        let scope_clause = Self::reports_scope_clause(scope);
         let sql = format!(
-            "SELECT {} FROM request_log WHERE requested_at >= ?{}",
+            "SELECT {} FROM request_log WHERE requested_at >= ?{}{}",
             Self::reports_metric_select_list(),
             if provider.is_some() {
                 " AND provider = ?"
             } else {
                 ""
-            }
+            },
+            scope_clause,
         );
         let mut query = sqlx::query_as::<_, ReportMetricsSqlRow>(&sql).bind(since_ts);
         if let Some(p) = provider {
@@ -1017,17 +1049,31 @@ impl RequestLogRepo {
         bucket_secs: i64,
         provider: Option<&str>,
     ) -> Result<Vec<ReportBucket>, StoreError> {
+        self.reports_series_scoped(since_ts, bucket_secs, provider, ReportTrafficScope::All)
+            .await
+    }
+
+    /// [`Self::reports_series`] with an explicit logical model/backend scope.
+    pub async fn reports_series_scoped(
+        &self,
+        since_ts: i64,
+        bucket_secs: i64,
+        provider: Option<&str>,
+        scope: ReportTrafficScope,
+    ) -> Result<Vec<ReportBucket>, StoreError> {
         let bucket_secs = bucket_secs.max(1);
+        let scope_clause = Self::reports_scope_clause(scope);
         let sql = format!(
             "SELECT (requested_at / ?) * ? AS bucket_ts, {} \
-             FROM request_log WHERE requested_at >= ?{} \
+             FROM request_log WHERE requested_at >= ?{}{} \
              GROUP BY bucket_ts ORDER BY bucket_ts ASC",
             Self::reports_metric_select_list(),
             if provider.is_some() {
                 " AND provider = ?"
             } else {
                 ""
-            }
+            },
+            scope_clause,
         );
         let mut query = sqlx::query_as::<_, ReportBucketSqlRow>(&sql)
             .bind(bucket_secs)
@@ -1065,6 +1111,18 @@ impl RequestLogRepo {
         dimension: &str,
         provider: Option<&str>,
     ) -> Result<Vec<ReportBreakdownRow>, StoreError> {
+        self.reports_breakdown_scoped(since_ts, dimension, provider, ReportTrafficScope::All)
+            .await
+    }
+
+    /// [`Self::reports_breakdown`] with an explicit logical model/backend scope.
+    pub async fn reports_breakdown_scoped(
+        &self,
+        since_ts: i64,
+        dimension: &str,
+        provider: Option<&str>,
+        scope: ReportTrafficScope,
+    ) -> Result<Vec<ReportBreakdownRow>, StoreError> {
         let expression = match dimension {
             "account" => "COALESCE(provider_credential_id, account_id, '')",
             "provider" => "provider",
@@ -1077,9 +1135,10 @@ impl RequestLogRepo {
             }
             _ => "COALESCE(model, '')",
         };
+        let scope_clause = Self::reports_scope_clause(scope);
         let sql = format!(
             "SELECT {expression} AS dim_key, {metrics} \
-             FROM request_log WHERE requested_at >= ?{provider_clause} \
+             FROM request_log WHERE requested_at >= ?{provider_clause}{scope_clause} \
              GROUP BY {expression} ORDER BY COALESCE(SUM(cost_usd), 0.0) DESC",
             expression = expression,
             metrics = Self::reports_metric_select_list(),
@@ -1087,7 +1146,8 @@ impl RequestLogRepo {
                 " AND provider = ?"
             } else {
                 ""
-            }
+            },
+            scope_clause = scope_clause,
         );
         let mut query = sqlx::query_as::<_, ReportBreakdownSqlRow>(&sql).bind(since_ts);
         if let Some(p) = provider {
@@ -2269,6 +2329,100 @@ mod tests {
         assert_eq!(totals.tokens, 600, "150 (row1) + 450 (row3)");
         assert_eq!(totals.ttft_sample_count, 2);
         assert_eq!(totals.avg_ttft_ms, 50.0, "(40+60)/2");
+    }
+
+    #[tokio::test]
+    async fn reports_scope_separates_model_and_backend_traffic_across_all_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        let mut legacy_backend =
+            report_row(10, "codex", "unused", None, 200, 10, 0, 0, 0, 0, None, None);
+        legacy_backend.path = "chatgpt_backend_passthrough_wham/usage".into();
+        legacy_backend.model = None;
+        repo.insert(&legacy_backend).await.unwrap();
+
+        let mut current_backend = report_row(
+            20,
+            "chatgpt_backend",
+            "unused",
+            None,
+            200,
+            20,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+        );
+        current_backend.path = "chatgpt_backend_synthetic_wham/usage".into();
+        current_backend.model = None;
+        repo.insert(&current_backend).await.unwrap();
+
+        repo.insert(&report_row(
+            30,
+            "codex",
+            "gpt-5.6",
+            Some("acct"),
+            200,
+            30,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let model = repo
+            .reports_totals_scoped(0, None, ReportTrafficScope::Model)
+            .await
+            .unwrap();
+        let backend = repo
+            .reports_totals_scoped(0, None, ReportTrafficScope::Backend)
+            .await
+            .unwrap();
+        let codex_model = repo
+            .reports_totals_scoped(0, Some("codex"), ReportTrafficScope::Model)
+            .await
+            .unwrap();
+        assert_eq!(model.requests, 1);
+        assert_eq!(backend.requests, 2);
+        assert_eq!(
+            codex_model.requests, 1,
+            "provider=codex must not re-admit its historical backend row"
+        );
+
+        let model_series = repo
+            .reports_series_scoped(0, 10, None, ReportTrafficScope::Model)
+            .await
+            .unwrap();
+        assert_eq!(
+            model_series
+                .iter()
+                .map(|bucket| bucket.metrics.requests)
+                .sum::<i64>(),
+            1
+        );
+
+        let backend_breakdown = repo
+            .reports_breakdown_scoped(0, "operation", None, ReportTrafficScope::Backend)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend_breakdown
+                .iter()
+                .map(|row| row.metrics.requests)
+                .sum::<i64>(),
+            2
+        );
+        assert!(backend_breakdown
+            .iter()
+            .all(|row| row.key != "Model response"));
     }
 
     /// `reports_breakdown("model")` groups by `model`, with each group's `ReportMetrics` matching

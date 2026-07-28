@@ -60,14 +60,16 @@ import { capacityMapAccounts } from "../lib/capacityMap";
 import { buildFleetBalance, fleetBalanceFallbackState } from "../lib/fleetBalance";
 import { compactNum, countdown, latency, pct, ratePct, relTime, tpsFmt } from "../lib/format";
 import {
+  analyzeTrafficSignal,
+  type TrafficSignal,
+} from "../lib/liveActivity";
+import {
   quotaDisplayLabel,
   quotaDisplayPercent,
   quotaWindowIsPresent,
 } from "../lib/quotaDisplay";
-import {
-  requestBucketErrorRate,
-  summarizeRequestVolume,
-} from "../lib/requestVolume";
+import { overviewProviderPulsePlan } from "../lib/providerSelection";
+import { requestBucketErrorRate } from "../lib/requestVolume";
 import { backendRequestDisplay } from "../lib/requestClassification";
 import { useQuotaDisplayPreference } from "../preferences/QuotaDisplayPreference";
 import {
@@ -268,6 +270,7 @@ export function Overview() {
   const { localAccess, token } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
   const providerFilter = parseProviderFilter(searchParams.get("provider"));
+  const providerPulsePlan = overviewProviderPulsePlan(providerFilter);
   const overviewRange = parseOverviewRange(searchParams.get("range"));
   const providerParam =
     providerFilter === "all"
@@ -275,10 +278,22 @@ export function Overview() {
       : providerFilter === "claude"
         ? "anthropic"
         : providerFilter;
+  const reportScope = providerFilter === "chatgpt_backend" ? "backend" : "model";
+  const reportProvider =
+    providerFilter === "all" || providerFilter === "chatgpt_backend"
+      ? undefined
+      : providerParam;
   const reportsQuery = useReports({
     range: overviewRange,
     dimension: "provider",
-    provider: providerParam,
+    provider: reportProvider,
+    scope: reportScope,
+  });
+  const liveReportsQuery = useReports({
+    range: "1h",
+    dimension: "provider",
+    provider: reportProvider,
+    scope: reportScope,
   });
   // Always keep an unfiltered provider breakdown available for the provider pulse. When the
   // overview itself is unfiltered this shares the exact TanStack query key with `reportsQuery`;
@@ -286,16 +301,19 @@ export function Overview() {
   const providerPulseQuery = useReports({
     range: overviewRange,
     dimension: "provider",
+    scope: providerPulsePlan.scope,
   });
   const modelDriversQuery = useReports({
     range: overviewRange,
     dimension: "model",
-    provider: providerParam,
+    provider: reportProvider,
+    scope: reportScope,
   });
   const accountDriversQuery = useReports({
     range: overviewRange,
     dimension: "account",
-    provider: providerParam,
+    provider: reportProvider,
+    scope: reportScope,
   });
   const requestsQuery = useRequests({
     limit: 12,
@@ -376,6 +394,19 @@ export function Overview() {
   const report = reportsQuery.data;
   const hasReportRequests = (report?.totals.requests ?? 0) > 0;
   const reportTrends = report ? buildReportTrends(report) : null;
+  const selectedProviderLabel =
+    providerFilters.find((option) => option.value === providerFilter)?.label ?? providerFilter;
+  const liveScopeLabel =
+    providerFilter === "all"
+      ? "all model providers"
+      : providerFilter === "chatgpt_backend"
+        ? "backend operations"
+        : selectedProviderLabel;
+  const liveRequestsParams = new URLSearchParams({
+    since_ts: String(Math.floor(nowMs / 1000) - 60 * 60),
+    provider: providerParam ?? "model",
+  });
+  const liveRequestsHref = `/requests?${liveRequestsParams.toString()}`;
   const analyticsParams = new URLSearchParams();
   if (overviewRange !== "7d") analyticsParams.set("range", overviewRange);
   if (providerParam) analyticsParams.set("provider", providerParam);
@@ -388,6 +419,7 @@ export function Overview() {
     void Promise.all([
       refetch(),
       ...reportRefreshes,
+      liveReportsQuery.refetch(),
       modelDriversQuery.refetch(),
       accountDriversQuery.refetch(),
       accountsQuery.refetch(),
@@ -436,6 +468,7 @@ export function Overview() {
                 className={clsx(
                   "h-3.5 w-3.5",
                   (reportsQuery.isFetching ||
+                    liveReportsQuery.isFetching ||
                     modelDriversQuery.isFetching ||
                     accountDriversQuery.isFetching ||
                     accountsQuery.isFetching ||
@@ -447,6 +480,18 @@ export function Overview() {
             </button>
           </div>
         }
+      />
+
+      <LiveActivityCard
+        isLoading={liveReportsQuery.isLoading}
+        isError={liveReportsQuery.isError}
+        error={liveReportsQuery.error}
+        onRetry={() => liveReportsQuery.refetch()}
+        report={liveReportsQuery.data}
+        scopeLabel={liveScopeLabel}
+        requestsHref={liveRequestsHref}
+        nowMs={nowMs}
+        updatedAt={liveReportsQuery.dataUpdatedAt}
       />
 
       <CommandMetricsStrip
@@ -493,17 +538,17 @@ export function Overview() {
         nowMs={nowMs}
       />
 
-      <section className="flex flex-col gap-3" aria-labelledby="traffic-runway-heading">
+      <section className="flex flex-col gap-3" aria-labelledby="capacity-runway-heading">
         <div className="flex flex-wrap items-end gap-3">
           <div>
             <h2
-              id="traffic-runway-heading"
+              id="capacity-runway-heading"
               className="text-[10px] font-bold uppercase tracking-[0.15em] text-fg opacity-55"
             >
-              Traffic &amp; runway
+              Capacity &amp; runway
             </h2>
             <p className="mt-0.5 text-[9.5px] text-fg opacity-40">
-              Demand, weekly account headroom, and the fleet-wide pool forecast
+              Weekly account headroom and the fleet-wide pool forecast
             </p>
           </div>
           <div className="mb-1 h-px min-w-10 flex-1 bg-border" />
@@ -517,70 +562,58 @@ export function Overview() {
         </div>
 
         <Grid>
-          <Col span={7} fill>
-            <RequestVolumeCard
-              isLoading={reportsQuery.isLoading}
-              isError={reportsQuery.isError}
-              error={reportsQuery.error}
-              onRetry={() => reportsQuery.refetch()}
-              buckets={report?.time_series ?? []}
-              range={overviewRange}
+          <Col span={6} fill>
+            <CapacityMapCard
+              isLoading={accountsQuery.isLoading}
+              isError={accountsQuery.isError}
+              error={accountsQuery.error}
+              onRetry={() => accountsQuery.refetch()}
+              accounts={accounts}
+              providerFilter={providerFilter}
+              nowMs={nowMs}
             />
           </Col>
 
-          <Col span={5} fill>
-            <Card className="!block !p-0">
-              <div className="grid min-h-full divide-y divide-border lg:grid-cols-2 lg:divide-x lg:divide-y-0">
-                <CapacityMapCard
-                  embedded
-                  isLoading={accountsQuery.isLoading}
-                  isError={accountsQuery.isError}
-                  error={accountsQuery.error}
-                  onRetry={() => accountsQuery.refetch()}
-                  accounts={accounts}
-                  providerFilter={providerFilter}
-                  nowMs={nowMs}
-                />
-                <PaceCard
-                  embedded
-                  isLoading={paceQuery.isLoading}
-                  isError={paceQuery.isError}
-                  error={paceQuery.error}
-                  onRetry={() => paceQuery.refetch()}
-                  pace={paceQuery.data?.pace ?? null}
-                  accounts={accounts}
-                  accountsLoading={accountsQuery.isLoading}
-                  accountsIsError={accountsQuery.isError}
-                  accountsError={accountsQuery.error}
-                  onRetryAccounts={() => accountsQuery.refetch()}
-                  nowMs={nowMs}
-                />
-              </div>
-            </Card>
+          <Col span={6} fill>
+            <PaceCard
+              isLoading={paceQuery.isLoading}
+              isError={paceQuery.isError}
+              error={paceQuery.error}
+              onRetry={() => paceQuery.refetch()}
+              pace={paceQuery.data?.pace ?? null}
+              accounts={accounts}
+              accountsLoading={accountsQuery.isLoading}
+              accountsIsError={accountsQuery.isError}
+              accountsError={accountsQuery.error}
+              onRetryAccounts={() => accountsQuery.refetch()}
+              nowMs={nowMs}
+            />
           </Col>
         </Grid>
       </section>
 
-      <ProviderPulse
-        isLoading={
-          providerPulseQuery.isLoading || accountsQuery.isLoading || providersQuery.isLoading
-        }
-        isError={
-          providerPulseQuery.isError || accountsQuery.isError || providersQuery.isError
-        }
-        error={providerPulseQuery.error ?? accountsQuery.error ?? providersQuery.error}
-        onRetry={() =>
-          void Promise.all([
-            providerPulseQuery.refetch(),
-            accountsQuery.refetch(),
-            providersQuery.refetch(),
-          ])
-        }
-        breakdown={providerPulseQuery.data?.breakdown ?? []}
-        accounts={accounts}
-        customProviders={providersQuery.data ?? []}
-        range={overviewRange}
-      />
+      {providerPulsePlan.visible && (
+        <ProviderPulse
+          isLoading={
+            providerPulseQuery.isLoading || accountsQuery.isLoading || providersQuery.isLoading
+          }
+          isError={
+            providerPulseQuery.isError || accountsQuery.isError || providersQuery.isError
+          }
+          error={providerPulseQuery.error ?? accountsQuery.error ?? providersQuery.error}
+          onRetry={() =>
+            void Promise.all([
+              providerPulseQuery.refetch(),
+              accountsQuery.refetch(),
+              providersQuery.refetch(),
+            ])
+          }
+          breakdown={providerPulseQuery.data?.breakdown ?? []}
+          accounts={accounts}
+          customProviders={providersQuery.data ?? []}
+          range={overviewRange}
+        />
+      )}
 
       {data.recent_errors.length > 0 && (
         <RecentErrorsStrip
@@ -1979,232 +2012,396 @@ function LoadDriversCard(props: {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Request-volume chart — `GET /api/reports` (24h hourly; 7d/30d daily; zero-filled by handler).
+// Live activity — `GET /api/reports?range=1h` (minute buckets, model/backend scoped).
 // ---------------------------------------------------------------------------------------------
 
-function requestVolumeTick(ts: number, range: OverviewRange): string {
-  const date = new Date(ts * 1000);
-  if (range === "24h") {
-    return date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
-  }
-  if (range === "7d") {
-    return date.toLocaleDateString(undefined, { weekday: "short" });
-  }
-  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+function liveActivityTick(ts: number): string {
+  return new Date(ts * 1000).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
-function RequestVolumeTooltip({
+function trafficSignalPresentation(signal: TrafficSignal): {
+  label: string;
+  detail: string;
+  tone: "quiet" | "steady" | "surge";
+} {
+  if (signal.state === "insufficient_history") {
+    return {
+      label: "Learning baseline",
+      detail: "Needs 35 completed minutes before comparing traffic",
+      tone: "quiet",
+    };
+  }
+  if (signal.state === "new_burst") {
+    return {
+      label: "New traffic burst",
+      detail: `${signal.recentRequests.toLocaleString()} requests in the latest completed 5 minutes`,
+      tone: "surge",
+    };
+  }
+  if (signal.state === "surge") {
+    return {
+      label: `Traffic surge · ${signal.ratio?.toFixed(1)}× normal`,
+      detail: `${signal.recentRequests.toLocaleString()} requests in 5m vs ${signal.baselineRequests.toLocaleString()} typical`,
+      tone: "surge",
+    };
+  }
+  if (signal.baselineRequests === 0 && signal.recentRequests === 0) {
+    return {
+      label: "Traffic quiet",
+      detail: "No completed model requests in the latest 5 minutes",
+      tone: "quiet",
+    };
+  }
+  return {
+    label:
+      signal.ratio === null
+        ? "Traffic steady"
+        : `Traffic steady · ${signal.ratio.toFixed(1)}× normal`,
+    detail: `${signal.recentRequests.toLocaleString()} requests in 5m vs ${signal.baselineRequests.toLocaleString()} typical`,
+    tone: "steady",
+  };
+}
+
+function LiveActivityTooltip({
   active,
   payload,
-  range,
+  currentBucketTs,
 }: {
   active?: boolean;
   payload?: Array<{ payload?: ReportBucketView }>;
-  range: OverviewRange;
+  currentBucketTs: number | null;
 }) {
   const bucket = payload?.[0]?.payload;
   if (!active || !bucket) return null;
-  const errorRate = requestBucketErrorRate(bucket);
+  const current = bucket.ts === currentBucketTs;
   return (
     <div className="pointer-events-none rounded-lg border border-border bg-card px-2.5 py-2 text-[9.5px] text-fg shadow-lg">
-      <div className="font-semibold">
-        {new Date(bucket.ts * 1000).toLocaleString(undefined, {
-          month: "short",
-          day: "numeric",
-          hour: range === "24h" ? "2-digit" : undefined,
-          minute: range === "24h" ? "2-digit" : undefined,
-        })}
+      <div className="flex items-center justify-between gap-3 font-semibold">
+        <span>{liveActivityTick(bucket.ts)}</span>
+        {current && <span className="text-signal">in progress</span>}
       </div>
       <div className="mt-1 grid grid-cols-[auto_auto] gap-x-4 gap-y-0.5 tabular-nums">
         <span className="opacity-55">Requests</span>
         <b className="text-right font-semibold">{bucket.requests.toLocaleString()}</b>
+        <span className="opacity-55">API tokens</span>
+        <b className="text-right font-semibold">{compactNum(bucket.tokens)}</b>
         <span className="opacity-55">Errors</span>
         <b className={clsx("text-right font-semibold", bucket.errors > 0 && "text-error")}>
-          {bucket.errors.toLocaleString()} · {ratePct(errorRate * 100)}
+          {bucket.errors.toLocaleString()} · {ratePct(requestBucketErrorRate(bucket) * 100)}
         </b>
       </div>
     </div>
   );
 }
 
-function RequestVolumeCard(
-  props: AsyncCardState & { buckets: ReportBucketView[]; range: OverviewRange },
-) {
-  const status = AsyncCardStatus({ title: `Request volume · ${props.range}`, state: props });
-  if (status) return status;
+function LiveActivityMetric({
+  label,
+  value,
+  meta,
+  tone,
+}: {
+  label: string;
+  value: string;
+  meta: string;
+  tone?: "error";
+}) {
+  return (
+    <div className="min-w-0 px-3.5 py-2.5">
+      <div className="truncate text-[8px] font-semibold uppercase tracking-[0.12em] text-fg opacity-40">
+        {label}
+      </div>
+      <div
+        className={clsx(
+          "mt-1 text-[16px] font-semibold leading-none tracking-[-0.025em] tabular-nums text-fg",
+          tone === "error" && "text-error",
+        )}
+      >
+        {value}
+      </div>
+      <p className="mt-1 truncate text-[8.5px] text-fg opacity-45">{meta}</p>
+    </div>
+  );
+}
 
-  const { buckets } = props;
-  const summary = summarizeRequestVolume(buckets);
-  const unit = props.range === "24h" ? "hour" : "day";
+function LiveActivityLane({
+  title,
+  subtitle,
+  metric,
+  buckets,
+  total,
+  currentBucketTs,
+  baselinePerMinute,
+}: {
+  title: string;
+  subtitle: string;
+  metric: "requests" | "tokens";
+  buckets: ReportBucketView[];
+  total: number;
+  currentBucketTs: number | null;
+  baselinePerMinute?: number;
+}) {
+  const color = metric === "requests" ? "accent" : "signal";
+  const gradientId = `live-activity-${metric}`;
+  return (
+    <figure className="min-w-0 px-3.5 py-3">
+      <figcaption className="mb-1.5 flex items-end justify-between gap-3">
+        <div>
+          <div className="text-[9px] font-bold uppercase tracking-[0.12em] text-fg opacity-55">
+            {title}
+          </div>
+          <p className="mt-0.5 text-[8.5px] text-fg opacity-40">{subtitle}</p>
+        </div>
+        <span
+          className={clsx(
+            "text-[11px] font-semibold tabular-nums",
+            metric === "requests" ? "text-accent" : "text-signal",
+          )}
+        >
+          {compactNum(total)}
+        </span>
+      </figcaption>
+      <div
+        className="h-[150px]"
+        role="img"
+        aria-label={`${title}: ${total.toLocaleString()} over the last 60 minutes`}
+      >
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={buckets} margin={{ top: 8, right: 8, bottom: 0, left: -8 }}>
+            <defs>
+              <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={`hsl(var(--${color}))`} stopOpacity={0.3} />
+                <stop offset="100%" stopColor={`hsl(var(--${color}))`} stopOpacity={0.01} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid
+              vertical={false}
+              stroke="hsl(var(--border))"
+              strokeDasharray="3 4"
+            />
+            <XAxis
+              dataKey="ts"
+              type="number"
+              domain={["dataMin", "dataMax"]}
+              tickCount={5}
+              minTickGap={28}
+              axisLine={false}
+              tickLine={false}
+              tick={{
+                fontSize: 8.5,
+                fill: "hsl(var(--fg))",
+                fillOpacity: 0.45,
+              }}
+              tickFormatter={liveActivityTick}
+            />
+            <YAxis
+              width={42}
+              allowDecimals={false}
+              axisLine={false}
+              tickLine={false}
+              tick={{
+                fontSize: 8.5,
+                fill: "hsl(var(--fg))",
+                fillOpacity: 0.5,
+              }}
+              tickFormatter={(value: number) => compactNum(value)}
+            />
+            {metric === "requests" &&
+              baselinePerMinute !== undefined &&
+              baselinePerMinute > 0 && (
+                <ReferenceLine
+                  y={baselinePerMinute}
+                  stroke="hsl(var(--warn))"
+                  strokeOpacity={0.65}
+                  strokeDasharray="4 4"
+                />
+              )}
+            <Tooltip
+              cursor={{ stroke: "hsl(var(--fg))", strokeOpacity: 0.2 }}
+              content={<LiveActivityTooltip currentBucketTs={currentBucketTs} />}
+            />
+            <Area
+              type="monotone"
+              dataKey={metric}
+              stroke={`hsl(var(--${color}))`}
+              strokeWidth={2}
+              fill={`url(#${gradientId})`}
+              isAnimationActive={false}
+              dot={false}
+              activeDot={{
+                r: 3,
+                fill: `hsl(var(--${color}))`,
+                strokeWidth: 0,
+              }}
+            />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+    </figure>
+  );
+}
+
+function LiveActivityCard(
+  props: AsyncCardState & {
+    report: ReportsView | undefined;
+    scopeLabel: string;
+    requestsHref: string;
+    nowMs: number;
+    updatedAt: number;
+  },
+) {
+  const status = AsyncCardStatus({ title: "Live activity · 60m", state: props });
+  if (status) return status;
+  if (!props.report) return null;
+
+  const { report } = props;
+  const buckets = report.time_series.slice(-61);
+  // The server always returns the aligned current bucket last. Keep that exact response bucket
+  // settling until a newer fetch replaces it; deriving this boundary from the ticking browser
+  // clock can briefly promote a partial bucket when the wall clock rolls over between polls.
+  const currentBucketTs = buckets.length > 0 ? buckets[buckets.length - 1].ts : null;
+  const signal = analyzeTrafficSignal(
+    buckets,
+    currentBucketTs ?? Math.floor(props.nowMs / 1000 / 60) * 60,
+  );
+  const presentation = trafficSignalPresentation(signal);
+  const hasErrors = report.totals.errors > 0;
 
   return (
-    <Card className="!block overflow-hidden !p-0">
-      <div className="flex flex-wrap items-start justify-between gap-2 border-b border-border px-3.5 py-2.5">
-        <div>
-          <div className="text-[10px] font-bold uppercase tracking-[0.13em] text-fg opacity-65">
-            Request volume · {props.range}
-          </div>
-          <p className="mt-0.5 text-[9.5px] text-fg opacity-40">
-            Routed demand by {unit}, with error incidence
-          </p>
-        </div>
-        <div className="flex items-center gap-3 text-[8.5px] text-fg">
-          <span className="inline-flex items-center gap-1 opacity-60">
-            <i className="h-1.5 w-3 rounded-full bg-accent" />
-            requests
-          </span>
-          <span className="inline-flex items-center gap-1 opacity-60">
-            <i className="h-px w-3 border-t border-dashed border-warn" />
-            average
-          </span>
-          <span className="inline-flex items-center gap-1 text-error">
-            <i className="h-1.5 w-3 rounded-full bg-error" />
-            errors
-          </span>
-        </div>
-      </div>
-      {buckets.length === 0 ? (
-        <p className="px-3.5 py-4 text-[11px] text-fg opacity-50">No data yet.</p>
-      ) : (
-        <>
-          <div className="grid grid-cols-2 border-b border-border sm:grid-cols-4">
-            {[
-              [`Latest / ${unit}`, compactNum(summary.latest)],
-              [`Average / ${unit}`, compactNum(Math.round(summary.average))],
-              ["Peak", compactNum(summary.peak)],
-              ["Error rate", ratePct(summary.errorRate * 100)],
-            ].map(([label, value], index) => (
-              <div
-                key={label}
-                className={clsx(
-                  "px-3.5 py-2",
-                  index % 2 !== 0 && "border-l border-border",
-                  index >= 2 && "border-t border-border sm:border-t-0",
-                  index === 2 && "sm:border-l",
-                )}
-              >
-                <div className="text-[8px] font-semibold uppercase tracking-[0.12em] text-fg opacity-40">
-                  {label}
-                </div>
-                <div
-                  className={clsx(
-                    "mt-0.5 text-[13px] font-semibold tabular-nums text-fg",
-                    label === "Error rate" && summary.errors > 0 && "text-error",
-                  )}
-                >
-                  {value}
-                </div>
-              </div>
-            ))}
-          </div>
-
-          <div
-            className="px-2.5 pb-2 pt-3"
-            role="img"
-            aria-label={`${summary.total.toLocaleString()} requests over the ${RANGE_LABEL[props.range]}; peak ${summary.peak.toLocaleString()} per ${unit}; ${summary.errors.toLocaleString()} errors`}
-          >
-            <div className="h-[168px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={buckets} margin={{ top: 8, right: 8, bottom: 0, left: -6 }}>
-                  <defs>
-                    <linearGradient id="overview-request-volume" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="hsl(var(--accent))" stopOpacity={0.32} />
-                      <stop offset="100%" stopColor="hsl(var(--accent))" stopOpacity={0.01} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid
-                    vertical={false}
-                    stroke="hsl(var(--border))"
-                    strokeDasharray="3 4"
-                  />
-                  <XAxis
-                    dataKey="ts"
-                    type="number"
-                    domain={["dataMin", "dataMax"]}
-                    tickCount={props.range === "7d" ? 7 : 5}
-                    minTickGap={24}
-                    axisLine={false}
-                    tickLine={false}
-                    tick={{
-                      fontSize: 8.5,
-                      fill: "hsl(var(--fg))",
-                      fillOpacity: 0.45,
-                    }}
-                    tickFormatter={(value: number) => requestVolumeTick(value, props.range)}
-                  />
-                  <YAxis
-                    width={42}
-                    allowDecimals={false}
-                    axisLine={false}
-                    tickLine={false}
-                    tick={{
-                      fontSize: 8.5,
-                      fill: "hsl(var(--fg))",
-                      fillOpacity: 0.5,
-                    }}
-                    tickFormatter={(value: number) => compactNum(value)}
-                  />
-                  {summary.average > 0 && (
-                    <ReferenceLine
-                      y={summary.average}
-                      stroke="hsl(var(--warn))"
-                      strokeOpacity={0.7}
-                      strokeDasharray="4 4"
-                    />
-                  )}
-                  <Tooltip
-                    cursor={{ stroke: "hsl(var(--fg))", strokeOpacity: 0.2 }}
-                    content={<RequestVolumeTooltip range={props.range} />}
-                  />
-                  <Area
-                    type="monotone"
-                    dataKey="requests"
-                    stroke="hsl(var(--accent))"
-                    strokeWidth={2}
-                    fill="url(#overview-request-volume)"
-                    isAnimationActive={false}
-                    dot={false}
-                    activeDot={{ r: 3, fill: "hsl(var(--accent))", strokeWidth: 0 }}
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
-            </div>
-
-            <div className="mt-1 flex items-center gap-2">
-              <span className="shrink-0 text-[8px] font-semibold uppercase tracking-[0.1em] text-fg opacity-35">
-                Errors
-              </span>
-              <div
-                className="grid h-1.5 min-w-0 flex-1 gap-px overflow-hidden rounded-full bg-muted"
-                style={{ gridTemplateColumns: `repeat(${buckets.length}, minmax(0, 1fr))` }}
-                aria-label="Error rate by request bucket"
-              >
-                {buckets.map((bucket) => {
-                  const bucketRate = requestBucketErrorRate(bucket);
-                  return (
-                    <i
-                      key={bucket.ts}
-                      title={`${requestVolumeTick(bucket.ts, props.range)}: ${bucket.errors.toLocaleString()} errors · ${ratePct(bucketRate * 100)}`}
-                      className={bucket.errors > 0 ? "bg-error" : "bg-muted"}
-                      style={{ opacity: bucket.errors > 0 ? 0.25 + bucketRate * 0.75 : 0.35 }}
-                    />
-                  );
-                })}
-              </div>
-              <span className="shrink-0 text-[8.5px] tabular-nums text-fg opacity-45">
-                {compactNum(summary.errors)} total
-              </span>
-            </div>
-          </div>
-
-          {summary.total === 0 && (
-            <p className="border-t border-border px-3.5 py-2 text-[10px] text-fg opacity-50">
-              No requests in the {RANGE_LABEL[props.range]}.
-            </p>
+    <section aria-labelledby="live-activity-heading">
+      <Card className="relative !block !p-0">
+        <div
+          aria-hidden="true"
+          className={clsx(
+            "h-[3px] w-full",
+            presentation.tone === "surge"
+              ? "bg-warn"
+              : presentation.tone === "steady"
+                ? "bg-success"
+                : "bg-signal/45",
           )}
-        </>
-      )}
-    </Card>
+        />
+        <div className="flex flex-col gap-3 border-b border-border px-3.5 py-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <h2
+                id="live-activity-heading"
+                className="text-[10px] font-bold uppercase tracking-[0.14em] text-fg opacity-70"
+              >
+                Live activity · 60m
+              </h2>
+              <span className="text-[8.5px] text-fg opacity-40">{props.scopeLabel}</span>
+            </div>
+            <p className="mt-1 text-[9.5px] text-fg opacity-45">
+              Completed request traffic and observed API-token usage, bucketed by local minute
+            </p>
+          </div>
+          <div
+            className={clsx(
+              "max-w-full rounded-lg border px-2.5 py-2 sm:max-w-[360px]",
+              presentation.tone === "surge"
+                ? "border-warn/35 bg-warn/[0.07]"
+                : presentation.tone === "steady"
+                  ? "border-success/25 bg-success/[0.05]"
+                  : "border-border bg-muted/25",
+            )}
+          >
+            <div
+              className={clsx(
+                "flex items-center gap-1.5 text-[10px] font-semibold",
+                presentation.tone === "surge"
+                  ? "text-warn"
+                  : presentation.tone === "steady"
+                    ? "text-success"
+                    : "text-fg",
+              )}
+            >
+              {presentation.tone === "surge" ? (
+                <AlertTriangle className="h-3.5 w-3.5 shrink-0" strokeWidth={1.9} />
+              ) : (
+                <Activity className="h-3.5 w-3.5 shrink-0" strokeWidth={1.9} />
+              )}
+              <span>{presentation.label}</span>
+            </div>
+            <p className="mt-0.5 text-[8.5px] text-fg opacity-45">{presentation.detail}</p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 divide-x divide-y divide-border border-b border-border sm:grid-cols-4 sm:divide-y-0">
+          <LiveActivityMetric
+            label="Requests"
+            value={compactNum(report.totals.requests)}
+            meta={`${(report.totals.requests / 60).toFixed(1)} average / min`}
+          />
+          <LiveActivityMetric
+            label="Observed API tokens"
+            value={compactNum(report.totals.tokens)}
+            meta={`${compactNum(report.totals.effective_tokens)} effective · ${compactNum(report.totals.cached_tokens)} cached`}
+          />
+          <LiveActivityMetric
+            label="Estimated cost"
+            value={`$${report.totals.cost_usd.toFixed(2)}`}
+            meta={
+              report.totals.requests > 0
+                ? `$${(report.totals.cost_usd / report.totals.requests).toFixed(4)} / request`
+                : "No billable traffic"
+            }
+          />
+          <LiveActivityMetric
+            label="Error rate"
+            value={
+              report.totals.requests > 0
+                ? ratePct(report.totals.error_rate * 100)
+                : "—"
+            }
+            meta={`${compactNum(report.totals.errors)} errors`}
+            tone={hasErrors ? "error" : undefined}
+          />
+        </div>
+
+        {buckets.length === 0 ? (
+          <p className="px-3.5 py-5 text-[11px] text-fg opacity-50">No activity recorded yet.</p>
+        ) : (
+          <div className="grid divide-y divide-border lg:grid-cols-2 lg:divide-x lg:divide-y-0">
+            <LiveActivityLane
+              title="Requests / minute"
+              subtitle="Dashed line marks the normal five-minute rate"
+              metric="requests"
+              buckets={buckets}
+              total={report.totals.requests}
+              currentBucketTs={currentBucketTs}
+              baselinePerMinute={signal.baselineRequests / 5}
+            />
+            <LiveActivityLane
+              title="API tokens / minute"
+              subtitle="Observed upstream totals; cache and reasoning are not double-counted"
+              metric="tokens"
+              buckets={buckets}
+              total={report.totals.tokens}
+              currentBucketTs={currentBucketTs}
+            />
+          </div>
+        )}
+
+        <div className="flex flex-col gap-1 border-t border-border px-3.5 py-2 text-[8.5px] text-fg opacity-45 sm:flex-row sm:items-center sm:justify-between">
+          <span>
+            Newest minute is still settling · updated{" "}
+            {props.updatedAt
+              ? relTime(Math.floor(props.updatedAt / 1000), props.nowMs)
+              : "—"}
+          </span>
+          <Link
+            to={props.requestsHref}
+            className="font-semibold text-accent no-underline opacity-100 hover:underline"
+          >
+            Inspect last hour
+            <ChevronRight className="ml-0.5 inline h-3 w-3" strokeWidth={2} />
+          </Link>
+        </div>
+      </Card>
+    </section>
   );
 }
 

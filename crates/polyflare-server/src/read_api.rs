@@ -19,7 +19,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use polyflare_codex::oauth::token_exp;
-use polyflare_store::{ApiKeyRow, RequestsFilter};
+use polyflare_store::{ApiKeyRow, ReportTrafficScope, RequestsFilter};
 
 use crate::app::AppState;
 use crate::usage_windows::{resolve, ResolvedWindow};
@@ -1388,25 +1388,31 @@ pub async fn sessions_handler(
 }
 
 /// `GET /api/reports`'s `range` query param resolves to a `(since_ts lookback, bucket_secs)` pair.
-/// `24h` buckets hourly (matching [`OVERVIEW_SERIES_BUCKET_SECS`]'s convention); `7d`/`30d` bucket
-/// daily — an hourly grid over 30 days would be 720 points, finer than a report chart needs.
+/// `1h` buckets by minute for the live Overview pulse; `24h` buckets hourly (matching
+/// [`OVERVIEW_SERIES_BUCKET_SECS`]'s convention); `7d`/`30d` bucket daily — an hourly grid over 30
+/// days would be 720 points, finer than a report chart needs.
+const REPORTS_RANGE_1H_LOOKBACK_SECS: i64 = 60 * 60;
 const REPORTS_RANGE_24H_LOOKBACK_SECS: i64 = 24 * 3600;
 const REPORTS_RANGE_7D_LOOKBACK_SECS: i64 = 7 * 24 * 3600;
 const REPORTS_RANGE_30D_LOOKBACK_SECS: i64 = 30 * 24 * 3600;
+const REPORTS_BUCKET_MINUTE_SECS: i64 = 60;
 const REPORTS_BUCKET_HOURLY_SECS: i64 = 3600;
 const REPORTS_BUCKET_DAILY_SECS: i64 = 24 * 3600;
 
-/// `GET /api/reports` query params. `range` ∈ {`24h`,`7d`,`30d`}: ABSENT defaults to `7d`; an
-/// explicit value outside that set is a `400` (see [`reports_handler`]), never silently
-/// defaulted. `dimension` ∈ {`account`,`model`,`provider`,`operation`} follows the identical
-/// absent-defaults/explicit-invalid-400 rule, defaulting to `model`. `operation` is a content-safe
-/// classification derived from normalized request paths. `provider` (unvalidated — any string)
-/// narrows all three store calls to that provider, same as `/api/requests`' own `provider` filter.
+/// `GET /api/reports` query params. `range` ∈ {`1h`,`24h`,`7d`,`30d`}: ABSENT defaults to `7d`; an
+/// explicit value outside that set is a `400` (see [`reports_handler`]), never silently defaulted.
+/// `dimension` ∈ {`account`,`model`,`provider`,`operation`} follows the identical
+/// absent-defaults/explicit-invalid-400 rule, defaulting to `model`. `scope` ∈
+/// {`all`,`model`,`backend`} defaults to `all` for API compatibility; dashboard consumers pass it
+/// explicitly so backend-control operations never contaminate model analytics. `operation` is a
+/// content-safe classification derived from normalized request paths. `provider` (unvalidated —
+/// any string) further narrows all three store calls to that provider.
 #[derive(Deserialize)]
 pub struct ReportsQuery {
     range: Option<String>,
     dimension: Option<String>,
     provider: Option<String>,
+    scope: Option<String>,
 }
 
 /// One bucket of `ReportsView::time_series`. Mirrors [`SeriesBucketView`]'s flat-field style:
@@ -1570,12 +1576,11 @@ struct ReportsView {
 /// `reports_series`/`reports_breakdown` into one payload over a shared `(since_ts, bucket_secs)`
 /// window resolved from `range`.
 ///
-/// `range` ∈ {`24h`,`7d`,`30d`} (absent → `7d`) and `dimension` ∈
-/// {`account`,`model`,`provider`,`operation`} (absent → `model`); an EXPLICIT value outside those
-/// sets is a `400`, never silently defaulted (only absence defaults) — the same
-/// "unknown-but-present is a client error" posture as `/api/requests`' `status_class` would if it
-/// validated (it currently doesn't, but this endpoint does, per its own brief). `provider` is
-/// passed through unvalidated, same as elsewhere in this module.
+/// `range` ∈ {`1h`,`24h`,`7d`,`30d`} (absent → `7d`), `dimension` ∈
+/// {`account`,`model`,`provider`,`operation`} (absent → `model`), and `scope` ∈
+/// {`all`,`model`,`backend`} (absent → `all`); an EXPLICIT value outside those sets is a `400`,
+/// never silently defaulted (only absence defaults). `provider` is passed through unvalidated,
+/// same as elsewhere in this module.
 ///
 /// `time_series` is ZERO-FILLED across the aligned `[since_ts, now]` grid at `bucket_secs` — the
 /// store's `reports_series` only emits buckets with >= 1 row, same contract `series_since` has;
@@ -1589,6 +1594,10 @@ pub async fn reports_handler(
 
     let range = q.range.as_deref().unwrap_or("7d");
     let (since_ts, bucket_secs) = match range {
+        "1h" => (
+            now - REPORTS_RANGE_1H_LOOKBACK_SECS,
+            REPORTS_BUCKET_MINUTE_SECS,
+        ),
         "24h" => (
             now - REPORTS_RANGE_24H_LOOKBACK_SECS,
             REPORTS_BUCKET_HOURLY_SECS,
@@ -1609,18 +1618,31 @@ pub async fn reports_handler(
         return (StatusCode::BAD_REQUEST, "invalid dimension").into_response();
     }
 
+    let scope = match q.scope.as_deref().unwrap_or("all") {
+        "all" => ReportTrafficScope::All,
+        "model" => ReportTrafficScope::Model,
+        "backend" => ReportTrafficScope::Backend,
+        _ => return (StatusCode::BAD_REQUEST, "invalid scope").into_response(),
+    };
+
     let provider = q.provider.as_deref();
     let repo = state.store.request_log();
 
-    let totals = match repo.reports_totals(since_ts, provider).await {
+    let totals = match repo.reports_totals_scoped(since_ts, provider, scope).await {
         Ok(t) => t,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
     };
-    let series_rows = match repo.reports_series(since_ts, bucket_secs, provider).await {
+    let series_rows = match repo
+        .reports_series_scoped(since_ts, bucket_secs, provider, scope)
+        .await
+    {
         Ok(r) => r,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
     };
-    let breakdown_rows = match repo.reports_breakdown(since_ts, dimension, provider).await {
+    let breakdown_rows = match repo
+        .reports_breakdown_scoped(since_ts, dimension, provider, scope)
+        .await
+    {
         Ok(r) => r,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
     };
