@@ -117,6 +117,23 @@ pub(crate) fn start_turn(
 }
 
 impl WsTurnTelemetry {
+    /// Preserve the effective policy tier in telemetry even when Standard intentionally removes
+    /// `service_tier` from the upstream frame.
+    pub(crate) fn apply_priority_decision(
+        &mut self,
+        decision: crate::priority_policy::PriorityDecision,
+    ) {
+        match decision {
+            crate::priority_policy::PriorityDecision::Priority => {
+                self.service_tier = Some("priority".to_string());
+            }
+            crate::priority_policy::PriorityDecision::Standard => {
+                self.service_tier = Some("standard".to_string());
+            }
+            crate::priority_policy::PriorityDecision::Passthrough => {}
+        }
+    }
+
     pub(crate) fn logical_turn_key(&self) -> Option<&str> {
         self.log_request
             .then_some(self.logical_turn_key.as_deref())

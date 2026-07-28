@@ -58,6 +58,8 @@ pub enum SettingsError {
 /// one source of truth for both the boot path and the (later) live PATCH path. A later task wires
 /// this into `AppState` + the settings endpoints.
 pub struct RuntimeSettings {
+    /// Persisted priority-tier policy shared by the HTTP/SSE and WebSocket ingress paths.
+    pub priority_policy: crate::priority_policy::PriorityPolicyRuntime,
     max_account_attempts: AtomicU32,
     starvation_wait_budget: AtomicU32,
     starvation_heartbeat: AtomicU32,
@@ -114,6 +116,7 @@ impl RuntimeSettings {
     /// every LIVE write after construction.
     pub fn new(cfg: &ServeConfig) -> Self {
         Self {
+            priority_policy: crate::priority_policy::PriorityPolicyRuntime::default(),
             max_account_attempts: AtomicU32::new(cfg.max_account_attempts),
             starvation_wait_budget: AtomicU32::new(cfg.starvation_wait_budget.as_secs() as u32),
             starvation_heartbeat: AtomicU32::new(cfg.starvation_heartbeat.as_secs() as u32),
@@ -147,6 +150,7 @@ impl RuntimeSettings {
     /// sites already did as bare `AppState` field literals before this task.
     pub fn new_from_fields(f: RuntimeSettingsFields) -> Self {
         Self {
+            priority_policy: crate::priority_policy::PriorityPolicyRuntime::default(),
             max_account_attempts: AtomicU32::new(f.max_account_attempts),
             starvation_wait_budget: AtomicU32::new(f.starvation_wait_budget.as_secs() as u32),
             starvation_heartbeat: AtomicU32::new(f.starvation_heartbeat.as_secs() as u32),
@@ -374,6 +378,7 @@ pub fn parse_setting_value(key: &str, s: &str) -> Option<SettingValue> {
 /// `overlay` that isn't one of the live keys is never visited (there is no persisted row for
 /// it to skip past), matching `parse_setting_value`'s `None` for an unknown key.
 pub fn overlay_persisted_settings(rs: &RuntimeSettings, overlay: &HashMap<String, String>) {
+    rs.priority_policy.load_persisted(overlay);
     for key in crate::read_api::LIVE_KEYS_ORDER {
         let Some(raw) = overlay.get(*key) else {
             continue;

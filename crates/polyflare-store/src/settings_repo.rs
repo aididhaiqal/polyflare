@@ -46,6 +46,15 @@ impl SettingsRepo {
         Ok(())
     }
 
+    /// Delete one persisted override. Missing keys are a successful no-op.
+    pub async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM settings WHERE key = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Read-modify-write ONE setting atomically, returning the value the row now holds.
     ///
     /// `get_all` + [`Self::set`] is a lost-update race whenever a value is a collection edited in
@@ -177,5 +186,23 @@ mod tests {
             1,
             "overwrite must not leave a duplicate row for the same key"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_existing_row_and_accepts_missing_row() {
+        let s = store().await;
+        let repo = s.settings();
+        repo.set("priority_session:abc", "\"priority\"", 100)
+            .await
+            .unwrap();
+
+        repo.delete("priority_session:abc").await.unwrap();
+        repo.delete("priority_session:abc").await.unwrap();
+
+        assert!(!repo
+            .get_all()
+            .await
+            .unwrap()
+            .contains_key("priority_session:abc"));
     }
 }

@@ -622,6 +622,21 @@ impl RequestLogRepo {
         Ok(())
     }
 
+    /// Whether a content-free request row already exists for this main session.
+    ///
+    /// Subagent rows deliberately do not count: only a prior main-session request proves that a
+    /// session predates the process-local interactive-presence cache.
+    pub async fn has_main_session_request(&self, session_key: &str) -> Result<bool, StoreError> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM request_log \
+             WHERE session_key = ? AND (subagent IS NULL OR subagent = '') LIMIT 1",
+        )
+        .bind(session_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
     /// Fill in terminal usage, cost, and timing on an already-inserted row, correlated by
     /// `request_id` — the stream wrapper's post-completion usage backfill (streaming responses
     /// only know final token/cost counts once the stream ends, well after [`Self::insert`] already

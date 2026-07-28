@@ -505,6 +505,7 @@ struct RouteOutcome {
 
 struct ResponsesHandlerOptions {
     resolved_custom_route: Option<Vec<(CustomProvider, ProviderModel)>>,
+    preapplied_priority_decision: Option<crate::priority_policy::PriorityDecision>,
     max_attempts: u32,
     starvation_budget: Duration,
     starvation_heartbeat: Duration,
@@ -2094,7 +2095,7 @@ pub(crate) async fn responses_route(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    responses_route_with_transport(state, pool, headers, body, None, None).await
+    responses_route_with_transport(state, pool, headers, body, None, None, None).await
 }
 
 pub(crate) async fn responses_custom_route_for_ws(
@@ -2102,9 +2103,18 @@ pub(crate) async fn responses_custom_route_for_ws(
     headers: HeaderMap,
     body: Bytes,
     targets: Vec<(CustomProvider, ProviderModel)>,
+    priority_decision: crate::priority_policy::PriorityDecision,
 ) -> Response {
-    responses_route_with_transport(state, None, headers, body, Some("websocket"), Some(targets))
-        .await
+    responses_route_with_transport(
+        state,
+        None,
+        headers,
+        body,
+        Some("websocket"),
+        Some(targets),
+        Some(priority_decision),
+    )
+    .await
 }
 
 pub(crate) async fn responses_translation_route_for_ws(
@@ -2112,8 +2122,18 @@ pub(crate) async fn responses_translation_route_for_ws(
     pool: Option<String>,
     headers: HeaderMap,
     body: Bytes,
+    priority_decision: crate::priority_policy::PriorityDecision,
 ) -> Response {
-    responses_route_with_transport(state, pool, headers, body, Some("websocket"), None).await
+    responses_route_with_transport(
+        state,
+        pool,
+        headers,
+        body,
+        Some("websocket"),
+        None,
+        Some(priority_decision),
+    )
+    .await
 }
 
 async fn responses_route_with_transport(
@@ -2123,6 +2143,7 @@ async fn responses_route_with_transport(
     body: Bytes,
     downstream_transport: Option<&'static str>,
     resolved_custom_route: Option<Vec<(CustomProvider, ProviderModel)>>,
+    preapplied_priority_decision: Option<crate::priority_policy::PriorityDecision>,
 ) -> Response {
     let start = Instant::now();
     maybe_capture_fingerprint(&state, "POST", "/responses", &headers);
@@ -2142,8 +2163,15 @@ async fn responses_route_with_transport(
         Some(pool) => crate::catalog::pooled_models_etag(&state, pool).await,
         None => crate::catalog::root_models_etag(&state).await,
     };
-    let (mut response, outcome) =
-        responses_handler_impl(state, pool.as_deref(), headers, body, resolved_custom_route).await;
+    let (mut response, outcome) = responses_handler_impl(
+        state,
+        pool.as_deref(),
+        headers,
+        body,
+        resolved_custom_route,
+        preapplied_priority_decision,
+    )
+    .await;
     apply_scope_models_etag(&mut response, catalog_etag);
     if response.status().is_success()
         && outcome.account_id.is_some()
@@ -2331,6 +2359,7 @@ async fn responses_handler_impl(
     headers: HeaderMap,
     raw: Bytes,
     resolved_custom_route: Option<Vec<(CustomProvider, ProviderModel)>>,
+    preapplied_priority_decision: Option<crate::priority_policy::PriorityDecision>,
 ) -> (Response, RouteOutcome) {
     let max_attempts = state.runtime_settings.max_account_attempts();
     let starvation_wait_budget = state.runtime_settings.starvation_wait_budget();
@@ -2342,6 +2371,7 @@ async fn responses_handler_impl(
         raw,
         ResponsesHandlerOptions {
             resolved_custom_route,
+            preapplied_priority_decision,
             max_attempts,
             starvation_budget: starvation_wait_budget,
             starvation_heartbeat,
@@ -2373,6 +2403,7 @@ pub async fn responses_handler_impl_for_test(
         body,
         ResponsesHandlerOptions {
             resolved_custom_route: None,
+            preapplied_priority_decision: None,
             max_attempts,
             starvation_budget: starvation::DEFAULT_WAIT_BUDGET,
             starvation_heartbeat: starvation::DEFAULT_HEARTBEAT,
@@ -2405,6 +2436,7 @@ pub async fn responses_handler_impl_for_test_with_starvation_timing(
         body,
         ResponsesHandlerOptions {
             resolved_custom_route: None,
+            preapplied_priority_decision: None,
             max_attempts,
             starvation_budget,
             starvation_heartbeat,
@@ -2618,6 +2650,7 @@ async fn responses_handler_impl_with_max_attempts(
 ) -> (Response, RouteOutcome) {
     let ResponsesHandlerOptions {
         resolved_custom_route,
+        preapplied_priority_decision,
         max_attempts,
         starvation_budget,
         starvation_heartbeat,
@@ -2632,7 +2665,7 @@ async fn responses_handler_impl_with_max_attempts(
     // this cheap parse. Only a MALFORMED body (invalid JSON, or a non-object root) 400s here;
     // semantic/schema checks (field types, numeric ranges, duplicate keys) are deferred to upstream,
     // the schema authority — a genuine pass-through, matching the old full-`Value` parse's tolerance.
-    let facts = match parse_inbound_scoped(&headers, &raw, pool) {
+    let mut facts = match parse_inbound_scoped(&headers, &raw, pool) {
         Some(f) => f,
         None => {
             return (
@@ -2641,9 +2674,56 @@ async fn responses_handler_impl_with_max_attempts(
             )
         }
     };
+    let now = unix_now();
+    let policy_session_key = facts.ctx.session_key.as_ref().map(|key| key.value.clone());
+    let is_subagent = facts
+        .ctx
+        .subagent
+        .as_deref()
+        .is_some_and(|subagent| !subagent.is_empty());
+    let priority_decision = match preapplied_priority_decision {
+        Some(decision) => decision,
+        None => {
+            state
+                .runtime_settings
+                .priority_policy
+                .decide(
+                    &state.store,
+                    policy_session_key.as_deref(),
+                    is_subagent,
+                    now,
+                )
+                .await
+        }
+    };
+    let raw = if preapplied_priority_decision.is_some() {
+        raw
+    } else {
+        match crate::priority_policy::apply_decision(&raw, priority_decision) {
+            Some(raw) => raw,
+            None => {
+                return (
+                    (StatusCode::BAD_REQUEST, "invalid JSON body").into_response(),
+                    RouteOutcome::default(),
+                )
+            }
+        }
+    };
+    if preapplied_priority_decision.is_none()
+        && priority_decision != crate::priority_policy::PriorityDecision::Passthrough
+    {
+        facts = match parse_inbound_scoped(&headers, &raw, pool) {
+            Some(facts) => facts,
+            None => {
+                return (
+                    (StatusCode::BAD_REQUEST, "invalid JSON body").into_response(),
+                    RouteOutcome::default(),
+                )
+            }
+        };
+    }
     let model = facts.model;
     let model_for_selection = model.clone();
-    let now = unix_now();
     let tier = tier_from_effort(facts.effort.as_deref());
     // Model + effort are known from the parse itself, regardless of what happens next; account_id
     // is filled in once (if ever) a `RouteDecision` actually selects one below. `subagent` comes
@@ -2653,7 +2733,10 @@ async fn responses_handler_impl_with_max_attempts(
         account_id: None,
         model: Some(model.clone()),
         reasoning_effort: facts.effort.clone(),
-        service_tier: facts.service_tier.clone(),
+        service_tier: match priority_decision {
+            crate::priority_policy::PriorityDecision::Standard => Some("standard".to_string()),
+            _ => facts.service_tier.clone(),
+        },
         subagent: facts.ctx.subagent.clone(),
         session_key: facts.ctx.session_key.as_ref().map(|key| key.value.clone()),
         estimated_tokens: facts.ctx.estimated_tokens,
@@ -2687,7 +2770,8 @@ async fn responses_handler_impl_with_max_attempts(
                 )
             }
         };
-        return execute_anthropic_translation(
+        let effective_service_tier = outcome.service_tier;
+        let (response, mut translated_outcome) = execute_anthropic_translation(
             state,
             pool,
             &headers,
@@ -2699,6 +2783,8 @@ async fn responses_handler_impl_with_max_attempts(
             },
         )
         .await;
+        translated_outcome.service_tier = effective_service_tier;
+        return (response, translated_outcome);
     }
 
     if let Some(targets) = resolved_custom_route {

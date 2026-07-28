@@ -142,6 +142,8 @@ fn effort_from_reasoning(rv: Option<&RawValue>) -> Option<String> {
 /// The owned facts ingress needs from a native `/responses` body. `input` is fully consumed here;
 /// nothing borrowed escapes.
 pub struct InboundFacts {
+    /// Optional WebSocket envelope type. Native HTTP Responses bodies normally omit this.
+    pub event_type: Option<String>,
     pub model: String,
     /// `reasoning.effort` (for the routing tier); the caller maps it to a `Tier`.
     pub effort: Option<String>,
@@ -369,6 +371,7 @@ pub fn parse_inbound_scoped(
         conn_discriminator: header_str(headers, "x-codex-window-id"),
     };
     Some(InboundFacts {
+        event_type: raw_as_str(field("type")),
         model: raw_as_str(field("model")).unwrap_or_default(),
         effort: effort_from_reasoning(field("reasoning")),
         service_tier: raw_as_str(field("service_tier")),

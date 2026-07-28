@@ -14,8 +14,13 @@
 import { useEffect, useState, type ReactNode } from "react";
 import clsx from "clsx";
 
-import type { SettingFieldView, SettingsView } from "../lib/api";
-import { useSettings, useUpdateSettings } from "../lib/queries";
+import type { PriorityPolicyConfig, SettingFieldView, SettingsView } from "../lib/api";
+import {
+  usePriorityPolicy,
+  useSettings,
+  useUpdatePriorityPolicy,
+  useUpdateSettings,
+} from "../lib/queries";
 import type { QuotaDisplayMode } from "../lib/quotaDisplay";
 import { useQuotaDisplayPreference } from "../preferences/QuotaDisplayPreference";
 import { Card } from "../ui/Card";
@@ -125,6 +130,7 @@ export function Settings() {
     <div className="flex flex-col gap-3">
       <PageHeader />
       <DashboardPreferences />
+      <PriorityPolicyCard />
 
       {isLoading ? (
         <SettingsSkeleton />
@@ -153,6 +159,171 @@ export function Settings() {
         <SettingsContent data={data} pendingKey={pendingKey} onSave={handleSave} />
       )}
     </div>
+  );
+}
+
+function minutesToTime(minutes: number): string {
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  return `${String(hours).padStart(2, "0")}:${String(mins).padStart(2, "0")}`;
+}
+
+function timeToMinutes(value: string): number {
+  const [hours, minutes] = value.split(":").map(Number);
+  return hours * 60 + minutes;
+}
+
+function utcOffsetLabel(minutes: number): string {
+  const sign = minutes >= 0 ? "+" : "−";
+  const absolute = Math.abs(minutes);
+  return `UTC${sign}${String(Math.floor(absolute / 60)).padStart(2, "0")}:${String(
+    absolute % 60,
+  ).padStart(2, "0")}`;
+}
+
+function PriorityPolicyCard() {
+  const { data, isLoading, isError } = usePriorityPolicy();
+  const update = useUpdatePriorityPolicy();
+  const [draft, setDraft] = useState<PriorityPolicyConfig | null>(null);
+
+  useEffect(() => {
+    if (data) setDraft(data.config);
+  }, [data]);
+
+  if (isLoading) {
+    return (
+      <Card>
+        <div className="h-28 animate-pulse rounded bg-muted" />
+      </Card>
+    );
+  }
+  if (isError || !draft || !data) {
+    return (
+      <Card>
+        <span className="text-[11px] text-error">Couldn&apos;t load priority policy.</span>
+      </Card>
+    );
+  }
+
+  const dirty = JSON.stringify(draft) !== JSON.stringify(data.config);
+  const schedule = draft.mode === "schedule";
+
+  return (
+    <Card className="gap-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-fg opacity-60">
+            Priority policy
+          </div>
+          <p className="mt-1 max-w-3xl text-[10px] leading-relaxed text-fg opacity-45">
+            Control service tier globally, or run priority only during active hours. A genuinely
+            new main session can open one bounded presence window; continued traffic and subagents
+            never renew it.
+          </p>
+        </div>
+        <button
+          type="button"
+          disabled={!dirty || update.isPending}
+          onClick={() => update.mutate(draft)}
+          className={clsx(
+            "rounded border px-3 py-1.5 text-[10.5px] font-semibold",
+            dirty && !update.isPending
+              ? "border-accent bg-accent/[0.12] text-accent hover:bg-accent/[0.2]"
+              : "cursor-not-allowed border-border text-fg opacity-35",
+          )}
+        >
+          {update.isPending ? "Saving…" : "Save policy"}
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 gap-3 rounded-lg border border-border/70 bg-bg/45 p-3 md:grid-cols-4">
+        <label className="flex flex-col gap-1 text-[9.5px] text-fg opacity-70">
+          Overall mode
+          <select
+            value={draft.mode}
+            onChange={(event) =>
+              setDraft({ ...draft, mode: event.target.value as PriorityPolicyConfig["mode"] })
+            }
+            className="rounded border border-border bg-card px-2 py-1.5 text-[10.5px] text-fg outline-none focus:border-accent"
+          >
+            <option value="passthrough">Follow each request</option>
+            <option value="force_priority">Always priority</option>
+            <option value="force_standard">Always standard</option>
+            <option value="schedule">Active-hours schedule</option>
+          </select>
+        </label>
+
+        <label className="flex flex-col gap-1 text-[9.5px] text-fg opacity-70">
+          Active start
+          <input
+            type="time"
+            disabled={!schedule}
+            value={minutesToTime(draft.active_start_minute)}
+            onChange={(event) =>
+              setDraft({ ...draft, active_start_minute: timeToMinutes(event.target.value) })
+            }
+            className="rounded border border-border bg-card px-2 py-1.5 text-[10.5px] text-fg outline-none disabled:opacity-35 focus:border-accent"
+          />
+        </label>
+
+        <label className="flex flex-col gap-1 text-[9.5px] text-fg opacity-70">
+          Active end
+          <input
+            type="time"
+            disabled={!schedule}
+            value={minutesToTime(draft.active_end_minute)}
+            onChange={(event) =>
+              setDraft({ ...draft, active_end_minute: timeToMinutes(event.target.value) })
+            }
+            className="rounded border border-border bg-card px-2 py-1.5 text-[10.5px] text-fg outline-none disabled:opacity-35 focus:border-accent"
+          />
+        </label>
+
+        <label className="flex flex-col gap-1 text-[9.5px] text-fg opacity-70">
+          Schedule timezone
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              min={-840}
+              max={840}
+              step={15}
+              disabled={!schedule}
+              value={draft.utc_offset_minutes}
+              onChange={(event) =>
+                setDraft({ ...draft, utc_offset_minutes: Number(event.target.value) })
+              }
+              className="min-w-0 flex-1 rounded border border-border bg-card px-2 py-1.5 text-[10.5px] text-fg outline-none disabled:opacity-35 focus:border-accent"
+            />
+            <span className="whitespace-nowrap text-[9px] text-fg opacity-50">
+              {utcOffsetLabel(draft.utc_offset_minutes)}
+            </span>
+          </div>
+        </label>
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border/70 bg-bg/45 px-3 py-2.5">
+        <div>
+          <div className="text-[11px] font-semibold text-fg">New-session presence window</div>
+          <div className="mt-0.5 text-[9.5px] text-fg opacity-50">
+            Applies only outside scheduled hours and only once per new main session.
+          </div>
+        </div>
+        <label className="flex items-center gap-2 text-[9.5px] text-fg opacity-70">
+          Minutes
+          <input
+            type="number"
+            min={1}
+            max={240}
+            disabled={!schedule}
+            value={draft.presence_minutes}
+            onChange={(event) =>
+              setDraft({ ...draft, presence_minutes: Number(event.target.value) })
+            }
+            className="w-20 rounded border border-border bg-card px-2 py-1.5 text-right text-[10.5px] text-fg outline-none disabled:opacity-35 focus:border-accent"
+          />
+        </label>
+      </div>
+    </Card>
   );
 }
 

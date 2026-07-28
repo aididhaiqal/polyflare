@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{any, get, patch, post};
+use axum::routing::{any, get, patch, post, put};
 use axum::Router;
 
 use polyflare_codex::oauth::OAuthClient;
@@ -354,6 +354,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         )
         .route("/api/requests", get(crate::read_api::requests_handler))
         .route("/api/sessions", get(crate::read_api::sessions_handler))
+        .route(
+            "/api/sessions/{session_key}/priority",
+            put(crate::priority_policy_api::set_session),
+        )
         .route("/api/pace", get(crate::read_api::pace_handler))
         .route("/api/overview", get(crate::read_api::overview_handler))
         .route(
@@ -364,6 +368,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route(
             "/api/settings",
             get(crate::read_api::settings_handler).patch(crate::write_api::patch_settings_handler),
+        )
+        .route(
+            "/api/priority-policy",
+            get(crate::priority_policy_api::get).patch(crate::priority_policy_api::patch),
         )
         .route(
             "/api/keys",
