@@ -1048,6 +1048,51 @@ fn admission_overview(
     }
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct NetworkRecoveryOverviewView {
+    status: &'static str,
+    origins_total: usize,
+    origins_offline: usize,
+    origins_probing: usize,
+    transport_failures: u64,
+    recoveries: u64,
+}
+
+fn network_recovery_overview(
+    snapshots: &[crate::network_recovery::CircuitSnapshot],
+) -> NetworkRecoveryOverviewView {
+    let origins_total = snapshots.len();
+    let origins_offline = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.status == crate::network_recovery::CircuitStatus::Offline)
+        .count();
+    let origins_probing = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.status == crate::network_recovery::CircuitStatus::Probing)
+        .count();
+    let online = origins_total.saturating_sub(origins_offline + origins_probing);
+    let status = if origins_probing > 0 {
+        "probing"
+    } else if origins_offline == 0 {
+        "online"
+    } else if online == 0 {
+        "offline"
+    } else {
+        "degraded"
+    };
+    NetworkRecoveryOverviewView {
+        status,
+        origins_total,
+        origins_offline,
+        origins_probing,
+        transport_failures: snapshots
+            .iter()
+            .map(|snapshot| snapshot.transport_failures)
+            .sum(),
+        recoveries: snapshots.iter().map(|snapshot| snapshot.recoveries).sum(),
+    }
+}
+
 #[derive(Serialize)]
 struct OverviewView {
     kpis: KpisView,
@@ -1058,6 +1103,7 @@ struct OverviewView {
     /// Count of accounts eligible for routing right now (see [`is_available`]), across ALL pools.
     accounts_available: usize,
     admission: AdmissionOverviewView,
+    network_recovery: NetworkRecoveryOverviewView,
     recent_errors: Vec<RecentErrorView>,
 }
 
@@ -1175,6 +1221,8 @@ pub async fn overview_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         state.runtime.pressure_calibration_snapshot(),
         in_flight_pressure,
     );
+    let network_recovery =
+        network_recovery_overview(&crate::network_recovery::global_registry().snapshots());
 
     Response::ok(OverviewView {
         kpis,
@@ -1182,6 +1230,7 @@ pub async fn overview_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         pools,
         accounts_available,
         admission,
+        network_recovery,
         recent_errors,
     })
 }
@@ -2351,5 +2400,54 @@ impl<T: Serialize> axum::response::IntoResponse for Response<T> {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod network_recovery_tests {
+    use super::*;
+    use crate::network_recovery::{CircuitSnapshot, CircuitStatus};
+
+    fn snapshot(status: CircuitStatus, failures: u64, recoveries: u64) -> CircuitSnapshot {
+        CircuitSnapshot {
+            origin_id: "opaque".into(),
+            status,
+            failures: u32::try_from(failures).unwrap_or(u32::MAX),
+            transport_failures: failures,
+            recoveries,
+        }
+    }
+
+    #[test]
+    fn network_recovery_overview_reports_all_four_states() {
+        assert_eq!(network_recovery_overview(&[]).status, "online");
+        assert_eq!(
+            network_recovery_overview(&[snapshot(CircuitStatus::Offline, 1, 0)]).status,
+            "offline"
+        );
+        assert_eq!(
+            network_recovery_overview(&[
+                snapshot(CircuitStatus::Online, 0, 1),
+                snapshot(CircuitStatus::Offline, 2, 0),
+            ])
+            .status,
+            "degraded"
+        );
+        assert_eq!(
+            network_recovery_overview(&[snapshot(CircuitStatus::Probing, 3, 0)]).status,
+            "probing"
+        );
+    }
+
+    #[test]
+    fn network_recovery_overview_sums_only_content_free_counters() {
+        let view = network_recovery_overview(&[
+            snapshot(CircuitStatus::Online, 2, 1),
+            snapshot(CircuitStatus::Offline, 3, 4),
+        ]);
+        assert_eq!(view.origins_total, 2);
+        assert_eq!(view.origins_offline, 1);
+        assert_eq!(view.transport_failures, 5);
+        assert_eq!(view.recoveries, 5);
     }
 }

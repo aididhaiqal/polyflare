@@ -89,6 +89,7 @@ export {
   Sun,
   Trash2,
   Users,
+  Wifi,
   X,
   Zap,
   type LucideIcon,

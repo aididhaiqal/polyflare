@@ -19,7 +19,8 @@
 //!   take priority over the raw status);
 //! - treat `status == 429` as the rate-limit bucket;
 //! - treat 5xx / 401 / 403 / 408 as the transient/account-health bucket;
-//! - treat a `None` signal (transport failure / mid-stream drop with no parsed status) as transient;
+//! - treat a `None` signal as origin connectivity, not account health, and surface it after the
+//!   per-origin recovery budget rather than fanning out across credentials on the same origin;
 //! - leave other 4xx (400/404/422/…) OUT of the account-health signal (`record_failure`'s
 //!   `Some(_) => {}` arm) — this classifier maps that same "other 4xx" bucket to `Surface`
 //!   (request-terminal: retrying elsewhere won't help a malformed/unprocessable request), which is
@@ -102,9 +103,10 @@ pub fn failover_verdict(
 /// (see the module doc for the bucket-by-bucket correspondence).
 fn classify_upstream(signal: Option<&FailureSignal>) -> FailoverVerdict {
     let Some(sig) = signal else {
-        // Transport failure / mid-stream drop with no parsed status: `record_failure`'s `None`
-        // arm treats this as a transient account-health error; here it's request-retryable.
-        return FailoverVerdict::FailoverNext;
+        // The executor-level per-origin circuit already retried this pre-response transport
+        // failure against the same account until its recovery budget expired. Rotating accounts
+        // would only amplify a shared DNS/connect/TLS outage and incorrectly bench healthy peers.
+        return FailoverVerdict::Surface;
     };
 
     // Permanent-auth codes take priority over the raw status, exactly as `record_failure` checks
@@ -330,11 +332,11 @@ mod tests {
     }
 
     #[test]
-    fn transport_error_with_no_status_fails_over() {
+    fn transport_error_with_no_status_surfaces_after_origin_recovery() {
         let err = WatchdogError::Upstream(None);
         assert_eq!(
             failover_verdict(&err, true, false),
-            FailoverVerdict::FailoverNext
+            FailoverVerdict::Surface
         );
     }
 

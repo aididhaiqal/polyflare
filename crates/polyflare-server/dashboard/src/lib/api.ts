@@ -535,6 +535,15 @@ export interface AdmissionOverviewView {
   calibration_samples: number;
 }
 
+export interface NetworkRecoveryOverviewView {
+  status: "online" | "degraded" | "offline" | "probing";
+  origins_total: number;
+  origins_offline: number;
+  origins_probing: number;
+  transport_failures: number;
+  recoveries: number;
+}
+
 /** `read_api.rs::OverviewView` — `GET /api/overview` response. */
 export interface OverviewView {
   kpis: KpisView;
@@ -542,6 +551,7 @@ export interface OverviewView {
   pools: PoolOverviewView[];
   accounts_available: number;
   admission: AdmissionOverviewView;
+  network_recovery: NetworkRecoveryOverviewView;
   recent_errors: RecentErrorView[];
 }
 

@@ -21,6 +21,7 @@ use polyflare_server::continuity::CodexContinuity;
 use polyflare_server::model_catalog::{
     floor_only_cache, HttpModelSource, ModelCatalogCache, ModelSource,
 };
+use polyflare_server::network_recovery::RecoveringExecutor;
 use polyflare_server::runtime_settings::{overlay_persisted_settings, RuntimeSettings};
 use polyflare_store::{import_from_codex_lb, Account, PlainTokens, Store, TokenCipher};
 
@@ -195,12 +196,20 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let cipher = TokenCipher::load_or_create(&config.key_path)?;
     let control_client = build_client()?;
-    let codex_executor: Arc<dyn Executor> = build_codex_executor_with_client(
+    let codex_transport: Arc<dyn Executor> = build_codex_executor_with_client(
         control_client.clone(),
         config.http_requests_use_upstream_websocket,
         config.http_upstream_websocket_ping,
     )?;
-    let anthropic_executor: Arc<dyn Executor> = Arc::new(AnthropicExecutor::new()?);
+    let codex_executor: Arc<dyn Executor> = Arc::new(RecoveringExecutor::new(
+        codex_transport,
+        runtime_settings.clone(),
+    ));
+    let anthropic_transport: Arc<dyn Executor> = Arc::new(AnthropicExecutor::new()?);
+    let anthropic_executor: Arc<dyn Executor> = Arc::new(RecoveringExecutor::new(
+        anthropic_transport,
+        runtime_settings.clone(),
+    ));
     // Routing: the global default strategy + any per-pool overrides, both from config.
     let selector: Arc<dyn Selector> = config.routing_strategy.selector();
     let pool_selectors: std::collections::HashMap<String, Arc<dyn Selector>> = config

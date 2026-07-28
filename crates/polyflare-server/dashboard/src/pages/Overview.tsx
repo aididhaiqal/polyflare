@@ -43,6 +43,7 @@ import type {
   AccountView,
   AdmissionOverviewView,
   CustomProviderView,
+  NetworkRecoveryOverviewView,
   PaceStatus,
   PoolOverviewView,
   PoolView,
@@ -113,6 +114,7 @@ import {
   RotateCcw,
   Route,
   ShieldCheck,
+  Wifi,
   Zap,
   type LucideIcon,
 } from "../ui/icons";
@@ -521,6 +523,7 @@ export function Overview() {
             availableAccounts={data.accounts_available}
             totalAccounts={totalAccounts}
             admission={data.admission}
+            networkRecovery={data.network_recovery}
           />
         }
       />
@@ -1046,6 +1049,7 @@ function RoutingStatusRail({
   availableAccounts,
   totalAccounts,
   admission,
+  networkRecovery,
 }: {
   pools: PoolView[] | null;
   poolsError: boolean;
@@ -1057,6 +1061,7 @@ function RoutingStatusRail({
   availableAccounts: number;
   totalAccounts: number;
   admission: AdmissionOverviewView;
+  networkRecovery: NetworkRecoveryOverviewView;
 }) {
   const strategies = [...new Set((pools ?? []).map((pool) => pool.strategy))];
   const routingValue =
@@ -1084,10 +1089,20 @@ function RoutingStatusRail({
       : admission.in_flight_pressure > 0
         ? `${admission.in_flight_pressure} pressure units · ${admission.calibration_ratio.toFixed(2)}× calibrated`
         : `${attempts ?? "—"} max account attempts`;
+  const networkMeta =
+    networkRecovery.origins_total === 0
+      ? "awaiting first upstream request"
+      : networkRecovery.origins_probing > 0
+        ? `${networkRecovery.origins_probing} recovery probe active`
+        : networkRecovery.origins_offline > 0
+          ? `${networkRecovery.origins_offline}/${networkRecovery.origins_total} origins unreachable`
+          : networkRecovery.recoveries > 0
+            ? `${networkRecovery.recoveries} automatic recoveries`
+            : `${networkRecovery.origins_total} origins reachable`;
 
   return (
     <div className="bg-border/70">
-      <div className="grid grid-cols-2 gap-px overflow-hidden sm:grid-cols-3 xl:grid-cols-5">
+      <div className="grid grid-cols-2 gap-px overflow-hidden sm:grid-cols-3 xl:grid-cols-6">
         <StatusRailItem
           icon={Activity}
           label="Fleet"
@@ -1117,6 +1132,20 @@ function RoutingStatusRail({
           meta={admissionMeta}
           tone={admission.waiters > 0 ? "warn" : "ok"}
           to="/settings"
+        />
+        <StatusRailItem
+          icon={Wifi}
+          label="Upstreams"
+          value={networkRecovery.status}
+          meta={networkMeta}
+          tone={
+            networkRecovery.status === "online"
+              ? "ok"
+              : networkRecovery.status === "probing"
+                ? "neutral"
+                : "warn"
+          }
+          to="/transport"
         />
         <StatusRailItem
           icon={List}

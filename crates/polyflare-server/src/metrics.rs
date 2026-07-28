@@ -58,6 +58,9 @@ pub struct MetricsSnapshot {
     /// (honest-liveness work, 2026-07-24) so anchor-resume rates and honest-close frequencies are
     /// observable without a debugger.
     pub relay_events: Vec<(String, u64)>,
+    /// Per-origin connectivity circuits. `origin_id` is a one-way short hash of normalized
+    /// scheme/host/port; no URL path, credential, request, or raw transport error is retained.
+    pub network_recovery: Vec<crate::network_recovery::CircuitSnapshot>,
 }
 
 /// One account's content-free gauge inputs. `account_id` is the OPAQUE store-row id (the same class
@@ -197,6 +200,7 @@ pub fn render_prometheus_text(snapshot: &MetricsSnapshot) -> String {
     write_upstream_requests_total(&mut out, &snapshot.upstream_requests);
     write_rate_limit_hits_total(&mut out, &snapshot.rate_limit_hits);
     write_relay_events_total(&mut out, &snapshot.relay_events);
+    write_network_recovery_metrics(&mut out, &snapshot.network_recovery);
 
     out
 }
@@ -432,6 +436,52 @@ fn write_relay_events_total(out: &mut String, entries: &[(String, u64)]) {
     }
 }
 
+fn write_network_recovery_metrics(
+    out: &mut String,
+    snapshots: &[crate::network_recovery::CircuitSnapshot],
+) {
+    let _ = writeln!(
+        out,
+        "# HELP polyflare_upstream_origin_state Current per-origin connectivity circuit state."
+    );
+    let _ = writeln!(out, "# TYPE polyflare_upstream_origin_state gauge");
+    for snapshot in snapshots {
+        let _ = writeln!(
+            out,
+            "polyflare_upstream_origin_state{{origin_id=\"{}\",status=\"{}\"}} 1",
+            escape_label_value(&snapshot.origin_id),
+            snapshot.status.as_str(),
+        );
+    }
+    for (name, help, failures) in [
+        (
+            "polyflare_upstream_transport_failures_total",
+            "Total pre-response upstream transport failures by opaque origin.",
+            true,
+        ),
+        (
+            "polyflare_upstream_recoveries_total",
+            "Total upstream connectivity circuit recoveries by opaque origin.",
+            false,
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} counter");
+        for snapshot in snapshots {
+            let count = if failures {
+                snapshot.transport_failures
+            } else {
+                snapshot.recoveries
+            };
+            let _ = writeln!(
+                out,
+                "{name}{{origin_id=\"{}\"}} {count}",
+                escape_label_value(&snapshot.origin_id),
+            );
+        }
+    }
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -504,6 +554,7 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
             .snapshot_for_active_targets(&account_ids, &credential_ids),
         rate_limit_hits: state.rate_limit_metrics.snapshot(),
         relay_events: state.relay_metrics.snapshot(),
+        network_recovery: crate::network_recovery::global_registry().snapshots(),
     };
 
     let body = render_prometheus_text(&snapshot);
@@ -589,6 +640,7 @@ mod tests {
             upstream_requests: vec![],
             rate_limit_hits: vec![],
             relay_events: vec![],
+            network_recovery: vec![],
         };
 
         let body = render_prometheus_text(&snapshot);
@@ -671,6 +723,7 @@ mod tests {
             upstream_requests: vec![],
             rate_limit_hits: vec![],
             relay_events: vec![],
+            network_recovery: vec![],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(body.contains("# TYPE polyflare_lease_inflight gauge"));
@@ -691,6 +744,7 @@ mod tests {
             upstream_requests: vec![],
             rate_limit_hits: vec![],
             relay_events: vec![],
+            network_recovery: vec![],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(body.contains("polyflare_lease_inflight 0"));
@@ -716,6 +770,7 @@ mod tests {
             upstream_requests: vec![],
             rate_limit_hits: vec![],
             relay_events: vec![],
+            network_recovery: vec![],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(body.contains("# TYPE polyflare_accounts_total gauge"));
@@ -747,6 +802,7 @@ mod tests {
             )],
             rate_limit_hits: vec![("upstream".to_string(), 1)],
             relay_events: vec![],
+            network_recovery: vec![],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(!body.contains('@'), "body must never contain an @: {body}");
@@ -775,6 +831,7 @@ mod tests {
             upstream_requests: vec![],
             rate_limit_hits: vec![],
             relay_events: vec![],
+            network_recovery: vec![],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(
@@ -807,6 +864,7 @@ mod tests {
             upstream_requests: vec![],
             rate_limit_hits: vec![],
             relay_events: vec![],
+            network_recovery: vec![],
         };
         let body = render_prometheus_text(&snapshot);
 
@@ -875,6 +933,7 @@ mod tests {
             ],
             rate_limit_hits: vec![("upstream".to_string(), 3), ("backoff".to_string(), 1)],
             relay_events: vec![],
+            network_recovery: vec![],
         };
 
         let body = render_prometheus_text(&snapshot);
@@ -945,6 +1004,7 @@ mod tests {
             )],
             rate_limit_hits: vec![("upstream".to_string(), 1)],
             relay_events: vec![],
+            network_recovery: vec![],
         };
         let body = render_prometheus_text(&snapshot);
         assert!(!body.contains('@'), "body must never contain an @: {body}");
@@ -956,5 +1016,40 @@ mod tests {
             !body.to_lowercase().contains("email"),
             "body must never contain 'email': {body}"
         );
+    }
+
+    #[test]
+    fn network_recovery_metrics_expose_only_opaque_origin_state_and_counters() {
+        let snapshot = MetricsSnapshot {
+            failover_total: 0,
+            starvation_total: 0,
+            health_tier_transitions_total: 0,
+            lease_acquired_total: 0,
+            lease_released_total: 0,
+            admission: vec![],
+            pressure_calibration: PressureCalibrationSnapshot::default(),
+            accounts: vec![],
+            upstream_requests: vec![],
+            rate_limit_hits: vec![],
+            relay_events: vec![],
+            network_recovery: vec![crate::network_recovery::CircuitSnapshot {
+                origin_id: "0123456789abcdef".into(),
+                status: crate::network_recovery::CircuitStatus::Offline,
+                failures: 2,
+                transport_failures: 3,
+                recoveries: 1,
+            }],
+        };
+        let body = render_prometheus_text(&snapshot);
+        assert!(body.contains(
+            "polyflare_upstream_origin_state{origin_id=\"0123456789abcdef\",status=\"offline\"} 1"
+        ));
+        assert!(body.contains(
+            "polyflare_upstream_transport_failures_total{origin_id=\"0123456789abcdef\"} 3"
+        ));
+        assert!(
+            body.contains("polyflare_upstream_recoveries_total{origin_id=\"0123456789abcdef\"} 1")
+        );
+        assert!(!body.contains("https://"));
     }
 }

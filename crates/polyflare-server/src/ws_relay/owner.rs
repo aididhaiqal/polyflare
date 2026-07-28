@@ -129,6 +129,59 @@ pub(crate) async fn dial_owner_upstream(
         .map_err(RelayError::Upstream)
 }
 
+/// Origin-aware wrapper around [`dial_owner_upstream`]. Only a transport failure before the
+/// WebSocket handshake opens the circuit; any completed HTTP handshake response (including a
+/// rejection status) proves connectivity and closes it.
+pub(crate) async fn dial_owner_upstream_recovering(
+    headers: &HeaderMap,
+    account: &Account,
+    deadline: tokio::time::Instant,
+) -> Result<WsConn, RelayError> {
+    dial_owner_upstream_recovering_with_registry(
+        headers,
+        account,
+        deadline,
+        crate::network_recovery::global_registry(),
+    )
+    .await
+}
+
+async fn dial_owner_upstream_recovering_with_registry(
+    headers: &HeaderMap,
+    account: &Account,
+    deadline: tokio::time::Instant,
+    registry: &crate::network_recovery::NetworkRecoveryRegistry,
+) -> Result<WsConn, RelayError> {
+    let Ok(origin) = crate::network_recovery::OriginKey::parse(&account.base_url) else {
+        return dial_owner_upstream(headers, account).await;
+    };
+    loop {
+        let permit = registry.acquire(&origin, deadline).await.map_err(|_| {
+            RelayError::Upstream(polyflare_core::ExecError::Upstream(
+                "network recovery budget exceeded".into(),
+            ))
+        })?;
+        match dial_owner_upstream(headers, account).await {
+            Ok(connection) => {
+                permit.success();
+                return Ok(connection);
+            }
+            Err(RelayError::Upstream(polyflare_core::ExecError::Upstream(_))) => {
+                permit.failure();
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(RelayError::Upstream(polyflare_core::ExecError::Upstream(
+                        "network recovery budget exceeded".into(),
+                    )));
+                }
+            }
+            Err(error) => {
+                permit.success();
+                return Err(error);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +196,7 @@ mod tests {
         SessionKey,
     };
     use polyflare_store::{Account as StoreAccount, PlainTokens, Store, TokenCipher};
+    use polyflare_testkit::{MockWsUpstream, ScriptedTurn};
 
     use crate::continuity::CodexContinuity;
     use crate::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
@@ -399,8 +453,6 @@ mod tests {
     #[tokio::test]
     async fn dial_owner_upstream_builds_forward_headers_and_connects() {
         use axum::http::{HeaderMap, HeaderName, HeaderValue};
-        use polyflare_testkit::{MockWsUpstream, ScriptedTurn};
-
         let mock = MockWsUpstream::new(ScriptedTurn::normal(vec![])).capturing_raw_frames();
         let base = mock.clone().spawn().await; // ws://host:port
         let account = Account {
@@ -450,6 +502,44 @@ mod tests {
             vec![raw],
             "socket is open, frame verbatim"
         );
+    }
+
+    #[tokio::test]
+    async fn successful_websocket_handshake_closes_origin_circuit() {
+        let mock = MockWsUpstream::new(ScriptedTurn::normal(vec![]));
+        let base = mock.clone().spawn().await;
+        let account = Account {
+            id: "acct-relay-recovery".to_string(),
+            base_url: base.clone(),
+            bearer_token: "owner-bearer".to_string(),
+            chatgpt_account_id: Some("owner-cid".to_string()),
+            is_fedramp: false,
+        };
+        let registry = crate::network_recovery::NetworkRecoveryRegistry::new();
+        let origin = crate::network_recovery::OriginKey::parse(&base).unwrap();
+        registry
+            .acquire(
+                &origin,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap()
+            .failure();
+
+        let connection = dial_owner_upstream_recovering_with_registry(
+            &HeaderMap::new(),
+            &account,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            &registry,
+        )
+        .await;
+        assert!(connection.is_ok());
+        let snapshot = registry.snapshots().pop().unwrap();
+        assert_eq!(
+            snapshot.status,
+            crate::network_recovery::CircuitStatus::Online
+        );
+        assert_eq!(snapshot.recoveries, 1);
     }
 
     /// A pin whose owner is currently INELIGIBLE (benched via a real rate-limit cooldown — the SAME

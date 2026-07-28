@@ -2405,8 +2405,8 @@ mod relay_through {
         let mut snapshots = vec![polyflare_core::AccountSnapshot::new("acct-visible-drop")];
         state.runtime.overlay(&mut snapshots, now());
         assert_eq!(
-            snapshots[0].error_count, 1,
-            "a WS transport loss after visible output must feed routing health exactly once"
+            snapshots[0].error_count, 0,
+            "a WS transport loss after visible output is not evidence of account health"
         );
         state.store.flush_background_writes().await.unwrap();
         let rows = state.store.request_log().list(10, 0).await.unwrap();

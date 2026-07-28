@@ -1175,7 +1175,7 @@ async fn exhausted_retryable_status_attributes_final_credential_in_logs_and_metr
 }
 
 #[tokio::test]
-async fn exhausted_transport_errors_attribute_final_credential_in_logs_and_metrics() {
+async fn transport_error_preserves_credential_health_and_does_not_rotate() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let unavailable_addr = listener.local_addr().unwrap();
     drop(listener);
@@ -1201,6 +1201,13 @@ async fn exhausted_transport_errors_attribute_final_credential_in_logs_and_metri
             created_at: now,
         })
         .await
+        .unwrap();
+    state
+        .runtime_settings
+        .set(
+            "starvation_wait_budget",
+            polyflare_server::runtime_settings::SettingValue::U64(0),
+        )
         .unwrap();
     for (id, label, secret) in [
         ("credential-transport-a", "first", "secret-transport-a"),
@@ -1276,8 +1283,20 @@ async fn exhausted_transport_errors_attribute_final_credential_in_logs_and_metri
     assert_eq!(row.target_kind.as_deref(), Some("credential"));
     assert_eq!(
         row.provider_credential_id.as_deref(),
-        Some("credential-transport-b")
+        Some("credential-transport-a")
     );
+
+    let credentials = state
+        .store
+        .providers()
+        .list_credentials("provider-transport")
+        .await
+        .unwrap();
+    assert_eq!(credentials.len(), 2);
+    assert!(credentials
+        .iter()
+        .all(|credential| credential.health_status == "healthy"
+            && credential.cooldown_until.is_none()));
 
     let metrics = reqwest::Client::new()
         .get(format!("{base}/metrics"))
@@ -1289,7 +1308,7 @@ async fn exhausted_transport_errors_attribute_final_credential_in_logs_and_metri
         .await
         .unwrap();
     assert!(metrics.contains(
-        "polyflare_upstream_requests_total{provider=\"transport-provider\",target_kind=\"credential\",target_id=\"credential-transport-b\",status=\"503\"} 1"
+        "polyflare_upstream_requests_total{provider=\"transport-provider\",target_kind=\"credential\",target_id=\"credential-transport-a\",status=\"503\"} 1"
     ));
     assert!(!metrics.contains("secret-transport-a"));
     assert!(!metrics.contains("secret-transport-b"));

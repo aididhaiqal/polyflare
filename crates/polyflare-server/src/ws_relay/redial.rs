@@ -15,7 +15,7 @@ use axum::http::HeaderMap;
 use polyflare_codex::{WsConn, WsRelayContract};
 use polyflare_core::Account;
 
-use super::owner::dial_owner_upstream;
+use super::owner::dial_owner_upstream_recovering;
 use super::owner::RelayError;
 
 pub(crate) enum RedialOutcome {
@@ -45,7 +45,14 @@ pub(crate) async fn redial_upstream(
     account: &Account,
     expected_contract: &WsRelayContract,
 ) -> RedialOutcome {
-    redial_upstream_with_models_etag(headers, account, expected_contract, None).await
+    redial_upstream_with_models_etag(
+        headers,
+        account,
+        expected_contract,
+        None,
+        std::time::Duration::ZERO,
+    )
+    .await
 }
 
 /// Redial while comparing the catalog identity visible to the downstream client. `None` means
@@ -56,9 +63,11 @@ pub(crate) async fn redial_upstream_with_models_etag(
     account: &Account,
     expected_contract: &WsRelayContract,
     models_etag_override: Option<Option<String>>,
+    recovery_budget: std::time::Duration,
 ) -> RedialOutcome {
+    let deadline = tokio::time::Instant::now() + recovery_budget;
     for attempt in 0..MAX_REDIAL_ATTEMPTS {
-        match dial_owner_upstream(headers, account).await {
+        match dial_owner_upstream_recovering(headers, account, deadline).await {
             Ok(conn)
                 if models_etag_override.clone().map_or_else(
                     || conn.relay_contract().clone(),
@@ -136,6 +145,7 @@ mod tests {
             &account,
             &expected,
             Some(Some("\"polyflare-pool-v1\"".to_string())),
+            std::time::Duration::ZERO,
         )
         .await;
         assert!(matches!(stable, RedialOutcome::Connected(_)));
@@ -145,6 +155,7 @@ mod tests {
             &account,
             &expected,
             Some(Some("\"polyflare-pool-v2\"".to_string())),
+            std::time::Duration::ZERO,
         )
         .await;
         assert!(

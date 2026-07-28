@@ -560,6 +560,7 @@ pub async fn test_provider(State(state): State<Arc<AppState>>, Path(id): Path<St
         model,
         &HeaderMap::new(),
         &body,
+        state.runtime_settings.starvation_wait_budget(),
     )
     .await;
     let upstream_status = response.status().as_u16();

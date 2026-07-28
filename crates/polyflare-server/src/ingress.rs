@@ -306,7 +306,10 @@ pub(crate) async fn bench_account_for_failure(
             state.runtime.record_transient_error(id, now)
         }
         Some(_) => None, // other 4xx (400/404/422/…): request-level, not account-health.
-        None => state.runtime.record_transient_error(id, now), // transport error / mid-stream drop.
+        // No HTTP status means origin connectivity (DNS/connect/TLS) or a stream transport loss,
+        // neither of which is evidence that this account is unhealthy. Pre-response failures are
+        // handled by the per-origin recovery circuit; post-response failures are never replayed.
+        None => None,
     };
     // B8 Task 4: if that error just moved the account's soft-drain tier (an error-drain entering
     // DRAINING, or a probe-streak promotion), emit the content-free health-tier signal here — this
@@ -2428,6 +2431,7 @@ async fn execute_custom_models(
         headers,
         raw,
         affinity_identity_override.as_deref(),
+        state.runtime_settings.starvation_wait_budget(),
     )
     .await;
     outcome.provider_slug = Some(custom.provider_slug);
@@ -2548,6 +2552,7 @@ async fn execute_anthropic_translation(
                 provider_model,
                 headers,
                 &encoded,
+                state.runtime_settings.starvation_wait_budget(),
             )
             .await;
             let outcome = RouteOutcome {
@@ -4013,6 +4018,7 @@ async fn messages_handler_custom_responses(
         provider_model,
         headers,
         &encoded,
+        state.runtime_settings.starvation_wait_budget(),
     )
     .await;
     let outcome = RouteOutcome {

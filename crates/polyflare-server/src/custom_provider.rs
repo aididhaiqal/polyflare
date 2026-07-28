@@ -974,10 +974,56 @@ async fn read_bounded_error_body(
 async fn send_with_header_timeout(
     request: reqwest::RequestBuilder,
     timeout: Duration,
-) -> Result<reqwest::Response, ()> {
+) -> Result<reqwest::Response, HeaderSendError> {
     match tokio::time::timeout(timeout, request.send()).await {
         Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) | Err(_) => Err(()),
+        Ok(Err(error)) if error.is_connect() => Err(HeaderSendError::Connectivity),
+        Ok(Err(_)) => Err(HeaderSendError::Other),
+        Err(_) => Err(HeaderSendError::Timeout),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderSendError {
+    Connectivity,
+    Timeout,
+    Other,
+}
+
+async fn send_with_network_recovery(
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+    origin: &crate::network_recovery::OriginKey,
+    recovery_budget: Duration,
+) -> Result<reqwest::Response, HeaderSendError> {
+    let deadline = tokio::time::Instant::now() + recovery_budget;
+    loop {
+        let permit = crate::network_recovery::global_registry()
+            .acquire(origin, deadline)
+            .await
+            .map_err(|_| HeaderSendError::Connectivity)?;
+        let Some(attempt) = request.try_clone() else {
+            drop(permit);
+            return send_with_header_timeout(request, timeout).await;
+        };
+        match send_with_header_timeout(attempt, timeout).await {
+            Ok(response) => {
+                permit.success();
+                return Ok(response);
+            }
+            Err(HeaderSendError::Connectivity) => {
+                permit.failure();
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(HeaderSendError::Connectivity);
+                }
+            }
+            Err(error) => {
+                // A timeout or non-connect reqwest failure does not prove the origin is offline.
+                // Dropping a half-open probe safely reopens it; a normal permit is a no-op.
+                drop(permit);
+                return Err(error);
+            }
+        }
     }
 }
 
@@ -1469,6 +1515,7 @@ pub async fn execute(
     model: ProviderModel,
     inbound_headers: &HeaderMap,
     raw_body: &Bytes,
+    recovery_budget: Duration,
 ) -> (Response, CustomRouteOutcome) {
     let affinity_key = request_affinity_key(
         inbound_headers,
@@ -1489,6 +1536,7 @@ pub async fn execute(
         raw_body,
         affinity_key,
         preferred_credential_id,
+        recovery_budget,
     )
     .await
 }
@@ -1503,11 +1551,21 @@ async fn execute_with_affinity(
     raw_body: &Bytes,
     affinity_key: Option<String>,
     preferred_credential_id: Option<String>,
+    recovery_budget: Duration,
 ) -> (Response, CustomRouteOutcome) {
     let mut outcome = custom_route_outcome(&provider, &model);
     let endpoint = match validate_endpoint(&provider) {
         Ok(endpoint) => endpoint,
         Err(message) => return ((StatusCode::BAD_GATEWAY, message).into_response(), outcome),
+    };
+    let origin = match crate::network_recovery::OriginKey::parse(endpoint.as_str()) {
+        Ok(origin) => origin,
+        Err(_) => {
+            return (
+                (StatusCode::BAD_GATEWAY, "invalid provider origin").into_response(),
+                outcome,
+            )
+        }
     };
     let mut body: serde_json::Value = match serde_json::from_slice(raw_body) {
         Ok(serde_json::Value::Object(object)) => serde_json::Value::Object(object),
@@ -1616,22 +1674,37 @@ async fn execute_with_affinity(
                 request = request.header("openai-beta", value);
             }
         }
-        let upstream = match send_with_header_timeout(request, idle_timeout).await {
-            Ok(response) => response,
-            Err(_) => {
-                let _ = store
-                    .providers()
-                    .set_credential_health(
-                        &credential.id,
-                        "cooldown",
-                        Some(unix_now() + 30),
-                        unix_now(),
-                    )
-                    .await;
-                drop(lease);
-                continue;
-            }
-        };
+        let upstream =
+            match send_with_network_recovery(request, idle_timeout, &origin, recovery_budget).await
+            {
+                Ok(response) => response,
+                Err(HeaderSendError::Connectivity) => {
+                    // Origin-wide transport loss is not credential health. The per-origin circuit
+                    // already waited and retried this same credential; do not rotate or cool it down.
+                    last_response = Some(
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "upstream network unavailable",
+                        )
+                            .into_response(),
+                    );
+                    drop(lease);
+                    break;
+                }
+                Err(HeaderSendError::Timeout | HeaderSendError::Other) => {
+                    let _ = store
+                        .providers()
+                        .set_credential_health(
+                            &credential.id,
+                            "cooldown",
+                            Some(unix_now() + 30),
+                            unix_now(),
+                        )
+                        .await;
+                    drop(lease);
+                    continue;
+                }
+            };
         let status = upstream.status();
         let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         if !status.is_success() {
@@ -1792,6 +1865,7 @@ fn unresolved_custom_outcome(public_model: String) -> CustomRouteOutcome {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_targets(
     store: &Store,
     cipher: &TokenCipher,
@@ -1800,6 +1874,7 @@ pub async fn execute_targets(
     inbound_headers: &HeaderMap,
     raw_body: &Bytes,
     affinity_identity_override: Option<&str>,
+    recovery_budget: Duration,
 ) -> (Response, CustomRouteOutcome) {
     let Some(public_model) = targets.first().map(|(_, model)| model.public_model.clone()) else {
         return (
@@ -1812,6 +1887,18 @@ pub async fn execute_targets(
         );
     };
     let required = request_capabilities(raw_body, wire_api);
+    // A public model may have targets on independent origins. In that case a dead origin gets one
+    // immediate attempt and the request can fall through to a working origin; the opened circuit
+    // still protects subsequent requests and admits one recovery probe. With only one origin,
+    // retain the full recovery wait so a brief WAN/provider outage heals in place.
+    let has_origin_fallback = targets
+        .iter()
+        .filter_map(|(provider, _)| {
+            crate::network_recovery::OriginKey::parse(&provider.base_url).ok()
+        })
+        .collect::<HashSet<_>>()
+        .len()
+        > 1;
     let affinity_key = request_affinity_key(
         inbound_headers,
         raw_body,
@@ -1834,6 +1921,11 @@ pub async fn execute_targets(
         for (index, (provider, model, preferred_credential_id)) in ranked.into_iter().enumerate() {
             let provider_slug = provider.slug.clone();
             let public_model = model.public_model.clone();
+            let target_recovery_budget = if has_origin_fallback {
+                Duration::ZERO
+            } else {
+                recovery_budget
+            };
             let mut result = execute_with_affinity(
                 store,
                 cipher,
@@ -1843,6 +1935,7 @@ pub async fn execute_targets(
                 raw_body,
                 affinity_key.clone(),
                 preferred_credential_id,
+                target_recovery_budget,
             )
             .await;
             result.1.effective_service_tier = Some("priority".into());
@@ -1886,6 +1979,11 @@ pub async fn execute_targets(
         for (index, (provider, model, preferred_credential_id)) in ranked.into_iter().enumerate() {
             let provider_slug = provider.slug.clone();
             let public_model = model.public_model.clone();
+            let target_recovery_budget = if has_origin_fallback {
+                Duration::ZERO
+            } else {
+                recovery_budget
+            };
             let mut result = execute_with_affinity(
                 store,
                 cipher,
@@ -1895,6 +1993,7 @@ pub async fn execute_targets(
                 &standard_body,
                 affinity_key.clone(),
                 preferred_credential_id,
+                target_recovery_budget,
             )
             .await;
             result.1.effective_service_tier = Some("standard".into());
@@ -1947,6 +2046,11 @@ pub async fn execute_targets(
     for (index, (provider, model, preferred_credential_id)) in ranked.into_iter().enumerate() {
         let provider_slug = provider.slug.clone();
         let public_model = model.public_model.clone();
+        let target_recovery_budget = if has_origin_fallback {
+            Duration::ZERO
+        } else {
+            recovery_budget
+        };
         let result = execute_with_affinity(
             store,
             cipher,
@@ -1956,6 +2060,7 @@ pub async fn execute_targets(
             raw_body,
             affinity_key.clone(),
             preferred_credential_id,
+            target_recovery_budget,
         )
         .await;
         if result.0.status().is_success() || !retryable_status(result.0.status()) {

@@ -412,7 +412,7 @@ async fn unary_5xx_penalizes_health_but_ordinary_request_4xx_is_neutral() {
 }
 
 #[tokio::test]
-async fn unary_quota_code_is_capacity_not_health_and_transport_loss_is_transient() {
+async fn unary_quota_code_and_transport_loss_do_not_poison_account_health() {
     let quota = MockControlUpstream::new(
         400,
         r#"{"error":{"code":"insufficient_quota","message":"ignored"}}"#,
@@ -459,8 +459,8 @@ async fn unary_quota_code_is_capacity_not_health_and_transport_loss_is_transient
     let mut snapshots = vec![polyflare_core::AccountSnapshot::new("acct-a")];
     state.runtime.overlay(&mut snapshots, now());
     assert_eq!(
-        snapshots[0].error_count, 1,
-        "a unary transport loss is a transient account-health failure"
+        snapshots[0].error_count, 0,
+        "an origin transport loss is not evidence that the selected account is unhealthy"
     );
     assert_eq!(state.lease_metrics.acquired(), 1);
     assert_eq!(state.lease_metrics.released(), 1);

@@ -65,7 +65,7 @@ mod signal;
 mod sniff;
 mod telemetry;
 
-pub(crate) use owner::{dial_owner_upstream, resolve_owner};
+pub(crate) use owner::resolve_owner;
 use redial::{redial_upstream_with_models_etag, RedialOutcome};
 pub(crate) use session::ws_session_key;
 
@@ -186,7 +186,14 @@ pub(crate) async fn redial_for_scope(
         Some(pool) => crate::catalog::pooled_models_etag(state, pool).await,
         None => crate::catalog::root_models_etag(state).await,
     };
-    redial_upstream_with_models_etag(headers, account, relay_contract, Some(current)).await
+    redial_upstream_with_models_etag(
+        headers,
+        account,
+        relay_contract,
+        Some(current),
+        state.runtime_settings.starvation_wait_budget(),
+    )
+    .await
 }
 
 /// Accepts the codex CLI's downstream WebSocket upgrade on `/responses` (routed here only when
@@ -265,7 +272,9 @@ async fn responses_ws_upgrade(
         }
     };
     let rejected_access_token = account.bearer_token.clone();
-    let first = dial_owner_upstream(&headers, &account).await;
+    let recovery_deadline =
+        tokio::time::Instant::now() + state.runtime_settings.starvation_wait_budget();
+    let first = owner::dial_owner_upstream_recovering(&headers, &account, recovery_deadline).await;
     let (account, upstream) = match first {
         Ok(upstream) => (account, upstream),
         Err(error) if relay_error_status(&error) == Some(StatusCode::UNAUTHORIZED) => {
@@ -279,7 +288,13 @@ async fn responses_ws_upgrade(
             .await
             {
                 Ok(Some(refreshed_account)) => {
-                    match dial_owner_upstream(&headers, &refreshed_account).await {
+                    match owner::dial_owner_upstream_recovering(
+                        &headers,
+                        &refreshed_account,
+                        recovery_deadline,
+                    )
+                    .await
+                    {
                         Ok(upstream) => (refreshed_account, upstream),
                         Err(error) => {
                             record_initial_dial_failure(&state, &refreshed_account, &error).await;
