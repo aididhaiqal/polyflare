@@ -83,6 +83,101 @@ async fn migration_0022_defaults_existing_models_to_noop_profiles() {
 }
 
 #[tokio::test]
+async fn provider_model_multi_target_migration_preserves_rows_and_scopes_uniqueness() {
+    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    sqlx::query(
+        "CREATE TABLE request_log (id INTEGER PRIMARY KEY, requested_at INTEGER NOT NULL DEFAULT 0)",
+    )
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../migrations/0019_custom_model_providers.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../migrations/0020_provider_model_catalog_visibility.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0022_custom_model_profiles.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "INSERT INTO custom_providers \
+         (id, slug, display_name, base_url, created_at, updated_at) \
+         VALUES ('provider-a', 'a', 'A', 'https://a.example/v1', 1, 1), \
+                ('provider-b', 'b', 'B', 'https://b.example/v1', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models \
+         (id, provider_id, public_model, upstream_model, display_name, created_at, updated_at) \
+         VALUES ('model-a', 'provider-a', 'shared-model', 'upstream-a', 'Shared A', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/20260727210344_provider_model_multi_target.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let preserved: (String, String, String, String, bool, bool, String) = sqlx::query_as(
+        "SELECT provider_id, public_model, upstream_model, display_name, \
+         visible_in_codex, visible_in_openai, instruction_mode \
+         FROM provider_models WHERE id = 'model-a'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        preserved,
+        (
+            "provider-a".into(),
+            "shared-model".into(),
+            "upstream-a".into(),
+            "Shared A".into(),
+            true,
+            true,
+            "none".into()
+        )
+    );
+
+    sqlx::query(
+        "INSERT INTO provider_models \
+         (id, provider_id, public_model, upstream_model, display_name, created_at, updated_at) \
+         VALUES ('model-b', 'provider-b', 'shared-model', 'upstream-b', 'Shared B', 2, 2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let duplicate = sqlx::query(
+        "INSERT INTO provider_models \
+         (id, provider_id, public_model, upstream_model, display_name, created_at, updated_at) \
+         VALUES ('model-a-duplicate', 'provider-a', 'shared-model', 'upstream-c', 'Shared C', 3, 3)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert!(
+        duplicate.to_string().contains("UNIQUE constraint failed"),
+        "unexpected error: {duplicate}"
+    );
+}
+
+#[tokio::test]
 async fn migration_0016_erases_preexisting_raw_session_ids() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("store.db");

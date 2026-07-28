@@ -5,6 +5,9 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::http::StatusCode;
+use axum::routing::post;
+use axum::Router;
 use futures_util::StreamExt;
 use polyflare_codex::oauth::OAuthClient;
 use polyflare_codex::CodexExecutor;
@@ -401,7 +404,460 @@ async fn messages_route_can_translate_to_a_custom_responses_provider() {
     let forwarded = handle.last_body().unwrap();
     assert_eq!(forwarded["model"], "custom-upstream");
     assert_eq!(forwarded["max_output_tokens"], 777);
+    assert_eq!(
+        forwarded["prompt_cache_key"].as_str().unwrap().len(),
+        48,
+        "translated custom Responses turns receive a stable cache-affinity key"
+    );
     assert!(forwarded.get("store").is_none());
+}
+
+#[tokio::test]
+async fn native_custom_messages_failover_attributes_usage_and_cost_to_the_final_target() {
+    let failed_upstream = Router::new().route(
+        "/v1/messages",
+        post(|| async { (StatusCode::TOO_MANY_REQUESTS, "provider exhausted") }),
+    );
+    let failed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let failed_addr = failed_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(failed_listener, failed_upstream).await.unwrap();
+    });
+
+    let successful_mock = MockUpstream::new(vec![
+        r#"{"type":"message_start","message":{"id":"msg_final","model":"anthropic-final","usage":{"input_tokens":80,"cache_creation_input_tokens":10,"cache_read_input_tokens":20,"output_tokens":0}}}"#.into(),
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#.into(),
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}"#.into(),
+        r#"{"type":"content_block_stop","index":0}"#.into(),
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":25}}"#.into(),
+        r#"{"type":"message_stop"}"#.into(),
+    ]);
+    let successful_upstream = successful_mock.spawn().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let inspect_store = store.clone();
+    let cipher = TokenCipher::from_key_bytes(&[21u8; 32]).unwrap();
+    let created_at = now();
+    for (
+        provider_id,
+        slug,
+        base_url,
+        credential_id,
+        upstream_model,
+        input_price,
+        cached_price,
+        output_price,
+    ) in [
+        (
+            "provider-a-anthropic-failed",
+            "anthropic-failed",
+            format!("http://{failed_addr}/v1"),
+            "credential-a-anthropic-failed",
+            "anthropic-failed",
+            100.0,
+            100.0,
+            100.0,
+        ),
+        (
+            "provider-b-anthropic-final",
+            "anthropic-final",
+            format!("{successful_upstream}/v1"),
+            "credential-b-anthropic-final",
+            "anthropic-final",
+            2.0,
+            0.5,
+            8.0,
+        ),
+    ] {
+        store
+            .providers()
+            .create_provider(&NewCustomProvider {
+                id: provider_id.into(),
+                slug: slug.into(),
+                display_name: slug.into(),
+                base_url,
+                wire_api: "anthropic_messages".into(),
+                enabled: true,
+                stateless_responses: false,
+                allow_private_hosts: true,
+                connect_timeout_ms: 1_000,
+                stream_idle_timeout_ms: 10_000,
+                request_max_retries: 0,
+                max_concurrency: None,
+                created_at,
+            })
+            .await
+            .unwrap();
+        store
+            .providers()
+            .create_credential(
+                credential_id,
+                provider_id,
+                "primary",
+                &format!("secret-{slug}"),
+                1.0,
+                None,
+                created_at,
+                &cipher,
+            )
+            .await
+            .unwrap();
+        store
+            .providers()
+            .create_model(&NewProviderModel {
+                id: format!("model-{slug}"),
+                provider_id: provider_id.into(),
+                public_model: "anthropic-balanced".into(),
+                upstream_model: upstream_model.into(),
+                display_name: "Anthropic Balanced".into(),
+                context_window: None,
+                max_output_tokens: Some(4096),
+                supports_tools: true,
+                supports_vision: true,
+                supports_parallel_tool_calls: true,
+                supports_web_search: false,
+                supports_reasoning_summaries: false,
+                reasoning_levels_json: "[]".into(),
+                model_info_json: None,
+                instruction_mode: "none".into(),
+                instruction_text: String::new(),
+                request_overrides_json: "{}".into(),
+                input_per_million: Some(input_price),
+                cached_input_per_million: Some(cached_price),
+                output_per_million: Some(output_price),
+                visible_in_codex: true,
+                visible_in_openai: true,
+                enabled: true,
+                created_at,
+            })
+            .await
+            .unwrap();
+    }
+    std::mem::forget(dir);
+    let pf = spawn_polyflare(store, "http://127.0.0.1:9".into()).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{pf}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "anthropic-balanced",
+            "messages": [{"role":"user","content":"hello"}],
+            "max_tokens": 100,
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.text().await.unwrap().contains("message_stop"));
+
+    inspect_store.flush_background_writes().await.unwrap();
+    let row = inspect_store
+        .request_log()
+        .list(10, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.model.as_deref() == Some("anthropic-balanced"))
+        .expect("native custom Messages request row");
+    assert_eq!(row.provider, "anthropic-final");
+    assert_eq!(
+        row.provider_credential_id.as_deref(),
+        Some("credential-b-anthropic-final")
+    );
+    assert_eq!(row.input_tokens, Some(110));
+    assert_eq!(row.cached_input_tokens, Some(20));
+    assert_eq!(row.cache_write_input_tokens, Some(10));
+    assert_eq!(row.output_tokens, Some(25));
+    assert_eq!(row.usage_status.as_deref(), Some("final"));
+    let cost = row
+        .cost_usd
+        .expect("final Anthropic target pricing must be applied");
+    assert!(
+        (cost - 0.000_39).abs() < 1e-12,
+        "cost must use the successful target's prices; got {cost}"
+    );
+}
+
+#[tokio::test]
+async fn admitted_claude_session_stays_on_its_completed_custom_target() {
+    let upstream_a_mock = MockUpstream::new(vec![r#"{"type":"message_stop"}"#.to_string()]);
+    let upstream_a_handle = upstream_a_mock.clone();
+    let upstream_a = upstream_a_mock.spawn().await;
+    let upstream_b_mock = MockUpstream::new(vec![r#"{"type":"message_stop"}"#.to_string()]);
+    let upstream_b_handle = upstream_b_mock.clone();
+    let upstream_b = upstream_b_mock.spawn().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let control_store = store.clone();
+    let cipher = TokenCipher::from_key_bytes(&[21u8; 32]).unwrap();
+    let created_at = now();
+    for (provider_id, slug, base_url, credential_id) in [
+        (
+            "provider-a-claude-affinity",
+            "a-claude-affinity",
+            format!("{upstream_a}/v1"),
+            "credential-a-claude-affinity",
+        ),
+        (
+            "provider-b-claude-affinity",
+            "b-claude-affinity",
+            format!("{upstream_b}/v1"),
+            "credential-b-claude-affinity",
+        ),
+    ] {
+        store
+            .providers()
+            .create_provider(&NewCustomProvider {
+                id: provider_id.into(),
+                slug: slug.into(),
+                display_name: slug.into(),
+                base_url,
+                wire_api: "anthropic_messages".into(),
+                enabled: true,
+                stateless_responses: false,
+                allow_private_hosts: true,
+                connect_timeout_ms: 1_000,
+                stream_idle_timeout_ms: 10_000,
+                request_max_retries: 0,
+                max_concurrency: None,
+                created_at,
+            })
+            .await
+            .unwrap();
+        store
+            .providers()
+            .create_credential(
+                credential_id,
+                provider_id,
+                "primary",
+                &format!("secret-{slug}"),
+                1.0,
+                None,
+                created_at,
+                &cipher,
+            )
+            .await
+            .unwrap();
+        store
+            .providers()
+            .create_model(&NewProviderModel {
+                id: format!("model-{slug}"),
+                provider_id: provider_id.into(),
+                public_model: "claude-affinity-model".into(),
+                upstream_model: format!("upstream-{slug}"),
+                display_name: "Claude Affinity Model".into(),
+                context_window: None,
+                max_output_tokens: Some(4_096),
+                supports_tools: true,
+                supports_vision: true,
+                supports_parallel_tool_calls: true,
+                supports_web_search: false,
+                supports_reasoning_summaries: false,
+                reasoning_levels_json: "[]".into(),
+                model_info_json: None,
+                instruction_mode: "none".into(),
+                instruction_text: String::new(),
+                request_overrides_json: "{}".into(),
+                input_per_million: None,
+                cached_input_per_million: None,
+                output_per_million: None,
+                visible_in_codex: true,
+                visible_in_openai: true,
+                enabled: true,
+                created_at,
+            })
+            .await
+            .unwrap();
+    }
+    control_store
+        .providers()
+        .set_credential_health(
+            "credential-a-claude-affinity",
+            "cooldown",
+            Some(i64::MAX),
+            created_at,
+        )
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+    let pf = spawn_polyflare(store, "http://127.0.0.1:9".into()).await;
+
+    let client = reqwest::Client::new();
+    let send_turn = || {
+        client
+            .post(format!("{pf}/v1/messages"))
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+            .header("user-agent", "claude-cli/2.1.218 (external, sdk-ts)")
+            .header(
+                "x-claude-code-session-id",
+                "c38f98c8-7c2a-4e93-aa3d-a79df7a7015f",
+            )
+            .json(&serde_json::json!({
+                "model": "claude-affinity-model",
+                "max_tokens": 100,
+                "messages": [{"role":"user","content":"hello"}],
+                "stream": true
+            }))
+    };
+    let first = send_turn().send().await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert!(first.text().await.unwrap().contains("message_stop"));
+    assert_eq!(upstream_b_handle.request_count(), 1);
+    assert_eq!(upstream_a_handle.request_count(), 0);
+
+    control_store
+        .providers()
+        .set_credential_health(
+            "credential-a-claude-affinity",
+            "healthy",
+            None,
+            created_at + 1,
+        )
+        .await
+        .unwrap();
+    let repeated = send_turn().send().await.unwrap();
+    assert_eq!(repeated.status(), StatusCode::OK);
+    assert!(repeated.text().await.unwrap().contains("message_stop"));
+    assert_eq!(
+        upstream_b_handle.request_count(),
+        2,
+        "the admitted Claude session must keep its warm target after the other target recovers"
+    );
+    assert_eq!(
+        upstream_a_handle.request_count(),
+        0,
+        "routing fairness must not displace a healthy admitted-session affinity"
+    );
+}
+
+#[tokio::test]
+async fn native_custom_messages_image_uses_only_a_vision_capable_target() {
+    let non_vision_mock = MockUpstream::error_status(400, "vision is unsupported");
+    let non_vision_handle = non_vision_mock.clone();
+    let non_vision_upstream = non_vision_mock.spawn().await;
+    let vision_mock = MockUpstream::new(vec![r#"{"type":"message_stop"}"#.to_string()]);
+    let vision_handle = vision_mock.clone();
+    let vision_upstream = vision_mock.spawn().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[21u8; 32]).unwrap();
+    let created_at = now();
+    for (provider_id, slug, base_url, credential_id, supports_vision) in [
+        (
+            "provider-a-no-vision",
+            "a-no-vision",
+            format!("{non_vision_upstream}/v1"),
+            "credential-a-no-vision",
+            false,
+        ),
+        (
+            "provider-b-with-vision",
+            "b-with-vision",
+            format!("{vision_upstream}/v1"),
+            "credential-b-with-vision",
+            true,
+        ),
+    ] {
+        store
+            .providers()
+            .create_provider(&NewCustomProvider {
+                id: provider_id.into(),
+                slug: slug.into(),
+                display_name: slug.into(),
+                base_url,
+                wire_api: "anthropic_messages".into(),
+                enabled: true,
+                stateless_responses: false,
+                allow_private_hosts: true,
+                connect_timeout_ms: 1_000,
+                stream_idle_timeout_ms: 10_000,
+                request_max_retries: 0,
+                max_concurrency: None,
+                created_at,
+            })
+            .await
+            .unwrap();
+        store
+            .providers()
+            .create_credential(
+                credential_id,
+                provider_id,
+                "primary",
+                &format!("secret-{slug}"),
+                1.0,
+                None,
+                created_at,
+                &cipher,
+            )
+            .await
+            .unwrap();
+        store
+            .providers()
+            .create_model(&NewProviderModel {
+                id: format!("model-{slug}"),
+                provider_id: provider_id.into(),
+                public_model: "claude-vision-balanced".into(),
+                upstream_model: format!("upstream-{slug}"),
+                display_name: "Claude Vision Balanced".into(),
+                context_window: None,
+                max_output_tokens: Some(4_096),
+                supports_tools: true,
+                supports_vision,
+                supports_parallel_tool_calls: true,
+                supports_web_search: false,
+                supports_reasoning_summaries: false,
+                reasoning_levels_json: "[]".into(),
+                model_info_json: None,
+                instruction_mode: "none".into(),
+                instruction_text: String::new(),
+                request_overrides_json: "{}".into(),
+                input_per_million: None,
+                cached_input_per_million: None,
+                output_per_million: None,
+                visible_in_codex: true,
+                visible_in_openai: true,
+                enabled: true,
+                created_at,
+            })
+            .await
+            .unwrap();
+    }
+    std::mem::forget(dir);
+    let pf = spawn_polyflare(store, "http://127.0.0.1:9".into()).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{pf}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-vision-balanced",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "opaque"
+                    }
+                }]
+            }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.text().await.unwrap().contains("message_stop"));
+    assert_eq!(
+        non_vision_handle.request_count(),
+        0,
+        "an Anthropic image request must not be sent to a target lacking vision"
+    );
+    assert_eq!(vision_handle.request_count(), 1);
 }
 
 #[tokio::test]

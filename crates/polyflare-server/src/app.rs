@@ -270,6 +270,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             get(crate::provider_api::list).post(crate::provider_api::create),
         )
         .route(
+            "/api/providers/performance",
+            get(crate::provider_api::performance),
+        )
+        .route(
             "/api/translations",
             get(crate::translation_api::list).post(crate::translation_api::create),
         )

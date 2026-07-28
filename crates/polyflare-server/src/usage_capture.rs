@@ -55,8 +55,31 @@ pub struct ResponseUsage {
     pub orchestration_cached_input_tokens: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureProtocol {
+    Responses,
+    AnthropicMessages,
+}
+
 fn non_negative_i64(value: &Value) -> Option<i64> {
     value.as_i64().filter(|value| *value >= 0)
+}
+
+fn sum_present(values: impl IntoIterator<Item = Option<i64>>) -> Option<i64> {
+    let mut total = 0_i64;
+    let mut found = false;
+    for value in values.into_iter().flatten() {
+        total = total.checked_add(value)?;
+        found = true;
+    }
+    found.then_some(total)
+}
+
+fn max_present(current: Option<i64>, incoming: Option<i64>) -> Option<i64> {
+    match (current, incoming) {
+        (Some(current), Some(incoming)) => Some(current.max(incoming)),
+        (current, incoming) => current.or(incoming),
+    }
 }
 
 /// Convert authoritative terminal usage into the same compute-pressure scale used by the
@@ -158,6 +181,53 @@ pub fn parse_response_usage(frame_json: &str) -> Option<ResponseUsage> {
     })
 }
 
+/// Parse Anthropic Messages usage into the same canonical counters used by Responses telemetry.
+///
+/// Anthropic reports prompt-cache reads and writes separately from ordinary `input_tokens`.
+/// Canonical `input_tokens` therefore includes all three categories, matching the Responses
+/// contract where cached tokens are a subset of total input. This lets the shared pricing path
+/// charge ordinary/cache-write input at the normal input rate and cache reads at the cached rate.
+pub(crate) fn parse_anthropic_usage(frame_json: &str) -> Option<ResponseUsage> {
+    let value: Value = serde_json::from_str(frame_json).ok()?;
+    let event_type = value.get("type")?.as_str()?;
+    let usage = match event_type {
+        "message_start" => value.get("message")?.get("usage")?,
+        "message_delta" | "message_stop" | "message" => value.get("usage")?,
+        _ => return None,
+    };
+    let usage = usage.as_object()?;
+    let cache_write_input_tokens = usage
+        .get("cache_creation_input_tokens")
+        .and_then(non_negative_i64)
+        .or_else(|| {
+            usage
+                .get("cache_creation")
+                .and_then(Value::as_object)
+                .and_then(|parts| sum_present(parts.values().map(non_negative_i64)))
+        });
+    let cached_input_tokens = usage
+        .get("cache_read_input_tokens")
+        .and_then(non_negative_i64);
+    let uncached_input_tokens = usage.get("input_tokens").and_then(non_negative_i64);
+    let input_tokens = sum_present([
+        uncached_input_tokens,
+        cache_write_input_tokens,
+        cached_input_tokens,
+    ]);
+    let output_tokens = usage.get("output_tokens").and_then(non_negative_i64);
+
+    Some(ResponseUsage {
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        cache_write_input_tokens,
+        reported_total_tokens: input_tokens
+            .zip(output_tokens)
+            .and_then(|(input, output)| input.checked_add(output)),
+        ..ResponseUsage::default()
+    })
+}
+
 /// Whether an SSE JSON payload carries the first generated output fragment. Control/lifecycle
 /// frames such as `response.created` do not count as TTFT. Codex output modalities use
 /// `response.*.delta` events for generated text, reasoning summaries, refusals, tool arguments,
@@ -169,6 +239,14 @@ pub(crate) fn is_output_delta(frame_json: &str) -> bool {
         .is_some_and(|event_type| {
             event_type.starts_with("response.") && event_type.ends_with(".delta")
         })
+}
+
+fn is_anthropic_output_delta(frame_json: &str) -> bool {
+    serde_json::from_str::<Value>(frame_json)
+        .ok()
+        .and_then(|value| value.get("type")?.as_str().map(str::to_owned))
+        .as_deref()
+        == Some("content_block_delta")
 }
 
 /// Usage + first-token latency observed on a passthrough stream (see [`UsageCapturingStream`]).
@@ -225,6 +303,7 @@ pub struct CapturedUsage {
 pub struct UsageCapturingStream<S> {
     inner: S,
     on_done: Option<Box<dyn FnOnce(CapturedUsage) + Send>>,
+    protocol: CaptureProtocol,
     start: Instant,
     ttft_ms: Option<i64>,
     usage: Option<ResponseUsage>,
@@ -278,9 +357,44 @@ impl<S> UsageCapturingStream<S> {
         eof_outcome: polyflare_store::RequestProtocolOutcome,
         on_done: impl FnOnce(CapturedUsage) + Send + 'static,
     ) -> Self {
+        Self::new_for_protocol(
+            inner,
+            start,
+            CaptureProtocol::Responses,
+            eof_outcome,
+            on_done,
+        )
+    }
+
+    /// Observe an Anthropic Messages response while preserving every response byte. Streaming
+    /// `message_start` and `message_delta` usage is merged until `message_stop`; a buffered
+    /// top-level `message` body is handled by the same observer.
+    pub fn new_anthropic_with_eof_outcome(
+        inner: S,
+        start: Instant,
+        eof_outcome: polyflare_store::RequestProtocolOutcome,
+        on_done: impl FnOnce(CapturedUsage) + Send + 'static,
+    ) -> Self {
+        Self::new_for_protocol(
+            inner,
+            start,
+            CaptureProtocol::AnthropicMessages,
+            eof_outcome,
+            on_done,
+        )
+    }
+
+    fn new_for_protocol(
+        inner: S,
+        start: Instant,
+        protocol: CaptureProtocol,
+        eof_outcome: polyflare_store::RequestProtocolOutcome,
+        on_done: impl FnOnce(CapturedUsage) + Send + 'static,
+    ) -> Self {
         Self {
             inner,
             on_done: Some(Box::new(on_done)),
+            protocol,
             start,
             ttft_ms: None,
             usage: None,
@@ -328,27 +442,60 @@ impl<S> UsageCapturingStream<S> {
         let Ok(s) = std::str::from_utf8(line_bytes) else {
             return; // best-effort: not UTF-8, silently skip; the chunk still passes through
         };
-        let payload = s.strip_prefix("data: ").unwrap_or(s);
-        if self.ttft_ms.is_none() && is_output_delta(payload) {
+        let payload = s.strip_prefix("data:").map(str::trim_start).unwrap_or(s);
+        let output_delta = match self.protocol {
+            CaptureProtocol::Responses => is_output_delta(payload),
+            CaptureProtocol::AnthropicMessages => is_anthropic_output_delta(payload),
+        };
+        if self.ttft_ms.is_none() && output_delta {
             self.ttft_ms = Some(self.start.elapsed().as_millis() as i64);
         }
-        if let Some(usage) = parse_response_usage(payload) {
-            self.usage = Some(usage); // keep the LAST successful parse
+        match self.protocol {
+            CaptureProtocol::Responses => {
+                if let Some(usage) = parse_response_usage(payload) {
+                    self.usage = Some(usage); // keep the LAST successful parse
+                }
+            }
+            CaptureProtocol::AnthropicMessages => {
+                if let Some(incoming) = parse_anthropic_usage(payload) {
+                    let usage = self.usage.get_or_insert_with(ResponseUsage::default);
+                    usage.input_tokens = max_present(usage.input_tokens, incoming.input_tokens);
+                    usage.output_tokens = max_present(usage.output_tokens, incoming.output_tokens);
+                    usage.cached_input_tokens =
+                        max_present(usage.cached_input_tokens, incoming.cached_input_tokens);
+                    usage.cache_write_input_tokens = max_present(
+                        usage.cache_write_input_tokens,
+                        incoming.cache_write_input_tokens,
+                    );
+                    usage.reported_total_tokens =
+                        max_present(usage.reported_total_tokens, incoming.reported_total_tokens);
+                }
+            }
         }
         if self.terminal_outcome.is_none() {
-            self.terminal_outcome = match serde_json::from_str::<Value>(payload)
+            let event_type = serde_json::from_str::<Value>(payload)
                 .ok()
-                .and_then(|value| value.get("type")?.as_str().map(str::to_owned))
-                .as_deref()
-            {
-                Some("response.completed") => {
-                    Some(polyflare_store::RequestProtocolOutcome::Completed)
-                }
-                Some("response.failed") => Some(polyflare_store::RequestProtocolOutcome::Failed),
-                Some("response.incomplete") => {
-                    Some(polyflare_store::RequestProtocolOutcome::Incomplete)
-                }
-                _ => None,
+                .and_then(|value| value.get("type")?.as_str().map(str::to_owned));
+            self.terminal_outcome = match self.protocol {
+                CaptureProtocol::Responses => match event_type.as_deref() {
+                    Some("response.completed") => {
+                        Some(polyflare_store::RequestProtocolOutcome::Completed)
+                    }
+                    Some("response.failed") => {
+                        Some(polyflare_store::RequestProtocolOutcome::Failed)
+                    }
+                    Some("response.incomplete") => {
+                        Some(polyflare_store::RequestProtocolOutcome::Incomplete)
+                    }
+                    _ => None,
+                },
+                CaptureProtocol::AnthropicMessages => match event_type.as_deref() {
+                    Some("message_stop" | "message") => {
+                        Some(polyflare_store::RequestProtocolOutcome::Completed)
+                    }
+                    Some("error") => Some(polyflare_store::RequestProtocolOutcome::Failed),
+                    _ => None,
+                },
             };
         }
     }
@@ -363,6 +510,14 @@ impl<S> UsageCapturingStream<S> {
         if !self.pending.is_empty() {
             let remainder = std::mem::take(&mut self.pending);
             self.process_line(&remainder);
+        }
+        if self.protocol == CaptureProtocol::AnthropicMessages {
+            if let Some(usage) = self.usage.as_mut() {
+                usage.reported_total_tokens = usage
+                    .input_tokens
+                    .zip(usage.output_tokens)
+                    .and_then(|(input, output)| input.checked_add(output));
+            }
         }
         if let Some(on_done) = self.on_done.take() {
             on_done(CapturedUsage {
@@ -454,6 +609,82 @@ mod tests {
         assert!(cu.ttft_ms.is_some());
         assert_eq!(
             cu.protocol_outcome,
+            polyflare_store::RequestProtocolOutcome::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_merges_cache_usage_and_terminal_output() {
+        let frames = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":80,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":20,\"output_tokens\":0}}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":25}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            )),
+        ];
+        let expected = frames
+            .iter()
+            .map(|frame| frame.as_ref().unwrap().clone())
+            .collect::<Vec<_>>();
+        let captured = Arc::new(Mutex::new(None));
+        let captured_2 = captured.clone();
+        let stream = UsageCapturingStream::new_anthropic_with_eof_outcome(
+            stream::iter(frames),
+            Instant::now(),
+            polyflare_store::RequestProtocolOutcome::TransportLost,
+            move |usage| *captured_2.lock().unwrap() = Some(usage),
+        );
+        let actual = stream.map(|chunk| chunk.unwrap()).collect::<Vec<_>>().await;
+
+        assert_eq!(
+            actual, expected,
+            "the Anthropic observer must preserve bytes"
+        );
+        let captured = captured.lock().unwrap().take().unwrap();
+        let usage = captured.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(110));
+        assert_eq!(usage.cached_input_tokens, Some(20));
+        assert_eq!(usage.cache_write_input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(25));
+        assert_eq!(usage.reported_total_tokens, Some(135));
+        assert!(captured.ttft_ms.is_some());
+        assert_eq!(
+            captured.protocol_outcome,
+            polyflare_store::RequestProtocolOutcome::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_anthropic_message_captures_top_level_usage() {
+        let captured = Arc::new(Mutex::new(None));
+        let captured_2 = captured.clone();
+        let body = UsageCapturingStream::new_anthropic_with_eof_outcome(
+            stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"message\",\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":3,\"output_tokens\":2}}",
+            ))]),
+            Instant::now(),
+            polyflare_store::RequestProtocolOutcome::Completed,
+            move |usage| *captured_2.lock().unwrap() = Some(usage),
+        );
+        let _: Vec<_> = body.collect().await;
+
+        let captured = captured.lock().unwrap().take().unwrap();
+        assert_eq!(
+            captured.usage,
+            Some(ResponseUsage {
+                input_tokens: Some(8),
+                output_tokens: Some(2),
+                cached_input_tokens: Some(3),
+                reported_total_tokens: Some(10),
+                ..ResponseUsage::default()
+            })
+        );
+        assert_eq!(
+            captured.protocol_outcome,
             polyflare_store::RequestProtocolOutcome::Completed
         );
     }

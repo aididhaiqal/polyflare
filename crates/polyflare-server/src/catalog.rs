@@ -63,8 +63,45 @@ pub(crate) fn safe_codex_model_info_extensions(value: &serde_json::Value) -> boo
             "priority" => value
                 .as_i64()
                 .is_some_and(|priority| i32::try_from(priority).is_ok()),
+            "service_tiers" => value == &priority_service_tiers(),
+            "additional_speed_tiers" => value == &serde_json::json!(["fast"]),
+            "default_service_tier" => value.is_null(),
             _ => false,
         })
+}
+
+fn priority_service_tiers() -> serde_json::Value {
+    serde_json::json!([{
+        "id": "priority",
+        "name": "Fast",
+        "description": "Higher-priority provider inference"
+    }])
+}
+
+pub(crate) fn supports_priority_service_tier(model_info_json: Option<&str>) -> bool {
+    model_info_json
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|value| value.get("service_tiers").cloned())
+        .is_some_and(|tiers| tiers == priority_service_tiers())
+}
+
+pub(crate) fn set_priority_service_tier(
+    model_info: Option<serde_json::Value>,
+    enabled: bool,
+) -> Option<serde_json::Value> {
+    let mut object = model_info
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    if enabled {
+        object.insert("service_tiers".into(), priority_service_tiers());
+        object.insert("additional_speed_tiers".into(), serde_json::json!(["fast"]));
+        object.insert("default_service_tier".into(), serde_json::Value::Null);
+    } else {
+        object.remove("service_tiers");
+        object.remove("additional_speed_tiers");
+        object.remove("default_service_tier");
+    }
+    (!object.is_empty()).then_some(serde_json::Value::Object(object))
 }
 
 /// A provider-agnostic catalog row before it's shaped for a response.
@@ -166,22 +203,94 @@ async fn root_models_with_custom(
         .list_enabled_models()
         .await
         .unwrap_or_default();
+    let mut grouped = BTreeMap::<String, Vec<_>>::new();
+    for (provider, model) in configured
+        .into_iter()
+        .filter(|(provider, _)| provider.wire_api == "responses")
+    {
+        grouped
+            .entry(model.public_model.clone())
+            .or_default()
+            .push((provider, model));
+    }
     let mut seen: std::collections::HashSet<String> =
         native.iter().map(|model| model.slug.clone()).collect();
-    for (provider, model) in configured.into_iter().filter(|(_, model)| match surface {
-        CatalogSurface::Codex => model.visible_in_codex,
-        CatalogSurface::OpenAi => model.visible_in_openai,
-    }) {
-        if !seen.insert(model.public_model.clone()) {
+    for (public_model, targets) in grouped {
+        if !targets.iter().any(|(_, model)| match surface {
+            CatalogSurface::Codex => model.visible_in_codex,
+            CatalogSurface::OpenAi => model.visible_in_openai,
+        }) {
+            continue;
+        }
+        if !seen.insert(public_model.clone()) {
             tracing::warn!(
-                provider = %provider.slug,
-                model = %model.public_model,
+                model = %public_model,
+                target_count = targets.len(),
                 "custom model collides with built-in catalog; built-in model wins"
             );
             continue;
         }
-        let reasoning: Vec<String> =
+
+        // A single catalog row is a guarantee about every target the router may choose. Start
+        // from the deterministic first target, then intersect capabilities and take the smallest
+        // declared limits. Any unknown limit remains unknown rather than overstating capacity.
+        let (first_provider, first_model) = &targets[0];
+        let mut model = first_model.clone();
+        model.context_window = targets
+            .iter()
+            .map(|(_, target)| target.context_window)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|limits| limits.into_iter().min());
+        model.max_output_tokens = targets
+            .iter()
+            .map(|(_, target)| target.max_output_tokens)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|limits| limits.into_iter().min());
+        model.supports_tools = targets.iter().all(|(_, target)| target.supports_tools);
+        model.supports_vision = targets.iter().all(|(_, target)| target.supports_vision);
+        model.supports_parallel_tool_calls = targets
+            .iter()
+            .all(|(_, target)| target.supports_parallel_tool_calls);
+        model.supports_web_search = targets.iter().all(|(_, target)| target.supports_web_search);
+        model.supports_reasoning_summaries = targets
+            .iter()
+            .all(|(_, target)| target.supports_reasoning_summaries);
+
+        let mut reasoning: Vec<String> =
             serde_json::from_str(&model.reasoning_levels_json).unwrap_or_default();
+        let other_reasoning: Vec<Vec<String>> = targets
+            .iter()
+            .skip(1)
+            .map(|(_, target)| {
+                serde_json::from_str(&target.reasoning_levels_json).unwrap_or_default()
+            })
+            .collect();
+        reasoning.retain(|effort| {
+            other_reasoning
+                .iter()
+                .all(|supported| supported.contains(effort))
+        });
+
+        // Priority is an available routing lane rather than a guarantee that every target can
+        // serve it. The router exhausts these capable targets first and can transparently
+        // downgrade to Standard, matching Codex's own Fast-mode fallback behavior.
+        let available_priority = targets
+            .iter()
+            .any(|(_, target)| supports_priority_service_tier(target.model_info_json.as_deref()));
+        let identical_model_info = targets
+            .iter()
+            .all(|(_, target)| target.model_info_json == first_model.model_info_json);
+        let shared_model_info = identical_model_info
+            .then(|| {
+                first_model
+                    .model_info_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            })
+            .flatten();
+        model.model_info_json = set_priority_service_tier(shared_model_info, available_priority)
+            .map(|value| value.to_string());
+
         let supported_reasoning_levels: Vec<serde_json::Value> = reasoning
             .iter()
             .map(|effort| {
@@ -194,7 +303,11 @@ async fn root_models_with_custom(
         let mut raw = serde_json::json!({
             "slug": model.public_model,
             "display_name": model.display_name,
-            "description": format!("{} via {}", model.display_name, provider.display_name),
+            "description": if targets.len() == 1 {
+                format!("{} via {}", model.display_name, first_provider.display_name)
+            } else {
+                format!("{} via {} providers", model.display_name, targets.len())
+            },
             "default_reasoning_level": reasoning.first(),
             "supported_reasoning_levels": supported_reasoning_levels,
             "shell_type": "shell_command",

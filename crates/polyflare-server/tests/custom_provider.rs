@@ -31,6 +31,8 @@ async fn upstream_handler(
         StatusCode::OK,
         [("content-type", "text/event-stream")],
         concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
             "event: response.completed\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_custom\",",
             "\"usage\":{\"input_tokens\":100,\"output_tokens\":25,\"total_tokens\":125,",
@@ -55,6 +57,21 @@ async fn retryable_failure_handler(
         body: serde_json::from_slice(&body).unwrap(),
     });
     (StatusCode::TOO_MANY_REQUESTS, "provider exhausted")
+}
+
+async fn empty_success_handler(
+    State(seen): State<Arc<Mutex<Vec<Seen>>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, [(&'static str, &'static str); 1], &'static str) {
+    seen.lock().unwrap().push(Seen {
+        authorization: headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        body: serde_json::from_slice(&body).unwrap(),
+    });
+    (StatusCode::OK, [("content-type", "text/event-stream")], "")
 }
 
 async fn models_handler(headers: HeaderMap) -> (StatusCode, axum::Json<serde_json::Value>) {
@@ -1350,6 +1367,94 @@ async fn provider_management_never_returns_api_key() {
 }
 
 #[tokio::test]
+async fn provider_model_pricing_can_be_set_updated_and_cleared() {
+    let (base, _state) = support::spawn("http://127.0.0.1:9".into()).await;
+    let client = reqwest::Client::new();
+    let provider: serde_json::Value = client
+        .post(format!("{base}/api/providers"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({
+            "slug": "priced-provider",
+            "display_name": "Priced Provider",
+            "base_url": "https://example.com/v1"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let provider_id = provider["id"].as_str().unwrap();
+    let model: serde_json::Value = client
+        .post(format!("{base}/api/providers/{provider_id}/models"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({
+            "public_model": "priced-model",
+            "upstream_model": "priced-upstream",
+            "display_name": "Priced Model",
+            "input_per_million": 2.5,
+            "cached_input_per_million": 0.25,
+            "output_per_million": 12.0
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(model["input_per_million"], 2.5);
+    assert_eq!(model["cached_input_per_million"], 0.25);
+    assert_eq!(model["output_per_million"], 12.0);
+    let model_id = model["id"].as_str().unwrap();
+
+    let updated = client
+        .patch(format!("{base}/api/provider-models/{model_id}"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({
+            "input_per_million": 3.0,
+            "cached_input_per_million": null,
+            "output_per_million": 15.0
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+
+    let providers: serde_json::Value = client
+        .get(format!("{base}/api/providers"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let updated = providers
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == provider_id)
+        .unwrap()["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == model_id)
+        .unwrap();
+    assert_eq!(updated["input_per_million"], 3.0);
+    assert!(updated["cached_input_per_million"].is_null());
+    assert_eq!(updated["output_per_million"], 15.0);
+
+    let invalid = client
+        .patch(format!("{base}/api/provider-models/{model_id}"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({"input_per_million": -0.01}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn provider_management_rejects_partial_codex_model_info() {
     let (base, _state) = support::spawn("http://127.0.0.1:9".into()).await;
     let client = reqwest::Client::new();
@@ -1465,4 +1570,867 @@ async fn provider_management_rejects_partial_codex_model_info() {
     assert_eq!(extended["description"], "Operator supplied description");
     assert_eq!(extended["priority"], 25);
     assert_eq!(extended["truncation_policy"]["mode"], "tokens");
+}
+
+#[tokio::test]
+async fn shared_public_model_prefers_priority_then_downgrades_before_output() {
+    let failed_seen = Arc::new(Mutex::new(Vec::new()));
+    let failed_upstream = Router::new()
+        .route("/v1/responses", post(empty_success_handler))
+        .with_state(failed_seen.clone());
+    let failed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let failed_addr = failed_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(failed_listener, failed_upstream).await.unwrap();
+    });
+
+    let successful_seen = Arc::new(Mutex::new(Vec::new()));
+    let successful_upstream = Router::new()
+        .route("/v1/responses", post(upstream_handler))
+        .with_state(successful_seen.clone());
+    let successful_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let successful_addr = successful_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(successful_listener, successful_upstream)
+            .await
+            .unwrap();
+    });
+
+    let (base, state) = support::spawn("http://127.0.0.1:9".into()).await;
+    let now = 100;
+    for (id, slug, address, credential) in [
+        (
+            "provider-a-priority",
+            "a-priority",
+            failed_addr,
+            "credential-a-priority",
+        ),
+        (
+            "provider-b-standard",
+            "b-standard",
+            successful_addr,
+            "credential-b-standard",
+        ),
+    ] {
+        state
+            .store
+            .providers()
+            .create_provider(&NewCustomProvider {
+                id: id.into(),
+                slug: slug.into(),
+                display_name: slug.into(),
+                base_url: format!("http://{address}/v1"),
+                wire_api: "responses".into(),
+                enabled: true,
+                stateless_responses: true,
+                allow_private_hosts: true,
+                connect_timeout_ms: 1_000,
+                stream_idle_timeout_ms: 10_000,
+                request_max_retries: 0,
+                max_concurrency: Some(4),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .providers()
+            .create_credential(
+                credential,
+                id,
+                "primary",
+                &format!("secret-{slug}"),
+                1.0,
+                Some(4),
+                now,
+                &state.cipher,
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .providers()
+            .create_model(&NewProviderModel {
+                id: format!("model-{slug}"),
+                provider_id: id.into(),
+                public_model: "shared-balanced-model".into(),
+                upstream_model: format!("upstream-{slug}"),
+                display_name: "Shared Balanced Model".into(),
+                context_window: Some(100_000),
+                max_output_tokens: Some(10_000),
+                supports_tools: true,
+                supports_vision: false,
+                supports_parallel_tool_calls: true,
+                supports_web_search: false,
+                supports_reasoning_summaries: false,
+                reasoning_levels_json: r#"["high"]"#.into(),
+                model_info_json: (id == "provider-a-priority").then(|| {
+                    serde_json::json!({
+                        "service_tiers": [{
+                            "id": "priority",
+                            "name": "Fast",
+                            "description": "Higher-priority provider inference"
+                        }],
+                        "additional_speed_tiers": ["fast"],
+                        "default_service_tier": null
+                    })
+                    .to_string()
+                }),
+                instruction_mode: "none".into(),
+                instruction_text: String::new(),
+                request_overrides_json: "{}".into(),
+                input_per_million: Some(if id == "provider-a-priority" {
+                    100.0
+                } else {
+                    1.0
+                }),
+                cached_input_per_million: Some(if id == "provider-a-priority" {
+                    100.0
+                } else {
+                    0.5
+                }),
+                output_per_million: Some(if id == "provider-a-priority" {
+                    100.0
+                } else {
+                    4.0
+                }),
+                visible_in_codex: true,
+                visible_in_openai: true,
+                enabled: true,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+    }
+
+    let client = reqwest::Client::new();
+    let priority = client
+        .post(format!("{base}/responses"))
+        .json(&serde_json::json!({
+            "model": "shared-balanced-model",
+            "stream": true,
+            "service_tier": "priority",
+            "input": "priority"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(priority.status(), StatusCode::OK);
+    assert!(priority
+        .text()
+        .await
+        .unwrap()
+        .contains("response.completed"));
+    assert_eq!(
+        failed_seen.lock().unwrap().len(),
+        1,
+        "Priority must try its capable target first"
+    );
+    assert_eq!(
+        successful_seen.lock().unwrap()[0].body["model"],
+        "upstream-b-standard"
+    );
+    assert!(
+        successful_seen.lock().unwrap()[0]
+            .body
+            .get("service_tier")
+            .is_none(),
+        "a Standard fallback must not receive the unavailable Priority marker"
+    );
+    state.store.flush_background_writes().await.unwrap();
+    let rows = state.store.request_log().list(10, 0).await.unwrap();
+    let downgraded = rows
+        .iter()
+        .find(|row| row.model.as_deref() == Some("shared-balanced-model"))
+        .expect("downgraded custom request log row");
+    assert_eq!(downgraded.provider, "b-standard");
+    assert_eq!(downgraded.service_tier.as_deref(), Some("standard"));
+    let cost = downgraded
+        .cost_usd
+        .expect("the successful target's configured pricing must be applied");
+    assert!(
+        (cost - 0.000_214_5).abs() < 1e-12,
+        "cost must use the final Standard target, not the failed Priority target; got {cost}"
+    );
+
+    let standard = client
+        .post(format!("{base}/responses"))
+        .json(&serde_json::json!({
+            "model": "shared-balanced-model",
+            "stream": true,
+            "input": "standard"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(standard.status(), StatusCode::OK);
+    assert!(standard
+        .text()
+        .await
+        .unwrap()
+        .contains("response.completed"));
+    assert_eq!(failed_seen.lock().unwrap().len(), 1);
+    assert_eq!(
+        successful_seen.lock().unwrap().len(),
+        2,
+        "the recovered Priority request and ordinary Standard request both use the healthy target"
+    );
+}
+
+#[tokio::test]
+async fn sequential_anonymous_requests_follow_aggregate_target_weights() {
+    let seen_high = Arc::new(Mutex::new(Vec::new()));
+    let upstream_high = Router::new()
+        .route("/v1/responses", post(upstream_handler))
+        .with_state(seen_high.clone());
+    let listener_high = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address_high = listener_high.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener_high, upstream_high).await.unwrap();
+    });
+
+    let seen_low = Arc::new(Mutex::new(Vec::new()));
+    let upstream_low = Router::new()
+        .route("/v1/responses", post(upstream_handler))
+        .with_state(seen_low.clone());
+    let listener_low = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address_low = listener_low.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener_low, upstream_low).await.unwrap();
+    });
+
+    let (base, state) = support::spawn("http://127.0.0.1:9".into()).await;
+    let created_at = 100;
+    for (provider_id, slug, address, credential_id, weight) in [
+        (
+            "provider-a-weighted-high",
+            "weighted-high",
+            address_high,
+            "credential-weighted-high",
+            3.0,
+        ),
+        (
+            "provider-b-weighted-low",
+            "weighted-low",
+            address_low,
+            "credential-weighted-low",
+            1.0,
+        ),
+    ] {
+        state
+            .store
+            .providers()
+            .create_provider(&NewCustomProvider {
+                id: provider_id.into(),
+                slug: slug.into(),
+                display_name: slug.into(),
+                base_url: format!("http://{address}/v1"),
+                wire_api: "responses".into(),
+                enabled: true,
+                stateless_responses: true,
+                allow_private_hosts: true,
+                connect_timeout_ms: 1_000,
+                stream_idle_timeout_ms: 10_000,
+                request_max_retries: 0,
+                max_concurrency: Some(8),
+                created_at,
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .providers()
+            .create_credential(
+                credential_id,
+                provider_id,
+                "primary",
+                &format!("secret-{slug}"),
+                weight,
+                Some(8),
+                created_at,
+                &state.cipher,
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .providers()
+            .create_model(&NewProviderModel {
+                id: format!("model-{slug}"),
+                provider_id: provider_id.into(),
+                public_model: "weighted-sequential-model".into(),
+                upstream_model: format!("upstream-{slug}"),
+                display_name: "Weighted Sequential Model".into(),
+                context_window: None,
+                max_output_tokens: None,
+                supports_tools: true,
+                supports_vision: false,
+                supports_parallel_tool_calls: true,
+                supports_web_search: false,
+                supports_reasoning_summaries: false,
+                reasoning_levels_json: "[]".into(),
+                model_info_json: None,
+                instruction_mode: "none".into(),
+                instruction_text: String::new(),
+                request_overrides_json: "{}".into(),
+                input_per_million: None,
+                cached_input_per_million: None,
+                output_per_million: None,
+                visible_in_codex: true,
+                visible_in_openai: true,
+                enabled: true,
+                created_at,
+            })
+            .await
+            .unwrap();
+    }
+
+    let client = reqwest::Client::new();
+    for _ in 0..8 {
+        let response = client
+            .post(format!("{base}/responses"))
+            .json(&serde_json::json!({
+                "model": "weighted-sequential-model",
+                "stream": true,
+                "input": "independent request"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .text()
+            .await
+            .unwrap()
+            .contains("response.completed"));
+    }
+
+    assert_eq!(
+        seen_high.lock().unwrap().len(),
+        6,
+        "a target with three times the eligible credential weight gets three quarters of idle traffic"
+    );
+    assert_eq!(
+        seen_low.lock().unwrap().len(),
+        2,
+        "the lower-weight target must still receive sequential traffic"
+    );
+}
+
+#[tokio::test]
+async fn completed_custom_turn_softly_prefers_the_same_target_for_its_prompt_cache_key() {
+    let seen_a = Arc::new(Mutex::new(Vec::new()));
+    let upstream_a = Router::new()
+        .route("/v1/responses", post(upstream_handler))
+        .with_state(seen_a.clone());
+    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address_a = listener_a.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener_a, upstream_a).await.unwrap();
+    });
+
+    let seen_b = Arc::new(Mutex::new(Vec::new()));
+    let upstream_b = Router::new()
+        .route("/v1/responses", post(upstream_handler))
+        .with_state(seen_b.clone());
+    let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address_b = listener_b.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener_b, upstream_b).await.unwrap();
+    });
+
+    let (base, state) = support::spawn("http://127.0.0.1:9".into()).await;
+    let created_at = 100;
+    for (provider_id, slug, address, credential_id) in [
+        (
+            "provider-a-cache-affinity",
+            "a-cache-affinity",
+            address_a,
+            "credential-a-cache-affinity",
+        ),
+        (
+            "provider-b-cache-affinity",
+            "b-cache-affinity",
+            address_b,
+            "credential-b-cache-affinity",
+        ),
+    ] {
+        state
+            .store
+            .providers()
+            .create_provider(&NewCustomProvider {
+                id: provider_id.into(),
+                slug: slug.into(),
+                display_name: slug.into(),
+                base_url: format!("http://{address}/v1"),
+                wire_api: "responses".into(),
+                enabled: true,
+                stateless_responses: true,
+                allow_private_hosts: true,
+                connect_timeout_ms: 1_000,
+                stream_idle_timeout_ms: 10_000,
+                request_max_retries: 0,
+                max_concurrency: Some(4),
+                created_at,
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .providers()
+            .create_credential(
+                credential_id,
+                provider_id,
+                "primary",
+                &format!("secret-{slug}"),
+                1.0,
+                Some(4),
+                created_at,
+                &state.cipher,
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .providers()
+            .create_model(&NewProviderModel {
+                id: format!("model-{slug}"),
+                provider_id: provider_id.into(),
+                public_model: "cache-affinity-model".into(),
+                upstream_model: format!("upstream-{slug}"),
+                display_name: "Cache Affinity Model".into(),
+                context_window: None,
+                max_output_tokens: None,
+                supports_tools: true,
+                supports_vision: false,
+                supports_parallel_tool_calls: true,
+                supports_web_search: false,
+                supports_reasoning_summaries: false,
+                reasoning_levels_json: "[]".into(),
+                model_info_json: None,
+                instruction_mode: "none".into(),
+                instruction_text: String::new(),
+                request_overrides_json: "{}".into(),
+                input_per_million: None,
+                cached_input_per_million: None,
+                output_per_million: None,
+                visible_in_codex: true,
+                visible_in_openai: true,
+                enabled: true,
+                created_at,
+            })
+            .await
+            .unwrap();
+    }
+
+    state
+        .store
+        .providers()
+        .set_credential_health(
+            "credential-a-cache-affinity",
+            "cooldown",
+            Some(i64::MAX),
+            created_at,
+        )
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    let request = |prompt_cache_key: &'static str| {
+        client
+            .post(format!("{base}/responses"))
+            .json(&serde_json::json!({
+                "model": "cache-affinity-model",
+                "stream": true,
+                "prompt_cache_key": prompt_cache_key,
+                "input": "hello"
+            }))
+    };
+    let first = request("conversation-affinity").send().await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert!(first.text().await.unwrap().contains("response.completed"));
+    assert_eq!(seen_b.lock().unwrap().len(), 1);
+
+    state
+        .store
+        .providers()
+        .set_credential_health(
+            "credential-a-cache-affinity",
+            "healthy",
+            None,
+            created_at + 1,
+        )
+        .await
+        .unwrap();
+    let repeated = request("conversation-affinity").send().await.unwrap();
+    assert_eq!(repeated.status(), StatusCode::OK);
+    assert!(repeated
+        .text()
+        .await
+        .unwrap()
+        .contains("response.completed"));
+    assert_eq!(
+        seen_b.lock().unwrap().len(),
+        2,
+        "the same prompt-cache identity should retain the warm provider and credential"
+    );
+    assert!(
+        seen_a.lock().unwrap().is_empty(),
+        "weighted routing must not displace a healthy affine target"
+    );
+
+    state
+        .store
+        .providers()
+        .set_credential_health(
+            "credential-b-cache-affinity",
+            "cooldown",
+            Some(i64::MAX),
+            created_at + 2,
+        )
+        .await
+        .unwrap();
+    let unrelated = request("another-conversation").send().await.unwrap();
+    assert_eq!(unrelated.status(), StatusCode::OK);
+    assert!(unrelated
+        .text()
+        .await
+        .unwrap()
+        .contains("response.completed"));
+    assert_eq!(
+        seen_a.lock().unwrap().len(),
+        1,
+        "an unrelated identity can establish affinity on another eligible target"
+    );
+
+    state
+        .store
+        .providers()
+        .set_credential_health(
+            "credential-b-cache-affinity",
+            "healthy",
+            None,
+            created_at + 3,
+        )
+        .await
+        .unwrap();
+    let unrelated_repeated = request("another-conversation").send().await.unwrap();
+    assert_eq!(unrelated_repeated.status(), StatusCode::OK);
+    assert!(unrelated_repeated
+        .text()
+        .await
+        .unwrap()
+        .contains("response.completed"));
+    assert_eq!(
+        seen_a.lock().unwrap().len(),
+        2,
+        "the second identity keeps its own target after the first target recovers"
+    );
+    assert_eq!(
+        seen_b.lock().unwrap().len(),
+        2,
+        "the first identity's affinity must not leak into the second identity"
+    );
+}
+
+#[tokio::test]
+async fn priority_capability_is_advertised_selected_forwarded_and_logged() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = Router::new()
+        .route("/v1/responses", post(upstream_handler))
+        .with_state(seen.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let (base, state) = support::spawn("http://127.0.0.1:9".into()).await;
+    let now = 100;
+    state
+        .store
+        .providers()
+        .create_provider(&NewCustomProvider {
+            id: "provider-fireworks".into(),
+            slug: "fireworks".into(),
+            display_name: "Fireworks".into(),
+            base_url: format!("http://{upstream_addr}/v1"),
+            wire_api: "responses".into(),
+            enabled: true,
+            stateless_responses: true,
+            allow_private_hosts: true,
+            connect_timeout_ms: 1_000,
+            stream_idle_timeout_ms: 10_000,
+            request_max_retries: 0,
+            max_concurrency: Some(4),
+            created_at: now,
+        })
+        .await
+        .unwrap();
+    state
+        .store
+        .providers()
+        .create_credential(
+            "credential-fireworks",
+            "provider-fireworks",
+            "primary",
+            "secret-fireworks",
+            1.0,
+            Some(4),
+            now,
+            &state.cipher,
+        )
+        .await
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("{base}/api/providers/provider-fireworks/models"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({
+            "public_model": "fireworks/kimi-k3",
+            "upstream_model": "accounts/fireworks/models/kimi-k3",
+            "display_name": "Kimi K3 · Fireworks",
+            "context_window": 262144,
+            "max_output_tokens": 131072,
+            "supports_tools": true,
+            "supports_vision": true,
+            "supports_parallel_tool_calls": true,
+            "supports_priority_service_tier": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created: serde_json::Value = created.json().await.unwrap();
+    assert_eq!(created["supports_priority_service_tier"], true);
+
+    let catalog: serde_json::Value = client
+        .get(format!("{base}/models"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let model = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["slug"] == "fireworks/kimi-k3")
+        .expect("priority-capable custom model must be visible to Codex");
+    assert_eq!(
+        model["service_tiers"],
+        serde_json::json!([{
+            "id": "priority",
+            "name": "Fast",
+            "description": "Higher-priority provider inference"
+        }])
+    );
+    assert_eq!(model["additional_speed_tiers"], serde_json::json!(["fast"]));
+    assert_eq!(model["default_service_tier"], serde_json::Value::Null);
+
+    let response = client
+        .post(format!("{base}/responses"))
+        .json(&serde_json::json!({
+            "model": "fireworks/kimi-k3",
+            "stream": true,
+            "service_tier": "priority",
+            "input": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response
+        .text()
+        .await
+        .unwrap()
+        .contains("response.completed"));
+    assert_eq!(
+        seen.lock().unwrap()[0].body["service_tier"],
+        "priority",
+        "PolyFlare must forward the tier selected by Codex"
+    );
+
+    state.store.flush_background_writes().await.unwrap();
+    let rows = state.store.request_log().list(10, 0).await.unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.model.as_deref() == Some("fireworks/kimi-k3"))
+        .expect("custom Priority request log row");
+    assert_eq!(row.service_tier.as_deref(), Some("priority"));
+
+    let performance = client
+        .get(format!("{base}/api/providers/performance?range=24h"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(performance.status(), StatusCode::OK);
+    let performance: serde_json::Value = performance.json().await.unwrap();
+    assert_eq!(performance["range"], "24h");
+    assert_eq!(performance["bucket_seconds"], 3_600);
+    let priority = performance["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| {
+            row["provider"] == "fireworks"
+                && row["model"] == "fireworks/kimi-k3"
+                && row["tier"] == "priority"
+        })
+        .expect("priority provider performance row");
+    assert_eq!(priority["requests"], 1);
+    assert_eq!(priority["ttft_sample_count"], 1);
+    assert!(priority["avg_ttft_ms"].as_f64().unwrap() >= 0.0);
+    assert!(priority["p50_ttft_ms"].as_f64().unwrap() >= 0.0);
+    assert!(priority["p95_ttft_ms"].as_f64().unwrap() >= 0.0);
+    assert_eq!(priority["successes"], 1);
+    assert_eq!(priority["errors"], 0);
+    assert_eq!(priority["rate_limited"], 0);
+    // The mock writes both frames together. Depending on scheduler timing, the millisecond clock
+    // can observe either no positive generation window or one tiny valid window.
+    match priority["tps_sample_count"].as_u64().unwrap() {
+        0 => assert!(priority["tps"].is_null()),
+        1 => assert!(priority["tps"].as_f64().unwrap() > 0.0),
+        count => panic!("unexpected TPS sample count: {count}"),
+    }
+    let bucket = performance["buckets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| {
+            row["provider"] == "fireworks"
+                && row["model"] == "fireworks/kimi-k3"
+                && row["tier"] == "priority"
+        })
+        .expect("priority provider trend bucket");
+    assert_eq!(bucket["requests"], 1);
+    assert_eq!(bucket["successes"], 1);
+    let invalid_range = client
+        .get(format!("{base}/api/providers/performance?range=forever"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_range.status(), StatusCode::BAD_REQUEST);
+
+    let disabled = client
+        .patch(format!(
+            "{base}/api/provider-models/{}",
+            created["id"].as_str().unwrap()
+        ))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({
+            "supports_priority_service_tier": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), StatusCode::OK);
+
+    let providers: serde_json::Value = client
+        .get(format!("{base}/api/providers"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let updated_model = providers
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == "provider-fireworks")
+        .unwrap()["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["public_model"] == "fireworks/kimi-k3")
+        .unwrap();
+    assert_eq!(updated_model["supports_priority_service_tier"], false);
+
+    let catalog: serde_json::Value = client
+        .get(format!("{base}/models"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let model = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["slug"] == "fireworks/kimi-k3")
+        .unwrap();
+    assert_eq!(model["service_tiers"], serde_json::json!([]));
+    assert_eq!(model["additional_speed_tiers"], serde_json::json!([]));
+
+    state
+        .store
+        .providers()
+        .create_provider(&NewCustomProvider {
+            id: "provider-anthropic-priority-guard".into(),
+            slug: "anthropic-priority-guard".into(),
+            display_name: "Anthropic Priority Guard".into(),
+            base_url: "https://example.com/v1".into(),
+            wire_api: "anthropic_messages".into(),
+            enabled: true,
+            stateless_responses: true,
+            allow_private_hosts: false,
+            connect_timeout_ms: 1_000,
+            stream_idle_timeout_ms: 10_000,
+            request_max_retries: 0,
+            max_concurrency: Some(4),
+            created_at: now,
+        })
+        .await
+        .unwrap();
+    let rejected = client
+        .post(format!(
+            "{base}/api/providers/provider-anthropic-priority-guard/models"
+        ))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({
+            "public_model": "anthropic-priority-model",
+            "upstream_model": "anthropic-priority-upstream",
+            "display_name": "Anthropic Priority",
+            "supports_priority_service_tier": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    let created_without_priority: serde_json::Value = client
+        .post(format!(
+            "{base}/api/providers/provider-anthropic-priority-guard/models"
+        ))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({
+            "public_model": "anthropic-standard-model",
+            "upstream_model": "anthropic-standard-upstream",
+            "display_name": "Anthropic Standard"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rejected = client
+        .patch(format!(
+            "{base}/api/provider-models/{}",
+            created_without_priority["id"].as_str().unwrap()
+        ))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({
+            "supports_priority_service_tier": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 }

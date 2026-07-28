@@ -684,6 +684,7 @@ export interface ProviderModelView {
   supports_parallel_tool_calls: boolean;
   supports_web_search: boolean;
   supports_reasoning_summaries: boolean;
+  supports_priority_service_tier: boolean;
   reasoning_levels: string[];
   instruction_mode: "none" | "append" | "replace";
   instruction_text: string;
@@ -716,6 +717,51 @@ export interface CustomProviderView {
   models: ProviderModelView[];
 }
 
+export interface ProviderPerformanceRowView {
+  provider: string;
+  model: string;
+  tier: "standard" | "priority";
+  requests: number;
+  avg_ttft_ms: number;
+  p50_ttft_ms: number | null;
+  p95_ttft_ms: number | null;
+  ttft_sample_count: number;
+  output_tokens: number;
+  generation_ms: number;
+  tps_sample_count: number;
+  tps: number | null;
+  p50_tps: number | null;
+  p95_tps: number | null;
+  successes: number;
+  errors: number;
+  rate_limited: number;
+}
+
+export interface ProviderPerformanceBucketView {
+  ts: number;
+  provider: string;
+  model: string;
+  tier: "standard" | "priority";
+  requests: number;
+  avg_ttft_ms: number;
+  ttft_sample_count: number;
+  output_tokens: number;
+  generation_ms: number;
+  tps_sample_count: number;
+  tps: number | null;
+  successes: number;
+  errors: number;
+  rate_limited: number;
+}
+
+export interface ProviderPerformanceView {
+  range: "24h" | "7d" | "30d";
+  since_ts: number;
+  bucket_seconds: number;
+  rows: ProviderPerformanceRowView[];
+  buckets: ProviderPerformanceBucketView[];
+}
+
 export interface CreateProviderBody {
   slug: string;
   display_name: string;
@@ -740,6 +786,7 @@ export interface CreateProviderModelBody {
   supports_parallel_tool_calls?: boolean;
   supports_web_search?: boolean;
   supports_reasoning_summaries?: boolean;
+  supports_priority_service_tier?: boolean;
   reasoning_levels?: string[];
   instruction_mode?: "none" | "append" | "replace";
   instruction_text?: string;
@@ -747,15 +794,15 @@ export interface CreateProviderModelBody {
     reasoning_effort?: string;
     max_output_tokens?: number;
   };
-  input_per_million?: number;
-  cached_input_per_million?: number;
-  output_per_million?: number;
+  input_per_million?: number | null;
+  cached_input_per_million?: number | null;
+  output_per_million?: number | null;
   visible_in_codex?: boolean;
   visible_in_openai?: boolean;
 }
 
 export type UpdateProviderModelBody = Partial<
-  Omit<CreateProviderModelBody, "public_model" | "input_per_million" | "cached_input_per_million" | "output_per_million">
+  Omit<CreateProviderModelBody, "public_model">
 > & {
   enabled?: boolean;
 };
@@ -1186,6 +1233,10 @@ export const api = {
   settings: () => fetchJson<SettingsView>("/api/settings"),
   keys: () => fetchJson<ApiKeysView>("/api/keys"),
   providers: () => fetchJson<CustomProviderView[]>("/api/providers"),
+  providerPerformance: (range: string) =>
+    fetchJson<ProviderPerformanceView>(
+      `/api/providers/performance?range=${encodeURIComponent(range)}`,
+    ),
   translations: () => fetchJson<TranslationRoutesView>("/api/translations"),
   builtinModels: () => fetchJson<BuiltinModelsView>("/api/translations/builtin-models"),
   capabilities: () => fetchJson<CapabilitiesView>("/api/capabilities"),

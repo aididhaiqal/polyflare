@@ -15,6 +15,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use polyflare_store::{CustomProvider, ProviderCredential, ProviderModel, Store, TokenCipher};
+use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -22,6 +23,11 @@ const MAX_MODEL_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DISCOVERED_MODELS: usize = 1_000;
 const PROFILE_SEPARATOR: &str = "\n\n--- PolyFlare model profile ---\n";
 const HTTP_CLIENT_DNS_TTL: Duration = Duration::from_secs(300);
+const CUSTOM_AFFINITY_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_CUSTOM_AFFINITIES: usize = 10_000;
+const CUSTOM_FAIR_ROUTING_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_CUSTOM_FAIR_ROUTING_SCOPES: usize = 10_000;
+const MAX_AFFINITY_SSE_LINE_BYTES: usize = 1024 * 1024;
 
 struct CachedHttpClient {
     client: reqwest::Client,
@@ -33,6 +39,171 @@ static HTTP_CLIENTS: LazyLock<Mutex<HashMap<(String, i64), CachedHttpClient>>> =
 
 static IN_FLIGHT: LazyLock<Mutex<HashMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AffinityTarget {
+    provider_id: String,
+    credential_id: String,
+    last_success: Instant,
+}
+
+struct AffinityCache {
+    entries: HashMap<String, AffinityTarget>,
+    ttl: Duration,
+    max_entries: usize,
+}
+
+impl AffinityCache {
+    fn new(ttl: Duration, max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl,
+            max_entries,
+        }
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        self.entries
+            .retain(|_, target| now.saturating_duration_since(target.last_success) < self.ttl);
+    }
+
+    fn get(&mut self, key: &str, now: Instant) -> Option<AffinityTarget> {
+        self.prune_expired(now);
+        self.entries.get(key).cloned()
+    }
+
+    fn record(&mut self, key: String, provider_id: String, credential_id: String, now: Instant) {
+        self.prune_expired(now);
+        if self.max_entries == 0 {
+            return;
+        }
+        if !self.entries.contains_key(&key) && self.entries.len() >= self.max_entries {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, target)| target.last_success)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            key,
+            AffinityTarget {
+                provider_id,
+                credential_id,
+                last_success: now,
+            },
+        );
+    }
+}
+
+static CUSTOM_AFFINITY: LazyLock<Mutex<AffinityCache>> = LazyLock::new(|| {
+    Mutex::new(AffinityCache::new(
+        CUSTOM_AFFINITY_TTL,
+        MAX_CUSTOM_AFFINITIES,
+    ))
+});
+
+#[derive(Debug)]
+struct SmoothWeightedState {
+    current: HashMap<String, f64>,
+    last_used: Instant,
+}
+
+struct SmoothWeightedCache {
+    entries: HashMap<String, SmoothWeightedState>,
+    ttl: Duration,
+    max_entries: usize,
+}
+
+impl SmoothWeightedCache {
+    fn new(ttl: Duration, max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl,
+            max_entries,
+        }
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        self.entries
+            .retain(|_, state| now.saturating_duration_since(state.last_used) < self.ttl);
+    }
+
+    fn select(
+        &mut self,
+        scope: String,
+        candidates: &[(String, f64)],
+        now: Instant,
+    ) -> Option<String> {
+        self.prune_expired(now);
+        if self.max_entries == 0 || candidates.is_empty() {
+            return None;
+        }
+        if !self.entries.contains_key(&scope) && self.entries.len() >= self.max_entries {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, state)| state.last_used)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+
+        let mut candidates = candidates
+            .iter()
+            .filter(|(_, weight)| weight.is_finite() && *weight > 0.0)
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+        if candidates.is_empty() {
+            return None;
+        }
+        let candidate_ids = candidates
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<HashSet<_>>();
+        let state = self
+            .entries
+            .entry(scope)
+            .or_insert_with(|| SmoothWeightedState {
+                current: HashMap::new(),
+                last_used: now,
+            });
+        state.last_used = now;
+        state
+            .current
+            .retain(|id, _| candidate_ids.contains(id.as_str()));
+
+        let mut total_weight = 0.0;
+        let mut selected: Option<(&str, f64)> = None;
+        for (id, weight) in &candidates {
+            total_weight += *weight;
+            let current = state.current.entry(id.clone()).or_default();
+            *current += *weight;
+            if selected.is_none_or(|(selected_id, selected_current)| {
+                current.total_cmp(&selected_current).is_gt()
+                    || (current.total_cmp(&selected_current).is_eq() && id.as_str() < selected_id)
+            }) {
+                selected = Some((id, *current));
+            }
+        }
+        let selected_id = selected?.0.to_string();
+        if let Some(current) = state.current.get_mut(&selected_id) {
+            *current -= total_weight;
+        }
+        Some(selected_id)
+    }
+}
+
+static CUSTOM_FAIR_ROUTING: LazyLock<Mutex<SmoothWeightedCache>> = LazyLock::new(|| {
+    Mutex::new(SmoothWeightedCache::new(
+        CUSTOM_FAIR_ROUTING_TTL,
+        MAX_CUSTOM_FAIR_ROUTING_SCOPES,
+    ))
+});
 
 pub(crate) fn evict_provider_client(provider_id: &str) {
     HTTP_CLIENTS
@@ -48,10 +219,22 @@ pub struct CustomRouteOutcome {
     pub public_model: String,
     pub upstream_model: String,
     pub upstream_transport: String,
+    /// Effective tier used by the selected target when PolyFlare changed the client's request.
+    pub effective_service_tier: Option<String>,
     pub profile_revision: Option<String>,
     pub input_per_million: Option<f64>,
     pub cached_input_per_million: Option<f64>,
     pub output_per_million: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RequestCapabilities {
+    priority: bool,
+    tools: bool,
+    vision: bool,
+    parallel_tool_calls: bool,
+    web_search: bool,
+    reasoning_summaries: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
@@ -277,9 +460,36 @@ fn acquire_credential(
     provider: &CustomProvider,
     credentials: &[ProviderCredential],
     tried: &HashSet<String>,
+    preferred_credential_id: Option<&str>,
     now: i64,
 ) -> Option<(ProviderCredential, CredentialLease)> {
     let mut in_flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    let candidate = best_credential(
+        provider,
+        credentials,
+        tried,
+        preferred_credential_id,
+        now,
+        &in_flight,
+    )?
+    .0
+    .clone();
+
+    *in_flight.entry(candidate.id.clone()).or_default() += 1;
+    let lease = CredentialLease {
+        id: candidate.id.clone(),
+    };
+    Some((candidate, lease))
+}
+
+fn best_credential<'a>(
+    provider: &CustomProvider,
+    credentials: &'a [ProviderCredential],
+    tried: &HashSet<String>,
+    preferred_credential_id: Option<&str>,
+    now: i64,
+    in_flight: &HashMap<String, usize>,
+) -> Option<(&'a ProviderCredential, f64)> {
     let provider_in_flight: usize = credentials
         .iter()
         .map(|credential| in_flight.get(&credential.id).copied().unwrap_or(0))
@@ -291,38 +501,453 @@ fn acquire_credential(
         return None;
     }
 
-    let candidate = credentials
-        .iter()
-        .filter(|credential| {
-            credential.enabled
-                && !tried.contains(&credential.id)
-                && (credential.health_status == "healthy"
-                    || (credential.health_status == "cooldown"
-                        && credential.cooldown_until.is_some_and(|until| until <= now)))
-                && !credential.max_concurrency.is_some_and(|limit| {
-                    in_flight.get(&credential.id).copied().unwrap_or(0) >= limit as usize
+    let preferred = preferred_credential_id.and_then(|preferred| {
+        credentials
+            .iter()
+            .filter(|credential| credential_is_eligible(credential, tried, now, in_flight))
+            .find(|credential| credential.id == preferred)
+    });
+    preferred
+        .or_else(|| {
+            credentials
+                .iter()
+                .filter(|credential| credential_is_eligible(credential, tried, now, in_flight))
+                .min_by(|left, right| {
+                    credential_pressure(left, in_flight)
+                        .total_cmp(&credential_pressure(right, in_flight))
+                        .then_with(|| left.id.cmp(&right.id))
                 })
         })
-        .min_by(|left, right| {
-            let left_score =
-                in_flight.get(&left.id).copied().unwrap_or(0) as f64 / left.routing_weight;
-            let right_score =
-                in_flight.get(&right.id).copied().unwrap_or(0) as f64 / right.routing_weight;
-            left_score
-                .total_cmp(&right_score)
-                .then_with(|| left.id.cmp(&right.id))
-        })?
-        .clone();
+        .map(|credential| (credential, credential_pressure(credential, in_flight)))
+}
 
-    *in_flight.entry(candidate.id.clone()).or_default() += 1;
-    let lease = CredentialLease {
-        id: candidate.id.clone(),
-    };
-    Some((candidate, lease))
+fn credential_is_eligible(
+    credential: &ProviderCredential,
+    tried: &HashSet<String>,
+    now: i64,
+    in_flight: &HashMap<String, usize>,
+) -> bool {
+    credential.enabled
+        && !tried.contains(&credential.id)
+        && (credential.health_status == "healthy"
+            || (credential.health_status == "cooldown"
+                && credential.cooldown_until.is_some_and(|until| until <= now)))
+        && !credential.max_concurrency.is_some_and(|limit| {
+            in_flight.get(&credential.id).copied().unwrap_or(0) >= limit as usize
+        })
+}
+
+fn credential_pressure(credential: &ProviderCredential, in_flight: &HashMap<String, usize>) -> f64 {
+    in_flight.get(&credential.id).copied().unwrap_or(0) as f64 / credential.routing_weight
 }
 
 fn retryable_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn request_capabilities(raw_body: &Bytes, wire_api: &str) -> RequestCapabilities {
+    let Ok(serde_json::Value::Object(object)) =
+        serde_json::from_slice::<serde_json::Value>(raw_body)
+    else {
+        return RequestCapabilities::default();
+    };
+    let tools = object
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    let web_search = object
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| kind.starts_with("web_search"))
+            })
+        });
+    let vision = if wire_api == "anthropic_messages" {
+        object
+            .get("messages")
+            .is_some_and(contains_anthropic_message_image)
+    } else {
+        object.get("input").is_some_and(contains_image_input)
+    };
+    let reasoning_summaries = object
+        .get("reasoning")
+        .and_then(|reasoning| reasoning.get("summary"))
+        .is_some_and(|summary| !summary.is_null() && summary.as_str() != Some("none"));
+    RequestCapabilities {
+        priority: object
+            .get("service_tier")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|tier| matches!(tier, "priority" | "fast")),
+        tools,
+        vision,
+        parallel_tool_calls: tools
+            && object
+                .get("parallel_tool_calls")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        web_search,
+        reasoning_summaries,
+    }
+}
+
+fn without_priority_service_tier(raw_body: &Bytes) -> Option<Bytes> {
+    let mut body = serde_json::from_slice::<serde_json::Value>(raw_body).ok()?;
+    let object = body.as_object_mut()?;
+    if object
+        .get("service_tier")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|tier| matches!(tier, "priority" | "fast"))
+    {
+        object.remove("service_tier");
+    }
+    serde_json::to_vec(&body).ok().map(Bytes::from)
+}
+
+fn contains_image_input(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values.iter().any(contains_image_input),
+        serde_json::Value::Object(object) => {
+            object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| matches!(kind, "input_image" | "image" | "image_url"))
+                || object.values().any(contains_image_input)
+        }
+        _ => false,
+    }
+}
+
+fn contains_anthropic_message_image(messages: &serde_json::Value) -> bool {
+    messages.as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message
+                .get("content")
+                .is_some_and(contains_anthropic_content_image)
+        })
+    })
+}
+
+fn contains_anthropic_content_image(content: &serde_json::Value) -> bool {
+    content.as_array().is_some_and(|blocks| {
+        blocks.iter().any(|block| {
+            let Some(kind) = block.get("type").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            kind == "image"
+                || (kind == "tool_result"
+                    && block
+                        .get("content")
+                        .is_some_and(contains_anthropic_content_image))
+        })
+    })
+}
+
+fn target_supports(
+    provider: &CustomProvider,
+    model: &ProviderModel,
+    wire_api: &str,
+    required: RequestCapabilities,
+) -> bool {
+    provider.wire_api == wire_api
+        && (!required.priority
+            || crate::catalog::supports_priority_service_tier(model.model_info_json.as_deref()))
+        && (!required.tools || model.supports_tools)
+        && (!required.vision || model.supports_vision)
+        && (!required.parallel_tool_calls || model.supports_parallel_tool_calls)
+        && (!required.web_search || model.supports_web_search)
+        && (!required.reasoning_summaries || model.supports_reasoning_summaries)
+}
+
+struct RankedTarget {
+    pressure: f64,
+    routing_weight: f64,
+    routing_id: String,
+    provider: CustomProvider,
+    model: ProviderModel,
+    preferred_credential_id: Option<String>,
+}
+
+fn fair_routing_scope(public_model: &str, wire_api: &str, required: RequestCapabilities) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"polyflare-custom-fair-routing-v1");
+    hasher.update([0]);
+    hasher.update(public_model.as_bytes());
+    hasher.update([0]);
+    hasher.update(wire_api.as_bytes());
+    hasher.update([0]);
+    hasher.update([
+        required.priority as u8,
+        required.tools as u8,
+        required.vision as u8,
+        required.parallel_tool_calls as u8,
+        required.web_search as u8,
+        required.reasoning_summaries as u8,
+    ]);
+    hex::encode(hasher.finalize())
+}
+
+fn weighted_rendezvous_score(selection_key: &str, candidate_id: &str, weight: f64) -> f64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"polyflare-custom-weighted-rendezvous-v1");
+    hasher.update([0]);
+    hasher.update(selection_key.as_bytes());
+    hasher.update([0]);
+    hasher.update(candidate_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    let sample = u64::from_be_bytes(prefix);
+    let unit = (sample as f64 + 1.0) / (u64::MAX as f64 + 2.0);
+    -unit.ln() / weight
+}
+
+async fn rank_eligible_targets(
+    store: &Store,
+    targets: Vec<(CustomProvider, ProviderModel)>,
+    wire_api: &str,
+    required: RequestCapabilities,
+    affinity: Option<&AffinityTarget>,
+    selection_key: Option<&str>,
+) -> Vec<(CustomProvider, ProviderModel, Option<String>)> {
+    let now = unix_now();
+    let public_model = targets
+        .first()
+        .map(|(_, model)| model.public_model.as_str())
+        .unwrap_or_default();
+    let routing_scope = fair_routing_scope(public_model, wire_api, required);
+    let mut candidates = Vec::new();
+    for (provider, model) in targets {
+        if !target_supports(&provider, &model, wire_api, required) {
+            continue;
+        }
+        let Ok(credentials) = store.providers().list_credentials(&provider.id).await else {
+            continue;
+        };
+        let in_flight = IN_FLIGHT.lock().unwrap_or_else(|error| error.into_inner());
+        let preferred_credential_id = affinity
+            .filter(|target| target.provider_id == provider.id)
+            .map(|target| target.credential_id.as_str());
+        let tried = HashSet::new();
+        let selected = best_credential(
+            &provider,
+            &credentials,
+            &tried,
+            preferred_credential_id,
+            now,
+            &in_flight,
+        )
+        .map(|(credential, score)| {
+            let routing_weight = credentials
+                .iter()
+                .filter(|credential| credential_is_eligible(credential, &tried, now, &in_flight))
+                .filter(|credential| {
+                    credential_pressure(credential, &in_flight)
+                        .total_cmp(&score)
+                        .is_eq()
+                })
+                .map(|credential| credential.routing_weight)
+                .sum::<f64>();
+            (
+                score,
+                routing_weight,
+                (preferred_credential_id == Some(credential.id.as_str()))
+                    .then(|| credential.id.clone()),
+            )
+        });
+        drop(in_flight);
+        if let Some((pressure, routing_weight, preferred_credential_id)) = selected {
+            let routing_id = format!("{}\0{}", provider.id, model.id);
+            candidates.push(RankedTarget {
+                pressure,
+                routing_weight,
+                routing_id,
+                provider,
+                model,
+                preferred_credential_id,
+            });
+        }
+    }
+
+    if candidates
+        .iter()
+        .any(|candidate| candidate.preferred_credential_id.is_some())
+    {
+        candidates.sort_by(|left, right| {
+            left.preferred_credential_id
+                .is_none()
+                .cmp(&right.preferred_credential_id.is_none())
+                .then_with(|| left.pressure.total_cmp(&right.pressure))
+                .then_with(|| left.provider.id.cmp(&right.provider.id))
+                .then_with(|| left.model.id.cmp(&right.model.id))
+        });
+    } else if let Some(selection_key) = selection_key {
+        candidates.sort_by(|left, right| {
+            left.pressure
+                .total_cmp(&right.pressure)
+                .then_with(|| {
+                    weighted_rendezvous_score(selection_key, &left.routing_id, left.routing_weight)
+                        .total_cmp(&weighted_rendezvous_score(
+                            selection_key,
+                            &right.routing_id,
+                            right.routing_weight,
+                        ))
+                })
+                .then_with(|| left.provider.id.cmp(&right.provider.id))
+                .then_with(|| left.model.id.cmp(&right.model.id))
+        });
+    } else if let Some(min_pressure) = candidates
+        .iter()
+        .map(|candidate| candidate.pressure)
+        .min_by(f64::total_cmp)
+    {
+        let fair_candidates = candidates
+            .iter()
+            .filter(|candidate| candidate.pressure.total_cmp(&min_pressure).is_eq())
+            .map(|candidate| (candidate.routing_id.clone(), candidate.routing_weight))
+            .collect::<Vec<_>>();
+        let selected = CUSTOM_FAIR_ROUTING
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .select(routing_scope, &fair_candidates, Instant::now());
+        candidates.sort_by(|left, right| {
+            (selected.as_deref() != Some(left.routing_id.as_str()))
+                .cmp(&(selected.as_deref() != Some(right.routing_id.as_str())))
+                .then_with(|| left.pressure.total_cmp(&right.pressure))
+                .then_with(|| left.provider.id.cmp(&right.provider.id))
+                .then_with(|| left.model.id.cmp(&right.model.id))
+        });
+    }
+
+    candidates
+        .into_iter()
+        .map(|candidate| {
+            (
+                candidate.provider,
+                candidate.model,
+                candidate.preferred_credential_id,
+            )
+        })
+        .collect()
+}
+
+fn request_affinity_key(
+    inbound_headers: &HeaderMap,
+    raw_body: &Bytes,
+    public_model: &str,
+    wire_api: &str,
+    identity_override: Option<&str>,
+) -> Option<String> {
+    let identity = if let Some(identity) = identity_override {
+        identity.to_string()
+    } else {
+        if wire_api != "responses" {
+            return None;
+        }
+        let fields: HashMap<String, &RawValue> = serde_json::from_slice(raw_body).ok()?;
+        let prompt_cache_key = fields
+            .get("prompt_cache_key")
+            .and_then(|value| serde_json::from_str::<String>(value.get()).ok());
+        crate::session_key::header_session_key(inbound_headers, prompt_cache_key.as_deref())
+            .map(|key| key.value)
+            .or(prompt_cache_key)?
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"polyflare-custom-affinity-v1");
+    hasher.update([0]);
+    hasher.update(public_model.as_bytes());
+    hasher.update([0]);
+    hasher.update(identity.as_bytes());
+    Some(hex::encode(hasher.finalize()))
+}
+
+fn current_affinity(key: Option<&str>) -> Option<AffinityTarget> {
+    let key = key?;
+    CUSTOM_AFFINITY
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(key, Instant::now())
+}
+
+fn record_affinity(key: Option<String>, provider_id: String, credential_id: String) {
+    let Some(key) = key else {
+        return;
+    };
+    CUSTOM_AFFINITY
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .record(key, provider_id, credential_id, Instant::now());
+}
+
+struct CompletionObserver {
+    wire_api: String,
+    event_stream: bool,
+    pending: Vec<u8>,
+    skipping_oversized_line: bool,
+    terminal_success: bool,
+}
+
+impl CompletionObserver {
+    fn new(wire_api: &str, event_stream: bool) -> Self {
+        Self {
+            wire_api: wire_api.to_string(),
+            event_stream,
+            pending: Vec::new(),
+            skipping_oversized_line: false,
+            terminal_success: false,
+        }
+    }
+
+    fn observe(&mut self, chunk: &[u8]) {
+        if !self.event_stream || self.terminal_success {
+            return;
+        }
+        for byte in chunk {
+            if self.skipping_oversized_line {
+                if *byte == b'\n' {
+                    self.skipping_oversized_line = false;
+                }
+                continue;
+            }
+            if *byte == b'\n' {
+                let line = std::mem::take(&mut self.pending);
+                self.observe_line(&line);
+            } else if self.pending.len() < MAX_AFFINITY_SSE_LINE_BYTES {
+                self.pending.push(*byte);
+            } else {
+                self.pending.clear();
+                self.skipping_oversized_line = true;
+            }
+        }
+    }
+
+    fn observe_line(&mut self, line: &[u8]) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(data) = line.strip_prefix(b"data:") else {
+            return;
+        };
+        let Ok(value) =
+            serde_json::from_slice::<serde_json::Value>(data.strip_prefix(b" ").unwrap_or(data))
+        else {
+            return;
+        };
+        let event_type = value.get("type").and_then(serde_json::Value::as_str);
+        self.terminal_success = match self.wire_api.as_str() {
+            "responses" => event_type == Some("response.completed"),
+            "anthropic_messages" => event_type == Some("message_stop"),
+            _ => false,
+        };
+    }
+
+    fn completed_cleanly(mut self) -> bool {
+        if self.event_stream && !self.pending.is_empty() && !self.skipping_oversized_line {
+            let line = std::mem::take(&mut self.pending);
+            self.observe_line(&line);
+        }
+        !self.event_stream || self.terminal_success
+    }
 }
 
 async fn read_bounded_error_body(
@@ -607,7 +1232,7 @@ pub async fn discover_models(
         .await
         .map_err(|_| "provider credentials unavailable")?;
     let (credential, lease) =
-        acquire_credential(provider, &credentials, &HashSet::new(), unix_now())
+        acquire_credential(provider, &credentials, &HashSet::new(), None, unix_now())
             .ok_or("no eligible provider credential")?;
     let (_, secret) = store
         .providers()
@@ -829,6 +1454,14 @@ fn copy_response_headers(
     }
 }
 
+fn is_event_stream_content_type(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
 pub async fn execute(
     store: &Store,
     cipher: &TokenCipher,
@@ -837,17 +1470,41 @@ pub async fn execute(
     inbound_headers: &HeaderMap,
     raw_body: &Bytes,
 ) -> (Response, CustomRouteOutcome) {
-    let mut outcome = CustomRouteOutcome {
-        provider_slug: provider.slug.clone(),
-        credential_id: None,
-        public_model: model.public_model.clone(),
-        upstream_model: model.upstream_model.clone(),
-        upstream_transport: "http_sse".into(),
-        profile_revision: profile_revision(&model),
-        input_per_million: model.input_per_million,
-        cached_input_per_million: model.cached_input_per_million,
-        output_per_million: model.output_per_million,
-    };
+    let affinity_key = request_affinity_key(
+        inbound_headers,
+        raw_body,
+        &model.public_model,
+        &provider.wire_api,
+        None,
+    );
+    let preferred_credential_id = current_affinity(affinity_key.as_deref())
+        .filter(|target| target.provider_id == provider.id)
+        .map(|target| target.credential_id);
+    execute_with_affinity(
+        store,
+        cipher,
+        provider,
+        model,
+        inbound_headers,
+        raw_body,
+        affinity_key,
+        preferred_credential_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_with_affinity(
+    store: &Store,
+    cipher: &TokenCipher,
+    provider: CustomProvider,
+    model: ProviderModel,
+    inbound_headers: &HeaderMap,
+    raw_body: &Bytes,
+    affinity_key: Option<String>,
+    preferred_credential_id: Option<String>,
+) -> (Response, CustomRouteOutcome) {
+    let mut outcome = custom_route_outcome(&provider, &model);
     let endpoint = match validate_endpoint(&provider) {
         Ok(endpoint) => endpoint,
         Err(message) => return ((StatusCode::BAD_GATEWAY, message).into_response(), outcome),
@@ -915,9 +1572,13 @@ pub async fn execute(
     let mut last_response: Option<Response> = None;
 
     for _ in 0..max_attempts {
-        let Some((credential, lease)) =
-            acquire_credential(&provider, &credentials, &tried, unix_now())
-        else {
+        let Some((credential, lease)) = acquire_credential(
+            &provider,
+            &credentials,
+            &tried,
+            preferred_credential_id.as_deref(),
+            unix_now(),
+        ) else {
             break;
         };
         tried.insert(credential.id.clone());
@@ -991,21 +1652,55 @@ pub async fn execute(
             return (last_response.expect("set above"), outcome);
         }
 
+        let headers = upstream.headers().clone();
+        let event_stream = is_event_stream_content_type(&headers);
+        let mut bytes = upstream.bytes_stream();
+        let first_chunk = match tokio::time::timeout(idle_timeout, bytes.next()).await {
+            Ok(Some(Ok(chunk))) => chunk,
+            Ok(Some(Err(_))) | Ok(None) | Err(_) => {
+                let _ = store
+                    .providers()
+                    .set_credential_health(
+                        &credential.id,
+                        "cooldown",
+                        Some(unix_now() + 30),
+                        unix_now(),
+                    )
+                    .await;
+                last_response = Some(
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        "custom provider closed before output",
+                    )
+                        .into_response(),
+                );
+                drop(lease);
+                continue;
+            }
+        };
         let _ = store
             .providers()
             .set_credential_health(&credential.id, "healthy", None, unix_now())
             .await;
-        let headers = upstream.headers().clone();
         let mut builder = Response::builder().status(status);
         copy_response_headers(&headers, &mut builder);
         let credential_id = credential.id.clone();
+        let affinity_credential_id = credential.id.clone();
+        let affinity_provider_id = provider.id.clone();
+        let affinity_key = affinity_key.clone();
+        let mut completion = CompletionObserver::new(&provider.wire_api, event_stream);
+        completion.observe(&first_chunk);
         let store = store.clone();
         let stream = async_stream::stream! {
             let _lease = lease;
-            let mut bytes = upstream.bytes_stream();
+            yield Ok::<Bytes, io::Error>(first_chunk);
+            let mut clean_eof = false;
             loop {
                 match tokio::time::timeout(idle_timeout, bytes.next()).await {
-                    Ok(Some(Ok(chunk))) => yield Ok::<Bytes, io::Error>(chunk),
+                    Ok(Some(Ok(chunk))) => {
+                        completion.observe(&chunk);
+                        yield Ok::<Bytes, io::Error>(chunk);
+                    }
                     Ok(Some(Err(error))) => {
                         let _ = store
                             .providers()
@@ -1019,7 +1714,10 @@ pub async fn execute(
                         yield Err(io::Error::other(error));
                         break;
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        clean_eof = true;
+                        break;
+                    }
                     Err(_) => {
                         let _ = store
                             .providers()
@@ -1038,6 +1736,13 @@ pub async fn execute(
                     }
                 }
             }
+            if clean_eof && completion.completed_cleanly() {
+                record_affinity(
+                    affinity_key,
+                    affinity_provider_id,
+                    affinity_credential_id,
+                );
+            }
         };
         let response = builder
             .body(Body::from_stream(stream))
@@ -1055,6 +1760,227 @@ pub async fn execute(
         }),
         outcome,
     )
+}
+
+fn custom_route_outcome(provider: &CustomProvider, model: &ProviderModel) -> CustomRouteOutcome {
+    CustomRouteOutcome {
+        provider_slug: provider.slug.clone(),
+        credential_id: None,
+        public_model: model.public_model.clone(),
+        upstream_model: model.upstream_model.clone(),
+        upstream_transport: "http_sse".into(),
+        effective_service_tier: None,
+        profile_revision: profile_revision(model),
+        input_per_million: model.input_per_million,
+        cached_input_per_million: model.cached_input_per_million,
+        output_per_million: model.output_per_million,
+    }
+}
+
+fn unresolved_custom_outcome(public_model: String) -> CustomRouteOutcome {
+    CustomRouteOutcome {
+        provider_slug: "custom".into(),
+        credential_id: None,
+        public_model,
+        upstream_model: String::new(),
+        upstream_transport: "http_sse".into(),
+        effective_service_tier: None,
+        profile_revision: None,
+        input_per_million: None,
+        cached_input_per_million: None,
+        output_per_million: None,
+    }
+}
+
+pub async fn execute_targets(
+    store: &Store,
+    cipher: &TokenCipher,
+    targets: Vec<(CustomProvider, ProviderModel)>,
+    wire_api: &str,
+    inbound_headers: &HeaderMap,
+    raw_body: &Bytes,
+    affinity_identity_override: Option<&str>,
+) -> (Response, CustomRouteOutcome) {
+    let Some(public_model) = targets.first().map(|(_, model)| model.public_model.clone()) else {
+        return (
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no compatible provider target",
+            )
+                .into_response(),
+            unresolved_custom_outcome(String::new()),
+        );
+    };
+    let required = request_capabilities(raw_body, wire_api);
+    let affinity_key = request_affinity_key(
+        inbound_headers,
+        raw_body,
+        &public_model,
+        wire_api,
+        affinity_identity_override,
+    );
+    let affinity = current_affinity(affinity_key.as_deref());
+    let mut last_priority = None;
+    if required.priority {
+        let ranked = rank_eligible_targets(
+            store,
+            targets.clone(),
+            wire_api,
+            required,
+            affinity.as_ref(),
+            affinity_key.as_deref(),
+        )
+        .await;
+        for (index, (provider, model, preferred_credential_id)) in ranked.into_iter().enumerate() {
+            let provider_slug = provider.slug.clone();
+            let public_model = model.public_model.clone();
+            let mut result = execute_with_affinity(
+                store,
+                cipher,
+                provider,
+                model,
+                inbound_headers,
+                raw_body,
+                affinity_key.clone(),
+                preferred_credential_id,
+            )
+            .await;
+            result.1.effective_service_tier = Some("priority".into());
+            if result.0.status().is_success() || !retryable_status(result.0.status()) {
+                return result;
+            }
+            tracing::debug!(
+                target: "polyflare_server::routing",
+                provider = %provider_slug,
+                model = %public_model,
+                status = result.0.status().as_u16(),
+                target_attempt = index + 1,
+                requested_tier = "priority",
+                "custom Priority target failed before output; trying another Priority target"
+            );
+            last_priority = Some(result);
+        }
+
+        let Some(standard_body) = without_priority_service_tier(raw_body) else {
+            return last_priority.unwrap_or_else(|| {
+                (
+                    (StatusCode::BAD_REQUEST, "invalid Priority fallback request").into_response(),
+                    unresolved_custom_outcome(public_model),
+                )
+            });
+        };
+        let standard_required = RequestCapabilities {
+            priority: false,
+            ..required
+        };
+        let ranked = rank_eligible_targets(
+            store,
+            targets,
+            wire_api,
+            standard_required,
+            affinity.as_ref(),
+            affinity_key.as_deref(),
+        )
+        .await;
+        let mut last_standard = None;
+        for (index, (provider, model, preferred_credential_id)) in ranked.into_iter().enumerate() {
+            let provider_slug = provider.slug.clone();
+            let public_model = model.public_model.clone();
+            let mut result = execute_with_affinity(
+                store,
+                cipher,
+                provider,
+                model,
+                inbound_headers,
+                &standard_body,
+                affinity_key.clone(),
+                preferred_credential_id,
+            )
+            .await;
+            result.1.effective_service_tier = Some("standard".into());
+            if result.0.status().is_success() || !retryable_status(result.0.status()) {
+                tracing::debug!(
+                    target: "polyflare_server::routing",
+                    provider = %provider_slug,
+                    model = %public_model,
+                    status = result.0.status().as_u16(),
+                    requested_tier = "priority",
+                    effective_tier = "standard",
+                    "custom Priority request downgraded to a Standard target"
+                );
+                return result;
+            }
+            tracing::debug!(
+                target: "polyflare_server::routing",
+                provider = %provider_slug,
+                model = %public_model,
+                status = result.0.status().as_u16(),
+                target_attempt = index + 1,
+                requested_tier = "priority",
+                effective_tier = "standard",
+                "custom Standard fallback target failed before output; trying another target"
+            );
+            last_standard = Some(result);
+        }
+        return last_standard.or(last_priority).unwrap_or_else(|| {
+            (
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no compatible provider target",
+                )
+                    .into_response(),
+                unresolved_custom_outcome(public_model),
+            )
+        });
+    }
+
+    let ranked = rank_eligible_targets(
+        store,
+        targets,
+        wire_api,
+        required,
+        affinity.as_ref(),
+        affinity_key.as_deref(),
+    )
+    .await;
+    let mut last = None;
+    for (index, (provider, model, preferred_credential_id)) in ranked.into_iter().enumerate() {
+        let provider_slug = provider.slug.clone();
+        let public_model = model.public_model.clone();
+        let result = execute_with_affinity(
+            store,
+            cipher,
+            provider,
+            model,
+            inbound_headers,
+            raw_body,
+            affinity_key.clone(),
+            preferred_credential_id,
+        )
+        .await;
+        if result.0.status().is_success() || !retryable_status(result.0.status()) {
+            return result;
+        }
+        tracing::debug!(
+            target: "polyflare_server::routing",
+            provider = %provider_slug,
+            model = %public_model,
+            status = result.0.status().as_u16(),
+            target_attempt = index + 1,
+            "custom provider target failed before output; trying another eligible target"
+        );
+        last = Some(result);
+    }
+    last.unwrap_or_else(|| {
+        (
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no compatible provider target",
+            )
+                .into_response(),
+            unresolved_custom_outcome(public_model),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1077,6 +2003,292 @@ mod tests {
             max_concurrency: None,
             created_at: 0,
             updated_at: 0,
+        }
+    }
+
+    fn credential(id: &str, weight: f64, max_concurrency: Option<i64>) -> ProviderCredential {
+        ProviderCredential {
+            id: id.into(),
+            provider_id: "provider".into(),
+            label: id.into(),
+            enabled: true,
+            health_status: "healthy".into(),
+            routing_weight: weight,
+            max_concurrency,
+            cooldown_until: None,
+            last_error_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn shared_credential_ranker_honors_weight_cooldown_and_concurrency() {
+        let mut provider = anthropic_provider();
+        provider.id = "provider".into();
+        let mut credentials = vec![
+            credential("credential-a", 1.0, Some(3)),
+            credential("credential-b", 4.0, Some(3)),
+        ];
+        let tried = HashSet::new();
+
+        let empty = HashMap::new();
+        assert_eq!(
+            best_credential(&provider, &credentials, &tried, None, 100, &empty)
+                .unwrap()
+                .0
+                .id,
+            "credential-a",
+            "an idle tie is deterministic"
+        );
+
+        let loaded = HashMap::from([
+            ("credential-a".to_string(), 1),
+            ("credential-b".to_string(), 1),
+        ]);
+        assert_eq!(
+            best_credential(&provider, &credentials, &tried, None, 100, &loaded)
+                .unwrap()
+                .0
+                .id,
+            "credential-b",
+            "load is normalized by routing weight"
+        );
+
+        credentials[1].health_status = "cooldown".into();
+        credentials[1].cooldown_until = Some(101);
+        assert_eq!(
+            best_credential(&provider, &credentials, &tried, None, 100, &loaded)
+                .unwrap()
+                .0
+                .id,
+            "credential-a"
+        );
+        credentials[1].cooldown_until = Some(100);
+        assert_eq!(
+            best_credential(&provider, &credentials, &tried, None, 100, &loaded)
+                .unwrap()
+                .0
+                .id,
+            "credential-b",
+            "an expired cooldown re-enters selection"
+        );
+
+        credentials[1].max_concurrency = Some(1);
+        assert_eq!(
+            best_credential(&provider, &credentials, &tried, None, 100, &loaded)
+                .unwrap()
+                .0
+                .id,
+            "credential-a",
+            "a saturated credential is excluded"
+        );
+        provider.max_concurrency = Some(2);
+        assert!(
+            best_credential(&provider, &credentials, &tried, None, 100, &loaded).is_none(),
+            "provider-level saturation excludes the whole target"
+        );
+    }
+
+    #[test]
+    fn credential_affinity_is_soft_and_never_overrides_eligibility() {
+        let mut provider = anthropic_provider();
+        provider.id = "provider".into();
+        let mut credentials = vec![
+            credential("credential-a", 4.0, Some(3)),
+            credential("credential-b", 1.0, Some(3)),
+        ];
+        let loaded = HashMap::from([
+            ("credential-a".to_string(), 0),
+            ("credential-b".to_string(), 2),
+        ]);
+        assert_eq!(
+            best_credential(
+                &provider,
+                &credentials,
+                &HashSet::new(),
+                Some("credential-b"),
+                100,
+                &loaded,
+            )
+            .unwrap()
+            .0
+            .id,
+            "credential-b",
+            "a healthy affine credential wins over weighted load"
+        );
+
+        credentials[1].health_status = "cooldown".into();
+        credentials[1].cooldown_until = Some(101);
+        assert_eq!(
+            best_credential(
+                &provider,
+                &credentials,
+                &HashSet::new(),
+                Some("credential-b"),
+                100,
+                &loaded,
+            )
+            .unwrap()
+            .0
+            .id,
+            "credential-a",
+            "an unavailable affine credential must fall back normally"
+        );
+    }
+
+    #[test]
+    fn affinity_cache_expires_and_evicts_the_oldest_success() {
+        let start = Instant::now();
+        let mut cache = AffinityCache::new(Duration::from_secs(10), 2);
+        cache.record(
+            "a".into(),
+            "provider-a".into(),
+            "credential-a".into(),
+            start,
+        );
+        cache.record(
+            "b".into(),
+            "provider-b".into(),
+            "credential-b".into(),
+            start + Duration::from_secs(1),
+        );
+        cache.record(
+            "c".into(),
+            "provider-c".into(),
+            "credential-c".into(),
+            start + Duration::from_secs(2),
+        );
+        assert!(cache.get("a", start + Duration::from_secs(2)).is_none());
+        assert!(cache.get("b", start + Duration::from_secs(2)).is_some());
+        assert!(cache.get("c", start + Duration::from_secs(2)).is_some());
+        assert!(
+            cache.get("b", start + Duration::from_secs(12)).is_none(),
+            "entries expire from their last successful completion"
+        );
+    }
+
+    #[test]
+    fn anthropic_affinity_accepts_only_the_prevalidated_protocol_override() {
+        let headers = HeaderMap::new();
+        let body = Bytes::from_static(
+            br#"{"prompt_cache_key":"codex-shaped","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert!(
+            request_affinity_key(&headers, &body, "shared-model", "anthropic_messages", None,)
+                .is_none(),
+            "generic Anthropic traffic must not borrow Codex affinity inputs"
+        );
+        assert!(request_affinity_key(
+            &headers,
+            &body,
+            "shared-model",
+            "anthropic_messages",
+            Some("validated-session-hash"),
+        )
+        .is_some());
+        assert!(request_affinity_key(&headers, &body, "shared-model", "responses", None).is_some());
+    }
+
+    #[test]
+    fn anonymous_smooth_weighted_routing_is_exact_and_bounded_by_scope() {
+        let now = Instant::now();
+        let mut cache = SmoothWeightedCache::new(Duration::from_secs(10), 2);
+        let candidates = vec![("a".to_string(), 3.0), ("b".to_string(), 1.0)];
+        let selected = (0..8)
+            .map(|_| cache.select("scope".into(), &candidates, now).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(selected.iter().filter(|id| id.as_str() == "a").count(), 6);
+        assert_eq!(selected.iter().filter(|id| id.as_str() == "b").count(), 2);
+
+        cache
+            .select("second".into(), &candidates, now + Duration::from_secs(1))
+            .unwrap();
+        cache
+            .select(
+                "third".into(),
+                &[("c".to_string(), 1.0)],
+                now + Duration::from_secs(2),
+            )
+            .unwrap();
+        assert_eq!(cache.entries.len(), 2);
+        assert!(!cache.entries.contains_key("scope"));
+    }
+
+    #[test]
+    fn affinity_completion_requires_a_protocol_terminal_for_event_streams() {
+        let mut responses = CompletionObserver::new("responses", true);
+        responses.observe(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n");
+        assert!(!responses.completed_cleanly());
+
+        let mut completed = CompletionObserver::new("responses", true);
+        completed
+            .observe(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\"}}\n\n");
+        assert!(completed.completed_cleanly());
+
+        let mut anthropic = CompletionObserver::new("anthropic_messages", true);
+        anthropic.observe(b"data: {\"type\":\"message_stop\"}\n\n");
+        assert!(anthropic.completed_cleanly());
+        assert!(
+            CompletionObserver::new("responses", false).completed_cleanly(),
+            "a clean finite JSON response is itself terminal"
+        );
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("Text/Event-Stream; charset=utf-8"),
+        );
+        assert!(is_event_stream_content_type(&headers));
+    }
+
+    #[test]
+    fn capability_detection_distinguishes_image_parts_from_structured_tool_output() {
+        let tool_output = Bytes::from_static(
+            br#"{"input":[{"type":"function_call_output","output":{"image_url":"text"}}]}"#,
+        );
+        assert!(!request_capabilities(&tool_output, "responses").vision);
+
+        let image = Bytes::from_static(
+            br#"{"input":[{"role":"user","content":[{"type":"input_image","image_url":"x"}]}]}"#,
+        );
+        assert!(request_capabilities(&image, "responses").vision);
+    }
+
+    #[test]
+    fn anthropic_capability_detection_only_inspects_message_content_blocks() {
+        let direct = Bytes::from_static(
+            br#"{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"opaque"}}]}]}"#,
+        );
+        assert!(
+            request_capabilities(&direct, "anthropic_messages").vision,
+            "a direct Anthropic image content block requires vision"
+        );
+
+        let nested = Bytes::from_static(
+            br#"{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":[{"type":"tool_result","tool_use_id":"tool-2","content":[{"type":"image","source":{"type":"base64","data":"opaque"}}]}]}]}]}"#,
+        );
+        assert!(
+            request_capabilities(&nested, "anthropic_messages").vision,
+            "tool_result content may recursively contain image blocks"
+        );
+
+        for not_content in [
+            br#"{"messages":[{"role":"user","content":[{"type":"text","text":"image","source":{"type":"image"},"data":{"type":"image"}}]}]}"#
+                .as_slice(),
+            br#"{"messages":[{"role":"user","content":[{"type":"tool_use","name":"inspect","input":{"type":"image"}}]}]}"#
+                .as_slice(),
+            br#"{"messages":[{"role":"user","content":"plain text"}],"system":[{"type":"image"}]}"#
+                .as_slice(),
+        ] {
+            assert!(
+                !request_capabilities(
+                    &Bytes::copy_from_slice(not_content),
+                    "anthropic_messages"
+                )
+                .vision,
+                "image-shaped values outside Messages content blocks are not vision inputs"
+            );
         }
     }
 

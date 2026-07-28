@@ -5,12 +5,29 @@ import {
   type FormEvent,
   type SetStateAction,
 } from "react";
+import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 
 import type {
   CreateProviderModelBody,
   ProviderModelDiscoveryResult,
+  ProviderPerformanceBucketView,
+  ProviderPerformanceRowView,
   ProviderModelView,
 } from "../lib/api";
+import { latency, tpsFmt } from "../lib/format";
+import {
+  buildProviderModelPerformanceComparisons,
+  performanceUplift,
+  type ProviderModelPerformanceComparison,
+} from "../lib/providerPerformance";
 import {
   filterDiscoveredModels,
   selectableDiscoveredModelIds,
@@ -20,19 +37,33 @@ import {
   isProviderModelProfile,
   providerProfileTemplate,
 } from "../lib/providerProfiles";
+import { providerPricingSummary } from "../lib/providerPricing";
 import {
   useAddProviderCredential,
   useAddProviderModel,
   useCreateProviderBundle,
   useDiscoverProviderModels,
   useProviderAction,
+  useProviderPerformance,
   useProviders,
   useSyncProviderModels,
   useTestProvider,
   useUpdateProviderModel,
 } from "../lib/queries";
 import { Card } from "../ui/Card";
-import { AlertTriangle, Check, KeyRound, Plus, Route, Search, Trash2, X } from "../ui/icons";
+import {
+  Activity,
+  AlertTriangle,
+  Check,
+  Clock,
+  KeyRound,
+  Plus,
+  Route,
+  Search,
+  Trash2,
+  X,
+  Zap,
+} from "../ui/icons";
 
 const INPUT =
   "h-9 w-full rounded-lg border border-border bg-bg/65 px-3 text-[11px] text-fg outline-none transition focus:border-accent/60";
@@ -47,6 +78,8 @@ export function Providers() {
   const discoverModels = useDiscoverProviderModels();
   const syncModels = useSyncProviderModels();
   const updateModel = useUpdateProviderModel();
+  const [performanceRange, setPerformanceRange] = useState<"24h" | "7d" | "30d">("24h");
+  const performance = useProviderPerformance(performanceRange);
   const [open, setOpen] = useState(false);
   const [addTarget, setAddTarget] = useState<{
     providerId: string;
@@ -90,6 +123,24 @@ export function Providers() {
           }
         />
       )}
+
+      <ProviderPerformancePanel
+        range={performanceRange}
+        onRangeChange={setPerformanceRange}
+        rows={buildProviderModelPerformanceComparisons(
+          providers.data ?? [],
+          performance.data?.rows ?? [],
+        )}
+        buckets={performance.data?.buckets ?? []}
+        sinceTs={performance.data?.since_ts ?? null}
+        bucketSeconds={performance.data?.bucket_seconds ?? null}
+        loading={providers.isLoading || performance.isLoading}
+        error={providers.isError || performance.isError}
+        onRetry={() => {
+          void providers.refetch();
+          void performance.refetch();
+        }}
+      />
 
       {providers.isLoading ? (
         <Card>
@@ -269,7 +320,17 @@ export function Providers() {
                     </span>
                   </div>
                   <div className="flex flex-col gap-2">
-                    {provider.models.map((model) => (
+                    {provider.models.map((model) => {
+                      const targetProviders = (providers.data ?? [])
+                        .filter((candidate) =>
+                          candidate.models.some(
+                            (candidateModel) =>
+                              candidateModel.enabled &&
+                              candidateModel.public_model === model.public_model,
+                          ),
+                        )
+                        .map((candidate) => candidate.display_name);
+                      return (
                       <div key={model.id}>
                         <div className="flex items-center justify-between gap-2">
                           <span className="truncate font-mono text-[10.5px] text-fg">
@@ -344,9 +405,23 @@ export function Providers() {
                             : "not advertised"}
                           {model.supports_reasoning_summaries ? " · summaries" : ""}
                         </div>
+                        <div className="mt-1 text-[8px] text-fg opacity-55">
+                          <span className="uppercase tracking-wide opacity-65">
+                            USD / 1M
+                          </span>{" "}
+                          · {providerPricingSummary(model)}
+                        </div>
                         {isProviderModelProfile(model) && (
                           <div className="mt-1 inline-flex rounded border border-signal/25 bg-signal/[0.07] px-1.5 py-0.5 text-[8px] font-semibold text-signal">
                             profile · {model.instruction_mode}
+                          </div>
+                        )}
+                        {targetProviders.length > 1 && (
+                          <div
+                            className="mt-1 inline-flex rounded border border-accent/25 bg-accent/[0.07] px-1.5 py-0.5 text-[8px] font-semibold text-accent"
+                            title={`Targets: ${targetProviders.join(", ")}`}
+                          >
+                            balanced · {targetProviders.length} providers
                           </div>
                         )}
                         <div className="mt-1 flex items-center gap-1">
@@ -392,7 +467,8 @@ export function Providers() {
                           )}
                         </div>
                       </div>
-                    ))}
+                      );
+                    })}
                     {!provider.models.length && (
                       <span className="text-[10px] text-fg opacity-40">No models</span>
                     )}
@@ -441,6 +517,7 @@ export function Providers() {
                   key={`${addTarget.model?.id ?? "new"}-${addTarget.template?.id ?? "blank"}`}
                   initial={addTarget.model}
                   template={addTarget.template}
+                  wireApi={provider.wire_api}
                   pending={addModel.isPending || updateModel.isPending}
                   onCancel={() => setAddTarget(null)}
                   onSubmit={(model) =>
@@ -458,10 +535,15 @@ export function Providers() {
                               supports_parallel_tool_calls: model.supports_parallel_tool_calls,
                               supports_web_search: model.supports_web_search,
                               supports_reasoning_summaries: model.supports_reasoning_summaries,
+                              supports_priority_service_tier:
+                                model.supports_priority_service_tier,
                               reasoning_levels: model.reasoning_levels,
                               instruction_mode: model.instruction_mode,
                               instruction_text: model.instruction_text,
                               request_overrides: model.request_overrides,
+                              input_per_million: model.input_per_million,
+                              cached_input_per_million: model.cached_input_per_million,
+                              output_per_million: model.output_per_million,
                               visible_in_codex: model.visible_in_codex,
                               visible_in_openai: model.visible_in_openai,
                             },
@@ -487,6 +569,540 @@ export function Providers() {
           </div>
         </Card>
       )}
+    </div>
+  );
+}
+
+const PERFORMANCE_RANGES = [
+  { value: "24h", label: "24 hours" },
+  { value: "7d", label: "7 days" },
+  { value: "30d", label: "30 days" },
+] as const;
+
+function ProviderPerformancePanel({
+  range,
+  onRangeChange,
+  rows,
+  buckets,
+  sinceTs,
+  bucketSeconds,
+  loading,
+  error,
+  onRetry,
+}: {
+  range: "24h" | "7d" | "30d";
+  onRangeChange: (range: "24h" | "7d" | "30d") => void;
+  rows: ProviderModelPerformanceComparison[];
+  buckets: ProviderPerformanceBucketView[];
+  sinceTs: number | null;
+  bucketSeconds: number | null;
+  loading: boolean;
+  error: boolean;
+  onRetry: () => void;
+}) {
+  const showPriority = rows.some((row) => row.supportsPriority || row.hasPriorityHistory);
+  const models = [...new Set(rows.map((row) => row.model))];
+  const [selectedModel, setSelectedModel] = useState("");
+  useEffect(() => {
+    if (!models.includes(selectedModel)) setSelectedModel(models[0] ?? "");
+  }, [models, selectedModel]);
+  const columns = showPriority
+    ? "sm:grid-cols-[minmax(210px,1.4fr)_minmax(180px,1fr)_minmax(180px,1fr)]"
+    : "sm:grid-cols-[minmax(210px,1.4fr)_minmax(180px,1fr)]";
+
+  return (
+    <Card className="gap-0 overflow-hidden p-0">
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border/70 px-4 py-3.5">
+        <div>
+          <div className="flex items-center gap-2">
+            <Activity className="h-4 w-4 text-accent" />
+            <h2 className="text-[12px] font-semibold text-fg">Model performance</h2>
+          </div>
+          <p className="mt-1 max-w-2xl text-[9.5px] leading-4 text-fg opacity-50">
+            Compare each provider&apos;s observed TTFT and weighted generation throughput. The same
+            public model remains a separate row per provider; Priority traffic never changes the
+            Standard baseline.
+          </p>
+        </div>
+        <div className="flex rounded-lg border border-border bg-bg/40 p-0.5">
+          {PERFORMANCE_RANGES.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              title={option.label}
+              onClick={() => onRangeChange(option.value)}
+              className={`rounded-md px-2.5 py-1 text-[9px] font-semibold transition ${
+                range === option.value
+                  ? "bg-accent/15 text-accent"
+                  : "text-fg opacity-45 hover:opacity-80"
+              }`}
+            >
+              {option.value}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="grid gap-2 px-4 py-4 sm:grid-cols-3">
+          {[0, 1, 2].map((index) => (
+            <div key={index} className="h-16 animate-pulse rounded-lg bg-muted" />
+          ))}
+        </div>
+      ) : error ? (
+        <div className="flex items-center justify-between gap-3 px-4 py-5">
+          <span className="flex items-center gap-2 text-[10px] text-error">
+            <AlertTriangle className="h-3.5 w-3.5" />
+            Couldn&apos;t load provider performance.
+          </span>
+          <button type="button" onClick={onRetry} className="text-[9px] font-semibold text-accent">
+            Retry
+          </button>
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="px-4 py-7 text-center">
+          <div className="text-[10.5px] font-medium text-fg opacity-65">
+            No configured model performance yet
+          </div>
+          <div className="mt-1 text-[9px] text-fg opacity-40">
+            Models appear here after provider onboarding; metrics fill in as requests complete.
+          </div>
+        </div>
+      ) : (
+        <div className="divide-y divide-border/60">
+          <div
+            className={`hidden gap-3 bg-bg/30 px-4 py-2 text-[8px] font-bold uppercase tracking-[0.14em] text-fg opacity-40 sm:grid ${columns}`}
+          >
+            <span>Provider · model</span>
+            <span>Standard</span>
+            {showPriority && <span>Priority / Fast</span>}
+          </div>
+          {rows.map((row) => (
+            <div
+              key={row.key}
+              className={`grid grid-cols-1 gap-3 px-4 py-3 transition-colors hover:bg-muted/20 ${columns}`}
+            >
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="rounded bg-signal/10 px-1.5 py-0.5 text-[8px] font-bold uppercase text-signal">
+                    {row.providerName}
+                  </span>
+                  {row.supportsPriority && (
+                    <span className="rounded bg-accent/10 px-1.5 py-0.5 text-[8px] font-bold uppercase text-accent">
+                      Fast capable
+                    </span>
+                  )}
+                  {!row.supportsPriority && row.hasPriorityHistory && (
+                    <span className="rounded bg-muted px-1.5 py-0.5 text-[8px] font-bold uppercase text-fg opacity-55">
+                      Priority history
+                    </span>
+                  )}
+                </div>
+                <div className="mt-1.5 truncate font-mono text-[10.5px] font-semibold text-fg">
+                  {row.model}
+                </div>
+                {row.modelName !== row.model && (
+                  <div className="mt-0.5 truncate text-[8.5px] text-fg opacity-40">
+                    {row.modelName}
+                  </div>
+                )}
+                <PerformanceUplift standard={row.standard} priority={row.priority} />
+              </div>
+              <PerformanceLane label="Standard" sample={row.standard} />
+              {showPriority && (
+                <PerformanceLane
+                  label="Priority"
+                  sample={row.priority}
+                  priority={row.supportsPriority}
+                  available={row.supportsPriority || row.hasPriorityHistory}
+                />
+              )}
+            </div>
+          ))}
+          {selectedModel && sinceTs !== null && bucketSeconds !== null && (
+            <ProviderPerformanceTrends
+              model={selectedModel}
+              models={models}
+              rows={rows.filter((row) => row.model === selectedModel)}
+              buckets={buckets.filter((bucket) => bucket.model === selectedModel)}
+              sinceTs={sinceTs}
+              bucketSeconds={bucketSeconds}
+              onModelChange={setSelectedModel}
+            />
+          )}
+        </div>
+      )}
+      <div className="border-t border-border/60 bg-bg/25 px-4 py-2 text-[8.5px] leading-4 text-fg opacity-40">
+        Weighted TPS = total output tokens ÷ total measured generation time after first token.
+        Percentiles use nearest-rank request samples. Missing timing evidence is excluded and shown
+        through coverage; final 429s do not include upstream attempts recovered before the client
+        response.
+      </div>
+    </Card>
+  );
+}
+
+function PerformanceLane({
+  label,
+  sample,
+  priority = false,
+  available = true,
+}: {
+  label: string;
+  sample: ProviderPerformanceRowView | null;
+  priority?: boolean;
+  available?: boolean;
+}) {
+  return (
+    <div
+      className={`rounded-lg border px-3 py-2 ${
+        priority
+          ? "border-accent/20 bg-accent/[0.04]"
+          : "border-border/70 bg-bg/30"
+      }`}
+    >
+      <div className="mb-1.5 text-[8px] font-bold uppercase tracking-wide text-fg opacity-35 sm:hidden">
+        {label}
+      </div>
+      {!available ? (
+        <div className="flex min-h-11 items-center text-[9px] text-fg opacity-30">
+          Priority not enabled
+        </div>
+      ) : sample ? (
+        <>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <div className="flex items-center gap-1 text-[8px] uppercase tracking-wide text-fg opacity-40">
+                <Zap className="h-3 w-3" />
+                TPS
+              </div>
+              <div className={`mt-0.5 text-[14px] font-semibold ${priority ? "text-accent" : "text-fg"}`}>
+                {tpsFmt(sample.tps)}
+              </div>
+            </div>
+            <div>
+              <div className="flex items-center gap-1 text-[8px] uppercase tracking-wide text-fg opacity-40">
+                <Clock className="h-3 w-3" />
+                TTFT
+              </div>
+              <div className="mt-0.5 text-[14px] font-semibold text-fg">
+                {sample.ttft_sample_count > 0 ? latency(sample.avg_ttft_ms) : "—"}
+              </div>
+            </div>
+          </div>
+          <div className="mt-1.5 flex flex-wrap gap-x-2 text-[8px] text-fg opacity-35">
+            <span>{sample.requests} req</span>
+            <span>{sample.tps_sample_count} TPS samples</span>
+            <span>{sample.ttft_sample_count} TTFT samples</span>
+          </div>
+          <div className="mt-2 grid grid-cols-1 gap-1 border-t border-border/50 pt-1.5 text-[8px] xl:grid-cols-2 xl:gap-x-3">
+            <div className="space-y-0.5 text-fg opacity-55">
+              <div>
+                TPS p50 / p95{" "}
+                <span className="font-semibold text-fg">
+                  {tpsFmt(sample.p50_tps)} / {tpsFmt(sample.p95_tps)}
+                </span>
+              </div>
+              <div>
+                TTFT p50 / p95{" "}
+                <span className="font-semibold text-fg">
+                  {sample.p50_ttft_ms === null ? "—" : latency(sample.p50_ttft_ms)} /{" "}
+                  {sample.p95_ttft_ms === null ? "—" : latency(sample.p95_ttft_ms)}
+                </span>
+              </div>
+            </div>
+            <div className="space-y-0.5 text-fg opacity-55 xl:text-right">
+              <div>
+                Success{" "}
+                <span className="font-semibold text-fg">
+                  {sample.requests > 0
+                    ? `${((sample.successes / sample.requests) * 100).toFixed(1)}%`
+                    : "—"}
+                </span>
+              </div>
+              <div>
+                Errors / final 429{" "}
+                <span className="font-semibold text-fg">
+                  {sample.errors} / {sample.rate_limited}
+                </span>
+              </div>
+            </div>
+          </div>
+        </>
+      ) : (
+        <div className="flex min-h-11 items-center text-[9px] text-fg opacity-35">
+          No {label.toLowerCase()} samples in this range
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PerformanceUplift({
+  standard,
+  priority,
+}: {
+  standard: ProviderPerformanceRowView | null;
+  priority: ProviderPerformanceRowView | null;
+}) {
+  const uplift = performanceUplift(standard, priority);
+  if (uplift.tps_percent === null && uplift.ttft_percent === null) return null;
+  const signed = (value: number) => `${value >= 0 ? "+" : ""}${value.toFixed(0)}%`;
+  return (
+    <div className="mt-2 flex flex-wrap gap-1 text-[8px] font-semibold">
+      {uplift.tps_percent !== null && (
+        <span
+          className={`rounded px-1.5 py-0.5 ${
+            uplift.tps_percent >= 0
+              ? "bg-success/10 text-success"
+              : "bg-error/10 text-error"
+          }`}
+        >
+          {signed(uplift.tps_percent)} Priority TPS
+        </span>
+      )}
+      {uplift.ttft_percent !== null && (
+        <span
+          className={`rounded px-1.5 py-0.5 ${
+            uplift.ttft_percent >= 0
+              ? "bg-success/10 text-success"
+              : "bg-error/10 text-error"
+          }`}
+        >
+          {Math.abs(uplift.ttft_percent).toFixed(0)}%{" "}
+          {uplift.ttft_percent >= 0 ? "faster" : "slower"} TTFT
+        </span>
+      )}
+    </div>
+  );
+}
+
+const TREND_COLORS = [
+  "hsl(var(--codex))",
+  "hsl(var(--claude))",
+  "hsl(var(--accent))",
+  "hsl(var(--signal))",
+  "hsl(var(--success))",
+];
+
+type PerformanceTrendPoint = {
+  ts: number;
+  [series: string]: number | null;
+};
+
+type PerformanceTrendSeries = {
+  key: string;
+  provider: string;
+  tier: "standard" | "priority";
+  label: string;
+  color: string;
+  priority: boolean;
+};
+
+function trendKey(provider: string, tier: string, metric: "tps" | "ttft") {
+  return `${provider}\u0000${tier}\u0000${metric}`;
+}
+
+function ProviderPerformanceTrends({
+  model,
+  models,
+  rows,
+  buckets,
+  sinceTs,
+  bucketSeconds,
+  onModelChange,
+}: {
+  model: string;
+  models: string[];
+  rows: ProviderModelPerformanceComparison[];
+  buckets: ProviderPerformanceBucketView[];
+  sinceTs: number;
+  bucketSeconds: number;
+  onModelChange: (model: string) => void;
+}) {
+  const series: PerformanceTrendSeries[] = rows.flatMap((row, index) => {
+    const color = TREND_COLORS[index % TREND_COLORS.length];
+    const lanes: PerformanceTrendSeries[] = [
+      {
+        key: `${row.providerSlug}:standard`,
+        provider: row.providerSlug,
+        tier: "standard",
+        label: `${row.providerName} · Standard`,
+        color,
+        priority: false,
+      },
+    ];
+    if (row.supportsPriority || row.hasPriorityHistory) {
+      lanes.push({
+        key: `${row.providerSlug}:priority`,
+        provider: row.providerSlug,
+        tier: "priority",
+        label: `${row.providerName} · Priority`,
+        color,
+        priority: true,
+      });
+    }
+    return lanes;
+  });
+
+  const start = Math.floor(sinceTs / bucketSeconds) * bucketSeconds;
+  const end = Math.floor(Date.now() / 1_000 / bucketSeconds) * bucketSeconds;
+  const visibleProviders = new Set(rows.map((row) => row.providerSlug));
+  const visibleBuckets = buckets.filter((bucket) => visibleProviders.has(bucket.provider));
+  const byTs = new Map<number, PerformanceTrendPoint>();
+  for (let ts = start; ts <= end; ts += bucketSeconds) byTs.set(ts, { ts });
+  for (const bucket of visibleBuckets) {
+    const point = byTs.get(bucket.ts) ?? { ts: bucket.ts };
+    point[trendKey(bucket.provider, bucket.tier, "tps")] = bucket.tps;
+    point[trendKey(bucket.provider, bucket.tier, "ttft")] =
+      bucket.ttft_sample_count > 0 ? bucket.avg_ttft_ms : null;
+    byTs.set(bucket.ts, point);
+  }
+  const points = [...byTs.values()].sort((left, right) => left.ts - right.ts);
+  const totalRequests = visibleBuckets.reduce((sum, bucket) => sum + bucket.requests, 0);
+  const totalErrors = visibleBuckets.reduce((sum, bucket) => sum + bucket.errors, 0);
+  const totalRateLimited = visibleBuckets.reduce(
+    (sum, bucket) => sum + bucket.rate_limited,
+    0,
+  );
+
+  return (
+    <section className="bg-bg/20 px-4 py-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-[10.5px] font-semibold text-fg">Provider trend comparison</div>
+          <div className="mt-0.5 text-[8.5px] text-fg opacity-45">
+            {totalRequests} requests · {totalErrors} errors · {totalRateLimited} final 429s
+          </div>
+        </div>
+        <label className="flex items-center gap-2 text-[8px] font-bold uppercase tracking-wide text-fg opacity-55">
+          Model
+          <select
+            value={model}
+            onChange={(event) => onModelChange(event.target.value)}
+            className="h-8 max-w-[280px] rounded-lg border border-border bg-bg px-2.5 font-mono text-[9px] font-medium normal-case tracking-normal text-fg outline-none focus:border-accent/60"
+          >
+            {models.map((candidate) => (
+              <option key={candidate} value={candidate}>
+                {candidate}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1 text-[8px] text-fg opacity-65">
+        {series.map((item) => (
+          <span key={item.key} className="flex items-center gap-1">
+            <span
+              className="inline-block h-[3px] w-3"
+              style={{
+                backgroundColor: item.color,
+                opacity: item.priority ? 0.65 : 1,
+              }}
+            />
+            {item.label}
+            {item.priority && <span className="opacity-55">(dashed)</span>}
+          </span>
+        ))}
+      </div>
+
+      <div className="mt-3 grid gap-3 lg:grid-cols-2">
+        <PerformanceTrendChart
+          title="Weighted generation TPS"
+          metric="tps"
+          points={points}
+          series={series}
+          bucketSeconds={bucketSeconds}
+        />
+        <PerformanceTrendChart
+          title="Average TTFT"
+          metric="ttft"
+          points={points}
+          series={series}
+          bucketSeconds={bucketSeconds}
+        />
+      </div>
+    </section>
+  );
+}
+
+function PerformanceTrendChart({
+  title,
+  metric,
+  points,
+  series,
+  bucketSeconds,
+}: {
+  title: string;
+  metric: "tps" | "ttft";
+  points: PerformanceTrendPoint[];
+  series: PerformanceTrendSeries[];
+  bucketSeconds: number;
+}) {
+  const tick = (timestamp: number) =>
+    new Date(timestamp * 1_000).toLocaleString([], {
+      month: bucketSeconds >= 86_400 ? "short" : undefined,
+      day: bucketSeconds >= 86_400 ? "numeric" : undefined,
+      hour: bucketSeconds < 86_400 ? "2-digit" : undefined,
+      minute: bucketSeconds < 86_400 ? "2-digit" : undefined,
+    });
+  return (
+    <div className="rounded-lg border border-border/70 bg-bg/35 p-3">
+      <div className="text-[8px] font-bold uppercase tracking-[0.12em] text-fg opacity-45">
+        {title}
+      </div>
+      <div className="mt-2 h-40 min-w-0">
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={points} margin={{ top: 4, right: 8, bottom: 0, left: -10 }}>
+            <CartesianGrid vertical={false} stroke="hsl(var(--border))" strokeDasharray="3 3" />
+            <XAxis
+              dataKey="ts"
+              type="number"
+              domain={["dataMin", "dataMax"]}
+              tick={{ fontSize: 8, fill: "hsl(var(--fg))", fillOpacity: 0.45 }}
+              tickLine={false}
+              axisLine={false}
+              tickFormatter={tick}
+              minTickGap={28}
+            />
+            <YAxis
+              width={42}
+              tick={{ fontSize: 8, fill: "hsl(var(--fg))", fillOpacity: 0.5 }}
+              tickLine={false}
+              axisLine={false}
+              tickFormatter={(value: number) => (metric === "tps" ? tpsFmt(value) : latency(value))}
+            />
+            <Tooltip
+              labelFormatter={(value) => new Date(Number(value) * 1_000).toLocaleString()}
+              formatter={(value, name) => [
+                metric === "tps" ? tpsFmt(Number(value)) : latency(Number(value)),
+                name,
+              ]}
+              contentStyle={{
+                background: "hsl(var(--panel))",
+                border: "1px solid hsl(var(--border))",
+                borderRadius: 8,
+                fontSize: 9,
+              }}
+            />
+            {series.map((item) => (
+              <Line
+                key={`${item.key}:${metric}`}
+                name={item.label}
+                dataKey={trendKey(item.provider, item.tier, metric)}
+                type="monotone"
+                stroke={item.color}
+                strokeWidth={item.priority ? 1.5 : 2}
+                strokeDasharray={item.priority ? "5 4" : undefined}
+                dot={false}
+                connectNulls={false}
+                isAnimationActive={false}
+              />
+            ))}
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
     </div>
   );
 }
@@ -678,9 +1294,7 @@ function ModelDiscoveryPanel({
                         : "reasoning"}
                     </span>
                   )}
-                  {model.input_per_million !== null && (
-                    <span>· ${model.input_per_million.toFixed(2)}/M input</span>
-                  )}
+                  <span>· USD/M {providerPricingSummary(model)}</span>
                 </span>
                 {model.suggested_public_model !== model.upstream_model && (
                   <span className="mt-1 block truncate font-mono text-[7.5px] text-fg opacity-35">
@@ -782,12 +1396,14 @@ function CredentialForm({
 function ModelForm({
   initial,
   template,
+  wireApi,
   pending,
   onSubmit,
   onCancel,
 }: {
   initial?: ProviderModelView;
   template?: ProviderModelView;
+  wireApi: string;
   pending: boolean;
   onSubmit: (model: CreateProviderModelBody) => void;
   onCancel: () => void;
@@ -807,6 +1423,15 @@ function ModelForm({
   const [maxOutputTokens, setMaxOutputTokens] = useState(
     source?.max_output_tokens?.toString() ?? "",
   );
+  const [inputPrice, setInputPrice] = useState(
+    source?.input_per_million?.toString() ?? "",
+  );
+  const [cachedInputPrice, setCachedInputPrice] = useState(
+    source?.cached_input_per_million?.toString() ?? "",
+  );
+  const [outputPrice, setOutputPrice] = useState(
+    source?.output_per_million?.toString() ?? "",
+  );
   const [reasoningLevels, setReasoningLevels] = useState(
     source?.reasoning_levels.join(",") ?? "",
   );
@@ -820,6 +1445,9 @@ function ModelForm({
   );
   const [supportsSummaries, setSupportsSummaries] = useState(
     source?.supports_reasoning_summaries ?? false,
+  );
+  const [supportsPriorityServiceTier, setSupportsPriorityServiceTier] = useState(
+    source?.supports_priority_service_tier ?? false,
   );
   const [instructionMode, setInstructionMode] = useState<"none" | "append" | "replace">(
     initial?.instruction_mode ?? templateDefaults?.instructionMode ?? "none",
@@ -854,6 +1482,8 @@ function ModelForm({
           supports_parallel_tool_calls: supportsParallel,
           supports_web_search: supportsSearch,
           supports_reasoning_summaries: supportsSummaries,
+          supports_priority_service_tier:
+            wireApi === "responses" && supportsPriorityServiceTier,
           reasoning_levels: reasoningLevels
             .split(",")
             .map((level) => level.trim())
@@ -866,9 +1496,10 @@ function ModelForm({
               ? { max_output_tokens: Number(overrideMaxOutput) }
               : {}),
           },
-          input_per_million: source?.input_per_million ?? undefined,
-          cached_input_per_million: source?.cached_input_per_million ?? undefined,
-          output_per_million: source?.output_per_million ?? undefined,
+          input_per_million: inputPrice === "" ? null : Number(inputPrice),
+          cached_input_per_million:
+            cachedInputPrice === "" ? null : Number(cachedInputPrice),
+          output_per_million: outputPrice === "" ? null : Number(outputPrice),
           visible_in_codex: visibleInCodex,
           visible_in_openai: visibleInOpenAi,
         });
@@ -931,6 +1562,54 @@ function ModelForm({
         aria-label="Reasoning efforts"
         onChange={(event) => setReasoningLevels(event.target.value)}
       />
+      <fieldset className="grid gap-2 rounded-lg border border-accent/20 bg-accent/[0.04] p-2.5 sm:col-span-2 sm:grid-cols-3">
+        <legend className="px-1 text-[9px] font-bold uppercase tracking-wide text-fg opacity-55">
+          Pricing · USD per 1M tokens
+        </legend>
+        <label className="text-[9px] font-semibold text-fg">
+          Normal input
+          <input
+            className={`${INPUT} mt-1`}
+            value={inputPrice}
+            type="number"
+            min="0"
+            step="any"
+            inputMode="decimal"
+            placeholder="e.g. 2.50"
+            onChange={(event) => setInputPrice(event.target.value)}
+          />
+        </label>
+        <label className="text-[9px] font-semibold text-fg">
+          Cached input
+          <input
+            className={`${INPUT} mt-1`}
+            value={cachedInputPrice}
+            type="number"
+            min="0"
+            step="any"
+            inputMode="decimal"
+            placeholder="e.g. 0.25"
+            onChange={(event) => setCachedInputPrice(event.target.value)}
+          />
+        </label>
+        <label className="text-[9px] font-semibold text-fg">
+          Output
+          <input
+            className={`${INPUT} mt-1`}
+            value={outputPrice}
+            type="number"
+            min="0"
+            step="any"
+            inputMode="decimal"
+            placeholder="e.g. 12.00"
+            onChange={(event) => setOutputPrice(event.target.value)}
+          />
+        </label>
+        <p className="text-[8.5px] leading-4 text-fg opacity-45 sm:col-span-3">
+          Cached input is the provider&apos;s prompt-cache read rate. Leave a field empty when the
+          price is unknown; zero means the provider does not charge for that token class.
+        </p>
+      </fieldset>
       <div className="grid gap-2 rounded-lg border border-signal/20 bg-signal/[0.04] p-2.5 sm:col-span-2 sm:grid-cols-2">
         <label className="text-[9px] font-semibold text-fg">
           Instruction mode
@@ -1039,6 +1718,27 @@ function ModelForm({
           Show in OpenAI model list
         </label>
       </div>
+      {wireApi === "responses" && (
+        <label className="flex items-start gap-2 rounded-lg border border-accent/20 bg-accent/[0.04] p-2.5 sm:col-span-2">
+          <input
+            className="mt-0.5"
+            type="checkbox"
+            checked={supportsPriorityServiceTier}
+            onChange={(event) => setSupportsPriorityServiceTier(event.target.checked)}
+          />
+          <span>
+            <span className="block text-[10px] font-semibold text-fg">
+              Priority / Fast tier
+            </span>
+            <span className="mt-0.5 block text-[9px] leading-4 text-fg opacity-55">
+              Advertise this provider&apos;s Priority tier so Codex users can select Fast mode.
+              PolyFlare forwards priority only when the user selects it; standard remains the
+              default. If every Priority route is unavailable before output, PolyFlare can
+              continue on an eligible Standard route.
+            </span>
+          </span>
+        </label>
+      )}
     </form>
   );
 }

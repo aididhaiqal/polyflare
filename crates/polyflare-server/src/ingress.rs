@@ -501,7 +501,7 @@ struct RouteOutcome {
 }
 
 struct ResponsesHandlerOptions {
-    resolved_custom_route: Option<(CustomProvider, ProviderModel)>,
+    resolved_custom_route: Option<Vec<(CustomProvider, ProviderModel)>>,
     max_attempts: u32,
     starvation_budget: Duration,
     starvation_heartbeat: Duration,
@@ -2098,18 +2098,10 @@ pub(crate) async fn responses_custom_route_for_ws(
     state: Arc<AppState>,
     headers: HeaderMap,
     body: Bytes,
-    provider: CustomProvider,
-    model: ProviderModel,
+    targets: Vec<(CustomProvider, ProviderModel)>,
 ) -> Response {
-    responses_route_with_transport(
-        state,
-        None,
-        headers,
-        body,
-        Some("websocket"),
-        Some((provider, model)),
-    )
-    .await
+    responses_route_with_transport(state, None, headers, body, Some("websocket"), Some(targets))
+        .await
 }
 
 pub(crate) async fn responses_translation_route_for_ws(
@@ -2127,7 +2119,7 @@ async fn responses_route_with_transport(
     headers: HeaderMap,
     body: Bytes,
     downstream_transport: Option<&'static str>,
-    resolved_custom_route: Option<(CustomProvider, ProviderModel)>,
+    resolved_custom_route: Option<Vec<(CustomProvider, ProviderModel)>>,
 ) -> Response {
     let start = Instant::now();
     maybe_capture_fingerprint(&state, "POST", "/responses", &headers);
@@ -2335,7 +2327,7 @@ async fn responses_handler_impl(
     pool: Option<&str>,
     headers: HeaderMap,
     raw: Bytes,
-    resolved_custom_route: Option<(CustomProvider, ProviderModel)>,
+    resolved_custom_route: Option<Vec<(CustomProvider, ProviderModel)>>,
 ) -> (Response, RouteOutcome) {
     let max_attempts = state.runtime_settings.max_account_attempts();
     let starvation_wait_budget = state.runtime_settings.starvation_wait_budget();
@@ -2419,27 +2411,32 @@ pub async fn responses_handler_impl_for_test_with_starvation_timing(
     .0
 }
 
-async fn execute_custom_model(
+async fn execute_custom_models(
     state: &AppState,
     headers: &HeaderMap,
     raw: &Bytes,
-    provider: CustomProvider,
-    provider_model: ProviderModel,
+    targets: Vec<(CustomProvider, ProviderModel)>,
+    wire_api: &str,
+    affinity_identity_override: Option<String>,
     mut outcome: RouteOutcome,
 ) -> (Response, RouteOutcome) {
-    let (response, custom) = crate::custom_provider::execute(
+    let (response, custom) = crate::custom_provider::execute_targets(
         &state.store,
         &state.cipher,
-        provider,
-        provider_model,
+        targets,
+        wire_api,
         headers,
         raw,
+        affinity_identity_override.as_deref(),
     )
     .await;
     outcome.provider_slug = Some(custom.provider_slug);
     outcome.provider_credential_id = custom.credential_id;
     outcome.upstream_model = Some(custom.upstream_model);
     outcome.upstream_transport = Some(custom.upstream_transport);
+    if custom.effective_service_tier.is_some() {
+        outcome.service_tier = custom.effective_service_tier;
+    }
     outcome.profile_revision = custom.profile_revision;
     outcome.custom_pricing = match (
         custom.input_per_million,
@@ -2699,27 +2696,32 @@ async fn responses_handler_impl_with_max_attempts(
         .await;
     }
 
-    if let Some((provider, provider_model)) = resolved_custom_route {
-        return execute_custom_model(&state, &headers, &raw, provider, provider_model, outcome)
+    if let Some(targets) = resolved_custom_route {
+        return execute_custom_models(&state, &headers, &raw, targets, "responses", None, outcome)
             .await;
     }
 
     // Custom models are a root-catalog contract. Resolve them before any built-in account or
     // continuity selection so API-key providers never enter OAuth ownership machinery.
     if pool.is_none() && !crate::catalog::model_slug_is_reserved(&state, &model) {
-        match state.store.providers().resolve_model(&model).await {
-            Ok(Some((provider, provider_model))) if provider.wire_api == "responses" => {
-                return execute_custom_model(
+        match state.store.providers().resolve_model_targets(&model).await {
+            Ok(targets)
+                if targets
+                    .iter()
+                    .any(|(provider, _)| provider.wire_api == "responses") =>
+            {
+                return execute_custom_models(
                     &state,
                     &headers,
                     &raw,
-                    provider,
-                    provider_model,
+                    targets,
+                    "responses",
+                    None,
                     outcome,
                 )
                 .await;
             }
-            Ok(Some(_)) => {
+            Ok(targets) if !targets.is_empty() => {
                 return (
                     (
                         StatusCode::BAD_REQUEST,
@@ -2729,7 +2731,7 @@ async fn responses_handler_impl_with_max_attempts(
                     outcome,
                 )
             }
-            Ok(None) => {}
+            Ok(_) => {}
             Err(_) => return (internal_error(), outcome),
         }
     }
@@ -3433,6 +3435,10 @@ async fn messages_route(
     maybe_capture_fingerprint(&state, "POST", "/v1/messages", &headers);
     // Keep the bounded background-writer handle before `state` moves into a sub-handler.
     let log_store = state.store.clone();
+    // Observe terminal Anthropic usage on the exact client-facing body, then queue the update
+    // behind the request-row insert through the same FIFO writer.
+    let usage_store = state.store.clone();
+    let pressure_runtime = state.runtime.clone();
     // Same reason: `state` moves into a sub-handler below, so grab the log-bus handle first.
     let log_bus = state.log_bus.clone();
     // C11b Task 2: same reason — grab the content-free `upstream_requests` counter handle before
@@ -3512,9 +3518,13 @@ async fn messages_route(
         }
     };
     let native_custom = if alias.is_none() && pool.is_none() {
-        match state.store.providers().resolve_model(&model).await {
-            Ok(Some((provider, provider_model))) if provider.wire_api == "anthropic_messages" => {
-                Some((provider, provider_model))
+        match state.store.providers().resolve_model_targets(&model).await {
+            Ok(targets)
+                if targets
+                    .iter()
+                    .any(|(provider, _)| provider.wire_api == "anthropic_messages") =>
+            {
+                Some(targets)
             }
             Ok(_) => None,
             Err(_) => return internal_error(),
@@ -3559,8 +3569,8 @@ async fn messages_route(
                 messages_handler_custom_responses(state, &headers, body, model_alias).await
             }
         }
-        (None, Some((provider, provider_model))) => {
-            messages_handler_custom_native(state, &headers, body, provider, provider_model).await
+        (None, Some(targets)) => {
+            messages_handler_custom_native(state, &headers, body, targets).await
         }
         _ => {
             messages_handler_native(
@@ -3578,6 +3588,17 @@ async fn messages_route(
         .provider_slug
         .clone()
         .unwrap_or_else(|| builtin_provider.to_string());
+    let model_for_cost = outcome.model.clone();
+    let custom_pricing = outcome.custom_pricing;
+    let estimated_tokens = outcome.estimated_tokens;
+    let response_transport_kind = response_transport(&response);
+    let eof_outcome = if response_transport_kind == "sse" {
+        polyflare_store::RequestProtocolOutcome::TransportLost
+    } else if response.status().is_success() {
+        polyflare_store::RequestProtocolOutcome::Completed
+    } else {
+        polyflare_store::RequestProtocolOutcome::Failed
+    };
 
     // Live-usage-cost-capture Task 4: a fresh per-request correlation id — content-free (128
     // random bits, never derived from request/response data) — so the (later) stream-wrapper task
@@ -3609,8 +3630,7 @@ async fn messages_route(
         reasoning_effort: outcome.reasoning_effort,
         // Not yet known at this chokepoint.
         service_tier: None,
-        transport: Some(response_transport(&response).to_string()),
-        // TODO(follow-up): populate ttft/tokens from the stream observer.
+        transport: Some(response_transport_kind.to_string()),
         ttft_ms: None,
         total_tokens: None,
         cached_tokens: None,
@@ -3620,6 +3640,10 @@ async fn messages_route(
     };
     log.emit();
     log_bus.publish(log.to_log_event());
+    let mut finalized_event = log.to_log_event();
+    finalized_event.kind = "request_finalized".to_string();
+    finalized_event.message = "request telemetry finalized".to_string();
+    let finalized_log_bus = log_bus.clone();
     // C11b Task 2: the content-free `upstream_requests` counter, keyed by the SAME
     // `(account_id, status)` pair `log` already carries — bumped exactly once per client request
     // (the final outcome only; per-attempt retries are `FailoverMetrics`, never double-counted
@@ -3634,7 +3658,41 @@ async fn messages_route(
     );
     queue_persist_request_log(&log_store, log.record(unix_now()));
 
-    response
+    let (parts, body) = response.into_parts();
+    let stream = body.into_data_stream();
+    let wrapped = usage_capture::UsageCapturingStream::new_anthropic_with_eof_outcome(
+        Box::pin(stream),
+        start,
+        eof_outcome,
+        move |captured| {
+            let store = usage_store;
+            let request_id = request_id;
+            let model = model_for_cost;
+            if let Some(actual_tokens) = captured
+                .usage
+                .and_then(usage_capture::pressure_equivalent_tokens)
+            {
+                pressure_runtime.record_actual_pressure(estimated_tokens, actual_tokens);
+            }
+            let receipt = apply_captured_usage(
+                &store,
+                &request_id,
+                model.as_deref(),
+                custom_pricing,
+                captured,
+            );
+            if let Some(receipt) = receipt {
+                finalized_event.ts_ms = crate::log_bus::now_ms();
+                finalized_event.latency_ms = captured.duration_ms;
+                tokio::spawn(async move {
+                    if matches!(receipt.await, Ok(true)) {
+                        finalized_log_bus.publish(finalized_event);
+                    }
+                });
+            }
+        },
+    );
+    Response::from_parts(parts, Body::from_stream(wrapped))
 }
 
 /// Adapts axum's `HeaderMap` to `polyflare_anthropic`'s `HeaderSource`, so the admission and
@@ -3656,6 +3714,20 @@ impl polyflare_anthropic::HeaderSource for ClientHeaders<'_> {
             .map(|name| name.as_str().to_string())
             .collect()
     }
+}
+
+fn admitted_claude_affinity_identity(
+    headers: &HeaderMap,
+    body: &serde_json::Value,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let envelope = polyflare_anthropic::admit_native_request(&ClientHeaders(headers), body).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"polyflare-custom-anthropic-affinity-v1");
+    hasher.update([0]);
+    hasher.update(envelope.session_id.as_bytes());
+    Some(hex::encode(hasher.finalize()))
 }
 
 /// The native Anthropic-Messages ingress path: no alias applies, so this relays straight to an
@@ -3858,19 +3930,20 @@ async fn messages_handler_custom_native(
     state: Arc<AppState>,
     headers: &HeaderMap,
     body: serde_json::Value,
-    provider: CustomProvider,
-    provider_model: ProviderModel,
+    targets: Vec<(CustomProvider, ProviderModel)>,
 ) -> (Response, RouteOutcome) {
+    let affinity_identity = admitted_claude_affinity_identity(headers, &body);
     let encoded = match serde_json::to_vec(&body) {
         Ok(encoded) => Bytes::from(encoded),
         Err(_) => return (internal_error(), RouteOutcome::default()),
     };
-    execute_custom_model(
+    execute_custom_models(
         &state,
         headers,
         &encoded,
-        provider,
-        provider_model,
+        targets,
+        "anthropic_messages",
+        affinity_identity,
         RouteOutcome {
             model: body
                 .get("model")
@@ -3920,6 +3993,14 @@ async fn messages_handler_custom_responses(
     translated["model"] = serde_json::Value::String(model_alias.target_model.clone());
     if let Some(effort) = &model_alias.reasoning_effort {
         translated["reasoning"] = serde_json::json!({"effort": effort});
+    }
+    if translated
+        .get("prompt_cache_key")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+    {
+        translated["prompt_cache_key"] =
+            serde_json::Value::String(derive_alias_prompt_cache_key(&translated));
     }
     let encoded = match serde_json::to_vec(&translated) {
         Ok(encoded) => Bytes::from(encoded),
@@ -4209,12 +4290,12 @@ async fn messages_handler_codex_aliased(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_scope_models_etag, derive_alias_prompt_cache_key, response_transport,
-        surface_watchdog_error, WaitClient,
+        admitted_claude_affinity_identity, apply_scope_models_etag, derive_alias_prompt_cache_key,
+        response_transport, surface_watchdog_error, WaitClient,
     };
     use crate::watchdog::WatchdogError;
     use axum::body::{to_bytes, Body};
-    use axum::http::{header, Response, StatusCode};
+    use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode};
     use serde_json::json;
 
     #[tokio::test]
@@ -4253,6 +4334,75 @@ mod tests {
 
         assert_eq!(response_transport(&sse), "sse");
         assert_eq!(response_transport(&json), "http");
+    }
+
+    #[test]
+    fn custom_anthropic_affinity_uses_only_an_admitted_hashed_claude_session() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static("claude-cli/2.1.218 (external, sdk-ts)"),
+        );
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("claude-code-20250219,oauth-2025-04-20"),
+        );
+        headers.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("c38f98c8-7c2a-4e93-aa3d-a79df7a7015f"),
+        );
+        let first = json!({
+            "model": "claude-balanced",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "first"}],
+            "stream": true
+        });
+        let later = json!({
+            "model": "claude-balanced",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "different content"}],
+            "stream": true
+        });
+        let first_identity =
+            admitted_claude_affinity_identity(&headers, &first).expect("admitted Claude identity");
+        assert_eq!(
+            first_identity,
+            admitted_claude_affinity_identity(&headers, &later).unwrap(),
+            "message content must not influence session affinity"
+        );
+        assert_eq!(first_identity.len(), 64);
+        assert!(
+            first_identity.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "the selector receives only an opaque hash"
+        );
+
+        let mut other_session = headers.clone();
+        other_session.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("d49f98c8-7c2a-4e93-aa3d-a79df7a7015f"),
+        );
+        assert_ne!(
+            first_identity,
+            admitted_claude_affinity_identity(&other_session, &first).unwrap()
+        );
+
+        let mut missing_oauth_beta = headers.clone();
+        missing_oauth_beta.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("claude-code-20250219"),
+        );
+        assert!(
+            admitted_claude_affinity_identity(&missing_oauth_beta, &first).is_none(),
+            "an unadmitted caller cannot claim Claude session affinity"
+        );
+
+        let mut malformed_session = headers;
+        malformed_session.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("../../not-a-session"),
+        );
+        assert!(admitted_claude_affinity_identity(&malformed_session, &first).is_none());
     }
 
     #[test]

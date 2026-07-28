@@ -436,6 +436,91 @@ pub struct ReportBreakdownRow {
     pub metrics: ReportMetrics,
 }
 
+/// Content-free provider/model performance rollup for the provider dashboard. `tier` is the
+/// bounded `"standard"`/`"priority"` classification derived from the recorded service tier.
+/// Throughput is weighted over valid per-request generation windows:
+/// `SUM(output_tokens) / SUM(duration_ms - effective_ttft_ms)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderModelPerformanceRow {
+    pub provider: String,
+    pub model: String,
+    pub tier: String,
+    pub requests: i64,
+    pub avg_ttft_ms: f64,
+    pub p50_ttft_ms: Option<f64>,
+    pub p95_ttft_ms: Option<f64>,
+    pub ttft_sample_count: i64,
+    pub output_tokens: i64,
+    pub generation_ms: i64,
+    pub tps_sample_count: i64,
+    pub tps: Option<f64>,
+    pub p50_tps: Option<f64>,
+    pub p95_tps: Option<f64>,
+    pub successes: i64,
+    pub errors: i64,
+    /// Final client-facing HTTP 429 outcomes. Upstream attempts recovered by failover are not
+    /// represented in `request_log` yet and are deliberately not inferred here.
+    pub rate_limited: i64,
+}
+
+/// One bounded trend bucket for provider/model/tier performance. Percentiles remain on the
+/// lookback-wide summary above; buckets keep the chart payload compact and show weighted TPS,
+/// average TTFT, volume, and final reliability outcomes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderModelPerformanceBucket {
+    pub ts: i64,
+    pub provider: String,
+    pub model: String,
+    pub tier: String,
+    pub requests: i64,
+    pub avg_ttft_ms: f64,
+    pub ttft_sample_count: i64,
+    pub output_tokens: i64,
+    pub generation_ms: i64,
+    pub tps_sample_count: i64,
+    pub tps: Option<f64>,
+    pub successes: i64,
+    pub errors: i64,
+    pub rate_limited: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct ProviderModelPerformanceSqlRow {
+    provider: String,
+    model: String,
+    tier: String,
+    requests: i64,
+    avg_ttft_ms: f64,
+    p50_ttft_ms: Option<f64>,
+    p95_ttft_ms: Option<f64>,
+    ttft_sample_count: i64,
+    output_tokens: i64,
+    generation_ms: i64,
+    tps_sample_count: i64,
+    p50_tps: Option<f64>,
+    p95_tps: Option<f64>,
+    successes: i64,
+    errors: i64,
+    rate_limited: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct ProviderModelPerformanceBucketSqlRow {
+    ts: i64,
+    provider: String,
+    model: String,
+    tier: String,
+    requests: i64,
+    avg_ttft_ms: f64,
+    ttft_sample_count: i64,
+    output_tokens: i64,
+    generation_ms: i64,
+    tps_sample_count: i64,
+    successes: i64,
+    errors: i64,
+    rate_limited: i64,
+}
+
 /// One row of [`RequestLogRepo::recent_errors`]: content-free error identification, never a body or
 /// upstream error message.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -1017,6 +1102,176 @@ impl RequestLogRepo {
                     row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11,
                     row.12, row.13, row.14,
                 )),
+            })
+            .collect())
+    }
+
+    /// Aggregate model-serving performance by provider, public model, and standard/priority tier.
+    ///
+    /// `COALESCE(latency_first_token_ms, ttft_ms)` matches the request read API's evidence
+    /// precedence. TPS excludes rows without output usage or a positive post-first-token window;
+    /// TTFT retains its own sample count so the dashboard can report partial evidence honestly.
+    pub async fn provider_model_performance(
+        &self,
+        since_ts: i64,
+    ) -> Result<Vec<ProviderModelPerformanceRow>, StoreError> {
+        let effective_ttft = "COALESCE(latency_first_token_ms, ttft_ms)";
+        let valid_tps = format!(
+            "output_tokens IS NOT NULL AND output_tokens >= 0 \
+             AND {effective_ttft} IS NOT NULL AND {effective_ttft} >= 0 \
+             AND duration_ms > {effective_ttft}"
+        );
+        let tier = "CASE \
+            WHEN LOWER(COALESCE(service_tier, '')) IN ('priority', 'fast') THEN 'priority' \
+            ELSE 'standard' \
+        END";
+        let sql = format!(
+            "WITH base AS ( \
+                SELECT provider, model, {tier} AS tier, \
+                       CASE WHEN {effective_ttft} >= 0 THEN CAST({effective_ttft} AS REAL) END AS ttft_ms, \
+                       CASE WHEN {valid_tps} \
+                            THEN CAST(output_tokens AS REAL) * 1000.0 / (duration_ms - {effective_ttft}) END AS request_tps, \
+                       CASE WHEN {valid_tps} THEN output_tokens ELSE 0 END AS tps_output_tokens, \
+                       CASE WHEN {valid_tps} THEN duration_ms - {effective_ttft} ELSE 0 END AS generation_ms, \
+                       CASE WHEN {success} THEN 1 ELSE 0 END AS is_success, \
+                       CASE WHEN {error} THEN 1 ELSE 0 END AS is_error, \
+                       CASE WHEN status = 429 THEN 1 ELSE 0 END AS is_rate_limited \
+                FROM request_log \
+                WHERE requested_at >= ? AND model IS NOT NULL AND model <> '' \
+             ), aggregate AS ( \
+                SELECT provider, model, tier, COUNT(*) AS requests, \
+                       COALESCE(AVG(ttft_ms), 0.0) AS avg_ttft_ms, \
+                       COUNT(ttft_ms) AS ttft_sample_count, \
+                       COALESCE(SUM(tps_output_tokens), 0) AS output_tokens, \
+                       COALESCE(SUM(generation_ms), 0) AS generation_ms, \
+                       COUNT(request_tps) AS tps_sample_count, \
+                       COALESCE(SUM(is_success), 0) AS successes, \
+                       COALESCE(SUM(is_error), 0) AS errors, \
+                       COALESCE(SUM(is_rate_limited), 0) AS rate_limited \
+                FROM base GROUP BY provider, model, tier \
+             ), ttft_ranked AS ( \
+                SELECT provider, model, tier, ttft_ms, \
+                       ROW_NUMBER() OVER (PARTITION BY provider, model, tier ORDER BY ttft_ms) AS sample_rank, \
+                       COUNT(*) OVER (PARTITION BY provider, model, tier) AS sample_count \
+                FROM base WHERE ttft_ms IS NOT NULL \
+             ), ttft_percentiles AS ( \
+                SELECT provider, model, tier, \
+                       MAX(CASE WHEN sample_rank = (sample_count + 1) / 2 THEN ttft_ms END) AS p50_ttft_ms, \
+                       MAX(CASE WHEN sample_rank = (sample_count * 95 + 99) / 100 THEN ttft_ms END) AS p95_ttft_ms \
+                FROM ttft_ranked GROUP BY provider, model, tier \
+             ), tps_ranked AS ( \
+                SELECT provider, model, tier, request_tps, \
+                       ROW_NUMBER() OVER (PARTITION BY provider, model, tier ORDER BY request_tps) AS sample_rank, \
+                       COUNT(*) OVER (PARTITION BY provider, model, tier) AS sample_count \
+                FROM base WHERE request_tps IS NOT NULL \
+             ), tps_percentiles AS ( \
+                SELECT provider, model, tier, \
+                       MAX(CASE WHEN sample_rank = (sample_count + 1) / 2 THEN request_tps END) AS p50_tps, \
+                       MAX(CASE WHEN sample_rank = (sample_count * 95 + 99) / 100 THEN request_tps END) AS p95_tps \
+                FROM tps_ranked GROUP BY provider, model, tier \
+             ) \
+             SELECT aggregate.provider, aggregate.model, aggregate.tier, aggregate.requests, \
+                    aggregate.avg_ttft_ms, ttft_percentiles.p50_ttft_ms, \
+                    ttft_percentiles.p95_ttft_ms, aggregate.ttft_sample_count, \
+                    aggregate.output_tokens, aggregate.generation_ms, aggregate.tps_sample_count, \
+                    tps_percentiles.p50_tps, tps_percentiles.p95_tps, aggregate.successes, \
+                    aggregate.errors, aggregate.rate_limited \
+             FROM aggregate \
+             LEFT JOIN ttft_percentiles USING (provider, model, tier) \
+             LEFT JOIN tps_percentiles USING (provider, model, tier) \
+             ORDER BY aggregate.provider ASC, aggregate.model ASC, aggregate.tier ASC",
+            success = SUCCESS_SQL,
+            error = ERROR_SQL,
+        );
+        let rows = sqlx::query_as::<_, ProviderModelPerformanceSqlRow>(&sql)
+            .bind(since_ts)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ProviderModelPerformanceRow {
+                provider: row.provider,
+                model: row.model,
+                tier: row.tier,
+                requests: row.requests,
+                avg_ttft_ms: row.avg_ttft_ms,
+                p50_ttft_ms: row.p50_ttft_ms,
+                p95_ttft_ms: row.p95_ttft_ms,
+                ttft_sample_count: row.ttft_sample_count,
+                output_tokens: row.output_tokens,
+                generation_ms: row.generation_ms,
+                tps_sample_count: row.tps_sample_count,
+                tps: (row.generation_ms > 0)
+                    .then_some(row.output_tokens as f64 / (row.generation_ms as f64 / 1000.0)),
+                p50_tps: row.p50_tps,
+                p95_tps: row.p95_tps,
+                successes: row.successes,
+                errors: row.errors,
+                rate_limited: row.rate_limited,
+            })
+            .collect())
+    }
+
+    /// Compact provider-performance series for charts. `bucket_secs` is defensively clamped to one
+    /// second. TPS remains token/time weighted inside each bucket; no per-request rates are averaged.
+    pub async fn provider_model_performance_series(
+        &self,
+        since_ts: i64,
+        bucket_secs: i64,
+    ) -> Result<Vec<ProviderModelPerformanceBucket>, StoreError> {
+        let bucket_secs = bucket_secs.max(1);
+        let effective_ttft = "COALESCE(latency_first_token_ms, ttft_ms)";
+        let valid_tps = format!(
+            "output_tokens IS NOT NULL AND output_tokens >= 0 \
+             AND {effective_ttft} IS NOT NULL AND {effective_ttft} >= 0 \
+             AND duration_ms > {effective_ttft}"
+        );
+        let tier = "CASE \
+            WHEN LOWER(COALESCE(service_tier, '')) IN ('priority', 'fast') THEN 'priority' \
+            ELSE 'standard' \
+        END";
+        let sql = format!(
+            "SELECT (requested_at / ?) * ? AS ts, provider, model, {tier} AS tier, \
+                    COUNT(*) AS requests, \
+                    COALESCE(AVG(CASE WHEN {effective_ttft} >= 0 THEN {effective_ttft} END), 0.0) AS avg_ttft_ms, \
+                    COUNT(CASE WHEN {effective_ttft} >= 0 THEN 1 END) AS ttft_sample_count, \
+                    COALESCE(SUM(CASE WHEN {valid_tps} THEN output_tokens ELSE 0 END), 0) AS output_tokens, \
+                    COALESCE(SUM(CASE WHEN {valid_tps} THEN duration_ms - {effective_ttft} ELSE 0 END), 0) AS generation_ms, \
+                    COUNT(CASE WHEN {valid_tps} THEN 1 END) AS tps_sample_count, \
+                    COALESCE(SUM(CASE WHEN {success} THEN 1 ELSE 0 END), 0) AS successes, \
+                    COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS errors, \
+                    COALESCE(SUM(CASE WHEN status = 429 THEN 1 ELSE 0 END), 0) AS rate_limited \
+             FROM request_log \
+             WHERE requested_at >= ? AND model IS NOT NULL AND model <> '' \
+             GROUP BY ts, provider, model, tier \
+             ORDER BY ts ASC, provider ASC, model ASC, tier ASC",
+            success = SUCCESS_SQL,
+            error = ERROR_SQL,
+        );
+        let rows = sqlx::query_as::<_, ProviderModelPerformanceBucketSqlRow>(&sql)
+            .bind(bucket_secs)
+            .bind(bucket_secs)
+            .bind(since_ts)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ProviderModelPerformanceBucket {
+                ts: row.ts,
+                provider: row.provider,
+                model: row.model,
+                tier: row.tier,
+                requests: row.requests,
+                avg_ttft_ms: row.avg_ttft_ms,
+                ttft_sample_count: row.ttft_sample_count,
+                output_tokens: row.output_tokens,
+                generation_ms: row.generation_ms,
+                tps_sample_count: row.tps_sample_count,
+                tps: (row.generation_ms > 0)
+                    .then_some(row.output_tokens as f64 / (row.generation_ms as f64 / 1000.0)),
+                successes: row.successes,
+                errors: row.errors,
+                rate_limited: row.rate_limited,
             })
             .collect())
     }
@@ -2201,6 +2456,141 @@ mod tests {
         assert_eq!(buckets[0].metrics.tokens, 150, "row1 only");
         assert_eq!(buckets[1].metrics.requests, 1);
         assert_eq!(buckets[1].metrics.tokens, 450, "row3 only");
+    }
+
+    #[tokio::test]
+    async fn provider_model_performance_separates_priority_and_weights_generation_tps() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.request_log();
+
+        // Standard: 100 output tokens over 1s, then 300 over 3s => weighted 100 TPS.
+        let mut standard_a = report_row(
+            100,
+            "fireworks",
+            "kimi-k3",
+            None,
+            200,
+            1_200,
+            10,
+            100,
+            0,
+            0,
+            None,
+            Some(200),
+        );
+        standard_a.ttft_ms = Some(200);
+        let mut standard_b = report_row(
+            101,
+            "fireworks",
+            "kimi-k3",
+            None,
+            200,
+            3_400,
+            10,
+            300,
+            0,
+            0,
+            None,
+            Some(400),
+        );
+        standard_b.ttft_ms = Some(400);
+
+        // Priority: one valid 200 TPS sample and one TTFT-only row. The incomplete sample must
+        // improve TTFT coverage without diluting throughput.
+        let mut priority = report_row(
+            102,
+            "fireworks",
+            "kimi-k3",
+            None,
+            200,
+            1_100,
+            10,
+            200,
+            0,
+            0,
+            None,
+            Some(100),
+        );
+        priority.service_tier = Some("priority".into());
+        priority.ttft_ms = Some(100);
+        let mut priority_without_usage = report_row(
+            103,
+            "fireworks",
+            "kimi-k3",
+            None,
+            200,
+            900,
+            10,
+            0,
+            0,
+            0,
+            None,
+            Some(300),
+        );
+        priority_without_usage.service_tier = Some("fast".into());
+        priority_without_usage.output_tokens = None;
+        priority_without_usage.ttft_ms = Some(300);
+        priority_without_usage.status = 429;
+
+        for row in [standard_a, standard_b, priority, priority_without_usage] {
+            repo.insert(&row).await.unwrap();
+        }
+
+        let rows = repo.provider_model_performance(0).await.unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let standard = rows.iter().find(|row| row.tier == "standard").unwrap();
+        assert_eq!(standard.requests, 2);
+        assert_eq!(standard.ttft_sample_count, 2);
+        assert_eq!(standard.tps_sample_count, 2);
+        assert_eq!(standard.avg_ttft_ms, 300.0);
+        assert_eq!(standard.p50_ttft_ms, Some(200.0));
+        assert_eq!(standard.p95_ttft_ms, Some(400.0));
+        assert_eq!(standard.output_tokens, 400);
+        assert_eq!(standard.generation_ms, 4_000);
+        assert_eq!(standard.tps, Some(100.0));
+        assert_eq!(standard.p50_tps, Some(100.0));
+        assert_eq!(standard.p95_tps, Some(100.0));
+        assert_eq!(standard.successes, 2);
+        assert_eq!(standard.errors, 0);
+        assert_eq!(standard.rate_limited, 0);
+
+        let priority = rows.iter().find(|row| row.tier == "priority").unwrap();
+        assert_eq!(priority.requests, 2);
+        assert_eq!(priority.ttft_sample_count, 2);
+        assert_eq!(priority.tps_sample_count, 1);
+        assert_eq!(priority.avg_ttft_ms, 200.0);
+        assert_eq!(priority.p50_ttft_ms, Some(100.0));
+        assert_eq!(priority.p95_ttft_ms, Some(300.0));
+        assert_eq!(priority.output_tokens, 200);
+        assert_eq!(priority.generation_ms, 1_000);
+        assert_eq!(priority.tps, Some(200.0));
+        assert_eq!(priority.p50_tps, Some(200.0));
+        assert_eq!(priority.p95_tps, Some(200.0));
+        assert_eq!(priority.successes, 1);
+        assert_eq!(priority.errors, 1);
+        assert_eq!(priority.rate_limited, 1);
+
+        let buckets = repo.provider_model_performance_series(0, 4).await.unwrap();
+        assert_eq!(buckets.len(), 2);
+        let standard_bucket = buckets.iter().find(|row| row.tier == "standard").unwrap();
+        assert_eq!(standard_bucket.ts, 100);
+        assert_eq!(standard_bucket.requests, 2);
+        assert_eq!(standard_bucket.successes, 2);
+        assert_eq!(standard_bucket.errors, 0);
+        assert_eq!(standard_bucket.rate_limited, 0);
+        assert_eq!(standard_bucket.avg_ttft_ms, 300.0);
+        assert_eq!(standard_bucket.tps, Some(100.0));
+
+        let priority_bucket = buckets.iter().find(|row| row.tier == "priority").unwrap();
+        assert_eq!(priority_bucket.ts, 100);
+        assert_eq!(priority_bucket.requests, 2);
+        assert_eq!(priority_bucket.successes, 1);
+        assert_eq!(priority_bucket.errors, 1);
+        assert_eq!(priority_bucket.rate_limited, 1);
+        assert_eq!(priority_bucket.avg_ttft_ms, 200.0);
+        assert_eq!(priority_bucket.tps, Some(200.0));
     }
 
     /// `recent_errors` returns only `status >= 400` rows, newest first, and honors `limit`.

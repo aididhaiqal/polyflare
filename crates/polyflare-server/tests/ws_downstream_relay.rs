@@ -490,6 +490,29 @@ mod relay_through {
             )
         }
 
+        async fn exhausted_response(
+            State(seen): State<Arc<Mutex<Vec<serde_json::Value>>>>,
+            body: Bytes,
+        ) -> (axum::http::StatusCode, &'static str) {
+            seen.lock()
+                .unwrap()
+                .push(serde_json::from_slice(&body).unwrap());
+            (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "provider exhausted",
+            )
+        }
+
+        let failed_seen = Arc::new(Mutex::new(Vec::new()));
+        let failed_app = Router::new()
+            .route("/v1/responses", post(exhausted_response))
+            .with_state(failed_seen.clone());
+        let failed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let failed_addr = failed_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(failed_listener, failed_app).await.unwrap();
+        });
+
         let seen = Arc::new(Mutex::new(Vec::new()));
         let custom_app = Router::new()
             .route("/v1/responses", post(custom_response))
@@ -504,6 +527,83 @@ mod relay_through {
         let codex_base = codex_upstream.spawn().await;
         let (base, state) = spawn_with_pinned_account("acct-custom-bridge", &codex_base).await;
         let timestamp = now();
+        state
+            .store
+            .providers()
+            .create_provider(&NewCustomProvider {
+                id: "provider-a-custom-ws-fail".into(),
+                slug: "custom-ws-fail".into(),
+                display_name: "Custom WS exhausted".into(),
+                base_url: format!("http://{failed_addr}/v1"),
+                wire_api: "responses".into(),
+                enabled: true,
+                stateless_responses: true,
+                allow_private_hosts: true,
+                connect_timeout_ms: 1_000,
+                stream_idle_timeout_ms: 10_000,
+                request_max_retries: 0,
+                max_concurrency: Some(2),
+                created_at: timestamp,
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .providers()
+            .create_credential(
+                "credential-a-custom-ws-fail",
+                "provider-a-custom-ws-fail",
+                "primary",
+                "secret-fail",
+                1.0,
+                Some(2),
+                timestamp,
+                &state.cipher,
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .providers()
+            .create_model(&NewProviderModel {
+                id: "model-a-custom-ws-fail".into(),
+                provider_id: "provider-a-custom-ws-fail".into(),
+                public_model: "fugu-ultra".into(),
+                upstream_model: "fugu-ultra-fail".into(),
+                display_name: "Fugu Ultra".into(),
+                context_window: Some(1_000_000),
+                max_output_tokens: None,
+                supports_tools: true,
+                supports_vision: true,
+                supports_parallel_tool_calls: true,
+                supports_web_search: true,
+                supports_reasoning_summaries: true,
+                reasoning_levels_json: r#"["high"]"#.into(),
+                model_info_json: Some(
+                    serde_json::json!({
+                        "service_tiers": [{
+                            "id": "priority",
+                            "name": "Fast",
+                            "description": "Higher-priority provider inference"
+                        }],
+                        "additional_speed_tiers": ["fast"],
+                        "default_service_tier": null
+                    })
+                    .to_string(),
+                ),
+                instruction_mode: "none".into(),
+                instruction_text: String::new(),
+                request_overrides_json: "{}".into(),
+                input_per_million: Some(1.0),
+                cached_input_per_million: Some(0.5),
+                output_per_million: Some(4.0),
+                visible_in_codex: true,
+                visible_in_openai: true,
+                enabled: true,
+                created_at: timestamp,
+            })
+            .await
+            .unwrap();
         state
             .store
             .providers()
@@ -578,8 +678,51 @@ mod relay_through {
             serde_json::json!({
                 "type": "response.create",
                 "model": "fugu-ultra",
+                "service_tier": "priority",
+                "prompt_cache_key": "custom-ws-affinity",
                 "input": [{"role": "user", "content": "hello"}],
                 "previous_response_id": "stale-custom-anchor"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+        let advisory = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let TMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == "error" {
+                    break value;
+                }
+            }
+        })
+        .await
+        .expect("anchored custom turn must request a full client resend");
+        assert_eq!(
+            advisory["error"]["code"],
+            "websocket_connection_limit_reached"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "PolyFlare must never strip the anchor and replay a delta as full history"
+        );
+
+        // Simulate codex-rs consuming its failed delta ledger and retrying with the full,
+        // anchorless conversation.
+        ws.send(TMessage::Text(
+            serde_json::json!({
+                "type": "response.create",
+                "model": "fugu-ultra",
+                "service_tier": "priority",
+                "prompt_cache_key": "custom-ws-affinity",
+                "input": [
+                    {"role": "user", "content": "earlier turn"},
+                    {"role": "user", "content": "hello"}
+                ]
             })
             .to_string()
             .into(),
@@ -605,12 +748,115 @@ mod relay_through {
             "stateless provider must force the next Codex WS request to carry full history"
         );
         {
+            let failed = failed_seen.lock().unwrap();
+            assert_eq!(
+                failed.len(),
+                1,
+                "the full resend may fail over before visible output"
+            );
+            assert_eq!(failed[0]["model"], "fugu-ultra-fail");
+            assert_eq!(failed[0]["service_tier"], "priority");
+            assert!(failed[0].get("previous_response_id").is_none());
+        }
+        {
             let captured = seen.lock().unwrap();
             assert_eq!(captured.len(), 1);
             assert_eq!(captured[0]["model"], "fugu-ultra-v1");
+            assert!(
+                captured[0].get("service_tier").is_none(),
+                "the WebSocket bridge must sanitize a downgraded Standard request"
+            );
             assert!(captured[0].get("type").is_none());
             assert!(captured[0].get("previous_response_id").is_none());
+            assert_eq!(captured[0]["input"].as_array().unwrap().len(), 2);
         }
+
+        state
+            .store
+            .providers()
+            .set_credential_health(
+                "credential-a-custom-ws-fail",
+                "healthy",
+                None,
+                timestamp + 1,
+            )
+            .await
+            .unwrap();
+        ws.send(TMessage::Text(
+            serde_json::json!({
+                "type": "response.create",
+                "model": "fugu-ultra",
+                "service_tier": "priority",
+                "prompt_cache_key": "custom-ws-affinity",
+                "input": [{"role": "user", "content": "priority again"}]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let TMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == "response.completed" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Priority turn completed after bounded downgrade");
+        assert_eq!(
+            failed_seen.lock().unwrap().len(),
+            2,
+            "Priority capability preference must stay above cache affinity"
+        );
+
+        state
+            .store
+            .providers()
+            .set_credential_health(
+                "credential-a-custom-ws-fail",
+                "healthy",
+                None,
+                timestamp + 2,
+            )
+            .await
+            .unwrap();
+        ws.send(TMessage::Text(
+            serde_json::json!({
+                "type": "response.create",
+                "model": "fugu-ultra",
+                "prompt_cache_key": "custom-ws-affinity",
+                "input": [{"role": "user", "content": "standard again"}]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let TMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == "response.completed" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("affine Standard turn completed");
+        assert_eq!(
+            failed_seen.lock().unwrap().len(),
+            2,
+            "the WS bridge must share HTTP's soft affinity after Priority gating"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 3);
+
         state.store.flush_background_writes().await.unwrap();
         let row = state
             .store
@@ -619,8 +865,10 @@ mod relay_through {
             .await
             .unwrap()
             .into_iter()
-            .find(|row| row.provider == "custom-ws")
-            .expect("custom WS request log row");
+            .find(|row| {
+                row.provider == "custom-ws" && row.service_tier.as_deref() == Some("standard")
+            })
+            .expect("downgraded custom WS request log row");
         assert_eq!(row.target_kind.as_deref(), Some("credential"));
         assert_eq!(
             row.provider_credential_id.as_deref(),
@@ -628,6 +876,7 @@ mod relay_through {
         );
         assert_eq!(row.transport.as_deref(), Some("websocket"));
         assert_eq!(row.upstream_transport.as_deref(), Some("http_sse"));
+        assert_eq!(row.service_tier.as_deref(), Some("standard"));
     }
 
     #[tokio::test]

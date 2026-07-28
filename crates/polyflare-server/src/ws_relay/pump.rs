@@ -224,6 +224,29 @@ fn custom_ws_error_frame(status: StatusCode) -> String {
     .to_string()
 }
 
+async fn request_custom_full_resend(
+    downstream: &mut WebSocket,
+    state: &AppState,
+    anchor_resend_pending: &mut bool,
+) -> CustomFrameDisposition {
+    let advisory = if *anchor_resend_pending {
+        custom_ws_error_frame(StatusCode::CONFLICT)
+    } else {
+        *anchor_resend_pending = true;
+        state.relay_metrics.record("custom_anchor_client_resend");
+        client_resend_error_frame()
+    };
+    if downstream
+        .send(Message::Text(advisory.into()))
+        .await
+        .is_ok()
+    {
+        CustomFrameDisposition::Relayed
+    } else {
+        CustomFrameDisposition::Failed
+    }
+}
+
 fn stateless_ws_event(line: &[u8]) -> Option<String> {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     let data = line.strip_prefix(b"data:")?;
@@ -307,6 +330,7 @@ async fn try_relay_custom_frame(
     headers: &HeaderMap,
     pool: Option<&str>,
     frame: &str,
+    anchor_resend_pending: &mut bool,
 ) -> CustomFrameDisposition {
     let mut body: serde_json::Value = match serde_json::from_str(frame) {
         Ok(value) => value,
@@ -346,6 +370,9 @@ async fn try_relay_custom_frame(
     // path instead of being intercepted and silently changed to HTTP.
     if !translated && (pool.is_some() || crate::catalog::model_slug_is_reserved(state, &model)) {
         return CustomFrameDisposition::Native;
+    }
+    if translated && is_anchored_generating_frame(frame) {
+        return request_custom_full_resend(downstream, state, anchor_resend_pending).await;
     }
 
     if object.get("generate").and_then(serde_json::Value::as_bool) == Some(false) {
@@ -395,14 +422,21 @@ async fn try_relay_custom_frame(
             };
         }
         return if relay_custom_sse_body(downstream, response.into_body()).await {
+            *anchor_resend_pending = false;
             CustomFrameDisposition::Relayed
         } else {
             CustomFrameDisposition::Failed
         };
     }
-    let (provider, provider_model) = match state.store.providers().resolve_model(&model).await {
-        Ok(Some(route)) if route.0.wire_api == "responses" => route,
-        Ok(Some(_)) => {
+    let targets = match state.store.providers().resolve_model_targets(&model).await {
+        Ok(targets)
+            if targets
+                .iter()
+                .any(|(provider, _)| provider.wire_api == "responses") =>
+        {
+            targets
+        }
+        Ok(targets) if !targets.is_empty() => {
             let _ = downstream
                 .send(Message::Text(
                     custom_ws_error_frame(StatusCode::BAD_REQUEST).into(),
@@ -410,7 +444,7 @@ async fn try_relay_custom_frame(
                 .await;
             return CustomFrameDisposition::Failed;
         }
-        Ok(None) => return CustomFrameDisposition::Native,
+        Ok(_) => return CustomFrameDisposition::Native,
         Err(_) => {
             let _ = downstream
                 .send(Message::Text(
@@ -420,12 +454,14 @@ async fn try_relay_custom_frame(
             return CustomFrameDisposition::Failed;
         }
     };
+    if is_anchored_generating_frame(frame) {
+        return request_custom_full_resend(downstream, state, anchor_resend_pending).await;
+    }
     let response = crate::ingress::responses_custom_route_for_ws(
         state.clone(),
         headers.clone(),
         Bytes::from(encoded),
-        provider,
-        provider_model,
+        targets,
     )
     .await;
     let status = response.status();
@@ -438,6 +474,7 @@ async fn try_relay_custom_frame(
         };
     }
     if relay_custom_sse_body(downstream, response.into_body()).await {
+        *anchor_resend_pending = false;
         CustomFrameDisposition::Relayed
     } else {
         let _ = downstream
@@ -553,6 +590,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
     // honoring the signal resends FULL history (anchorless — it cannot miss again); a client that
     // instead repeats an anchored attempt gets the raw miss verbatim rather than a signal loop.
     let mut anchor_resend_pending = false;
+    // Custom Responses targets are stateless behind the WS-to-SSE bridge. An anchored Codex delta
+    // therefore needs the same bounded client full-resend handshake as a moved native socket.
+    let mut custom_anchor_resend_pending = false;
     // One user-visible turn per socket at a time. Same-account reconnect/replay deliberately keeps
     // this alive so latency spans the interruption and the eventual completion still emits once.
     let mut turn_telemetry: Option<WsTurnTelemetry> = None;
@@ -602,6 +642,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                             &headers,
                             pool.as_deref(),
                             &frame,
+                            &mut custom_anchor_resend_pending,
                         )
                         .await
                         {

@@ -140,9 +140,13 @@ pub struct ProviderModelPatch {
     pub supports_web_search: Option<bool>,
     pub supports_reasoning_summaries: Option<bool>,
     pub reasoning_levels_json: Option<String>,
+    pub model_info_json: Option<String>,
     pub instruction_mode: Option<String>,
     pub instruction_text: Option<String>,
     pub request_overrides_json: Option<String>,
+    pub input_per_million: Option<Option<f64>>,
+    pub cached_input_per_million: Option<Option<f64>>,
+    pub output_per_million: Option<Option<f64>>,
     pub visible_in_codex: Option<bool>,
     pub visible_in_openai: Option<bool>,
     pub enabled: Option<bool>,
@@ -568,9 +572,13 @@ impl ProviderRepo {
              supports_web_search = COALESCE(?, supports_web_search), \
              supports_reasoning_summaries = COALESCE(?, supports_reasoning_summaries), \
              reasoning_levels_json = COALESCE(?, reasoning_levels_json), \
+             model_info_json = COALESCE(?, model_info_json), \
              instruction_mode = COALESCE(?, instruction_mode), \
              instruction_text = COALESCE(?, instruction_text), \
              request_overrides_json = COALESCE(?, request_overrides_json), \
+             input_per_million = CASE WHEN ? THEN ? ELSE input_per_million END, \
+             cached_input_per_million = CASE WHEN ? THEN ? ELSE cached_input_per_million END, \
+             output_per_million = CASE WHEN ? THEN ? ELSE output_per_million END, \
              visible_in_codex = COALESCE(?, visible_in_codex), \
              visible_in_openai = COALESCE(?, visible_in_openai), \
              enabled = COALESCE(?, enabled), \
@@ -586,9 +594,16 @@ impl ProviderRepo {
         .bind(patch.supports_web_search)
         .bind(patch.supports_reasoning_summaries)
         .bind(&patch.reasoning_levels_json)
+        .bind(&patch.model_info_json)
         .bind(&patch.instruction_mode)
         .bind(&patch.instruction_text)
         .bind(&patch.request_overrides_json)
+        .bind(patch.input_per_million.is_some())
+        .bind(patch.input_per_million.flatten())
+        .bind(patch.cached_input_per_million.is_some())
+        .bind(patch.cached_input_per_million.flatten())
+        .bind(patch.output_per_million.is_some())
+        .bind(patch.output_per_million.flatten())
         .bind(patch.visible_in_codex)
         .bind(patch.visible_in_openai)
         .bind(patch.enabled)
@@ -621,35 +636,42 @@ impl ProviderRepo {
         &self,
         public_model: &str,
     ) -> Result<Option<(CustomProvider, ProviderModel)>, StoreError> {
-        let Some(provider_id) = sqlx::query_scalar::<_, String>(
-            "SELECT provider_id FROM provider_models \
-             WHERE public_model = ? AND enabled = 1",
+        Ok(self
+            .resolve_model_targets(public_model)
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// All enabled targets for a public model, ordered stably for deterministic selection.
+    pub async fn resolve_model_targets(
+        &self,
+        public_model: &str,
+    ) -> Result<Vec<(CustomProvider, ProviderModel)>, StoreError> {
+        let models = sqlx::query_as::<_, ProviderModel>(
+            "SELECT pm.id, pm.provider_id, pm.public_model, pm.upstream_model, pm.display_name, \
+             pm.context_window, pm.max_output_tokens, pm.supports_tools, pm.supports_vision, \
+             pm.supports_parallel_tool_calls, pm.supports_web_search, \
+             pm.supports_reasoning_summaries, pm.reasoning_levels_json, pm.model_info_json, \
+             pm.instruction_mode, pm.instruction_text, pm.request_overrides_json, \
+             pm.input_per_million, pm.cached_input_per_million, pm.output_per_million, \
+             pm.visible_in_codex, pm.visible_in_openai, pm.enabled, pm.created_at, pm.updated_at \
+             FROM provider_models pm \
+             JOIN custom_providers cp ON cp.id = pm.provider_id \
+             WHERE pm.public_model = ? AND pm.enabled = 1 AND cp.enabled = 1 \
+             ORDER BY cp.slug, cp.id, pm.id",
         )
         .bind(public_model)
-        .fetch_optional(&self.pool)
-        .await?
-        else {
-            return Ok(None);
-        };
-        let Some(provider) = self.get_provider(&provider_id).await? else {
-            return Ok(None);
-        };
-        if !provider.enabled {
-            return Ok(None);
-        }
-        let model = sqlx::query_as::<_, ProviderModel>(
-            "SELECT id, provider_id, public_model, upstream_model, display_name, context_window, \
-             max_output_tokens, supports_tools, supports_vision, supports_parallel_tool_calls, \
-             supports_web_search, supports_reasoning_summaries, reasoning_levels_json, \
-             model_info_json, instruction_mode, instruction_text, request_overrides_json, \
-             input_per_million, cached_input_per_million, output_per_million, \
-             visible_in_codex, visible_in_openai, enabled, created_at, updated_at \
-             FROM provider_models WHERE public_model = ?",
-        )
-        .bind(public_model)
-        .fetch_one(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(Some((provider, model)))
+
+        let mut targets = Vec::with_capacity(models.len());
+        for model in models {
+            if let Some(provider) = self.get_provider(&model.provider_id).await? {
+                targets.push((provider, model));
+            }
+        }
+        Ok(targets)
     }
 
     pub async fn list_enabled_models(
@@ -777,6 +799,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_pricing_patch_sets_and_clears_individual_rates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.providers();
+        repo.create_provider(&provider(10)).await.unwrap();
+        repo.create_model(&model(10)).await.unwrap();
+
+        assert!(repo
+            .update_model(
+                "model-fugu-ultra",
+                &ProviderModelPatch {
+                    input_per_million: Some(Some(2.5)),
+                    cached_input_per_million: Some(None),
+                    output_per_million: Some(Some(12.0)),
+                    ..Default::default()
+                },
+                11,
+            )
+            .await
+            .unwrap());
+        let updated = repo.get_model("model-fugu-ultra").await.unwrap().unwrap();
+        assert_eq!(updated.input_per_million, Some(2.5));
+        assert_eq!(updated.cached_input_per_million, None);
+        assert_eq!(updated.output_per_million, Some(12.0));
+    }
+
+    #[tokio::test]
     async fn disabled_provider_is_not_resolved_but_history_rows_remain_independent() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("store.db")).await.unwrap();
@@ -789,5 +838,67 @@ mod tests {
             .await
             .unwrap());
         assert!(repo.resolve_model("fugu-ultra").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn same_public_model_resolves_all_enabled_provider_targets_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.providers();
+
+        let mut first_provider = provider(10);
+        first_provider.id = "provider-zeta".into();
+        first_provider.slug = "zeta".into();
+        first_provider.display_name = "Zeta".into();
+        repo.create_provider(&first_provider).await.unwrap();
+
+        let mut second_provider = provider(10);
+        second_provider.id = "provider-alpha".into();
+        second_provider.slug = "alpha".into();
+        second_provider.display_name = "Alpha".into();
+        repo.create_provider(&second_provider).await.unwrap();
+
+        let mut first_model = model(10);
+        first_model.id = "model-zeta".into();
+        first_model.provider_id = first_provider.id.clone();
+        repo.create_model(&first_model).await.unwrap();
+
+        let mut second_model = model(10);
+        second_model.id = "model-alpha".into();
+        second_model.provider_id = second_provider.id.clone();
+        repo.create_model(&second_model).await.unwrap();
+
+        let targets = repo.resolve_model_targets("fugu-ultra").await.unwrap();
+        assert_eq!(
+            targets
+                .iter()
+                .map(|(provider, model)| (provider.slug.as_str(), model.id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("alpha", "model-alpha"), ("zeta", "model-zeta")]
+        );
+
+        repo.set_provider_enabled("provider-alpha", false, 11)
+            .await
+            .unwrap();
+        let targets = repo.resolve_model_targets("fugu-ultra").await.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0.slug, "zeta");
+    }
+
+    #[tokio::test]
+    async fn duplicate_public_model_within_one_provider_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let repo = store.providers();
+        repo.create_provider(&provider(10)).await.unwrap();
+        repo.create_model(&model(10)).await.unwrap();
+
+        let mut duplicate = model(11);
+        duplicate.id = "model-fugu-ultra-duplicate".into();
+        let error = repo.create_model(&duplicate).await.unwrap_err();
+        assert!(
+            error.to_string().contains("UNIQUE constraint failed"),
+            "unexpected error: {error}"
+        );
     }
 }

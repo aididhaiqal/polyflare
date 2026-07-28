@@ -18,7 +18,9 @@ use polyflare_server::model_catalog::{
     UpstreamModel,
 };
 use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
-use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
+use polyflare_store::{
+    Account, NewCustomProvider, NewProviderModel, PlainTokens, Store, TokenCipher,
+};
 
 /// A [`ModelSource`] that always returns a fixed, pre-scripted upstream catalog — the external
 /// (integration-test-crate) equivalent of `model_catalog.rs`'s internal `#[cfg(test)] StubSource`.
@@ -188,6 +190,64 @@ async fn spawn_with_catalog_and_active_account(model_catalog: Arc<ModelCatalogCa
     spawn_app(build_app(state)).await
 }
 
+fn custom_provider(id: &str, slug: &str) -> NewCustomProvider {
+    NewCustomProvider {
+        id: id.to_string(),
+        slug: slug.to_string(),
+        display_name: slug.to_string(),
+        base_url: format!("https://{slug}.example/v1"),
+        wire_api: "responses".to_string(),
+        enabled: true,
+        stateless_responses: true,
+        allow_private_hosts: false,
+        connect_timeout_ms: 10_000,
+        stream_idle_timeout_ms: 300_000,
+        request_max_retries: 1,
+        max_concurrency: None,
+        created_at: 1,
+    }
+}
+
+fn custom_model(id: &str, provider_id: &str) -> NewProviderModel {
+    NewProviderModel {
+        id: id.to_string(),
+        provider_id: provider_id.to_string(),
+        public_model: "shared-custom".to_string(),
+        upstream_model: id.to_string(),
+        display_name: "Shared Custom".to_string(),
+        context_window: Some(200_000),
+        max_output_tokens: Some(20_000),
+        supports_tools: true,
+        supports_vision: true,
+        supports_parallel_tool_calls: true,
+        supports_web_search: true,
+        supports_reasoning_summaries: true,
+        reasoning_levels_json: r#"["high","xhigh"]"#.to_string(),
+        model_info_json: Some(
+            serde_json::json!({
+                "service_tiers": [{
+                    "id": "priority",
+                    "name": "Fast",
+                    "description": "Higher-priority provider inference"
+                }],
+                "additional_speed_tiers": ["fast"],
+                "default_service_tier": null
+            })
+            .to_string(),
+        ),
+        instruction_mode: "none".to_string(),
+        instruction_text: String::new(),
+        request_overrides_json: "{}".to_string(),
+        input_per_million: None,
+        cached_input_per_million: None,
+        output_per_million: None,
+        visible_in_codex: true,
+        visible_in_openai: true,
+        enabled: true,
+        created_at: 1,
+    }
+}
+
 fn account(id: &str) -> Account {
     Account {
         id: id.to_string(),
@@ -337,6 +397,71 @@ async fn models_endpoint_falls_back_to_static_floor_when_cache_has_no_live_data(
     // No live-upstream-only slug (e.g. a stubbed `gpt-5.7-nova`) leaked in from a colder run.
     assert!(!ids.contains(&"gpt-5.7-nova"));
     assert!(!ids.iter().any(|id| id.starts_with("claude-")));
+}
+
+#[tokio::test]
+async fn shared_custom_model_lists_conservative_capabilities_and_available_priority() {
+    let state = test_state(floor_only_model_catalog()).await;
+    let repo = state.store.providers();
+    repo.create_provider(&custom_provider("provider-a", "a"))
+        .await
+        .unwrap();
+    repo.create_provider(&custom_provider("provider-b", "b"))
+        .await
+        .unwrap();
+
+    repo.create_model(&custom_model("model-a", "provider-a"))
+        .await
+        .unwrap();
+    let mut constrained = custom_model("model-b", "provider-b");
+    constrained.context_window = Some(100_000);
+    constrained.max_output_tokens = Some(10_000);
+    constrained.supports_tools = false;
+    constrained.supports_vision = false;
+    constrained.supports_parallel_tool_calls = false;
+    constrained.supports_web_search = false;
+    constrained.reasoning_levels_json = r#"["high"]"#.to_string();
+    constrained.model_info_json = None;
+    repo.create_model(&constrained).await.unwrap();
+
+    let base = spawn_app(build_app(state)).await;
+    let body: serde_json::Value = reqwest::get(format!("{base}/models"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let matching: Vec<&serde_json::Value> = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|model| model["slug"] == "shared-custom")
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "one public id must produce one catalog row"
+    );
+    let model = matching[0];
+    assert_eq!(model["context_window"], 100_000);
+    assert_eq!(model["max_context_window"], 100_000);
+    assert!(model["apply_patch_tool_type"].is_null());
+    assert_eq!(model["supports_parallel_tool_calls"], false);
+    assert_eq!(model["supports_search_tool"], false);
+    assert_eq!(
+        model["supported_reasoning_levels"],
+        serde_json::json!([{"effort": "high", "description": "high reasoning"}])
+    );
+    assert_eq!(
+        model["service_tiers"],
+        serde_json::json!([{
+            "id": "priority",
+            "name": "Fast",
+            "description": "Higher-priority provider inference"
+        }]),
+        "Priority remains selectable when at least one target supports it because routing can downgrade"
+    );
+    assert_eq!(model["additional_speed_tiers"], serde_json::json!(["fast"]));
 }
 
 /// `/v1/models` with `client_version` also reads the live-or-floor cache (not just the bare

@@ -47,6 +47,7 @@ import {
   type OverviewView,
   type PaceResponse,
   type PoolView,
+  type ProviderPerformanceView,
   type RequestsQueryParams,
   type RequestsView,
   type ResetPlanView,
@@ -82,6 +83,7 @@ export const queryKeys = {
   settings: ["settings"] as const,
   keys: ["keys"] as const,
   providers: ["providers"] as const,
+  providerPerformance: (range: string) => ["providers", "performance", range] as const,
   translations: ["translations"] as const,
   builtinModels: ["builtin-models"] as const,
   capabilities: ["capabilities"] as const,
@@ -93,6 +95,15 @@ export function useOverview() {
     queryFn: api.overview,
     refetchInterval: LIST_REFETCH_MS,
     staleTime: LIST_REFETCH_MS,
+  });
+}
+
+export function useProviderPerformance(range: "24h" | "7d" | "30d") {
+  return useQuery<ProviderPerformanceView>({
+    queryKey: queryKeys.providerPerformance(range),
+    queryFn: () => api.providerPerformance(range),
+    refetchInterval: 60_000,
+    staleTime: 60_000,
   });
 }
 

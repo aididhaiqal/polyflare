@@ -134,6 +134,7 @@ pub struct ModelView {
     supports_web_search: bool,
     supports_reasoning_summaries: bool,
     reasoning_levels: Vec<String>,
+    supports_priority_service_tier: bool,
     instruction_mode: String,
     instruction_text: String,
     request_overrides: ProfileRequestOverrides,
@@ -178,6 +179,9 @@ impl From<ProviderModel> for ModelView {
             supports_reasoning_summaries: value.supports_reasoning_summaries,
             reasoning_levels: serde_json::from_str(&value.reasoning_levels_json)
                 .unwrap_or_default(),
+            supports_priority_service_tier: crate::catalog::supports_priority_service_tier(
+                value.model_info_json.as_deref(),
+            ),
             instruction_mode: value.instruction_mode,
             instruction_text: value.instruction_text,
             request_overrides: serde_json::from_str(&value.request_overrides_json)
@@ -263,6 +267,136 @@ pub async fn list(State(state): State<Arc<AppState>>) -> Response {
         }
     }
     Json(result).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct PerformanceQuery {
+    range: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PerformanceView {
+    range: String,
+    since_ts: i64,
+    bucket_seconds: i64,
+    rows: Vec<PerformanceRowView>,
+    buckets: Vec<PerformanceBucketView>,
+}
+
+#[derive(Serialize)]
+struct PerformanceRowView {
+    provider: String,
+    model: String,
+    tier: String,
+    requests: i64,
+    avg_ttft_ms: f64,
+    p50_ttft_ms: Option<f64>,
+    p95_ttft_ms: Option<f64>,
+    ttft_sample_count: i64,
+    output_tokens: i64,
+    generation_ms: i64,
+    tps_sample_count: i64,
+    tps: Option<f64>,
+    p50_tps: Option<f64>,
+    p95_tps: Option<f64>,
+    successes: i64,
+    errors: i64,
+    rate_limited: i64,
+}
+
+#[derive(Serialize)]
+struct PerformanceBucketView {
+    ts: i64,
+    provider: String,
+    model: String,
+    tier: String,
+    requests: i64,
+    avg_ttft_ms: f64,
+    ttft_sample_count: i64,
+    output_tokens: i64,
+    generation_ms: i64,
+    tps_sample_count: i64,
+    tps: Option<f64>,
+    successes: i64,
+    errors: i64,
+    rate_limited: i64,
+}
+
+impl From<polyflare_store::ProviderModelPerformanceRow> for PerformanceRowView {
+    fn from(row: polyflare_store::ProviderModelPerformanceRow) -> Self {
+        Self {
+            provider: row.provider,
+            model: row.model,
+            tier: row.tier,
+            requests: row.requests,
+            avg_ttft_ms: row.avg_ttft_ms,
+            p50_ttft_ms: row.p50_ttft_ms,
+            p95_ttft_ms: row.p95_ttft_ms,
+            ttft_sample_count: row.ttft_sample_count,
+            output_tokens: row.output_tokens,
+            generation_ms: row.generation_ms,
+            tps_sample_count: row.tps_sample_count,
+            tps: row.tps,
+            p50_tps: row.p50_tps,
+            p95_tps: row.p95_tps,
+            successes: row.successes,
+            errors: row.errors,
+            rate_limited: row.rate_limited,
+        }
+    }
+}
+
+impl From<polyflare_store::ProviderModelPerformanceBucket> for PerformanceBucketView {
+    fn from(row: polyflare_store::ProviderModelPerformanceBucket) -> Self {
+        Self {
+            ts: row.ts,
+            provider: row.provider,
+            model: row.model,
+            tier: row.tier,
+            requests: row.requests,
+            avg_ttft_ms: row.avg_ttft_ms,
+            ttft_sample_count: row.ttft_sample_count,
+            output_tokens: row.output_tokens,
+            generation_ms: row.generation_ms,
+            tps_sample_count: row.tps_sample_count,
+            tps: row.tps,
+            successes: row.successes,
+            errors: row.errors,
+            rate_limited: row.rate_limited,
+        }
+    }
+}
+
+/// Content-free custom-provider performance analysis over a bounded lookback. TPS is computed
+/// from output-token evidence and post-first-token generation time, grouped separately for
+/// Standard and Priority/Fast calls.
+pub async fn performance(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<PerformanceQuery>,
+) -> Response {
+    let range = query.range.as_deref().unwrap_or("24h");
+    let (lookback_secs, bucket_seconds): (i64, i64) = match range {
+        "24h" => (24 * 60 * 60, 60 * 60),
+        "7d" => (7 * 24 * 60 * 60, 6 * 60 * 60),
+        "30d" => (30 * 24 * 60 * 60, 24 * 60 * 60),
+        _ => return (StatusCode::BAD_REQUEST, "invalid range").into_response(),
+    };
+    let since_ts = now().saturating_sub(lookback_secs);
+    let repo = state.store.request_log();
+    match tokio::try_join!(
+        repo.provider_model_performance(since_ts),
+        repo.provider_model_performance_series(since_ts, bucket_seconds)
+    ) {
+        Ok((rows, buckets)) => Json(PerformanceView {
+            range: range.into(),
+            since_ts,
+            bucket_seconds,
+            rows: rows.into_iter().map(Into::into).collect(),
+            buckets: buckets.into_iter().map(Into::into).collect(),
+        })
+        .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -464,26 +598,6 @@ fn model_is_configured(
     })
 }
 
-async fn configured_public_models(state: &AppState) -> Result<HashSet<String>, Response> {
-    let providers = state
-        .store
-        .providers()
-        .list_providers()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
-    let mut public_models = HashSet::new();
-    for provider in providers {
-        let models = state
-            .store
-            .providers()
-            .list_models(&provider.id)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
-        public_models.extend(models.into_iter().map(|model| model.public_model));
-    }
-    Ok(public_models)
-}
-
 #[derive(Serialize)]
 struct DiscoveredModelView {
     #[serde(flatten)]
@@ -516,10 +630,6 @@ pub async fn discover_models(
         Ok(existing) => existing,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let configured_public_models = match configured_public_models(&state).await {
-        Ok(models) => models,
-        Err(response) => return response,
-    };
     let models = discovered
         .into_iter()
         .map(|model| {
@@ -528,7 +638,6 @@ pub async fn discover_models(
                 if model_is_configured(&existing, &model.upstream_model, &suggested_public_model) {
                     "configured"
                 } else if !valid_model_identifier(&suggested_public_model)
-                    || configured_public_models.contains(&suggested_public_model)
                     || crate::catalog::model_slug_is_reserved(&state, &suggested_public_model)
                 {
                     "conflict"
@@ -603,10 +712,6 @@ pub async fn sync_models(
         Ok(existing) => existing,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let configured_public_models = match configured_public_models(&state).await {
-        Ok(models) => models,
-        Err(response) => return response,
-    };
     let timestamp = now();
     let mut imported = 0usize;
     let mut skipped_existing = 0usize;
@@ -621,7 +726,6 @@ pub async fn sync_models(
             continue;
         }
         if !valid_model_identifier(&public_model)
-            || configured_public_models.contains(&public_model)
             || crate::catalog::model_slug_is_reserved(&state, &public_model)
         {
             skipped_conflicts += 1;
@@ -783,6 +887,8 @@ pub struct CreateModel {
     supports_reasoning_summaries: bool,
     #[serde(default)]
     reasoning_levels: Vec<String>,
+    #[serde(default)]
+    supports_priority_service_tier: bool,
     model_info: Option<serde_json::Value>,
     #[serde(default = "default_instruction_mode")]
     instruction_mode: String,
@@ -842,12 +948,22 @@ pub async fn create_model(
     {
         return (StatusCode::BAD_REQUEST, "invalid or reserved model").into_response();
     }
-    if !matches!(
-        state.store.providers().get_provider(&provider_id).await,
-        Ok(Some(_))
-    ) {
-        return StatusCode::NOT_FOUND.into_response();
+    let provider = match state.store.providers().get_provider(&provider_id).await {
+        Ok(Some(provider)) => provider,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if input.supports_priority_service_tier && provider.wire_api != "responses" {
+        return (
+            StatusCode::BAD_REQUEST,
+            "priority service tier requires a Responses provider",
+        )
+            .into_response();
     }
+    let model_info = crate::catalog::set_priority_service_tier(
+        input.model_info,
+        input.supports_priority_service_tier,
+    );
     let timestamp = now();
     let model = NewProviderModel {
         id: id("model"),
@@ -864,7 +980,7 @@ pub async fn create_model(
         supports_reasoning_summaries: input.supports_reasoning_summaries,
         reasoning_levels_json: serde_json::to_string(&input.reasoning_levels)
             .unwrap_or_else(|_| "[]".into()),
-        model_info_json: input.model_info.map(|value| value.to_string()),
+        model_info_json: model_info.map(|value| value.to_string()),
         instruction_mode: input.instruction_mode,
         instruction_text: input.instruction_text,
         request_overrides_json: serde_json::to_string(&input.request_overrides)
@@ -910,9 +1026,23 @@ pub struct ModelPatch {
     supports_web_search: Option<bool>,
     supports_reasoning_summaries: Option<bool>,
     reasoning_levels: Option<Vec<String>>,
+    supports_priority_service_tier: Option<bool>,
     instruction_mode: Option<String>,
     instruction_text: Option<String>,
     request_overrides: Option<ProfileRequestOverrides>,
+    #[serde(default, deserialize_with = "deserialize_nullable_price")]
+    input_per_million: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_price")]
+    cached_input_per_million: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_price")]
+    output_per_million: Option<Option<f64>>,
+}
+
+fn deserialize_nullable_price<'de, D>(deserializer: D) -> Result<Option<Option<f64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<f64>::deserialize(deserializer).map(Some)
 }
 
 pub async fn patch_model(
@@ -933,9 +1063,13 @@ pub async fn patch_model(
         && input.supports_web_search.is_none()
         && input.supports_reasoning_summaries.is_none()
         && input.reasoning_levels.is_none()
+        && input.supports_priority_service_tier.is_none()
         && input.instruction_mode.is_none()
         && input.instruction_text.is_none()
         && input.request_overrides.is_none()
+        && input.input_per_million.is_none()
+        && input.cached_input_per_million.is_none()
+        && input.output_per_million.is_none()
     {
         return (StatusCode::BAD_REQUEST, "empty model patch").into_response();
     }
@@ -944,6 +1078,25 @@ pub async fn patch_model(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
+    if input.supports_priority_service_tier == Some(true) {
+        let provider = match state
+            .store
+            .providers()
+            .get_provider(&existing.provider_id)
+            .await
+        {
+            Ok(Some(provider)) => provider,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        if provider.wire_api != "responses" {
+            return (
+                StatusCode::BAD_REQUEST,
+                "priority service tier requires a Responses provider",
+            )
+                .into_response();
+        }
+    }
     let effective_instruction_mode = input
         .instruction_mode
         .as_deref()
@@ -976,6 +1129,15 @@ pub async fn patch_model(
             .is_some_and(|value| !valid_label(value))
         || input.context_window.is_some_and(|value| value <= 0)
         || input.max_output_tokens.is_some_and(|value| value <= 0)
+        || [
+            input.input_per_million,
+            input.cached_input_per_million,
+            input.output_per_million,
+        ]
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|price| !price.is_finite() || price < 0.0)
         || input
             .reasoning_levels
             .as_ref()
@@ -990,6 +1152,17 @@ pub async fn patch_model(
     {
         return (StatusCode::BAD_REQUEST, "invalid model patch").into_response();
     }
+    let model_info_json = input.supports_priority_service_tier.map(|enabled| {
+        crate::catalog::set_priority_service_tier(
+            existing
+                .model_info_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok()),
+            enabled,
+        )
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "{}".into())
+    });
     let patch = ProviderModelPatch {
         upstream_model: input.upstream_model,
         display_name: input.display_name.map(|value| value.trim().to_string()),
@@ -1003,11 +1176,15 @@ pub async fn patch_model(
         reasoning_levels_json: input
             .reasoning_levels
             .map(|levels| serde_json::to_string(&levels).unwrap_or_else(|_| "[]".into())),
+        model_info_json,
         instruction_mode: input.instruction_mode,
         instruction_text: input.instruction_text,
         request_overrides_json: input
             .request_overrides
             .map(|overrides| serde_json::to_string(&overrides).unwrap_or_else(|_| "{}".into())),
+        input_per_million: input.input_per_million,
+        cached_input_per_million: input.cached_input_per_million,
+        output_per_million: input.output_per_million,
         visible_in_codex: input.visible_in_codex,
         visible_in_openai: input.visible_in_openai,
         enabled: input.enabled,

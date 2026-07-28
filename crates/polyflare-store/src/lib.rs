@@ -29,9 +29,10 @@ pub use provider_repo::{
     ProviderCredentialSecret, ProviderModel, ProviderModelPatch, ProviderRepo,
 };
 pub use request_log_repo::{
-    RecentErrorRow, ReportBreakdownRow, ReportBucket, ReportMetrics, RequestAggregate,
-    RequestBucket, RequestLogRecord, RequestLogRepo, RequestLogRow, RequestProtocolOutcome,
-    RequestsFilter, TranslatedRequestRow,
+    ProviderModelPerformanceBucket, ProviderModelPerformanceRow, RecentErrorRow,
+    ReportBreakdownRow, ReportBucket, ReportMetrics, RequestAggregate, RequestBucket,
+    RequestLogRecord, RequestLogRepo, RequestLogRow, RequestProtocolOutcome, RequestsFilter,
+    TranslatedRequestRow,
 };
 pub use reset_credit_repo::{
     ResetCredit, ResetCreditRedeemRequest, ResetCreditRedeemResult, ResetCreditRepo,
