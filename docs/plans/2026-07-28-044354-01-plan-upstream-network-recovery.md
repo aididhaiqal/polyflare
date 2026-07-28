@@ -1,6 +1,6 @@
 # Upstream network recovery
 
-**Status:** Complete in isolated worktree; not committed, merged, deployed, or restarted.
+**Status:** Complete, committed, and merged into local `main`; not pushed, deployed, or restarted.
 
 **Goal:** Keep PolyFlare available through temporary upstream network outages without rotating or penalizing healthy accounts, then recover automatically and safely when each upstream origin becomes reachable again.
 **Why planning is required:** This changes shared request-routing and retry behavior across built-in HTTP/SSE, custom-provider, and WebSocket transports on a live production gateway.
