@@ -276,6 +276,135 @@ async fn request_rows(state: &AppState, expected: usize) -> Vec<polyflare_store:
 }
 
 #[tokio::test]
+async fn bounded_backend_body_recovers_from_connect_failure_without_losing_identity() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = reservation.local_addr().unwrap();
+    drop(reservation);
+
+    let (base, state) = spawn_polyflare(&format!("http://{upstream_address}")).await;
+    state
+        .runtime_settings
+        .set(
+            "chatgpt_backend_passthrough_enabled",
+            SettingValue::Bool(true),
+        )
+        .unwrap();
+
+    let request = tokio::spawn(async move {
+        reqwest::Client::new()
+            .patch(format!("{base}/backend-api/wham/settings/user"))
+            .header("authorization", "Bearer client-owned")
+            .body("client-settings-body")
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_route = attempts.clone();
+    let captured = Capture::default();
+    let captured_for_route = captured.clone();
+    let app = Router::new().route(
+        "/backend-api/wham/settings/user",
+        any(move |headers: HeaderMap, body: Bytes| {
+            let attempts = attempts_for_route.clone();
+            let captured = captured_for_route.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                *captured.0.lock().unwrap() = Some(CapturedRequest {
+                    method: Method::PATCH,
+                    uri: "/backend-api/wham/settings/user".parse().unwrap(),
+                    headers,
+                    body,
+                });
+                axum::Json(serde_json::json!({"theme": "system"}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(upstream_address)
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = tokio::time::timeout(Duration::from_secs(4), request)
+        .await
+        .expect("backend recovery must stay within the configured budget")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({"theme": "system"})
+    );
+    assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    let captured = captured.0.lock().unwrap().clone().unwrap();
+    assert_eq!(captured.headers["authorization"], "Bearer client-owned");
+    assert_eq!(captured.body, "client-settings-body");
+    server.abort();
+}
+
+#[tokio::test]
+async fn streamed_backend_body_is_never_replayed_after_connect_failure() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = reservation.local_addr().unwrap();
+    drop(reservation);
+
+    let (base, state) = spawn_polyflare(&format!("http://{upstream_address}")).await;
+    state
+        .runtime_settings
+        .set(
+            "chatgpt_backend_passthrough_enabled",
+            SettingValue::Bool(true),
+        )
+        .unwrap();
+    let streaming_body =
+        reqwest::Body::wrap_stream(futures_util::stream::iter([Ok::<_, std::io::Error>(
+            Bytes::from_static(b"non-replayable-stream"),
+        )]));
+    let response = reqwest::Client::new()
+        .post(format!("{base}/backend-api/wham/settings/user"))
+        .header("authorization", "Bearer client-owned")
+        .body(streaming_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_route = attempts.clone();
+    let app = Router::new().route(
+        "/backend-api/wham/settings/user",
+        any(move || {
+            let attempts = attempts_for_route.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                StatusCode::OK
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(upstream_address)
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(1_250)).await;
+
+    assert_eq!(
+        attempts.load(Ordering::Relaxed),
+        0,
+        "a streamed request body must never be replayed in the background"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn wham_usage_returns_capacity_weighted_pool_as_canonical_codex_limit() {
     let (upstream, capture) = spawn_upstream().await;
     let (base, state) = spawn_polyflare(&upstream).await;

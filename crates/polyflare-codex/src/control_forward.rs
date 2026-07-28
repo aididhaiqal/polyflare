@@ -87,16 +87,17 @@ pub struct ControlResponse {
     pub body: Bytes,
 }
 
-/// A transport-level failure forwarding a control request (DNS/connect/TLS/timeout/stream
-/// error) — the caller (Task 3's handlers) maps this to a 502. Never carries an upstream
-/// status/body; those only exist on the `Ok(ControlResponse)` path, however non-2xx that status
-/// is — a control forward does not special-case upstream error statuses the way
-/// `CodexExecutor::execute` does for `/responses` (there is no retry/failover signal to extract
-/// here, just a status to relay).
+/// Failures preserve whether an upstream HTTP response was established so callers can retry only
+/// DNS/connect/TLS failures. Request-stage failures after connecting and response-body failures
+/// are never replayable: the upstream may already have acted on the request.
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
-    #[error("control forward transport error: {0}")]
-    Transport(String),
+    #[error("control forward connect error: {0}")]
+    Connect(String),
+    #[error("control forward request error: {0}")]
+    Request(String),
+    #[error("control response body error: {0}")]
+    ResponseBody(String),
     #[error("invalid control forward header: {0}")]
     InvalidHeader(String),
     #[error("control response body exceeds {limit} bytes")]
@@ -209,10 +210,13 @@ pub async fn control_forward_with_limit(
     if let Some(bytes) = body {
         builder = builder.body(bytes);
     }
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| ControlError::Transport(e.to_string()))?;
+    let resp = builder.send().await.map_err(|error| {
+        if error.is_connect() {
+            ControlError::Connect(error.to_string())
+        } else {
+            ControlError::Request(error.to_string())
+        }
+    })?;
 
     let status = resp.status().as_u16();
     let filtered_headers: Vec<(String, String)> = resp
@@ -240,7 +244,7 @@ pub async fn control_forward_with_limit(
 
 /// Reads a control response body up to [`MAX_CONTROL_BODY_BYTES`]. Oversize is an explicit
 /// [`ControlError::ResponseTooLarge`] rather than a truncated body carrying the upstream success
-/// status. A mid-stream transport error is likewise surfaced as [`ControlError::Transport`] —
+/// status. A mid-stream transport error is likewise surfaced as [`ControlError::ResponseBody`] —
 /// unlike `executor.rs::read_bounded_error_body` (which is best-effort because it only feeds a
 /// discardable error-code scrape), this payload is handed back to the caller and must be complete.
 async fn read_bounded_body(
@@ -258,7 +262,7 @@ async fn read_bounded_body(
     let mut buf = Vec::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| ControlError::Transport(e.to_string()))?;
+        let chunk = chunk.map_err(|e| ControlError::ResponseBody(e.to_string()))?;
         if chunk.len() > max_body_bytes.saturating_sub(buf.len()) {
             return Err(ControlError::ResponseTooLarge {
                 limit: max_body_bytes,

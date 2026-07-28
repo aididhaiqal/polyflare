@@ -173,6 +173,36 @@ async fn oversized_response_is_rejected_instead_of_returned_as_truncated_success
 }
 
 #[tokio::test]
+async fn established_redirect_is_returned_without_hidden_replay() {
+    let destination = MockControlUpstream::new(200, r#"{"followed":true}"#);
+    let destination_handle = destination.clone();
+    let destination_base = destination.spawn().await;
+    let source = MockControlUpstream::new(307, r#"{"redirected":true}"#).with_header(
+        "location",
+        format!("{destination_base}/codex/thread/goal/get"),
+    );
+    let source_base = source.spawn().await;
+
+    let response = polyflare_codex::control_forward(
+        &polyflare_codex::build_client().unwrap(),
+        &account_for(&source_base),
+        "thread/goal/get",
+        reqwest::Method::GET,
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status, 307);
+    assert_eq!(response.body, r#"{"redirected":true}"#);
+    assert!(
+        destination_handle.last_request().is_none(),
+        "an established redirect must not trigger an implicit second request"
+    );
+}
+
+#[tokio::test]
 async fn wham_path_joins_without_a_codex_segment() {
     let mock = MockControlUpstream::new(200, r#"{"keys":[]}"#);
     let handle = mock.clone();
@@ -228,7 +258,7 @@ async fn get_with_no_body_works() {
 }
 
 #[tokio::test]
-async fn transport_failure_returns_a_typed_error_not_a_panic() {
+async fn connect_failure_is_distinct_from_an_established_response_failure() {
     // A syntactically valid but non-resolving host — the same pattern
     // `polyflare-server/src/watchdog.rs`'s own tests use for an unreachable base_url.
     let account = Account {
@@ -251,7 +281,42 @@ async fn transport_failure_returns_a_typed_error_not_a_panic() {
     .await;
 
     assert!(
-        matches!(result, Err(polyflare_codex::ControlError::Transport(_))),
-        "expected a Transport error, got: {result:?}"
+        matches!(result, Err(polyflare_codex::ControlError::Connect(_))),
+        "expected a connect-stage error, got: {result:?}"
     );
+}
+
+#[tokio::test]
+async fn truncated_established_response_is_a_body_error_not_connect_failure() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 20\r\nconnection: close\r\n\r\n{\"partial\":true}",
+            )
+            .await
+            .unwrap();
+        socket.shutdown().await.unwrap();
+    });
+    let account = account_for(&format!("http://{address}"));
+
+    let result = polyflare_codex::control_forward(
+        &reqwest::Client::new(),
+        &account,
+        "thread/goal/get",
+        reqwest::Method::GET,
+        &[],
+        None,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(polyflare_codex::ControlError::ResponseBody(_))),
+        "an established response body failure must never be classified as replayable: {result:?}"
+    );
+    server.await.unwrap();
 }

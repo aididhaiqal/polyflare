@@ -429,6 +429,78 @@ async fn finalize_unary_transport_failure(
     (StatusCode::BAD_GATEWAY, transport_error_body).into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn forward_unary_with_network_recovery(
+    state: &AppState,
+    account: &Account,
+    forward_path: &str,
+    forward_method: Method,
+    forward_headers: &[(String, String)],
+    body: Option<Bytes>,
+    max_response_body_bytes: usize,
+    deadline: tokio::time::Instant,
+) -> Result<polyflare_codex::ControlResponse, polyflare_codex::ControlError> {
+    let Ok(origin) = crate::network_recovery::OriginKey::parse(&account.base_url) else {
+        return polyflare_codex::control_forward_with_limit(
+            &state.control_client,
+            account,
+            forward_path,
+            forward_method,
+            forward_headers,
+            body,
+            max_response_body_bytes,
+        )
+        .await;
+    };
+    loop {
+        let permit = crate::network_recovery::global_registry()
+            .acquire(&origin, deadline)
+            .await
+            .map_err(|_| {
+                polyflare_codex::ControlError::Connect(
+                    "network recovery budget exceeded".to_string(),
+                )
+            })?;
+        let result = polyflare_codex::control_forward_with_limit(
+            &state.control_client,
+            account,
+            forward_path,
+            forward_method.clone(),
+            forward_headers,
+            body.clone(),
+            max_response_body_bytes,
+        )
+        .await;
+        match result {
+            Ok(response) => {
+                permit.success();
+                return Ok(response);
+            }
+            Err(error @ polyflare_codex::ControlError::Connect(_)) => {
+                permit.failure();
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(error);
+                }
+            }
+            Err(
+                error @ (polyflare_codex::ControlError::ResponseBody(_)
+                | polyflare_codex::ControlError::ResponseTooLarge { .. }),
+            ) => {
+                // Response headers already exist, so connectivity is healthy. The body failure is
+                // client-visible and must surface without replay.
+                permit.success();
+                return Err(error);
+            }
+            Err(error) => {
+                // Local header validation and later request-stage failures are not safe to replay.
+                // Dropping a half-open permit reopens it instead of stranding circuit waiters.
+                drop(permit);
+                return Err(error);
+            }
+        }
+    }
+}
+
 /// Forward one unary Codex request and, when the selected bearer is rejected, perform exactly one
 /// synchronized reactive refresh and retry on that same account. Keeping the retry here makes the
 /// policy identical for compact, control, search, and image requests without allowing a 401 to
@@ -447,14 +519,17 @@ async fn forward_unary_with_reactive_auth(
     transport_error_body: &'static str,
 ) -> Response {
     let rejected_access_token = account.bearer_token.clone();
-    let first = polyflare_codex::control_forward_with_limit(
-        &state.control_client,
+    let recovery_deadline =
+        tokio::time::Instant::now() + state.runtime_settings.starvation_wait_budget();
+    let first = forward_unary_with_network_recovery(
+        state,
         account,
         forward_path,
         forward_method.clone(),
         forward_headers,
         body.clone(),
         max_response_body_bytes,
+        recovery_deadline,
     )
     .await;
     let first = match first {
@@ -471,14 +546,15 @@ async fn forward_unary_with_reactive_auth(
         .await
     {
         Ok(Some(refreshed_account)) => {
-            match polyflare_codex::control_forward_with_limit(
-                &state.control_client,
+            match forward_unary_with_network_recovery(
+                state,
                 &refreshed_account,
                 forward_path,
                 forward_method,
                 forward_headers,
                 body,
                 max_response_body_bytes,
+                recovery_deadline,
             )
             .await
             {

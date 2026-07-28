@@ -167,6 +167,11 @@ pub fn build_client() -> Result<reqwest::Client, ExecError> {
         // Force rustls: `default-tls` (native-tls) is also compiled in workspace-wide, so
         // without this the client would silently use native-tls instead.
         .use_rustls_tls()
+        // PolyFlare owns replay policy. Reqwest's redirect and protocol-NACK retry defaults could
+        // otherwise resend a state-changing request after bytes reached an upstream, outside the
+        // per-origin recovery circuit and its response-establishment boundary.
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
         .connect_timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| ExecError::Upstream(e.to_string()))

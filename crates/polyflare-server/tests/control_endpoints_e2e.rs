@@ -19,7 +19,7 @@ use polyflare_core::{Continuity, Executor, RoundRobin};
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::continuity::CodexContinuity;
 use polyflare_server::keys::sha256_hex;
-use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
+use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields, SettingValue};
 use polyflare_server::session_key::header_session_key;
 use polyflare_store::{Account, PlainTokens, Store, TokenCipher};
 use polyflare_testkit::{MockControlUpstream, MockOAuth};
@@ -178,6 +178,66 @@ async fn rows_eventually(store: &Store) -> Vec<polyflare_store::RequestLogRow> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     rows
+}
+
+#[tokio::test]
+async fn unary_control_connect_failure_recovers_on_the_same_account() {
+    use axum::routing::get;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = reservation.local_addr().unwrap();
+    drop(reservation);
+
+    let (base, state) = spawn_app(false, &format!("http://{upstream_address}")).await;
+    seed_account(&state.store, &state.cipher, "acct-recovery", "tok-recovery").await;
+
+    let request = tokio::spawn(async move {
+        reqwest::Client::new()
+            .get(format!("{base}/thread/goal/get"))
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_route = attempts.clone();
+    let app = axum::Router::new().route(
+        "/codex/thread/goal/get",
+        get(move || {
+            let attempts = attempts_for_route.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                axum::Json(serde_json::json!({"goal": null}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(upstream_address)
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = tokio::time::timeout(Duration::from_secs(4), request)
+        .await
+        .expect("control recovery must stay within the configured budget")
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({"goal": null})
+    );
+    assert_eq!(attempts.load(Ordering::Relaxed), 1);
+
+    let mut snapshots = vec![polyflare_core::AccountSnapshot::new("acct-recovery")];
+    state.runtime.overlay(&mut snapshots, now());
+    assert_eq!(
+        snapshots[0].error_count, 0,
+        "origin recovery must not poison account health"
+    );
+    server.abort();
 }
 
 // -------------------------------------------------------------------------------------------
@@ -449,6 +509,10 @@ async fn unary_quota_code_and_transport_loss_do_not_poison_account_health() {
 
     let (base, state) = spawn_app(false, "http://127.0.0.1:9").await;
     seed_account(&state.store, &state.cipher, "acct-a", "tok-a").await;
+    state
+        .runtime_settings
+        .set("starvation_wait_budget", SettingValue::U64(0))
+        .unwrap();
     let response = reqwest::Client::new()
         .get(format!("{base}/agent-identities/jwks"))
         .send()

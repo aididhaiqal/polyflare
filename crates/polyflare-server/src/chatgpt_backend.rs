@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::ws::{Message as DownstreamMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderName, Method, Request, StatusCode, Uri};
@@ -35,6 +35,7 @@ const SYNTHETIC_USAGE_LOG_PATH: &str = "chatgpt_backend_synthetic_wham/usage";
 const BACKEND_PROVIDER: &str = "chatgpt_backend";
 const BACKEND_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_REPLAYABLE_BACKEND_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
 type RemoteControlUpstream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -344,6 +345,14 @@ fn end_to_end_headers(headers: &HeaderMap) -> HeaderMap {
     forwarded
 }
 
+fn replayable_backend_body_length(headers: &HeaderMap) -> Option<usize> {
+    headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|length| *length <= MAX_REPLAYABLE_BACKEND_REQUEST_BYTES)
+}
+
 fn remote_control_websocket_url(
     upstream_base_url: &str,
     query: Option<&str>,
@@ -596,8 +605,122 @@ fn normalized_route(path: &str) -> String {
 async fn send_with_header_timeout(
     request: reqwest::RequestBuilder,
     timeout: Duration,
-) -> Option<Result<reqwest::Response, reqwest::Error>> {
-    tokio::time::timeout(timeout, request.send()).await.ok()
+) -> Result<reqwest::Response, BackendSendError> {
+    match tokio::time::timeout(timeout, request.send()).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) if error.is_connect() => Err(BackendSendError::Connect),
+        Ok(Err(_)) | Err(_) => Err(BackendSendError::Other),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendSendError {
+    Connect,
+    Other,
+}
+
+async fn send_replayable_backend_with_recovery(
+    state: &AppState,
+    method: &Method,
+    target: &reqwest::Url,
+    headers: &HeaderMap,
+    body: &bytes::Bytes,
+) -> Result<reqwest::Response, BackendSendError> {
+    let Ok(origin) = crate::network_recovery::OriginKey::parse(target.as_str()) else {
+        return send_with_header_timeout(
+            state
+                .control_client
+                .request(method.clone(), target.clone())
+                .headers(headers.clone())
+                .body(body.clone()),
+            BACKEND_RESPONSE_HEADER_TIMEOUT,
+        )
+        .await;
+    };
+    let deadline = tokio::time::Instant::now() + state.runtime_settings.starvation_wait_budget();
+    loop {
+        let permit = crate::network_recovery::global_registry()
+            .acquire(&origin, deadline)
+            .await
+            .map_err(|_| BackendSendError::Connect)?;
+        let result = send_with_header_timeout(
+            state
+                .control_client
+                .request(method.clone(), target.clone())
+                .headers(headers.clone())
+                .body(body.clone()),
+            BACKEND_RESPONSE_HEADER_TIMEOUT,
+        )
+        .await;
+        match result {
+            Ok(response) => {
+                permit.success();
+                return Ok(response);
+            }
+            Err(BackendSendError::Connect) => {
+                permit.failure();
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(BackendSendError::Connect);
+                }
+            }
+            Err(error) => {
+                // Header timeouts and later request errors may occur after request bytes were sent.
+                // They are never replayed. Dropping a half-open permit safely reopens the circuit.
+                drop(permit);
+                return Err(error);
+            }
+        }
+    }
+}
+
+async fn send_streaming_backend_once(
+    state: &AppState,
+    method: Method,
+    target: reqwest::Url,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<reqwest::Response, BackendSendError> {
+    let Ok(origin) = crate::network_recovery::OriginKey::parse(target.as_str()) else {
+        return send_with_header_timeout(
+            state
+                .control_client
+                .request(method, target)
+                .headers(headers)
+                .body(reqwest::Body::wrap_stream(body.into_data_stream())),
+            BACKEND_RESPONSE_HEADER_TIMEOUT,
+        )
+        .await;
+    };
+    let deadline = tokio::time::Instant::now() + state.runtime_settings.starvation_wait_budget();
+    let permit = crate::network_recovery::global_registry()
+        .acquire(&origin, deadline)
+        .await
+        .map_err(|_| BackendSendError::Connect)?;
+    let result = send_with_header_timeout(
+        state
+            .control_client
+            .request(method, target)
+            .headers(headers)
+            .body(reqwest::Body::wrap_stream(body.into_data_stream())),
+        BACKEND_RESPONSE_HEADER_TIMEOUT,
+    )
+    .await;
+    match result {
+        Ok(response) => {
+            permit.success();
+            Ok(response)
+        }
+        Err(BackendSendError::Connect) => {
+            // The body stream cannot be reconstructed, so mark the origin offline but never replay
+            // this request. A later request will wait for and participate in recovery.
+            permit.failure();
+            Err(BackendSendError::Connect)
+        }
+        Err(error) => {
+            drop(permit);
+            Err(error)
+        }
+    }
 }
 
 async fn passthrough_route(state: Arc<AppState>, path: String, request: Request<Body>) -> Response {
@@ -620,18 +743,28 @@ async fn passthrough_route(state: Arc<AppState>, path: String, request: Request<
         }
     };
     let (parts, body) = request.into_parts();
-    let upstream = send_with_header_timeout(
-        state
-            .control_client
-            .request(method, target)
-            .headers(end_to_end_headers(&parts.headers))
-            .body(reqwest::Body::wrap_stream(body.into_data_stream())),
-        BACKEND_RESPONSE_HEADER_TIMEOUT,
-    )
-    .await;
+    let headers = end_to_end_headers(&parts.headers);
+    let upstream = if replayable_backend_body_length(&parts.headers).is_some() {
+        match to_bytes(body, MAX_REPLAYABLE_BACKEND_REQUEST_BYTES).await {
+            Ok(body) => {
+                send_replayable_backend_with_recovery(&state, &method, &target, &headers, &body)
+                    .await
+            }
+            Err(_) => {
+                // A bounded read can fail because the client sent more than its declared length
+                // or because its body stream failed. Neither case is safe to forward or replay.
+                let response =
+                    error_response(StatusCode::BAD_REQUEST, "backend_request_body_invalid");
+                record_gateway_request(&state, method_name, log_path, response.status(), started);
+                return response;
+            }
+        }
+    } else {
+        send_streaming_backend_once(&state, method, target, headers, body).await
+    };
     let response = match upstream {
-        None | Some(Err(_)) => error_response(StatusCode::BAD_GATEWAY, "backend_forward_failed"),
-        Some(Ok(upstream)) => {
+        Err(_) => error_response(StatusCode::BAD_GATEWAY, "backend_forward_failed"),
+        Ok(upstream) => {
             let status = upstream.status();
             let headers = end_to_end_headers(upstream.headers());
             let body = Body::from_stream(
@@ -670,6 +803,30 @@ pub async fn pooled_passthrough_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_explicitly_sized_backend_bodies_are_replayable() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(replayable_backend_body_length(&headers), None);
+
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from_static("128"),
+        );
+        assert_eq!(replayable_backend_body_length(&headers), Some(128));
+
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from_static("4194305"),
+        );
+        assert_eq!(replayable_backend_body_length(&headers), None);
+
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from_static("invalid"),
+        );
+        assert_eq!(replayable_backend_body_length(&headers), None);
+    }
 
     #[test]
     fn route_normalization_keeps_known_operations_and_drops_identifiers() {
@@ -736,7 +893,7 @@ mod tests {
         let result = send_with_header_timeout(request, Duration::from_millis(50)).await;
 
         assert!(
-            result.is_none(),
+            matches!(result, Err(BackendSendError::Other)),
             "stalled headers must hit the explicit bound"
         );
         stalled.abort();
