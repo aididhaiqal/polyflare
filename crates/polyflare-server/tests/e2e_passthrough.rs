@@ -47,7 +47,7 @@ fn store_account(id: &str) -> Account {
     }
 }
 
-async fn spawn_polyflare(upstream: String) -> String {
+async fn spawn_polyflare(upstream: String) -> (String, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
     let cipher = TokenCipher::from_key_bytes(&[5u8; 32]).unwrap();
@@ -127,13 +127,13 @@ async fn spawn_polyflare(upstream: String) -> String {
         starvation_metrics: polyflare_server::observability::StarvationMetrics::new(),
         runtime: Default::default(),
     });
-    let app = build_app(state);
+    let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), state)
 }
 
 #[tokio::test]
@@ -145,7 +145,7 @@ async fn end_to_end_streaming_passthrough() {
     ]);
     let handle = mock.clone();
     let upstream = mock.spawn().await;
-    let pf = spawn_polyflare(upstream).await;
+    let (pf, _) = spawn_polyflare(upstream).await;
 
     let client = reqwest::Client::new();
     let resp = client
@@ -178,7 +178,7 @@ async fn native_http_exposes_pool_quota_and_selected_account_separately() {
         .with_response_header("x-codex-credits-has-credits", "true")
         .with_response_header("x-codex-credits-unlimited", "false");
     let upstream = mock.spawn().await;
-    let pf = spawn_polyflare(upstream).await;
+    let (pf, _) = spawn_polyflare(upstream).await;
 
     let response = reqwest::Client::new()
         .post(format!("{pf}/responses"))
@@ -199,4 +199,75 @@ async fn native_http_exposes_pool_quota_and_selected_account_separately() {
     assert_eq!(headers["x-polyflare-selected-secondary-used-percent"], "80");
     assert!(headers.get("x-codex-credits-has-credits").is_none());
     assert_eq!(headers["x-polyflare-selected-credits-has-credits"], "true");
+}
+
+#[tokio::test]
+async fn http_priority_policy_rewrites_the_body_seen_by_upstream() {
+    let mock = MockUpstream::new(vec![r#"{"type":"response.completed"}"#.to_string()]);
+    let handle = mock.clone();
+    let upstream = mock.spawn().await;
+    let (pf, state) = spawn_polyflare(upstream).await;
+
+    state
+        .runtime_settings
+        .priority_policy
+        .set_config(polyflare_server::priority_policy::PriorityPolicyConfig {
+            mode: polyflare_server::priority_policy::OverallMode::ForcePriority,
+            ..Default::default()
+        })
+        .unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": "hi",
+            "service_tier": "flex"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    assert_eq!(
+        handle.last_body().unwrap()["service_tier"],
+        serde_json::json!("priority")
+    );
+
+    state
+        .runtime_settings
+        .priority_policy
+        .set_config(polyflare_server::priority_policy::PriorityPolicyConfig {
+            mode: polyflare_server::priority_policy::OverallMode::ForceStandard,
+            ..Default::default()
+        })
+        .unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": "hi again",
+            "service_tier": "priority"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    assert!(
+        handle.last_body().unwrap().get("service_tier").is_none(),
+        "forced Standard must remove service_tier from upstream bytes"
+    );
+
+    state.store.flush_background_writes().await.unwrap();
+    let row = state
+        .store
+        .request_log()
+        .list(10, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.service_tier.as_deref() == Some("standard"))
+        .expect("forced Standard request log row");
+    assert_eq!(row.provider, "codex");
+    assert_eq!(row.service_tier.as_deref(), Some("standard"));
 }

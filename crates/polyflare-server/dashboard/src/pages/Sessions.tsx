@@ -29,7 +29,7 @@ import clsx from "clsx";
 
 import type { SessionRowView, SessionsQueryParams } from "../lib/api";
 import { relTime } from "../lib/format";
-import { useSessions } from "../lib/queries";
+import { useSessions, useSetSessionPriority } from "../lib/queries";
 import { ShieldedAccount } from "../privacy/ScreenShield";
 import { Card } from "../ui/Card";
 import { Col, Grid } from "../ui/Grid";
@@ -112,6 +112,7 @@ export function Sessions() {
   };
   const { data, isLoading, isFetching, isError, error, refetch, dataUpdatedAt } =
     useSessions(queryParams);
+  const setPriority = useSetSessionPriority();
 
   if (isLoading) return <SessionsSkeleton />;
 
@@ -192,7 +193,14 @@ export function Sessions() {
       ) : (
         <Grid>
           <Col span={12}>
-            <SessionsTable rows={rows} nowMs={nowMs} />
+            <SessionsTable
+              rows={rows}
+              nowMs={nowMs}
+              pendingSessionKey={setPriority.isPending ? setPriority.variables?.sessionKey : undefined}
+              onPriorityChange={(sessionKey, mode) =>
+                setPriority.mutate({ sessionKey, mode })
+              }
+            />
           </Col>
         </Grid>
       )}
@@ -263,7 +271,20 @@ function LiveBadge({ isFetching }: { isFetching: boolean }) {
 const TABLE_HEAD_CLASS =
   "px-2 py-1.5 text-left text-[9px] font-medium uppercase tracking-wide text-fg opacity-60";
 
-function SessionsTable({ rows, nowMs }: { rows: SessionRowView[]; nowMs: number }) {
+function SessionsTable({
+  rows,
+  nowMs,
+  pendingSessionKey,
+  onPriorityChange,
+}: {
+  rows: SessionRowView[];
+  nowMs: number;
+  pendingSessionKey?: string;
+  onPriorityChange: (
+    sessionKey: string,
+    mode: "inherit" | "priority" | "standard",
+  ) => void;
+}) {
   return (
     <Card>
       <div className="overflow-x-auto">
@@ -276,13 +297,20 @@ function SessionsTable({ rows, nowMs }: { rows: SessionRowView[]; nowMs: number 
               <th className={TABLE_HEAD_CLASS}>Model</th>
               <th className={TABLE_HEAD_CLASS}>State</th>
               <th className={TABLE_HEAD_CLASS}>Capabilities</th>
+              <th className={TABLE_HEAD_CLASS}>Priority</th>
               <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>Requests</th>
               <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>Last activity</th>
             </tr>
           </thead>
           <tbody>
             {rows.map((s) => (
-              <SessionRow key={s.session_key} row={s} nowMs={nowMs} />
+              <SessionRow
+                key={s.session_key}
+                row={s}
+                nowMs={nowMs}
+                priorityPending={pendingSessionKey === s.session_key}
+                onPriorityChange={onPriorityChange}
+              />
             ))}
           </tbody>
         </table>
@@ -297,7 +325,20 @@ function SessionsTable({ rows, nowMs }: { rows: SessionRowView[]; nowMs: number 
   );
 }
 
-function SessionRow({ row: s, nowMs }: { row: SessionRowView; nowMs: number }) {
+function SessionRow({
+  row: s,
+  nowMs,
+  priorityPending,
+  onPriorityChange,
+}: {
+  row: SessionRowView;
+  nowMs: number;
+  priorityPending: boolean;
+  onPriorityChange: (
+    sessionKey: string,
+    mode: "inherit" | "priority" | "standard",
+  ) => void;
+}) {
   const idleSecs = Math.floor(nowMs / 1000) - s.last_activity_at;
   const stale = idleSecs >= STALE_AFTER_SECS;
 
@@ -328,9 +369,6 @@ function SessionRow({ row: s, nowMs }: { row: SessionRowView; nowMs: number }) {
       <td className="px-2 py-1.5 align-top">
         <SessionStatePill state={s.state} />
       </td>
-      <td className="whitespace-nowrap px-2 py-1.5 text-right align-top tabular-nums text-fg opacity-80">
-        {s.request_count}
-      </td>
       <td className="px-2 py-1.5 align-top">
         {s.required_capabilities ? (
           <span className="inline-block whitespace-nowrap rounded bg-muted px-2 py-0.5 text-[10px] font-medium text-fg opacity-80">
@@ -339,6 +377,27 @@ function SessionRow({ row: s, nowMs }: { row: SessionRowView; nowMs: number }) {
         ) : (
           <span className="text-fg opacity-40">—</span>
         )}
+      </td>
+      <td className="px-2 py-1.5 align-top">
+        <select
+          value={s.priority_override ?? "inherit"}
+          disabled={priorityPending}
+          aria-label={`Priority policy for session ${s.session_key.slice(0, 12)}`}
+          onChange={(event) =>
+            onPriorityChange(
+              s.session_key,
+              event.target.value as "inherit" | "priority" | "standard",
+            )
+          }
+          className="rounded border border-border bg-bg px-2 py-1 text-[9.5px] text-fg outline-none disabled:opacity-40 focus:border-accent"
+        >
+          <option value="inherit">Inherit</option>
+          <option value="priority">Priority</option>
+          <option value="standard">Standard</option>
+        </select>
+      </td>
+      <td className="whitespace-nowrap px-2 py-1.5 text-right align-top tabular-nums text-fg opacity-80">
+        {s.request_count}
       </td>
       <td className="whitespace-nowrap px-2 py-1.5 text-right align-top tabular-nums text-fg opacity-80">
         {relTime(s.last_activity_at, nowMs)}

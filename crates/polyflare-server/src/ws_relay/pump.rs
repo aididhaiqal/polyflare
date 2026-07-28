@@ -117,6 +117,7 @@ use super::signal::{classify_upstream_signal, UpstreamSignal};
 use super::sniff::sniff_completed_id;
 use super::telemetry::{start_turn, WsRoutingOutcome, WsTurnTelemetry, WsTurnTerminal};
 use crate::reasoning_transform::{strip_unverifiable_reasoning, INVALID_ENCRYPTED_CONTENT_CODE};
+use crate::session_key::parse_inbound_scoped;
 
 /// How many CONSECUTIVE re-dials (eager cap re-dial, client-send re-dial, an exhaustion-move, or
 /// this task's mid-turn in-flight replay) are tolerated without a single forwarded `response.completed` in
@@ -330,6 +331,7 @@ async fn try_relay_custom_frame(
     headers: &HeaderMap,
     pool: Option<&str>,
     frame: &str,
+    priority_decision: Option<crate::priority_policy::PriorityDecision>,
     anchor_resend_pending: &mut bool,
 ) -> CustomFrameDisposition {
     let mut body: serde_json::Value = match serde_json::from_str(frame) {
@@ -410,6 +412,7 @@ async fn try_relay_custom_frame(
             pool.map(str::to_string),
             headers.clone(),
             Bytes::from(encoded),
+            priority_decision.unwrap_or(crate::priority_policy::PriorityDecision::Passthrough),
         )
         .await;
         let status = response.status();
@@ -462,6 +465,7 @@ async fn try_relay_custom_frame(
         headers.clone(),
         Bytes::from(encoded),
         targets,
+        priority_decision.unwrap_or(crate::priority_policy::PriorityDecision::Passthrough),
     )
     .await;
     let status = response.status();
@@ -635,13 +639,45 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
             down = downstream.recv() => {
                 match down {
                     Some(Ok(Message::Text(t))) => {
-                        let frame = t.to_string();
+                        let mut frame = t.to_string();
+                        let mut priority_decision = None;
+                        if let Some(facts) =
+                            parse_inbound_scoped(&headers, frame.as_bytes(), pool.as_deref())
+                        {
+                            if facts.event_type.as_deref() == Some("response.create") {
+                                let is_subagent = facts
+                                    .ctx
+                                    .subagent
+                                    .as_deref()
+                                    .is_some_and(|subagent| !subagent.is_empty());
+                                let decision = state
+                                    .runtime_settings
+                                    .priority_policy
+                                    .decide(
+                                        &state.store,
+                                        Some(&session_key.value),
+                                        is_subagent,
+                                        unix_now(),
+                                    )
+                                    .await;
+                                priority_decision = Some(decision);
+                                if let Some(rewritten) = crate::priority_policy::apply_decision(
+                                    &Bytes::copy_from_slice(frame.as_bytes()),
+                                    decision,
+                                ) {
+                                    if let Ok(rewritten) = String::from_utf8(rewritten.to_vec()) {
+                                        frame = rewritten;
+                                    }
+                                }
+                            }
+                        }
                         match try_relay_custom_frame(
                             &mut downstream,
                             &state,
                             &headers,
                             pool.as_deref(),
                             &frame,
+                            priority_decision,
                             &mut custom_anchor_resend_pending,
                         )
                         .await
@@ -659,6 +695,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                         if let Some(mut next_turn) =
                             start_turn(&headers, &frame, &session_key, pool.as_deref())
                         {
+                            if let Some(decision) = priority_decision {
+                                next_turn.apply_priority_decision(decision);
+                            }
                             logical_turn_key =
                                 next_turn.logical_turn_key().map(str::to_owned);
                             if !next_turn

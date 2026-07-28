@@ -1350,6 +1350,7 @@ struct SessionRowView {
     updated_at: i64,
     last_activity_at: i64,
     request_count: i64,
+    priority_override: Option<crate::priority_policy::SessionMode>,
 }
 
 impl From<polyflare_store::continuity_repo::DashboardSessionRow> for SessionRowView {
@@ -1378,8 +1379,21 @@ impl From<polyflare_store::continuity_repo::DashboardSessionRow> for SessionRowV
             updated_at: s.updated_at,
             last_activity_at: s.last_activity_at,
             request_count: s.request_count,
+            priority_override: None,
         }
     }
+}
+
+fn session_view(
+    state: &AppState,
+    row: polyflare_store::continuity_repo::DashboardSessionRow,
+) -> SessionRowView {
+    let mut view = SessionRowView::from(row);
+    view.priority_override = state
+        .runtime_settings
+        .priority_policy
+        .session_override(&view.session_key);
+    view
 }
 
 /// `GET /api/sessions` pagination. Mirrors `RequestsQuery` exactly: `limit` clamps to
@@ -1416,7 +1430,10 @@ pub async fn sessions_handler(
             Ok(row) => row,
             Err(_) => return Response::error(),
         };
-        let rows: Vec<SessionRowView> = row.into_iter().map(SessionRowView::from).collect();
+        let rows: Vec<SessionRowView> = row
+            .into_iter()
+            .map(|row| session_view(&state, row))
+            .collect();
         return Response::ok(SessionsView {
             total: rows.len() as i64,
             rows,
@@ -1432,7 +1449,10 @@ pub async fn sessions_handler(
     };
     Response::ok(SessionsView {
         total,
-        rows: rows.into_iter().map(SessionRowView::from).collect(),
+        rows: rows
+            .into_iter()
+            .map(|row| session_view(&state, row))
+            .collect(),
     })
 }
 

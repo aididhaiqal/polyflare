@@ -411,6 +411,7 @@ export interface SessionRowView {
   updated_at: number;
   last_activity_at: number;
   request_count: number;
+  priority_override: "priority" | "standard" | null;
 }
 
 /** `read_api.rs::SessionsView` — `GET /api/sessions` response envelope. */
@@ -425,6 +426,24 @@ export interface SessionsQueryParams {
   limit?: number;
   offset?: number;
   session_key?: string;
+}
+
+export type PriorityOverallMode =
+  | "passthrough"
+  | "force_priority"
+  | "force_standard"
+  | "schedule";
+
+export interface PriorityPolicyConfig {
+  mode: PriorityOverallMode;
+  active_start_minute: number;
+  active_end_minute: number;
+  utc_offset_minutes: number;
+  presence_minutes: number;
+}
+
+export interface PriorityPolicyView {
+  config: PriorityPolicyConfig;
 }
 
 /** `read_api.rs::ReportBucketView`/`ReportBreakdownView`/`ReportTotalsView` share this same flat
@@ -1027,6 +1046,28 @@ export function patchSettings(body: Record<string, number | boolean>): Promise<O
   });
 }
 
+export function patchPriorityPolicy(config: PriorityPolicyConfig): Promise<OkResponse> {
+  return fetchJson<OkResponse>("/api/priority-policy", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(config),
+  });
+}
+
+export function setSessionPriority(
+  sessionKey: string,
+  mode: "inherit" | "priority" | "standard",
+): Promise<OkResponse> {
+  return fetchJson<OkResponse>(
+    `/api/sessions/${encodeURIComponent(sessionKey)}/priority`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    },
+  );
+}
+
 /** `POST /api/keys` — mint a new client proxy API key (`write_api.rs::create_key_handler`).
  * `label` omitted/undefined ⇒ no label. Returns the raw `key` plaintext exactly once; the caller
  * (`useCreateKey`) hands it straight to the page for a show-once modal — it must never be written
@@ -1241,6 +1282,7 @@ export const api = {
   pace: () => fetchJson<PaceResponse>("/api/pace"),
   requests: (qs: string) => fetchJson<RequestsView>(`/api/requests${qs}`),
   sessions: (qs: string) => fetchJson<SessionsView>(`/api/sessions${qs}`),
+  priorityPolicy: () => fetchJson<PriorityPolicyView>("/api/priority-policy"),
   reports: (qs: string) => fetchJson<ReportsView>(`/api/reports${qs}`),
   settings: () => fetchJson<SettingsView>("/api/settings"),
   keys: () => fetchJson<ApiKeysView>("/api/keys"),

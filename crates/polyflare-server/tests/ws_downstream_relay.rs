@@ -782,6 +782,21 @@ mod relay_through {
             )
             .await
             .unwrap();
+        state
+            .runtime_settings
+            .priority_policy
+            .set_config(polyflare_server::priority_policy::PriorityPolicyConfig {
+                mode: polyflare_server::priority_policy::OverallMode::ForcePriority,
+                ..Default::default()
+            })
+            .unwrap();
+        let body_session_key = polyflare_server::session_key::sha256_hex(
+            &serde_json::to_vec(&("codex-soft-v1", "", "custom-ws-affinity")).unwrap(),
+        );
+        state.runtime_settings.priority_policy.set_session_override(
+            body_session_key.clone(),
+            Some(polyflare_server::priority_policy::SessionMode::Standard),
+        );
         ws.send(TMessage::Text(
             serde_json::json!({
                 "type": "response.create",
@@ -811,7 +826,8 @@ mod relay_through {
         assert_eq!(
             failed_seen.lock().unwrap().len(),
             2,
-            "Priority capability preference must stay above cache affinity"
+            "the WS pump's ForcePriority decision must reach the custom bridge unchanged instead \
+             of being re-evaluated against the body-derived Standard override"
         );
 
         state
@@ -825,6 +841,15 @@ mod relay_through {
             )
             .await
             .unwrap();
+        state
+            .runtime_settings
+            .priority_policy
+            .set_config(Default::default())
+            .unwrap();
+        state
+            .runtime_settings
+            .priority_policy
+            .set_session_override(body_session_key, None);
         ws.send(TMessage::Text(
             serde_json::json!({
                 "type": "response.create",
@@ -984,6 +1009,14 @@ mod relay_through {
             })
             .await
             .unwrap();
+        state
+            .runtime_settings
+            .priority_policy
+            .set_config(polyflare_server::priority_policy::PriorityPolicyConfig {
+                mode: polyflare_server::priority_policy::OverallMode::ForceStandard,
+                ..Default::default()
+            })
+            .unwrap();
 
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
             .await
@@ -992,6 +1025,7 @@ mod relay_through {
             serde_json::json!({
                 "type": "response.create",
                 "model": "claude-ws-alias",
+                "service_tier": "priority",
                 "input": [{"role": "user", "content": "hello"}],
                 "max_output_tokens": 333
             })
@@ -1051,6 +1085,17 @@ mod relay_through {
             codex_upstream.frames().is_empty(),
             "a matched translation route must never leak the frame to Codex"
         );
+        state.store.flush_background_writes().await.unwrap();
+        let row = state
+            .store
+            .request_log()
+            .list(10, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.provider == "anthropic-translation-ws")
+            .expect("translated WS request log row");
+        assert_eq!(row.service_tier.as_deref(), Some("standard"));
     }
 
     #[tokio::test]
@@ -1631,6 +1676,69 @@ mod relay_through {
             "the completed response's ownership must be pinned to the account the relay dialed, \
              proving the pump's sniff -> Continuity::observe wiring actually ran"
         );
+    }
+
+    #[tokio::test]
+    async fn websocket_priority_policy_rewrites_frame_and_records_effective_standard() {
+        let mock = MockWsUpstream::new(ScriptedTurn::normal(Vec::new())).capturing_raw_frames();
+        let mock_base = mock.clone().spawn().await;
+        let (base, state) = spawn_with_pinned_account("acct-priority-policy", &mock_base).await;
+        state
+            .runtime_settings
+            .priority_policy
+            .set_config(polyflare_server::priority_policy::PriorityPolicyConfig {
+                mode: polyflare_server::priority_policy::OverallMode::ForceStandard,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .unwrap();
+        ws.send(TMessage::Text(
+            r#"{"type":"response.create","input":[],"service_tier":"flex"}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        for _ in 0..50 {
+            if !mock.raw_frames().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let frame: serde_json::Value =
+            serde_json::from_str(mock.raw_frames().first().expect("upstream frame")).unwrap();
+        assert!(
+            frame.get("service_tier").is_none(),
+            "forced Standard must remove service_tier from the native WS frame"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let TMessage::Text(text) = ws.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == "response.completed" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("forced Standard turn completed");
+        state.store.flush_background_writes().await.unwrap();
+        let row = state
+            .store
+            .request_log()
+            .list(10, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.service_tier.as_deref() == Some("standard"))
+            .expect("forced Standard native WS request log row");
+        assert_eq!(row.transport.as_deref(), Some("ws"));
+        assert_eq!(row.upstream_transport.as_deref(), Some("codex_ws"));
     }
 
     #[tokio::test]

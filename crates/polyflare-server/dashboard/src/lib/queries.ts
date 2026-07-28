@@ -25,10 +25,12 @@ import {
   patchProviderCredentialEnabled,
   patchProviderEnabled,
   patchProviderModel,
+  patchPriorityPolicy,
   patchSettings,
   redeemAccountResetCredit,
   redeemFleetResetCredits,
   startCodexOnboarding,
+  setSessionPriority,
   syncProviderModels,
   testProvider,
   testTranslationRoute,
@@ -47,6 +49,8 @@ import {
   type OverviewView,
   type PaceResponse,
   type PoolView,
+  type PriorityPolicyConfig,
+  type PriorityPolicyView,
   type ProviderPerformanceView,
   type RequestsQueryParams,
   type RequestsView,
@@ -82,6 +86,7 @@ export const queryKeys = {
   sessions: (params: SessionsQueryParams) => ["sessions", params] as const,
   reports: (params: ReportsParams) => ["reports", params] as const,
   settings: ["settings"] as const,
+  priorityPolicy: ["priority-policy"] as const,
   keys: ["keys"] as const,
   providers: ["providers"] as const,
   providerPerformance: (range: string) => ["providers", "performance", range] as const,
@@ -297,6 +302,14 @@ export function useSessions(params: SessionsQueryParams = {}) {
     queryFn: () => api.sessions(buildSessionsQueryString(params)),
     refetchInterval: LIST_REFETCH_MS,
     staleTime: LIST_REFETCH_MS,
+  });
+}
+
+export function usePriorityPolicy() {
+  return useQuery<PriorityPolicyView>({
+    queryKey: queryKeys.priorityPolicy,
+    queryFn: api.priorityPolicy,
+    staleTime: 60_000,
   });
 }
 
@@ -736,6 +749,40 @@ export function useUpdateSettings() {
       qc.invalidateQueries({ queryKey: queryKeys.settings });
       qc.invalidateQueries({ queryKey: queryKeys.capabilities });
       toast({ title: "Settings updated", variant: "success" });
+    },
+    onError: (e) =>
+      toast({ title: "Update failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+export function useUpdatePriorityPolicy() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (config: PriorityPolicyConfig) => patchPriorityPolicy(config),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.priorityPolicy });
+      toast({ title: "Priority policy updated", variant: "success" });
+    },
+    onError: (e) =>
+      toast({ title: "Update failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+export function useSetSessionPriority() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: ({
+      sessionKey,
+      mode,
+    }: {
+      sessionKey: string;
+      mode: "inherit" | "priority" | "standard";
+    }) => setSessionPriority(sessionKey, mode),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["sessions"] });
+      toast({ title: "Session priority updated", variant: "success" });
     },
     onError: (e) =>
       toast({ title: "Update failed", description: mutationErrorText(e), variant: "error" }),

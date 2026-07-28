@@ -10,6 +10,138 @@ mod support;
 use support::spawn;
 
 #[tokio::test]
+async fn priority_policy_round_trips_live_and_persisted() {
+    let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
+    let (pf, state) = spawn(up).await;
+    let c = reqwest::Client::new();
+
+    let initial: serde_json::Value = c
+        .get(format!("{pf}/api/priority-policy"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(initial["config"]["mode"], "passthrough");
+
+    let config = serde_json::json!({
+        "mode": "schedule",
+        "active_start_minute": 1320,
+        "active_end_minute": 360,
+        "utc_offset_minutes": 480,
+        "presence_minutes": 45
+    });
+    let response = c
+        .patch(format!("{pf}/api/priority-policy"))
+        .header("authorization", "Bearer secret")
+        .json(&config)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        serde_json::to_value(state.runtime_settings.priority_policy.config()).unwrap(),
+        config
+    );
+    let persisted = state.store.settings().get_all().await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            persisted.get("priority_policy").expect("persisted policy")
+        )
+        .unwrap(),
+        config
+    );
+}
+
+#[tokio::test]
+async fn per_session_priority_override_can_be_set_and_returned_to_inherit() {
+    let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
+    let (pf, state) = spawn(up).await;
+    let c = reqwest::Client::new();
+    let session = "a".repeat(64);
+    let url = format!("{pf}/api/sessions/{session}/priority");
+
+    let response = c
+        .put(&url)
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "mode": "priority" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        state
+            .runtime_settings
+            .priority_policy
+            .session_override(&session),
+        Some(polyflare_server::priority_policy::SessionMode::Priority)
+    );
+    assert!(state
+        .store
+        .settings()
+        .get_all()
+        .await
+        .unwrap()
+        .contains_key(&format!("priority_session:{session}")));
+
+    let response = c
+        .put(&url)
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "mode": "inherit" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        state
+            .runtime_settings
+            .priority_policy
+            .session_override(&session),
+        None
+    );
+    assert!(!state
+        .store
+        .settings()
+        .get_all()
+        .await
+        .unwrap()
+        .contains_key(&format!("priority_session:{session}")));
+}
+
+#[tokio::test]
+async fn priority_policy_rejects_invalid_config_and_session_keys() {
+    let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
+    let (pf, _) = spawn(up).await;
+    let c = reqwest::Client::new();
+
+    let invalid_policy = c
+        .patch(format!("{pf}/api/priority-policy"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({
+            "mode": "schedule",
+            "active_start_minute": 2000,
+            "active_end_minute": 0,
+            "utc_offset_minutes": 0,
+            "presence_minutes": 30
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_policy.status(), 400);
+
+    let invalid_session = c
+        .put(format!("{pf}/api/sessions/not-a-hash/priority"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "mode": "priority" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_session.status(), 400);
+}
+
+#[tokio::test]
 async fn patch_max_account_attempts_applies_live_and_persists() {
     let up = polyflare_testkit::MockUpstream::new(vec![]).spawn().await;
     let (pf, state) = spawn(up).await;

@@ -14,6 +14,14 @@ edition = "2021"
 version = "0.1.0"
 license = "MIT"
 
+# Keep target/ small: line tables only for workspace crates (readable backtraces), no debug
+# info for dependencies. Full dep debuginfo was the main driver of a 70GB+ target dir.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
