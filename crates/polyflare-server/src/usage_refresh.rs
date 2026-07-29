@@ -244,7 +244,7 @@ async fn refresh_account(
         // Tell established connections. Without this, a live relay socket owned by an account
         // this refresh just gated kept pumping to it until its idle/age budget expired —
         // new selections rotated correctly while the open socket stayed deaf (2026-07-29 live).
-        runtime.note_account_status(&account.id, status);
+        runtime.note_account_status_with_reset(&account.id, status, reset_at);
         effective_status = status;
     }
 

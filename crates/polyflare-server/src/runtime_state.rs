@@ -371,7 +371,7 @@ pub struct RuntimeStates {
     /// idle/age budget happens to expire (observed live 2026-07-29: a thread kept using a
     /// `quota_exceeded` owner for the better part of an hour because only NEW selections consult
     /// account status). Content-free: ids only.
-    gated_accounts: RwLock<HashSet<String>>,
+    gated_accounts: RwLock<HashMap<String, Option<i64>>>,
     /// Woken (`notify_waiters`) whenever `gated_accounts` GAINS an entry, so a parked relay pump
     /// re-checks immediately rather than at its next idle tick. Ungating never notifies — a socket
     /// has nothing to do about its account becoming healthy.
@@ -447,7 +447,7 @@ impl Default for RuntimeStates {
             admission_changed: tokio::sync::Notify::new(),
             admission_metrics: AdmissionMetrics::default(),
             pressure_calibration: PressureCalibration::default(),
-            gated_accounts: RwLock::new(HashSet::new()),
+            gated_accounts: RwLock::new(HashMap::new()),
             account_gate_changed: tokio::sync::Notify::new(),
         }
     }
@@ -1372,16 +1372,31 @@ impl RuntimeStates {
     /// Only a transition INTO a gated status notifies. Ungating silently clears the flag: a parked
     /// socket has nothing to do about its account becoming healthy again.
     pub fn note_account_status(&self, id: &str, status: &str) {
+        self.note_account_status_with_reset(id, status, None);
+    }
+
+    /// [`Self::note_account_status`] with the gate's own expiry, for the reset-driven statuses.
+    ///
+    /// The selector's eligibility recovers a `rate_limited`/`quota_exceeded` account the moment
+    /// `now >= reset_at` — but the DURABLE status stays gated until the next usage-refresh cycle
+    /// (up to 10 minutes) rewrites it. An expiry-less gate therefore disagrees with routing for
+    /// that whole window: a fresh handshake selects the recovered account and the pump instantly
+    /// honest-closes it, looping reconnects until the refresh catches up. With 5h windows live
+    /// (returning 2026-07-30) that disagreement would fire on every recovery, so the gate carries
+    /// the same expiry eligibility uses and simply stops gating when the reset passes. `None`
+    /// means indefinite — correct for `paused`/`deactivated`/`reauth_required`, which only a
+    /// status write can clear.
+    pub fn note_account_status_with_reset(&self, id: &str, status: &str, reset_at: Option<i64>) {
         let gated = GATED_STATUSES.contains(&status);
         let newly_gated = {
-            let mut set = self
+            let mut map = self
                 .gated_accounts
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
             if gated {
-                set.insert(id.to_string())
+                map.insert(id.to_string(), reset_at).is_none()
             } else {
-                set.remove(id);
+                map.remove(id);
                 false
             }
         };
@@ -1390,13 +1405,21 @@ impl RuntimeStates {
         }
     }
 
-    /// Whether `id`'s last-noted durable status gates it out of routing. Between-turns poll for the
-    /// WS relay; pair with [`Self::account_gate_changed`] to wake promptly instead of polling.
-    pub fn is_account_gated(&self, id: &str) -> bool {
-        self.gated_accounts
+    /// Whether `id`'s last-noted durable status gates it out of routing AT `now`. An entry whose
+    /// reset has passed no longer gates — mirroring exactly when the selector readmits the
+    /// account. Between-turns poll for the WS relay; pair with [`Self::account_gate_changed`] to
+    /// wake promptly instead of polling.
+    pub fn is_account_gated(&self, id: &str, now: i64) -> bool {
+        match self
+            .gated_accounts
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(id)
+            .get(id)
+        {
+            None => false,
+            Some(None) => true,
+            Some(Some(reset_at)) => now < *reset_at,
+        }
     }
 
     /// A future that resolves when SOME account transitions into a gated status. Wakes all
@@ -3577,11 +3600,27 @@ mod tests {
             "reauth_required",
         ] {
             rs.note_account_status("a", status);
-            assert!(rs.is_account_gated("a"), "{status} must gate");
+            assert!(rs.is_account_gated("a", 1_000), "{status} must gate");
             rs.note_account_status("a", "active");
-            assert!(!rs.is_account_gated("a"), "active must clear {status}");
+            assert!(
+                !rs.is_account_gated("a", 1_000),
+                "active must clear {status}"
+            );
         }
-        assert!(!rs.is_account_gated("never-noted"));
+        assert!(!rs.is_account_gated("never-noted", 1_000));
+
+        // A reset-driven gate expires WITH its reset — the moment the selector readmits the
+        // account, the socket gate must stop disagreeing with it (else every 5h-window recovery
+        // becomes a reconnect loop until the next 10-minute refresh rewrites the status).
+        rs.note_account_status_with_reset("r", "rate_limited", Some(2_000));
+        assert!(rs.is_account_gated("r", 1_999), "gated until the reset");
+        assert!(
+            !rs.is_account_gated("r", 2_000),
+            "the gate expires exactly when eligibility recovers the account"
+        );
+        // An indefinite gate (operator pause / reauth) never self-expires.
+        rs.note_account_status("p", "paused");
+        assert!(rs.is_account_gated("p", i64::MAX));
 
         // A parked waiter is woken by a gating transition.
         let notified = rs.account_gate_changed();

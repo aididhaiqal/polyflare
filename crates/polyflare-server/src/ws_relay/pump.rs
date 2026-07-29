@@ -644,7 +644,11 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
         // Checked at the top of EVERY iteration (not only in the notify arm below) so a gate that
         // fired mid-turn is honoured the moment the turn finishes. Never mid-turn: output that is
         // already streaming must finish on the account that holds its anchor.
-        if !turn_active && upstream.is_some() && state.runtime.is_account_gated(account.id.as_str())
+        if !turn_active
+            && upstream.is_some()
+            && state
+                .runtime
+                .is_account_gated(account.id.as_str(), unix_now())
         {
             relay_metrics.record("honest_close_account_gated");
             let _ = downstream.send(Message::Close(None)).await;
