@@ -241,6 +241,10 @@ async fn refresh_account(
             derive_gate(rl.primary_window.as_ref(), rl.secondary_window.as_ref());
         repo.update_status_and_reset(&account.id, status, reset_at)
             .await?;
+        // Tell established connections. Without this, a live relay socket owned by an account
+        // this refresh just gated kept pumping to it until its idle/age budget expired —
+        // new selections rotated correctly while the open socket stayed deaf (2026-07-29 live).
+        runtime.note_account_status(&account.id, status);
         effective_status = status;
     }
 

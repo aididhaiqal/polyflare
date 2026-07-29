@@ -180,8 +180,16 @@ pub async fn patch_account_handler(
         usage_cap_percent: patch.usage_cap_percent,
         usage_cap_override: patch.usage_cap_override,
     };
+    let patched_status = update.status.clone();
     match repo.update_settings_atomic(&id, update).await {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Ok(true) => {
+            // An operator pause must reach live relay sockets, not only future selections — the
+            // whole point of pausing is that the account stops serving.
+            if let Some(status) = patched_status {
+                state.runtime.note_account_status(&id, &status);
+            }
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+        }
         Ok(false) => (StatusCode::NOT_FOUND, "no such account").into_response(),
         Err(_) => internal_error(),
     }

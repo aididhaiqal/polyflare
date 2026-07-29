@@ -635,7 +635,26 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
         // mid-turn stall deadline (`recv_text`); a parked socket between turns gets the idle
         // policy (`recv_text_idle`) — no stall deadline, optional keepalive pings, honest budget.
         let turn_active = in_flight.is_some() || turn_telemetry.is_some();
+        // ACCOUNT GATED between turns (2026-07-29): the usage refresh, an operator pause, or an
+        // OAuth failure retired this connection's account AFTER the handshake resolved it. New
+        // selections rotate immediately, but this socket would keep pumping to the retired
+        // account until its idle/age budget expired — up to ~50 minutes on a dead owner. Honest
+        // close instead, exactly like the idle-budget path: codex sees its socket die, wipes its
+        // anchor ledger, reconnects, and the fresh handshake re-resolves onto a healthy account.
+        // Checked at the top of EVERY iteration (not only in the notify arm below) so a gate that
+        // fired mid-turn is honoured the moment the turn finishes. Never mid-turn: output that is
+        // already streaming must finish on the account that holds its anchor.
+        if !turn_active && upstream.is_some() && state.runtime.is_account_gated(account.id.as_str())
+        {
+            relay_metrics.record("honest_close_account_gated");
+            let _ = downstream.send(Message::Close(None)).await;
+            break;
+        }
         tokio::select! {
+            // Wakes when SOME account transitions into a gated status; the top-of-loop check
+            // decides whether it was OURS. Spurious wakes cost one set lookup. Only armed while
+            // parked — a mid-turn gate must wait for the turn boundary anyway.
+            _ = state.runtime.account_gate_changed(), if !turn_active && upstream.is_some() => {}
             down = downstream.recv() => {
                 match down {
                     Some(Ok(Message::Text(t))) => {

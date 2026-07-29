@@ -1329,6 +1329,67 @@ mod relay_through {
         );
     }
 
+    /// An ESTABLISHED relay socket must hear a routing decision (2026-07-29 live): the usage
+    /// refresh flipped this connection's owner to `quota_exceeded` and the socket kept pumping
+    /// turns to it for the better part of an hour — only NEW selections consult account status,
+    /// and the pump's only exits were its own idle/age budgets. The fix: every status-write site
+    /// flags the gate registry, and the parked pump honest-closes so codex reconnects and the
+    /// fresh handshake re-resolves onto a healthy account.
+    ///
+    /// Ordering matters in this test: the gate lands BETWEEN turns (after `response.completed`),
+    /// which is the only moment the pump may act on it — a mid-turn close would kill streaming
+    /// output that must finish on the account holding its anchor.
+    #[tokio::test]
+    async fn a_gated_account_closes_its_parked_relay_socket() {
+        let mock = MockWsUpstream::new(ScriptedTurn::normal(Vec::new()));
+        let mock_base = mock.clone().spawn().await;
+        let (base, state) = spawn_with_pinned_account("acct-gated", &mock_base).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        ws.send(TMessage::Text(
+            r#"{"type":"response.create","input":[]}"#.to_string().into(),
+        ))
+        .await
+        .unwrap();
+        // Drain the scripted turn to its terminal frame so the pump PARKS between turns.
+        loop {
+            match ws.next().await.expect("frame").expect("no WS error") {
+                TMessage::Text(text) => {
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if value["type"] == "response.completed" {
+                        break;
+                    }
+                }
+                TMessage::Ping(_) | TMessage::Pong(_) => {}
+                other => panic!("unexpected frame while draining the turn: {other:?}"),
+            }
+        }
+
+        // The background flip: what the usage refresh / an operator pause does.
+        state
+            .runtime
+            .note_account_status("acct-gated", "quota_exceeded");
+
+        // The parked pump must close BOTH legs promptly — not at the idle budget (25 min) and not
+        // at the age rotation (50 min). Anything but a Close/stream-end within the timeout fails.
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(TMessage::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(TMessage::Ping(_))) | Some(Ok(TMessage::Pong(_))) => {}
+                    Some(Ok(other)) => panic!("expected a close, got: {other:?}"),
+                }
+            }
+        })
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "a gated account's parked socket must honest-close promptly"
+        );
+    }
+
     #[tokio::test]
     async fn established_ws_401_after_visible_output_is_not_retried() {
         const VALID_JWT: &str = "eyJhbGciOiJub25lIn0.e30.sig";

@@ -16,7 +16,7 @@
 //!
 //! [`overlay`]: RuntimeStates::overlay
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -364,7 +364,30 @@ pub struct RuntimeStates {
     admission_changed: tokio::sync::Notify,
     admission_metrics: AdmissionMetrics,
     pressure_calibration: PressureCalibration,
+    /// Account ids whose CURRENT status gates them out of routing (`quota_exceeded`,
+    /// `rate_limited`, `paused`, `deactivated`, `reauth_required`). Written by every status-write
+    /// site via [`Self::note_account_status`]; read by the WS relay pump between turns so an
+    /// established socket hears a routing decision instead of pumping to a dead account until its
+    /// idle/age budget happens to expire (observed live 2026-07-29: a thread kept using a
+    /// `quota_exceeded` owner for the better part of an hour because only NEW selections consult
+    /// account status). Content-free: ids only.
+    gated_accounts: RwLock<HashSet<String>>,
+    /// Woken (`notify_waiters`) whenever `gated_accounts` GAINS an entry, so a parked relay pump
+    /// re-checks immediately rather than at its next idle tick. Ungating never notifies — a socket
+    /// has nothing to do about its account becoming healthy.
+    account_gate_changed: tokio::sync::Notify,
 }
+
+/// The statuses that make an account unroutable, mirrored from `eligibility`'s hard-block set plus
+/// the two reset-driven backoff statuses. One list, used by [`RuntimeStates::note_account_status`]
+/// alone — the selector keeps its own richer verdicts; this is only the yes/no a live socket needs.
+const GATED_STATUSES: &[&str] = &[
+    "quota_exceeded",
+    "rate_limited",
+    "paused",
+    "deactivated",
+    "reauth_required",
+];
 
 /// Hard process-local admission bounds. Zero disables the corresponding bound.
 ///
@@ -424,6 +447,8 @@ impl Default for RuntimeStates {
             admission_changed: tokio::sync::Notify::new(),
             admission_metrics: AdmissionMetrics::default(),
             pressure_calibration: PressureCalibration::default(),
+            gated_accounts: RwLock::new(HashSet::new()),
+            account_gate_changed: tokio::sync::Notify::new(),
         }
     }
 }
@@ -1287,6 +1312,54 @@ impl RuntimeStates {
     /// on every selection.
     pub fn record_selected(&self, id: &AccountId, now: i64) {
         self.mutate(id, |rt| rt.last_selected_at = Some(now));
+    }
+
+    /// Record an account's just-written durable status so ESTABLISHED connections can hear it.
+    ///
+    /// New selections consult status via snapshots, but a live WS relay socket resolved its owner
+    /// once at handshake and never asks again — so a background status flip (the usage refresh
+    /// deriving `quota_exceeded`, an operator pausing the account, an OAuth refresh parking it as
+    /// `reauth_required`) was invisible to it, and the socket kept pumping turns to an account the
+    /// router had already retired (2026-07-29 live: ~50 minutes on a `quota_exceeded` owner,
+    /// bounded only by the relay's age rotation). Call this wherever the durable status is
+    /// written; the relay checks [`Self::is_account_gated`] between turns and honest-closes so the
+    /// client reconnects and re-resolves.
+    ///
+    /// Only a transition INTO a gated status notifies. Ungating silently clears the flag: a parked
+    /// socket has nothing to do about its account becoming healthy again.
+    pub fn note_account_status(&self, id: &str, status: &str) {
+        let gated = GATED_STATUSES.contains(&status);
+        let newly_gated = {
+            let mut set = self
+                .gated_accounts
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if gated {
+                set.insert(id.to_string())
+            } else {
+                set.remove(id);
+                false
+            }
+        };
+        if newly_gated {
+            self.account_gate_changed.notify_waiters();
+        }
+    }
+
+    /// Whether `id`'s last-noted durable status gates it out of routing. Between-turns poll for the
+    /// WS relay; pair with [`Self::account_gate_changed`] to wake promptly instead of polling.
+    pub fn is_account_gated(&self, id: &str) -> bool {
+        self.gated_accounts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
+    }
+
+    /// A future that resolves when SOME account transitions into a gated status. Wakes all
+    /// waiters; each re-checks its own account via [`Self::is_account_gated`]. Spurious wakes are
+    /// fine — the check is a set lookup.
+    pub fn account_gate_changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.account_gate_changed.notified()
     }
 
     /// C9 Task 1: acquire a leak-proof in-flight lease on `id` — increments `RuntimeState.in_flight`
@@ -3370,6 +3443,49 @@ mod tests {
 
         drop(owner_recovery);
         drop(ordinary);
+    }
+
+    /// The gate registry behind the WS relay's "hear routing decisions" close (2026-07-29): every
+    /// gated status flags the account, `active` clears it, and a waiter parked on the notify is
+    /// woken by a transition INTO gated — not by ungating, which a socket has nothing to do about.
+    #[tokio::test]
+    async fn account_gate_registry_flags_and_wakes() {
+        let rs = RuntimeStates::new();
+        for status in [
+            "quota_exceeded",
+            "rate_limited",
+            "paused",
+            "deactivated",
+            "reauth_required",
+        ] {
+            rs.note_account_status("a", status);
+            assert!(rs.is_account_gated("a"), "{status} must gate");
+            rs.note_account_status("a", "active");
+            assert!(!rs.is_account_gated("a"), "active must clear {status}");
+        }
+        assert!(!rs.is_account_gated("never-noted"));
+
+        // A parked waiter is woken by a gating transition.
+        let notified = rs.account_gate_changed();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        rs.note_account_status("b", "quota_exceeded");
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("a gating transition must wake parked waiters");
+
+        // Re-noting an ALREADY-gated account does not notify again (no wake storm from the
+        // 10-minute refresh loop re-deriving the same status every cycle).
+        let notified = rs.account_gate_changed();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        rs.note_account_status("b", "quota_exceeded");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), notified)
+                .await
+                .is_err(),
+            "an unchanged gate must not re-notify"
+        );
     }
 
     #[test]

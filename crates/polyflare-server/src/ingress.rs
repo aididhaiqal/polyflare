@@ -277,6 +277,7 @@ pub(crate) async fn bench_account_for_failure(
                     .accounts()
                     .update_status(id.as_str(), status)
                     .await;
+                state.runtime.note_account_status(id.as_str(), status);
                 return;
             }
         }
@@ -867,6 +868,7 @@ pub(crate) async fn resolve_core_account(
                 }) => {
                     if let Some(status) = classify_failure(&code).status() {
                         let _ = repo.update_status(picked.as_str(), status).await;
+                        state.runtime.note_account_status(picked.as_str(), status);
                     }
                     return Err(account_unavailable_because(
                         "oauth_refresh_rejected",
@@ -875,6 +877,9 @@ pub(crate) async fn resolve_core_account(
                 }
                 Err(OAuthError::Endpoint { code: None, .. }) | Err(OAuthError::MalformedJwt(_)) => {
                     let _ = repo.update_status(picked.as_str(), "reauth_required").await;
+                    state
+                        .runtime
+                        .note_account_status(picked.as_str(), "reauth_required");
                     return Err(account_unavailable_because(
                         "oauth_refresh_malformed",
                         picked.as_str(),
