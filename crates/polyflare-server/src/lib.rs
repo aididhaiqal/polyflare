@@ -2,6 +2,7 @@
 
 pub mod account_cache;
 pub mod account_onboarding;
+pub mod admission_api;
 pub mod alias;
 pub mod app;
 pub mod auth;

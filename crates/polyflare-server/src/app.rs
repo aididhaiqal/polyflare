@@ -303,6 +303,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
                 .delete(crate::provider_api::delete_credential),
         )
         .route(
+            "/api/admission-limits",
+            get(crate::admission_api::get_handler).patch(crate::admission_api::patch_handler),
+        )
+        .route(
             "/api/ws/sse-pins",
             get(crate::sse_pins::list).post(crate::sse_pins::add),
         )

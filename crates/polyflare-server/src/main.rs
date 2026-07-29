@@ -246,7 +246,13 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // served before this feature existed, so every fallback rung — disabled, no accounts, fetch
     // failure — degrades to exactly that pre-D15 `/models` behavior.
     let model_catalog_enabled = config.model_catalog_enabled;
-    let admission_limits = config.admission_limits;
+    let mut admission_limits = config.admission_limits;
+    // A live PATCH to /api/admission-limits persists what applied; boot re-applies it here so the
+    // operator's tuning survives a restart, exactly like every other settings-row overlay above.
+    polyflare_server::admission_api::overlay_admission_settings(
+        &mut admission_limits,
+        &settings_overlay,
+    );
     let model_catalog_floor = polyflare_server::catalog::codex_bootstrap_floor();
     let model_catalog = Arc::new(if model_catalog_enabled {
         let source: Box<dyn ModelSource> = Box::new(HttpModelSource::new(

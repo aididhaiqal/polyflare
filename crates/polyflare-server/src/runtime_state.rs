@@ -360,7 +360,7 @@ pub struct RuntimeStates {
     /// per key; repeated rate-limit/quota signals overwrite this value instead of growing an
     /// unbounded queue while SQLite is slow.
     cooldown_persist_pending: Mutex<HashMap<AccountId, RoutingCooldownWrite>>,
-    admission_limits: AdmissionLimits,
+    admission_limits: RwLock<AdmissionLimits>,
     admission_changed: tokio::sync::Notify,
     admission_metrics: AdmissionMetrics,
     pressure_calibration: PressureCalibration,
@@ -443,7 +443,7 @@ impl Default for RuntimeStates {
             usage_refresh_coalesced: AtomicU64::new(0),
             cooldown_persist_tx: RwLock::new(None),
             cooldown_persist_pending: Mutex::new(HashMap::new()),
-            admission_limits: AdmissionLimits::default(),
+            admission_limits: RwLock::new(AdmissionLimits::default()),
             admission_changed: tokio::sync::Notify::new(),
             admission_metrics: AdmissionMetrics::default(),
             pressure_calibration: PressureCalibration::default(),
@@ -949,9 +949,53 @@ impl RuntimeStates {
 
     pub fn with_admission_limits(admission_limits: AdmissionLimits) -> Self {
         Self {
-            admission_limits,
+            admission_limits: RwLock::new(admission_limits),
             ..Self::default()
         }
+    }
+
+    /// The CURRENT admission limits, copied out. Every gate reads through this, so a live update
+    /// takes effect on the next admission check — no restart. Uncontended read-lock + `Copy`.
+    pub fn admission_limits(&self) -> AdmissionLimits {
+        *self
+            .admission_limits
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Replace the admission limits at runtime.
+    ///
+    /// Until 2026-07-29 these were startup-env only, so tuning them under load meant a restart
+    /// that drops or drains every in-flight turn — which is exactly when tuning them matters (the
+    /// 07-28 pressure saturation: every account at its ordinary pressure limit, 90s owner-waits,
+    /// and no lever that didn't cost a restart mid-burst). The priority presence policy adjusts
+    /// per-session spend live; this makes the throughput caps it interacts with adjustable live
+    /// too.
+    ///
+    /// Reserves are clamped against their caps HERE (a reserve at or above its cap would leave
+    /// zero ordinary budget and starve all new work — the same invariant boot enforces via
+    /// `clamp_owner_recovery_reserve`). Wakes every queued admission waiter: a RAISED cap must
+    /// admit the queue immediately, not at each waiter's next timeout.
+    pub fn set_admission_limits(&self, mut next: AdmissionLimits) -> AdmissionLimits {
+        if next.account_in_flight > 0 {
+            next.owner_recovery_reserve = next
+                .owner_recovery_reserve
+                .min(next.account_in_flight.saturating_sub(1));
+        }
+        if next.account_in_flight_pressure > 0 {
+            next.owner_recovery_pressure_reserve = next
+                .owner_recovery_pressure_reserve
+                .min(next.account_in_flight_pressure.saturating_sub(1));
+        }
+        {
+            let mut cell = self
+                .admission_limits
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            *cell = next;
+        }
+        self.admission_changed.notify_waiters();
+        next
     }
 
     /// Convert the content-free token estimate into bounded admission units using the rolling
@@ -968,10 +1012,10 @@ impl RuntimeStates {
             .div_ceil(1_000);
         let units = calibrated.div_ceil(PRESSURE_TOKENS_PER_UNIT).max(1);
         let ordinary_limit = self
-            .admission_limits
+            .admission_limits()
             .account_in_flight_pressure
-            .saturating_sub(self.admission_limits.owner_recovery_pressure_reserve);
-        let max_units = if self.admission_limits.account_in_flight_pressure == 0 {
+            .saturating_sub(self.admission_limits().owner_recovery_pressure_reserve);
+        let max_units = if self.admission_limits().account_in_flight_pressure == 0 {
             DEFAULT_MAX_REQUEST_PRESSURE_UNITS
         } else {
             ordinary_limit.max(1)
@@ -1459,21 +1503,22 @@ impl RuntimeStates {
             let account = map.get(id).map_or(0, |state| state.in_flight);
             let account_pressure = map.get(id).map_or(0, |state| state.in_flight_pressure);
             let ordinary_limit = self
-                .admission_limits
+                .admission_limits()
                 .account_in_flight
-                .saturating_sub(self.admission_limits.owner_recovery_reserve);
+                .saturating_sub(self.admission_limits().owner_recovery_reserve);
             let ordinary_pressure_limit = self
-                .admission_limits
+                .admission_limits()
                 .account_in_flight_pressure
-                .saturating_sub(self.admission_limits.owner_recovery_pressure_reserve);
-            let global_available = self.admission_limits.global_in_flight == 0
-                || global < self.admission_limits.global_in_flight;
+                .saturating_sub(self.admission_limits().owner_recovery_pressure_reserve);
+            let global_available = self.admission_limits().global_in_flight == 0
+                || global < self.admission_limits().global_in_flight;
             let account_available =
-                self.admission_limits.account_in_flight == 0 || account < ordinary_limit;
-            let global_pressure_available = self.admission_limits.global_in_flight_pressure == 0
+                self.admission_limits().account_in_flight == 0 || account < ordinary_limit;
+            let global_pressure_available = self.admission_limits().global_in_flight_pressure == 0
                 || global_pressure.saturating_add(pressure_units)
-                    <= self.admission_limits.global_in_flight_pressure;
-            let account_pressure_available = self.admission_limits.account_in_flight_pressure == 0
+                    <= self.admission_limits().global_in_flight_pressure;
+            let account_pressure_available = self.admission_limits().account_in_flight_pressure
+                == 0
                 || account_pressure.saturating_add(pressure_units) <= ordinary_pressure_limit;
             if global_available
                 && account_available
@@ -1533,7 +1578,7 @@ impl RuntimeStates {
         pressure_units: u32,
     ) -> Option<InFlightGuard> {
         let pressure_units = pressure_units.max(1);
-        let deadline = tokio::time::Instant::now() + self.admission_limits.wait_timeout;
+        let deadline = tokio::time::Instant::now() + self.admission_limits().wait_timeout;
         let mut wait: Option<AdmissionWaitGuard<'_>> = None;
         loop {
             // Register before checking under the lock so a release between the check and await
@@ -1551,18 +1596,18 @@ impl RuntimeStates {
                 });
                 let account = map.get(id).map_or(0, |state| state.in_flight);
                 let account_pressure = map.get(id).map_or(0, |state| state.in_flight_pressure);
-                let global_available = self.admission_limits.global_in_flight == 0
-                    || global < self.admission_limits.global_in_flight;
-                let account_available = self.admission_limits.account_in_flight == 0
-                    || account < self.admission_limits.account_in_flight;
-                let global_pressure_available = self.admission_limits.global_in_flight_pressure
+                let global_available = self.admission_limits().global_in_flight == 0
+                    || global < self.admission_limits().global_in_flight;
+                let account_available = self.admission_limits().account_in_flight == 0
+                    || account < self.admission_limits().account_in_flight;
+                let global_pressure_available = self.admission_limits().global_in_flight_pressure
                     == 0
                     || global_pressure.saturating_add(pressure_units)
-                        <= self.admission_limits.global_in_flight_pressure;
-                let account_pressure_available = self.admission_limits.account_in_flight_pressure
+                        <= self.admission_limits().global_in_flight_pressure;
+                let account_pressure_available = self.admission_limits().account_in_flight_pressure
                     == 0
                     || account_pressure.saturating_add(pressure_units)
-                        <= self.admission_limits.account_in_flight_pressure;
+                        <= self.admission_limits().account_in_flight_pressure;
                 if global_available
                     && account_available
                     && global_pressure_available
@@ -1574,16 +1619,17 @@ impl RuntimeStates {
                     runtime.in_flight_pressure =
                         runtime.in_flight_pressure.saturating_add(pressure_units);
                     let ordinary_limit = self
-                        .admission_limits
+                        .admission_limits()
                         .account_in_flight
-                        .saturating_sub(self.admission_limits.owner_recovery_reserve);
+                        .saturating_sub(self.admission_limits().owner_recovery_reserve);
                     let ordinary_pressure_limit = self
-                        .admission_limits
+                        .admission_limits()
                         .account_in_flight_pressure
-                        .saturating_sub(self.admission_limits.owner_recovery_pressure_reserve);
+                        .saturating_sub(self.admission_limits().owner_recovery_pressure_reserve);
                     Some(
-                        (self.admission_limits.account_in_flight > 0 && account >= ordinary_limit)
-                            || (self.admission_limits.account_in_flight_pressure > 0
+                        (self.admission_limits().account_in_flight > 0
+                            && account >= ordinary_limit)
+                            || (self.admission_limits().account_in_flight_pressure > 0
                                 && account_pressure.saturating_add(pressure_units)
                                     > ordinary_pressure_limit),
                     )
@@ -1637,7 +1683,7 @@ impl RuntimeStates {
         id: &AccountId,
         now: i64,
     ) -> Option<WsSocketGuard> {
-        let deadline = tokio::time::Instant::now() + self.admission_limits.socket_wait_timeout;
+        let deadline = tokio::time::Instant::now() + self.admission_limits().socket_wait_timeout;
         let mut wait: Option<AdmissionWaitGuard<'_>> = None;
         loop {
             let changed = self.admission_changed.notified();
@@ -1649,19 +1695,19 @@ impl RuntimeStates {
                     .values()
                     .fold(0u32, |total, state| total.saturating_add(state.open_ws));
                 let account = map.get(id).map_or(0, |state| state.open_ws);
-                let global_available = self.admission_limits.global_open_ws == 0
-                    || global < self.admission_limits.global_open_ws;
-                let account_available = self.admission_limits.account_open_ws == 0
-                    || account < self.admission_limits.account_open_ws;
+                let global_available = self.admission_limits().global_open_ws == 0
+                    || global < self.admission_limits().global_open_ws;
+                let account_available = self.admission_limits().account_open_ws == 0
+                    || account < self.admission_limits().account_open_ws;
                 if global_available && account_available {
                     let runtime = map.entry(id.clone()).or_default();
                     runtime.last_selected_at = Some(now);
                     runtime.open_ws = runtime.open_ws.saturating_add(1);
                     let ordinary_limit = self
-                        .admission_limits
+                        .admission_limits()
                         .account_open_ws
-                        .saturating_sub(self.admission_limits.owner_recovery_reserve);
-                    Some(self.admission_limits.account_open_ws > 0 && account >= ordinary_limit)
+                        .saturating_sub(self.admission_limits().owner_recovery_reserve);
+                    Some(self.admission_limits().account_open_ws > 0 && account >= ordinary_limit)
                 } else {
                     None
                 }
@@ -1713,21 +1759,21 @@ impl RuntimeStates {
         let pressure_units = ctx.request_pressure_units.max(1);
         let id = {
             let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
-            if self.admission_limits.global_in_flight > 0
+            if self.admission_limits().global_in_flight > 0
                 && map.values().fold(0u32, |total, runtime| {
                     total.saturating_add(runtime.in_flight)
-                }) >= self.admission_limits.global_in_flight
+                }) >= self.admission_limits().global_in_flight
             {
                 return None;
             }
-            if self.admission_limits.global_in_flight_pressure > 0
+            if self.admission_limits().global_in_flight_pressure > 0
                 && map
                     .values()
                     .fold(0u32, |total, runtime| {
                         total.saturating_add(runtime.in_flight_pressure)
                     })
                     .saturating_add(pressure_units)
-                    > self.admission_limits.global_in_flight_pressure
+                    > self.admission_limits().global_in_flight_pressure
             {
                 return None;
             }
@@ -1751,17 +1797,18 @@ impl RuntimeStates {
                 .iter()
                 .filter(|snapshot| {
                     let ordinary_limit = self
-                        .admission_limits
+                        .admission_limits()
                         .account_in_flight
-                        .saturating_sub(self.admission_limits.owner_recovery_reserve);
+                        .saturating_sub(self.admission_limits().owner_recovery_reserve);
                     let ordinary_pressure_limit = self
-                        .admission_limits
+                        .admission_limits()
                         .account_in_flight_pressure
-                        .saturating_sub(self.admission_limits.owner_recovery_pressure_reserve);
-                    let count_available = self.admission_limits.account_in_flight == 0
+                        .saturating_sub(self.admission_limits().owner_recovery_pressure_reserve);
+                    let count_available = self.admission_limits().account_in_flight == 0
                         || map.get(&snapshot.id).map_or(0, |runtime| runtime.in_flight)
                             < ordinary_limit;
-                    let pressure_available = self.admission_limits.account_in_flight_pressure == 0
+                    let pressure_available = self.admission_limits().account_in_flight_pressure
+                        == 0
                         || map
                             .get(&snapshot.id)
                             .map_or(0, |runtime| runtime.in_flight_pressure)
@@ -1800,7 +1847,7 @@ impl RuntimeStates {
         now: i64,
         metrics: &Arc<LeaseMetrics>,
     ) -> Option<(AccountId, InFlightGuard)> {
-        let deadline = tokio::time::Instant::now() + self.admission_limits.wait_timeout;
+        let deadline = tokio::time::Instant::now() + self.admission_limits().wait_timeout;
         let mut wait: Option<AdmissionWaitGuard<'_>> = None;
         loop {
             let changed = self.admission_changed.notified();
@@ -1855,11 +1902,11 @@ impl RuntimeStates {
     ) -> Option<(AccountId, WsSocketGuard)> {
         let id = {
             let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
-            if self.admission_limits.global_open_ws > 0
+            if self.admission_limits().global_open_ws > 0
                 && map
                     .values()
                     .fold(0u32, |total, runtime| total.saturating_add(runtime.open_ws))
-                    >= self.admission_limits.global_open_ws
+                    >= self.admission_limits().global_open_ws
             {
                 return None;
             }
@@ -1883,10 +1930,10 @@ impl RuntimeStates {
                 .iter()
                 .filter(|snapshot| {
                     let ordinary_limit = self
-                        .admission_limits
+                        .admission_limits()
                         .account_open_ws
-                        .saturating_sub(self.admission_limits.owner_recovery_reserve);
-                    self.admission_limits.account_open_ws == 0
+                        .saturating_sub(self.admission_limits().owner_recovery_reserve);
+                    self.admission_limits().account_open_ws == 0
                         || map.get(&snapshot.id).map_or(0, |runtime| runtime.open_ws)
                             < ordinary_limit
                 })
@@ -1915,7 +1962,7 @@ impl RuntimeStates {
     ) -> Option<(AccountId, WsSocketGuard)> {
         // Socket admission, not request admission — see `acquire_pinned_open_ws`'s doc: a queued
         // handshake outlives the client's own connect deadline and simply hangs it.
-        let deadline = tokio::time::Instant::now() + self.admission_limits.socket_wait_timeout;
+        let deadline = tokio::time::Instant::now() + self.admission_limits().socket_wait_timeout;
         let mut wait: Option<AdmissionWaitGuard<'_>> = None;
         loop {
             let changed = self.admission_changed.notified();
@@ -3443,6 +3490,77 @@ mod tests {
 
         drop(owner_recovery);
         drop(ordinary);
+    }
+
+    /// THE point of live admission limits (2026-07-29): a queued owner-wait unblocks the moment an
+    /// operator raises the cap — not at its own timeout, and without the restart that was
+    /// previously the only lever (and that drains every in-flight turn at exactly the moment the
+    /// caps matter). Also pins the reserve clamp: a reserve at or above its cap would zero the
+    /// ordinary budget and starve all new work.
+    #[tokio::test]
+    async fn raising_a_cap_live_admits_a_queued_waiter() {
+        let runtime = Arc::new(RuntimeStates::with_admission_limits(AdmissionLimits {
+            account_in_flight: 1,
+            owner_recovery_reserve: 0,
+            wait_timeout: Duration::from_secs(30),
+            ..AdmissionLimits::default()
+        }));
+        let metrics = LeaseMetrics::new();
+        let owner = AccountId::from("owner");
+        let _held = runtime
+            .try_acquire_in_flight_weighted(&owner, 1_000, &metrics, 1)
+            .expect("first acquire fills the cap of 1");
+
+        let waiter_runtime = runtime.clone();
+        let waiter_metrics = metrics.clone();
+        let waiter_owner = owner.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_runtime
+                .acquire_pinned_in_flight_weighted(&waiter_owner, 1_001, &waiter_metrics, 1)
+                .await
+        });
+        // Let the waiter genuinely park before the cap moves.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the waiter must be queued on the cap"
+        );
+
+        let applied = runtime.set_admission_limits(AdmissionLimits {
+            account_in_flight: 2,
+            owner_recovery_reserve: 0,
+            wait_timeout: Duration::from_secs(30),
+            ..AdmissionLimits::default()
+        });
+        assert_eq!(applied.account_in_flight, 2);
+
+        let lease = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("a raised cap must admit the queued waiter promptly, not at its timeout")
+            .expect("waiter task must not panic");
+        assert!(lease.is_some(), "the waiter acquires under the new cap");
+    }
+
+    #[test]
+    fn a_reserve_can_never_swallow_its_whole_cap() {
+        let runtime = RuntimeStates::new();
+        let applied = runtime.set_admission_limits(AdmissionLimits {
+            account_in_flight: 4,
+            owner_recovery_reserve: 9, // above the cap
+            account_in_flight_pressure: 16,
+            owner_recovery_pressure_reserve: 40, // above the cap
+            ..AdmissionLimits::default()
+        });
+        assert_eq!(
+            applied.owner_recovery_reserve, 3,
+            "reserve clamps to cap - 1 so ordinary work keeps at least one slot"
+        );
+        assert_eq!(applied.owner_recovery_pressure_reserve, 15);
+        assert_eq!(
+            runtime.admission_limits().owner_recovery_reserve,
+            3,
+            "the clamped value is what every gate reads"
+        );
     }
 
     /// The gate registry behind the WS relay's "hear routing decisions" close (2026-07-29): every
