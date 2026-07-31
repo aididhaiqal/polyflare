@@ -741,6 +741,17 @@ impl RuntimeStates {
 
         if let Some(entry) = registry.entries.get_mut(key) {
             if entry.consumed >= limit {
+                // Content-free: `key` is already a sha256 of (pool, session, thread, turn_id).
+                // Logged because the client-visible 400 this refusal becomes carried NO trace of
+                // which key exhausted, how, or when — unanswerable after the fact (2026-07-31).
+                tracing::warn!(
+                    target: "logical_turn_budget",
+                    key_prefix = &key[..key.len().min(12)],
+                    consumed = entry.consumed,
+                    limit,
+                    entry_expires_in_secs = entry.expires_at.saturating_sub(now),
+                    "logical turn attempt budget refused (already exhausted)"
+                );
                 return false;
             }
             entry.consumed = entry.consumed.saturating_add(1);
@@ -751,6 +762,12 @@ impl RuntimeStates {
         // Preserve budgets already protecting active turns. Evicting one here would let a
         // high-cardinality client erase another turn's spent attempts and resume amplification.
         if registry.entries.len() >= LOGICAL_TURN_ATTEMPT_MAX_KEYS {
+            tracing::warn!(
+                target: "logical_turn_budget",
+                key_prefix = &key[..key.len().min(12)],
+                tracked_keys = registry.entries.len(),
+                "logical turn attempt budget refused (registry at capacity)"
+            );
             return false;
         }
         registry.entries.insert(
