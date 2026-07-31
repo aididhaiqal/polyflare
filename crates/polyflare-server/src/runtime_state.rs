@@ -90,7 +90,18 @@ const LOGICAL_TURN_ATTEMPT_CLEANUP_INTERVAL_SECS: i64 = 60;
 struct LogicalTurnAttempts {
     consumed: u32,
     expires_at: i64,
+    /// When the budget was last spent. An exhausted entry older than
+    /// [`LOGICAL_TURN_PROBE_INTERVAL_SECS`] grants ONE probe attempt instead of refusing: the
+    /// burst that exhausted it was seconds long (2026-07-31: 8 consumes in ~10s against a failing
+    /// upstream), but the entry lives 15 minutes and every user retry was refused instantly for
+    /// that whole window — long after the upstream had recovered. One attempt per interval keeps
+    /// the anti-amplification property (a hot loop still can't spin) while giving a deliberate
+    /// human retry a real chance.
+    last_consumed_at: i64,
 }
+
+/// How long an exhausted budget refuses before granting a single probe attempt.
+const LOGICAL_TURN_PROBE_INTERVAL_SECS: i64 = 60;
 
 #[derive(Default)]
 struct LogicalTurnAttemptRegistry {
@@ -740,6 +751,21 @@ impl RuntimeStates {
         }
 
         if let Some(entry) = registry.entries.get_mut(key) {
+            if entry.consumed >= limit
+                && now.saturating_sub(entry.last_consumed_at) >= LOGICAL_TURN_PROBE_INTERVAL_SECS
+            {
+                // Exhausted, but cold: the failure burst is over. Spend the probe (stay at the
+                // limit so the NEXT retry inside the interval is still refused) and let this one
+                // through — content-free log so the grant is visible next to the refusals.
+                entry.last_consumed_at = now;
+                entry.expires_at = now.saturating_add(LOGICAL_TURN_ATTEMPT_TTL_SECS);
+                tracing::info!(
+                    target: "logical_turn_budget",
+                    key_prefix = &key[..key.len().min(12)],
+                    "exhausted budget granted a probe attempt after cooldown"
+                );
+                return true;
+            }
             if entry.consumed >= limit {
                 // Content-free: `key` is already a sha256 of (pool, session, thread, turn_id).
                 // Logged because the client-visible 400 this refusal becomes carried NO trace of
@@ -756,6 +782,7 @@ impl RuntimeStates {
             }
             entry.consumed = entry.consumed.saturating_add(1);
             entry.expires_at = now.saturating_add(LOGICAL_TURN_ATTEMPT_TTL_SECS);
+            entry.last_consumed_at = now;
             return true;
         }
 
@@ -775,6 +802,7 @@ impl RuntimeStates {
             LogicalTurnAttempts {
                 consumed: 1,
                 expires_at: now.saturating_add(LOGICAL_TURN_ATTEMPT_TTL_SECS),
+                last_consumed_at: now,
             },
         );
         true
@@ -3660,6 +3688,32 @@ mod tests {
                 .is_err(),
             "an unchanged gate must not re-notify"
         );
+    }
+
+    /// The 2026-07-31 sharp edge: a failure burst exhausts the budget in seconds, but the entry
+    /// lives 15 minutes and refreshes on every retry — so the user's deliberate retry after the
+    /// outage was refused instantly for the whole window. An exhausted-but-cold entry now grants
+    /// exactly ONE probe per cooldown interval; a hot loop is still refused.
+    #[test]
+    fn an_exhausted_budget_grants_one_probe_after_cooldown() {
+        let rs = RuntimeStates::new();
+        let key = Some("turn-key");
+        for _ in 0..3 {
+            assert!(rs.try_consume_logical_turn_attempt(key, 3, 1_000));
+        }
+        // Hot: refused immediately, and still refused on rapid retries.
+        assert!(!rs.try_consume_logical_turn_attempt(key, 3, 1_005));
+        assert!(!rs.try_consume_logical_turn_attempt(key, 3, 1_030));
+        // Cold (>= 60s since the last consume): one probe passes...
+        assert!(
+            rs.try_consume_logical_turn_attempt(key, 3, 1_000 + 61),
+            "a cold exhausted budget must grant a probe"
+        );
+        // ...and the probe re-heats the entry: the next retry inside the interval is refused.
+        assert!(!rs.try_consume_logical_turn_attempt(key, 3, 1_000 + 62));
+        // A completion still clears outright.
+        rs.clear_logical_turn_attempts(key);
+        assert!(rs.try_consume_logical_turn_attempt(key, 3, 1_000 + 63));
     }
 
     #[test]
