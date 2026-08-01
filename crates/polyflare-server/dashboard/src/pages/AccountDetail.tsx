@@ -9,8 +9,9 @@
 // pool, alias, pause/resume, delete) via the shared `useAccountActions()` hook (Task 7,
 // `../lib/useAccountActions`) — each wired control calls `actions.patch.mutate({id, body})` directly
 // or opens one of the hook's confirmation dialogs. Controls with no backing field in this MVP schema
-// Limit warm-up, force probe, and credential export remain unavailable until they have explicit
-// backend operations. Rate-limit reset credits are live through the reset-credit optimizer.
+// Limit warm-up remains unavailable until it has an explicit backend field. Rate-limit reset
+// credits are live through the reset-credit optimizer; force probe and credential export are live
+// through crate::account_ops.
 //
 // Field mapping (see read_api.rs::AccountDetailView / src/lib/api.ts's mirror):
 //   rail rows                 <- useAccounts() (AccountView[] — DOES have an `alias` field; Task 4b
@@ -44,8 +45,10 @@
 //                                 Rate-limit resets: live optimizer candidate, banked count,
 //                                 recommendation, reason, and idempotent account consume.
 //                                 Operations: Pause/Resume and Delete are EDITABLE (wired to
-//                                 actions.patch / actions.openDelete); Force probe/Re-authenticate/
-//                                 Export auth remain plain disabled buttons — no backend for them.
+//                                 actions.patch / actions.openDelete). Re-authenticate opens the
+//                                 targeted OAuth dialog; Force probe POSTs /probe (refresh
+//                                 credential + live usage, no inference); Export auth opens the
+//                                 audited codex auth.json export dialog.
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
@@ -79,6 +82,7 @@ import {
   useAccount,
   useAccountTrends,
   useAccounts,
+  useProbeAccount,
   useRedeemAccountResetCredit,
   useResetCreditPlan,
 } from "../lib/queries";
@@ -91,6 +95,7 @@ import {
 } from "../privacy/ScreenShield";
 import { Card } from "../ui/Card";
 import { CodexOnboardingDialog } from "../ui/CodexOnboardingDialog";
+import { ExportAuthDialog } from "../ui/ExportAuthDialog";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { Col, Grid } from "../ui/Grid";
 import {
@@ -98,6 +103,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Coins,
+  Download,
   Flame,
   Key,
   Layers,
@@ -110,6 +116,7 @@ import {
   Search,
   ShieldCheck,
   Trash2,
+  Zap,
   type LucideIcon,
 } from "../ui/icons";
 import { providerBrandKey, ProviderTag } from "../ui/ProviderTag";
@@ -577,6 +584,8 @@ function DetailContent({
   const { active } = useScreenShield();
   const { mode: quotaMode } = useQuotaDisplayPreference();
   const [reauthOpen, setReauthOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const probe = useProbeAccount();
   const [resetRequestId, setResetRequestId] = useState<string | null>(null);
   const weekly = quotaRows.find((row) => row.window === "weekly") ?? quotaRows[0] ?? null;
   const weeklyDisplay = weekly ? quotaDisplayPercent(weekly.used_percent, quotaMode) : null;
@@ -718,6 +727,13 @@ function DetailContent({
             onReauthenticate={
               identity.provider === "codex" ? () => setReauthOpen(true) : undefined
             }
+            onProbe={
+              identity.provider === "codex" ? () => probe.mutate(identity.id) : undefined
+            }
+            probeBusy={probe.isPending}
+            onExportAuth={
+              identity.provider === "codex" ? () => setExportOpen(true) : undefined
+            }
             onDeleted={() => navigate("/accounts")}
           />
         </Col>
@@ -728,6 +744,12 @@ function DetailContent({
         open={reauthOpen}
         onOpenChange={setReauthOpen}
         reauth={{ accountId: identity.id, label: displayName, email: identity.email }}
+      />
+      <ExportAuthDialog
+        open={exportOpen}
+        onOpenChange={setExportOpen}
+        accountId={identity.id}
+        label={displayName}
       />
       <ConfirmDialog
         open={resetRequestId !== null}
@@ -1056,6 +1078,9 @@ function ActionsCard({
   onRedeemReset,
   actions,
   onReauthenticate,
+  onProbe,
+  probeBusy,
+  onExportAuth,
   onDeleted,
 }: {
   id: string;
@@ -1071,6 +1096,11 @@ function ActionsCard({
   actions: AccountActionsApi;
   /** Absent when the provider has no targeted re-auth flow (only Codex OAuth has one today). */
   onReauthenticate?: () => void;
+  /** Absent for providers with no usage endpoint to probe (Codex only today). */
+  onProbe?: () => void;
+  probeBusy?: boolean;
+  /** Absent for providers with no codex `auth.json` shape to export into. */
+  onExportAuth?: () => void;
   onDeleted: () => void;
 }) {
   const paused = status === "paused";
@@ -1226,10 +1256,21 @@ function ActionsCard({
             {onReauthenticate && (
               <OpButton icon={LogIn} label="Re-authenticate" onClick={onReauthenticate} />
             )}
+            {onProbe && (
+              <OpButton
+                icon={Zap}
+                label={probeBusy ? "Probing…" : "Force probe"}
+                disabled={probeBusy}
+                onClick={onProbe}
+              />
+            )}
+            {onExportAuth && (
+              <OpButton icon={Download} label="Export auth" onClick={onExportAuth} />
+            )}
           </div>
           <div className="rounded-md border border-border/60 bg-muted/35 px-3 py-2 text-[10.5px] leading-relaxed text-fg opacity-50">
-            Force probe and credential export stay unavailable until PolyFlare has explicit,
-            audited backend operations for them.
+            A probe refreshes this account&apos;s credential and live quota without spending any of
+            it. Exporting credentials reveals a live refresh token and is recorded in the logs.
           </div>
           <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/70 pt-3">
             <span className="text-[10px] font-semibold uppercase tracking-wide text-error opacity-75">

@@ -990,6 +990,42 @@ export interface OAuthOnboardingResult {
   account_id: string;
 }
 
+export interface AccountProbeResult {
+  usage_refreshed: boolean;
+  token_rotated: boolean;
+  token_state: "valid" | "expired" | "missing";
+  token_expires_at: number | null;
+  status: string;
+  probed_at: number;
+}
+
+/** The codex CLI `auth.json` document. Contains live credentials — never log or persist it. */
+export interface ExportedAuthJson {
+  OPENAI_API_KEY: string | null;
+  tokens: {
+    id_token: string;
+    access_token: string;
+    refresh_token: string;
+    account_id: string | null;
+  };
+  last_refresh: string;
+}
+
+/** Refresh this account's credential + live usage on demand. Sends no inference request. */
+export function probeAccount(id: string): Promise<AccountProbeResult> {
+  return fetchJson<AccountProbeResult>(`/api/accounts/${encodeURIComponent(id)}/probe`, {
+    method: "POST",
+  });
+}
+
+/** Export the account's credentials. The response is secret: it is never cached or stored. */
+export function exportAccountAuth(id: string): Promise<ExportedAuthJson> {
+  return fetchJson<ExportedAuthJson>(`/api/accounts/${encodeURIComponent(id)}/export-auth`, {
+    method: "POST",
+    cache: "no-store",
+  });
+}
+
 export interface OAuthDeviceStart {
   flow_id: string;
   user_code: string;

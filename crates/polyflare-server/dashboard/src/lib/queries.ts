@@ -20,7 +20,9 @@ import {
   deleteProviderModel,
   deleteTranslationRoute,
   discoverProviderModels,
+  exportAccountAuth,
   patchAccount,
+  probeAccount,
   patchKey,
   patchProviderCredentialEnabled,
   patchProviderEnabled,
@@ -679,6 +681,46 @@ export function usePatchAccount() {
       toast({ title: "Account updated", variant: "success" });
     },
     onError: (e) => toast({ title: "Update failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+/** On-demand health probe: rotates a stale token, then refetches live usage. */
+export function useProbeAccount() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (id: string) => probeAccount(id),
+    onSuccess: (result, id) => {
+      qc.invalidateQueries({ queryKey: queryKeys.account(id) });
+      qc.invalidateQueries({ queryKey: queryKeys.accounts });
+      qc.invalidateQueries({ queryKey: queryKeys.overview });
+      const rotated = result.token_rotated ? " · token rotated" : "";
+      toast(
+        result.usage_refreshed
+          ? {
+              title: "Probe complete",
+              description: `Live usage refreshed · token ${result.token_state}${rotated}`,
+              variant: "success",
+            }
+          : {
+              title: "Probe could not reach upstream",
+              description: `No trustworthy usage returned · token ${result.token_state}${rotated}`,
+              variant: "error",
+            },
+      );
+    },
+    onError: (e) =>
+      toast({ title: "Probe failed", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+/** Credential export. The result is a live secret — the caller must not persist or log it. */
+export function useExportAccountAuth() {
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (id: string) => exportAccountAuth(id),
+    onError: (e) =>
+      toast({ title: "Export failed", description: mutationErrorText(e), variant: "error" }),
   });
 }
 
