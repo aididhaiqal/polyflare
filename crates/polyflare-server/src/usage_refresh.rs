@@ -374,6 +374,38 @@ pub async fn flush_cooldown_persistence(state: &AppState) -> Result<(), StoreErr
     flush_pending_cooldowns(&state.store.accounts(), &state.runtime).await
 }
 
+/// Proactively rotate one Codex account's access token if it is stale (see
+/// [`crate::reactive_auth::ReactiveAuth::refresh_stale_codex_token`] — status/mode/staleness gates
+/// live there, under the per-account refresh lock). Failures are logged, never propagated: the
+/// sweep must go on to the next account, and a permanent OAuth failure has already parked the
+/// account's status inside the call.
+async fn refresh_stale_token(state: &AppState, account_id: &str) {
+    let reactive = crate::reactive_auth::ReactiveAuth::new(
+        state.store.clone(),
+        state.cipher.clone(),
+        state.oauth.clone(),
+        state.refresh_locks.clone(),
+        state
+            .upstream_base_url_for(polyflare_core::Provider::Codex)
+            .to_string(),
+        state
+            .upstream_base_url_for(polyflare_core::Provider::Anthropic)
+            .to_string(),
+    );
+    match reactive
+        .refresh_stale_codex_token(&AccountId::from(account_id), unix_now())
+        .await
+    {
+        Ok(true) => tracing::info!(account_id, "usage sweep rotated a stale access token"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            account_id,
+            error = ?e,
+            "usage sweep could not rotate a stale access token"
+        ),
+    }
+}
+
 /// Spawn the background usage-refresh loop: every [`REFRESH_INTERVAL`], poll each Codex account.
 pub fn spawn_usage_refresh(state: Arc<AppState>) {
     let http = match reqwest::Client::builder()
@@ -484,6 +516,11 @@ pub fn spawn_usage_refresh(state: Arc<AppState>) {
             let repo = state.store.accounts();
             let accounts = repo.list().await.unwrap_or_default();
             for account in accounts.iter().filter(|a| a.provider == "codex") {
+                // Keep IDLE accounts' tokens warm: without this, a token refreshes only when
+                // traffic next lands on the account, and one idle past its refresh token's
+                // lifetime dies straight into reauth_required. Runs first so the usage poll
+                // below sends a live bearer instead of silently skipping on a stale-token 401.
+                refresh_stale_token(&state, &account.id).await;
                 if let Err(e) = refresh_account(
                     &repo,
                     &state.cipher,
