@@ -270,6 +270,11 @@ impl Store {
         ApiKeyRepo::new(self.pool.clone())
     }
 
+    /// Dashboard passkey + session persistence (WebAuthn sign-in).
+    pub fn passkeys(&self) -> crate::PasskeyRepo {
+        crate::PasskeyRepo::new(self.pool.clone())
+    }
+
     /// The settings repository over this store's pool (Settings-subsystem Task 3). No
     /// generation-bump wiring: nothing in-process caches `settings` rows today, so there is
     /// nothing here for a generation counter to invalidate.

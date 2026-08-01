@@ -25,6 +25,7 @@ pub mod model_catalog;
 pub mod network_recovery;
 pub mod oauth_loopback;
 pub mod observability;
+pub mod passkey_auth;
 pub mod pool_quota;
 pub mod posture;
 pub mod priority_policy;

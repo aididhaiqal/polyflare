@@ -208,6 +208,8 @@ async fn spawn_app(
         })),
         ws_downstream: false,
         ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
+        webauthn: None,
+        passkey_ceremonies: std::sync::Arc::new(Default::default()),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),

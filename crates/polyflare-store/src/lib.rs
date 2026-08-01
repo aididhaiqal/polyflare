@@ -8,6 +8,7 @@ pub mod continuity_repo;
 pub mod crypto;
 pub mod import;
 pub mod onboarding_repo;
+pub mod passkey_repo;
 pub mod provider_repo;
 pub mod request_log_repo;
 pub mod reset_credit_repo;
@@ -24,6 +25,7 @@ pub use continuity_repo::{ContinuityRepo, SessionRow};
 pub use crypto::TokenCipher;
 pub use import::{import_from_codex_lb, ImportSummary};
 pub use onboarding_repo::{OnboardingFlow, OnboardingRepo};
+pub use passkey_repo::{PasskeyRepo, PasskeyRow};
 pub use provider_repo::{
     CustomProvider, NewCustomProvider, NewProviderModel, ProviderCredential,
     ProviderCredentialSecret, ProviderModel, ProviderModelPatch, ProviderRepo,

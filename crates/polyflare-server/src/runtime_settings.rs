@@ -446,6 +446,7 @@ mod tests {
             routing_strategy: Default::default(),
             pool_strategies: HashMap::new(),
             admin_token: None,
+            passkey_origin: "http://localhost:8080".to_string(),
             live_logs: false,
             http_requests_use_upstream_websocket: false,
             client_websocket_enabled: false,

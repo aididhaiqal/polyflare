@@ -51,6 +51,26 @@ enum Commands {
         #[command(subcommand)]
         command: KeysCommands,
     },
+    /// Dashboard passkey management. The BREAK-GLASS path: if every authenticator is lost, the
+    /// dashboard can be reopened from here without touching the database by hand.
+    Passkeys {
+        #[command(subcommand)]
+        command: PasskeysCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum PasskeysCommands {
+    /// List registered dashboard passkeys.
+    List,
+    /// Remove a passkey by id. Removing the LAST one restores the tokenless local-dashboard
+    /// posture on a loopback bind, which is exactly what you want when locked out — and exactly
+    /// what you do not want by accident, so it is spelled out on completion.
+    Remove {
+        /// The passkey id to remove (as shown by `passkeys list`).
+        #[arg(long = "id", value_name = "PASSKEY_ID")]
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -164,7 +184,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             KeysCommands::List => keys_list().await,
             KeysCommands::Revoke { id } => keys_revoke(&id).await,
         },
+        Commands::Passkeys { command } => match command {
+            PasskeysCommands::List => passkeys_list().await,
+            PasskeysCommands::Remove { id } => passkeys_remove(&id).await,
+        },
     }
+}
+
+async fn passkeys_list() -> Result<(), Box<dyn std::error::Error>> {
+    let config = ServeConfig::from_env()?;
+    let store = Store::open(&config.db_path).await?;
+    let rows = store.passkeys().list().await?;
+    if rows.is_empty() {
+        println!("No dashboard passkeys registered.");
+        return Ok(());
+    }
+    for row in rows {
+        println!(
+            "{}\t{}\tcreated={}\tlast_used={}",
+            row.id,
+            row.label,
+            row.created_at,
+            row.last_used_at
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "never".to_string())
+        );
+    }
+    Ok(())
+}
+
+async fn passkeys_remove(id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let config = ServeConfig::from_env()?;
+    let store = Store::open(&config.db_path).await?;
+    if !store.passkeys().delete(id).await? {
+        return Err(format!("no passkey with id {id}").into());
+    }
+    println!("Removed passkey {id}.");
+    if !store.passkeys().any_registered().await? {
+        println!(
+            "No passkeys remain. On a loopback bind with no POLYFLARE_ADMIN_TOKEN, the dashboard \
+             is now reachable WITHOUT authentication again — register a new passkey once you are \
+             back in."
+        );
+    }
+    Ok(())
 }
 
 /// The M2b server: store-backed multi-account pool selection.
@@ -295,6 +358,8 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         runtime_settings,
         ws_downstream: config.client_websocket_enabled,
         ws_relay_idle: config.websocket_idle_policy,
+        webauthn: polyflare_server::passkey_auth::build_webauthn(&config.passkey_origin),
+        passkey_ceremonies: std::sync::Arc::new(Default::default()),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
         health_tier_metrics: polyflare_server::observability::HealthTierMetrics::new(),

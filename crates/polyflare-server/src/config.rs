@@ -36,6 +36,11 @@ pub struct ServeConfig {
     /// `Authorization: Bearer <token>`). Unset is open only on a loopback bind; non-loopback
     /// management remains disabled.
     pub admin_token: Option<String>,
+    /// Origin passkey sign-in is bound to (`POLYFLARE_PASSKEY_ORIGIN`). Defaults to
+    /// `http://localhost:<bind port>`: WebAuthn forbids an IP-literal relying-party id, so the
+    /// loopback default has to be the `localhost` NAME, not `127.0.0.1`. Set this to the exact
+    /// origin the browser shows (e.g. `https://mac.tailnet.ts.net`) when serving remotely.
+    pub passkey_origin: String,
     /// Enables the dashboard live log/request stream (`POLYFLARE_LIVE_LOGS`). **Default ON**;
     /// `0`/`false`/`no`/`off` is the explicit polling-only rollback lever.
     pub live_logs: bool,
@@ -1034,6 +1039,10 @@ impl ServeConfig {
             Err(_) => HashMap::new(),
         };
         let admin_token = std::env::var("POLYFLARE_ADMIN_TOKEN").ok();
+        let passkey_origin = std::env::var("POLYFLARE_PASSKEY_ORIGIN").unwrap_or_else(|_| {
+            let port = bind_addr.rsplit(':').next().unwrap_or("8080");
+            format!("http://localhost:{port}")
+        });
         // Default ON because the dashboard uses this content-free SSE stream for both Live Logs
         // and request-list updates. Operators retain a clean polling-only rollback.
         let live_logs = live_logs_enabled_from_env();
@@ -1073,6 +1082,7 @@ impl ServeConfig {
         let model_catalog_ttl_secs = model_catalog_ttl_secs_from_env();
         let model_catalog_enabled = model_catalog_enabled_from_env();
         Ok(ServeConfig {
+            passkey_origin,
             bind_addr,
             upstream_base_url,
             anthropic_upstream_base_url,

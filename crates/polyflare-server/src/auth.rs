@@ -1,7 +1,17 @@
-//! Admin authentication for dashboard `/api/*` routes. A configured `POLYFLARE_ADMIN_TOKEN` is
-//! presented as `Authorization: Bearer <token>` — no per-user sessions or cookies. When no token
-//! is configured, a loopback-bound server may opt into [`LocalDashboardAccess`]; non-loopback
-//! deployments remain disabled rather than silently opening the management surface.
+//! Admin authentication for dashboard `/api/*` routes. Three credentials are accepted, in
+//! descending order of preference:
+//!
+//! 1. **A passkey session** — minted by `crate::passkey_auth` after a WebAuthn assertion, presented
+//!    as `Authorization: Bearer <session token>` and validated by hash lookup.
+//! 2. **`POLYFLARE_ADMIN_TOKEN`** — a shared operator token, and the break-glass path if every
+//!    passkey is lost.
+//! 3. **[`LocalDashboardAccess`]** — the tokenless loopback bypass, available ONLY while no passkey
+//!    is registered. Registering one withdraws it permanently, which is how the dashboard stops
+//!    trusting "any process that reached loopback" (including anything that could hit the
+//!    credential-export route).
+//!
+//! Non-loopback deployments with no credential configured stay disabled rather than silently
+//! opening the management surface.
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -28,34 +38,85 @@ pub fn local_dashboard_access(admin_token: Option<&str>, bind_addr: &str) -> boo
             .unwrap_or(false)
 }
 
-/// Gate every `/api/*` route on either the startup-resolved loopback marker or
-/// `POLYFLARE_ADMIN_TOKEN`. Unset on a non-loopback deployment ⇒ dashboard disabled (503).
+/// The presented `Authorization: Bearer <token>`, if any.
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .filter(|token| !token.is_empty())
+}
+
+/// Whether this request carries proof of authorization: a live passkey session, or the configured
+/// admin token. Deliberately excludes the loopback bypass — callers that also honour the bypass
+/// check it separately, so the two are never conflated.
+pub(crate) async fn presented_credential_is_valid(s: &AppState, headers: &HeaderMap) -> bool {
+    let Some(presented) = bearer_token(headers) else {
+        return false;
+    };
+    if let Some(expected) = s.admin_token.as_deref() {
+        if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+            return true;
+        }
+    }
+    // A passkey session token. Hash-lookup, never a plaintext compare — the same rule `api_keys`
+    // follows, so a database reader cannot replay a live session.
+    s.store
+        .passkeys()
+        .session_is_valid(&crate::keys::sha256_hex(presented), unix_now())
+        .await
+        .unwrap_or(false)
+}
+
+/// Whether the tokenless loopback bypass may still admit this request. It is withdrawn the moment
+/// a passkey exists: "anything that reached loopback is the operator" is only an acceptable
+/// posture while there is no way for the operator to actually prove who they are. A store error
+/// fails CLOSED (treated as "a passkey exists"), because admitting an unauthenticated caller
+/// because the database hiccuped is the wrong failure mode for an auth gate.
+async fn local_bypass_available(s: &AppState, marker_present: bool) -> bool {
+    marker_present && !s.store.passkeys().any_registered().await.unwrap_or(true)
+}
+
+/// Whether a request would be admitted, without consuming it. Powers `GET /api/auth/status`, whose
+/// whole job is telling the login screen if it already has access.
+pub(crate) async fn request_is_authenticated(
+    s: &AppState,
+    headers: &HeaderMap,
+    marker_present: bool,
+) -> bool {
+    presented_credential_is_valid(s, headers).await
+        || local_bypass_available(s, marker_present).await
+}
+
+/// Gate every `/api/*` route on a passkey session, `POLYFLARE_ADMIN_TOKEN`, or — only while no
+/// passkey is registered — the startup-resolved loopback marker. With none of the three available,
+/// a non-loopback deployment reports the dashboard disabled (503) rather than opening it.
 pub async fn require_admin(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
     req: Request,
     next: Next,
 ) -> Response {
-    if req.extensions().get::<LocalDashboardAccess>().is_some() {
+    if presented_credential_is_valid(&s, &headers).await {
         return next.run(req).await;
     }
-    let Some(expected) = s.admin_token.as_deref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "dashboard disabled: set POLYFLARE_ADMIN_TOKEN",
-        )
-            .into_response();
-    };
-    let presented = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    if presented
-        .is_some_and(|presented| constant_time_eq(presented.as_bytes(), expected.as_bytes()))
-    {
-        next.run(req).await
-    } else {
+    let marker_present = req.extensions().get::<LocalDashboardAccess>().is_some();
+    if local_bypass_available(&s, marker_present).await {
+        return next.run(req).await;
+    }
+    // A registered passkey means sign-in is possible, so an unauthenticated caller gets 401 (go
+    // sign in) rather than 503 (nothing is configured).
+    let signin_possible =
+        s.admin_token.is_some() || s.store.passkeys().any_registered().await.unwrap_or(false);
+    if signin_possible {
         (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "dashboard disabled: register a passkey from a local session or set \
+             POLYFLARE_ADMIN_TOKEN",
+        )
+            .into_response()
     }
 }
 

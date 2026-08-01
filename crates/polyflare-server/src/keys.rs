@@ -79,6 +79,15 @@ fn generate_id() -> String {
     format!("key_{}", hex::encode(bytes))
 }
 
+/// A 256-bit CSPRNG token, hex-encoded — the same `rand::rng()` source [`generate_key`] uses.
+/// Used for dashboard session tokens and passkey ceremony handles, both of which must be
+/// unguessable and are never parsed for structure.
+pub fn random_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 /// A newly created + persisted client API key, as returned to the CLI. `raw` must be printed to
 /// stdout exactly once by the caller and then dropped — this struct is not retained anywhere.
 #[derive(Debug)]

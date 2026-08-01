@@ -24,6 +24,7 @@ import {
 import type { QuotaDisplayMode } from "../lib/quotaDisplay";
 import { useQuotaDisplayPreference } from "../preferences/QuotaDisplayPreference";
 import { Card } from "../ui/Card";
+import { PasskeySettings } from "../ui/PasskeySettings";
 import { Col, Grid } from "../ui/Grid";
 import { AlertTriangle } from "../ui/icons";
 import { Switch } from "../ui/Switch";
@@ -130,6 +131,7 @@ export function Settings() {
     <div className="flex flex-col gap-3">
       <PageHeader />
       <DashboardPreferences />
+      <PasskeySettings />
       <PriorityPolicyCard />
 
       {isLoading ? (

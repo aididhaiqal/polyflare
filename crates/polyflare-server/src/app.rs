@@ -104,6 +104,12 @@ pub struct AppState {
     /// `websocket_idle_budget_secs`; read only at
     /// pump start (`crate::ws_relay::pump::run_pump`), never per-frame.
     pub ws_relay_idle: crate::ws_relay::WsRelayIdlePolicy,
+    /// Relying-party config for passkey sign-in (`crate::passkey_auth`). `None` when the configured
+    /// origin cannot host WebAuthn (an IP-literal host), in which case the passkey routes report
+    /// themselves unsupported instead of the server refusing to start.
+    pub webauthn: Option<std::sync::Arc<webauthn_rs::Webauthn>>,
+    /// In-flight passkey ceremony challenges (in-memory, short TTL, single-use).
+    pub passkey_ceremonies: std::sync::Arc<crate::passkey_auth::CeremonyStore>,
     /// Content-free live-log bus (see `crate::log_bus`): a broadcast channel + ring buffer fed
     /// from the `RequestLog` content-safety chokepoint (`crate::ingress`'s route wrappers). A
     /// later task exposes this over `/api/logs/stream`; present now so publishing starts
@@ -247,6 +253,19 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     // Register only routes whose handlers exist today.
     let api = Router::new()
         .route("/api/whoami", get(crate::auth::whoami_handler))
+        .route(
+            "/api/auth/passkey/register/start",
+            post(crate::passkey_auth::register_start_handler),
+        )
+        .route(
+            "/api/auth/passkey/register/finish",
+            post(crate::passkey_auth::register_finish_handler),
+        )
+        .route("/api/auth/passkeys", get(crate::passkey_auth::list_handler))
+        .route(
+            "/api/auth/passkeys/{id}",
+            axum::routing::delete(crate::passkey_auth::delete_handler),
+        )
         .route("/api/capabilities", get(crate::auth::capabilities_handler))
         .route(
             "/api/pools",
@@ -399,6 +418,27 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             state.clone(),
             crate::auth::require_admin,
         ));
+
+    // The sign-in surface, deliberately OUTSIDE `require_admin` — a login path behind the gate it
+    // opens could never be used. Each route is safe to expose unauthenticated: `status` returns
+    // only booleans about which methods exist, `login/start` returns a random challenge plus the
+    // credential ids allowed to answer it, and `login/finish` mints a session only for an
+    // assertion signed by a private key that never leaves the operator's authenticator.
+    let public_auth = Router::new()
+        .route("/api/auth/status", get(crate::passkey_auth::status_handler))
+        .route(
+            "/api/auth/passkey/login/start",
+            post(crate::passkey_auth::login_start_handler),
+        )
+        .route(
+            "/api/auth/passkey/login/finish",
+            post(crate::passkey_auth::login_finish_handler),
+        )
+        .route(
+            "/api/auth/logout",
+            post(crate::passkey_auth::logout_handler),
+        );
+    let api = api.merge(public_auth);
 
     // D18 Task 4: the caller-auth gate on the proxy surface. POST handlers ONLY — the GET-426
     // WS-fallback shim below is deliberately kept OUTSIDE this sub-router (see the comment on the

@@ -1,10 +1,11 @@
 // The only unauthenticated route. A single centered ccflare-styled card: no signup, no other
 // credential fields — the dashboard has exactly one shared operator token (POLYFLARE_ADMIN_TOKEN).
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { Navigate, useNavigate } from "react-router-dom";
 
 import { AccessCheck, useAuth } from "../auth/AuthProvider";
 import { ApiError, fetchJson, type WhoamiView } from "../lib/api";
+import { getAuthStatus, passkeysAvailable, signInWithPasskey } from "../lib/passkey";
 import { BrandMark } from "../shell/Sidebar";
 
 export function Login() {
@@ -13,6 +14,42 @@ export function Login() {
   const [value, setValue] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [verifying, setVerifying] = useState(false);
+  // Whether the server has a passkey to offer. Probed once so the token field can stay out of the
+  // way when the operator has a better credential available.
+  const [passkeyReady, setPasskeyReady] = useState(false);
+  const [passkeyBusy, setPasskeyBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!passkeysAvailable()) return;
+    getAuthStatus()
+      .then((status) => {
+        if (!cancelled) setPasskeyReady(status.passkey_supported && status.passkey_registered);
+      })
+      .catch(() => {
+        // A server too old for /api/auth/status simply has no passkeys to offer.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function handlePasskey() {
+    if (passkeyBusy) return;
+    setError(null);
+    setPasskeyBusy(true);
+    try {
+      const token = await signInWithPasskey();
+      signIn(token);
+      navigate("/", { replace: true });
+    } catch (err) {
+      // A cancelled prompt (the operator dismissed Touch ID) is not an error worth shouting about.
+      const aborted = err instanceof DOMException && (err.name === "NotAllowedError" || err.name === "AbortError");
+      if (!aborted) setError("Passkey sign-in failed. Try again, or use the admin token.");
+    } finally {
+      setPasskeyBusy(false);
+    }
+  }
 
   if (checkingAccess) return <AccessCheck />;
   if (token || localAccess) return <Navigate to="/" replace />;
@@ -76,8 +113,27 @@ export function Login() {
           </p>
           <h2 className="mt-2 text-2xl font-semibold tracking-[-0.035em] text-fg">Open dashboard</h2>
           <p className="mb-7 mt-2 text-[12px] leading-5 text-fg opacity-55">
-            Use the admin token configured on this PolyFlare server.
+            {passkeyReady
+              ? "Use the passkey registered on this device."
+              : "Use the admin token configured on this PolyFlare server."}
           </p>
+          {passkeyReady && (
+            <div className="mb-6 flex flex-col gap-3">
+              <button
+                type="button"
+                onClick={handlePasskey}
+                disabled={passkeyBusy}
+                className="flex items-center justify-center gap-2 rounded-lg bg-accent px-3 py-2.5 text-[12px] font-bold text-bg shadow-[0_8px_24px_hsl(var(--accent)/0.2)] transition-transform hover:-translate-y-px disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:translate-y-0"
+              >
+                {passkeyBusy ? "Waiting for passkey…" : "Sign in with passkey"}
+              </button>
+              <div className="flex items-center gap-3 text-[9px] font-bold uppercase tracking-[0.14em] text-fg opacity-30">
+                <span className="h-px flex-1 bg-border" />
+                or admin token
+                <span className="h-px flex-1 bg-border" />
+              </div>
+            </div>
+          )}
           <form onSubmit={handleSubmit} className="flex flex-col gap-3">
           <label htmlFor="admin-token" className="text-[9px] font-bold uppercase tracking-[0.14em] text-fg opacity-45">
             Admin token
@@ -85,7 +141,6 @@ export function Login() {
           <input
             id="admin-token"
             type="password"
-            autoFocus
             autoComplete="off"
             value={value}
             onChange={(event) => setValue(event.target.value)}

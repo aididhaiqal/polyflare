@@ -319,6 +319,8 @@ mod tests {
             })),
             ws_downstream: true,
             ws_relay_idle: crate::ws_relay::WsRelayIdlePolicy::default(),
+            webauthn: None,
+            passkey_ceremonies: std::sync::Arc::new(Default::default()),
             log_bus: crate::log_bus::LogBus::new(1000),
             failover_metrics: crate::observability::FailoverMetrics::new(),
             health_tier_metrics: crate::observability::HealthTierMetrics::new(),
