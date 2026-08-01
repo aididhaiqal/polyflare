@@ -34,6 +34,12 @@ pub(crate) struct WsTurnTelemetry {
     model: Option<String>,
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
+    /// The tier asked of the UPSTREAM, frozen before any response is observed. Kept apart from
+    /// `service_tier` so a turn can be read as "asked X, got Y" — without it, a turn that was
+    /// never requested as priority is indistinguishable from one the upstream declined.
+    requested_service_tier: Option<String>,
+    /// The tier the upstream REPORTED. `None` when the response carried none.
+    actual_service_tier: Option<String>,
     subagent: Option<String>,
     session_key: Option<String>,
     logical_turn_key: Option<String>,
@@ -105,7 +111,9 @@ pub(crate) fn start_turn(
         started_at: Instant::now(),
         model: (!facts.model.is_empty()).then_some(facts.model),
         reasoning_effort: facts.effort,
-        service_tier: facts.service_tier,
+        service_tier: facts.service_tier.clone(),
+        requested_service_tier: facts.service_tier,
+        actual_service_tier: None,
         subagent: facts.ctx.subagent,
         session_key: Some(session_key.value.clone()),
         logical_turn_key: facts.ctx.logical_turn_key,
@@ -126,9 +134,11 @@ impl WsTurnTelemetry {
         match decision {
             crate::priority_policy::PriorityDecision::Priority => {
                 self.service_tier = Some("priority".to_string());
+                self.requested_service_tier = Some("priority".to_string());
             }
             crate::priority_policy::PriorityDecision::Standard => {
                 self.service_tier = Some("standard".to_string());
+                self.requested_service_tier = Some("standard".to_string());
             }
             crate::priority_policy::PriorityDecision::Passthrough => {}
         }
@@ -180,6 +190,7 @@ impl WsTurnTelemetry {
                     .and_then(Value::as_str)
                     .filter(|tier| !tier.is_empty())
                 {
+                    self.actual_service_tier = Some(reported.to_string());
                     self.service_tier = Some(reported.to_string());
                 }
                 Some(WsTurnTerminal {
@@ -290,8 +301,8 @@ impl WsTurnTelemetry {
         let duration_ms = self.started_at.elapsed().as_millis() as u64;
         let request_id = format!("{:032x}", rand::random::<u128>());
         let log = RequestLog {
-            requested_service_tier: None,
-            actual_service_tier: None,
+            requested_service_tier: self.requested_service_tier,
+            actual_service_tier: self.actual_service_tier,
             method: "WS",
             path: "/responses".to_string(),
             provider: Provider::Codex.to_string(),
@@ -507,6 +518,50 @@ mod tests {
             Some("standard"),
             "an upstream downgrade must win over the requested tier"
         );
+    }
+
+    /// The requested tier must survive an upstream downgrade, or "asked priority, got standard"
+    /// is indistinguishable from "never asked for priority".
+    #[test]
+    fn a_downgrade_keeps_both_what_was_asked_and_what_was_served() {
+        let headers = HeaderMap::new();
+        let mut turn = start_turn(
+            &headers,
+            r#"{"type":"response.create","model":"gpt-5.6-sol","service_tier":"priority","input":[]}"#,
+            &super::super::session::ws_session_key(&headers, None),
+            None,
+        )
+        .unwrap();
+        turn.observe(
+            r#"{"type":"response.completed","response":{"service_tier":"default","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}"#,
+        )
+        .unwrap();
+        assert_eq!(turn.requested_service_tier.as_deref(), Some("priority"));
+        assert_eq!(turn.actual_service_tier.as_deref(), Some("default"));
+        assert_eq!(
+            turn.service_tier.as_deref(),
+            Some("default"),
+            "billing follows what was served"
+        );
+    }
+
+    /// A turn that never asked for priority must not look like a declined one.
+    #[test]
+    fn an_unrequested_turn_records_no_priority_ask() {
+        let headers = HeaderMap::new();
+        let mut turn = start_turn(
+            &headers,
+            r#"{"type":"response.create","model":"gpt-5.6-sol","input":[]}"#,
+            &super::super::session::ws_session_key(&headers, None),
+            None,
+        )
+        .unwrap();
+        turn.observe(
+            r#"{"type":"response.completed","response":{"service_tier":"default","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}"#,
+        )
+        .unwrap();
+        assert_eq!(turn.requested_service_tier, None);
+        assert_eq!(turn.actual_service_tier.as_deref(), Some("default"));
     }
 
     /// A response that reports no tier leaves the policy decision intact rather than blanking it.
