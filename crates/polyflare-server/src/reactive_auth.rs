@@ -11,7 +11,9 @@ use polyflare_anthropic::oauth::{
     classify_failure as classify_anthropic_failure, AnthropicOAuthClient,
     OAuthError as AnthropicOAuthError,
 };
-use polyflare_codex::oauth::{classify_failure, is_fedramp_account, OAuthClient, OAuthError};
+use polyflare_codex::oauth::{
+    classify_failure, is_fedramp_account, should_refresh, token_exp, OAuthClient, OAuthError,
+};
 use polyflare_core::{Account, AccountId};
 use polyflare_store::{AuthMode, PlainTokens, Store, TokenCipher};
 
@@ -136,7 +138,78 @@ impl ReactiveAuth {
                 .await;
         }
 
-        let refreshed = match self.oauth.refresh(&stored_tokens.refresh_token).await {
+        let new = match self
+            .rotate_codex_tokens(picked, &stored_tokens.refresh_token, now)
+            .await?
+        {
+            Some(new) => new,
+            None => return Ok(None),
+        };
+
+        Ok(Some(Account {
+            id: stored_account.id,
+            base_url: self.codex_base_url.clone(),
+            bearer_token: new.access_token.clone(),
+            chatgpt_account_id: stored_account.chatgpt_account_id,
+            is_fedramp: is_fedramp_account(&new.id_token),
+        }))
+    }
+
+    /// Proactively rotate a STALE Codex access token off the request path. The usage sweep calls
+    /// this each cycle so an idle account's token is kept warm instead of refreshing only when
+    /// traffic next lands on it — without this, an account idle past its refresh token's lifetime
+    /// dies straight into `reauth_required`.
+    ///
+    /// Runs for every usage-controlled status (`active`/`rate_limited`/`quota_exceeded`): a benched
+    /// account is exactly the idle account whose token would otherwise go stale. Never touches
+    /// `paused`/`reauth_required`/`deactivated`. Returns whether a rotation was persisted.
+    pub(crate) async fn refresh_stale_codex_token(
+        &self,
+        picked: &AccountId,
+        now: i64,
+    ) -> Result<bool, ReactiveAuthError> {
+        let repo = self.store.accounts();
+        let lock = self.refresh_locks.handle(picked);
+        let _guard = lock.lock().await;
+        // Fresh read under the lock: a request-path refresh may have rotated while we waited.
+        let (stored_account, stored_tokens, auth) = repo
+            .get_with_tokens_and_auth(picked.as_str(), &self.cipher)
+            .await
+            .map_err(|_| ReactiveAuthError::Internal)?
+            .ok_or(ReactiveAuthError::Internal)?;
+        if !matches!(
+            stored_account.status.as_str(),
+            "active" | "rate_limited" | "quota_exceeded"
+        ) {
+            return Ok(false);
+        }
+        if auth.mode() != AuthMode::CodexOauth {
+            return Ok(false);
+        }
+        if !should_refresh(
+            token_exp(&stored_tokens.access_token),
+            stored_account.last_refresh,
+            now,
+        ) {
+            return Ok(false);
+        }
+        Ok(self
+            .rotate_codex_tokens(picked, &stored_tokens.refresh_token, now)
+            .await?
+            .is_some())
+    }
+
+    /// The shared Codex rotate-and-persist step. The caller MUST hold this account's refresh lock
+    /// and have re-read `stored_refresh_token` under it. `Ok(None)` is a transient OAuth failure —
+    /// stored credentials untouched, the caller's original error (if any) stays visible.
+    async fn rotate_codex_tokens(
+        &self,
+        picked: &AccountId,
+        stored_refresh_token: &str,
+        now: i64,
+    ) -> Result<Option<PlainTokens>, ReactiveAuthError> {
+        let repo = self.store.accounts();
+        let refreshed = match self.oauth.refresh(stored_refresh_token).await {
             Ok(refreshed) => refreshed,
             Err(OAuthError::Endpoint {
                 code: Some(code), ..
@@ -187,16 +260,15 @@ impl ReactiveAuth {
             }
         }
         if !persisted {
+            // Fail closed, immediately: the upstream exchange already CONSUMED the stored refresh
+            // token, so the row now holds dead credentials whatever we do. Marking here surfaces
+            // the account as needing re-auth at the moment it became true, instead of `active`
+            // limping along until the next refresh burns as `refresh_token_reused`. Best-effort:
+            // if storage is down this write fails too, and the next refresh attempt re-marks.
+            let _ = repo.update_status(picked.as_str(), "reauth_required").await;
             return Err(ReactiveAuthError::Internal);
         }
-
-        Ok(Some(Account {
-            id: stored_account.id,
-            base_url: self.codex_base_url.clone(),
-            bearer_token: new.access_token.clone(),
-            chatgpt_account_id: stored_account.chatgpt_account_id,
-            is_fedramp: is_fedramp_account(&new.id_token),
-        }))
+        Ok(Some(new))
     }
 
     /// The Anthropic half of [`Self::refresh_after_unauthorized`]. Called with the per-account lock
@@ -284,8 +356,10 @@ impl ReactiveAuth {
         }
         // Fail closed: upstream may have rotated the refresh token, so a token we could not store
         // is one that will not survive a restart. Using it now would hide an account we have
-        // already lost the ability to refresh.
+        // already lost the ability to refresh. Mark it immediately (best-effort — storage may
+        // still be down) rather than leaving `active` credentials that die on the next refresh.
         if !persisted {
+            let _ = repo.update_status(picked.as_str(), "reauth_required").await;
             return Err(ReactiveAuthError::Internal);
         }
 
@@ -462,7 +536,7 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ReactiveAuthError::Internal)));
-        let (_, stored) = store
+        let (account, stored) = store
             .accounts()
             .get_with_tokens("acct-persist-fails", &cipher)
             .await
@@ -470,6 +544,152 @@ mod tests {
             .unwrap();
         assert_eq!(stored.access_token, "old-access");
         assert_eq!(stored.refresh_token, "old-refresh");
+        // The upstream exchange already consumed the stored refresh token, so the row now holds
+        // dead credentials: the account must be parked immediately, not left `active` to die as
+        // `refresh_token_reused` on its next refresh.
+        assert_eq!(account.status, "reauth_required");
+    }
+
+    fn codex_account(id: &str, status: &str, last_refresh: i64) -> StoredAccount {
+        StoredAccount {
+            id: id.to_string(),
+            chatgpt_account_id: Some(format!("chatgpt-{id}")),
+            chatgpt_user_id: None,
+            email: "sweep@example.test".to_string(),
+            alias: None,
+            workspace_id: None,
+            workspace_label: None,
+            seat_type: None,
+            plan_type: "plus".to_string(),
+            routing_policy: "eligible".to_string(),
+            last_refresh,
+            created_at: 1,
+            status: status.to_string(),
+            deactivation_reason: None,
+            reset_at: None,
+            blocked_at: None,
+            security_work_authorized: false,
+            usage_cap_percent: None,
+            usage_cap_override: false,
+            provider: "codex".to_string(),
+            pool: None,
+        }
+    }
+
+    async fn sweep_fixture(
+        dir: &tempfile::TempDir,
+        oauth: MockOAuth,
+        status: &str,
+        last_refresh: i64,
+    ) -> (Store, TokenCipher, ReactiveAuth) {
+        let oauth_url = oauth.spawn().await;
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[61u8; 32]).unwrap();
+        store
+            .accounts()
+            .insert(
+                &codex_account("acct-sweep", status, last_refresh),
+                &PlainTokens {
+                    // Not a JWT, so staleness runs on the age gate against `last_refresh`.
+                    access_token: "old-access".to_string(),
+                    refresh_token: "old-refresh".to_string(),
+                    id_token: "old-id".to_string(),
+                },
+                &cipher,
+            )
+            .await
+            .unwrap();
+        let auth = ReactiveAuth::new(
+            store.clone(),
+            cipher.clone(),
+            OAuthClient::new(oauth_url).unwrap(),
+            RefreshLocks::default(),
+            "https://example.test/backend-api/codex".to_string(),
+            "https://example.test/anthropic".to_string(),
+        );
+        (store, cipher, auth)
+    }
+
+    /// Ten days after `last_refresh = 1` — comfortably past the 8-day no-exp age gate.
+    const STALE_NOW: i64 = 10 * 86_400;
+
+    #[tokio::test]
+    async fn sweep_rotates_a_stale_token_and_persists_it() {
+        let oauth = MockOAuth::ok("new-access", "new-refresh", "eyJhbGciOiJub25lIn0.e30.sig");
+        let oauth_handle = oauth.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cipher, auth) = sweep_fixture(&dir, oauth, "active", 1).await;
+
+        let rotated = auth
+            .refresh_stale_codex_token(&AccountId::from("acct-sweep"), STALE_NOW)
+            .await
+            .unwrap();
+
+        assert!(rotated);
+        assert_eq!(oauth_handle.hit_count(), 1);
+        let (_, stored) = store
+            .accounts()
+            .get_with_tokens("acct-sweep", &cipher)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.access_token, "new-access");
+        assert_eq!(stored.refresh_token, "new-refresh");
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_a_benched_accounts_token_warm_but_never_a_parked_one() {
+        // A quota-benched account is exactly the idle account whose token would otherwise go
+        // stale over a week-long bench.
+        let oauth = MockOAuth::ok("new-access", "new-refresh", "eyJhbGciOiJub25lIn0.e30.sig");
+        let oauth_handle = oauth.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, auth) = sweep_fixture(&dir, oauth, "quota_exceeded", 1).await;
+        assert!(auth
+            .refresh_stale_codex_token(&AccountId::from("acct-sweep"), STALE_NOW)
+            .await
+            .unwrap());
+        assert_eq!(oauth_handle.hit_count(), 1);
+
+        // Parked statuses are untouchable: only an operator re-auth may revive them.
+        for status in ["reauth_required", "paused", "deactivated"] {
+            let oauth = MockOAuth::ok("new-access", "new-refresh", "eyJhbGciOiJub25lIn0.e30.sig");
+            let oauth_handle = oauth.clone();
+            let dir = tempfile::tempdir().unwrap();
+            let (_, _, auth) = sweep_fixture(&dir, oauth, status, 1).await;
+            assert!(
+                !auth
+                    .refresh_stale_codex_token(&AccountId::from("acct-sweep"), STALE_NOW)
+                    .await
+                    .unwrap(),
+                "{status} must not be refreshed"
+            );
+            assert_eq!(oauth_handle.hit_count(), 0, "{status} must not hit OAuth");
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_leaves_a_fresh_token_alone() {
+        let oauth = MockOAuth::ok("new-access", "new-refresh", "eyJhbGciOiJub25lIn0.e30.sig");
+        let oauth_handle = oauth.clone();
+        let dir = tempfile::tempdir().unwrap();
+        // Refreshed "now": the age gate is nowhere near due.
+        let (store, cipher, auth) = sweep_fixture(&dir, oauth, "active", STALE_NOW).await;
+
+        let rotated = auth
+            .refresh_stale_codex_token(&AccountId::from("acct-sweep"), STALE_NOW)
+            .await
+            .unwrap();
+
+        assert!(!rotated);
+        assert_eq!(oauth_handle.hit_count(), 0);
+        let (_, stored) = store
+            .accounts()
+            .get_with_tokens("acct-sweep", &cipher)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.access_token, "old-access");
     }
 }
 

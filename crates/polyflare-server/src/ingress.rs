@@ -859,6 +859,14 @@ pub(crate) async fn resolve_core_account(
                         }
                     }
                     if !persisted {
+                        // The exchange already CONSUMED the stored refresh token, so the row now
+                        // holds dead credentials regardless. Mark it now (best-effort — storage
+                        // may still be down) instead of leaving an `active` account that dies as
+                        // `refresh_token_reused` on its next refresh attempt.
+                        let _ = repo.update_status(picked.as_str(), "reauth_required").await;
+                        state
+                            .runtime
+                            .note_account_status(picked.as_str(), "reauth_required");
                         return Err(internal_error());
                     }
                     tokens = new;
