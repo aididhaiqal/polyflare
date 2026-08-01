@@ -484,7 +484,7 @@ struct RouteOutcome {
     upstream_model: Option<String>,
     upstream_transport: Option<String>,
     profile_revision: Option<String>,
-    custom_pricing: Option<(f64, f64, f64)>,
+    custom_pricing: Option<polyflare_core::pricing::CustomModelRates>,
     /// The requested (native path) or resolved target (translated/aliased path) model string.
     model: Option<String>,
     /// `reasoning.effort` for this request, when known.
@@ -2033,11 +2033,16 @@ fn apply_captured_usage(
     store: &Store,
     request_id: &str,
     model: Option<&str>,
-    custom_pricing: Option<(f64, f64, f64)>,
+    custom_pricing: Option<polyflare_core::pricing::CustomModelRates>,
+    effective_service_tier: Option<&str>,
     captured: usage_capture::CapturedUsage,
 ) -> Option<tokio::sync::oneshot::Receiver<bool>> {
     let u = captured.usage.unwrap_or_default();
-    let cost = if let Some((input_price, cached_price, output_price)) = custom_pricing {
+    // `effective_service_tier` is the tier the UPSTREAM REPORTED, never the one requested: a
+    // provider may accept a priority request and still serve it as standard, and charging the
+    // premium for that turn would overstate cost.
+    let cost = if let Some(rates) = custom_pricing {
+        let (input_price, cached_price, output_price) = rates.rates_for(effective_service_tier);
         u.input_tokens.zip(u.output_tokens).map(|(input, output)| {
             let cached = u.cached_input_tokens.unwrap_or(0).clamp(0, input.max(0));
             let uncached = input.saturating_sub(cached);
@@ -2067,7 +2072,7 @@ fn apply_captured_usage(
                     input,
                     output,
                     u.cached_input_tokens.unwrap_or(0),
-                    None,
+                    effective_service_tier,
                 )
             })
     };
@@ -2213,6 +2218,9 @@ async fn responses_route_with_transport(
     // `RequestLog` below (`model: outcome.model` takes ownership of the original).
     let model_for_cost = outcome.model.clone();
     let custom_pricing = outcome.custom_pricing;
+    // The tier the upstream actually served this turn at — cloned here for the same reason
+    // `model_for_cost` is: `outcome` is moved into `RequestLog` below.
+    let billed_service_tier = outcome.service_tier.clone();
     let estimated_tokens = outcome.estimated_tokens;
     let response_transport_kind = response_transport(&response);
     let eof_outcome = if response_transport_kind == "sse" {
@@ -2327,6 +2335,7 @@ async fn responses_route_with_transport(
                 &request_id,
                 model.as_deref(),
                 custom_pricing,
+                billed_service_tier.as_deref(),
                 captured,
             );
             if let Some(receipt) = receipt {
@@ -2492,7 +2501,16 @@ async fn execute_custom_models(
         custom.cached_input_per_million,
         custom.output_per_million,
     ) {
-        (Some(input), Some(cached), Some(output)) => Some((input, cached, output)),
+        (Some(input), Some(cached), Some(output)) => {
+            Some(polyflare_core::pricing::CustomModelRates {
+                input_per_1m: input,
+                cached_input_per_1m: cached,
+                output_per_1m: output,
+                priority_input_per_1m: custom.priority_input_per_million,
+                priority_cached_input_per_1m: custom.priority_cached_input_per_million,
+                priority_output_per_1m: custom.priority_output_per_million,
+            })
+        }
         _ => None,
     };
     (response, outcome)
@@ -2611,7 +2629,16 @@ async fn execute_anthropic_translation(
                     custom.cached_input_per_million,
                     custom.output_per_million,
                 ) {
-                    (Some(input), Some(cached), Some(output)) => Some((input, cached, output)),
+                    (Some(input), Some(cached), Some(output)) => {
+                        Some(polyflare_core::pricing::CustomModelRates {
+                            input_per_1m: input,
+                            cached_input_per_1m: cached,
+                            output_per_1m: output,
+                            priority_input_per_1m: custom.priority_input_per_million,
+                            priority_cached_input_per_1m: custom.priority_cached_input_per_million,
+                            priority_output_per_1m: custom.priority_output_per_million,
+                        })
+                    }
                     _ => None,
                 },
                 model: Some(model_alias.target_model.clone()),
@@ -3700,6 +3727,9 @@ async fn messages_route(
         .unwrap_or_else(|| builtin_provider.to_string());
     let model_for_cost = outcome.model.clone();
     let custom_pricing = outcome.custom_pricing;
+    // The tier the upstream actually served this turn at — cloned here for the same reason
+    // `model_for_cost` is: `outcome` is moved into `RequestLog` below.
+    let billed_service_tier = outcome.service_tier.clone();
     let estimated_tokens = outcome.estimated_tokens;
     let response_transport_kind = response_transport(&response);
     let eof_outcome = if response_transport_kind == "sse" {
@@ -3789,6 +3819,7 @@ async fn messages_route(
                 &request_id,
                 model.as_deref(),
                 custom_pricing,
+                billed_service_tier.as_deref(),
                 captured,
             );
             if let Some(receipt) = receipt {
@@ -4137,7 +4168,16 @@ async fn messages_handler_custom_responses(
             custom.cached_input_per_million,
             custom.output_per_million,
         ) {
-            (Some(input), Some(cached), Some(output)) => Some((input, cached, output)),
+            (Some(input), Some(cached), Some(output)) => {
+                Some(polyflare_core::pricing::CustomModelRates {
+                    input_per_1m: input,
+                    cached_input_per_1m: cached,
+                    output_per_1m: output,
+                    priority_input_per_1m: custom.priority_input_per_million,
+                    priority_cached_input_per_1m: custom.priority_cached_input_per_million,
+                    priority_output_per_1m: custom.priority_output_per_million,
+                })
+            }
             _ => None,
         },
         model: Some(model_alias.target_model),
@@ -4763,7 +4803,7 @@ mod tests {
                 duration_ms: Some(9000),
                 protocol_outcome: polyflare_store::RequestProtocolOutcome::Completed,
             };
-            apply_captured_usage(&store, "rq", Some("gpt-5.6-sol"), None, captured);
+            apply_captured_usage(&store, "rq", Some("gpt-5.6-sol"), None, None, captured);
             store.flush_background_writes().await.unwrap();
 
             let row = repo
@@ -4828,6 +4868,7 @@ mod tests {
                 "rq2",
                 Some("gpt-5.6-sol"),
                 None,
+                None,
                 CapturedUsage {
                     usage: None,
                     ttft_ms: Some(500),
@@ -4866,6 +4907,7 @@ mod tests {
                 "rq3",
                 Some("gpt-5.6-sol"),
                 None,
+                None,
                 CapturedUsage {
                     usage: Some(ResponseUsage {
                         input_tokens: Some(1_000),
@@ -4892,6 +4934,113 @@ mod tests {
             assert_eq!(row.output_tokens, None);
             assert_eq!(row.cached_input_tokens, None);
             assert_eq!(row.cost_usd, None);
+        }
+
+        /// Billing must follow the tier the UPSTREAM REPORTED, not the tier requested. A custom
+        /// provider that accepts a priority request and serves it as standard must be charged the
+        /// standard rate — the case that motivated the priority rate columns.
+        #[tokio::test]
+        async fn custom_model_cost_uses_the_reported_tier_not_the_requested_one() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+            let repo = store.request_log();
+            // $2/1M input, $0.50 cached, $8 output; priority is double across the board.
+            let rates = polyflare_core::pricing::CustomModelRates {
+                input_per_1m: 2.0,
+                cached_input_per_1m: 0.5,
+                output_per_1m: 8.0,
+                priority_input_per_1m: Some(4.0),
+                priority_cached_input_per_1m: Some(1.0),
+                priority_output_per_1m: Some(16.0),
+            };
+            let captured = || CapturedUsage {
+                usage: Some(ResponseUsage {
+                    input_tokens: Some(1_000_000),
+                    output_tokens: Some(1_000_000),
+                    cached_input_tokens: Some(0),
+                    ..Default::default()
+                }),
+                ttft_ms: None,
+                duration_ms: Some(10),
+                protocol_outcome: polyflare_store::RequestProtocolOutcome::Completed,
+            };
+
+            for (request_id, tier, expected) in [
+                ("standard-turn", Some("standard"), 10.0),
+                // The premium applies only here.
+                ("priority-turn", Some("priority"), 20.0),
+                ("fast-turn", Some("fast"), 20.0),
+                // Requested priority, served standard: bill standard.
+                ("downgraded-turn", Some("standard"), 10.0),
+                ("untiered-turn", None, 10.0),
+            ] {
+                repo.insert(&sample_record(request_id)).await.unwrap();
+                apply_captured_usage(&store, request_id, None, Some(rates), tier, captured());
+                store.flush_background_writes().await.unwrap();
+                let row = repo
+                    .list(50, 0)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|r| r.request_id.as_deref() == Some(request_id))
+                    .unwrap();
+                let cost = row.cost_usd.expect("custom pricing must produce a cost");
+                assert!(
+                    (cost - expected).abs() < 1e-9,
+                    "{request_id} at tier {tier:?}: expected {expected}, got {cost}"
+                );
+            }
+        }
+
+        /// A model with no configured priority rate is never charged a premium, even for a turn the
+        /// upstream genuinely served as priority.
+        #[tokio::test]
+        async fn a_model_without_priority_rates_bills_standard_for_a_priority_turn() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+            let repo = store.request_log();
+            let rates = polyflare_core::pricing::CustomModelRates {
+                input_per_1m: 2.0,
+                cached_input_per_1m: 0.5,
+                output_per_1m: 8.0,
+                priority_input_per_1m: None,
+                priority_cached_input_per_1m: None,
+                priority_output_per_1m: None,
+            };
+            repo.insert(&sample_record("no-priority-rate"))
+                .await
+                .unwrap();
+            apply_captured_usage(
+                &store,
+                "no-priority-rate",
+                None,
+                Some(rates),
+                Some("priority"),
+                CapturedUsage {
+                    usage: Some(ResponseUsage {
+                        input_tokens: Some(1_000_000),
+                        output_tokens: Some(1_000_000),
+                        cached_input_tokens: Some(0),
+                        ..Default::default()
+                    }),
+                    ttft_ms: None,
+                    duration_ms: Some(10),
+                    protocol_outcome: polyflare_store::RequestProtocolOutcome::Completed,
+                },
+            );
+            store.flush_background_writes().await.unwrap();
+            let row = repo
+                .list(10, 0)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.request_id.as_deref() == Some("no-priority-rate"))
+                .unwrap();
+            let cost = row.cost_usd.unwrap();
+            assert!(
+                (cost - 10.0).abs() < 1e-9,
+                "expected standard 10.0, got {cost}"
+            );
         }
     }
 }

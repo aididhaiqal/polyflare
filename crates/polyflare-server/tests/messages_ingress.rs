@@ -337,6 +337,9 @@ async fn messages_route_can_translate_to_a_custom_responses_provider() {
     store
         .providers()
         .create_model(&NewProviderModel {
+            priority_input_per_million: None,
+            priority_cached_input_per_million: None,
+            priority_output_per_million: None,
             id: "model-custom-responses".into(),
             provider_id: "provider-custom-responses".into(),
             public_model: "custom-public".into(),
@@ -508,6 +511,9 @@ async fn native_custom_messages_failover_attributes_usage_and_cost_to_the_final_
         store
             .providers()
             .create_model(&NewProviderModel {
+                priority_input_per_million: None,
+                priority_cached_input_per_million: None,
+                priority_output_per_million: None,
                 id: format!("model-{slug}"),
                 provider_id: provider_id.into(),
                 public_model: "anthropic-balanced".into(),
@@ -645,6 +651,9 @@ async fn admitted_claude_session_stays_on_its_completed_custom_target() {
         store
             .providers()
             .create_model(&NewProviderModel {
+                priority_input_per_million: None,
+                priority_cached_input_per_million: None,
+                priority_output_per_million: None,
                 id: format!("model-{slug}"),
                 provider_id: provider_id.into(),
                 public_model: "claude-affinity-model".into(),
@@ -800,6 +809,9 @@ async fn native_custom_messages_image_uses_only_a_vision_capable_target() {
         store
             .providers()
             .create_model(&NewProviderModel {
+                priority_input_per_million: None,
+                priority_cached_input_per_million: None,
+                priority_output_per_million: None,
                 id: format!("model-{slug}"),
                 provider_id: provider_id.into(),
                 public_model: "claude-vision-balanced".into(),
@@ -913,6 +925,9 @@ async fn responses_route_can_translate_to_a_custom_anthropic_provider() {
     store
         .providers()
         .create_model(&NewProviderModel {
+            priority_input_per_million: None,
+            priority_cached_input_per_million: None,
+            priority_output_per_million: None,
             id: "model-custom-anthropic".into(),
             provider_id: "provider-custom-anthropic".into(),
             public_model: "anthropic-public".into(),

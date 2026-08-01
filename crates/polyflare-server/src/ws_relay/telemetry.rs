@@ -170,13 +170,26 @@ impl WsTurnTelemetry {
 
         let value: Value = serde_json::from_str(frame).ok()?;
         match value.get("type").and_then(Value::as_str)? {
-            "response.completed" => Some(WsTurnTerminal {
-                error_code: None,
-                status: StatusCode::OK,
-                usage: parse_response_usage(frame),
-                routing: WsRoutingOutcome::Completed,
-                protocol_outcome: RequestProtocolOutcome::Completed,
-            }),
+            "response.completed" => {
+                // Prefer the tier the RESPONSE reports over the one the policy asked for: an
+                // upstream may accept a priority request and still serve it as standard, and
+                // billing the premium for that turn would overstate cost.
+                if let Some(reported) = value
+                    .get("response")
+                    .and_then(|response| response.get("service_tier"))
+                    .and_then(Value::as_str)
+                    .filter(|tier| !tier.is_empty())
+                {
+                    self.service_tier = Some(reported.to_string());
+                }
+                Some(WsTurnTerminal {
+                    status: StatusCode::OK,
+                    usage: parse_response_usage(frame),
+                    routing: WsRoutingOutcome::Completed,
+                    protocol_outcome: RequestProtocolOutcome::Completed,
+                    error_code: None,
+                })
+            }
             "response.failed" => Some(WsTurnTerminal {
                 error_code: Self::terminal_error_code(&value),
                 status: StatusCode::BAD_GATEWAY,
@@ -463,6 +476,53 @@ mod tests {
             "request telemetry must link to the relay's exact continuity session"
         );
         assert!(turn.ttft_ms.is_some());
+    }
+
+    /// The billing-correctness case: the client asked for priority, the upstream served the turn
+    /// as standard, and the recorded tier must follow the RESPONSE. Costing this turn at the
+    /// priority rate would charge a premium for service that was never delivered.
+    #[test]
+    fn a_downgraded_turn_is_recorded_at_the_tier_the_response_reports() {
+        let headers = HeaderMap::new();
+        let mut turn = start_turn(
+            &headers,
+            r#"{"type":"response.create","model":"gpt-5.6-sol","service_tier":"priority","input":[]}"#,
+            &super::super::session::ws_session_key(&headers, None),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            turn.service_tier.as_deref(),
+            Some("priority"),
+            "the requested tier is what we start from"
+        );
+        turn.observe(
+            r#"{"type":"response.completed","response":{"service_tier":"standard","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            turn.service_tier.as_deref(),
+            Some("standard"),
+            "an upstream downgrade must win over the requested tier"
+        );
+    }
+
+    /// A response that reports no tier leaves the policy decision intact rather than blanking it.
+    #[test]
+    fn a_response_without_a_tier_keeps_the_policy_decision() {
+        let headers = HeaderMap::new();
+        let mut turn = start_turn(
+            &headers,
+            r#"{"type":"response.create","model":"gpt-5.6-sol","service_tier":"priority","input":[]}"#,
+            &super::super::session::ws_session_key(&headers, None),
+            None,
+        )
+        .unwrap();
+        turn.observe(
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}"#,
+        )
+        .unwrap();
+        assert_eq!(turn.service_tier.as_deref(), Some("priority"));
     }
 
     #[test]

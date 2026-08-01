@@ -557,6 +557,10 @@ function ProviderModelRow({
     )
     .map((candidate) => candidate.display_name);
   const price = compactPrice(model);
+  // A priority tariff only counts when BOTH ends are set — the server falls back to standard
+  // otherwise, so showing a badge for a half-configured pair would misreport what gets billed.
+  const priorityPriced =
+    model.priority_input_per_million !== null && model.priority_output_per_million !== null;
   const routeOnly = !model.visible_in_codex && !model.visible_in_openai;
 
   return (
@@ -577,6 +581,11 @@ function ProviderModelRow({
         <span className="flex shrink-0 items-center gap-1.5 text-[8px] text-fg opacity-45">
           {model.context_window ? `${Math.round(model.context_window / 1000)}k` : "—"}
           {price && <span className="opacity-80">{price}</span>}
+          {priorityPriced && (
+            <span className="text-accent" title="Has a separate priority-tier rate">
+              prio
+            </span>
+          )}
           {isProviderModelProfile(model) && <span className="text-signal">profile</span>}
           {targetProviders.length > 1 && (
             <span className="text-accent">×{targetProviders.length}</span>
@@ -635,6 +644,16 @@ function ProviderModelRow({
             <span className="uppercase tracking-wide opacity-65">USD / 1M</span> ·{" "}
             {providerPricingSummary(model)}
           </div>
+          {priorityPriced && (
+            <div className="mt-1 text-[8px] text-accent opacity-80">
+              Priority · Input ${model.priority_input_per_million} · Cache{" "}
+              {model.priority_cached_input_per_million ?? model.priority_input_per_million} ·
+              Output ${model.priority_output_per_million}
+              <span className="ml-1 text-fg opacity-45">
+                billed only when upstream reports priority
+              </span>
+            </div>
+          )}
           {isProviderModelProfile(model) && (
             <div className="mt-1 inline-flex rounded border border-signal/25 bg-signal/[0.07] px-1.5 py-0.5 text-[8px] font-semibold text-signal">
               profile · {model.instruction_mode}
@@ -1566,6 +1585,15 @@ function ModelForm({
   const [outputPrice, setOutputPrice] = useState(
     source?.output_per_million?.toString() ?? "",
   );
+  const [priorityInputPrice, setPriorityInputPrice] = useState(
+    source?.priority_input_per_million?.toString() ?? "",
+  );
+  const [priorityCachedPrice, setPriorityCachedPrice] = useState(
+    source?.priority_cached_input_per_million?.toString() ?? "",
+  );
+  const [priorityOutputPrice, setPriorityOutputPrice] = useState(
+    source?.priority_output_per_million?.toString() ?? "",
+  );
   const [reasoningLevels, setReasoningLevels] = useState(
     source?.reasoning_levels.join(",") ?? "",
   );
@@ -1634,6 +1662,12 @@ function ModelForm({
           cached_input_per_million:
             cachedInputPrice === "" ? null : Number(cachedInputPrice),
           output_per_million: outputPrice === "" ? null : Number(outputPrice),
+          priority_input_per_million:
+            priorityInputPrice === "" ? null : Number(priorityInputPrice),
+          priority_cached_input_per_million:
+            priorityCachedPrice === "" ? null : Number(priorityCachedPrice),
+          priority_output_per_million:
+            priorityOutputPrice === "" ? null : Number(priorityOutputPrice),
           visible_in_codex: visibleInCodex,
           visible_in_openai: visibleInOpenAi,
         });
@@ -1739,9 +1773,51 @@ function ModelForm({
             onChange={(event) => setOutputPrice(event.target.value)}
           />
         </label>
+        <label className="text-[9px] font-semibold text-fg">
+          Priority input
+          <input
+            className={`${INPUT} mt-1`}
+            value={priorityInputPrice}
+            type="number"
+            min="0"
+            step="any"
+            inputMode="decimal"
+            placeholder="leave empty = same as normal"
+            onChange={(event) => setPriorityInputPrice(event.target.value)}
+          />
+        </label>
+        <label className="text-[9px] font-semibold text-fg">
+          Priority cached
+          <input
+            className={`${INPUT} mt-1`}
+            value={priorityCachedPrice}
+            type="number"
+            min="0"
+            step="any"
+            inputMode="decimal"
+            placeholder="defaults to priority input"
+            onChange={(event) => setPriorityCachedPrice(event.target.value)}
+          />
+        </label>
+        <label className="text-[9px] font-semibold text-fg">
+          Priority output
+          <input
+            className={`${INPUT} mt-1`}
+            value={priorityOutputPrice}
+            type="number"
+            min="0"
+            step="any"
+            inputMode="decimal"
+            placeholder="leave empty = same as normal"
+            onChange={(event) => setPriorityOutputPrice(event.target.value)}
+          />
+        </label>
         <p className="text-[8.5px] leading-4 text-fg opacity-45 sm:col-span-3">
           Cached input is the provider&apos;s prompt-cache read rate. Leave a field empty when the
           price is unknown; zero means the provider does not charge for that token class.
+          Priority rates are billed only on turns the upstream actually reports as priority — a
+          request that asks for priority but comes back standard is charged the normal rate. Set
+          both priority input and output, or neither: a half-configured pair falls back to normal.
         </p>
       </fieldset>
       <div className="grid gap-2 rounded-lg border border-signal/20 bg-signal/[0.04] p-2.5 sm:col-span-2 sm:grid-cols-2">

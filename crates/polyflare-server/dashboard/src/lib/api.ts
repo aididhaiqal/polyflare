@@ -726,6 +726,10 @@ export interface ProviderModelView {
   input_per_million: number | null;
   cached_input_per_million: number | null;
   output_per_million: number | null;
+  /** Priority-tier rates; null means no separate priority price (bills at standard). */
+  priority_input_per_million: number | null;
+  priority_cached_input_per_million: number | null;
+  priority_output_per_million: number | null;
   visible_in_codex: boolean;
   visible_in_openai: boolean;
   enabled: boolean;
@@ -828,6 +832,9 @@ export interface CreateProviderModelBody {
   input_per_million?: number | null;
   cached_input_per_million?: number | null;
   output_per_million?: number | null;
+  priority_input_per_million?: number | null;
+  priority_cached_input_per_million?: number | null;
+  priority_output_per_million?: number | null;
   visible_in_codex?: boolean;
   visible_in_openai?: boolean;
 }
@@ -862,6 +869,10 @@ export interface ProviderDiscoveredModelView {
   input_per_million: number | null;
   cached_input_per_million: number | null;
   output_per_million: number | null;
+  /** Priority-tier rates; null means no separate priority price (bills at standard). */
+  priority_input_per_million: number | null;
+  priority_cached_input_per_million: number | null;
+  priority_output_per_million: number | null;
   state: "available" | "configured" | "conflict";
 }
 

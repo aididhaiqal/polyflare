@@ -141,6 +141,14 @@ pub struct ModelView {
     input_per_million: Option<f64>,
     cached_input_per_million: Option<f64>,
     output_per_million: Option<f64>,
+    /// Priority-tier rates. Omitted/null means "no separate priority price"; billing then falls
+    /// back to the standard rates even for a turn the upstream served as priority.
+    #[serde(default)]
+    priority_input_per_million: Option<f64>,
+    #[serde(default)]
+    priority_cached_input_per_million: Option<f64>,
+    #[serde(default)]
+    priority_output_per_million: Option<f64>,
     visible_in_codex: bool,
     visible_in_openai: bool,
     enabled: bool,
@@ -187,6 +195,9 @@ impl From<ProviderModel> for ModelView {
             request_overrides: serde_json::from_str(&value.request_overrides_json)
                 .unwrap_or_default(),
             input_per_million: value.input_per_million,
+            priority_input_per_million: value.priority_input_per_million,
+            priority_cached_input_per_million: value.priority_cached_input_per_million,
+            priority_output_per_million: value.priority_output_per_million,
             cached_input_per_million: value.cached_input_per_million,
             output_per_million: value.output_per_million,
             visible_in_codex: value.visible_in_codex,
@@ -733,6 +744,11 @@ pub async fn sync_models(
             continue;
         }
         let model = NewProviderModel {
+            // Discovery never advertises a priority tariff; these stay unset until an operator
+            // configures one.
+            priority_input_per_million: discovered_model.priority_input_per_million,
+            priority_cached_input_per_million: discovered_model.priority_cached_input_per_million,
+            priority_output_per_million: discovered_model.priority_output_per_million,
             id: id("model"),
             provider_id: provider.id.clone(),
             public_model,
@@ -900,6 +916,14 @@ pub struct CreateModel {
     input_per_million: Option<f64>,
     cached_input_per_million: Option<f64>,
     output_per_million: Option<f64>,
+    /// Priority-tier rates. Omitted/null means "no separate priority price"; billing then falls
+    /// back to the standard rates even for a turn the upstream served as priority.
+    #[serde(default)]
+    priority_input_per_million: Option<f64>,
+    #[serde(default)]
+    priority_cached_input_per_million: Option<f64>,
+    #[serde(default)]
+    priority_output_per_million: Option<f64>,
     #[serde(default = "default_true")]
     visible_in_codex: bool,
     #[serde(default = "default_true")]
@@ -967,6 +991,9 @@ pub async fn create_model(
     );
     let timestamp = now();
     let model = NewProviderModel {
+        priority_input_per_million: input.priority_input_per_million,
+        priority_cached_input_per_million: input.priority_cached_input_per_million,
+        priority_output_per_million: input.priority_output_per_million,
         id: id("model"),
         provider_id,
         public_model: input.public_model,
@@ -1037,6 +1064,14 @@ pub struct ModelPatch {
     cached_input_per_million: Option<Option<f64>>,
     #[serde(default, deserialize_with = "deserialize_nullable_price")]
     output_per_million: Option<Option<f64>>,
+    /// Priority-tier rates. Absent leaves the stored value alone; explicit `null` clears it back
+    /// to "no separate priority price".
+    #[serde(default, deserialize_with = "deserialize_nullable_price")]
+    priority_input_per_million: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_price")]
+    priority_cached_input_per_million: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_price")]
+    priority_output_per_million: Option<Option<f64>>,
 }
 
 fn deserialize_nullable_price<'de, D>(deserializer: D) -> Result<Option<Option<f64>>, D::Error>
@@ -1165,6 +1200,9 @@ pub async fn patch_model(
         .unwrap_or_else(|| "{}".into())
     });
     let patch = ProviderModelPatch {
+        priority_input_per_million: input.priority_input_per_million,
+        priority_cached_input_per_million: input.priority_cached_input_per_million,
+        priority_output_per_million: input.priority_output_per_million,
         upstream_model: input.upstream_model,
         display_name: input.display_name.map(|value| value.trim().to_string()),
         context_window: input.context_window,

@@ -212,6 +212,9 @@ fn custom_provider(id: &str, slug: &str) -> NewCustomProvider {
 
 fn custom_model(id: &str, provider_id: &str) -> NewProviderModel {
     NewProviderModel {
+        priority_input_per_million: None,
+        priority_cached_input_per_million: None,
+        priority_output_per_million: None,
         id: id.to_string(),
         provider_id: provider_id.to_string(),
         public_model: "shared-custom".to_string(),

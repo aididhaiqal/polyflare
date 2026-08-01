@@ -93,6 +93,11 @@ pub struct ProviderModel {
     pub input_per_million: Option<f64>,
     pub cached_input_per_million: Option<f64>,
     pub output_per_million: Option<f64>,
+    /// Priority/fast-tier rates. `None` means "no separate priority price" — billing then falls
+    /// back to the standard rates. Applied only when the UPSTREAM REPORTS a priority tier.
+    pub priority_input_per_million: Option<f64>,
+    pub priority_cached_input_per_million: Option<f64>,
+    pub priority_output_per_million: Option<f64>,
     pub visible_in_codex: bool,
     pub visible_in_openai: bool,
     pub enabled: bool,
@@ -122,6 +127,11 @@ pub struct NewProviderModel {
     pub input_per_million: Option<f64>,
     pub cached_input_per_million: Option<f64>,
     pub output_per_million: Option<f64>,
+    /// Priority/fast-tier rates. `None` means "no separate priority price" — billing then falls
+    /// back to the standard rates. Applied only when the UPSTREAM REPORTS a priority tier.
+    pub priority_input_per_million: Option<f64>,
+    pub priority_cached_input_per_million: Option<f64>,
+    pub priority_output_per_million: Option<f64>,
     pub visible_in_codex: bool,
     pub visible_in_openai: bool,
     pub enabled: bool,
@@ -147,6 +157,9 @@ pub struct ProviderModelPatch {
     pub input_per_million: Option<Option<f64>>,
     pub cached_input_per_million: Option<Option<f64>>,
     pub output_per_million: Option<Option<f64>>,
+    pub priority_input_per_million: Option<Option<f64>>,
+    pub priority_cached_input_per_million: Option<Option<f64>>,
+    pub priority_output_per_million: Option<Option<f64>>,
     pub visible_in_codex: Option<bool>,
     pub visible_in_openai: Option<bool>,
     pub enabled: Option<bool>,
@@ -439,8 +452,10 @@ impl ProviderRepo {
               supports_web_search, supports_reasoning_summaries, reasoning_levels_json, \
               model_info_json, instruction_mode, instruction_text, request_overrides_json, \
               input_per_million, cached_input_per_million, output_per_million, \
+              priority_input_per_million, priority_cached_input_per_million, \
+              priority_output_per_million, \
               visible_in_codex, visible_in_openai, enabled, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&model.id)
         .bind(&model.provider_id)
@@ -462,6 +477,9 @@ impl ProviderRepo {
         .bind(model.input_per_million)
         .bind(model.cached_input_per_million)
         .bind(model.output_per_million)
+        .bind(model.priority_input_per_million)
+        .bind(model.priority_cached_input_per_million)
+        .bind(model.priority_output_per_million)
         .bind(model.visible_in_codex)
         .bind(model.visible_in_openai)
         .bind(model.enabled)
@@ -480,6 +498,8 @@ impl ProviderRepo {
              supports_web_search, supports_reasoning_summaries, reasoning_levels_json, \
              model_info_json, instruction_mode, instruction_text, request_overrides_json, \
              input_per_million, cached_input_per_million, output_per_million, \
+             priority_input_per_million, priority_cached_input_per_million, \
+             priority_output_per_million, \
              visible_in_codex, visible_in_openai, enabled, created_at, updated_at FROM provider_models \
              WHERE provider_id = ? ORDER BY display_name, id",
         )
@@ -495,6 +515,8 @@ impl ProviderRepo {
              supports_web_search, supports_reasoning_summaries, reasoning_levels_json, \
              model_info_json, instruction_mode, instruction_text, request_overrides_json, \
              input_per_million, cached_input_per_million, output_per_million, \
+             priority_input_per_million, priority_cached_input_per_million, \
+             priority_output_per_million, \
              visible_in_codex, visible_in_openai, enabled, created_at, updated_at \
              FROM provider_models WHERE id = ?",
         )
@@ -579,6 +601,12 @@ impl ProviderRepo {
              input_per_million = CASE WHEN ? THEN ? ELSE input_per_million END, \
              cached_input_per_million = CASE WHEN ? THEN ? ELSE cached_input_per_million END, \
              output_per_million = CASE WHEN ? THEN ? ELSE output_per_million END, \
+             priority_input_per_million = \
+               CASE WHEN ? THEN ? ELSE priority_input_per_million END, \
+             priority_cached_input_per_million = \
+               CASE WHEN ? THEN ? ELSE priority_cached_input_per_million END, \
+             priority_output_per_million = \
+               CASE WHEN ? THEN ? ELSE priority_output_per_million END, \
              visible_in_codex = COALESCE(?, visible_in_codex), \
              visible_in_openai = COALESCE(?, visible_in_openai), \
              enabled = COALESCE(?, enabled), \
@@ -604,6 +632,12 @@ impl ProviderRepo {
         .bind(patch.cached_input_per_million.flatten())
         .bind(patch.output_per_million.is_some())
         .bind(patch.output_per_million.flatten())
+        .bind(patch.priority_input_per_million.is_some())
+        .bind(patch.priority_input_per_million.flatten())
+        .bind(patch.priority_cached_input_per_million.is_some())
+        .bind(patch.priority_cached_input_per_million.flatten())
+        .bind(patch.priority_output_per_million.is_some())
+        .bind(patch.priority_output_per_million.flatten())
         .bind(patch.visible_in_codex)
         .bind(patch.visible_in_openai)
         .bind(patch.enabled)
@@ -655,6 +689,8 @@ impl ProviderRepo {
              pm.supports_reasoning_summaries, pm.reasoning_levels_json, pm.model_info_json, \
              pm.instruction_mode, pm.instruction_text, pm.request_overrides_json, \
              pm.input_per_million, pm.cached_input_per_million, pm.output_per_million, \
+             pm.priority_input_per_million, pm.priority_cached_input_per_million, \
+             pm.priority_output_per_million, \
              pm.visible_in_codex, pm.visible_in_openai, pm.enabled, pm.created_at, pm.updated_at \
              FROM provider_models pm \
              JOIN custom_providers cp ON cp.id = pm.provider_id \
@@ -736,6 +772,9 @@ mod tests {
             instruction_text: String::new(),
             request_overrides_json: "{}".into(),
             input_per_million: Some(1.0),
+            priority_input_per_million: None,
+            priority_cached_input_per_million: None,
+            priority_output_per_million: None,
             cached_input_per_million: Some(0.5),
             output_per_million: Some(4.0),
             visible_in_codex: true,

@@ -594,6 +594,120 @@ pub fn cost_usd(
         + (output / 1_000_000.0) * output_rate
 }
 
+/// Per-1M rates for a CUSTOM provider model, which — unlike the built-in [`ModelPrice`] table —
+/// are operator-configured and cover only the standard and priority tiers.
+///
+/// The priority rates are optional: a model with none is billed at its standard rates whatever
+/// tier it ran in, which is the right reading of "no priority price configured".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CustomModelRates {
+    pub input_per_1m: f64,
+    pub cached_input_per_1m: f64,
+    pub output_per_1m: f64,
+    pub priority_input_per_1m: Option<f64>,
+    pub priority_cached_input_per_1m: Option<f64>,
+    pub priority_output_per_1m: Option<f64>,
+}
+
+impl CustomModelRates {
+    /// The `(input, cached, output)` rates to bill a turn that ran in `service_tier`.
+    ///
+    /// **`service_tier` must be the tier the upstream REPORTED, not the tier requested.** A
+    /// provider may accept a priority request and still serve it as standard; billing the premium
+    /// for that turn would overstate cost. A priority turn on a model with no configured priority
+    /// rate falls back to standard rather than guessing a multiplier.
+    pub fn rates_for(&self, service_tier: Option<&str>) -> (f64, f64, f64) {
+        if uses_priority_tier(service_tier) {
+            if let (Some(input), Some(output)) =
+                (self.priority_input_per_1m, self.priority_output_per_1m)
+            {
+                return (
+                    input,
+                    self.priority_cached_input_per_1m.unwrap_or(input),
+                    output,
+                );
+            }
+        }
+        (
+            self.input_per_1m,
+            self.cached_input_per_1m,
+            self.output_per_1m,
+        )
+    }
+
+    /// Whether a separate priority rate is configured (drives "priority billed" reporting).
+    pub fn has_priority_rates(&self) -> bool {
+        self.priority_input_per_1m.is_some() && self.priority_output_per_1m.is_some()
+    }
+}
+
+/// Whether a reported service tier counts as priority for billing. Public so callers outside this
+/// module classify tiers exactly the way the rate selection does.
+pub fn is_priority_tier(service_tier: Option<&str>) -> bool {
+    uses_priority_tier(service_tier)
+}
+
+#[cfg(test)]
+mod custom_rate_tests {
+    use super::*;
+
+    fn rates() -> CustomModelRates {
+        CustomModelRates {
+            input_per_1m: 2.0,
+            cached_input_per_1m: 0.5,
+            output_per_1m: 8.0,
+            priority_input_per_1m: Some(4.0),
+            priority_cached_input_per_1m: Some(1.0),
+            priority_output_per_1m: Some(16.0),
+        }
+    }
+
+    #[test]
+    fn priority_rates_apply_only_to_a_reported_priority_tier() {
+        let r = rates();
+        assert_eq!(r.rates_for(Some("priority")), (4.0, 1.0, 16.0));
+        assert_eq!(r.rates_for(Some("fast")), (4.0, 1.0, 16.0));
+        // The whole point: a request we ASKED to be priority that upstream served as standard
+        // must be billed standard.
+        assert_eq!(r.rates_for(Some("standard")), (2.0, 0.5, 8.0));
+        assert_eq!(r.rates_for(None), (2.0, 0.5, 8.0));
+        assert_eq!(r.rates_for(Some("default")), (2.0, 0.5, 8.0));
+    }
+
+    #[test]
+    fn a_model_without_priority_rates_never_charges_a_premium() {
+        let r = CustomModelRates {
+            priority_input_per_1m: None,
+            priority_cached_input_per_1m: None,
+            priority_output_per_1m: None,
+            ..rates()
+        };
+        assert_eq!(r.rates_for(Some("priority")), (2.0, 0.5, 8.0));
+        assert!(!r.has_priority_rates());
+    }
+
+    #[test]
+    fn a_partial_priority_rate_falls_back_rather_than_half_billing() {
+        // Output configured but not input: guessing the missing half would invent a price.
+        let r = CustomModelRates {
+            priority_input_per_1m: None,
+            priority_output_per_1m: Some(16.0),
+            ..rates()
+        };
+        assert_eq!(r.rates_for(Some("priority")), (2.0, 0.5, 8.0));
+        assert!(!r.has_priority_rates());
+    }
+
+    #[test]
+    fn priority_cached_defaults_to_the_priority_input_rate() {
+        let r = CustomModelRates {
+            priority_cached_input_per_1m: None,
+            ..rates()
+        };
+        assert_eq!(r.rates_for(Some("priority")), (4.0, 4.0, 16.0));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -197,6 +197,9 @@ async fn model_sync_previews_then_imports_only_selected_ids_without_overwriting_
         .store
         .providers()
         .create_model(&NewProviderModel {
+            priority_input_per_million: None,
+            priority_cached_input_per_million: None,
+            priority_output_per_million: None,
             id: "model-manual-ultra".into(),
             provider_id: "provider-discovery".into(),
             public_model: "fugu-ultra".into(),
@@ -614,6 +617,9 @@ async fn custom_model_routes_statelessly_and_is_provider_aware_everywhere() {
         .store
         .providers()
         .create_model(&NewProviderModel {
+            priority_input_per_million: None,
+            priority_cached_input_per_million: None,
+            priority_output_per_million: None,
             id: "model-fugu".into(),
             provider_id: "provider-sakana".into(),
             public_model: "fugu-ultra".into(),
@@ -1097,6 +1103,9 @@ async fn exhausted_retryable_status_attributes_final_credential_in_logs_and_metr
         .store
         .providers()
         .create_model(&NewProviderModel {
+            priority_input_per_million: None,
+            priority_cached_input_per_million: None,
+            priority_output_per_million: None,
             id: "model-retry".into(),
             provider_id: "provider-retry".into(),
             public_model: "retry-model".into(),
@@ -1233,6 +1242,9 @@ async fn transport_error_preserves_credential_health_and_does_not_rotate() {
         .store
         .providers()
         .create_model(&NewProviderModel {
+            priority_input_per_million: None,
+            priority_cached_input_per_million: None,
+            priority_output_per_million: None,
             id: "model-transport".into(),
             provider_id: "provider-transport".into(),
             public_model: "transport-model".into(),
@@ -1670,6 +1682,9 @@ async fn shared_public_model_prefers_priority_then_downgrades_before_output() {
             .store
             .providers()
             .create_model(&NewProviderModel {
+                priority_input_per_million: None,
+                priority_cached_input_per_million: None,
+                priority_output_per_million: None,
                 id: format!("model-{slug}"),
                 provider_id: id.into(),
                 public_model: "shared-balanced-model".into(),
@@ -1875,6 +1890,9 @@ async fn sequential_anonymous_requests_follow_aggregate_target_weights() {
             .store
             .providers()
             .create_model(&NewProviderModel {
+                priority_input_per_million: None,
+                priority_cached_input_per_million: None,
+                priority_output_per_million: None,
                 id: format!("model-{slug}"),
                 provider_id: provider_id.into(),
                 public_model: "weighted-sequential-model".into(),
@@ -2013,6 +2031,9 @@ async fn completed_custom_turn_softly_prefers_the_same_target_for_its_prompt_cac
             .store
             .providers()
             .create_model(&NewProviderModel {
+                priority_input_per_million: None,
+                priority_cached_input_per_million: None,
+                priority_output_per_million: None,
                 id: format!("model-{slug}"),
                 provider_id: provider_id.into(),
                 public_model: "cache-affinity-model".into(),

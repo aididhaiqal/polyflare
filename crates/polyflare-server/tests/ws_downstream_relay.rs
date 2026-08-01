@@ -570,6 +570,9 @@ mod relay_through {
             .store
             .providers()
             .create_model(&NewProviderModel {
+                priority_input_per_million: None,
+                priority_cached_input_per_million: None,
+                priority_output_per_million: None,
                 id: "model-a-custom-ws-fail".into(),
                 provider_id: "provider-a-custom-ws-fail".into(),
                 public_model: "fugu-ultra".into(),
@@ -647,6 +650,9 @@ mod relay_through {
             .store
             .providers()
             .create_model(&NewProviderModel {
+                priority_input_per_million: None,
+                priority_cached_input_per_million: None,
+                priority_output_per_million: None,
                 id: "model-custom-ws".into(),
                 provider_id: "provider-custom-ws".into(),
                 public_model: "fugu-ultra".into(),
@@ -967,6 +973,9 @@ mod relay_through {
             .store
             .providers()
             .create_model(&NewProviderModel {
+                priority_input_per_million: None,
+                priority_cached_input_per_million: None,
+                priority_output_per_million: None,
                 id: "model-anthropic-translation-ws".into(),
                 provider_id: "provider-anthropic-translation-ws".into(),
                 public_model: "claude-public".into(),

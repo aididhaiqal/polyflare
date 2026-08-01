@@ -225,6 +225,9 @@ pub struct CustomRouteOutcome {
     pub input_per_million: Option<f64>,
     pub cached_input_per_million: Option<f64>,
     pub output_per_million: Option<f64>,
+    pub priority_input_per_million: Option<f64>,
+    pub priority_cached_input_per_million: Option<f64>,
+    pub priority_output_per_million: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -264,6 +267,9 @@ pub struct DiscoveredProviderModel {
     pub input_per_million: Option<f64>,
     pub cached_input_per_million: Option<f64>,
     pub output_per_million: Option<f64>,
+    pub priority_input_per_million: Option<f64>,
+    pub priority_cached_input_per_million: Option<f64>,
+    pub priority_output_per_million: Option<f64>,
     #[serde(skip_serializing)]
     pub model_info: Option<serde_json::Value>,
 }
@@ -1246,6 +1252,11 @@ fn parse_discovered_models(payload: &[u8]) -> Result<Vec<DiscoveredProviderModel
                 input_per_million: per_token_price_to_per_million(
                     row.get("pricing").and_then(|pricing| pricing.get("prompt")),
                 ),
+                // Upstream model listings do not advertise a priority tariff, so discovery
+                // leaves the priority rates unset rather than inventing one.
+                priority_input_per_million: None,
+                priority_cached_input_per_million: None,
+                priority_output_per_million: None,
                 cached_input_per_million: per_token_price_to_per_million(
                     row.get("pricing")
                         .and_then(|pricing| pricing.get("input_cache_read")),
@@ -1845,6 +1856,9 @@ fn custom_route_outcome(provider: &CustomProvider, model: &ProviderModel) -> Cus
         effective_service_tier: None,
         profile_revision: profile_revision(model),
         input_per_million: model.input_per_million,
+        priority_input_per_million: model.priority_input_per_million,
+        priority_cached_input_per_million: model.priority_cached_input_per_million,
+        priority_output_per_million: model.priority_output_per_million,
         cached_input_per_million: model.cached_input_per_million,
         output_per_million: model.output_per_million,
     }
@@ -1852,6 +1866,9 @@ fn custom_route_outcome(provider: &CustomProvider, model: &ProviderModel) -> Cus
 
 fn unresolved_custom_outcome(public_model: String) -> CustomRouteOutcome {
     CustomRouteOutcome {
+        priority_input_per_million: None,
+        priority_cached_input_per_million: None,
+        priority_output_per_million: None,
         provider_slug: "custom".into(),
         credential_id: None,
         public_model,
@@ -2405,6 +2422,9 @@ mod tests {
             "https://example.com/v1/messages"
         );
         let model = ProviderModel {
+            priority_input_per_million: None,
+            priority_cached_input_per_million: None,
+            priority_output_per_million: None,
             id: "m".into(),
             provider_id: provider.id,
             public_model: "claude-profile".into(),
