@@ -29,6 +29,8 @@ import {
   patchSettings,
   redeemAccountResetCredit,
   redeemFleetResetCredits,
+  getOnboardingFlowStatus,
+  startCodexDeviceOnboarding,
   startCodexOnboarding,
   setSessionPriority,
   syncProviderModels,
@@ -684,6 +686,39 @@ export function useStartCodexOnboarding() {
   return useMutation({
     mutationFn: (opts?: { initialPool?: string; accountId?: string }) =>
       startCodexOnboarding(opts),
+  });
+}
+
+export function useStartCodexDeviceOnboarding() {
+  return useMutation({
+    mutationFn: (opts?: { initialPool?: string; accountId?: string }) =>
+      startCodexDeviceOnboarding(opts),
+  });
+}
+
+/** Polls a pending flow so the dialog completes hands-free — the loopback listener (browser
+ * method) or the server-side device poller finishes the flow without a manual paste. */
+export function useOnboardingFlowStatus(flowId: string | null) {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useQuery({
+    queryKey: flowId ? ["onboarding-flow", flowId] : ["onboarding-flow", "idle"],
+    queryFn: async () => {
+      const status = await getOnboardingFlowStatus(flowId as string);
+      if (status.status === "completed") {
+        qc.invalidateQueries({ queryKey: queryKeys.accounts });
+        qc.invalidateQueries({ queryKey: queryKeys.pools });
+        qc.invalidateQueries({ queryKey: queryKeys.overview });
+        toast({ title: "Codex account connected", variant: "success" });
+      }
+      return status;
+    },
+    enabled: flowId !== null,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      return status === "pending" || status === "exchanging" ? 2000 : false;
+    },
+    gcTime: 0,
   });
 }
 

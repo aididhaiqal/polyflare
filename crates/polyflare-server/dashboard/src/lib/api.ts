@@ -990,6 +990,21 @@ export interface OAuthOnboardingResult {
   account_id: string;
 }
 
+export interface OAuthDeviceStart {
+  flow_id: string;
+  user_code: string;
+  verification_url: string;
+  expires_at: number;
+  interval_seconds: number;
+}
+
+export interface OAuthFlowStatus {
+  status: "pending" | "exchanging" | "completed" | "failed" | "expired";
+  expires_at: number;
+  account_id?: string;
+  error_code?: string;
+}
+
 export function startCodexOnboarding(opts?: {
   initialPool?: string;
   /** Targets an existing account for re-authentication: completion refuses any other seat. */
@@ -1003,6 +1018,25 @@ export function startCodexOnboarding(opts?: {
       account_id: opts?.accountId || null,
     }),
   });
+}
+
+/** Device-code sign-in: works from any browser on any machine — the server polls for approval. */
+export function startCodexDeviceOnboarding(opts?: {
+  initialPool?: string;
+  accountId?: string;
+}): Promise<OAuthDeviceStart> {
+  return fetchJson<OAuthDeviceStart>("/api/account-onboarding/codex/device", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      initial_pool: opts?.initialPool || null,
+      account_id: opts?.accountId || null,
+    }),
+  });
+}
+
+export function getOnboardingFlowStatus(flowId: string): Promise<OAuthFlowStatus> {
+  return fetchJson<OAuthFlowStatus>(`/api/account-onboarding/${encodeURIComponent(flowId)}`);
 }
 
 export function completeCodexOnboarding(
