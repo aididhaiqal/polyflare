@@ -27,6 +27,11 @@ pub struct OnboardingFlow {
     /// only known once the callback listener is bound — so it cannot be reconstructed later.
     /// `None` for Codex flows, which use a fixed registered redirect.
     pub redirect_uri: Option<String>,
+    /// When this flow is a targeted re-authentication, the id of the account it must repair.
+    /// Completion refuses a callback whose seat does not belong to this account, so signing into
+    /// the wrong ChatGPT account fails loudly instead of silently updating a different row.
+    /// `None` is an ordinary untargeted "Add account" flow.
+    pub intended_account_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -42,8 +47,8 @@ impl OnboardingRepo {
     pub async fn create(&self, flow: &OnboardingFlow) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO account_onboarding_flows (id, flow_provider, oauth_state, verifier_enc, \
-             initial_pool, status, created_at, expires_at, redirect_uri) \
-             VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+             initial_pool, status, created_at, expires_at, redirect_uri, intended_account_id) \
+             VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
         )
         .bind(&flow.id)
         .bind(&flow.provider)
@@ -53,6 +58,7 @@ impl OnboardingRepo {
         .bind(flow.created_at)
         .bind(flow.expires_at)
         .bind(flow.redirect_uri.as_deref())
+        .bind(flow.intended_account_id.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -61,7 +67,8 @@ impl OnboardingRepo {
     pub async fn get(&self, id: &str) -> Result<Option<OnboardingFlow>, StoreError> {
         Ok(sqlx::query_as::<_, OnboardingFlow>(
             "SELECT id, flow_provider AS provider, oauth_state, verifier_enc, initial_pool, status, \
-             created_at, expires_at, finished_at, account_id, error_code, redirect_uri \
+             created_at, expires_at, finished_at, account_id, error_code, redirect_uri, \
+             intended_account_id \
              FROM account_onboarding_flows WHERE id = ?",
         )
         .bind(id)
@@ -85,7 +92,8 @@ impl OnboardingRepo {
         let flow = if changed == 1 {
             sqlx::query_as::<_, OnboardingFlow>(
                 "SELECT id, flow_provider AS provider, oauth_state, verifier_enc, initial_pool, status, \
-                 created_at, expires_at, finished_at, account_id, error_code, redirect_uri \
+                 created_at, expires_at, finished_at, account_id, error_code, redirect_uri, \
+                 intended_account_id \
                  FROM account_onboarding_flows WHERE id = ?",
             )
             .bind(id)
@@ -199,6 +207,7 @@ mod tests {
             account_id: None,
             error_code: None,
             redirect_uri: None,
+            intended_account_id: None,
         };
         store.onboarding().create(&flow).await.unwrap();
         let raw: Vec<u8> = sqlx::query_scalar(
@@ -242,6 +251,7 @@ mod tests {
             account_id: None,
             error_code: None,
             redirect_uri: None,
+            intended_account_id: None,
         };
         store.onboarding().create(&flow).await.unwrap();
         assert!(store
@@ -274,6 +284,7 @@ mod tests {
             account_id: None,
             error_code: None,
             redirect_uri: None,
+            intended_account_id: None,
         };
         store.onboarding().create(&flow).await.unwrap();
         let result = store
@@ -287,6 +298,7 @@ mod tests {
                 },
                 &cipher,
                 "flow-pending",
+                None,
             )
             .await;
         assert!(result.is_err());

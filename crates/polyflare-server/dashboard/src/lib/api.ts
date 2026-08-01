@@ -990,11 +990,18 @@ export interface OAuthOnboardingResult {
   account_id: string;
 }
 
-export function startCodexOnboarding(initialPool?: string): Promise<OAuthOnboardingStart> {
+export function startCodexOnboarding(opts?: {
+  initialPool?: string;
+  /** Targets an existing account for re-authentication: completion refuses any other seat. */
+  accountId?: string;
+}): Promise<OAuthOnboardingStart> {
   return fetchJson<OAuthOnboardingStart>("/api/account-onboarding/codex", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ initial_pool: initialPool || null }),
+    body: JSON.stringify({
+      initial_pool: opts?.initialPool || null,
+      account_id: opts?.accountId || null,
+    }),
   });
 }
 

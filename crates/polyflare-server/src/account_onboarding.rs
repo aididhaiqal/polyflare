@@ -33,6 +33,10 @@ fn safe_error(status: StatusCode, code: &'static str) -> Response {
 pub struct StartRequest {
     #[serde(default)]
     initial_pool: Option<String>,
+    /// When present, this flow re-authenticates exactly this existing account: completion refuses
+    /// a callback whose seat belongs to any other account instead of silently updating it.
+    #[serde(default)]
+    account_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,6 +57,18 @@ pub async fn start_handler(
     {
         return safe_error(StatusCode::BAD_REQUEST, "invalid_pool_slug");
     }
+    // A targeted re-auth flow must point at a real Codex account NOW — failing at start beats
+    // sending the operator through a whole browser login only to bounce at completion.
+    let intended_account_id = match body.account_id.map(|v| v.trim().to_string()) {
+        Some(id) if !id.is_empty() => match state.store.accounts().get(&id).await {
+            Ok(Some(account)) if account.provider == "codex" => Some(id),
+            Ok(Some(_)) | Ok(None) => {
+                return safe_error(StatusCode::NOT_FOUND, "account_not_found")
+            }
+            Err(_) => return safe_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error"),
+        },
+        _ => None,
+    };
 
     let flow_id = format!("oauth_{}", generate_state());
     let oauth_state = generate_state();
@@ -86,6 +102,7 @@ pub async fn start_handler(
         error_code: None,
         // Codex uses the fixed registered loopback redirect, so there is nothing per-flow to record.
         redirect_uri: None,
+        intended_account_id,
     };
     if state.store.onboarding().create(&flow).await.is_err() {
         return safe_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error");
@@ -224,11 +241,27 @@ pub async fn callback_handler(
             return safe_error(StatusCode::BAD_GATEWAY, "exchange_failed");
         }
     };
-    let account_id = match persist_refreshed(&state, refreshed, flow.initial_pool, &id).await {
+    let account_id = match persist_refreshed(
+        &state,
+        refreshed,
+        flow.initial_pool,
+        flow.intended_account_id.as_deref(),
+        &id,
+    )
+    .await
+    {
         Ok(value) => value,
         Err(code) => {
             let _ = state.store.onboarding().fail(&id, code, unix_now()).await;
-            return safe_error(StatusCode::INTERNAL_SERVER_ERROR, code);
+            // A refused targeted re-auth is the operator signing into the wrong seat (or the
+            // target vanishing mid-flow) — a conflict with the flow's stated intent, not a
+            // server fault. No account row was touched.
+            let status = if matches!(code, "seat_mismatch" | "intended_account_missing") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return safe_error(status, code);
         }
     };
     Json(serde_json::json!({ "status": "completed", "account_id": account_id })).into_response()
@@ -238,9 +271,34 @@ async fn persist_refreshed(
     state: &AppState,
     refreshed: Refreshed,
     initial_pool: Option<String>,
+    intended_account_id: Option<&str>,
     flow_id: &str,
 ) -> Result<String, &'static str> {
     let claims = refreshed.claims.ok_or("identity_missing")?;
+    // Targeted re-auth: the exchanged seat must belong to the account this flow was started to
+    // repair. Refusing here (before any write) is what keeps a wrong-seat login from silently
+    // onboarding/updating a DIFFERENT account while the broken one stays reauth_required.
+    if let Some(intended_id) = intended_account_id {
+        let intended = state
+            .store
+            .accounts()
+            .get(intended_id)
+            .await
+            .map_err(|_| "storage_error")?
+            .ok_or("intended_account_missing")?;
+        let seat_matches = match intended.chatgpt_account_id.as_deref() {
+            Some(stored) => claims.chatgpt_account_id.as_deref() == Some(stored),
+            // An account without a stored ChatGPT id (possible for imported rows) can only be
+            // matched by email — case-insensitive, and only when both sides actually have one.
+            None => match (intended.email.as_str(), claims.email.as_deref()) {
+                ("", _) | (_, None) => false,
+                (stored, Some(returned)) => stored.eq_ignore_ascii_case(returned),
+            },
+        };
+        if !seat_matches {
+            return Err("seat_mismatch");
+        }
+    }
     let tokens = PlainTokens {
         access_token: refreshed.tokens.access_token,
         refresh_token: refreshed.tokens.refresh_token,
@@ -280,7 +338,23 @@ async fn persist_refreshed(
     state
         .store
         .accounts()
-        .upsert_oauth_and_complete_flow(&account, &tokens, &state.cipher, flow_id)
+        .upsert_oauth_and_complete_flow(
+            &account,
+            &tokens,
+            &state.cipher,
+            flow_id,
+            intended_account_id,
+        )
         .await
-        .map_err(|_| "storage_error")
+        .map_err(|error| match error {
+            // The verified target vanished between the seat check and the write. (InvalidState's
+            // other cause — a flow no longer in `exchanging` — cannot reach here: this call runs
+            // immediately after the atomic claim.)
+            polyflare_store::StoreError::InvalidState(message)
+                if message.contains("re-auth account") =>
+            {
+                "intended_account_missing"
+            }
+            _ => "storage_error",
+        })
 }

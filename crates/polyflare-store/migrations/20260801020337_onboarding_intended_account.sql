@@ -1,0 +1,12 @@
+-- onboarding intended account
+--
+-- Forward-only. A dashboard "Re-authenticate" flow must repair the exact account the operator
+-- chose: without a recorded target, logging into the wrong ChatGPT seat silently onboards/updates
+-- a DIFFERENT account while the broken one stays reauth_required. This column records the target
+-- account id at flow start so completion can refuse a mismatched seat. NULL (every pre-existing
+-- row and every untargeted "Add account" flow) keeps today's behaviour unchanged.
+--
+-- Deliberately NOT a foreign key: if the target account is deleted mid-flow the completion path
+-- must fail loudly ("intended_account_missing") rather than silently degrade into an untargeted
+-- onboarding, which an ON DELETE SET NULL would cause.
+ALTER TABLE account_onboarding_flows ADD COLUMN intended_account_id TEXT;

@@ -682,7 +682,8 @@ export function usePatchAccount() {
 
 export function useStartCodexOnboarding() {
   return useMutation({
-    mutationFn: (initialPool?: string) => startCodexOnboarding(initialPool),
+    mutationFn: (opts?: { initialPool?: string; accountId?: string }) =>
+      startCodexOnboarding(opts),
   });
 }
 

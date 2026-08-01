@@ -393,16 +393,34 @@ impl AccountRepo {
     /// Persist a dashboard OAuth result and mark its claimed flow complete in one SQLite
     /// transaction. Existing ChatGPT identities are refreshed in place; a supplied pool retags
     /// them, while an omitted pool preserves membership.
+    ///
+    /// `target_account_id` is a targeted re-authentication: the tokens repair EXACTLY that row
+    /// (the caller has already verified the exchanged seat belongs to it). Without it, the
+    /// ChatGPT-id lookup below would miss a target whose stored id is NULL and insert a duplicate
+    /// account instead of repairing the one the operator chose.
     pub async fn upsert_oauth_and_complete_flow(
         &self,
         candidate: &Account,
         tokens: &PlainTokens,
         cipher: &TokenCipher,
         flow_id: &str,
+        target_account_id: Option<&str>,
     ) -> Result<String, StoreError> {
         let enc = EncryptedTokens::encrypt(tokens, cipher)?;
         let mut tx = self.pool.begin().await?;
-        let existing_id = if let Some(chatgpt_id) = candidate.chatgpt_account_id.as_deref() {
+        let existing_id = if let Some(target) = target_account_id {
+            let found = sqlx::query_scalar::<_, String>("SELECT id FROM accounts WHERE id = ?")
+                .bind(target)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if found.is_none() {
+                tx.rollback().await?;
+                return Err(StoreError::InvalidState(
+                    "targeted re-auth account no longer exists".into(),
+                ));
+            }
+            found
+        } else if let Some(chatgpt_id) = candidate.chatgpt_account_id.as_deref() {
             sqlx::query_scalar::<_, String>("SELECT id FROM accounts WHERE chatgpt_account_id = ?")
                 .bind(chatgpt_id)
                 .fetch_optional(&mut *tx)
@@ -412,9 +430,12 @@ impl AccountRepo {
         };
 
         let account_id = if let Some(id) = existing_id {
+            // COALESCE backfills a NULL ChatGPT id on a targeted repair; for the untargeted path
+            // the row was FOUND by that id, so it is a no-op.
             sqlx::query(
                 "UPDATE accounts SET access_token_enc = ?, refresh_token_enc = ?, \
                  id_token_enc = ?, last_refresh = ?, \
+                 chatgpt_account_id = COALESCE(chatgpt_account_id, ?), \
                  status = CASE WHEN status = 'reauth_required' THEN 'active' ELSE status END \
                  WHERE id = ?",
             )
@@ -422,6 +443,7 @@ impl AccountRepo {
             .bind(enc.refresh_token_enc.as_slice())
             .bind(enc.id_token_enc.as_slice())
             .bind(candidate.last_refresh)
+            .bind(candidate.chatgpt_account_id.as_deref())
             .bind(&id)
             .execute(&mut *tx)
             .await?;
