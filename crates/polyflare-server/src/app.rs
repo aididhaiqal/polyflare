@@ -353,6 +353,14 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             post(crate::reset_credits::account_redeem_handler),
         )
         .route(
+            "/api/accounts/{id}/probe",
+            post(crate::account_ops::probe_handler),
+        )
+        .route(
+            "/api/accounts/{id}/export-auth",
+            post(crate::account_ops::export_auth_handler),
+        )
+        .route(
             "/api/reset-credits/plan",
             get(crate::reset_credits::plan_handler),
         )
