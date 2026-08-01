@@ -305,7 +305,7 @@ function AccountRail({
   const groups = groupByPool(orderAccounts(filtered));
 
   return (
-    <div className="flex w-full shrink-0 flex-col gap-2 self-start rounded-xl border border-border/80 bg-card/90 p-3 shadow-[0_12px_32px_hsl(var(--surface-shadow)/0.12)] lg:w-[232px]">
+    <div className="flex w-full shrink-0 flex-col gap-2 self-start rounded-xl border border-border/80 bg-card/90 p-3 shadow-[0_12px_32px_hsl(var(--surface-shadow)/0.12)] lg:w-[280px]">
       <Link
         to="/accounts"
         className="px-0.5 text-[11.5px] font-semibold text-fg no-underline hover:text-accent"
@@ -319,15 +319,15 @@ function AccountRail({
           value={search}
           onChange={(e) => onSearchChange(e.target.value)}
           placeholder="Search accounts…"
-          className="w-full bg-transparent text-[10.5px] text-fg outline-none placeholder:text-fg placeholder:opacity-40"
+          className="w-full bg-transparent text-[11.5px] text-fg outline-none placeholder:text-fg placeholder:opacity-40"
         />
       </div>
 
-      <div className="flex max-h-[220px] flex-col gap-0.5 overflow-y-auto lg:max-h-[560px]">
+      <div className="flex max-h-[220px] flex-col gap-0.5 overflow-y-auto lg:max-h-[72vh]">
         {isLoading ? (
           <RailSkeleton />
         ) : isError ? (
-          <div className="flex flex-col items-start gap-1.5 px-1 py-2 text-[10.5px] text-error">
+          <div className="flex flex-col items-start gap-1.5 px-1 py-2 text-[11.5px] text-error">
             <span className="flex items-center gap-1.5">
               <AlertTriangle className="h-3.5 w-3.5 shrink-0" strokeWidth={1.9} />
               Couldn&apos;t load accounts.
@@ -335,19 +335,19 @@ function AccountRail({
             <button
               type="button"
               onClick={onRetry}
-              className="rounded border border-border px-2 py-0.5 text-[10px] text-fg opacity-80 hover:opacity-100"
+              className="rounded border border-border px-2 py-0.5 text-[11px] text-fg opacity-80 hover:opacity-100"
             >
               Retry
             </button>
           </div>
         ) : accounts.length === 0 ? (
-          <p className="px-1 py-2 text-[10.5px] text-fg opacity-50">No accounts configured yet.</p>
+          <p className="px-1 py-2 text-[11.5px] text-fg opacity-50">No accounts configured yet.</p>
         ) : groups.length === 0 ? (
-          <p className="px-1 py-2 text-[10.5px] text-fg opacity-50">No matches.</p>
+          <p className="px-1 py-2 text-[11.5px] text-fg opacity-50">No matches.</p>
         ) : (
           groups.map((group) => (
             <div key={group.key}>
-              <div className="px-1 pb-1 pt-2 text-[8.5px] font-medium uppercase tracking-wide text-fg opacity-50 first:pt-0.5">
+              <div className="px-1 pb-1 pt-2 text-[9.5px] font-medium uppercase tracking-wide text-fg opacity-50 first:pt-0.5">
                 {group.label} · {group.accounts.length}
               </div>
               {group.accounts.map((a) => (
@@ -398,16 +398,16 @@ function RailRow({
       )}
     >
       {isSelected && <span className="absolute inset-y-1 left-0 w-[3px] rounded-full bg-accent" />}
-      <span className={clsx("h-[7px] w-[7px] shrink-0 rounded-full", DOT_CLASS[tone])} />
+      <span className={clsx("h-2 w-2 shrink-0 rounded-full", DOT_CLASS[tone])} />
       <span className="min-w-0 flex-1">
         <ShieldedAccount
           id={account.id}
           label={displayName}
-          className="block truncate text-[11px] font-medium text-fg"
+          className="block truncate text-[12px] font-medium text-fg"
         />
-        <span className="block truncate text-[9px] text-fg opacity-55">{meta}</span>
+        <span className="block truncate text-[10px] text-fg opacity-55">{meta}</span>
       </span>
-      <div className="h-[4px] w-8 shrink-0 overflow-hidden rounded-full bg-muted">
+      <div className="h-[5px] w-10 shrink-0 overflow-hidden rounded-full bg-muted">
         {worst !== null && (
           <div
             className={clsx("h-full rounded-full", DOT_CLASS[usageRiskTone(worst)])}
@@ -436,7 +436,7 @@ function RailSkeleton() {
 function NotFoundPanel({ id }: { id: string }) {
   return (
     <Card>
-      <div className="flex flex-col items-start gap-2 text-[12px]">
+      <div className="flex flex-col items-start gap-2 text-[13px]">
         <span className="flex items-center gap-2 text-fg opacity-80">
           <AlertTriangle className="h-4 w-4 shrink-0 text-warn" strokeWidth={1.9} />
           {id ? (
@@ -453,7 +453,7 @@ function NotFoundPanel({ id }: { id: string }) {
         </span>
         <Link
           to="/accounts"
-          className="text-[11px] font-medium text-accent no-underline hover:underline"
+          className="text-[12px] font-medium text-accent no-underline hover:underline"
         >
           Back to Accounts
         </Link>
@@ -466,14 +466,14 @@ function ErrorPanel({ message, onRetry }: { message: string; onRetry: () => void
   return (
     <Card>
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <span className="flex items-center gap-2 text-[12px] text-error">
+        <span className="flex items-center gap-2 text-[13px] text-error">
           <AlertTriangle className="h-4 w-4 shrink-0" strokeWidth={1.9} />
           {message}
         </span>
         <button
           type="button"
           onClick={onRetry}
-          className="shrink-0 rounded border border-border px-2.5 py-1 text-[11px] text-fg opacity-80 hover:opacity-100"
+          className="shrink-0 rounded border border-border px-2.5 py-1 text-[12px] text-fg opacity-80 hover:opacity-100"
         >
           Retry
         </button>
@@ -591,7 +591,7 @@ function DetailContent({
           <div className="flex min-w-0 flex-1 items-start gap-3">
             <span
               className={clsx(
-                "mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full ring-4 ring-muted",
+                "mt-1.5 h-3 w-3 shrink-0 rounded-full ring-4 ring-muted",
                 DOT_CLASS[tone],
               )}
             />
@@ -600,7 +600,7 @@ function DetailContent({
                 <ShieldedAccount
                   id={identity.id}
                   label={displayName}
-                  className="truncate text-[17px] font-bold tracking-tight text-fg"
+                  className="truncate text-[20px] font-bold tracking-tight text-fg"
                 />
                 <button
                   type="button"
@@ -614,7 +614,7 @@ function DetailContent({
                 <ProviderTag provider={identity.provider} />
                 <StatusPill status={detail.status} />
               </div>
-              <p className="mt-1.5 text-[11px] leading-relaxed text-fg opacity-60">
+              <p className="mt-1.5 text-[12px] leading-relaxed text-fg opacity-60">
                 {active ? (
                   "Identity and workspace shielded"
                 ) : (
@@ -635,7 +635,7 @@ function DetailContent({
           </div>
 
           {cycleLabel && (
-            <div className="flex shrink-0 items-center gap-1.5 rounded-lg border border-border bg-bg/55 p-1 text-[10.5px] text-fg">
+            <div className="flex shrink-0 items-center gap-1.5 rounded-lg border border-border bg-bg/55 p-1 text-[11.5px] text-fg">
               <span className="px-1.5 opacity-55">{cycleLabel}</span>
               <button type="button" onClick={onPrev} disabled={!canCycle} aria-label="Previous account" className="flex h-7 w-7 items-center justify-center rounded-md text-fg opacity-65 hover:bg-muted hover:opacity-100 disabled:opacity-30">
                 <ChevronLeft className="h-3.5 w-3.5" strokeWidth={2} />
@@ -658,11 +658,11 @@ function DetailContent({
       <Grid>
         <Col span={5}>
           <Card>
-            <div className="text-[10px] uppercase tracking-wide text-fg opacity-60">
+            <div className="text-[11px] uppercase tracking-wide text-fg opacity-60">
               Usage / quota
             </div>
             {quotaRows.length === 0 ? (
-              <p className="mt-2 text-[11px] text-fg opacity-50">No quota windows reported yet.</p>
+              <p className="mt-2 text-[12px] text-fg opacity-50">No quota windows reported yet.</p>
             ) : (
               <div className="mt-1.5">
                 {quotaRows.map((row) => (
@@ -671,16 +671,16 @@ function DetailContent({
               </div>
             )}
 
-            <div className="mt-2.5 border-t border-border pt-2 text-[9.5px] text-fg opacity-55">
+            <div className="mt-2.5 border-t border-border pt-2 text-[10.5px] text-fg opacity-55">
               {compactNum(detail.request_totals.total_tokens)} tok ·{" "}
               {compactNum(detail.request_totals.request_count)} req{" "}
               <span className="opacity-70">(all-time)</span>
             </div>
 
-            <div className="mt-3 text-[10px] uppercase tracking-wide text-fg opacity-60">
+            <div className="mt-3 text-[11px] uppercase tracking-wide text-fg opacity-60">
               Token status
             </div>
-            <div className="mt-1.5 flex items-center justify-between text-[11px]">
+            <div className="mt-1.5 flex items-center justify-between text-[12px]">
               <span className="flex items-center gap-1.5 text-fg opacity-70">
                 <Key className="h-3 w-3 shrink-0" strokeWidth={2} />
                 Access token
@@ -715,14 +715,20 @@ function DetailContent({
             resetBusy={redeemReset.isPending}
             onRedeemReset={() => setResetRequestId(crypto.randomUUID())}
             actions={actions}
-            onReauthenticate={() => setReauthOpen(true)}
+            onReauthenticate={
+              identity.provider === "codex" ? () => setReauthOpen(true) : undefined
+            }
             onDeleted={() => navigate("/accounts")}
           />
         </Col>
       </Grid>
 
       {actions.dialogs}
-      <CodexOnboardingDialog open={reauthOpen} onOpenChange={setReauthOpen} />
+      <CodexOnboardingDialog
+        open={reauthOpen}
+        onOpenChange={setReauthOpen}
+        reauth={{ accountId: identity.id, label: displayName, email: identity.email }}
+      />
       <ConfirmDialog
         open={resetRequestId !== null}
         onOpenChange={(open) => !open && !redeemReset.isPending && setResetRequestId(null)}
@@ -762,13 +768,13 @@ function HealthMetric({
 }) {
   return (
     <div className="rounded-lg border border-border/70 bg-bg/45 px-3 py-2.5">
-      <div className="text-[9px] font-semibold uppercase tracking-[0.08em] text-fg opacity-45">
+      <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-fg opacity-45">
         {label}
       </div>
       <div className={clsx("mt-1 truncate text-[13px] font-bold text-fg", tone && TEXT_TONE_CLASS[tone])}>
         {value}
       </div>
-      <div className="mt-0.5 text-[9.5px] text-fg opacity-45">{hint}</div>
+      <div className="mt-0.5 text-[10.5px] text-fg opacity-45">{hint}</div>
     </div>
   );
 }
@@ -780,19 +786,19 @@ function QuotaRow({ row, nowMs }: { row: UsageWindowView; nowMs: number }) {
   const displayed = quotaDisplayPercent(clamped, mode);
   return (
     <div className="mt-2 first:mt-0">
-      <div className="flex items-center justify-between text-[10.5px]">
+      <div className="flex items-center justify-between text-[11.5px]">
         <span className="text-fg opacity-70">
           {labelForWindow(row.window)} {quotaDisplayLabel(mode)}
         </span>
         <b className={TEXT_TONE_CLASS[tone]}>{pct(displayed)}</b>
       </div>
-      <div className="mt-1 h-[6px] overflow-hidden rounded-full bg-muted">
+      <div className="mt-1.5 h-2 overflow-hidden rounded-full bg-muted">
         <div
           className={clsx("h-full rounded-full", DOT_CLASS[tone])}
           style={{ width: `${displayed}%` }}
         />
       </div>
-      <div className="mt-0.5 text-[9px] text-fg opacity-50">Reset {countdown(row.reset_at, nowMs)}</div>
+      <div className="mt-0.5 text-[10px] text-fg opacity-50">Reset {countdown(row.reset_at, nowMs)}</div>
     </div>
   );
 }
@@ -862,7 +868,7 @@ function DepletionRiskBadge({ forecast }: { forecast: DepletionForecast }) {
   return (
     <span
       className={clsx(
-        "inline-block whitespace-nowrap rounded px-1.5 py-0.5 text-[9px] font-bold normal-case tracking-normal",
+        "inline-block whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-bold normal-case tracking-normal",
         RISK_CLASS[forecast.risk_level],
       )}
       title={`Projected to reach ${pct(Math.min(100, forecast.risk * 100))} of the weekly window by reset`}
@@ -894,7 +900,7 @@ function TrendCard({
   if (isLoading) {
     return (
       <Card>
-        <div className="text-[10px] uppercase tracking-wide text-fg opacity-60">
+        <div className="text-[11px] uppercase tracking-wide text-fg opacity-60">
           {trendLabel}
         </div>
         <div className="mt-2 h-52 animate-pulse rounded bg-muted" />
@@ -904,10 +910,10 @@ function TrendCard({
   if (isError) {
     return (
       <Card>
-        <div className="text-[10px] uppercase tracking-wide text-fg opacity-60">
+        <div className="text-[11px] uppercase tracking-wide text-fg opacity-60">
           {trendLabel}
         </div>
-        <div className="mt-2 flex flex-1 flex-col items-start justify-center gap-1.5 text-[11px] text-error">
+        <div className="mt-2 flex flex-1 flex-col items-start justify-center gap-1.5 text-[12px] text-error">
           <span className="flex items-center gap-1.5">
             <AlertTriangle className="h-3.5 w-3.5 shrink-0" strokeWidth={1.9} />
             Couldn&apos;t load trend data.
@@ -915,7 +921,7 @@ function TrendCard({
           <button
             type="button"
             onClick={onRetry}
-            className="rounded border border-border px-2 py-0.5 text-[10.5px] text-fg opacity-80 hover:opacity-100"
+            className="rounded border border-border px-2 py-0.5 text-[11.5px] text-fg opacity-80 hover:opacity-100"
           >
             Retry
           </button>
@@ -934,20 +940,20 @@ function TrendCard({
 
   return (
     <Card>
-      <div className="flex items-center justify-between text-[10px] uppercase tracking-wide text-fg opacity-60">
+      <div className="flex items-center justify-between text-[11px] uppercase tracking-wide text-fg opacity-60">
         <span>{trendLabel}</span>
         <span className="flex items-center gap-2">
           {forecast && <DepletionRiskBadge forecast={forecast} />}
-          <span className="flex items-center gap-3 normal-case tracking-normal text-[9px] opacity-80">
+          <span className="flex items-center gap-3 normal-case tracking-normal text-[10px] opacity-80">
             {hasFiveHourWindow && <LegendSwatch colorClass="bg-codex" label="5h" />}
             <LegendSwatch colorClass="bg-claude" label="Weekly" />
           </span>
         </span>
       </div>
       {!hasData ? (
-        <p className="mt-2 text-[11px] text-fg opacity-50">No trend data yet.</p>
+        <p className="mt-2 text-[12px] text-fg opacity-50">No trend data yet.</p>
       ) : (
-        <div className="mt-2" style={{ height: 190 }}>
+        <div className="mt-2" style={{ height: 260 }}>
           <ResponsiveContainer width="100%" height="100%">
             <AreaChart data={merged} margin={{ top: 4, right: 6, bottom: 0, left: -18 }}>
               <defs>
@@ -1063,7 +1069,8 @@ function ActionsCard({
   resetBusy: boolean;
   onRedeemReset: () => void;
   actions: AccountActionsApi;
-  onReauthenticate: () => void;
+  /** Absent when the provider has no targeted re-auth flow (only Codex OAuth has one today). */
+  onReauthenticate?: () => void;
   onDeleted: () => void;
 }) {
   const paused = status === "paused";
@@ -1073,14 +1080,14 @@ function ActionsCard({
     <Card>
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
-          <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-fg opacity-65">
+          <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-fg opacity-65">
             Account controls
           </div>
-          <p className="mt-1 text-[10px] text-fg opacity-45">
+          <p className="mt-1 text-[11px] text-fg opacity-45">
             Routing changes apply to the next eligible selection.
           </p>
         </div>
-        <span className={clsx("rounded-full px-2 py-1 text-[9px] font-semibold", paused ? "bg-warn/10 text-warn" : "bg-success/10 text-success")}>
+        <span className={clsx("rounded-full px-2 py-1 text-[10px] font-semibold", paused ? "bg-warn/10 text-warn" : "bg-success/10 text-success")}>
           {paused ? "Manually paused" : "Ready for routing"}
         </span>
       </div>
@@ -1088,7 +1095,7 @@ function ActionsCard({
       <div className="mt-4 grid grid-cols-1 gap-3 xl:grid-cols-3">
         {/* Configuration */}
         <div className="flex flex-col gap-3 rounded-lg border border-border/70 bg-bg/35 p-3">
-          <div className="text-[9px] font-semibold uppercase tracking-wide text-fg opacity-50">
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-fg opacity-50">
             Routing &amp; access
           </div>
 
@@ -1098,7 +1105,7 @@ function ActionsCard({
               onChange={(e) =>
                 actions.patch.mutate({ id, body: { routing_policy: e.target.value } })
               }
-              className="rounded border border-border bg-bg px-2 py-1 text-[10.5px] text-fg hover:border-accent"
+              className="rounded border border-border bg-bg px-2 py-1 text-[11.5px] text-fg hover:border-accent"
             >
               <option value="normal">normal</option>
               <option value="burn_first">burn_first</option>
@@ -1135,14 +1142,14 @@ function ActionsCard({
             <button
               type="button"
               onClick={() => actions.openSetPool({ id, pools })}
-              className="max-w-[220px] truncate rounded border border-border bg-bg px-2 py-1 text-[10.5px] text-fg hover:border-accent"
+              className="max-w-[220px] truncate rounded border border-border bg-bg px-2 py-1 text-[11.5px] text-fg hover:border-accent"
             >
               {pools.length > 0 ? pools.join(", ") : "unpooled"}
             </button>
           </ConfigRow>
 
           <ConfigRow icon={Flame} label="Warm-up policy">
-            <span className="rounded bg-muted px-2 py-1 text-[9px] text-fg opacity-50">
+            <span className="rounded bg-muted px-2 py-1 text-[10px] text-fg opacity-50">
               server default
             </span>
           </ConfigRow>
@@ -1150,7 +1157,7 @@ function ActionsCard({
 
         <div className="flex flex-col gap-3 rounded-lg border border-accent/20 bg-[linear-gradient(145deg,hsl(var(--bg)/0.35),hsl(var(--accent)/0.055))] p-3">
           <div className="flex items-center justify-between gap-2">
-            <div className="text-[9px] font-semibold uppercase tracking-wide text-fg opacity-50">
+            <div className="text-[10px] font-semibold uppercase tracking-wide text-fg opacity-50">
               Reset reserve
             </div>
             <Coins className="h-3.5 w-3.5 text-signal" />
@@ -1163,22 +1170,22 @@ function ActionsCard({
                 <span className="text-3xl font-bold tracking-tight text-fg tabular-nums">
                   {reset.available_credits}
                 </span>
-                <span className="text-[10px] text-fg opacity-50">
+                <span className="text-[11px] text-fg opacity-50">
                   banked credit{reset.available_credits === 1 ? "" : "s"}
                 </span>
               </div>
               <div className="rounded-md border border-border/70 bg-bg/45 px-2.5 py-2">
-                <div className="text-[9.5px] font-semibold text-accent">
+                <div className="text-[10.5px] font-semibold text-accent">
                   {resetRecommendationLabel(reset)}
                 </div>
-                <p className="mt-1 text-[9.5px] leading-relaxed text-fg opacity-55">
+                <p className="mt-1 text-[10.5px] leading-relaxed text-fg opacity-55">
                   {reset.reason}
                 </p>
               </div>
               <div className="mt-auto flex items-center justify-between gap-2">
                 <Link
                   to="/reset-credits"
-                  className="text-[10px] font-medium text-accent no-underline hover:underline"
+                  className="text-[11px] font-medium text-accent no-underline hover:underline"
                 >
                   Open fleet optimizer
                 </Link>
@@ -1186,7 +1193,7 @@ function ActionsCard({
                   type="button"
                   disabled={resetBusy || reset.recommendation === "unavailable"}
                   onClick={onRedeemReset}
-                  className="flex items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-[10px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-35"
+                  className="flex items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-[11px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-35"
                 >
                   <RotateCcw className="h-3 w-3" />
                   Redeem one
@@ -1195,8 +1202,8 @@ function ActionsCard({
             </>
           ) : (
             <div className="flex flex-1 flex-col justify-center rounded-md border border-dashed border-border px-3 py-4 text-center">
-              <span className="text-[11px] font-semibold text-fg">No banked resets</span>
-              <span className="mt-1 text-[9.5px] text-fg opacity-45">
+              <span className="text-[12px] font-semibold text-fg">No banked resets</span>
+              <span className="mt-1 text-[10.5px] text-fg opacity-45">
                 Discovery runs once per minute for eligible Codex accounts.
               </span>
             </div>
@@ -1205,7 +1212,7 @@ function ActionsCard({
 
         {/* Operations + Danger */}
         <div className="flex flex-col gap-3 rounded-lg border border-border/70 bg-bg/35 p-3">
-          <div className="text-[9px] font-semibold uppercase tracking-wide text-fg opacity-50">
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-fg opacity-50">
             Lifecycle
           </div>
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
@@ -1216,20 +1223,22 @@ function ActionsCard({
                 actions.patch.mutate({ id, body: { status: paused ? "active" : "paused" } })
               }
             />
-            <OpButton icon={LogIn} label="Re-authenticate" onClick={onReauthenticate} />
+            {onReauthenticate && (
+              <OpButton icon={LogIn} label="Re-authenticate" onClick={onReauthenticate} />
+            )}
           </div>
-          <div className="rounded-md border border-border/60 bg-muted/35 px-3 py-2 text-[9.5px] leading-relaxed text-fg opacity-50">
+          <div className="rounded-md border border-border/60 bg-muted/35 px-3 py-2 text-[10.5px] leading-relaxed text-fg opacity-50">
             Force probe and credential export stay unavailable until PolyFlare has explicit,
             audited backend operations for them.
           </div>
           <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/70 pt-3">
-            <span className="text-[9px] font-semibold uppercase tracking-wide text-error opacity-75">
+            <span className="text-[10px] font-semibold uppercase tracking-wide text-error opacity-75">
               Danger zone
             </span>
             <button
               type="button"
               onClick={() => actions.openDelete({ id, label: displayLabel, onDeleted })}
-              className="flex items-center gap-1.5 rounded-md border border-error/35 bg-error/10 px-3 py-1.5 text-[10.5px] font-semibold text-error hover:bg-error/15"
+              className="flex items-center gap-1.5 rounded-md border border-error/35 bg-error/10 px-3 py-1.5 text-[11.5px] font-semibold text-error hover:bg-error/15"
             >
               <Trash2 className="h-3.5 w-3.5" />
               Delete account
@@ -1254,10 +1263,10 @@ function ConfigRow({
 }) {
   return (
     <div className="flex items-center justify-between gap-2">
-      <span className="flex items-center gap-1.5 text-[11px] text-fg opacity-80">
+      <span className="flex items-center gap-1.5 text-[12px] text-fg opacity-80">
         <Icon className="h-3.5 w-3.5 shrink-0 opacity-60" strokeWidth={1.8} />
         {label}
-        {hint && <span className="text-[9px] text-fg opacity-40">· {hint}</span>}
+        {hint && <span className="text-[10px] text-fg opacity-40">· {hint}</span>}
       </span>
       {children}
     </div>
@@ -1283,7 +1292,7 @@ function OpButton({
       disabled={disabled}
       onClick={onClick}
       className={clsx(
-        "flex items-center justify-center gap-1.5 rounded border px-2.5 py-1.5 text-[10.5px]",
+        "flex items-center justify-center gap-1.5 rounded border px-2.5 py-1.5 text-[11.5px]",
         disabled ? "cursor-not-allowed" : "hover:opacity-100 hover:border-accent",
         danger
           ? clsx("border-error/30 bg-error/10 text-error", disabled ? "opacity-60" : "opacity-90")

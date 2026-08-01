@@ -6,6 +6,13 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   base: "/dashboard/",
   plugins: [react()],
+  // Dev-only: forward API calls to a locally running polyflare instance so `bun run dev` renders
+  // live data instead of request errors. No effect on the embedded production build.
+  server: {
+    proxy: {
+      "/api": "http://127.0.0.1:8080",
+    },
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,

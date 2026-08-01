@@ -160,7 +160,7 @@ export function Accounts() {
         <PageHeader />
         <Card>
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <span className="flex items-center gap-2 text-[12px] text-error">
+            <span className="flex items-center gap-2 text-[13px] text-error">
               <AlertTriangle className="h-4 w-4 shrink-0" strokeWidth={1.9} />
               Couldn&apos;t load accounts
               {error instanceof Error ? `: ${error.message}` : "."}
@@ -168,7 +168,7 @@ export function Accounts() {
             <button
               type="button"
               onClick={() => refetch()}
-              className="shrink-0 rounded border border-border px-2.5 py-1 text-[11px] text-fg opacity-80 hover:opacity-100"
+              className="shrink-0 rounded border border-border px-2.5 py-1 text-[12px] text-fg opacity-80 hover:opacity-100"
             >
               Retry
             </button>
@@ -207,8 +207,8 @@ export function Accounts() {
         subtitle={`${totalAccounts} ${totalAccounts === 1 ? "account" : "accounts"} · ${activeCount} active · ${reauthCount} reauth · ${poolCount} ${poolCount === 1 ? "pool" : "pools"}`}
         actions={
           <div className="flex flex-wrap items-center gap-2">
-            <button type="button" onClick={() => setAddOpen(true)} className="flex items-center gap-1.5 rounded bg-accent px-2.5 py-1 text-[10.5px] font-semibold text-white"><Plus className="h-3 w-3" />Add account</button>
-            <div className="flex shrink-0 overflow-hidden rounded border border-border bg-card text-[10.5px]">
+            <button type="button" onClick={() => setAddOpen(true)} className="flex items-center gap-1.5 rounded bg-accent px-2.5 py-1 text-[11.5px] font-semibold text-white"><Plus className="h-3 w-3" />Add account</button>
+            <div className="flex shrink-0 overflow-hidden rounded border border-border bg-card text-[11.5px]">
               {PROVIDER_FILTERS.map((f) => (
                 <button
                   key={f.value}
@@ -234,7 +234,7 @@ export function Accounts() {
             />
 
             <Tabs.Root value={view} onValueChange={(v) => setView(v as ViewMode)}>
-              <Tabs.List className="flex shrink-0 overflow-hidden rounded border border-border bg-card text-[10.5px]">
+              <Tabs.List className="flex shrink-0 overflow-hidden rounded border border-border bg-card text-[11.5px]">
                 <Tabs.Trigger
                   value="cards"
                   className={clsx(
@@ -267,14 +267,14 @@ export function Accounts() {
 
       {accounts.length === 0 ? (
         <Card>
-          <div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-[12px] font-semibold text-fg">No accounts configured yet</p><p className="mt-1 text-[11px] text-fg opacity-50">Connect a Codex account to begin routing requests.</p></div><button type="button" onClick={() => setAddOpen(true)} className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-[11px] font-semibold text-white"><Plus className="h-3.5 w-3.5" />Add account</button></div>
+          <div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-[13px] font-semibold text-fg">No accounts configured yet</p><p className="mt-1 text-[12px] text-fg opacity-50">Connect a Codex account to begin routing requests.</p></div><button type="button" onClick={() => setAddOpen(true)} className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-[12px] font-semibold text-white"><Plus className="h-3.5 w-3.5" />Add account</button></div>
         </Card>
       ) : filtered.length === 0 ? (
         <Card>
-          <p className="text-[11px] text-fg opacity-50">No accounts match the current filters.</p>
+          <p className="text-[12px] text-fg opacity-50">No accounts match the current filters.</p>
         </Card>
       ) : view === "cards" ? (
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           {filtered.map((a) => (
             <AccountCard
               key={a.id}
@@ -365,8 +365,8 @@ function PageHeader({ subtitle, actions }: { subtitle?: string; actions?: ReactN
   return (
     <div className="flex flex-wrap items-center justify-between gap-3">
       <div>
-        <h1 className="text-lg font-semibold text-fg">Accounts</h1>
-        {subtitle && <p className="mt-0.5 text-[11px] text-fg opacity-60">{subtitle}</p>}
+        <h1 className="text-xl font-semibold text-fg">Accounts</h1>
+        {subtitle && <p className="mt-0.5 text-[12px] text-fg opacity-60">{subtitle}</p>}
       </div>
       {actions}
     </div>
@@ -388,7 +388,7 @@ function PoolSelect({
     "cursor-pointer select-none rounded px-2.5 py-1 text-fg opacity-80 outline-none data-[highlighted]:bg-muted data-[highlighted]:opacity-100";
   return (
     <Select.Root value={value} onValueChange={onChange}>
-      <Select.Trigger className="flex shrink-0 items-center gap-1.5 rounded border border-border bg-card px-2.5 py-1 text-[10.5px] text-fg opacity-80 outline-none hover:opacity-100 focus:opacity-100">
+      <Select.Trigger className="flex shrink-0 items-center gap-1.5 rounded border border-border bg-card px-2.5 py-1 text-[11.5px] text-fg opacity-80 outline-none hover:opacity-100 focus:opacity-100">
         <span className="opacity-60">Pool:</span>
         <Select.Value />
         <Select.Icon>
@@ -399,7 +399,7 @@ function PoolSelect({
         <Select.Content
           position="popper"
           sideOffset={4}
-          className="z-50 overflow-hidden rounded border border-border bg-card text-[10.5px] shadow-lg"
+          className="z-50 overflow-hidden rounded border border-border bg-card text-[11.5px] shadow-lg"
         >
           <Select.Viewport className="p-1">
             <Select.Item value={ALL_POOLS} className={itemClass}>
@@ -439,9 +439,9 @@ function CardUsageRow({
   const { mode } = useQuotaDisplayPreference();
   if (!window) {
     return (
-      <div className="flex items-center gap-2 text-[9.5px]">
-        <span className="w-11 shrink-0 text-fg opacity-60">{label}</span>
-        <div className="h-1.5 flex-1 rounded-full bg-muted" />
+      <div className="flex items-center gap-2 text-[10.5px]">
+        <span className="w-14 shrink-0 text-fg opacity-60">{label}</span>
+        <div className="h-2 flex-1 rounded-full bg-muted" />
         <span className="shrink-0 text-fg opacity-40">—</span>
       </div>
     );
@@ -449,9 +449,9 @@ function CardUsageRow({
   const clamped = Math.max(0, Math.min(100, window.used_percent));
   const displayed = quotaDisplayPercent(clamped, mode);
   return (
-    <div className="flex items-center gap-2 text-[9.5px]">
-      <span className="w-11 shrink-0 text-fg opacity-60">{label}</span>
-      <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
+    <div className="flex items-center gap-2 text-[10.5px]">
+      <span className="w-14 shrink-0 text-fg opacity-60">{label}</span>
+      <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
         <div
           className={clsx("h-full rounded-full", TONE_BAR_CLASS[usageRiskTone(clamped)])}
           style={{ width: `${displayed}%` }}
@@ -490,17 +490,17 @@ function AccountCard({
         <Card className="h-full gap-2 transition-colors hover:border-accent">
           {/* pr-7 keeps the StatusPill clear of the kebab overlaid at the card's top-right corner */}
           <div className="flex items-center gap-1.5 pr-7">
-            <span className={clsx("h-[7px] w-[7px] shrink-0 rounded-full", TONE_BAR_CLASS[tone])} />
+            <span className={clsx("h-2 w-2 shrink-0 rounded-full", TONE_BAR_CLASS[tone])} />
             <ShieldedAccount
               id={a.id}
               label={a.alias ?? a.id}
-              className="truncate text-[12.5px] font-semibold text-fg"
+              className="truncate text-[13.5px] font-semibold text-fg"
             />
             <ProviderTag provider={a.provider} />
             {reset && reset.available_credits > 0 && (
               <span
                 className={clsx(
-                  "shrink-0 rounded-full border px-1.5 py-0.5 text-[8.5px] font-semibold",
+                  "shrink-0 rounded-full border px-1.5 py-0.5 text-[9.5px] font-semibold",
                   reset.recommendation === "redeem_now" ||
                     reset.recommendation === "redeem_before_expiry"
                     ? "border-accent/30 bg-accent/[0.08] text-accent"
@@ -513,7 +513,7 @@ function AccountCard({
             <StatusPill status={a.status} className="ml-auto shrink-0" />
           </div>
 
-          <div className="truncate text-[10px] text-fg opacity-60">
+          <div className="truncate text-[11px] text-fg opacity-60">
             {active ? (
               <span className="opacity-60">identity shielded · </span>
             ) : (
@@ -535,7 +535,7 @@ function AccountCard({
             <CardUsageRow label="Weekly" window={a.weekly} nowMs={nowMs} />
           </div>
 
-          <div className="mt-auto flex items-center justify-between gap-2 border-t border-border pt-2 text-[9.5px]">
+          <div className="mt-auto flex items-center justify-between gap-2 border-t border-border pt-2 text-[10.5px]">
             <span className={clsx("flex items-center gap-1 whitespace-nowrap", token.className)}>
               <Key className="h-3 w-3 shrink-0" strokeWidth={2} />
               {token.text}
@@ -567,7 +567,7 @@ function ListUsageCell({ window }: { window: WindowView | null }) {
   const displayed = quotaDisplayPercent(clamped, mode);
   return (
     <div className="flex items-center gap-1.5">
-      <div className="h-[5px] w-[46px] shrink-0 overflow-hidden rounded-full bg-muted">
+      <div className="h-1.5 w-[72px] shrink-0 overflow-hidden rounded-full bg-muted">
         <div
           className={clsx("h-full rounded-full", TONE_BAR_CLASS[usageRiskTone(clamped)])}
           style={{ width: `${displayed}%` }}
@@ -579,7 +579,7 @@ function ListUsageCell({ window }: { window: WindowView | null }) {
 }
 
 const TABLE_HEAD_CLASS =
-  "px-2 py-1.5 text-left text-[9px] font-medium uppercase tracking-wide text-fg opacity-60";
+  "px-2.5 py-2 text-left text-[10px] font-medium uppercase tracking-wide text-fg opacity-60";
 
 function AccountsTable({
   accounts,
@@ -601,8 +601,8 @@ function AccountsTable({
       <div className="overflow-x-auto">
         <table
           className={clsx(
-            "w-full border-collapse text-[10.5px]",
-            showFiveHour ? "min-w-[760px]" : "min-w-[680px]",
+            "w-full border-collapse text-[11.5px]",
+            showFiveHour ? "min-w-[880px]" : "min-w-[800px]",
           )}
         >
           <thead>
@@ -644,10 +644,10 @@ function AccountsTable({
                   }}
                   className="cursor-pointer border-b border-border/55 last:border-0 hover:bg-muted/60"
                 >
-                  <td className="whitespace-nowrap px-2 py-1.5">
+                  <td className="whitespace-nowrap px-2.5 py-2">
                     <span
                       className={clsx(
-                        "mr-1.5 inline-block h-[7px] w-[7px] rounded-full",
+                        "mr-1.5 inline-block h-2 w-2 rounded-full",
                         TONE_BAR_CLASS[tone],
                       )}
                     />
@@ -656,32 +656,32 @@ function AccountsTable({
                       <span className="ml-1.5 text-fg opacity-40">({a.id})</span>
                     )}
                   </td>
-                  <td className="px-2 py-1.5">
+                  <td className="px-2.5 py-2">
                     <ProviderTag provider={a.provider} />
                   </td>
-                  <td className="px-2 py-1.5 text-fg opacity-60">
+                  <td className="px-2.5 py-2 text-fg opacity-60">
                     {a.pools.length > 0 ? a.pools.join(", ") : "unpooled"}
                   </td>
-                  <td className="px-2 py-1.5 text-fg opacity-80">{a.plan_type}</td>
-                  <td className="px-2 py-1.5">
+                  <td className="px-2.5 py-2 text-fg opacity-80">{a.plan_type}</td>
+                  <td className="px-2.5 py-2">
                     <StatusPill status={a.status} />
                   </td>
                   {showFiveHour && (
-                    <td className="px-2 py-1.5">
+                    <td className="px-2.5 py-2">
                       <ListUsageCell window={a.five_hour} />
                     </td>
                   )}
-                  <td className="px-2 py-1.5">
+                  <td className="px-2.5 py-2">
                     <ListUsageCell window={a.weekly} />
                   </td>
-                  <td className={clsx("whitespace-nowrap px-2 py-1.5", token.className)}>
+                  <td className={clsx("whitespace-nowrap px-2.5 py-2", token.className)}>
                     {token.text}
                   </td>
-                  <td className="whitespace-nowrap px-2 py-1.5">
+                  <td className="whitespace-nowrap px-2.5 py-2">
                     {reset && reset.available_credits > 0 ? (
                       <span
                         className={clsx(
-                          "rounded-full border px-1.5 py-0.5 text-[8.5px] font-semibold",
+                          "rounded-full border px-1.5 py-0.5 text-[9.5px] font-semibold",
                           reset.recommendation === "redeem_now" ||
                             reset.recommendation === "redeem_before_expiry"
                             ? "border-accent/30 bg-accent/[0.08] text-accent"
@@ -694,10 +694,10 @@ function AccountsTable({
                       <span className="text-fg opacity-35">—</span>
                     )}
                   </td>
-                  <td className="px-2 py-1.5 text-right tabular-nums text-fg opacity-80">
+                  <td className="px-2.5 py-2 text-right tabular-nums text-fg opacity-80">
                     {compactNum(a.request_count_24h)}
                   </td>
-                  <td className="px-2 py-1.5 text-right">
+                  <td className="px-2.5 py-2 text-right">
                     <AccountRowMenu account={a} actions={actions} />
                   </td>
                 </tr>
@@ -724,7 +724,7 @@ function AccountsSkeleton() {
         </div>
         <div className="h-7 w-64 animate-pulse rounded bg-muted" />
       </div>
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
         {[0, 1, 2, 3, 4, 5].map((i) => (
           <Card key={i}>
             <div className="h-[150px] animate-pulse rounded bg-muted" />
