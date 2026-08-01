@@ -1,7 +1,13 @@
-//! Surfacing an upstream that accepts a priority request and serves it as standard.
+//! The requested-vs-reported service-tier diagnostic.
 //!
-//! The distinction that matters: PolyFlare's OWN priority policy downgrading a turn is not the
-//! upstream declining it, and must not be reported as one.
+//! This is deliberately NOT a "downgrade" signal. Codex reports `service_tier: "default"` even for
+//! turns it genuinely serves at priority (openai/codex#30413, open; the Rho project shipped a
+//! user-facing notice on this and reverted it in matthewyjiang/rho#675). Measuring this
+//! deployment's traffic reproduces it: priority-requested turns run ~1.3-1.9x the tokens/sec of
+//! standard ones while 100% report `default`.
+//!
+//! What the flag must still get right is the comparison itself — and in particular that a turn
+//! PolyFlare's OWN policy downgraded is not counted as an upstream disagreement.
 
 mod support;
 
@@ -49,12 +55,12 @@ fn record(request_id: &str, requested: Option<&str>, actual: Option<&str>) -> Re
 }
 
 #[tokio::test]
-async fn a_declined_priority_request_is_flagged_and_nothing_else_is() {
+async fn a_reported_tier_mismatch_is_flagged_and_nothing_else_is() {
     let (pf, app_state) = support::spawn("http://127.0.0.1:9".to_string()).await;
     let repo = app_state.store.request_log();
 
     for (id, requested, actual) in [
-        // The case being surfaced: asked priority, served standard.
+        // The case being surfaced: asked priority, upstream reported something else.
         ("declined", Some("priority"), Some("standard")),
         ("declined-fast", Some("fast"), Some("standard")),
         // Honoured — not a downgrade.
@@ -86,7 +92,7 @@ async fn a_declined_priority_request_is_flagged_and_nothing_else_is() {
         .filter_map(|row| {
             Some((
                 row["request_id"].as_str()?.to_string(),
-                row["priority_downgraded"].as_bool()?,
+                row["service_tier_reported_mismatch"].as_bool()?,
             ))
         })
         .collect();
@@ -103,7 +109,7 @@ async fn a_declined_priority_request_is_flagged_and_nothing_else_is() {
     assert_eq!(
         flagged.get("policy-downgraded"),
         Some(&false),
-        "PolyFlare's own downgrade must not be reported as an upstream refusal"
+        "PolyFlare's own downgrade is not an upstream disagreement"
     );
     assert_eq!(
         flagged.get("unknown-tier"),

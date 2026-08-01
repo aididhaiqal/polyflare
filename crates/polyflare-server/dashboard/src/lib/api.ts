@@ -331,8 +331,10 @@ export interface RequestRowView {
   profile_revision: string | null;
   reasoning_effort: string | null;
   service_tier: string | null;
-  /** The upstream accepted a priority request but reported serving a different tier. */
-  priority_downgraded: boolean;
+  /** Diagnostic only: the upstream's reported tier disagrees with the requested one. Codex
+   * reports `default` even for genuinely-priority turns (openai/codex#30413), so this is NOT
+   * presented as a refusal anywhere in the UI. */
+  service_tier_reported_mismatch: boolean;
   transport: string | null;
   ttft_ms: number | null;
   /** API total: upstream-reported total when present, otherwise a compatibility fallback. */

@@ -113,15 +113,7 @@ export function RequestDetailPanel({
             }
           />
           <DetailField label="Provider" value={backend ? "chatgpt_backend" : row.provider} />
-          <DetailField
-            label="Tier"
-            value={
-              <ServiceTierBadge
-                tier={row.service_tier}
-                downgraded={row.priority_downgraded}
-              />
-            }
-          />
+          <DetailField label="Tier" value={<ServiceTierBadge tier={row.service_tier} />} />
           <DetailField label={backend ? "Operation" : "Model"} value={modelContract} />
           <DetailField label="Transport" value={row.transport ?? "—"} />
           {row.upstream_model && row.upstream_model !== row.model && (
@@ -285,7 +277,7 @@ export function RequestDetailsDialog({
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
               <ProviderTag provider={backend ? "chatgpt_backend" : row.provider} />
-              <ServiceTierBadge tier={row.service_tier} downgraded={row.priority_downgraded} />
+              <ServiceTierBadge tier={row.service_tier} />
               <span
                 className={clsx(
                   "rounded-full border px-2 py-0.5 text-[9px] font-bold",

@@ -2042,13 +2042,21 @@ fn apply_captured_usage(
     captured: usage_capture::CapturedUsage,
 ) -> Option<tokio::sync::oneshot::Receiver<bool>> {
     let u = captured.usage.unwrap_or_default();
-    // The tier the UPSTREAM REPORTED, never the one requested: a provider may accept a priority
-    // request and still serve it as standard, and charging the premium for that turn would
-    // overstate cost. The terminal SSE frame is the most authoritative source (it is the
-    // upstream's own statement about this turn); `effective_service_tier` is the custom-provider
-    // header-derived fallback for responses that carry no terminal tier.
+    // The served tier is RECORDED but deliberately NOT used for billing on the Codex path.
+    //
+    // Codex reports `service_tier: "default"` on `response.completed` even for turns it genuinely
+    // serves at the priority tier — see openai/codex#30413 (open) and the Rho project, which
+    // shipped a "fast mode was not applied" notice on this signal and then removed it as
+    // unreliable (matthewyjiang/rho#675). Measuring this deployment's own traffic reproduces it:
+    // priority-requested turns run ~1.3-1.9x the tokens/sec of standard ones on every model, and
+    // reach first token several times sooner, while 100% of them report `default`.
+    //
+    // Billing therefore stays on the tier that was REQUESTED. Trusting the reported value here
+    // would under-report real spend, which is the more dangerous error for a cost tracker: an
+    // operator would believe they are paying standard rates for service being delivered — and
+    // charged — at priority. `custom_pricing`'s tier still arrives via `effective_service_tier`,
+    // which for a custom provider comes from that provider's own contract rather than this field.
     let served = captured.served_tier.map(|tier| tier.as_str());
-    let effective_service_tier = served.or(effective_service_tier);
     let cost = if let Some(rates) = custom_pricing {
         let (input_price, cached_price, output_price) = rates.rates_for(effective_service_tier);
         u.input_tokens.zip(u.output_tokens).map(|(input, output)| {
@@ -5020,12 +5028,17 @@ mod tests {
             }
         }
 
-        /// The built-in pricing table's priority rates must follow the tier the terminal SSE frame
-        /// reports, not the tier requested. gpt-5.6-sol is 5.0/30.0 standard and 10.0/60.0
-        /// priority per 1M; 100k in + 100k out stays under its 272k long-context threshold so this
-        /// measures the TIER and nothing else.
+        /// Billing must NOT follow the tier the terminal SSE frame reports.
+        ///
+        /// Codex reports `service_tier: "default"` for turns it genuinely serves at priority
+        /// (openai/codex#30413). Costing those at the standard rate would under-report real spend
+        /// — the more dangerous direction for a cost tracker — so the requested tier decides the
+        /// rate while the reported tier is recorded for diagnostics only.
+        ///
+        /// gpt-5.6-sol is 5.0/30.0 standard and 10.0/60.0 priority per 1M; 100k in + 100k out
+        /// stays under its 272k long-context threshold so this measures the TIER alone.
         #[tokio::test]
-        async fn builtin_model_cost_follows_the_served_tier_from_the_stream() {
+        async fn builtin_cost_follows_the_requested_tier_and_records_the_reported_one() {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::open(&dir.path().join("s.db")).await.unwrap();
             let repo = store.request_log();
@@ -5043,21 +5056,27 @@ mod tests {
                 protocol_outcome: polyflare_store::RequestProtocolOutcome::Completed,
             };
 
-            for (id, served, expected) in [
-                // Requested priority, upstream reported priority: premium applies.
+            for (id, requested, served, expected) in [
+                // The real-world case: asked priority, Codex claims default, bill priority anyway.
                 (
-                    "served-priority",
+                    "reported-default",
+                    Some("priority"),
+                    Some(crate::usage_capture::ServedTier::Default),
+                    7.0,
+                ),
+                (
+                    "reported-priority",
+                    Some("priority"),
                     Some(crate::usage_capture::ServedTier::Priority),
                     7.0,
                 ),
-                // Requested priority, upstream served default: the case that was over-billing.
+                // Never asked for priority: standard, whatever the label says.
                 (
-                    "served-default",
+                    "never-asked",
+                    None,
                     Some(crate::usage_capture::ServedTier::Default),
                     3.5,
                 ),
-                // Upstream reported nothing: fall back to what we asked for rather than guessing.
-                ("served-unknown", None, 7.0),
             ] {
                 repo.insert(&sample_record(id)).await.unwrap();
                 apply_captured_usage(
@@ -5065,7 +5084,7 @@ mod tests {
                     id,
                     Some("gpt-5.6-sol"),
                     None,
-                    Some("priority"),
+                    requested,
                     captured(served),
                 );
                 store.flush_background_writes().await.unwrap();
@@ -5081,10 +5100,11 @@ mod tests {
                     (cost - expected).abs() < 1e-9,
                     "{id}: expected {expected}, got {cost}"
                 );
+                // The reported tier is still persisted — it is what made the analysis possible.
                 assert_eq!(
                     row.actual_service_tier.as_deref(),
                     served.map(|tier| tier.as_str()),
-                    "{id}: the served tier must be persisted for the downgrade flag"
+                    "{id}: the reported tier must survive as a diagnostic"
                 );
             }
         }
