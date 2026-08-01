@@ -144,6 +144,7 @@ async fn test_state(model_catalog: Arc<ModelCatalogCache>) -> Arc<AppState> {
         })),
         ws_downstream: false,
         ws_relay_idle: polyflare_server::ws_relay::WsRelayIdlePolicy::default(),
+        trust_forwarded_identity: false,
         webauthn: None,
         passkey_ceremonies: std::sync::Arc::new(Default::default()),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),

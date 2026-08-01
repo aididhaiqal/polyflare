@@ -296,8 +296,10 @@ pub async fn register_start_handler(State(state): State<Arc<AppState>>) -> Respo
 /// resulting public credential.
 pub async fn register_finish_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<RegisterFinishRequest>,
 ) -> Response {
+    let actor = crate::identity::actor_label(&headers, state.trust_forwarded_identity);
     let Some(webauthn) = state.webauthn.clone() else {
         return safe_error(StatusCode::BAD_REQUEST, "passkey_unsupported_origin");
     };
@@ -333,7 +335,12 @@ pub async fn register_finish_handler(
     {
         return safe_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error");
     }
-    tracing::info!(passkey_id = %id, label, "dashboard passkey registered");
+    tracing::warn!(passkey_id = %id, label, actor, "dashboard passkey registered");
+    state.log_bus.publish(crate::log_bus::LogEvent::new(
+        crate::log_bus::LogLevel::Warn,
+        "passkey_registered",
+        format!("passkey '{label}' registered by {actor}"),
+    ));
     Json(serde_json::json!({ "id": id, "label": label })).into_response()
 }
 
@@ -495,7 +502,9 @@ pub async fn list_handler(State(state): State<Arc<AppState>>) -> Response {
 pub async fn delete_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
+    let actor = crate::identity::actor_label(&headers, state.trust_forwarded_identity);
     let repo = state.store.passkeys();
     let remaining = match repo.list().await {
         Ok(rows) => rows.len(),
@@ -506,7 +515,12 @@ pub async fn delete_handler(
     }
     match repo.delete(&id).await {
         Ok(true) => {
-            tracing::info!(passkey_id = %id, "dashboard passkey removed");
+            tracing::warn!(passkey_id = %id, actor, "dashboard passkey removed");
+            state.log_bus.publish(crate::log_bus::LogEvent::new(
+                crate::log_bus::LogLevel::Warn,
+                "passkey_removed",
+                format!("passkey removed by {actor}"),
+            ));
             Json(serde_json::json!({ "ok": true })).into_response()
         }
         Ok(false) => safe_error(StatusCode::NOT_FOUND, "not_found"),

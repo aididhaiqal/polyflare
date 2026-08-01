@@ -63,7 +63,12 @@ pub struct ProbeResponse {
 }
 
 /// `POST /api/accounts/{id}/probe` — refresh this account's credential + live usage on demand.
-pub async fn probe_handler(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+pub async fn probe_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let actor = crate::identity::actor_label(&headers, state.trust_forwarded_identity);
     let repo = state.store.accounts();
     let account = match repo.get(&id).await {
         Ok(Some(account)) => account,
@@ -120,7 +125,7 @@ pub async fn probe_handler(State(state): State<Arc<AppState>>, Path(id): Path<St
     state.log_bus.publish(LogEvent::info(
         "account_probe",
         format!(
-            "probe: usage_refreshed={usage_refreshed} token_rotated={token_rotated} \
+            "probe by {actor}: usage_refreshed={usage_refreshed} token_rotated={token_rotated} \
              token={token_state}"
         ),
     ));
@@ -191,7 +196,9 @@ fn rfc3339_utc(unix_seconds: i64) -> String {
 pub async fn export_auth_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
+    let actor = crate::identity::actor_label(&headers, state.trust_forwarded_identity);
     let repo = state.store.accounts();
     let (account, tokens) = match repo.get_with_tokens(&id, &state.cipher).await {
         Ok(Some(pair)) => pair,
@@ -218,10 +225,11 @@ pub async fn export_auth_handler(
     state.log_bus.publish(LogEvent::new(
         crate::log_bus::LogLevel::Warn,
         "account_auth_export",
-        "credentials exported as codex auth.json",
+        format!("credentials exported as codex auth.json by {actor}"),
     ));
     tracing::warn!(
         account_id = %account.id,
+        actor,
         "account credentials exported via the dashboard auth-export endpoint"
     );
 

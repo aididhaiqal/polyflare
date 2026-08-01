@@ -104,6 +104,11 @@ pub struct AppState {
     /// `websocket_idle_budget_secs`; read only at
     /// pump start (`crate::ws_relay::pump::run_pump`), never per-frame.
     pub ws_relay_idle: crate::ws_relay::WsRelayIdlePolicy,
+    /// Whether a reverse proxy's forwarded operator identity (`Tailscale-User-Login`) may be
+    /// believed. Resolved ONCE at startup from the listener bind: true only for a loopback bind,
+    /// where the sole reachable path is a local proxy. On any other bind the header is forgeable
+    /// by a remote caller, so it is ignored — see `crate::identity`.
+    pub trust_forwarded_identity: bool,
     /// Relying-party config for passkey sign-in (`crate::passkey_auth`). `None` when the configured
     /// origin cannot host WebAuthn (an IP-literal host), in which case the passkey routes report
     /// themselves unsupported instead of the server refusing to start.

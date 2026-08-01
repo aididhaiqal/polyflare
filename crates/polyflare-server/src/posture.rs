@@ -113,7 +113,7 @@ pub fn resolve_proxy_enforcement(
 /// addresses (`0.0.0.0`, `::`) both resolve to `false` — see [`resolve_proxy_enforcement`]'s doc
 /// for why both of those must be treated as non-loopback (the safe/dangerous-respectively
 /// defaults).
-fn bind_is_loopback(bind_addr: &str) -> bool {
+pub fn bind_is_loopback(bind_addr: &str) -> bool {
     bind_addr
         .parse::<SocketAddr>()
         .map(|s| s.ip().is_loopback())

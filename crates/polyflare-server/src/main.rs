@@ -358,6 +358,9 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         runtime_settings,
         ws_downstream: config.client_websocket_enabled,
         ws_relay_idle: config.websocket_idle_policy,
+        // Only a loopback listener can be reached solely through a local reverse proxy, which is
+        // the one arrangement where a forwarded identity header cannot be set by the caller.
+        trust_forwarded_identity: polyflare_server::posture::bind_is_loopback(&config.bind_addr),
         webauthn: polyflare_server::passkey_auth::build_webauthn(
             &config.passkey_origin,
             config.passkey_rp_id.as_deref(),

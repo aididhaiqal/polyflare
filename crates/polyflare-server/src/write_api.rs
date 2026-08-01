@@ -249,9 +249,29 @@ pub async fn delete_account_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<DeleteQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
+    let actor = crate::identity::actor_label(&headers, state.trust_forwarded_identity);
     match state.store.accounts().delete(&id, q.delete_history).await {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Ok(true) => {
+            // Destroying an account's stored credentials is irreversible and was previously
+            // unaudited — the operation left no trace at all once the row was gone.
+            state.log_bus.publish(crate::log_bus::LogEvent::new(
+                crate::log_bus::LogLevel::Warn,
+                "account_deleted",
+                format!(
+                    "account deleted by {actor} (history {})",
+                    if q.delete_history { "purged" } else { "kept" }
+                ),
+            ));
+            tracing::warn!(
+                account_id = %id,
+                actor,
+                delete_history = q.delete_history,
+                "account deleted via the dashboard"
+            );
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+        }
         Ok(false) => (StatusCode::NOT_FOUND, "no such account").into_response(),
         Err(_) => internal_error(),
     }

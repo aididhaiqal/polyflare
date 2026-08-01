@@ -17,6 +17,7 @@ pub mod custom_provider;
 pub mod dashboard;
 pub mod failover;
 pub mod fingerprint_capture;
+pub mod identity;
 pub mod ingress;
 pub mod keys;
 pub mod log_bus;

@@ -319,6 +319,7 @@ mod tests {
             })),
             ws_downstream: true,
             ws_relay_idle: crate::ws_relay::WsRelayIdlePolicy::default(),
+            trust_forwarded_identity: false,
             webauthn: None,
             passkey_ceremonies: std::sync::Arc::new(Default::default()),
             log_bus: crate::log_bus::LogBus::new(1000),
