@@ -174,8 +174,17 @@ pub struct RequestLogRecord {
     pub profile_revision: Option<String>,
     /// The requested reasoning effort (e.g. `"high"`), if applicable to the provider/model.
     pub reasoning_effort: Option<String>,
-    /// The resolved service tier (e.g. `"priority"`), if applicable.
+    /// The resolved service tier (e.g. `"priority"`), if applicable — the tier this turn was
+    /// billed at.
     pub service_tier: Option<String>,
+    /// The tier PolyFlare asked the UPSTREAM for, after its own priority policy ran. Compared
+    /// against [`Self::actual_service_tier`] this is what shows an upstream silently declining a
+    /// priority request; a turn PolyFlare itself downgraded records `standard` here, so its own
+    /// policy decisions never look like an upstream refusal.
+    pub requested_service_tier: Option<String>,
+    /// The tier the upstream REPORTED serving. `None` when the response carried no tier at all,
+    /// which must not be read as a downgrade — only as unknown.
+    pub actual_service_tier: Option<String>,
     /// The transport used to serve the request (e.g. `"http"`, `"sse"`).
     pub transport: Option<String>,
     /// Time-to-first-token in milliseconds, for streaming requests.
@@ -250,6 +259,8 @@ pub struct RequestLogRow {
     pub profile_revision: Option<String>,
     pub reasoning_effort: Option<String>,
     pub service_tier: Option<String>,
+    pub requested_service_tier: Option<String>,
+    pub actual_service_tier: Option<String>,
     pub transport: Option<String>,
     pub ttft_ms: Option<i64>,
     pub total_tokens: Option<i64>,
@@ -575,13 +586,14 @@ impl RequestLogRepo {
             "INSERT INTO request_log \
              (requested_at, provider, method, path, aliased, status, duration_ms, \
               account_id, target_kind, provider_credential_id, model, upstream_model, \
-              upstream_transport, profile_revision, reasoning_effort, service_tier, transport, ttft_ms, \
+              upstream_transport, profile_revision, reasoning_effort, service_tier, \
+              requested_service_tier, actual_service_tier, transport, ttft_ms, \
               total_tokens, cached_tokens, subagent, request_id, session_key, input_tokens, \
               output_tokens, cached_input_tokens, reasoning_tokens, orchestration_input_tokens, \
               orchestration_output_tokens, orchestration_cached_input_tokens, cost_usd, \
               latency_first_token_ms, protocol_outcome, error_code) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.requested_at)
         .bind(&record.provider)
@@ -599,6 +611,8 @@ impl RequestLogRepo {
         .bind(&record.profile_revision)
         .bind(&record.reasoning_effort)
         .bind(&record.service_tier)
+        .bind(&record.requested_service_tier)
+        .bind(&record.actual_service_tier)
         .bind(&record.transport)
         .bind(record.ttft_ms)
         .bind(record.total_tokens)
@@ -717,7 +731,8 @@ impl RequestLogRepo {
         let rows = sqlx::query_as::<_, RequestLogRow>(
             "SELECT id, requested_at, provider, method, path, aliased, status, duration_ms, \
              account_id, target_kind, provider_credential_id, model, upstream_model, \
-             upstream_transport, profile_revision, reasoning_effort, service_tier, transport, ttft_ms, \
+             upstream_transport, profile_revision, reasoning_effort, service_tier, \
+             requested_service_tier, actual_service_tier, transport, ttft_ms, \
              total_tokens, cached_tokens, subagent, request_id, session_key, input_tokens, output_tokens, \
              cached_input_tokens, cache_write_input_tokens, reasoning_tokens, \
              reported_total_tokens, usage_schema, usage_source, usage_status, orchestration_input_tokens, \
@@ -806,7 +821,8 @@ impl RequestLogRepo {
         let mut select = QueryBuilder::<Sqlite>::new(
             "SELECT id, requested_at, provider, method, path, aliased, status, duration_ms, \
              account_id, target_kind, provider_credential_id, model, upstream_model, \
-             upstream_transport, profile_revision, reasoning_effort, service_tier, transport, ttft_ms, \
+             upstream_transport, profile_revision, reasoning_effort, service_tier, \
+             requested_service_tier, actual_service_tier, transport, ttft_ms, \
              total_tokens, cached_tokens, subagent, request_id, session_key, input_tokens, output_tokens, \
              cached_input_tokens, cache_write_input_tokens, reasoning_tokens, \
              reported_total_tokens, usage_schema, usage_source, usage_status, orchestration_input_tokens, \
@@ -1537,6 +1553,8 @@ mod tests {
         let repo = store.request_log();
 
         let rec = RequestLogRecord {
+            requested_service_tier: None,
+            actual_service_tier: None,
             requested_at: 100,
             provider: "codex".into(),
             method: "POST".into(),
@@ -1621,6 +1639,8 @@ mod tests {
 
     fn rec(provider: &str, path: &str, status: u16, model: Option<&str>) -> RequestLogRecord {
         RequestLogRecord {
+            requested_service_tier: None,
+            actual_service_tier: None,
             requested_at: 100,
             provider: provider.into(),
             method: "POST".into(),
@@ -1881,6 +1901,8 @@ mod tests {
         duration_ms: i64,
     ) -> RequestLogRecord {
         RequestLogRecord {
+            requested_service_tier: None,
+            actual_service_tier: None,
             requested_at,
             provider: "codex".into(),
             method: "POST".into(),
@@ -1931,6 +1953,8 @@ mod tests {
         output_tokens: i64,
     ) -> RequestLogRecord {
         RequestLogRecord {
+            requested_service_tier: None,
+            actual_service_tier: None,
             requested_at,
             provider: "codex".into(),
             method: "POST".into(),
@@ -2168,6 +2192,8 @@ mod tests {
         latency_first_token_ms: Option<i64>,
     ) -> RequestLogRecord {
         RequestLogRecord {
+            requested_service_tier: None,
+            actual_service_tier: None,
             requested_at,
             provider: provider.into(),
             method: "POST".into(),
@@ -3178,6 +3204,8 @@ mod tests {
     /// `None` — the shared base for tests that only care about a couple of fields on top.
     fn sample_record() -> RequestLogRecord {
         RequestLogRecord {
+            requested_service_tier: None,
+            actual_service_tier: None,
             requested_at: 100,
             provider: "codex".into(),
             method: "POST".into(),

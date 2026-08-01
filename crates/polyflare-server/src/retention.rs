@@ -291,6 +291,8 @@ mod tests {
 
     fn rec(requested_at: i64) -> polyflare_store::RequestLogRecord {
         polyflare_store::RequestLogRecord {
+            requested_service_tier: None,
+            actual_service_tier: None,
             requested_at,
             provider: "codex".into(),
             method: "POST".into(),

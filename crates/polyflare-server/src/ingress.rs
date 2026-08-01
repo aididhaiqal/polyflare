@@ -485,6 +485,10 @@ struct RouteOutcome {
     upstream_transport: Option<String>,
     profile_revision: Option<String>,
     custom_pricing: Option<polyflare_core::pricing::CustomModelRates>,
+    /// The tier asked of the UPSTREAM, after PolyFlare's own priority policy ran.
+    requested_service_tier: Option<String>,
+    /// The tier the upstream REPORTED, when the response carried one.
+    actual_service_tier: Option<String>,
     /// The requested (native path) or resolved target (translated/aliased path) model string.
     model: Option<String>,
     /// `reasoning.effort` for this request, when known.
@@ -2268,6 +2272,8 @@ async fn responses_route_with_transport(
         // Not yet known at this chokepoint (SPEC-M4a has no per-account subscription-tier read
         // wired here today).
         service_tier: outcome.service_tier,
+        requested_service_tier: outcome.requested_service_tier,
+        actual_service_tier: outcome.actual_service_tier,
         transport: Some(
             downstream_transport
                 .unwrap_or(response_transport_kind)
@@ -2493,6 +2499,7 @@ async fn execute_custom_models(
     outcome.upstream_model = Some(custom.upstream_model);
     outcome.upstream_transport = Some(custom.upstream_transport);
     if custom.effective_service_tier.is_some() {
+        outcome.actual_service_tier = custom.effective_service_tier.clone();
         outcome.service_tier = custom.effective_service_tier;
     }
     outcome.profile_revision = custom.profile_revision;
@@ -2774,6 +2781,12 @@ async fn responses_handler_impl_with_max_attempts(
         model: Some(model.clone()),
         reasoning_effort: facts.effort.clone(),
         service_tier: match priority_decision {
+            crate::priority_policy::PriorityDecision::Standard => Some("standard".to_string()),
+            _ => facts.service_tier.clone(),
+        },
+        // What we will actually ask the upstream for. A turn PolyFlare downgraded itself records
+        // `standard` here, so its own policy never reads as an upstream refusal later.
+        requested_service_tier: match priority_decision {
             crate::priority_policy::PriorityDecision::Standard => Some("standard".to_string()),
             _ => facts.service_tier.clone(),
         },
@@ -3625,6 +3638,8 @@ async fn messages_route(
             };
             let request_id = format!("{:032x}", rand::random::<u128>());
             let log = RequestLog {
+                requested_service_tier: None,
+                actual_service_tier: None,
                 method: "POST",
                 path: "/v1/messages".to_string(),
                 provider: Provider::Anthropic.to_string(),
@@ -3745,6 +3760,8 @@ async fn messages_route(
     // can call `RequestLogRepo::update_usage` against the SAME row this request inserts.
     let request_id = format!("{:032x}", rand::random::<u128>());
     let log = RequestLog {
+        requested_service_tier: None,
+        actual_service_tier: None,
         method: "POST",
         path: "/v1/messages".to_string(),
         provider,
@@ -4732,6 +4749,8 @@ mod tests {
 
         fn sample_record(request_id: &str) -> RequestLogRecord {
             RequestLogRecord {
+                requested_service_tier: None,
+                actual_service_tier: None,
                 requested_at: 100,
                 provider: "codex".into(),
                 method: "POST".into(),

@@ -340,6 +340,8 @@ mod tests {
 
     fn sample_record(request_id: &str) -> RequestLogRecord {
         RequestLogRecord {
+            requested_service_tier: None,
+            actual_service_tier: None,
             requested_at: 100,
             provider: "codex".into(),
             method: "POST".into(),

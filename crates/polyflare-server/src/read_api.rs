@@ -662,6 +662,11 @@ struct RequestRowView {
     profile_revision: Option<String>,
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
+    /// True when PolyFlare asked the upstream for a priority tier and the upstream reported
+    /// serving a different one — i.e. the priority request was declined. `false` when the tiers
+    /// agree OR when the upstream reported no tier at all (unknown is not a downgrade), so this
+    /// flag never overstates what was observed.
+    priority_downgraded: bool,
     transport: Option<String>,
     ttft_ms: Option<i64>,
     total_tokens: Option<i64>,
@@ -819,73 +824,78 @@ pub async fn requests_handler(
         Ok(r) => r,
         Err(_) => return Response::error(),
     };
-    let rows = rows
-        .into_iter()
-        .map(|r| {
-            // Prefer upstream-reported total, then compatibility evidence, then input+output.
-            // Reasoning is already a subset of output. TTFT falls back to
-            // latency_first_token_ms when ttft_ms is null. The effective TTFT is both serialized
-            // for the dashboard and used with output_tokens for the tps derivation below.
-            let total_tokens = r.api_total_tokens();
-            let uncached_input_tokens = r.uncached_input_tokens();
-            let visible_output_tokens = r.visible_output_tokens();
-            let effective_tokens = r.effective_tokens();
-            let tps_ttft_ms = r.ttft_ms.or(r.latency_first_token_ms);
-            let outcome =
-                canonical_imported_outcome(r.status, r.outcome.as_deref()).map(str::to_string);
-            let error_code = canonical_imported_error_code(
-                r.status,
-                r.outcome.as_deref(),
-                r.error_code.as_deref(),
-            );
-            RequestRowView {
-                id: r.id,
-                request_id: r.request_id,
-                session_key: r.session_key,
-                requested_at: r.requested_at,
-                provider: r.provider,
-                method: r.method,
-                path: r.path,
-                aliased: r.aliased,
-                status: r.status,
-                duration_ms: r.duration_ms,
-                tps: derive_tps(r.duration_ms, tps_ttft_ms, r.output_tokens),
-                account_id: r.account_id,
-                target_kind: r.target_kind,
-                provider_credential_id: r.provider_credential_id,
-                model: r.model,
-                upstream_model: r.upstream_model,
-                upstream_transport: r.upstream_transport,
-                profile_revision: r.profile_revision,
-                reasoning_effort: r.reasoning_effort,
-                service_tier: r.service_tier,
-                transport: r.transport,
-                ttft_ms: tps_ttft_ms,
-                total_tokens,
-                cached_tokens: r.cached_tokens.or(r.cached_input_tokens),
-                input_tokens: r.input_tokens,
-                cached_input_tokens: r.cached_input_tokens.or(r.cached_tokens),
-                cache_write_input_tokens: r.cache_write_input_tokens,
-                uncached_input_tokens,
-                output_tokens: r.output_tokens,
-                reasoning_output_tokens: r.reasoning_tokens,
-                visible_output_tokens,
-                reported_total_tokens: r.reported_total_tokens,
-                effective_tokens,
-                usage_schema: r.usage_schema,
-                usage_source: r.usage_source,
-                usage_status: r.usage_status,
-                orchestration_input_tokens: r.orchestration_input_tokens,
-                orchestration_output_tokens: r.orchestration_output_tokens,
-                orchestration_cached_input_tokens: r.orchestration_cached_input_tokens,
-                subagent: r.subagent,
-                outcome,
-                protocol_outcome: canonical_protocol_outcome(r.protocol_outcome.as_deref())
-                    .map(str::to_string),
-                error_code,
-            }
-        })
-        .collect();
+    let rows =
+        rows.into_iter()
+            .map(|r| {
+                // Prefer upstream-reported total, then compatibility evidence, then input+output.
+                // Reasoning is already a subset of output. TTFT falls back to
+                // latency_first_token_ms when ttft_ms is null. The effective TTFT is both serialized
+                // for the dashboard and used with output_tokens for the tps derivation below.
+                let total_tokens = r.api_total_tokens();
+                let uncached_input_tokens = r.uncached_input_tokens();
+                let visible_output_tokens = r.visible_output_tokens();
+                let effective_tokens = r.effective_tokens();
+                let tps_ttft_ms = r.ttft_ms.or(r.latency_first_token_ms);
+                let outcome =
+                    canonical_imported_outcome(r.status, r.outcome.as_deref()).map(str::to_string);
+                let error_code = canonical_imported_error_code(
+                    r.status,
+                    r.outcome.as_deref(),
+                    r.error_code.as_deref(),
+                );
+                RequestRowView {
+                    id: r.id,
+                    request_id: r.request_id,
+                    session_key: r.session_key,
+                    requested_at: r.requested_at,
+                    provider: r.provider,
+                    method: r.method,
+                    path: r.path,
+                    aliased: r.aliased,
+                    status: r.status,
+                    duration_ms: r.duration_ms,
+                    tps: derive_tps(r.duration_ms, tps_ttft_ms, r.output_tokens),
+                    account_id: r.account_id,
+                    target_kind: r.target_kind,
+                    provider_credential_id: r.provider_credential_id,
+                    model: r.model,
+                    upstream_model: r.upstream_model,
+                    upstream_transport: r.upstream_transport,
+                    profile_revision: r.profile_revision,
+                    reasoning_effort: r.reasoning_effort,
+                    priority_downgraded: polyflare_core::pricing::is_priority_tier(
+                        r.requested_service_tier.as_deref(),
+                    ) && r.actual_service_tier.as_deref().is_some_and(
+                        |actual| !polyflare_core::pricing::is_priority_tier(Some(actual)),
+                    ),
+                    service_tier: r.service_tier,
+                    transport: r.transport,
+                    ttft_ms: tps_ttft_ms,
+                    total_tokens,
+                    cached_tokens: r.cached_tokens.or(r.cached_input_tokens),
+                    input_tokens: r.input_tokens,
+                    cached_input_tokens: r.cached_input_tokens.or(r.cached_tokens),
+                    cache_write_input_tokens: r.cache_write_input_tokens,
+                    uncached_input_tokens,
+                    output_tokens: r.output_tokens,
+                    reasoning_output_tokens: r.reasoning_tokens,
+                    visible_output_tokens,
+                    reported_total_tokens: r.reported_total_tokens,
+                    effective_tokens,
+                    usage_schema: r.usage_schema,
+                    usage_source: r.usage_source,
+                    usage_status: r.usage_status,
+                    orchestration_input_tokens: r.orchestration_input_tokens,
+                    orchestration_output_tokens: r.orchestration_output_tokens,
+                    orchestration_cached_input_tokens: r.orchestration_cached_input_tokens,
+                    subagent: r.subagent,
+                    outcome,
+                    protocol_outcome: canonical_protocol_outcome(r.protocol_outcome.as_deref())
+                        .map(str::to_string),
+                    error_code,
+                }
+            })
+            .collect();
     Response::ok(RequestsView {
         total: total as i64,
         rows,

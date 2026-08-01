@@ -331,6 +331,8 @@ export interface RequestRowView {
   profile_revision: string | null;
   reasoning_effort: string | null;
   service_tier: string | null;
+  /** The upstream accepted a priority request but reported serving a different tier. */
+  priority_downgraded: boolean;
   transport: string | null;
   ttft_ms: number | null;
   /** API total: upstream-reported total when present, otherwise a compatibility fallback. */

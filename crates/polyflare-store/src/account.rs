@@ -1972,6 +1972,8 @@ mod tests {
     /// brief specifies.
     fn seed_request_log_record(account_id: &str) -> crate::RequestLogRecord {
         crate::RequestLogRecord {
+            requested_service_tier: None,
+            actual_service_tier: None,
             account_id: Some(account_id.into()),
             requested_at: 0,
             provider: "codex".into(),

@@ -199,12 +199,14 @@ function ModelCell({
   model,
   effort,
   tier,
+  downgraded = false,
   subagent,
   showAgent = true,
 }: {
   model: string | null;
   effort: string | null;
   tier: string | null;
+  downgraded?: boolean;
   subagent: string | null;
   showAgent?: boolean;
 }) {
@@ -216,7 +218,7 @@ function ModelCell({
           {effort}
         </span>
       )}
-      <ServiceTierBadge tier={tier} className="ml-1" />
+      <ServiceTierBadge tier={tier} downgraded={downgraded} className="ml-1" />
       {showAgent && <SubagentTag subagent={subagent} />}
     </span>
   );
@@ -910,6 +912,7 @@ function RequestRow({
             model={backend?.operationLabel ?? r.model}
             effort={r.reasoning_effort}
             tier={r.service_tier}
+            downgraded={r.priority_downgraded}
             subagent={r.subagent}
             showAgent={!backend}
           />

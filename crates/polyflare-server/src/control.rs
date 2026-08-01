@@ -642,6 +642,8 @@ async fn control_route(
     // can call `RequestLogRepo::update_usage` against the SAME row this request inserts.
     let request_id = format!("{:032x}", rand::random::<u128>());
     let log = RequestLog {
+        requested_service_tier: None,
+        actual_service_tier: None,
         method: method_label,
         path: log_label.to_string(),
         provider: Provider::Codex.to_string(),
@@ -1029,6 +1031,8 @@ async fn compact_route(
     // can call `RequestLogRepo::update_usage` against the SAME row this request inserts.
     let request_id = format!("{:032x}", rand::random::<u128>());
     let log = RequestLog {
+        requested_service_tier: None,
+        actual_service_tier: None,
         method: "POST",
         path: "responses_compact".to_string(),
         provider: Provider::Codex.to_string(),

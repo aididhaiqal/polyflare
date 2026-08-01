@@ -74,6 +74,8 @@ fn record_gateway_request(
     let request_id = format!("{:032x}", rand::random::<u128>());
     let transport = if method == "WS" { "ws" } else { "http" };
     let log = RequestLog {
+        requested_service_tier: None,
+        actual_service_tier: None,
         method,
         path,
         provider: BACKEND_PROVIDER.to_string(),

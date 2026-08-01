@@ -59,6 +59,11 @@ pub struct RequestLog {
     /// The recorded request service tier, when known. Native Responses traffic carries the
     /// client-requested value; imported history carries codex-lb's recorded tier.
     pub service_tier: Option<String>,
+    /// The tier asked of the UPSTREAM, after PolyFlare's own priority policy ran.
+    pub requested_service_tier: Option<String>,
+    /// The tier the upstream REPORTED. `None` means the response carried none — unknown, not a
+    /// downgrade.
+    pub actual_service_tier: Option<String>,
     /// The wire transport this request rode in on (`"http"` today; `"ws"` lands with the WS
     /// milestone).
     pub transport: Option<String>,
@@ -142,6 +147,8 @@ impl RequestLog {
             profile_revision: self.profile_revision.clone(),
             reasoning_effort: bounded_identifier(self.reasoning_effort.as_deref(), 32),
             service_tier: bounded_identifier(self.service_tier.as_deref(), 32),
+            requested_service_tier: bounded_identifier(self.requested_service_tier.as_deref(), 32),
+            actual_service_tier: bounded_identifier(self.actual_service_tier.as_deref(), 32),
             transport: self.transport.clone(),
             ttft_ms: self.ttft_ms,
             total_tokens: self.total_tokens,
@@ -865,6 +872,8 @@ mod tests {
 
         tracing::dispatcher::with_default(&dispatch, || {
             RequestLog {
+                requested_service_tier: None,
+                actual_service_tier: None,
                 method: "POST",
                 path: "/responses".to_string(),
                 provider: "codex".to_string(),
@@ -939,6 +948,8 @@ mod tests {
     #[test]
     fn record_and_to_log_event_carry_subagent_like_model_and_account_id() {
         let log = RequestLog {
+            requested_service_tier: None,
+            actual_service_tier: None,
             method: "POST",
             path: "/responses".to_string(),
             provider: "codex".to_string(),
@@ -993,6 +1004,8 @@ mod tests {
     #[test]
     fn record_and_to_log_event_carry_none_subagent_for_the_main_agent() {
         let log = RequestLog {
+            requested_service_tier: None,
+            actual_service_tier: None,
             method: "POST",
             path: "/responses".to_string(),
             provider: "codex".to_string(),
@@ -1025,6 +1038,8 @@ mod tests {
     fn arbitrary_client_metadata_is_dropped_at_every_telemetry_sink() {
         let sentinel = "operator secret sentence that is not an identifier";
         let log = RequestLog {
+            requested_service_tier: None,
+            actual_service_tier: None,
             method: "POST",
             path: "/responses".to_string(),
             provider: "codex".to_string(),
@@ -1077,6 +1092,8 @@ mod tests {
     #[test]
     fn record_carries_request_id_through_to_the_persisted_record() {
         let log = RequestLog {
+            requested_service_tier: None,
+            actual_service_tier: None,
             method: "POST",
             path: "/responses".to_string(),
             provider: "codex".to_string(),

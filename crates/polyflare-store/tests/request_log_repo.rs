@@ -11,6 +11,8 @@ fn rec(
     duration_ms: i64,
 ) -> RequestLogRecord {
     RequestLogRecord {
+        requested_service_tier: None,
+        actual_service_tier: None,
         requested_at,
         provider: provider.to_string(),
         method: "POST".to_string(),

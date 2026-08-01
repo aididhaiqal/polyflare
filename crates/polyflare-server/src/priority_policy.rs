@@ -280,6 +280,8 @@ mod tests {
 
     fn request_record(session_key: &str, subagent: Option<&str>) -> RequestLogRecord {
         RequestLogRecord {
+            requested_service_tier: None,
+            actual_service_tier: None,
             requested_at: 1,
             provider: "codex".into(),
             method: "POST".into(),

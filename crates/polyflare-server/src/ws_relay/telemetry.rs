@@ -290,6 +290,8 @@ impl WsTurnTelemetry {
         let duration_ms = self.started_at.elapsed().as_millis() as u64;
         let request_id = format!("{:032x}", rand::random::<u128>());
         let log = RequestLog {
+            requested_service_tier: None,
+            actual_service_tier: None,
             method: "WS",
             path: "/responses".to_string(),
             provider: Provider::Codex.to_string(),
