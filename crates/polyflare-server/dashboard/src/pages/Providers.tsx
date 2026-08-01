@@ -68,6 +68,9 @@ import {
 const INPUT =
   "h-9 w-full rounded-lg border border-border bg-bg/65 px-3 text-[11px] text-fg outline-none transition focus:border-accent/60";
 
+/** Above this many providers, cards start collapsed — see `Providers`'s `collapseByDefault`. */
+const COLLAPSE_THRESHOLD = 6;
+
 export function Providers() {
   const providers = useProviders();
   const create = useCreateProviderBundle();
@@ -92,6 +95,23 @@ export function Providers() {
     providerName: string;
     result: ProviderModelDiscoveryResult;
   } | null>(null);
+  const [search, setSearch] = useState("");
+  // Which cards are open. Past a handful of providers, fully-expanded cards turn the page into a
+  // wall of scroll, so detail is opt-in above that threshold and automatic below it.
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+
+  const allProviders = providers.data ?? [];
+  const needle = search.trim().toLowerCase();
+  const visibleProviders = needle
+    ? allProviders.filter((provider) =>
+        [provider.display_name, provider.slug, provider.base_url]
+          .concat(provider.models.map((model) => model.public_model))
+          .some((field) => field?.toLowerCase().includes(needle)),
+      )
+    : allProviders;
+  // Small fleets keep the old always-open behaviour; large ones start collapsed.
+  const collapseByDefault = allProviders.length > COLLAPSE_THRESHOLD;
+  const isExpanded = (id: string) => expanded[id] ?? !collapseByDefault;
 
   return (
     <div className="flex flex-col gap-3">
@@ -99,18 +119,47 @@ export function Providers() {
         <div>
           <h1 className="text-lg font-semibold text-fg">Model providers</h1>
           <p className="mt-0.5 text-[11px] text-fg opacity-60">
-            Add Responses- or Anthropic-compatible providers, credential pools, and models to the
-            main PolyFlare catalog.
+            {allProviders.length === 0
+              ? "Add Responses- or Anthropic-compatible providers, credential pools, and models to the main PolyFlare catalog."
+              : `${allProviders.length} ${allProviders.length === 1 ? "provider" : "providers"} · ${allProviders.reduce((total, provider) => total + provider.models.length, 0)} models · ${allProviders.filter((provider) => provider.enabled).length} enabled${needle ? ` · ${visibleProviders.length} matching` : ""}`}
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => setOpen((value) => !value)}
-          className="flex items-center gap-2 rounded-lg bg-accent px-3 py-2 text-[11px] font-semibold text-white"
-        >
-          <Plus className="h-3.5 w-3.5" />
-          Add provider
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          {allProviders.length > 3 && (
+            <>
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="Filter providers or models…"
+                aria-label="Filter providers"
+                className="h-8 w-56 rounded-lg border border-border bg-bg px-2.5 text-[11px] text-fg outline-none focus:border-accent"
+              />
+              <button
+                type="button"
+                onClick={() =>
+                  setExpanded(
+                    allProviders.every((provider) => isExpanded(provider.id))
+                      ? Object.fromEntries(allProviders.map((provider) => [provider.id, false]))
+                      : Object.fromEntries(allProviders.map((provider) => [provider.id, true])),
+                  )
+                }
+                className="h-8 rounded-lg border border-border px-2.5 text-[11px] text-fg opacity-75 hover:opacity-100"
+              >
+                {allProviders.every((provider) => isExpanded(provider.id))
+                  ? "Collapse all"
+                  : "Expand all"}
+              </button>
+            </>
+          )}
+          <button
+            type="button"
+            onClick={() => setOpen((value) => !value)}
+            className="flex h-8 items-center gap-2 rounded-lg bg-accent px-3 text-[11px] font-semibold text-white"
+          >
+            <Plus className="h-3.5 w-3.5" />
+            Add provider
+          </button>
+        </div>
       </div>
 
       {open && (
@@ -124,24 +173,6 @@ export function Providers() {
         />
       )}
 
-      <ProviderPerformancePanel
-        range={performanceRange}
-        onRangeChange={setPerformanceRange}
-        rows={buildProviderModelPerformanceComparisons(
-          providers.data ?? [],
-          performance.data?.rows ?? [],
-        )}
-        buckets={performance.data?.buckets ?? []}
-        sinceTs={performance.data?.since_ts ?? null}
-        bucketSeconds={performance.data?.bucket_seconds ?? null}
-        loading={providers.isLoading || performance.isLoading}
-        error={providers.isError || performance.isError}
-        onRetry={() => {
-          void providers.refetch();
-          void performance.refetch();
-        }}
-      />
-
       {providers.isLoading ? (
         <Card>
           <div className="h-36 animate-pulse rounded-lg bg-muted" />
@@ -153,9 +184,9 @@ export function Providers() {
             Couldn&apos;t load configured providers.
           </div>
         </Card>
-      ) : providers.data?.length ? (
+      ) : visibleProviders.length ? (
         <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
-          {providers.data.map((provider) => (
+          {visibleProviders.map((provider) => (
             <Card key={provider.id} className="gap-4">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
@@ -226,6 +257,28 @@ export function Providers() {
                 </div>
               </div>
 
+              <button
+                type="button"
+                onClick={() =>
+                  setExpanded((current) => ({
+                    ...current,
+                    [provider.id]: !isExpanded(provider.id),
+                  }))
+                }
+                aria-expanded={isExpanded(provider.id)}
+                className="flex items-center justify-between gap-2 rounded-lg border border-border/60 bg-bg/25 px-3 py-1.5 text-[10px] text-fg opacity-70 hover:opacity-100"
+              >
+                <span>
+                  {provider.credentials.length}{" "}
+                  {provider.credentials.length === 1 ? "credential" : "credentials"} ·{" "}
+                  {provider.models.length} {provider.models.length === 1 ? "model" : "models"}
+                </span>
+                <span className="font-semibold text-accent">
+                  {isExpanded(provider.id) ? "Hide" : "Manage"}
+                </span>
+              </button>
+
+              {isExpanded(provider.id) && (
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <section className="rounded-lg border border-border/70 bg-bg/35 p-3">
                   <div className="mb-2 flex items-center justify-between gap-2">
@@ -475,6 +528,7 @@ export function Providers() {
                   </div>
                 </section>
               </div>
+              )}
               {discoveryTarget?.providerId === provider.id && (
                 <ModelDiscoveryPanel
                   key={`${provider.id}-${discoveryTarget.result.discovered}`}
@@ -569,6 +623,26 @@ export function Providers() {
           </div>
         </Card>
       )}
+
+      {/* Analytics sits BELOW the provider list: this page's primary job is managing providers,
+          and a per-model comparison table pushed that job several screens down. */}
+      <ProviderPerformancePanel
+        range={performanceRange}
+        onRangeChange={setPerformanceRange}
+        rows={buildProviderModelPerformanceComparisons(
+          providers.data ?? [],
+          performance.data?.rows ?? [],
+        )}
+        buckets={performance.data?.buckets ?? []}
+        sinceTs={performance.data?.since_ts ?? null}
+        bucketSeconds={performance.data?.bucket_seconds ?? null}
+        loading={providers.isLoading || performance.isLoading}
+        error={providers.isError || performance.isError}
+        onRetry={() => {
+          void providers.refetch();
+          void performance.refetch();
+        }}
+      />
     </div>
   );
 }
@@ -600,7 +674,12 @@ function ProviderPerformancePanel({
   error: boolean;
   onRetry: () => void;
 }) {
-  const showPriority = rows.some((row) => row.supportsPriority || row.hasPriorityHistory);
+  // A model with no samples in range contributed a full-height, entirely empty lane. With a
+  // couple of dozen models that was several screens of nothing sitting above the provider list,
+  // so unmeasured models are summarised on one line instead.
+  const measured = rows.filter((row) => row.standard || row.priority);
+  const unmeasuredCount = rows.length - measured.length;
+  const showPriority = measured.some((row) => row.supportsPriority || row.hasPriorityHistory);
   const models = [...new Set(rows.map((row) => row.model))];
   const [selectedModel, setSelectedModel] = useState("");
   useEffect(() => {
@@ -659,10 +738,12 @@ function ProviderPerformancePanel({
             Retry
           </button>
         </div>
-      ) : rows.length === 0 ? (
+      ) : measured.length === 0 ? (
         <div className="px-4 py-7 text-center">
           <div className="text-[10.5px] font-medium text-fg opacity-65">
-            No configured model performance yet
+            {rows.length === 0
+              ? "No configured model performance yet"
+              : `No samples in this range across ${rows.length} configured ${rows.length === 1 ? "model" : "models"}`}
           </div>
           <div className="mt-1 text-[9px] text-fg opacity-40">
             Models appear here after provider onboarding; metrics fill in as requests complete.
@@ -677,7 +758,7 @@ function ProviderPerformancePanel({
             <span>Standard</span>
             {showPriority && <span>Priority / Fast</span>}
           </div>
-          {rows.map((row) => (
+          {measured.map((row) => (
             <div
               key={row.key}
               className={`grid grid-cols-1 gap-3 px-4 py-3 transition-colors hover:bg-muted/20 ${columns}`}
@@ -719,6 +800,12 @@ function ProviderPerformancePanel({
               )}
             </div>
           ))}
+          {unmeasuredCount > 0 && (
+            <div className="px-4 py-2.5 text-[9px] text-fg opacity-40">
+              {unmeasuredCount} more configured{" "}
+              {unmeasuredCount === 1 ? "model has" : "models have"} no samples in this range.
+            </div>
+          )}
           {selectedModel && sinceTs !== null && bucketSeconds !== null && (
             <ProviderPerformanceTrends
               model={selectedModel}

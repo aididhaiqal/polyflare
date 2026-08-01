@@ -7,10 +7,12 @@ export default defineConfig({
   base: "/dashboard/",
   plugins: [react()],
   // Dev-only: forward API calls to a locally running polyflare instance so `bun run dev` renders
-  // live data instead of request errors. No effect on the embedded production build.
+  // live data instead of request errors. `POLYFLARE_DEV_PROXY` retargets it at a scratch instance
+  // (useful for exercising a page against seeded data without touching the real store). No effect
+  // on the embedded production build.
   server: {
     proxy: {
-      "/api": "http://127.0.0.1:8080",
+      "/api": process.env.POLYFLARE_DEV_PROXY || "http://127.0.0.1:8080",
     },
   },
   build: {
