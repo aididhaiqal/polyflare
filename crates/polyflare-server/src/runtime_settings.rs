@@ -447,6 +447,7 @@ mod tests {
             pool_strategies: HashMap::new(),
             admin_token: None,
             passkey_origin: "http://localhost:8080".to_string(),
+            passkey_rp_id: None,
             live_logs: false,
             http_requests_use_upstream_websocket: false,
             client_websocket_enabled: false,

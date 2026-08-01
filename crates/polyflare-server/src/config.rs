@@ -36,11 +36,16 @@ pub struct ServeConfig {
     /// `Authorization: Bearer <token>`). Unset is open only on a loopback bind; non-loopback
     /// management remains disabled.
     pub admin_token: Option<String>,
-    /// Origin passkey sign-in is bound to (`POLYFLARE_PASSKEY_ORIGIN`). Defaults to
-    /// `http://localhost:<bind port>`: WebAuthn forbids an IP-literal relying-party id, so the
+    /// Origin(s) passkey sign-in accepts (`POLYFLARE_PASSKEY_ORIGIN`, comma-separated). Defaults
+    /// to `http://localhost:<bind port>`: WebAuthn forbids an IP-literal relying-party id, so the
     /// loopback default has to be the `localhost` NAME, not `127.0.0.1`. Set this to the exact
-    /// origin the browser shows (e.g. `https://mac.tailnet.ts.net`) when serving remotely.
+    /// origin(s) the browser shows (e.g. `https://mac.tailnet.ts.net`) when serving remotely.
     pub passkey_origin: String,
+    /// Relying-party id override (`POLYFLARE_PASSKEY_RP_ID`). Unset means "the first origin's
+    /// host", which scopes a passkey to exactly that host. Set it to a PARENT domain
+    /// (`tailnet.ts.net`) to make one passkey work from every subdomain beneath it — the only way
+    /// to avoid re-registering per machine. See `crate::passkey_auth::build_webauthn`.
+    pub passkey_rp_id: Option<String>,
     /// Enables the dashboard live log/request stream (`POLYFLARE_LIVE_LOGS`). **Default ON**;
     /// `0`/`false`/`no`/`off` is the explicit polling-only rollback lever.
     pub live_logs: bool,
@@ -1039,6 +1044,7 @@ impl ServeConfig {
             Err(_) => HashMap::new(),
         };
         let admin_token = std::env::var("POLYFLARE_ADMIN_TOKEN").ok();
+        let passkey_rp_id = std::env::var("POLYFLARE_PASSKEY_RP_ID").ok();
         let passkey_origin = std::env::var("POLYFLARE_PASSKEY_ORIGIN").unwrap_or_else(|_| {
             let port = bind_addr.rsplit(':').next().unwrap_or("8080");
             format!("http://localhost:{port}")
@@ -1083,6 +1089,7 @@ impl ServeConfig {
         let model_catalog_enabled = model_catalog_enabled_from_env();
         Ok(ServeConfig {
             passkey_origin,
+            passkey_rp_id,
             bind_addr,
             upstream_base_url,
             anthropic_upstream_base_url,

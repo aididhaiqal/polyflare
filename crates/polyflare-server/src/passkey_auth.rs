@@ -17,9 +17,14 @@
 //! # Origin binding (the constraint that shapes the UX)
 //! WebAuthn forbids an IP address as a relying-party id, so passkeys work at
 //! `http://localhost:8080` but NOT `http://127.0.0.1:8080` — browsers treat `localhost` as a
-//! secure context, so plain HTTP is fine there. Credentials are bound to the origin that created
-//! them, so reaching this dashboard over a different hostname (a Tailscale `ts.net` name, say)
-//! needs its own passkey registered at that origin, and `POLYFLARE_PASSKEY_ORIGIN` set to it.
+//! secure context, so plain HTTP is fine there.
+//!
+//! A credential is scoped to its relying-party id and usable only from that host or a subdomain of
+//! it. `POLYFLARE_PASSKEY_ORIGIN` therefore takes a comma-separated LIST, and
+//! `POLYFLARE_PASSKEY_RP_ID` sets the id those origins share — pointing it at a parent domain is
+//! what lets one passkey cover every machine on a tailnet. Hosts with no common parent
+//! (`localhost` vs a `ts.net` name) cannot share a credential under any configuration; see
+//! [`build_webauthn`].
 //!
 //! # Challenge state
 //! In-flight registration/authentication challenges live in memory with a short TTL, never in the
@@ -97,25 +102,79 @@ impl CeremonyStore {
     }
 }
 
-/// Build the relying-party config from an origin like `http://localhost:8080`. `None` when the
-/// origin is unusable (an IP-address host, or unparseable), in which case passkey routes report
-/// themselves unavailable rather than the server refusing to start.
-pub fn build_webauthn(origin: &str) -> Option<Arc<Webauthn>> {
-    let url = Url::parse(origin).ok()?;
-    let host = url.host_str()?;
+/// Build the relying-party config.
+///
+/// `origins` is one or more origins the dashboard is browsed at (comma-separated in
+/// `POLYFLARE_PASSKEY_ORIGIN`); `rp_id` optionally overrides the relying-party id, which is what
+/// makes ONE passkey usable from several origins.
+///
+/// # Why the relying-party id is the whole story
+/// A credential is bound to its RP id, and a browser will only use it from an origin whose host is
+/// that id or a subdomain of it. So:
+///
+/// - Default (`rp_id` unset) — the id is the first origin's host, and the passkey works at exactly
+///   that host.
+/// - Set `rp_id` to a PARENT domain (`tailnet-name.ts.net`) while serving from
+///   `mac.tailnet-name.ts.net`, and subdomain matching is enabled: one passkey then works from
+///   every machine on that tailnet.
+/// - Hosts that share no parent — `localhost` and `mac.tailnet.ts.net` — cannot be covered by a
+///   single RP id at all. That is a WebAuthn rule, not a limitation here: browse both at the same
+///   hostname, or register one passkey per origin.
+///
+/// `None` (passkeys disabled, server still starts) when no usable origin is configured.
+pub fn build_webauthn(origins: &str, rp_id: Option<&str>) -> Option<Arc<Webauthn>> {
+    let parsed = origins
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .filter_map(|origin| Url::parse(origin).ok())
+        .collect::<Vec<_>>();
+    let first = parsed.first()?;
+    let first_host = first.host_str()?;
+
     // WebAuthn requires the relying-party id to be a domain; an IP literal is not permitted.
-    if host.parse::<std::net::IpAddr>().is_ok() {
+    let rp_id = rp_id.map(str::trim).filter(|id| !id.is_empty());
+    let effective_rp_id = rp_id.unwrap_or(first_host);
+    if effective_rp_id.parse::<std::net::IpAddr>().is_ok() {
         tracing::warn!(
-            origin,
+            rp_id = effective_rp_id,
             "passkey sign-in disabled: WebAuthn does not allow an IP address as a relying-party \
              id — browse the dashboard at http://localhost:<port> instead"
         );
         return None;
     }
-    match WebauthnBuilder::new(host, &url).and_then(|b| b.rp_name("PolyFlare").build()) {
+    // Subdomain matching is only meaningful when the id is a PARENT of the origin host; enabling
+    // it unconditionally would widen the credential's scope for no reason.
+    let needs_subdomains = parsed
+        .iter()
+        .filter_map(|url| url.host_str())
+        .any(|host| host != effective_rp_id && host.ends_with(&format!(".{effective_rp_id}")));
+
+    let mut builder = match WebauthnBuilder::new(effective_rp_id, first) {
+        Ok(builder) => builder.rp_name("PolyFlare"),
+        Err(error) => {
+            tracing::warn!(
+                rp_id = effective_rp_id,
+                %error,
+                "passkey sign-in disabled: invalid relying-party config"
+            );
+            return None;
+        }
+    };
+    if needs_subdomains {
+        builder = builder.allow_subdomains(true);
+    }
+    for extra in parsed.iter().skip(1) {
+        builder = builder.append_allowed_origin(extra);
+    }
+    match builder.build() {
         Ok(webauthn) => Some(Arc::new(webauthn)),
         Err(error) => {
-            tracing::warn!(origin, %error, "passkey sign-in disabled: invalid relying-party config");
+            tracing::warn!(
+                rp_id = effective_rp_id,
+                %error,
+                "passkey sign-in disabled: invalid relying-party config"
+            );
             None
         }
     }
@@ -468,21 +527,62 @@ mod tests {
     #[test]
     fn webauthn_is_built_for_localhost_but_refused_for_ip_origins() {
         assert!(
-            build_webauthn("http://localhost:8080").is_some(),
+            build_webauthn("http://localhost:8080", None).is_some(),
             "localhost is a valid relying-party id and a secure context"
         );
         // WebAuthn forbids IP-literal relying-party ids — this must fail closed, not silently
         // produce a config browsers will reject at ceremony time.
-        assert!(build_webauthn("http://127.0.0.1:8080").is_none());
-        assert!(build_webauthn("http://[::1]:8080").is_none());
-        assert!(build_webauthn("not a url").is_none());
-        assert!(build_webauthn("https://mac.tail1234.ts.net").is_some());
+        assert!(build_webauthn("http://127.0.0.1:8080", None).is_none());
+        assert!(build_webauthn("http://[::1]:8080", None).is_none());
+        assert!(build_webauthn("not a url", None).is_none());
+        assert!(build_webauthn("", None).is_none());
+        assert!(build_webauthn("https://mac.tail1234.ts.net", None).is_some());
+    }
+
+    #[test]
+    fn a_parent_rp_id_covers_every_origin_beneath_it() {
+        // The multi-origin fix: one credential scoped to the tailnet domain, usable from every
+        // machine on it. Both origins must be accepted by the SAME relying party.
+        let webauthn = build_webauthn(
+            "https://mac.tail1234.ts.net, https://laptop.tail1234.ts.net",
+            Some("tail1234.ts.net"),
+        )
+        .expect("a parent rp id spanning two subdomains is valid");
+        let origins = webauthn
+            .get_allowed_origins()
+            .iter()
+            .map(|o| o.to_string())
+            .collect::<Vec<_>>();
+        assert!(origins.iter().any(|o| o.contains("mac.tail1234.ts.net")));
+        assert!(origins.iter().any(|o| o.contains("laptop.tail1234.ts.net")));
+    }
+
+    #[test]
+    fn an_ip_relying_party_id_is_refused_however_it_arrives() {
+        // Explicitly, not just as a derived default — an operator could set it directly.
+        assert!(build_webauthn("https://example.test", Some("10.0.0.1")).is_none());
+    }
+
+    #[test]
+    fn unrelated_hosts_cannot_share_one_relying_party() {
+        // localhost and a tailnet name share no parent, so no rp id covers both. The build still
+        // succeeds (scoped to the id given) — the SECOND origin is simply not reachable by that
+        // credential, which is why the docs tell operators to register one passkey per origin.
+        let webauthn = build_webauthn("http://localhost:8080, https://mac.tail1234.ts.net", None)
+            .expect("the first origin remains usable");
+        assert!(
+            webauthn
+                .get_allowed_origins()
+                .iter()
+                .any(|o| o.to_string().contains("localhost")),
+            "the relying party stays anchored to the first origin"
+        );
     }
 
     #[test]
     fn ceremony_state_is_single_use_and_expires() {
         let store = CeremonyStore::default();
-        let webauthn = build_webauthn("http://localhost:8080").unwrap();
+        let webauthn = build_webauthn("http://localhost:8080", None).unwrap();
         let (_, registration) = webauthn
             .start_passkey_registration(Uuid::new_v4(), "u", "u", None)
             .unwrap();

@@ -358,7 +358,10 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         runtime_settings,
         ws_downstream: config.client_websocket_enabled,
         ws_relay_idle: config.websocket_idle_policy,
-        webauthn: polyflare_server::passkey_auth::build_webauthn(&config.passkey_origin),
+        webauthn: polyflare_server::passkey_auth::build_webauthn(
+            &config.passkey_origin,
+            config.passkey_rp_id.as_deref(),
+        ),
         passkey_ceremonies: std::sync::Arc::new(Default::default()),
         log_bus: polyflare_server::log_bus::LogBus::new(1000),
         failover_metrics: polyflare_server::observability::FailoverMetrics::new(),
