@@ -17,6 +17,7 @@ import {
 
 import type {
   CreateProviderModelBody,
+  CustomProviderView,
   ProviderModelDiscoveryResult,
   ProviderPerformanceBucketView,
   ProviderPerformanceRowView,
@@ -46,6 +47,7 @@ import {
   useProviderAction,
   useProviderPerformance,
   useProviders,
+  type ProviderAction,
   useSyncProviderModels,
   useTestProvider,
   useUpdateProviderModel,
@@ -57,6 +59,7 @@ import {
   Check,
   Clock,
   KeyRound,
+  ChevronDown,
   Plus,
   Route,
   Search,
@@ -373,155 +376,20 @@ export function Providers() {
                     </span>
                   </div>
                   <div className="flex flex-col gap-2">
-                    {provider.models.map((model) => {
-                      const targetProviders = (providers.data ?? [])
-                        .filter((candidate) =>
-                          candidate.models.some(
-                            (candidateModel) =>
-                              candidateModel.enabled &&
-                              candidateModel.public_model === model.public_model,
-                          ),
-                        )
-                        .map((candidate) => candidate.display_name);
-                      return (
-                      <div key={model.id}>
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="truncate font-mono text-[10.5px] text-fg">
-                            {model.public_model}
-                          </span>
-                          <span className="flex items-center gap-1.5 text-[8px] text-fg opacity-40">
-                            {model.context_window
-                              ? `${Math.round(model.context_window / 1000)}k ctx`
-                              : "context unknown"}
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setAddTarget({
-                                  providerId: provider.id,
-                                  kind: "model",
-                                  template: model,
-                                })
-                              }
-                              className="text-signal opacity-100"
-                            >
-                              profile
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setAddTarget({
-                                  providerId: provider.id,
-                                  kind: "model",
-                                  model,
-                                })
-                              }
-                              className="text-accent opacity-100"
-                            >
-                              edit
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                action.mutate({
-                                  kind: "model_enabled",
-                                  id: model.id,
-                                  enabled: !model.enabled,
-                                })
-                              }
-                              className="text-accent opacity-100"
-                            >
-                              {model.enabled ? "off" : "on"}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                if (window.confirm(`Delete model ${model.public_model}?`)) {
-                                  action.mutate({ kind: "model_delete", id: model.id });
-                                }
-                              }}
-                              className="text-error opacity-100"
-                              aria-label={`Delete model ${model.public_model}`}
-                            >
-                              <Trash2 className="h-2.5 w-2.5" />
-                            </button>
-                          </span>
-                        </div>
-                        {model.public_model !== model.upstream_model && (
-                          <div className="mt-0.5 truncate font-mono text-[8.5px] text-fg opacity-35">
-                            upstream: {model.upstream_model}
-                          </div>
-                        )}
-                        <div className="mt-1 text-[8px] text-fg opacity-45">
-                          Effort{" "}
-                          {model.reasoning_levels.length
-                            ? model.reasoning_levels.join(" · ")
-                            : "not advertised"}
-                          {model.supports_reasoning_summaries ? " · summaries" : ""}
-                        </div>
-                        <div className="mt-1 text-[8px] text-fg opacity-55">
-                          <span className="uppercase tracking-wide opacity-65">
-                            USD / 1M
-                          </span>{" "}
-                          · {providerPricingSummary(model)}
-                        </div>
-                        {isProviderModelProfile(model) && (
-                          <div className="mt-1 inline-flex rounded border border-signal/25 bg-signal/[0.07] px-1.5 py-0.5 text-[8px] font-semibold text-signal">
-                            profile · {model.instruction_mode}
-                          </div>
-                        )}
-                        {targetProviders.length > 1 && (
-                          <div
-                            className="mt-1 inline-flex rounded border border-accent/25 bg-accent/[0.07] px-1.5 py-0.5 text-[8px] font-semibold text-accent"
-                            title={`Targets: ${targetProviders.join(", ")}`}
-                          >
-                            balanced · {targetProviders.length} providers
-                          </div>
-                        )}
-                        <div className="mt-1 flex items-center gap-1">
-                          <span className="mr-1 text-[8px] uppercase tracking-wide text-fg opacity-35">
-                            Discoverable
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              action.mutate({
-                                kind: "model_visibility",
-                                id: model.id,
-                                visible_in_codex: !model.visible_in_codex,
-                              })
-                            }
-                            className={`rounded border px-1.5 py-0.5 text-[8px] ${
-                              model.visible_in_codex
-                                ? "border-accent/35 bg-accent/10 text-accent"
-                                : "border-border text-fg opacity-40"
-                            }`}
-                          >
-                            Codex picker
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              action.mutate({
-                                kind: "model_visibility",
-                                id: model.id,
-                                visible_in_openai: !model.visible_in_openai,
-                              })
-                            }
-                            className={`rounded border px-1.5 py-0.5 text-[8px] ${
-                              model.visible_in_openai
-                                ? "border-signal/35 bg-signal/10 text-signal"
-                                : "border-border text-fg opacity-40"
-                            }`}
-                          >
-                            OpenAI list
-                          </button>
-                          {!model.visible_in_codex && !model.visible_in_openai && (
-                            <span className="text-[8px] text-warn">route only</span>
-                          )}
-                        </div>
-                      </div>
-                      );
-                    })}
+                    {provider.models.map((model) => (
+                      <ProviderModelRow
+                        key={model.id}
+                        model={model}
+                        allProviders={providers.data ?? []}
+                        onEditProfile={() =>
+                          setAddTarget({ providerId: provider.id, kind: "model", template: model })
+                        }
+                        onEdit={() =>
+                          setAddTarget({ providerId: provider.id, kind: "model", model })
+                        }
+                        onAction={action.mutate}
+                      />
+                    ))}
                     {!provider.models.length && (
                       <span className="text-[10px] text-fg opacity-40">No models</span>
                     )}
@@ -643,6 +511,185 @@ export function Providers() {
           void performance.refetch();
         }}
       />
+    </div>
+  );
+}
+
+/** A model's price summary reduced to a single glanceable token, e.g. `$2.50/$10`. */
+function compactPrice(model: ProviderModelView): string | null {
+  const inp = model.input_per_million;
+  const out = model.output_per_million;
+  if (inp === null && out === null) return null;
+  const fmt = (v: number | null) => (v === null ? "?" : `$${v % 1 === 0 ? v : v.toFixed(2)}`);
+  return `${fmt(inp)}/${fmt(out)}`;
+}
+
+/**
+ * One model inside a provider card.
+ *
+ * Collapsed by default to a single line, because the full detail — upstream alias, reasoning
+ * effort, pricing, profile/balanced badges, and the two discoverability toggles — runs to roughly
+ * 120px per model. At ten models per provider that alone was over a thousand pixels inside a
+ * single card, which is what made an expanded provider unreadable. The summary line keeps the
+ * facts you scan for (name, context, price, enabled) and everything else is one click away.
+ */
+function ProviderModelRow({
+  model,
+  allProviders,
+  onEditProfile,
+  onEdit,
+  onAction,
+}: {
+  model: ProviderModelView;
+  allProviders: CustomProviderView[];
+  onEditProfile: () => void;
+  onEdit: () => void;
+  onAction: (action: ProviderAction) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  // Which other providers also serve this public model — the "balanced" signal.
+  const targetProviders = allProviders
+    .filter((candidate) =>
+      candidate.models.some(
+        (candidateModel) =>
+          candidateModel.enabled && candidateModel.public_model === model.public_model,
+      ),
+    )
+    .map((candidate) => candidate.display_name);
+  const price = compactPrice(model);
+  const routeOnly = !model.visible_in_codex && !model.visible_in_openai;
+
+  return (
+    <div className="rounded border border-border/50 bg-bg/25">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 px-2 py-1.5 text-left hover:bg-muted/25"
+      >
+        <span
+          className={`h-1.5 w-1.5 shrink-0 rounded-full ${model.enabled ? "bg-success" : "bg-border"}`}
+          aria-hidden
+        />
+        <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-fg">
+          {model.public_model}
+        </span>
+        <span className="flex shrink-0 items-center gap-1.5 text-[8px] text-fg opacity-45">
+          {model.context_window ? `${Math.round(model.context_window / 1000)}k` : "—"}
+          {price && <span className="opacity-80">{price}</span>}
+          {isProviderModelProfile(model) && <span className="text-signal">profile</span>}
+          {targetProviders.length > 1 && (
+            <span className="text-accent">×{targetProviders.length}</span>
+          )}
+          {routeOnly && <span className="text-warn">route only</span>}
+          <ChevronDown
+            className={`h-3 w-3 transition-transform ${open ? "rotate-180" : ""}`}
+            strokeWidth={2}
+          />
+        </span>
+      </button>
+
+      {open && (
+        <div className="border-t border-border/40 px-2 py-1.5">
+          <div className="flex flex-wrap items-center gap-2 text-[8px]">
+            <button type="button" onClick={onEditProfile} className="text-signal">
+              profile
+            </button>
+            <button type="button" onClick={onEdit} className="text-accent">
+              edit
+            </button>
+            <button
+              type="button"
+              onClick={() => onAction({ kind: "model_enabled", id: model.id, enabled: !model.enabled })}
+              className="text-accent"
+            >
+              {model.enabled ? "off" : "on"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (window.confirm(`Delete model ${model.public_model}?`)) {
+                  onAction({ kind: "model_delete", id: model.id });
+                }
+              }}
+              className="text-error"
+              aria-label={`Delete model ${model.public_model}`}
+            >
+              <Trash2 className="h-2.5 w-2.5" />
+            </button>
+          </div>
+
+          {model.public_model !== model.upstream_model && (
+            <div className="mt-1 truncate font-mono text-[8.5px] text-fg opacity-35">
+              upstream: {model.upstream_model}
+            </div>
+          )}
+          <div className="mt-1 text-[8px] text-fg opacity-45">
+            Effort{" "}
+            {model.reasoning_levels.length
+              ? model.reasoning_levels.join(" · ")
+              : "not advertised"}
+            {model.supports_reasoning_summaries ? " · summaries" : ""}
+          </div>
+          <div className="mt-1 text-[8px] text-fg opacity-55">
+            <span className="uppercase tracking-wide opacity-65">USD / 1M</span> ·{" "}
+            {providerPricingSummary(model)}
+          </div>
+          {isProviderModelProfile(model) && (
+            <div className="mt-1 inline-flex rounded border border-signal/25 bg-signal/[0.07] px-1.5 py-0.5 text-[8px] font-semibold text-signal">
+              profile · {model.instruction_mode}
+            </div>
+          )}
+          {targetProviders.length > 1 && (
+            <div
+              className="mt-1 inline-flex rounded border border-accent/25 bg-accent/[0.07] px-1.5 py-0.5 text-[8px] font-semibold text-accent"
+              title={`Targets: ${targetProviders.join(", ")}`}
+            >
+              balanced · {targetProviders.length} providers
+            </div>
+          )}
+          <div className="mt-1 flex items-center gap-1">
+            <span className="mr-1 text-[8px] uppercase tracking-wide text-fg opacity-35">
+              Discoverable
+            </span>
+            <button
+              type="button"
+              onClick={() =>
+                onAction({
+                  kind: "model_visibility",
+                  id: model.id,
+                  visible_in_codex: !model.visible_in_codex,
+                })
+              }
+              className={`rounded border px-1.5 py-0.5 text-[8px] ${
+                model.visible_in_codex
+                  ? "border-accent/35 bg-accent/10 text-accent"
+                  : "border-border text-fg opacity-40"
+              }`}
+            >
+              Codex picker
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                onAction({
+                  kind: "model_visibility",
+                  id: model.id,
+                  visible_in_openai: !model.visible_in_openai,
+                })
+              }
+              className={`rounded border px-1.5 py-0.5 text-[8px] ${
+                model.visible_in_openai
+                  ? "border-signal/35 bg-signal/10 text-signal"
+                  : "border-border text-fg opacity-40"
+              }`}
+            >
+              OpenAI list
+            </button>
+            {routeOnly && <span className="text-[8px] text-warn">route only</span>}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
