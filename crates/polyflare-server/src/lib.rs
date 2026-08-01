@@ -22,6 +22,7 @@ pub mod log_bus;
 pub mod metrics;
 pub mod model_catalog;
 pub mod network_recovery;
+pub mod oauth_loopback;
 pub mod observability;
 pub mod pool_quota;
 pub mod posture;

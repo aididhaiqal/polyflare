@@ -244,6 +244,54 @@ struct TokenResponse {
     id_token: String,
 }
 
+/// Fallback TTL for a device code whose response carries no usable `expires_in` (codex-lb
+/// defaults to 900s the same way).
+const DEVICE_CODE_DEFAULT_TTL_SECS: i64 = 900;
+
+/// A started device authorization: what to show the operator + what the server polls with.
+#[derive(Debug, Clone)]
+pub struct DeviceCode {
+    pub device_auth_id: String,
+    pub user_code: String,
+    /// Where the operator enters `user_code` — works from any browser on any machine.
+    pub verification_url: String,
+    /// The auth server's requested poll spacing; `0` when unspecified.
+    pub interval_seconds: i64,
+    pub expires_in_seconds: i64,
+}
+
+/// The `error` code from either the flat (`{"error": "code"}`) or nested
+/// (`{"error": {"code"|"error": "..."}}`) body shapes the auth endpoints use.
+fn extract_error_code(v: &Value) -> Option<String> {
+    match v.get("error") {
+        Some(Value::String(code)) => Some(code.clone()),
+        Some(Value::Object(map)) => map
+            .get("code")
+            .or_else(|| map.get("error"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// codex-lb's exact pending predicate (`_is_pending_error`): an `authorization_pending` /
+/// `slow_down` error code, or a `status` field of `pending` / `authorization_pending`.
+fn is_device_pending(v: &Value) -> bool {
+    if matches!(
+        extract_error_code(v).as_deref(),
+        Some("authorization_pending") | Some("slow_down")
+    ) {
+        return true;
+    }
+    matches!(
+        v.get("status")
+            .and_then(Value::as_str)
+            .map(str::to_lowercase)
+            .as_deref(),
+        Some("pending") | Some("authorization_pending")
+    )
+}
+
 /// Generate a PKCE `(verifier, S256 challenge)` pair (RFC 7636): a 64-random-byte URL-safe-base64
 /// (no-pad) verifier, and `challenge = base64url(SHA256(verifier_ascii))`.
 pub fn generate_pkce() -> (String, String) {
@@ -332,6 +380,135 @@ impl OAuthClient {
             },
             claims,
         })
+    }
+
+    /// Start a device-code authorization: `POST {auth_base_url}/api/accounts/deviceauth/usercode`.
+    /// The operator enters the returned `user_code` at [`DeviceCode::verification_url`] from ANY
+    /// browser; the server then polls [`Self::poll_device_token`] until approval. Protocol and
+    /// endpoints verified against codex-lb `app/core/clients/oauth.py::request_device_code`.
+    /// A 404 means the auth server has device login disabled (`device_auth_unavailable`).
+    pub async fn request_device_code(&self) -> Result<DeviceCode, OAuthError> {
+        let base = self.auth_base_url.trim_end_matches('/').to_string();
+        let url = format!("{base}/api/accounts/deviceauth/usercode");
+        let resp = self
+            .http
+            .post(url)
+            .json(&serde_json::json!({ "client_id": CLIENT_ID }))
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| OAuthError::Transport(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let code = if status.as_u16() == 404 {
+                Some("device_auth_unavailable".to_string())
+            } else {
+                resp.json::<Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| extract_error_code(&v))
+            };
+            return Err(OAuthError::Endpoint {
+                status: status.as_u16(),
+                code,
+            });
+        }
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| OAuthError::Transport(e.to_string()))?;
+        let user_code = v
+            .get("user_code")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let device_auth_id = v
+            .get("device_auth_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let (Some(user_code), Some(device_auth_id)) = (user_code, device_auth_id) else {
+            return Err(OAuthError::Transport(
+                "device auth response missing user_code/device_auth_id".to_string(),
+            ));
+        };
+        let expires_in = v
+            .get("expires_in")
+            .and_then(Value::as_i64)
+            .filter(|s| *s > 0)
+            .unwrap_or(DEVICE_CODE_DEFAULT_TTL_SECS);
+        Ok(DeviceCode {
+            device_auth_id,
+            user_code,
+            verification_url: format!("{base}/codex/device"),
+            interval_seconds: v.get("interval").and_then(Value::as_i64).unwrap_or(0),
+            expires_in_seconds: expires_in,
+        })
+    }
+
+    /// One poll of `POST {auth_base_url}/api/accounts/deviceauth/token`. `Ok(None)` means the
+    /// operator has not approved yet (HTTP 403/404, or an `authorization_pending`/`slow_down`
+    /// body — codex-lb's exact pending predicate). On approval the body carries either the tokens
+    /// directly or an `authorization_code` + `code_verifier` pair to finish through the standard
+    /// token endpoint with the device redirect (`{auth_base_url}/deviceauth/callback`).
+    pub async fn poll_device_token(
+        &self,
+        device_auth_id: &str,
+        user_code: &str,
+    ) -> Result<Option<Refreshed>, OAuthError> {
+        let base = self.auth_base_url.trim_end_matches('/').to_string();
+        let url = format!("{base}/api/accounts/deviceauth/token");
+        let resp = self
+            .http
+            .post(url)
+            .json(&serde_json::json!({
+                "device_auth_id": device_auth_id,
+                "user_code": user_code,
+            }))
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| OAuthError::Transport(e.to_string()))?;
+        let status = resp.status();
+        if matches!(status.as_u16(), 403 | 404) {
+            return Ok(None);
+        }
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| OAuthError::Transport(e.to_string()))?;
+        if is_device_pending(&v) {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(OAuthError::Endpoint {
+                status: status.as_u16(),
+                code: extract_error_code(&v),
+            });
+        }
+        // Approved. Either an authorization_code hand-off...
+        if let Some(code) = v.get("authorization_code").and_then(Value::as_str) {
+            let Some(verifier) = v.get("code_verifier").and_then(Value::as_str) else {
+                return Err(OAuthError::Transport(
+                    "device auth response missing code_verifier".to_string(),
+                ));
+            };
+            let redirect_uri = format!("{base}/deviceauth/callback");
+            return self
+                .exchange_code(code, verifier, &redirect_uri)
+                .await
+                .map(Some);
+        }
+        // ...or the tokens directly.
+        let token: TokenResponse =
+            serde_json::from_value(v).map_err(|e| OAuthError::Transport(e.to_string()))?;
+        let claims = decode_claims(&token.id_token).ok();
+        Ok(Some(Refreshed {
+            tokens: RefreshedTokens {
+                access_token: token.access_token,
+                refresh_token: token.refresh_token.unwrap_or_default(),
+                id_token: token.id_token,
+            },
+            claims,
+        }))
     }
 
     /// The Codex CLI's authorize URL for the authorization_code + PKCE login flow. Parameters and

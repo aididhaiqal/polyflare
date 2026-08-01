@@ -257,6 +257,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             post(crate::account_onboarding::start_handler),
         )
         .route(
+            "/api/account-onboarding/codex/device",
+            post(crate::account_onboarding::device_start_handler),
+        )
+        .route(
             "/api/account-onboarding/{id}",
             get(crate::account_onboarding::status_handler),
         )

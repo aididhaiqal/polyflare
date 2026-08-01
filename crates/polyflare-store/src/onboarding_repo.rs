@@ -32,6 +32,16 @@ pub struct OnboardingFlow {
     /// the wrong ChatGPT account fails loudly instead of silently updating a different row.
     /// `None` is an ordinary untargeted "Add account" flow.
     pub intended_account_id: Option<String>,
+    /// `browser` (authorization_code + loopback redirect) | `device` (user enters a short code at
+    /// the auth server's verification page and the SERVER polls for approval — the only method a
+    /// REMOTE browser can complete, since the registered redirect is pinned to localhost:1455).
+    pub method: String,
+    /// Device flow only: the auth server's handle for the pending device authorization.
+    pub device_auth_id: Option<String>,
+    /// Device flow only: the short code the operator enters at the verification page.
+    pub user_code: Option<String>,
+    /// Device flow only: the auth server's requested poll interval (seconds).
+    pub interval_seconds: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -47,8 +57,9 @@ impl OnboardingRepo {
     pub async fn create(&self, flow: &OnboardingFlow) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO account_onboarding_flows (id, flow_provider, oauth_state, verifier_enc, \
-             initial_pool, status, created_at, expires_at, redirect_uri, intended_account_id) \
-             VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+             initial_pool, status, created_at, expires_at, redirect_uri, intended_account_id, \
+             method, device_auth_id, user_code, interval_seconds) \
+             VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&flow.id)
         .bind(&flow.provider)
@@ -59,21 +70,61 @@ impl OnboardingRepo {
         .bind(flow.expires_at)
         .bind(flow.redirect_uri.as_deref())
         .bind(flow.intended_account_id.as_deref())
+        .bind(&flow.method)
+        .bind(flow.device_auth_id.as_deref())
+        .bind(flow.user_code.as_deref())
+        .bind(flow.interval_seconds)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
+    const SELECT_COLUMNS: &'static str =
+        "SELECT id, flow_provider AS provider, oauth_state, verifier_enc, initial_pool, status, \
+         created_at, expires_at, finished_at, account_id, error_code, redirect_uri, \
+         intended_account_id, method, device_auth_id, user_code, interval_seconds \
+         FROM account_onboarding_flows";
+
     pub async fn get(&self, id: &str) -> Result<Option<OnboardingFlow>, StoreError> {
-        Ok(sqlx::query_as::<_, OnboardingFlow>(
-            "SELECT id, flow_provider AS provider, oauth_state, verifier_enc, initial_pool, status, \
-             created_at, expires_at, finished_at, account_id, error_code, redirect_uri, \
-             intended_account_id \
-             FROM account_onboarding_flows WHERE id = ?",
+        Ok(
+            sqlx::query_as::<_, OnboardingFlow>(&format!("{} WHERE id = ?", Self::SELECT_COLUMNS))
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
         )
-        .bind(id)
+    }
+
+    /// Look up a PENDING, unexpired flow by its `oauth_state` — how the transient loopback
+    /// listener maps an incoming `/auth/callback?state=...` redirect back to its flow. The state
+    /// column is UNIQUE, and restricting to pending/unexpired keeps a replayed redirect from
+    /// resurrecting a finished flow.
+    pub async fn get_pending_by_state(
+        &self,
+        oauth_state: &str,
+        now: i64,
+    ) -> Result<Option<OnboardingFlow>, StoreError> {
+        Ok(sqlx::query_as::<_, OnboardingFlow>(&format!(
+            "{} WHERE oauth_state = ? AND status = 'pending' AND expires_at > ?",
+            Self::SELECT_COLUMNS
+        ))
+        .bind(oauth_state)
+        .bind(now)
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    /// Whether any pending, unexpired BROWSER-method Codex flow exists — the loopback listener's
+    /// stay-alive condition.
+    pub async fn has_pending_browser_codex_flow(&self, now: i64) -> Result<bool, StoreError> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM account_onboarding_flows \
+             WHERE flow_provider = 'codex' AND method = 'browser' AND status = 'pending' \
+             AND expires_at > ?",
+        )
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?
+            > 0)
     }
 
     /// Atomically consumes a pending, unexpired flow. A callback can claim a flow only once,
@@ -90,15 +141,10 @@ impl OnboardingRepo {
         .await?
         .rows_affected();
         let flow = if changed == 1 {
-            sqlx::query_as::<_, OnboardingFlow>(
-                "SELECT id, flow_provider AS provider, oauth_state, verifier_enc, initial_pool, status, \
-                 created_at, expires_at, finished_at, account_id, error_code, redirect_uri, \
-                 intended_account_id \
-                 FROM account_onboarding_flows WHERE id = ?",
-            )
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?
+            sqlx::query_as::<_, OnboardingFlow>(&format!("{} WHERE id = ?", Self::SELECT_COLUMNS))
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
         } else {
             None
         };
@@ -208,6 +254,10 @@ mod tests {
             error_code: None,
             redirect_uri: None,
             intended_account_id: None,
+            method: "browser".into(),
+            device_auth_id: None,
+            user_code: None,
+            interval_seconds: None,
         };
         store.onboarding().create(&flow).await.unwrap();
         let raw: Vec<u8> = sqlx::query_scalar(
@@ -252,6 +302,10 @@ mod tests {
             error_code: None,
             redirect_uri: None,
             intended_account_id: None,
+            method: "browser".into(),
+            device_auth_id: None,
+            user_code: None,
+            interval_seconds: None,
         };
         store.onboarding().create(&flow).await.unwrap();
         assert!(store
@@ -285,6 +339,10 @@ mod tests {
             error_code: None,
             redirect_uri: None,
             intended_account_id: None,
+            method: "browser".into(),
+            device_auth_id: None,
+            user_code: None,
+            interval_seconds: None,
         };
         store.onboarding().create(&flow).await.unwrap();
         let result = store

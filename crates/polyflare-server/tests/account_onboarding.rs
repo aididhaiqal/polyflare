@@ -325,3 +325,219 @@ async fn targeted_reauth_refuses_a_mismatched_seat_and_touches_nothing() {
     assert_eq!(status_body["status"], "failed");
     assert_eq!(status_body["error_code"], "seat_mismatch");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Device-code flow + loopback listener
+// ---------------------------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+async fn device_usercode() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "user_code": "ABCD-1234",
+        "device_auth_id": "dev-auth-1",
+        "interval": 1,
+        "expires_in": 900
+    }))
+}
+
+/// Pending for the first `threshold` polls (HTTP 403, like the real endpoint), then approves with
+/// an authorization_code + code_verifier hand-off (the shape that exercises the standard token
+/// endpoint too).
+async fn device_token(
+    axum::extract::State((hits, threshold)): axum::extract::State<(Arc<AtomicUsize>, usize)>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let n = hits.fetch_add(1, Ordering::SeqCst);
+    if n < threshold {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "status": "pending" })),
+        );
+    }
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({
+            "authorization_code": "device-one-time-code",
+            "code_verifier": "device-code-verifier"
+        })),
+    )
+}
+
+/// Mock auth server with the device endpoints as well; approves after `pending_polls` polls.
+async fn mock_oauth_with_device(pending_polls: usize) -> String {
+    let app = Router::new()
+        .route("/oauth/token", post(oauth_token))
+        .route("/api/accounts/deviceauth/usercode", post(device_usercode))
+        .route("/api/accounts/deviceauth/token", post(device_token))
+        .with_state((Arc::new(AtomicUsize::new(0)), pending_polls));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+async fn wait_for_flow_terminal(
+    client: &reqwest::Client,
+    pf: &str,
+    flow_id: &str,
+) -> serde_json::Value {
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let status: serde_json::Value = client
+            .get(format!("{pf}/api/account-onboarding/{flow_id}"))
+            .header("authorization", "Bearer secret")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if status["status"] == "completed" || status["status"] == "failed" {
+            return status;
+        }
+    }
+    panic!("flow {flow_id} never reached a terminal status");
+}
+
+#[tokio::test]
+async fn device_flow_polls_until_approval_and_onboards() {
+    let (pf, app_state) = support::spawn_with_oauth_base(mock_oauth_with_device(2).await).await;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{pf}/api/account-onboarding/codex/device"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["user_code"], "ABCD-1234");
+    assert!(body["verification_url"]
+        .as_str()
+        .unwrap()
+        .ends_with("/codex/device"));
+    let flow_id = body["flow_id"].as_str().unwrap();
+
+    let status = wait_for_flow_terminal(&client, &pf, flow_id).await;
+    assert_eq!(status["status"], "completed", "status: {status}");
+    assert!(app_state
+        .store
+        .accounts()
+        .get("codex_chatgpt-new")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn device_flow_enforces_the_targeted_seat() {
+    let (pf, app_state) = support::spawn_with_oauth_base(mock_oauth_with_device(0).await).await;
+    sqlx::query(
+        "UPDATE accounts SET chatgpt_account_id = 'chatgpt-other', status = 'reauth_required' \
+         WHERE id = 'acct-1'",
+    )
+    .execute(app_state.store.pool())
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{pf}/api/account-onboarding/codex/device"))
+        .header("authorization", "Bearer secret")
+        .json(&serde_json::json!({ "account_id": "acct-1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let flow_id = body["flow_id"].as_str().unwrap();
+
+    let status = wait_for_flow_terminal(&client, &pf, flow_id).await;
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["error_code"], "seat_mismatch");
+    // Nothing changed: no new account, target still parked.
+    assert_eq!(app_state.store.accounts().list().await.unwrap().len(), 1);
+    let account = app_state
+        .store
+        .accounts()
+        .get("acct-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(account.status, "reauth_required");
+}
+
+#[tokio::test]
+async fn loopback_listener_completes_a_pending_browser_flow() {
+    let (pf, app_state) = support::spawn_with_oauth_base(mock_oauth().await).await;
+    let client = reqwest::Client::new();
+    let (flow, state) = start_flow(&client, &pf, None).await;
+    let flow_id = flow["flow_id"].as_str().unwrap();
+
+    // The listener on an ephemeral port (the production path binds the fixed 1455).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(polyflare_server::oauth_loopback::serve(
+        listener,
+        app_state.clone(),
+    ));
+
+    // A stale/unknown state is refused without touching anything.
+    let bogus = client
+        .get(format!(
+            "http://{addr}/auth/callback?code=x&state=not-a-state"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(bogus.contains("no longer valid"), "body: {bogus}");
+
+    // The real redirect completes the flow hands-free.
+    let ok = client
+        .get(format!(
+            "http://{addr}/auth/callback?code=one-time-code&state={state}"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(ok.contains("Account connected"), "body: {ok}");
+    assert!(!ok.contains("secret-access"), "must not leak tokens");
+
+    let status: serde_json::Value = client
+        .get(format!("{pf}/api/account-onboarding/{flow_id}"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["status"], "completed");
+    assert!(app_state
+        .store
+        .accounts()
+        .get("codex_chatgpt-new")
+        .await
+        .unwrap()
+        .is_some());
+
+    // A replayed redirect cannot resurrect the finished flow.
+    let replay = client
+        .get(format!(
+            "http://{addr}/auth/callback?code=again&state={state}"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(replay.contains("no longer valid"), "body: {replay}");
+}
