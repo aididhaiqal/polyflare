@@ -40,6 +40,9 @@ pub struct RequestUsageUpdate {
     pub orchestration_output_tokens: Option<i64>,
     pub orchestration_cached_input_tokens: Option<i64>,
     pub cost_usd: Option<f64>,
+    /// The tier the upstream reported serving. Arrives with usage because it comes off the same
+    /// terminal stream frame, long after the row was inserted.
+    pub actual_service_tier: Option<String>,
     pub latency_first_token_ms: Option<i64>,
     pub duration_ms: Option<i64>,
     pub protocol_outcome: RequestProtocolOutcome,
@@ -111,6 +114,7 @@ async fn run_background_writer(pool: SqlitePool, mut rx: mpsc::Receiver<Backgrou
                         update.orchestration_output_tokens,
                         update.orchestration_cached_input_tokens,
                         update.cost_usd,
+                        update.actual_service_tier.as_deref(),
                         update.latency_first_token_ms,
                         update.duration_ms,
                         Some(update.protocol_outcome),
@@ -387,6 +391,7 @@ mod tests {
         store.enqueue_request_log(sample_record("rq-1")).unwrap();
         store
             .enqueue_request_usage(RequestUsageUpdate {
+                actual_service_tier: None,
                 request_id: "rq-1".into(),
                 input_tokens: Some(10),
                 output_tokens: Some(5),
@@ -427,6 +432,7 @@ mod tests {
             .unwrap();
         let receipt = store
             .enqueue_request_usage_with_receipt(RequestUsageUpdate {
+                actual_service_tier: None,
                 request_id: "rq-receipt".into(),
                 input_tokens: Some(10),
                 output_tokens: Some(5),

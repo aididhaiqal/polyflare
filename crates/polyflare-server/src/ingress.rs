@@ -2042,9 +2042,13 @@ fn apply_captured_usage(
     captured: usage_capture::CapturedUsage,
 ) -> Option<tokio::sync::oneshot::Receiver<bool>> {
     let u = captured.usage.unwrap_or_default();
-    // `effective_service_tier` is the tier the UPSTREAM REPORTED, never the one requested: a
-    // provider may accept a priority request and still serve it as standard, and charging the
-    // premium for that turn would overstate cost.
+    // The tier the UPSTREAM REPORTED, never the one requested: a provider may accept a priority
+    // request and still serve it as standard, and charging the premium for that turn would
+    // overstate cost. The terminal SSE frame is the most authoritative source (it is the
+    // upstream's own statement about this turn); `effective_service_tier` is the custom-provider
+    // header-derived fallback for responses that carry no terminal tier.
+    let served = captured.served_tier.map(|tier| tier.as_str());
+    let effective_service_tier = served.or(effective_service_tier);
     let cost = if let Some(rates) = custom_pricing {
         let (input_price, cached_price, output_price) = rates.rates_for(effective_service_tier);
         u.input_tokens.zip(u.output_tokens).map(|(input, output)| {
@@ -2092,6 +2096,7 @@ fn apply_captured_usage(
         orchestration_output_tokens: u.orchestration_output_tokens,
         orchestration_cached_input_tokens: u.orchestration_cached_input_tokens,
         cost_usd: cost,
+        actual_service_tier: served.map(str::to_string),
         latency_first_token_ms: captured.ttft_ms,
         duration_ms: captured.duration_ms,
         protocol_outcome: captured.protocol_outcome,
@@ -4809,6 +4814,7 @@ mod tests {
             repo.insert(&sample_record("rq")).await.unwrap();
 
             let captured = CapturedUsage {
+                served_tier: None,
                 usage: Some(ResponseUsage {
                     input_tokens: Some(100_000),
                     output_tokens: Some(10_000),
@@ -4889,6 +4895,7 @@ mod tests {
                 None,
                 None,
                 CapturedUsage {
+                    served_tier: None,
                     usage: None,
                     ttft_ms: Some(500),
                     duration_ms: Some(4000),
@@ -4928,6 +4935,7 @@ mod tests {
                 None,
                 None,
                 CapturedUsage {
+                    served_tier: None,
                     usage: Some(ResponseUsage {
                         input_tokens: Some(1_000),
                         output_tokens: None,
@@ -4973,6 +4981,7 @@ mod tests {
                 priority_output_per_1m: Some(16.0),
             };
             let captured = || CapturedUsage {
+                served_tier: None,
                 usage: Some(ResponseUsage {
                     input_tokens: Some(1_000_000),
                     output_tokens: Some(1_000_000),
@@ -5011,6 +5020,75 @@ mod tests {
             }
         }
 
+        /// The built-in pricing table's priority rates must follow the tier the terminal SSE frame
+        /// reports, not the tier requested. gpt-5.6-sol is 5.0/30.0 standard and 10.0/60.0
+        /// priority per 1M; 100k in + 100k out stays under its 272k long-context threshold so this
+        /// measures the TIER and nothing else.
+        #[tokio::test]
+        async fn builtin_model_cost_follows_the_served_tier_from_the_stream() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("s.db")).await.unwrap();
+            let repo = store.request_log();
+
+            let captured = |served: Option<crate::usage_capture::ServedTier>| CapturedUsage {
+                served_tier: served,
+                usage: Some(ResponseUsage {
+                    input_tokens: Some(100_000),
+                    output_tokens: Some(100_000),
+                    cached_input_tokens: Some(0),
+                    ..Default::default()
+                }),
+                ttft_ms: None,
+                duration_ms: Some(10),
+                protocol_outcome: polyflare_store::RequestProtocolOutcome::Completed,
+            };
+
+            for (id, served, expected) in [
+                // Requested priority, upstream reported priority: premium applies.
+                (
+                    "served-priority",
+                    Some(crate::usage_capture::ServedTier::Priority),
+                    7.0,
+                ),
+                // Requested priority, upstream served default: the case that was over-billing.
+                (
+                    "served-default",
+                    Some(crate::usage_capture::ServedTier::Default),
+                    3.5,
+                ),
+                // Upstream reported nothing: fall back to what we asked for rather than guessing.
+                ("served-unknown", None, 7.0),
+            ] {
+                repo.insert(&sample_record(id)).await.unwrap();
+                apply_captured_usage(
+                    &store,
+                    id,
+                    Some("gpt-5.6-sol"),
+                    None,
+                    Some("priority"),
+                    captured(served),
+                );
+                store.flush_background_writes().await.unwrap();
+                let row = repo
+                    .list(50, 0)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|r| r.request_id.as_deref() == Some(id))
+                    .unwrap();
+                let cost = row.cost_usd.expect("known model must produce a cost");
+                assert!(
+                    (cost - expected).abs() < 1e-9,
+                    "{id}: expected {expected}, got {cost}"
+                );
+                assert_eq!(
+                    row.actual_service_tier.as_deref(),
+                    served.map(|tier| tier.as_str()),
+                    "{id}: the served tier must be persisted for the downgrade flag"
+                );
+            }
+        }
+
         /// A model with no configured priority rate is never charged a premium, even for a turn the
         /// upstream genuinely served as priority.
         #[tokio::test]
@@ -5036,6 +5114,7 @@ mod tests {
                 Some(rates),
                 Some("priority"),
                 CapturedUsage {
+                    served_tier: None,
                     usage: Some(ResponseUsage {
                         input_tokens: Some(1_000_000),
                         output_tokens: Some(1_000_000),

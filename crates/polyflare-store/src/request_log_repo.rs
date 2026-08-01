@@ -680,6 +680,7 @@ impl RequestLogRepo {
         orchestration_output_tokens: Option<i64>,
         orchestration_cached_input_tokens: Option<i64>,
         cost_usd: Option<f64>,
+        actual_service_tier: Option<&str>,
         latency_first_token_ms: Option<i64>,
         duration_ms: Option<i64>,
         protocol_outcome: Option<RequestProtocolOutcome>,
@@ -700,7 +701,9 @@ impl RequestLogRepo {
              usage_source = CASE WHEN ? THEN 'upstream_response' ELSE usage_source END, \
              usage_status = CASE WHEN ? THEN 'final' ELSE usage_status END, \
              orchestration_input_tokens=?, orchestration_output_tokens=?, \
-             orchestration_cached_input_tokens=?, cost_usd=?, latency_first_token_ms=?, \
+             orchestration_cached_input_tokens=?, cost_usd=?, \
+             actual_service_tier = COALESCE(?, actual_service_tier), \
+             latency_first_token_ms=?, \
              duration_ms = COALESCE(?, duration_ms), \
              protocol_outcome = COALESCE(?, protocol_outcome) WHERE request_id=?",
         )
@@ -717,6 +720,7 @@ impl RequestLogRepo {
         .bind(orchestration_output_tokens)
         .bind(orchestration_cached_input_tokens)
         .bind(cost_usd)
+        .bind(actual_service_tier)
         .bind(latency_first_token_ms)
         .bind(duration_ms)
         .bind(protocol_outcome.map(RequestProtocolOutcome::as_str))
@@ -2927,6 +2931,7 @@ mod tests {
             Some(7),
             Some(3),
             Some(0.089),
+            None,
             Some(3510),
             Some(9000),
             Some(RequestProtocolOutcome::Completed),
@@ -2976,6 +2981,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(RequestProtocolOutcome::Completed),
         )
         .await
@@ -2983,7 +2989,8 @@ mod tests {
 
         // duration_ms: None must leave the existing value untouched (COALESCE), not null it out.
         repo.update_usage(
-            "req-xyz", None, None, None, None, None, None, None, None, None, None, None, None, None,
+            "req-xyz", None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None,
         )
         .await
         .unwrap();
@@ -3025,6 +3032,7 @@ mod tests {
             Some(12),
             Some(5),
             Some(999),
+            None,
             None,
             None,
             None,
@@ -3098,6 +3106,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(RequestProtocolOutcome::Completed),
         )
         .await
@@ -3129,6 +3138,7 @@ mod tests {
             repo.insert(&rec).await.unwrap();
             repo.update_usage(
                 request_id,
+                None,
                 None,
                 None,
                 None,

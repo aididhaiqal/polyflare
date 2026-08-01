@@ -349,6 +349,8 @@ impl WsTurnTelemetry {
         if let Err(error) = state
             .store
             .enqueue_request_usage(polyflare_store::RequestUsageUpdate {
+                // Already recorded on this turn's log insert; COALESCE keeps that value.
+                actual_service_tier: None,
                 request_id,
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,

@@ -1649,6 +1649,7 @@ async fn requests_endpoint_exposes_canonical_raw_and_derived_usage() {
         None,
         None,
         None,
+        None,
         Some(10),
         Some(100),
         Some(polyflare_store::RequestProtocolOutcome::Completed),

@@ -101,6 +101,57 @@ pub fn pressure_equivalent_tokens(usage: ResponseUsage) -> Option<u64> {
     )
 }
 
+/// The service tier an upstream reported serving a turn at, normalised to a bounded vocabulary.
+///
+/// Bounded on purpose: the raw value is an upstream-controlled string, and this rides the same
+/// content-safe telemetry path as everything else here. An unrecognised tier becomes
+/// [`ServedTier::Other`] rather than being forwarded verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServedTier {
+    Priority,
+    Flex,
+    Default,
+    Other,
+}
+
+impl ServedTier {
+    fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            // `fast` is the Codex-side spelling of the priority tier.
+            "priority" | "fast" | "scale" => ServedTier::Priority,
+            "flex" => ServedTier::Flex,
+            "default" | "auto" | "standard" => ServedTier::Default,
+            _ => ServedTier::Other,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServedTier::Priority => "priority",
+            ServedTier::Flex => "flex",
+            ServedTier::Default => "default",
+            ServedTier::Other => "other",
+        }
+    }
+
+    pub fn is_priority(self) -> bool {
+        matches!(self, ServedTier::Priority)
+    }
+}
+
+/// The tier a `response.completed` frame reports the turn was SERVED at, if it carries one.
+///
+/// This is the only trustworthy answer to "was priority actually honoured": the request's own
+/// `service_tier` says what was asked for, and an upstream is free to serve something else.
+pub fn parse_response_service_tier(frame_json: &str) -> Option<ServedTier> {
+    let value: Value = serde_json::from_str(frame_json).ok()?;
+    if value.get("type")?.as_str()? != "response.completed" {
+        return None;
+    }
+    let raw = value.get("response")?.get("service_tier")?.as_str()?.trim();
+    (!raw.is_empty()).then(|| ServedTier::parse(raw))
+}
+
 /// Parse one JSON stream frame and, if it is a `response.completed` frame carrying a
 /// `response.usage` object, return its canonical numeric usage counts. Returns `None` for any other
 /// frame type, malformed JSON, or a `response.completed` frame with no `usage` object.
@@ -264,6 +315,9 @@ fn is_anthropic_output_delta(frame_json: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapturedUsage {
     pub usage: Option<ResponseUsage>,
+    /// The tier the upstream REPORTED serving, when the terminal frame carried one. `None` means
+    /// the upstream said nothing — unknown, which must never be read as a downgrade.
+    pub served_tier: Option<ServedTier>,
     pub ttft_ms: Option<i64>,
     pub duration_ms: Option<i64>,
     pub protocol_outcome: polyflare_store::RequestProtocolOutcome,
@@ -307,6 +361,8 @@ pub struct UsageCapturingStream<S> {
     start: Instant,
     ttft_ms: Option<i64>,
     usage: Option<ResponseUsage>,
+    /// The tier the terminal frame reported. Set once, from the frame that also carries usage.
+    served_tier: Option<ServedTier>,
     terminal_outcome: Option<polyflare_store::RequestProtocolOutcome>,
     eof_outcome: polyflare_store::RequestProtocolOutcome,
     /// Side-buffer of raw SSE bytes accumulated ACROSS chunks, so a `data: {...}` line split by
@@ -398,6 +454,7 @@ impl<S> UsageCapturingStream<S> {
             start,
             ttft_ms: None,
             usage: None,
+            served_tier: None,
             terminal_outcome: None,
             eof_outcome,
             pending: Vec::new(),
@@ -472,6 +529,11 @@ impl<S> UsageCapturingStream<S> {
                 }
             }
         }
+        if self.served_tier.is_none() {
+            // Only a terminal frame carries the served tier; a request-echo elsewhere in the
+            // stream must not be mistaken for it.
+            self.served_tier = parse_response_service_tier(payload);
+        }
         if self.terminal_outcome.is_none() {
             let event_type = serde_json::from_str::<Value>(payload)
                 .ok()
@@ -522,6 +584,7 @@ impl<S> UsageCapturingStream<S> {
         if let Some(on_done) = self.on_done.take() {
             on_done(CapturedUsage {
                 usage: self.usage,
+                served_tier: self.served_tier,
                 ttft_ms: self.ttft_ms,
                 duration_ms: Some(self.start.elapsed().as_millis() as i64),
                 protocol_outcome: self.terminal_outcome.unwrap_or(fallback),
@@ -569,6 +632,67 @@ where
 impl<S> Drop for UsageCapturingStream<S> {
     fn drop(&mut self) {
         self.fire_on_done(polyflare_store::RequestProtocolOutcome::Cancelled);
+    }
+}
+
+#[cfg(test)]
+mod served_tier_tests {
+    use super::*;
+
+    #[test]
+    fn the_served_tier_comes_only_from_a_terminal_frame() {
+        assert_eq!(
+            parse_response_service_tier(
+                r#"{"type":"response.completed","response":{"service_tier":"priority"}}"#
+            ),
+            Some(ServedTier::Priority)
+        );
+        // `fast` is the Codex spelling of priority; billing must treat them alike.
+        assert_eq!(
+            parse_response_service_tier(
+                r#"{"type":"response.completed","response":{"service_tier":"fast"}}"#
+            ),
+            Some(ServedTier::Priority)
+        );
+        assert_eq!(
+            parse_response_service_tier(
+                r#"{"type":"response.completed","response":{"service_tier":"default"}}"#
+            ),
+            Some(ServedTier::Default)
+        );
+        // A non-terminal frame echoing the request must not be mistaken for what was served.
+        assert_eq!(
+            parse_response_service_tier(
+                r#"{"type":"response.created","response":{"service_tier":"priority"}}"#
+            ),
+            None
+        );
+        // No tier reported at all is unknown, not a downgrade.
+        assert_eq!(
+            parse_response_service_tier(r#"{"type":"response.completed","response":{}}"#),
+            None
+        );
+        assert_eq!(
+            parse_response_service_tier(
+                r#"{"type":"response.completed","response":{"service_tier":""}}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unknown_tier_is_bounded_rather_than_forwarded_verbatim() {
+        // The raw value is upstream-controlled, so it must never reach telemetry as-is.
+        assert_eq!(
+            parse_response_service_tier(
+                r#"{"type":"response.completed","response":{"service_tier":"experimental-tier-xyz"}}"#
+            ),
+            Some(ServedTier::Other)
+        );
+        assert_eq!(ServedTier::Other.as_str(), "other");
+        assert!(!ServedTier::Other.is_priority());
+        assert!(ServedTier::Priority.is_priority());
+        assert!(!ServedTier::Default.is_priority());
     }
 }
 
