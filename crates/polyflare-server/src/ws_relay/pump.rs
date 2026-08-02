@@ -1453,19 +1453,34 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                 break;
                             }
                         } else {
-                            // HONEST MIRROR (2026-07-24): between turns, the connection-scoped
-                            // anchor died with this socket. Keeping the downstream open would let
-                            // codex's one-bit liveness model (`is_closed()` ⇒ keep the anchor
-                            // ledger) believe an anchor that no longer exists, guaranteeing its
-                            // next anchored delta a client-visible `previous_response_not_found`
-                            // round-trip. Close BOTH legs instead: codex sees its socket die,
-                            // wipes its ledger (`client.rs::websocket_connection`), reconnects,
-                            // and full-resends natively — silent, no failed attempt, exactly the
-                            // direct-connection behavior. The counter label distinguishes the
-                            // deliberate idle-budget let-go from a genuine upstream drop.
-                            // A deliberate age rotation is neither a drop nor an idle let-go: the
-                            // socket was healthy and we chose the moment. Distinguishing it keeps
-                            // the drop counter an honest measure of the network.
+                            // ROTATE OUR LEG, NOT THEIRS (2026-08-02).
+                            //
+                            // The ~60-minute connection cap belongs to the PolyFlare -> upstream
+                            // socket. The client's socket to PolyFlare has no such deadline — this
+                            // process terminates it — so tearing it down to satisfy an UPSTREAM
+                            // constraint imposed a limit the client never had.
+                            //
+                            // Worse, the client cannot see a close coming. A `response.create`
+                            // that raced ours landed on a closing socket and surfaced to the user
+                            // as "failed to send websocket request: Connection closed normally" —
+                            // a hard, mid-session failure with no server-side trace (no turn is in
+                            // flight, so no `request_log` row is written).
+                            //
+                            // Dropping only the upstream keeps that race impossible: the next
+                            // client frame lazily re-dials via `send_client_text`. The cost is the
+                            // one this code previously avoided — codex still believes its anchor
+                            // (its liveness model is one bit, `is_closed()`, confirmed in
+                            // codex-rs `client.rs::websocket_connection`, which clears
+                            // `last_request`/`last_response_rx` ONLY when the socket is closed), so
+                            // its next anchored delta misses. That miss is already handled: the
+                            // `UpstreamSignal::AnchorMissing` arm forges the one error shape
+                            // codex-rs retries in place, and the retry arrives as a full anchorless
+                            // resend. So both designs end in a full resend; this one trades a
+                            // cheap failed delta for never breaking the client's connection.
+                            //
+                            // The idle budget is served just as well: its purpose is that an
+                            // abandoned TUI stops costing an UPSTREAM socket, which dropping the
+                            // upstream achieves on its own.
                             let rotated_for_age = idle_budget_expired
                                 && rotate_after.is_some_and(|max_age| {
                                     upstream_since.elapsed() >= max_age
@@ -1493,16 +1508,19 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                 close_reason,
                                 socket_age_secs = upstream_since.elapsed().as_secs(),
                                 turn_active,
-                                "relay closed the downstream websocket between turns"
+                                "relay dropped the upstream websocket between turns"
                             );
                             if turn_active {
                                 // A live turn with nothing replayable (its telemetry outlived its
-                                // buffered frame) — record the teardown as a transport loss, not a
-                                // client cancel.
+                                // buffered frame) — the client IS waiting on this one, so it still
+                                // has to learn the turn died. Record the transport loss and close.
                                 unfinished_status = StatusCode::BAD_GATEWAY;
+                                let _ = downstream.send(Message::Close(None)).await;
+                                break;
                             }
-                            let _ = downstream.send(Message::Close(None)).await;
-                            break;
+                            // Nothing in flight: drop only our leg and leave the client connected.
+                            upstream = None;
+                            continue;
                         }
                     }
                 }

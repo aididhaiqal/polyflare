@@ -3502,14 +3502,20 @@ mod relay_through {
         }
     }
 
-    /// Honest-liveness (2026-07-24): when the upstream dies BETWEEN turns, the relay must close
-    /// the downstream too — codex's anchor ledger lives and dies with its socket
-    /// (`client.rs::websocket_connection`), so a still-open downstream would make it trust a dead
-    /// anchor and pay a client-visible `previous_response_not_found` round-trip on its next delta.
-    /// The old behavior (park and lazily re-dial on the next frame) is exactly what produced the
-    /// recurring "Reconnecting n/5" incident.
+    /// Rotate our leg, not theirs (2026-08-02): when the upstream dies BETWEEN turns, the relay
+    /// drops ONLY the upstream and leaves the client connected.
+    ///
+    /// This reverses the 2026-07-24 honest-close, and the reason it is now safe is a matter of
+    /// record: closing both legs was chosen when an anchor miss still mapped to codex-rs's
+    /// non-retryable `InvalidRequest` and wedged the task (the "Reconnecting n/5" incident). The
+    /// forged retryable resend that recovers a missed anchor landed the NEXT day (`4ef40c0`), so
+    /// the failure that motivated closing the client's socket no longer occurs.
+    ///
+    /// What closing cost instead: the client cannot see a close coming, so a `response.create`
+    /// racing it fails with "Connection closed normally" — and with no turn in flight there is no
+    /// `request_log` row to show it ever happened.
     #[tokio::test]
-    async fn between_turns_upstream_death_closes_the_downstream_honestly() {
+    async fn between_turns_upstream_death_rotates_only_the_upstream_leg() {
         let mock = MockWsUpstream::scripted(vec![ScriptedTurn::normal_then_close(vec![])]);
         let mock_base = mock.clone().spawn().await;
         let (base, state) = spawn_with_pinned_account("acct-honest-close", &mock_base).await;
@@ -3529,21 +3535,20 @@ mod relay_through {
         let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(v["type"], "response.completed", "turn 1 completes normally");
 
-        // The mock closed its socket right after the completed frame. WITHOUT any further client
-        // activity, the relay must mirror that death downstream — a Close (or clean end), never a
-        // silent park that hides the dead anchor.
-        let next = tokio::time::timeout(Duration::from_secs(5), ws.next())
-            .await
-            .expect("the downstream must close after a between-turns upstream death, not park");
-        match next {
-            None | Some(Ok(TMessage::Close(_))) => {}
-            other => panic!("expected the downstream to close, got: {other:?}"),
-        }
+        // The mock closed its socket right after the completed frame. The client's socket must
+        // SURVIVE that: nothing is in flight, so the client has no way to know a close is coming
+        // and must never be handed one it did not ask for.
+        let parked = tokio::time::timeout(Duration::from_millis(750), ws.next()).await;
+        assert!(
+            parked.is_err(),
+            "the downstream must stay open after a between-turns upstream death, got: {parked:?}"
+        );
 
         assert_eq!(
             mock.handshake_count(),
             1,
-            "a between-turns death must NOT trigger a lazy same-account re-dial"
+            "the relay must not eagerly re-dial while the client is idle — the next client frame \
+             pays for the new socket"
         );
         let snapshot = state.relay_metrics.snapshot();
         let honest = snapshot
@@ -3553,7 +3558,7 @@ mod relay_through {
             .unwrap_or(0);
         assert!(
             honest >= 1,
-            "expected honest_close_upstream_drop >= 1, got snapshot: {snapshot:?}"
+            "the upstream drop must still be counted, got snapshot: {snapshot:?}"
         );
     }
 
@@ -3633,7 +3638,7 @@ mod relay_through {
     /// closing BOTH legs (label `honest_close_idle_budget`) so codex reconnects natively on the
     /// user's return instead of trusting an anchor the relay stopped keeping alive.
     #[tokio::test]
-    async fn idle_budget_expiry_closes_both_legs_honestly() {
+    async fn idle_budget_expiry_drops_only_the_upstream_leg() {
         let mock = MockWsUpstream::scripted(vec![ScriptedTurn::normal(vec![])]);
         let mock_base = mock.clone().spawn().await;
         let idle = polyflare_server::ws_relay::WsRelayIdlePolicy {
@@ -3661,14 +3666,14 @@ mod relay_through {
             "response.completed"
         );
 
-        // No further client activity: after ~300ms the budget expires and the downstream closes.
-        let next = tokio::time::timeout(Duration::from_secs(5), ws.next())
-            .await
-            .expect("the downstream must close once the idle budget expires, not park forever");
-        match next {
-            None | Some(Ok(TMessage::Close(_))) => {}
-            other => panic!("expected the downstream to close, got: {other:?}"),
-        }
+        // After ~300ms the budget expires. Its purpose is that an abandoned TUI stops costing an
+        // UPSTREAM socket — which dropping the upstream achieves on its own. The client's socket
+        // costs this process nothing and must be left alone.
+        let parked = tokio::time::timeout(Duration::from_millis(750), ws.next()).await;
+        assert!(
+            parked.is_err(),
+            "the idle budget must free the upstream WITHOUT closing the client, got: {parked:?}"
+        );
 
         let snapshot = state.relay_metrics.snapshot();
         let expired = snapshot
@@ -3678,7 +3683,7 @@ mod relay_through {
             .unwrap_or(0);
         assert!(
             expired >= 1,
-            "expected honest_close_idle_budget >= 1, got snapshot: {snapshot:?}"
+            "the idle expiry must still be counted, got snapshot: {snapshot:?}"
         );
     }
 
@@ -3810,11 +3815,104 @@ mod relay_through {
     /// poisoned history forever) — it must rewrite the buffered frame ONCE (reasoning envelopes
     /// out, plaintext summaries preserved as assistant text), re-dial the same account, and
     /// replay, so the client sees only the clean completion.
-    /// Proactive age rotation (2026-07-26): the relay retires a HEALTHY idle upstream once it
-    /// reaches `max_socket_age`, ahead of the backend's ~60-minute cap. The anchor dies either way;
-    /// rotating early only moves that loss to a harmless moment. A rotation must close BOTH legs —
-    /// the existing honest-close contract — so codex reconnects and full-resends silently, and it
-    /// must be labelled distinctly so the drop counter stays an honest measure of the network.
+    /// The payoff of rotating only our leg (2026-08-02): after the upstream dies between turns,
+    /// the client — still connected, still believing its anchor — sends an anchored delta. That
+    /// delta misses on the fresh socket, and the existing `AnchorMissing` forge turns the miss
+    /// into a retry the client resolves itself, so the turn completes without the client ever
+    /// losing its connection.
+    ///
+    /// This is the chain that did NOT exist on 2026-07-24, when closing both legs was chosen: the
+    /// forge landed the following day (`4ef40c0`). Without it a miss mapped to codex-rs's
+    /// non-retryable `InvalidRequest` and wedged the task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_turn_after_a_between_turns_death_still_completes() {
+        let mock = MockWsUpstream::scripted(vec![
+            // Turn 1 completes, then the upstream socket dies.
+            ScriptedTurn::normal_then_close(vec![]),
+            // The client's next frame lands on a FRESH socket where its anchor cannot exist.
+            ScriptedTurn::previous_response_not_found("resp_dead_anchor"),
+            // Its resend carries full history and succeeds.
+            ScriptedTurn::normal(vec![]),
+        ]);
+        let mock_base = mock.clone().spawn().await;
+        let (base, _state) = spawn_with_pinned_account("acct-rotate-recover", &mock_base).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake must succeed");
+        ws.send(TMessage::Text(
+            r#"{"type":"response.create","input":[]}"#.to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let TMessage::Text(first) = ws.next().await.expect("a reply").expect("no ws error") else {
+            panic!("expected a text frame");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first).unwrap()["type"],
+            "response.completed",
+            "turn 1 completes"
+        );
+
+        // The upstream is gone, but the client's socket is not — it can still send.
+        ws.send(TMessage::Text(
+            r#"{"type":"response.create","previous_response_id":"resp_dead_anchor","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}]}"#
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("the client must still be able to send after a between-turns upstream death");
+
+        // The miss is converted into a retryable signal; a real codex would resend in place. Drive
+        // that resend explicitly and assert the turn completes.
+        let mut saw_retry_signal = false;
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(Ok(TMessage::Text(text))) = ws.next().await {
+                let value: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                if value["type"] == "response.completed" {
+                    return true;
+                }
+                if value["type"] == "error" {
+                    saw_retry_signal = true;
+                    // codex-rs's in-place retry: a full, anchorless resend.
+                    ws.send(TMessage::Text(
+                        r#"{"type":"response.create","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}]}"#
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .expect("the resend must be sendable on the SAME client socket");
+                }
+            }
+            false
+        })
+        .await
+        .expect("the recovery must not hang");
+
+        assert!(
+            saw_retry_signal,
+            "the dead anchor must surface as a retryable signal, not a silent stall"
+        );
+        assert!(completed, "the resent turn must complete");
+        assert!(
+            mock.handshake_count() >= 2,
+            "the next client frame must lazily re-dial the upstream"
+        );
+    }
+
+    /// Proactive age rotation (2026-07-26, revised 2026-08-02): the relay retires a HEALTHY idle
+    /// upstream once it reaches `max_socket_age`, ahead of the backend's ~60-minute cap.
+    ///
+    /// That cap is a property of the PolyFlare -> upstream socket. The client's socket to
+    /// PolyFlare has no such deadline, so the rotation must retire ONLY our leg and leave the
+    /// client connected — otherwise a client send racing the rotation fails with "Connection
+    /// closed normally", a hard failure the client had no way to anticipate.
+    ///
+    /// The rotation must still be labelled distinctly so the drop counter stays an honest measure
+    /// of the network rather than counting moments we chose.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_healthy_idle_socket_is_rotated_before_the_server_cap() {
         let mock = MockWsUpstream::scripted(vec![ScriptedTurn::normal(vec![])]);
@@ -3852,20 +3950,12 @@ mod relay_through {
         .await
         .expect("the turn must complete");
 
-        // The downstream must be closed BY US shortly after the rotation deadline, not left open
-        // lying about a dead anchor.
-        let closed = tokio::time::timeout(Duration::from_secs(10), async {
-            while let Some(frame) = ws.next().await {
-                match frame {
-                    Ok(TMessage::Close(_)) | Err(_) => return true,
-                    _ => continue,
-                }
-            }
-            true
-        })
-        .await
-        .expect("the relay must retire the idle socket, not hold it to the server cap");
-        assert!(closed, "both legs must close on rotation");
+        // The rotation deadline passes. Our leg is retired; the client's must survive it.
+        let parked = tokio::time::timeout(Duration::from_millis(1_500), ws.next()).await;
+        assert!(
+            parked.is_err(),
+            "an age rotation must retire only the upstream leg, got: {parked:?}"
+        );
 
         let snapshot = state.relay_metrics.snapshot();
         let rotations = snapshot
@@ -3875,7 +3965,7 @@ mod relay_through {
             .unwrap_or(0);
         assert!(
             rotations >= 1,
-            "the close must be labelled a deliberate rotation, not a network drop: {snapshot:?}"
+            "the rotation must be labelled deliberate, not a network drop: {snapshot:?}"
         );
     }
 
