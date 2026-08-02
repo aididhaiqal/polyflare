@@ -1470,13 +1470,31 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                 && rotate_after.is_some_and(|max_age| {
                                     upstream_since.elapsed() >= max_age
                                 });
-                            relay_metrics.record(if rotated_for_age {
-                                "honest_close_age_rotation"
+                            let close_reason = if rotated_for_age {
+                                "age_rotation"
                             } else if idle_budget_expired {
-                                "honest_close_idle_budget"
+                                "idle_budget"
                             } else {
-                                "honest_close_upstream_drop"
+                                "upstream_drop"
+                            };
+                            relay_metrics.record(match close_reason {
+                                "age_rotation" => "honest_close_age_rotation",
+                                "idle_budget" => "honest_close_idle_budget",
+                                _ => "honest_close_upstream_drop",
                             });
+                            // Closing the client's socket is invisible everywhere else: no turn is
+                            // in flight, so no `request_log` row is written, and the relay counters
+                            // are not exposed. Codex is expected to reconnect silently, but a
+                            // client send that races this close surfaces to the user as
+                            // "Connection closed normally" — so record WHY and HOW OLD the socket
+                            // was, which is the only way to tell a deliberate rotation from a
+                            // genuine upstream drop after the fact.
+                            tracing::info!(
+                                close_reason,
+                                socket_age_secs = upstream_since.elapsed().as_secs(),
+                                turn_active,
+                                "relay closed the downstream websocket between turns"
+                            );
                             if turn_active {
                                 // A live turn with nothing replayable (its telemetry outlived its
                                 // buffered frame) — record the teardown as a transport loss, not a
