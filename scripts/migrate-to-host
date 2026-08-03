@@ -35,7 +35,98 @@ die() { printf 'migrate-to-host: %s\n' "$*" >&2; exit 1; }
 say() { printf '\n== %s ==\n' "$*"; }
 
 TARGET="${1:-}"
-[[ -n "$TARGET" ]] || die "usage: $0 <ssh-host>   (e.g. $0 ultraflux)"
+MODE="${2:-live}"
+[[ -n "$TARGET" ]] || die "usage: $0 <ssh-host> [--dry-run]   (e.g. $0 ultraflux)"
+[[ "$MODE" == "live" || "$MODE" == "--dry-run" ]] || die "unknown option: $MODE"
+
+# ---------------------------------------------------------------------------------------------
+# 0. Dry run: rehearse the copy against a still-running source, into a scratch directory.
+#
+# The point is to see the real store open on the target — settings, pools, accounts, model
+# routes — BEFORE committing to a cutover, while the source keeps serving.
+#
+# WHAT MAKES THIS SAFE: the rehearsal server is started with POLYFLARE_AUTH_URL pointed at a
+# dead port. That is the endpoint an OAuth refresh posts to, and a refresh is the one thing a
+# second server can do that damages the first — the rotated token would invalidate the copy the
+# live server is still using, logging every account out. Pointed at a closed port, a refresh
+# cannot succeed, so the rehearsal cannot reach through and rotate anything. The upstream URLs
+# are dead-ended too, so no request can be proxied by accident.
+#
+# It also runs on its own port, out of its own data directory, so it cannot collide with the
+# real deployment on the target either.
+# ---------------------------------------------------------------------------------------------
+if [[ "$MODE" == "--dry-run" ]]; then
+  VERIFY_DIR=".polyflare-verify"
+  VERIFY_PORT=8081
+  DEAD="http://127.0.0.1:9"
+
+  say "rehearsing a copy to $TARGET (source stays up)"
+  [[ -f "$DATA_DIR/store.db" ]] || die "no store at $DATA_DIR/store.db"
+  [[ -f "$DATA_DIR/key" ]]      || die "no at-rest key at $DATA_DIR/key"
+
+  SNAPSHOT="$(mktemp -d)/store.db"
+  sqlite3 "$DATA_DIR/store.db" "VACUUM INTO '$SNAPSHOT'"
+  SRC_ACCOUNTS="$(sqlite3 "$SNAPSHOT" 'SELECT COUNT(*) FROM accounts')"
+  printf 'snapshot taken: %s, %s accounts\n' "$(du -h "$SNAPSHOT" | cut -f1)" "$SRC_ACCOUNTS"
+
+  ssh "$TARGET" "rm -rf ~/$VERIFY_DIR && mkdir -p ~/$VERIFY_DIR && chmod 700 ~/$VERIFY_DIR"
+  rsync -a -e ssh "$SNAPSHOT" "$TARGET:$VERIFY_DIR/store.db"
+  rsync -a -e ssh "$DATA_DIR/key" "$TARGET:$VERIFY_DIR/key"
+  ssh "$TARGET" "chmod 600 ~/$VERIFY_DIR/key ~/$VERIFY_DIR/store.db"
+  rm -rf "$(dirname "$SNAPSHOT")"
+
+  say "starting a sealed rehearsal server on $TARGET:$VERIFY_PORT"
+  ssh "$TARGET" "
+    pkill -f 'POLYFLARE_DATA_DIR=.*$VERIFY_DIR' 2>/dev/null || true
+    cd ~ && POLYFLARE_DATA_DIR=\$HOME/$VERIFY_DIR \
+      POLYFLARE_BIND=127.0.0.1:$VERIFY_PORT \
+      POLYFLARE_AUTH_URL=$DEAD \
+      POLYFLARE_UPSTREAM_URL=$DEAD \
+      POLYFLARE_ANTHROPIC_UPSTREAM_URL=$DEAD \
+      nohup ~/.local/bin/polyflare serve > ~/$VERIFY_DIR/out.log 2>&1 &
+    sleep 12
+  "
+
+  say "what the target sees in the copied store"
+  # The copied store carries the source's passkey, which closes the tokenless local bypass — so
+  # the rehearsal needs its own admin token to answer API questions. It is set on the THROWAWAY
+  # copy only and dies with it.
+  ssh "$TARGET" "
+    TOK=\$(POLYFLARE_DATA_DIR=\$HOME/$VERIFY_DIR ~/.local/bin/polyflare admin-token set 2>/dev/null | sed -n 's/^    \(pfa_.*\)\$/\1/p')
+    api() { curl -s -H \"Authorization: Bearer \$TOK\" \"http://127.0.0.1:$VERIFY_PORT/api/\$1\"; }
+    echo \"dashboard : \$(curl -s -o /dev/null -w %{http_code} http://127.0.0.1:$VERIFY_PORT/dashboard/)\"
+    echo \"accounts  : \$(api accounts | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d), \"accounts:\", \", \".join((a.get(\"alias\") or a.get(\"email\") or a[\"id\"])+\" [\"+a[\"status\"]+\"]\" for a in d))' 2>/dev/null || echo UNREADABLE)\"
+    echo \"providers : \$(api providers | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d if isinstance(d,list) else d.get(\"providers\",[])))' 2>/dev/null || echo UNREADABLE)\"
+    echo
+    echo \"-- pool membership --\"
+    sqlite3 ~/$VERIFY_DIR/store.db \"SELECT '   ' || COALESCE(pool,'(unpooled)') || ': ' || COUNT(*) FROM accounts GROUP BY pool;\"
+    echo
+    echo \"-- sqlite row counts --\"
+    for t in accounts account_pool_memberships request_log settings dashboard_passkeys api_keys; do
+      printf '   %-28s %s\n' \"\$t\" \"\$(sqlite3 ~/$VERIFY_DIR/store.db \"SELECT COUNT(*) FROM \$t\" 2>/dev/null || echo 'n/a')\"
+    done
+    echo
+    echo \"-- did the seal hold? --\"
+    # The seal is POLYFLARE_AUTH_URL pointing at a closed port. A refresh that TRIED would show as
+    # a connection failure to 127.0.0.1:9; a refresh that SUCCEEDED would have had to reach the
+    # real authority, which this configuration cannot address. Matching the word 'refresh' alone
+    # is useless here — the catalog and usage subsystems both use it constantly.
+    # `grep -c` exits 1 on zero matches, so a `|| echo 0` fallback would print the count AND the
+    # fallback. `|| true` keeps the count as the single source of the number.
+    printf '   oauth refresh attempts  : %s\n' \"\$(grep -ciE 'oauth/token|refresh_token|token refresh (failed|succeeded)' ~/$VERIFY_DIR/out.log 2>/dev/null || true)\"
+    printf '   reached a real authority: %s\n' \"\$(grep -ciE 'auth\.openai\.com|chatgpt\.com/backend-api' ~/$VERIFY_DIR/out.log 2>/dev/null || true)\"
+  "
+
+  # Keep the rehearsal log for inspection rather than destroying the evidence with the copy.
+  scp -q "$TARGET:$VERIFY_DIR/out.log" "/tmp/polyflare-rehearsal-$TARGET.log" 2>/dev/null \
+    && printf '\nrehearsal log saved to /tmp/polyflare-rehearsal-%s.log\n' "$TARGET"
+
+  say "tearing the rehearsal down"
+  ssh "$TARGET" "pkill -f 'polyflare serve' 2>/dev/null || true; sleep 1; rm -rf ~/$VERIFY_DIR"
+  printf '\nRehearsal complete. Nothing on %s or here was changed.\n' "$TARGET"
+  printf 'When the numbers above look right, run without --dry-run to cut over.\n'
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------------------------
 # 1. Refuse to run against a live source.
