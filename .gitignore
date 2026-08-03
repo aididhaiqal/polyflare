@@ -7,3 +7,28 @@
 # Per-worktree scratch database (scripts/polyflare-service keeps a linked worktree off the
 # shared live store).
 /.polyflare-worktree/
+
+# Browser-automation output. These are screenshots and accessibility dumps of a LIVE dashboard,
+# so they carry account emails, internal account ids, the upstream account_id, and usage figures.
+# They were committed by `git add -A` sweeping up a directory nothing was ignoring, and reached a
+# public remote. Throwaway test output should never have been eligible for that in the first place.
+/.playwright-mcp/
+/playwright-report/
+/test-results/
+*.png.tmp
+
+# Credential material and live data. None of this has ever been committed — every one of these
+# lives in ~/.polyflare, outside the repo — and that is the point: this list exists so a stray
+# `git add -A` from inside a data directory cannot make a first mistake, rather than to clean up
+# after one.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+auth.json
+.env
+.env.*
+*.pem
+*.p12
+id_rsa*
