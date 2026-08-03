@@ -65,6 +65,7 @@ import {
   Trash2,
 } from "../ui/icons";
 import { CodexOnboardingDialog } from "../ui/CodexOnboardingDialog";
+import { CyberAccessBadge } from "../ui/CyberAccessBadge";
 import { providerBrandKey, ProviderTag } from "../ui/ProviderTag";
 import { StatusPill, statusTone, type StatusTone } from "../ui/StatusPill";
 
@@ -513,7 +514,9 @@ function AccountCard({
             <StatusPill status={a.status} className="ml-auto shrink-0" />
           </div>
 
-          <div className="truncate text-[11px] text-fg opacity-60">
+          <div className="flex items-center gap-1 truncate text-[11px] text-fg opacity-60">
+            {a.security_work_authorized && <CyberAccessBadge />}
+            <span className="truncate">
             {active ? (
               <span className="opacity-60">identity shielded · </span>
             ) : (
@@ -525,6 +528,7 @@ function AccountCard({
             <span className="font-medium text-fg opacity-90">{a.plan_type}</span> · pool{" "}
             <span className="font-medium text-fg opacity-90">
               {a.pools.length > 0 ? a.pools.join(", ") : "unpooled"}
+            </span>
             </span>
           </div>
 
@@ -652,6 +656,7 @@ function AccountsTable({
                       )}
                     />
                     <ShieldedAccount id={a.id} label={a.alias ?? a.id} />
+                    {a.security_work_authorized && <CyberAccessBadge className="ml-1.5 align-text-bottom" />}
                     {!active && a.alias && (
                       <span className="ml-1.5 text-fg opacity-40">({a.id})</span>
                     )}

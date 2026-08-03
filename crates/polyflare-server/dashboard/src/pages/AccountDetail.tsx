@@ -95,6 +95,7 @@ import {
 } from "../privacy/ScreenShield";
 import { Card } from "../ui/Card";
 import { CodexOnboardingDialog } from "../ui/CodexOnboardingDialog";
+import { CyberAccessBadge } from "../ui/CyberAccessBadge";
 import { ExportAuthDialog } from "../ui/ExportAuthDialog";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { Col, Grid } from "../ui/Grid";
@@ -623,7 +624,8 @@ function DetailContent({
                 <ProviderTag provider={identity.provider} />
                 <StatusPill status={detail.status} />
               </div>
-              <p className="mt-1.5 text-[12px] leading-relaxed text-fg opacity-60">
+              <p className="mt-1.5 flex flex-wrap items-center gap-1 text-[12px] leading-relaxed text-fg opacity-60">
+                {detail.security_work_authorized && <CyberAccessBadge />}
                 {active ? (
                   "Identity and workspace shielded"
                 ) : (
