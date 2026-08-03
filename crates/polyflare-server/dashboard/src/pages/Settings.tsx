@@ -16,6 +16,7 @@ import clsx from "clsx";
 
 import type { PriorityPolicyConfig, SettingFieldView, SettingsView } from "../lib/api";
 import {
+  useCapabilities,
   usePriorityPolicy,
   useSettings,
   useUpdatePriorityPolicy,
@@ -634,13 +635,17 @@ function EditableFieldRow({
 // ---------------------------------------------------------------------------------------------
 // Read-only field row — restart-only/fixed fields, disabled, showing `value ?? default` with a
 // class badge. `admin_token` is special-cased: its `value` is ALWAYS `null` on the wire and it
-// gets NO input control at all (per the content-safety constraint), just a static presence label.
+// gets NO input control at all (per the content-safety constraint), just a presence label. That
+// label reads presence from `/api/capabilities`, not from `value` — `value` is null whether or not
+// a token exists, so it cannot answer the question, and the row used to say "configured"
+// unconditionally even on a wide-open dashboard.
 // ---------------------------------------------------------------------------------------------
 
 function ReadOnlyFieldRow({ field }: { field: SettingFieldView }) {
   const display = field.value ?? field.default;
   const isAdminToken = field.key === "admin_token";
   const isBool = field.kind === "bool";
+  const capabilities = useCapabilities();
 
   return (
     <div className="flex items-center justify-between gap-2 py-1">
@@ -649,7 +654,13 @@ function ReadOnlyFieldRow({ field }: { field: SettingFieldView }) {
         <ClassBadge cls={field.class} />
       </span>
       {isAdminToken ? (
-        <span className="shrink-0 text-[10px] text-fg opacity-50">configured</span>
+        <span className="shrink-0 text-[10px] text-fg opacity-50">
+          {capabilities.data === undefined
+            ? "…"
+            : capabilities.data.admin_token_configured
+              ? "configured"
+              : "not set"}
+        </span>
       ) : isBool ? (
         <Switch
           checked={display === "true"}

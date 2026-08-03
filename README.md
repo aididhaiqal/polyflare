@@ -535,10 +535,10 @@ Its pages cover:
 - **Keys** — create and revoke caller API keys.
 - **Live logs** — content-safe server events delivered over SSE.
 
-When PolyFlare is bound to a parsed loopback address and `POLYFLARE_ADMIN_TOKEN` is unset, dashboard
-API access is local and tokenless. If an admin token is configured, the dashboard login stores it
-in that browser and sends it as a bearer token. On a non-loopback bind, an unset admin token
-disables the management API rather than exposing it.
+When PolyFlare is bound to a parsed loopback address and no credential is configured — no admin
+token from either source, and no registered passkey — dashboard API access is local and tokenless.
+If an admin token is configured, the dashboard login stores it in that browser and sends it as a
+bearer token. On a non-loopback bind, an unconfigured dashboard is disabled rather than exposed.
 
 ## Install and run
 
@@ -708,10 +708,35 @@ scripts/codex-polyflare --model fugu-ultra "review this change"
 
 Dashboard administration and proxied model traffic use separate credentials:
 
-- `POLYFLARE_ADMIN_TOKEN` protects `/api/*` and `/metrics`.
+- The admin token protects `/api/*` and `/metrics`. Set one with `polyflare admin-token set`, or
+  supply `POLYFLARE_ADMIN_TOKEN`; either is accepted.
 - PolyFlare client API keys protect model and control endpoints. Create one with the dashboard or
   `polyflare keys create`.
 - Upstream OAuth tokens and provider API keys authenticate PolyFlare to upstream services.
+
+### Setting the admin token
+
+`polyflare admin-token set` generates a token, stores only its SHA-256, and prints the plaintext
+once:
+
+```sh
+polyflare admin-token set          # generates and reveals a token
+polyflare admin-token status       # which credentials exist; never prints a token
+polyflare admin-token clear        # removes it, and says what that re-opens
+```
+
+Prefer this over `POLYFLARE_ADMIN_TOKEN` for a service managed by launchd or systemd. The
+environment-variable route requires the plaintext secret to live in the service definition, and
+those files are world-readable by default; a stored token leaves nothing on disk that can be
+replayed. Use `--stdin` to install a token you already have (from a password manager, or to migrate
+an existing `POLYFLARE_ADMIN_TOKEN` into the store).
+
+Both sources stay valid, and the environment variable is checked first. `POLYFLARE_ADMIN_TOKEN`
+remains the right choice where there is no writable database — a container, or CI.
+
+Setting or clearing a token takes effect on the next request; no restart is needed. Note that
+configuring a token **closes the tokenless loopback bypass**, so local callers must present it too.
+Rotation replaces the token, and the previous one stops working immediately.
 
 Create and manage caller keys:
 
@@ -746,7 +771,7 @@ settings override their environment-derived startup values.
 |---|---|---|
 | `POLYFLARE_BIND` | `127.0.0.1:8080` | Listener socket address. |
 | `POLYFLARE_DATA_DIR` | `$HOME/.polyflare` | Directory for `store.db` and `key`. |
-| `POLYFLARE_ADMIN_TOKEN` | unset | Bearer token for dashboard APIs and `/metrics`; local loopback dashboard is tokenless when unset. |
+| `POLYFLARE_ADMIN_TOKEN` | unset | Bearer token for dashboard APIs and `/metrics`. An alternative to `polyflare admin-token set`; both are accepted, and this one is checked first. The local loopback dashboard is tokenless only when neither is configured. |
 | `POLYFLARE_ALLOW_UNAUTHENTICATED_REMOTE` | unset | Only exact `1` allows a non-loopback, keyless proxy. |
 | `POLYFLARE_UPSTREAM_URL` | production Codex endpoint | Shared Codex account base URL. |
 | `POLYFLARE_ANTHROPIC_UPSTREAM_URL` | `https://api.anthropic.com` | Shared Anthropic account base URL. |

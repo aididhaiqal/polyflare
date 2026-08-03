@@ -57,6 +57,30 @@ enum Commands {
         #[command(subcommand)]
         command: PasskeysCommands,
     },
+    /// Dashboard admin-token management. Sets the shared operator token WITHOUT putting the
+    /// plaintext in a service file: only its hash is stored, and the token is shown once.
+    #[command(name = "admin-token")]
+    AdminToken {
+        #[command(subcommand)]
+        command: AdminTokenCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminTokenCommands {
+    /// Generate and install an admin token, replacing any current one. Prints the RAW token to
+    /// stdout EXACTLY ONCE — save it now, it is never shown again (only its hash is persisted).
+    /// Takes effect immediately: the running server picks it up on the next request.
+    Set {
+        /// Read the token from stdin instead of generating one. For migrating an existing
+        /// POLYFLARE_ADMIN_TOKEN into the store, or for a token from your own password manager.
+        #[arg(long = "stdin")]
+        stdin: bool,
+    },
+    /// Show which dashboard credentials are configured. Never prints a token.
+    Status,
+    /// Remove the stored admin token. Prints what that changes before it changes it.
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -188,7 +212,114 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             PasskeysCommands::List => passkeys_list().await,
             PasskeysCommands::Remove { id } => passkeys_remove(&id).await,
         },
+        Commands::AdminToken { command } => match command {
+            AdminTokenCommands::Set { stdin } => admin_token_set(stdin).await,
+            AdminTokenCommands::Status => admin_token_status().await,
+            AdminTokenCommands::Clear => admin_token_clear().await,
+        },
     }
+}
+
+/// Install an admin token. The plaintext is printed here and nowhere else — not stored, not
+/// logged, not recoverable afterwards.
+async fn admin_token_set(from_stdin: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let config = ServeConfig::from_env()?;
+    let store = Store::open(&config.db_path).await?;
+
+    let (raw, hash, prefix) = if from_stdin {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+        let raw = input.trim().to_string();
+        // A token short enough to guess is worse than no token, because it looks like protection.
+        if raw.len() < 16 {
+            return Err("refusing a token shorter than 16 characters".into());
+        }
+        let hash = polyflare_server::keys::sha256_hex(&raw);
+        let prefix = polyflare_server::admin_token::display_prefix(&raw);
+        (raw, hash, prefix)
+    } else {
+        let generated = polyflare_server::admin_token::generate();
+        (generated.raw, generated.hash, generated.prefix)
+    };
+
+    let replacing = store.admin_token().get().await?.is_some();
+    store.admin_token().set(&hash, &prefix, unix_now()).await?;
+
+    if from_stdin {
+        println!("Admin token installed (read from stdin).");
+    } else {
+        println!("Admin token installed. This is the ONLY time it is shown:\n");
+        println!("    {raw}\n");
+    }
+    if replacing {
+        println!("The previous admin token no longer works.");
+    }
+    println!(
+        "Sign in at the dashboard with this token, or send it as `Authorization: Bearer <token>`."
+    );
+    if !store.passkeys().any_registered().await? {
+        println!(
+            "The tokenless local dashboard bypass is now closed — this token (or a passkey) is \
+             required from every caller, including local ones."
+        );
+    }
+    Ok(())
+}
+
+/// Report which dashboard credentials exist. Reads the store, which the running server shares.
+async fn admin_token_status() -> Result<(), Box<dyn std::error::Error>> {
+    let config = ServeConfig::from_env()?;
+    let store = Store::open(&config.db_path).await?;
+    let status =
+        polyflare_server::admin_token::status(config.admin_token.as_deref(), &store).await?;
+    print!(
+        "{}",
+        polyflare_server::admin_token::render_status(&status, format_unix_date)
+    );
+    Ok(())
+}
+
+/// Remove the stored token, stating first what that re-opens.
+async fn admin_token_clear() -> Result<(), Box<dyn std::error::Error>> {
+    let config = ServeConfig::from_env()?;
+    let store = Store::open(&config.db_path).await?;
+    if !store.admin_token().clear().await? {
+        println!("No admin token was stored; nothing to clear.");
+        return Ok(());
+    }
+    println!("Stored admin token removed. It no longer authenticates.");
+    // The bypass reopens only when NOTHING else can authenticate. Say which, so an operator is not
+    // left guessing whether their dashboard just became reachable by any local process.
+    let passkeys = store.passkeys().any_registered().await?;
+    if passkeys {
+        println!("Passkey sign-in still protects the dashboard.");
+    } else if config.admin_token.is_some() {
+        println!(
+            "POLYFLARE_ADMIN_TOKEN is set in this shell and may still protect the dashboard — the \
+             running service has its own environment, so confirm there."
+        );
+    } else {
+        println!(
+            "No credential remains. On a loopback bind the dashboard API is now reachable WITHOUT \
+             authentication by any local process — set a new token or register a passkey."
+        );
+    }
+    Ok(())
+}
+
+fn unix_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// A unix timestamp as a readable UTC date for CLI output.
+fn format_unix_date(seconds: i64) -> String {
+    chrono::DateTime::from_timestamp(seconds, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| seconds.to_string())
 }
 
 async fn passkeys_list() -> Result<(), Box<dyn std::error::Error>> {

@@ -3,15 +3,24 @@
 //!
 //! 1. **A passkey session** — minted by `crate::passkey_auth` after a WebAuthn assertion, presented
 //!    as `Authorization: Bearer <session token>` and validated by hash lookup.
-//! 2. **`POLYFLARE_ADMIN_TOKEN`** — a shared operator token, and the break-glass path if every
-//!    passkey is lost.
+//! 2. **The admin token** — a shared operator token, and the break-glass path if every passkey is
+//!    lost. It comes from `POLYFLARE_ADMIN_TOKEN` or from the store (`polyflare admin-token set`);
+//!    see [`crate::admin_token`] for why the stored form exists and why both stay valid.
 //! 3. **[`LocalDashboardAccess`]** — the tokenless loopback bypass, available ONLY while no passkey
-//!    is registered. Registering one withdraws it permanently, which is how the dashboard stops
-//!    trusting "any process that reached loopback" (including anything that could hit the
-//!    credential-export route).
+//!    is registered AND no admin token is configured. Either one withdraws it, which is how the
+//!    dashboard stops trusting "any process that reached loopback" (including anything that could
+//!    hit the credential-export route).
 //!
 //! Non-loopback deployments with no credential configured stay disabled rather than silently
 //! opening the management surface.
+//!
+//! # Why the bypass is re-checked per request
+//! [`local_dashboard_access`] resolves at startup and decides whether the [`LocalDashboardAccess`]
+//! marker layer is installed at all. That is a bind-address decision and cannot change while the
+//! process runs. Whether a *credential* exists very much can — `admin-token set` and passkey
+//! registration both happen against a running server — so the marker alone must never be enough to
+//! admit a request. [`local_bypass_available`] re-asks both questions on every request, which is
+//! what lets a newly set token close the bypass without a restart.
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -25,11 +34,18 @@ use crate::app::AppState;
 /// Request-extension marker installed once at startup when the dashboard has no configured token
 /// and the listener is bound to a loopback address. It is derived from the server bind, never from
 /// caller-controlled forwarding headers.
+///
+/// Necessary but NOT sufficient to admit a request — see the module docs and
+/// [`local_bypass_available`].
 #[derive(Debug, Clone, Copy)]
 pub struct LocalDashboardAccess;
 
 /// Resolve the zero-config local dashboard posture. Parse the complete socket address and fail
 /// closed for hostnames, unspecified addresses, and malformed input.
+///
+/// Only the *environment* token is consulted here: this runs at startup to decide whether the
+/// marker layer exists, and a stored token can be set or cleared long afterwards. The per-request
+/// check in [`local_bypass_available`] is what accounts for the stored one.
 pub fn local_dashboard_access(admin_token: Option<&str>, bind_addr: &str) -> bool {
     admin_token.is_none()
         && bind_addr
@@ -59,6 +75,11 @@ pub(crate) async fn presented_credential_is_valid(s: &AppState, headers: &Header
             return true;
         }
     }
+    // The stored admin token (`polyflare admin-token set`). Hash comparison, so the plaintext is
+    // never on disk to be read.
+    if crate::admin_token::stored_token_is_valid(presented, &s.store).await {
+        return true;
+    }
     // A passkey session token. Hash-lookup, never a plaintext compare — the same rule `api_keys`
     // follows, so a database reader cannot replay a live session.
     s.store
@@ -69,12 +90,22 @@ pub(crate) async fn presented_credential_is_valid(s: &AppState, headers: &Header
 }
 
 /// Whether the tokenless loopback bypass may still admit this request. It is withdrawn the moment
-/// a passkey exists: "anything that reached loopback is the operator" is only an acceptable
-/// posture while there is no way for the operator to actually prove who they are. A store error
-/// fails CLOSED (treated as "a passkey exists"), because admitting an unauthenticated caller
-/// because the database hiccuped is the wrong failure mode for an auth gate.
+/// ANY credential exists — a passkey or an admin token: "anything that reached loopback is the
+/// operator" is only an acceptable posture while there is no way for the operator to actually
+/// prove who they are. Both store reads fail CLOSED (treated as "a credential exists"), because
+/// admitting an unauthenticated caller because the database hiccuped is the wrong failure mode for
+/// an auth gate.
+///
+/// The admin-token half is why setting a token takes effect immediately: the startup-installed
+/// marker cannot know about a token stored minutes later, so the token is re-checked here.
 async fn local_bypass_available(s: &AppState, marker_present: bool) -> bool {
-    marker_present && !s.store.passkeys().any_registered().await.unwrap_or(true)
+    if !marker_present {
+        return false;
+    }
+    if s.store.passkeys().any_registered().await.unwrap_or(true) {
+        return false;
+    }
+    !crate::admin_token::configured(s.admin_token.as_deref(), &s.store).await
 }
 
 /// Whether a request would be admitted, without consuming it. Powers `GET /api/auth/status`, whose
@@ -104,17 +135,17 @@ pub async fn require_admin(
     if local_bypass_available(&s, marker_present).await {
         return next.run(req).await;
     }
-    // A registered passkey means sign-in is possible, so an unauthenticated caller gets 401 (go
-    // sign in) rather than 503 (nothing is configured).
-    let signin_possible =
-        s.admin_token.is_some() || s.store.passkeys().any_registered().await.unwrap_or(false);
+    // A registered passkey or a configured admin token means sign-in is possible, so an
+    // unauthenticated caller gets 401 (go sign in) rather than 503 (nothing is configured).
+    let signin_possible = crate::admin_token::configured(s.admin_token.as_deref(), &s.store).await
+        || s.store.passkeys().any_registered().await.unwrap_or(false);
     if signin_possible {
         (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "dashboard disabled: register a passkey from a local session or set \
-             POLYFLARE_ADMIN_TOKEN",
+            "dashboard disabled: run `polyflare admin-token set`, or register a passkey from a \
+             local session",
         )
             .into_response()
     }
@@ -137,10 +168,18 @@ pub async fn whoami_handler() -> impl IntoResponse {
     Json(serde_json::json!({ "ok": true }))
 }
 
-/// `GET /api/capabilities` — feature flags the dashboard SPA gates UI on. Currently just
-/// `live_logs` (from `POLYFLARE_LIVE_LOGS`); grows as later tasks add capabilities.
+/// `GET /api/capabilities` — feature flags the dashboard SPA gates UI on.
+///
+/// `admin_token_configured` is presence only, never the token or its hash — the Settings page
+/// needs to state whether one exists, and it can now change at runtime (`polyflare admin-token
+/// set`/`clear`), so it cannot be inferred from a startup-time config snapshot.
 pub async fn capabilities_handler(State(s): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(serde_json::json!({ "live_logs": s.runtime_settings.live_logs() }))
+    let admin_token_configured =
+        crate::admin_token::configured(s.admin_token.as_deref(), &s.store).await;
+    Json(serde_json::json!({
+        "live_logs": s.runtime_settings.live_logs(),
+        "admin_token_configured": admin_token_configured,
+    }))
 }
 
 /// D18 Task 3: client API-key auth for the proxy surface (`/responses`, `/v1/messages`,

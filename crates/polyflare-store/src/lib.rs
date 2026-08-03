@@ -3,6 +3,7 @@
 //! is never logged.
 
 pub mod account;
+pub mod admin_token_repo;
 pub mod api_key_repo;
 pub mod continuity_repo;
 pub mod crypto;
@@ -20,6 +21,7 @@ pub use account::{
     Account, AccountRepo, AccountSettingsUpdate, AuthMode, EncryptedTokens, NewUpstreamAuth,
     PlainTokens, UpstreamAuth, UsageSnapshot, WindowUsage,
 };
+pub use admin_token_repo::{AdminTokenRepo, AdminTokenRow};
 pub use api_key_repo::{ApiKeyRepo, ApiKeyRow};
 pub use continuity_repo::{ContinuityRepo, SessionRow};
 pub use crypto::TokenCipher;

@@ -279,6 +279,11 @@ impl Store {
         crate::PasskeyRepo::new(self.pool.clone())
     }
 
+    /// The stored dashboard admin token (hash only) — the alternative to POLYFLARE_ADMIN_TOKEN.
+    pub fn admin_token(&self) -> crate::AdminTokenRepo {
+        crate::AdminTokenRepo::new(self.pool.clone())
+    }
+
     /// The settings repository over this store's pool (Settings-subsystem Task 3). No
     /// generation-bump wiring: nothing in-process caches `settings` rows today, so there is
     /// nothing here for a generation counter to invalidate.

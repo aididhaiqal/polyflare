@@ -510,7 +510,12 @@ pub async fn delete_handler(
         Ok(rows) => rows.len(),
         Err(_) => return safe_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error"),
     };
-    if remaining <= 1 && state.admin_token.is_none() {
+    // Either admin-token source counts: a token set by `polyflare admin-token set` is just as much
+    // a way back in as POLYFLARE_ADMIN_TOKEN, and refusing to honour it would strand an operator
+    // who configured the token properly instead of via the environment.
+    if remaining <= 1
+        && !crate::admin_token::configured(state.admin_token.as_deref(), &state.store).await
+    {
         return safe_error(StatusCode::CONFLICT, "last_passkey_needs_admin_token");
     }
     match repo.delete(&id).await {

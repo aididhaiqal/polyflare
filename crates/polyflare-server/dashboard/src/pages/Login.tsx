@@ -71,7 +71,9 @@ export function Login() {
         signOut();
         setError("Invalid token");
       } else if (err instanceof ApiError && err.status === 503) {
-        setError("Dashboard is disabled (POLYFLARE_ADMIN_TOKEN is not set on the server)");
+        setError(
+          "Dashboard is disabled — no credential is configured. Run `polyflare admin-token set` on the server.",
+        );
       } else {
         signOut();
         setError("Could not reach the server. Try again.");

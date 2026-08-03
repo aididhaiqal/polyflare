@@ -607,9 +607,12 @@ export interface WhoamiView {
 }
 
 /** `auth.rs::capabilities_handler` — `GET /api/capabilities` response. Grows as later tasks add
- * capability flags; `live_logs` is the only one today. */
+ * capability flags. */
 export interface CapabilitiesView {
   live_logs: boolean;
+  /** Whether an admin token is configured, from EITHER `POLYFLARE_ADMIN_TOKEN` or the store
+   * (`polyflare admin-token set`). Presence only — the token never reaches the browser. */
+  admin_token_configured: boolean;
 }
 
 /** `log_bus.rs::LogLevel` — `#[serde(rename_all = "lowercase")]`. */

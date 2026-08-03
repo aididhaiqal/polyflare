@@ -3,6 +3,7 @@
 pub mod account_cache;
 pub mod account_onboarding;
 pub mod account_ops;
+pub mod admin_token;
 pub mod admission_api;
 pub mod alias;
 pub mod app;
