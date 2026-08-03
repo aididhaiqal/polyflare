@@ -364,6 +364,21 @@ async fn passkeys_remove(id: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// The M2b server: store-backed multi-account pool selection.
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = ServeConfig::from_env()?;
+    // Bind BEFORE any startup work. Everything below — opening a multi-hundred-megabyte store,
+    // running migrations, warming the model catalog — takes seconds, and until the socket exists a
+    // client connecting to this port is REFUSED, not delayed. `launchctl kickstart -k` kills the
+    // outgoing process before starting this one, so nothing else is holding the port during that
+    // window: measured at ~12s on 2026-08-03, which surfaced to a running Codex session as
+    // "stream disconnected before completion: error sending request for url".
+    //
+    // SO_REUSEPORT was already meant to make a deploy seamless, but it can only do that when the
+    // two processes overlap. Binding first restores the property under a kill-then-start
+    // supervisor: the listen backlog (1024) holds arriving connections until `axum::serve` starts
+    // accepting them a few seconds later, so a redeploy costs a client latency rather than an
+    // error. A startup that fails still closes the socket, so those callers fail — just no sooner
+    // than they would have anyway.
+    let listener = bind_handover_listener(&config.bind_addr)?;
+    println!("polyflare listening on {}", config.bind_addr);
     let store = Store::open(&config.db_path).await?;
     let settings_overlay = store.settings().get_all().await?;
     config::overlay_persisted_websocket_settings(&mut config, &settings_overlay);
@@ -557,11 +572,8 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = build_app_for_bind(state.clone(), &config.bind_addr);
 
-    // Handover-capable bind: `SO_REUSEPORT` lets a replacement process bind and accept while this
-    // one is still draining its last turns, so a deploy never refuses a connection and never races
-    // the dying process for the port.
-    let listener = bind_handover_listener(&config.bind_addr)?;
-    println!("polyflare listening on {}", config.bind_addr);
+    // The listener was bound at the top of `serve` — see the comment there for why it must precede
+    // startup rather than follow it. Accepting begins here, once the router is actually ready.
     let drain_timeout = config::shutdown_drain_timeout_from_env();
     let lease_metrics = state.lease_metrics.clone();
     let drain_outcome =
