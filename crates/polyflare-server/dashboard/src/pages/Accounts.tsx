@@ -34,6 +34,7 @@ import type {
   TokenHealthView,
   WindowView,
 } from "../lib/api";
+import { accountLabel } from "../lib/accountDisplay";
 import { compactNum, countdown, pct } from "../lib/format";
 import {
   quotaDisplayLabel,
@@ -280,6 +281,7 @@ export function Accounts() {
             <AccountCard
               key={a.id}
               account={a}
+              siblings={accounts}
               reset={resetByAccount.get(a.id)}
               nowMs={nowMs}
               actions={actions}
@@ -311,7 +313,7 @@ export function Accounts() {
 function AccountRowMenu({ account: a, actions }: { account: AccountView; actions: AccountActionsApi }) {
   const paused = a.status === "paused";
   const { active } = useScreenShield();
-  const displayLabel = active ? routePseudonym(a.id) : a.alias ?? a.id;
+  const displayLabel = active ? routePseudonym(a.id) : accountLabel(a);
   return (
     <ActionMenu label={`Actions for ${displayLabel}`}>
       <ActionMenu.Item
@@ -468,11 +470,14 @@ function CardUsageRow({
 
 function AccountCard({
   account: a,
+  siblings,
   reset,
   nowMs,
   actions,
 }: {
   account: AccountView;
+  /** Every account on screen — lets a label that would collide gain a disambiguator. */
+  siblings: AccountView[];
   reset?: ResetPlanCandidateView;
   nowMs: number;
   actions: AccountActionsApi;
@@ -494,7 +499,7 @@ function AccountCard({
             <span className={clsx("h-2 w-2 shrink-0 rounded-full", TONE_BAR_CLASS[tone])} />
             <ShieldedAccount
               id={a.id}
-              label={a.alias ?? a.id}
+              label={accountLabel(a, siblings)}
               className="truncate text-[13.5px] font-semibold text-fg"
             />
             <ProviderTag provider={a.provider} />
@@ -521,8 +526,7 @@ function AccountCard({
               <span className="opacity-60">identity shielded · </span>
             ) : (
               <>
-                {a.alias && <span className="opacity-60">{a.id} · </span>}
-                {a.email} ·{" "}
+                {a.alias && a.email && <span className="opacity-60">{a.email} · </span>}
               </>
             )}
             <span className="font-medium text-fg opacity-90">{a.plan_type}</span> · pool{" "}
@@ -655,10 +659,10 @@ function AccountsTable({
                         TONE_BAR_CLASS[tone],
                       )}
                     />
-                    <ShieldedAccount id={a.id} label={a.alias ?? a.id} />
+                    <ShieldedAccount id={a.id} label={accountLabel(a, accounts)} />
                     {a.security_work_authorized && <CyberAccessBadge className="ml-1.5 align-text-bottom" />}
-                    {!active && a.alias && (
-                      <span className="ml-1.5 text-fg opacity-40">({a.id})</span>
+                    {!active && a.alias && a.email && (
+                      <span className="ml-1.5 text-fg opacity-40">{a.email}</span>
                     )}
                   </td>
                   <td className="px-2.5 py-2">

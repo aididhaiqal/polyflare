@@ -2710,7 +2710,10 @@ function AccountHealthCard(
                     <StatusPill status={focus.status} />
                   </div>
                   <div className="mt-1 text-[9.5px] text-fg opacity-45">
-                    {active ? "identity shielded" : focus.alias ? focus.email : focus.id} · {focus.pools.length > 0 ? focus.pools.join(", ") : "unpooled"} · reset {countdown(focus.reset_at ?? focus.weekly?.reset_at, nowMs)}
+                    {/* The heading above is already the email unless a nickname replaced it, so the
+                        address belongs here only in the nicknamed case — never the internal id. */}
+                    {active ? "identity shielded · " : focus.alias ? `${focus.email} · ` : ""}
+                    {focus.pools.length > 0 ? focus.pools.join(", ") : "unpooled"} · reset {countdown(focus.reset_at ?? focus.weekly?.reset_at, nowMs)}
                   </div>
                   <div className="mt-3 flex flex-wrap gap-1.5" aria-label="Why this route needs attention">
                     {focusHealth.reasons.map((reason) => (
@@ -3688,7 +3691,7 @@ function BalanceRoute({
         to={`/accounts/${encodeURIComponent(id)}`}
         className="mt-0.5 block truncate font-semibold text-fg no-underline hover:text-accent"
       >
-        <ShieldedAccount id={id} label={account?.alias ?? account?.email ?? id} />
+        <ShieldedAccount id={id} label={accountDisplayLabel(account, id)} />
       </Link>
     </div>
   );

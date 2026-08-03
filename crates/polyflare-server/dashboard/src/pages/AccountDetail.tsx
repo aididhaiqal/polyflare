@@ -21,9 +21,11 @@
 //                                 rather than reading it off the list row directly — a harmless
 //                                 pre-existing pattern, left as-is since this task's scope is the
 //                                 Actions panel, not the rail.
-//   header dot/name/pv/status  <- detail.status (via statusTone/StatusPill), detail.identity.alias
-//                                 ?? identity.id, identity.provider
-//   meta line                  <- identity.email/workspace_label/plan_type/pool/seat_type
+//   header dot/name/pv/status  <- detail.status (via statusTone/StatusPill), accountLabel(identity,
+//                                 accounts) — nickname else email, never the internal id unless two
+//                                 accounts would otherwise render alike, identity.provider
+//   meta line                  <- identity.workspace_label/plan_type/pool/seat_type, plus
+//                                 identity.email only when a nickname took its place in the title
 //   Usage / quota              <- detail.quota_windows (adaptive UsageWindowView[] — a window not
 //                                 reported is simply absent, never a fabricated dash row here,
 //                                 unlike the Accounts list page's fixed five_hour/weekly pair)
@@ -72,6 +74,7 @@ import {
   type TokenHealthView,
   type UsageWindowView,
 } from "../lib/api";
+import { accountLabel } from "../lib/accountDisplay";
 import { compactNum, countdown, pct } from "../lib/format";
 import {
   quotaDisplayLabel,
@@ -272,6 +275,7 @@ export function AccountDetail() {
             primary={trendsQuery.data?.primary ?? []}
             secondary={trendsQuery.data?.secondary ?? []}
             forecast={trendsQuery.data?.forecast ?? null}
+            siblings={accounts}
           />
         ) : (
           // Defensive fallback (e.g. a route somehow reached with no :id) — never a blank page.
@@ -363,7 +367,10 @@ function AccountRail({
                   key={a.id}
                   account={a}
                   isSelected={a.id === currentId}
-                  displayName={a.id === currentId && currentAlias ? currentAlias : a.id}
+                  displayName={accountLabel(
+                    a.id === currentId && currentAlias ? { ...a, alias: currentAlias } : a,
+                    accounts,
+                  )}
                 />
               ))}
             </div>
@@ -387,14 +394,15 @@ function RailRow({
   const worst = worstUsedPercent(account);
   const { active } = useScreenShield();
   const { mode: quotaMode } = useQuotaDisplayPreference();
-  // The mockup's rail meta line shows "id · provider" for the one row whose name is an alias (so
-  // the real id is still visible somewhere), and "provider · status" for every plain-id row (no
-  // point repeating the id right below itself).
-  const isAliasName = displayName !== account.id;
+  // The meta line carries the email under a nicknamed row (so the underlying identity is still
+  // visible), and provider + status when the name already IS the email — no point repeating it.
+  // `startsWith`, not `===`: a name disambiguated against a same-email sibling reads
+  // "you@example.com · 6da27c17…8c8e", and that still leads with the address.
+  const nameIsEmail = !!account.email && displayName.startsWith(account.email);
   const meta = active
     ? `${providerBrandKey(account.provider)} · identity shielded`
-    : isAliasName
-      ? `${account.id} · ${providerBrandKey(account.provider)}`
+    : !nameIsEmail && account.email
+      ? `${account.email} · ${providerBrandKey(account.provider)}`
       : `${providerBrandKey(account.provider)} · ${account.status.replace(/_/g, " ")}`;
 
   return (
@@ -554,6 +562,8 @@ interface DetailContentProps {
   primary: Point[];
   secondary: Point[];
   forecast: DepletionForecast | null;
+  /** Every account in the rail, so a title that would collide gets disambiguated. */
+  siblings: AccountView[];
 }
 
 function DetailContent({
@@ -569,9 +579,10 @@ function DetailContent({
   primary,
   secondary,
   forecast,
+  siblings,
 }: DetailContentProps) {
   const { identity } = detail;
-  const displayName = identity.alias ?? identity.id;
+  const displayName = accountLabel(identity, siblings);
   const tone = statusTone(detail.status);
   const token = tokenStatusText(detail.token_status, nowMs);
   const quotaRows = detail.quota_windows
@@ -627,14 +638,15 @@ function DetailContent({
               <p className="mt-1.5 flex flex-wrap items-center gap-1 text-[12px] leading-relaxed text-fg opacity-60">
                 {detail.security_work_authorized && <CyberAccessBadge />}
                 {active ? (
-                  "Identity and workspace shielded"
+                  <>{"Identity and workspace shielded · "}</>
                 ) : (
                   <>
-                    {identity.email}
-                    {identity.workspace_label && <> · {identity.workspace_label}</>}
+                    {/* The title already IS the email unless a nickname replaced it, so repeating
+                        it here would print the same address twice, one line apart. */}
+                    {identity.alias && identity.email && <>{identity.email} · </>}
+                    {identity.workspace_label && <>{identity.workspace_label} · </>}
                   </>
                 )}
-                {" · "}
                 <span className="font-semibold text-fg opacity-90">{identity.plan_type}</span> plan
                 {" · "}
                 <span className="font-semibold text-fg opacity-90">
@@ -716,7 +728,7 @@ function DetailContent({
         <Col span={12}>
           <ActionsCard
             id={identity.id}
-            alias={identity.alias}
+            label={displayName}
             status={detail.status}
             routingPolicy={detail.routing_policy}
             trustedAccess={detail.security_work_authorized}
@@ -1069,7 +1081,7 @@ function resetRecommendationLabel(candidate: ResetPlanCandidateView): string {
 
 function ActionsCard({
   id,
-  alias,
+  label,
   status,
   routingPolicy,
   trustedAccess,
@@ -1086,7 +1098,8 @@ function ActionsCard({
   onDeleted,
 }: {
   id: string;
-  alias: string | null;
+  /** The account's display name, already resolved to nickname-else-email. */
+  label: string;
   status: string;
   routingPolicy: string;
   trustedAccess: boolean;
@@ -1107,7 +1120,7 @@ function ActionsCard({
 }) {
   const paused = status === "paused";
   const { active } = useScreenShield();
-  const displayLabel = active ? routePseudonym(id) : alias ?? id;
+  const displayLabel = active ? routePseudonym(id) : label;
   return (
     <Card>
       <div className="flex flex-wrap items-start justify-between gap-2">

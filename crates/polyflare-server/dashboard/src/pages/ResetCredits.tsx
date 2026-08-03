@@ -550,7 +550,10 @@ function CandidateRow({
           </span>
         </div>
         <div className="mt-1 truncate text-[9.5px] text-fg opacity-45">
-          {candidate.alias ? candidate.email : candidate.account_id} · {candidate.plan_type} ·{" "}
+          {/* The title above is already the email unless a nickname replaced it, so the address
+              belongs here only in the nicknamed case — never the internal id in its place. */}
+          {candidate.alias && <>{candidate.email} · </>}
+          {candidate.plan_type} ·{" "}
           {candidate.pools.length > 0 ? candidate.pools.join(", ") : "unpooled"}
         </div>
         <p className="mt-1.5 text-[9.5px] leading-relaxed text-fg opacity-60">
