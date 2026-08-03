@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+#
+# Move a PolyFlare deployment's data to another machine.
+#
+#   scripts/migrate-to-host ultraflux
+#
+# Copies the store and the at-rest encryption key to <host>, then loads the launchd agent there.
+# The binary and the repo are NOT copied — build those on the target first.
+#
+# THE ONE RULE THIS SCRIPT ENFORCES: the source server must be stopped before the copy.
+#
+# PolyFlare's upstream refresh tokens are single-use and rotate on every refresh. Two servers
+# sharing one set of accounts each invalidate the other's tokens, and the loser of that race cannot
+# re-derive a valid one — the whole account family has to be re-authenticated by hand. That is not
+# a degraded mode, it is every account logged out at once, so this script refuses to copy while the
+# source is still serving rather than trusting the operator to have stopped it.
+#
+# The store is snapshotted with `VACUUM INTO`, not copied with `cp`. A live SQLite database in WAL
+# mode is three files whose contents only agree at a checkpoint; copying store.db alone yields a
+# torn database that may open cleanly and be missing recent writes. `VACUUM INTO` serialises a
+# consistent image regardless of WAL state.
+#
+# The key file matters as much as the store. Account tokens are encrypted at rest with it, so a
+# store without its key is unreadable ciphertext — the accounts appear, and every one of them
+# fails to authenticate. They move together or not at all.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+DATA_DIR="${POLYFLARE_DATA_DIR:-$HOME/.polyflare}"
+LAUNCHD_LABEL="com.polyflare.server"
+SERVICE_URL="${POLYFLARE_SERVICE_URL:-http://127.0.0.1:8080}"
+
+die() { printf 'migrate-to-host: %s\n' "$*" >&2; exit 1; }
+say() { printf '\n== %s ==\n' "$*"; }
+
+TARGET="${1:-}"
+[[ -n "$TARGET" ]] || die "usage: $0 <ssh-host>   (e.g. $0 ultraflux)"
+
+# ---------------------------------------------------------------------------------------------
+# 1. Refuse to run against a live source.
+# ---------------------------------------------------------------------------------------------
+say "checking the source server is stopped"
+if curl -sf -o /dev/null --max-time 3 "$SERVICE_URL/dashboard/" 2>/dev/null; then
+  die "PolyFlare is STILL SERVING on $SERVICE_URL.
+Stop it first:  launchctl bootout gui/\$(id -u)/$LAUNCHD_LABEL
+Copying a live store risks running two servers against one set of accounts, which destroys the
+rotating refresh tokens and logs every account out."
+fi
+if launchctl list "$LAUNCHD_LABEL" >/dev/null 2>&1; then
+  die "the launchd agent $LAUNCHD_LABEL is still loaded.
+Stop it first:  launchctl bootout gui/\$(id -u)/$LAUNCHD_LABEL"
+fi
+printf 'source is stopped.\n'
+
+[[ -f "$DATA_DIR/store.db" ]] || die "no store at $DATA_DIR/store.db"
+[[ -f "$DATA_DIR/key" ]]      || die "no at-rest key at $DATA_DIR/key — refusing to move a store whose tokens could not be decrypted"
+
+# ---------------------------------------------------------------------------------------------
+# 2. Consistent snapshot, and a count to verify the far side against.
+# ---------------------------------------------------------------------------------------------
+say "snapshotting the store"
+SNAPSHOT="$(mktemp -d)/store.db"
+sqlite3 "$DATA_DIR/store.db" "VACUUM INTO '$SNAPSHOT'"
+SRC_ACCOUNTS="$(sqlite3 "$SNAPSHOT" 'SELECT COUNT(*) FROM accounts')"
+SRC_REQUESTS="$(sqlite3 "$SNAPSHOT" 'SELECT COUNT(*) FROM request_log')"
+printf 'snapshot: %s (%s accounts, %s request-log rows)\n' \
+  "$(du -h "$SNAPSHOT" | cut -f1)" "$SRC_ACCOUNTS" "$SRC_REQUESTS"
+
+# ---------------------------------------------------------------------------------------------
+# 3. Transfer. The key goes over the same authenticated SSH channel as the store.
+# ---------------------------------------------------------------------------------------------
+say "transferring to $TARGET"
+ssh "$TARGET" 'mkdir -p ~/.polyflare && chmod 700 ~/.polyflare'
+rsync -a --progress -e ssh "$SNAPSHOT" "$TARGET:.polyflare/store.db"
+rsync -a -e ssh "$DATA_DIR/key" "$TARGET:.polyflare/key"
+ssh "$TARGET" 'chmod 600 ~/.polyflare/key ~/.polyflare/store.db'
+rm -rf "$(dirname "$SNAPSHOT")"
+
+# A stale WAL/SHM beside a freshly copied database would be read as that database's journal.
+ssh "$TARGET" 'rm -f ~/.polyflare/store.db-wal ~/.polyflare/store.db-shm'
+
+# ---------------------------------------------------------------------------------------------
+# 4. Verify the copy before anything starts serving from it.
+# ---------------------------------------------------------------------------------------------
+say "verifying the copy"
+DST_ACCOUNTS="$(ssh "$TARGET" 'sqlite3 ~/.polyflare/store.db "SELECT COUNT(*) FROM accounts"')"
+DST_INTEGRITY="$(ssh "$TARGET" 'sqlite3 ~/.polyflare/store.db "PRAGMA integrity_check" | head -1')"
+[[ "$DST_INTEGRITY" == "ok" ]] || die "integrity check on the target says: $DST_INTEGRITY"
+[[ "$DST_ACCOUNTS" == "$SRC_ACCOUNTS" ]] || die "account count mismatch: source $SRC_ACCOUNTS, target $DST_ACCOUNTS"
+printf 'integrity ok; %s accounts present on %s\n' "$DST_ACCOUNTS" "$TARGET"
+
+# ---------------------------------------------------------------------------------------------
+# 5. Start the target.
+# ---------------------------------------------------------------------------------------------
+say "starting PolyFlare on $TARGET"
+ssh "$TARGET" '
+  if [ -f ~/Library/LaunchAgents/com.polyflare.server.plist.staged ]; then
+    mv ~/Library/LaunchAgents/com.polyflare.server.plist.staged ~/Library/LaunchAgents/com.polyflare.server.plist
+  fi
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.polyflare.server.plist 2>/dev/null || true
+  launchctl kickstart gui/$(id -u)/com.polyflare.server
+'
+sleep 8
+if ssh "$TARGET" 'curl -sf -o /dev/null --max-time 5 http://127.0.0.1:8080/dashboard/'; then
+  printf '\nPolyFlare is serving on %s.\n' "$TARGET"
+else
+  die "the agent was loaded but $TARGET is not serving yet; check ~/.polyflare/stderr.log there"
+fi
+
+cat <<EOF
+
+The source machine still has its store and key at $DATA_DIR — nothing was deleted. Keep them
+until you are satisfied the migration held, then remove them deliberately.
+
+Do NOT start the source server again while $TARGET is serving these accounts.
+EOF
