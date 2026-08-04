@@ -23,7 +23,7 @@ import {
 } from "recharts";
 
 import type { ReportBreakdownView, ReportBucketView, ReportsView } from "../lib/api";
-import { compactNum, latency, pct, ratePct } from "../lib/format";
+import { compactNum, latency, pctTenths, ratePct } from "../lib/format";
 import { useProviders, useReports, type ReportsParams } from "../lib/queries";
 import { Card } from "../ui/Card";
 import { Col, Grid } from "../ui/Grid";
@@ -280,7 +280,7 @@ function CostSection({ data, dimensionLabel }: { data: ReportsView; dimensionLab
             <MetricCard
               icon={Activity}
               title="Cache-hit rate"
-              value={pct(data.totals.cache_hit_rate * 100)}
+              value={pctTenths(data.totals.cache_hit_rate * 100)}
             />
           </Col>
           <Col span={4}>
@@ -379,7 +379,7 @@ function UsageSection({ data, dimensionLabel }: { data: ReportsView; dimensionLa
             <MetricCard
               icon={Activity}
               title="Cache-hit rate"
-              value={pct(data.totals.cache_hit_rate * 100)}
+              value={pctTenths(data.totals.cache_hit_rate * 100)}
             />
           </Col>
           <Col span={3}>

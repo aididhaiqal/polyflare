@@ -56,6 +56,23 @@ export function ratePct(n: number | null | undefined): string {
 // @check ratePct(99.99) === "<100%"
 // @check ratePct(0) === "0%"
 
+/** A percentage kept to one decimal ACROSS THE WHOLE RANGE, for a rate that sits in the middle of
+ * it and moves only slightly.
+ *
+ * Neither formatter above fits such a metric. `pct` rounds to whole numbers; `ratePct` adds
+ * precision only below 10% and between 99% and 100%, falling through to the same whole-number
+ * rounding in between — it was written for error and reliability rates, which live at the
+ * extremes. The cache-hit rate does not: it holds around 95-96% and varies by roughly two points
+ * across a day. Rounded, it renders as one unchanging number and reads as a stuck gauge rather
+ * than a live measurement, which is exactly how it was first reported as a bug. */
+export function pctTenths(n: number | null | undefined): string {
+  if (n === null || n === undefined || !Number.isFinite(n)) return "—";
+  return `${n.toFixed(1)}%`;
+}
+// @check pctTenths(95.78) === "95.8%"
+// @check pctTenths(96) === "96.0%"
+// @check pctTenths(0) === "0.0%"
+
 /** Relative-time string for an absolute unix-epoch-seconds timestamp, e.g. `"3m ago"`. `nowMs`
  * defaults to `Date.now()` for call-site convenience but can be overridden for deterministic
  * testing. */
