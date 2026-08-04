@@ -1,0 +1,32 @@
+[package]
+name = "polyflare-loopback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "polyflare_loopback"
+path = "src/lib.rs"
+
+[[bin]]
+name = "polyflare-loopback"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+
+[dev-dependencies]
+serde_json = { workspace = true }

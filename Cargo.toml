@@ -7,6 +7,7 @@ members = [
     "crates/polyflare-store",
     "crates/polyflare-testkit",
     "crates/polyflare-server",
+    "crates/polyflare-loopback",
 ]
 
 [workspace.package]
