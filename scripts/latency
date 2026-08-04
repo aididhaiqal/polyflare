@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+#
+# latency — where the time in a request actually goes, across both legs.
+#
+#   scripts/latency              # one snapshot
+#   scripts/latency --watch      # refresh every 15s until interrupted
+#
+# A request crosses two networks and PolyFlare sits between them:
+#
+#   Codex ──leg 1──▶ PolyFlare ──leg 2──▶ upstream model
+#
+# PolyFlare's own `request_log` cannot separate those. `ttft_ms` is measured from the moment the
+# route starts, so it bundles PolyFlare's routing and admission work together with the upstream
+# model's time to first token — a single number that answers "was this slow" but never "which
+# side was slow". This probes each leg independently and prints the live figures beside them, so
+# the three can be compared directly.
+#
+# The probes are synthetic: leg 1 opens a fresh connection (Codex reuses one, so real per-request
+# cost is lower), and leg 2 measures reaching the upstream API rather than an inference. They
+# bound the transport; the live figures show what inference actually costs on top.
+
+set -euo pipefail
+
+HOST="${POLYFLARE_HOST:-ultraflux}"
+URL="${POLYFLARE_URL:-https://ultraflux.tail6de914.ts.net}"
+TOKEN="${POLYFLARE_ADMIN_TOKEN:-}"
+UPSTREAM="${POLYFLARE_UPSTREAM_PROBE:-https://api.openai.com/v1/models}"
+WINDOW_SECS="${POLYFLARE_LATENCY_WINDOW:-1800}"
+
+CURL_FMT='%{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total}\n'
+
+ms() { awk -v s="$1" 'BEGIN{printf "%.0f", s*1000}'; }
+
+leg1() {
+  local auth=()
+  [[ -n "$TOKEN" ]] && auth=(-H "Authorization: Bearer $TOKEN")
+  read -r tcp tls ttfb total < <(
+    curl -s -o /dev/null -w "$CURL_FMT" "${auth[@]}" "$URL/api/whoami" 2>/dev/null || echo "0 0 0 0"
+  )
+  printf '  tcp %sms   tls %sms   first-byte %sms   total %sms\n' \
+    "$(ms "$tcp")" "$(ms "$tls")" "$(ms "$ttfb")" "$(ms "$total")"
+  # What PolyFlare itself contributed, once the connection was already established.
+  printf '    └ PolyFlare handling (first-byte minus handshake): %sms\n' \
+    "$(awk -v a="$ttfb" -v b="$tls" 'BEGIN{printf "%.0f", (a-b)*1000}')"
+}
+
+leg2() {
+  ssh "$HOST" "curl -s -o /dev/null -w '$CURL_FMT' '$UPSTREAM'" 2>/dev/null \
+    | while read -r tcp tls ttfb total; do
+        printf '  tcp %sms   tls %sms   first-byte %sms   total %sms\n' \
+          "$(ms "$tcp")" "$(ms "$tls")" "$(ms "$ttfb")" "$(ms "$total")"
+      done
+}
+
+live() {
+  ssh "$HOST" "sqlite3 ~/.polyflare/store.db \"
+    SELECT
+      '  ' || COUNT(*) || ' requests' ||
+      '   ttft avg ' || COALESCE(CAST(AVG(NULLIF(ttft_ms,0)) AS INT),0) || 'ms' ||
+      '   (min ' || COALESCE(CAST(MIN(NULLIF(ttft_ms,0)) AS INT),0) || 'ms)' ||
+      '   total avg ' || COALESCE(CAST(AVG(duration_ms) AS INT),0) || 'ms' ||
+      '   max ' || COALESCE(CAST(MAX(duration_ms) AS INT),0) || 'ms'
+    FROM request_log
+    WHERE path = '/responses' AND requested_at > strftime('%s','now') - $WINDOW_SECS;\"" 2>/dev/null
+}
+
+snapshot() {
+  printf '\n== latency at %s ==\n' "$(date '+%H:%M:%S')"
+  printf '\nleg 1 — this machine to PolyFlare (%s)\n' "$URL"
+  leg1
+  printf '\nleg 2 — PolyFlare to upstream (%s)\n' "$UPSTREAM"
+  leg2
+  printf '\nlive /responses traffic (last %s min, as PolyFlare measured it)\n' $((WINDOW_SECS / 60))
+  live
+  printf '\n  ttft above spans PolyFlare handling AND the upstream model; the two probes bound\n'
+  printf '  the transport, so the remainder is inference.\n'
+}
+
+if [[ "${1:-}" == "--watch" ]]; then
+  while true; do
+    snapshot
+    sleep "${POLYFLARE_LATENCY_INTERVAL:-15}"
+  done
+else
+  snapshot
+fi
