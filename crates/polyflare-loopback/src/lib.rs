@@ -36,6 +36,7 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 // outer bound must be longer or it can manufacture a premature 502 while PolyFlare is still validly
 // waiting. The extra margin covers tailnet transport latency.
 const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
+const UPSTREAM_HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 
 type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -159,6 +160,7 @@ struct ProxyConfig {
 
 impl ProxyConfig {
     async fn from_config(config: &Config) -> Result<Self, PrepareError> {
+        install_crypto_provider()?;
         let upstream_addresses = resolve_upstream(&config.upstream).await?;
         let host = config
             .upstream
@@ -197,6 +199,26 @@ impl ProxyConfig {
             target.set_scheme(scheme).map_err(|_| ())?;
         }
         Ok(target)
+    }
+
+    async fn upstream_status(&self) -> Result<StatusCode, ()> {
+        let target = self.upstream.clone();
+        match tokio::time::timeout(UPSTREAM_HEALTH_TIMEOUT, self.http.get(target).send()).await {
+            Ok(Ok(response)) if !response.status().is_redirection() => Ok(response.status()),
+            _ => Err(()),
+        }
+    }
+}
+
+fn install_crypto_provider() -> Result<(), PrepareError> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+    let installed = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    if installed.is_ok() || rustls::crypto::CryptoProvider::get_default().is_some() {
+        Ok(())
+    } else {
+        Err(PrepareError::CryptoProvider)
     }
 }
 
@@ -287,12 +309,22 @@ fn error_response(status: StatusCode, code: &'static str) -> Response {
         .into_response()
 }
 
-async fn health() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        "{\"status\":\"ok\",\"mode\":\"remote-polyflare-loopback\"}",
-    )
+async fn health(State(state): State<Arc<ProxyConfig>>) -> impl IntoResponse {
+    match state.upstream_status().await {
+        Ok(status) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!(
+                "{{\"status\":\"ok\",\"mode\":\"remote-polyflare-loopback\",\"upstream_http_status\":{}}}",
+                status.as_u16()
+            ),
+        ),
+        Err(()) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "application/json")],
+            "{\"status\":\"degraded\",\"mode\":\"remote-polyflare-loopback\",\"upstream\":\"unavailable\"}".to_string(),
+        ),
+    }
 }
 
 async fn proxy_handler(State(state): State<Arc<ProxyConfig>>, request: Request<Body>) -> Response {
@@ -525,14 +557,20 @@ where
 }
 
 pub async fn check_upstream(config: &Config) -> Result<(), RunError> {
-    ProxyConfig::from_config(config)
+    let state = ProxyConfig::from_config(config)
+        .await
+        .map_err(RunError::Prepare)?;
+    state
+        .upstream_status()
         .await
         .map(|_| ())
-        .map_err(RunError::Prepare)
+        .map_err(|()| RunError::Prepare(PrepareError::UpstreamUnavailable))
 }
 
 #[derive(Debug, Error)]
 pub enum PrepareError {
+    #[error("could not initialize the TLS crypto provider")]
+    CryptoProvider,
     #[error("remote upstream DNS resolution failed")]
     Resolve(#[source] std::io::Error),
     #[error("remote upstream resolved to no addresses")]
@@ -541,6 +579,8 @@ pub enum PrepareError {
     UnsafeAddress,
     #[error("could not construct the pinned upstream client")]
     Client(#[source] reqwest::Error),
+    #[error("remote upstream HTTPS readiness check failed")]
+    UpstreamUnavailable,
 }
 
 async fn shutdown_signal() {
@@ -586,6 +626,12 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::{oneshot, Mutex, Notify};
     use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    #[test]
+    fn installs_the_workspace_tls_crypto_provider() {
+        install_crypto_provider().unwrap();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
 
     #[test]
     fn accepts_only_explicit_remote_https_origin_and_loopback_listener() {
@@ -946,7 +992,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_is_local_and_upstream_failure_is_fail_closed() {
+    async fn health_reports_upstream_failure_and_proxy_remains_fail_closed() {
         let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_address = dead.local_addr().unwrap();
         drop(dead);
@@ -957,10 +1003,10 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(health.status(), StatusCode::OK);
+        assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             health.json::<serde_json::Value>().await.unwrap()["status"],
-            "ok"
+            "degraded"
         );
         let failed = client
             .get(format!("http://{companion}/backend-api/failure"))

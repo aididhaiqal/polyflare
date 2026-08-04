@@ -33,11 +33,16 @@ target/release/polyflare-loopback \
 
 The default and recommended listener is `127.0.0.1:8080`. The binary rejects non-loopback bind
 addresses, non-HTTPS upstreams, localhost upstreams, redirects to another origin, URL credentials,
-and upstream URLs containing a path/query/fragment. Its local health endpoint is:
+and upstream URLs containing a path/query/fragment. `--check-config` also performs an HTTPS
+readiness request to the configured origin. The health endpoint checks both the local service and
+that remote HTTPS leg:
 
 ```text
 GET http://127.0.0.1:8080/_polyflare-loopback/health
 ```
+
+It returns `200` with `status: "ok"` when the remote origin responds (any non-redirect HTTP status
+is sufficient), or `503` with `status: "degraded"` when it cannot be reached.
 
 For Codex, change only the ChatGPT backend setting:
 

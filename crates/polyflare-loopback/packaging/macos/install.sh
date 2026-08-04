@@ -25,7 +25,7 @@ launchctl bootstrap "gui/$(id -u)" "$agent"
 attempt=0
 healthy=false
 while [ "$attempt" -lt 30 ]; do
-  health=$(curl -fsS --max-time 1 http://127.0.0.1:8080/_polyflare-loopback/health 2>/dev/null || true)
+  health=$(curl -fsS --max-time 4 http://127.0.0.1:8080/_polyflare-loopback/health 2>/dev/null || true)
   case "$health" in
     *'"status":"ok"'*'"mode":"remote-polyflare-loopback"'*) healthy=true; break ;;
   esac

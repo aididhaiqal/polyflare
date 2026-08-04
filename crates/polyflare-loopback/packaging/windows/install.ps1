@@ -21,7 +21,7 @@ if ($LASTEXITCODE -ne 0) { throw "The service was installed but did not start" }
 $Healthy = $false
 for ($Attempt = 0; $Attempt -lt 30; $Attempt++) {
     try {
-        $Health = Invoke-RestMethod -TimeoutSec 1 -Uri "http://127.0.0.1:8080/_polyflare-loopback/health"
+        $Health = Invoke-RestMethod -TimeoutSec 4 -Uri "http://127.0.0.1:8080/_polyflare-loopback/health"
         if ($Health.status -eq "ok" -and $Health.mode -eq "remote-polyflare-loopback") {
             $Healthy = $true
             break
