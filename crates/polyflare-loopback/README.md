@@ -44,6 +44,69 @@ GET http://127.0.0.1:8000/_polyflare-loopback/health
 It returns `200` with `status: "ok"` when the remote origin responds (any non-redirect HTTP status
 is sufficient), or `503` with `status: "degraded"` when it cannot be reached.
 
+### Docker Desktop on Windows
+
+When Windows Smart App Control blocks Cargo-generated build programs, keep it enabled and build the
+Linux companion inside Docker Desktop instead:
+
+```powershell
+$branch = git branch --show-current
+git fetch origin +refs/heads/main:refs/remotes/origin/main
+$revision = git rev-parse HEAD
+$remoteRevision = git rev-parse origin/main
+if ($branch -ne "main") { throw "Build the Hyperflux deployment from main" }
+if ($revision -ne $remoteRevision) { throw "HEAD must match the pushed origin/main revision" }
+if (git status --porcelain) { throw "Build only from a clean checkout" }
+docker build --file crates/polyflare-loopback/Dockerfile `
+  --build-arg SOURCE_REVISION=$revision `
+  --tag "polyflare-loopback:$revision" .
+docker run --detach --name polyflare-loopback --restart unless-stopped `
+  --publish 127.0.0.1:8000:8000 `
+  --env POLYFLARE_LOOPBACK_UPSTREAM_ORIGIN=https://ultraflux.tail6de914.ts.net `
+  "polyflare-loopback:$revision"
+docker image inspect "polyflare-loopback:$revision" `
+  --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+```
+
+The host publication must remain exactly `127.0.0.1:8000:8000`; do not publish the companion on
+every host interface. The container runs without root privileges. Inside it, the Rust companion
+still binds only to loopback, while a container-local TCP relay makes the port publishable through
+Docker. Docker Desktop must start at login for `--restart unless-stopped` to take effect after a
+Windows reboot.
+
+Back up the Windows Codex configuration before setting its top-level ChatGPT backend key:
+
+```powershell
+$configPath = Join-Path $env:USERPROFILE ".codex\config.toml"
+if (Test-Path $configPath) {
+  $backupPath = "$configPath.loopback-backup-$(Get-Date -Format yyyyMMddHHmmss)"
+  Copy-Item $configPath $backupPath
+}
+```
+
+Set this top-level entry in `config.toml`, preserving all unrelated settings:
+
+```toml
+chatgpt_base_url = "http://localhost:8000/backend-api"
+```
+
+Then set and read back the renderer's persistent per-user environment value:
+
+```powershell
+$previousApiBaseUrl = [Environment]::GetEnvironmentVariable("CODEX_API_BASE_URL", "User")
+Write-Output "Previous CODEX_API_BASE_URL: $previousApiBaseUrl"
+[Environment]::SetEnvironmentVariable(
+  "CODEX_API_BASE_URL",
+  "http://localhost:8000/backend-api",
+  "User"
+)
+[Environment]::GetEnvironmentVariable("CODEX_API_BASE_URL", "User")
+Select-String -Path $configPath -Pattern '^chatgpt_base_url\s*='
+```
+
+Fully exit and reopen Codex Desktop after changing the configuration or environment. The
+`launchctl` commands below apply only to macOS.
+
 For Codex, change only the ChatGPT backend setting:
 
 ```toml

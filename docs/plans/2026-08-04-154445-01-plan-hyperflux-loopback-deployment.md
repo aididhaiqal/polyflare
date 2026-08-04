@@ -1,39 +1,47 @@
 # Hyperflux loopback companion deployment
 
-**Goal:** Deploy the native Windows PolyFlare loopback companion on Hyperflux and configure Codex
-Desktop to use it for authenticated backend Usage and remote control.
+**Goal:** Deploy the PolyFlare loopback companion on Hyperflux and configure Codex Desktop to use
+it for authenticated backend Usage and remote control.
 
-**Why planning is required:** This changes an auto-start Windows service and per-user Codex routing
-on a remote machine. A bad target or configuration can make Codex backend and remote-control
-traffic unavailable.
+**Why planning is required:** This changes an auto-start Docker-managed container and per-user
+Codex routing on a remote machine. A bad target or configuration can make Codex backend and
+remote-control traffic unavailable.
 
-**Acceptance:** The exact pushed `main` revision builds natively on Hyperflux, the
-`PolyFlareLoopback` service runs automatically on `127.0.0.1:8000`, its health reports `ok` against
-Ultraflux, Hyperflux Codex configuration uses `http://localhost:8000/backend-api`, and prior local
-configuration is backed up before mutation. Do not restart the Ultraflux PolyFlare service.
+**Acceptance:** A container image built from the exact pushed `main` revision runs automatically
+through Hyperflux Docker Desktop, publishes only `127.0.0.1:8000`, reports healthy against
+Ultraflux, and survives a container restart. Hyperflux Codex configuration uses
+`http://localhost:8000/backend-api`, and prior local configuration is backed up before mutation.
+Do not restart the Ultraflux PolyFlare service or weaken Smart App Control.
 
-### Outcome 1: Deliver and build the committed companion
+**Approved disposition (2026-08-04):** Native Windows compilation remains blocked by enforced
+Smart App Control even after Developer Mode was enabled (`os error 4551` on Cargo-generated build
+scripts). The user approved replacing the native Windows-service outcome with an existing Docker
+Desktop deployment. The failed native build artifacts are not deployed.
 
-- Work: Push the clean local `main`, clone or fast-forward a native Windows checkout at
-  `D:\src\polyflare`, verify the checkout revision, and build `polyflare-loopback.exe` in release
-  mode.
+### Outcome 1: Deliver and build the committed container
+
+- Work: Add a reproducible, non-root companion image and build it from the clean Hyperflux checkout
+  at `D:\src\polyflare`. Keep the companion itself loopback-bound inside the container and use a
+  container-local TCP relay solely to publish the container port. Publish the host port only on
+  `127.0.0.1:8000`.
 - Risks/open questions: Stop if the remote checkout has unrelated changes, the resolved revision
-  differs from the pushed revision, or the native Windows build fails. Do not substitute a WSL
-  binary.
-- Verify: `cargo test -p polyflare-loopback` and
-  `cargo build --release -p polyflare-loopback` on Hyperflux.
+  differs from the pushed revision, Docker Desktop is unavailable, or port 8000 has an unexpected
+  listener. Do not expose the host port on every interface.
+- Verify: `cargo test -p polyflare-loopback`, build the image from the committed revision, inspect
+  its non-root user and published-port binding, and run its image health check.
 
-### Outcome 2: Install the Windows service with rollback
+### Outcome 2: Install the restart-managed container with rollback
 
-- Work: Confirm port 8000 and service ownership, preserve any existing installed binary or service
-  state, then run the repository Windows installer against
-  `https://ultraflux.tail6de914.ts.net`. Roll back with the supplied uninstaller if the new service
-  cannot become healthy.
+- Work: Confirm port 8000 and container ownership, preserve any existing companion container state,
+  then install the committed image against `https://ultraflux.tail6de914.ts.net` with Docker's
+  `unless-stopped` restart policy. Roll back by restoring the prior container, or remove the new
+  container when none existed, if it cannot become healthy.
 - Risks/open questions: Stop rather than replace an unexpected listener or unrelated service.
   Never log or print request headers, credentials, bodies, cookies, or WebSocket frames.
-- Verify: `Get-Service PolyFlareLoopback` reports `Running` and `Automatic`, and
-  `Invoke-RestMethod http://127.0.0.1:8000/_polyflare-loopback/health` reports `status=ok` and
-  `mode=remote-polyflare-loopback`.
+- Verify: Docker reports the container running with `unless-stopped`, its only host publication is
+  `127.0.0.1:8000`, and `Invoke-RestMethod
+  http://127.0.0.1:8000/_polyflare-loopback/health` reports `status=ok` and
+  `mode=remote-polyflare-loopback`. Restart the container once and repeat the health probe.
 
 ### Outcome 3: Configure the Hyperflux Codex user
 

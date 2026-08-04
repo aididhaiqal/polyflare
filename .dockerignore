@@ -1,0 +1,10 @@
+.git
+.github
+.polyflare
+target
+**/target
+**/node_modules
+**/*.db
+**/*.db-*
+**/*.log
+
