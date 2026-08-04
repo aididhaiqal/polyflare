@@ -672,7 +672,56 @@ backend usage is visible without being presented as model-response traffic or lo
 query values, dynamic resource IDs, frame contents, or bodies. Reports uses the same distinction
 for its `Operation` breakdown.
 
-To target a pool, include the pool in the provider base URL:
+### Remotely hosted PolyFlare and Codex Desktop
+
+The direct loopback configuration above is enough when PolyFlare runs on the same computer as the
+Codex client. Do not run another proxy in that case: point `chatgpt_base_url` and the provider
+`base_url` at that local PolyFlare instance.
+
+When PolyFlare runs on another computer, Codex Desktop will not attach ChatGPT authentication or
+enable remote control directly against an arbitrary remote hostname. Run the
+`polyflare-loopback` companion on each client computer so Codex sees an allowlisted local origin
+while the traffic still terminates at remote PolyFlare:
+
+```text
+Codex Desktop
+  -> http://localhost:8000/backend-api
+  -> polyflare-loopback on the client
+  -> https/wss://remote-polyflare-host/backend-api
+  -> PolyFlare synthetic usage or ChatGPT backend passthrough
+```
+
+Install the companion as described in
+[`crates/polyflare-loopback/README.md`](crates/polyflare-loopback/README.md), then configure Codex:
+
+```toml
+chatgpt_base_url = "http://localhost:8000/backend-api"
+
+[model_providers.polyflare]
+name = "openai"
+base_url = "https://remote-polyflare-host"
+wire_api = "responses"
+supports_websockets = true
+requires_openai_auth = true
+```
+
+For the desktop Usage screen, set the renderer base in the launchd user environment before opening
+Codex, verify it, then fully quit and reopen Codex:
+
+```sh
+launchctl setenv CODEX_API_BASE_URL http://localhost:8000/backend-api
+launchctl getenv CODEX_API_BASE_URL
+```
+
+Use exactly `localhost:8000`. Current Codex Desktop accepts signed-in backend authentication on
+that development loopback origin, but rejects `127.0.0.1:8000`, `localhost:8080`, and remote
+PolyFlare hostnames before sending the request. The companion forwards both backend HTTP and the
+remote-control WebSocket to PolyFlare; it does not bypass PolyFlare. Provider `/responses` traffic
+continues directly to the remote `base_url` shown above. Normal website/browser traffic is
+unaffected. `launchctl setenv` affects apps launched later in the current login session, so run it
+again after logout or reboot unless login automation sets it for you.
+
+For a same-host local PolyFlare, target a pool by including it in both local base URLs:
 
 ```toml
 model_provider = "polyflare"
@@ -689,6 +738,27 @@ requires_openai_auth = true
 Because `chatgpt_base_url` is a top-level Codex setting, it appears before the provider table. A
 pool-scoped usage URL reports only that pool; unchanged ChatGPT backend calls still pass through
 with the client's own identity.
+
+For remotely hosted PolyFlare, keep the backend path on the companion and put the same pool slug
+on the remote provider URL:
+
+```toml
+model_provider = "polyflare"
+chatgpt_base_url = "http://localhost:8000/work/backend-api"
+
+[model_providers.polyflare]
+name = "openai"
+base_url = "https://remote-polyflare-host/work"
+wire_api = "responses"
+supports_websockets = true
+requires_openai_auth = true
+```
+
+To show that pool in Codex Desktop Usage, use the matching path before opening the app:
+
+```sh
+launchctl setenv CODEX_API_BASE_URL http://localhost:8000/work/backend-api
+```
 
 Stock Codex reset-credit reads and consumes also work through PolyFlare. The ChatGPT path style
 uses `/backend-api/wham/rate-limit-reset-credits` and `/consume`; the Codex API path style uses

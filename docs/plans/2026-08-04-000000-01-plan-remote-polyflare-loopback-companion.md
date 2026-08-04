@@ -2,7 +2,7 @@
 
 **Goal:** Let Codex use remote-control and other ChatGPT backend routes when PolyFlare runs on
 another tailnet host, while Codex still sees the allowlisted local origin
-`http://127.0.0.1:8080/backend-api`.
+`http://localhost:8000/backend-api`.
 
 **Scope boundary:** This companion is only for remotely hosted PolyFlare. It is unnecessary when
 PolyFlare already runs on the Codex machine. This work builds and packages the companion but does
@@ -47,7 +47,7 @@ forward traffic to the wrong origin, or interfere with the production PolyFlare 
 ### Outcome 5: Opt-in service packaging
 
 - Work: Add documented macOS LaunchAgent and Windows install/uninstall entry points that require an
-  explicit remote origin. Templates use loopback `127.0.0.1:8080`, keep secrets out of arguments,
+  explicit remote origin. Templates use loopback `127.0.0.1:8000`, keep secrets out of arguments,
   and remain inert until the user installs them.
 - Verify: shell/PowerShell syntax checks where available and documentation review. Do not load,
   enable, or start either service in this task.
@@ -56,7 +56,7 @@ forward traffic to the wrong origin, or interfere with the production PolyFlare 
 
 - Work: Review the authenticated forwarding boundary, then run formatting, lint, focused tests,
   workspace tests, diff checks, and a release build. Perform live proxy checks only against an
-  ephemeral loopback port and a controlled test upstream, never the production `:8080` listener.
+  ephemeral loopback port and a controlled test upstream, never the installed `:8000` listener.
 - Verify: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace`, `git diff --check`, and
   `cargo build --release -p polyflare-loopback`.

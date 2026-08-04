@@ -4,6 +4,8 @@ use reqwest::Url;
 use std::{net::SocketAddr, process::ExitCode};
 use tracing_subscriber::EnvFilter;
 
+const DEFAULT_LISTEN: &str = "127.0.0.1:8000";
+
 #[cfg(windows)]
 mod windows_service;
 
@@ -19,7 +21,7 @@ struct Args {
     upstream_origin: Url,
 
     /// Local listener. Non-loopback addresses are always rejected.
-    #[arg(long, default_value = "127.0.0.1:8080")]
+    #[arg(long, default_value = DEFAULT_LISTEN)]
     listen: SocketAddr,
 
     /// Validate arguments and exit without binding a listener.
@@ -89,5 +91,22 @@ fn main() -> ExitCode {
             eprintln!("companion stopped: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_listener_uses_codex_desktop_allowlisted_port() {
+        let args = Args::try_parse_from([
+            "polyflare-loopback",
+            "--upstream-origin",
+            "https://polyflare.example",
+        ])
+        .unwrap();
+
+        assert_eq!(args.listen, "127.0.0.1:8000".parse().unwrap());
     }
 }
