@@ -765,6 +765,16 @@ async fn passthrough_route(state: Arc<AppState>, path: String, request: Request<
     // Opt-in diagnostic capture. See `remote_control_trace_enabled` for why this exists and why
     // it is not on by default.
     let trace = remote_control_trace_enabled() && path.contains("remote/control");
+    // Upstream compresses these responses, and a traced body is useless as binary. Asking for
+    // identity encoding on the traced request only keeps the capture readable without touching
+    // how any other request is negotiated.
+    let mut headers = headers;
+    if trace {
+        headers.insert(
+            axum::http::header::ACCEPT_ENCODING,
+            axum::http::HeaderValue::from_static("identity"),
+        );
+    }
     let upstream = if replayable_backend_body_length(&parts.headers).is_some() {
         match to_bytes(body, MAX_REPLAYABLE_BACKEND_REQUEST_BYTES).await {
             Ok(body) => {
