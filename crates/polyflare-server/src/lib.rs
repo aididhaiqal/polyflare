@@ -10,6 +10,7 @@ pub mod app;
 pub mod auth;
 pub mod catalog;
 pub mod chatgpt_backend;
+pub mod codex_sessions;
 pub mod collect_message;
 pub mod config;
 pub mod continuity;

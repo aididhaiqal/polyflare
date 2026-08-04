@@ -64,6 +64,39 @@ enum Commands {
         #[command(subcommand)]
         command: AdminTokenCommands,
     },
+    /// Codex session records. `codex resume` filters by the provider a session was recorded
+    /// under, so renaming the provider hides all earlier history until it is re-tagged.
+    #[command(name = "codex-sessions")]
+    CodexSessions {
+        #[command(subcommand)]
+        command: CodexSessionsCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum CodexSessionsCommands {
+    /// Show which providers Codex's session records currently name, in both stores.
+    Census {
+        /// Codex home to inspect. Defaults to `$CODEX_HOME`, else `~/.codex`.
+        #[arg(long = "codex-home", value_name = "PATH")]
+        codex_home: Option<PathBuf>,
+    },
+    /// Re-tag session records from one provider name to another, so `codex resume` finds them
+    /// again. Close Codex first — it holds its state database open.
+    Retag {
+        /// The provider name currently recorded (e.g. `codex-lb`).
+        #[arg(long = "from", value_name = "PROVIDER")]
+        from: String,
+        /// The provider name to write (e.g. `polyflare`).
+        #[arg(long = "to", value_name = "PROVIDER")]
+        to: String,
+        /// Report what would change and write nothing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Codex home to operate on. Defaults to `$CODEX_HOME`, else `~/.codex`.
+        #[arg(long = "codex-home", value_name = "PATH")]
+        codex_home: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -217,7 +250,119 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             AdminTokenCommands::Status => admin_token_status().await,
             AdminTokenCommands::Clear => admin_token_clear().await,
         },
+        Commands::CodexSessions { command } => match command {
+            CodexSessionsCommands::Census { codex_home } => codex_sessions_census(codex_home).await,
+            CodexSessionsCommands::Retag {
+                from,
+                to,
+                dry_run,
+                codex_home,
+            } => codex_sessions_retag(&from, &to, dry_run, codex_home).await,
+        },
     }
+}
+
+fn resolve_codex_home(explicit: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let home = explicit
+        .or_else(polyflare_server::codex_sessions::default_codex_home)
+        .ok_or("could not resolve a Codex home; pass --codex-home")?;
+    if !home.is_dir() {
+        return Err(format!("no Codex home at {}", home.display()).into());
+    }
+    Ok(home)
+}
+
+async fn codex_sessions_census(
+    codex_home: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let home = resolve_codex_home(codex_home)?;
+    println!("Codex home: {}\n", home.display());
+    let (jsonl, threads) = polyflare_server::codex_sessions::census(&home).await;
+
+    println!("session transcripts (sessions/**/*.jsonl)");
+    if jsonl.is_empty() {
+        println!("  none");
+    }
+    for (provider, count) in &jsonl {
+        println!("  {provider:<24} {count}");
+    }
+    println!("\nresume index (threads in state_*.sqlite)");
+    if threads.is_empty() {
+        println!("  none");
+    }
+    for (provider, count) in &threads {
+        println!("  {provider:<24} {count}");
+    }
+    Ok(())
+}
+
+async fn codex_sessions_retag(
+    from: &str,
+    to: &str,
+    dry_run: bool,
+    codex_home: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if from.trim() == to.trim() {
+        return Err("--from and --to must differ".into());
+    }
+    let home = resolve_codex_home(codex_home)?;
+
+    // Codex keeps its state database open while running, and a retag rewrites rows underneath it.
+    // Warn rather than refuse: an operator who knows the holder is harmless should not be blocked.
+    if !dry_run && state_db_is_open(&home) {
+        println!(
+            "WARNING: a Codex process appears to be running. It holds state_*.sqlite open and may \
+             overwrite these changes on exit — quit Codex and Codex CLI first.\n"
+        );
+    }
+
+    println!("Codex home: {}", home.display());
+    println!(
+        "Retagging {from} -> {to}{}\n",
+        if dry_run { " (dry run)" } else { "" }
+    );
+
+    let stamp = chrono::DateTime::from_timestamp(unix_now(), 0)
+        .map(|dt| dt.format("%Y%m%d-%H%M%S").to_string())
+        .unwrap_or_else(|| unix_now().to_string());
+    let report = polyflare_server::codex_sessions::retag(&home, from, to, !dry_run, &stamp).await?;
+
+    println!(
+        "session transcripts : {} scanned, {} name {from}, {} rewritten",
+        report.jsonl_scanned, report.jsonl_matched, report.jsonl_rewritten
+    );
+    println!(
+        "resume index        : {} database(s), {} thread rows name {from}, {} updated",
+        report.sqlite_dbs_scanned, report.sqlite_rows_matched, report.sqlite_rows_updated
+    );
+    match &report.backup {
+        Some(path) => println!("\nOriginals backed up to {}", path.display()),
+        None if dry_run => println!("\nNothing was written. Re-run without --dry-run to apply."),
+        None => println!("\nNothing matched; nothing was written."),
+    }
+    if !dry_run && (report.jsonl_rewritten > 0 || report.sqlite_rows_updated > 0) {
+        println!("Restart Codex, then `codex resume` will list these sessions under {to}.");
+    }
+    Ok(())
+}
+
+/// Whether anything currently holds a Codex state database open.
+///
+/// Asks about the FILE rather than about process names. Matching processes by name looked
+/// equivalent and was not: `pgrep -f codex` also matches every unrelated process whose environment
+/// mentions `/codex.system/` in `PATH`, which on this machine meant 23 MCP servers and a warning
+/// that fired every time. `lsof` on the database answers the question actually being asked — is
+/// someone else using this file — and says nothing when the answer is no.
+fn state_db_is_open(codex_home: &Path) -> bool {
+    polyflare_server::codex_sessions::state_dbs(codex_home)
+        .iter()
+        .any(|db| {
+            std::process::Command::new("lsof")
+                .arg(db)
+                .output()
+                .map(|out| !out.stdout.is_empty())
+                .unwrap_or(false)
+        })
 }
 
 /// Install an admin token. The plaintext is printed here and nowhere else — not stored, not
