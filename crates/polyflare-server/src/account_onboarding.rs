@@ -490,26 +490,35 @@ async fn persist_anthropic(
         // Anthropic returns no id token; the field exists for Codex's OIDC response.
         id_token: String::new(),
     };
-    state
+    // `upsert_anthropic_oauth`, NOT the Codex path. The Codex upsert leaves `auth_mode` at its
+    // column default of `codex_oauth`, and that column is the credential CONTRACT: it decides
+    // which token endpoint a refresh posts to. An Anthropic seat marked `codex_oauth` would send
+    // an Anthropic refresh token to OpenAI's authority on first refresh, fail, and be marked
+    // reauth_required — the account would work exactly until its access token expired.
+    //
+    // This path also records the token expiry, the granted scopes and the contract version, none
+    // of which the Codex upsert carries, and keys the row on the provider-scoped upstream identity
+    // so a re-login updates the seat instead of inserting a duplicate.
+    let auth = polyflare_store::NewUpstreamAuth {
+        upstream_identity: identity.upstream_identity.clone(),
+        access_token_expires_at: tokens.access_token_expires_at,
+        oauth_contract_version: polyflare_anthropic::CONTRACT.version.to_string(),
+        granted_scopes: tokens.granted_scopes.clone(),
+    };
+    let account_id = state
         .store
         .accounts()
-        .upsert_oauth_and_complete_flow(
-            &account,
-            &plain,
-            &state.cipher,
-            flow_id,
-            intended_account_id,
-        )
+        .upsert_anthropic_oauth(&account, &plain, &state.cipher, &auth)
         .await
-        .map_err(|error| match error {
-            polyflare_store::StoreError::InvalidState(message)
-                if message.contains("re-auth account") =>
-            {
-                "intended_account_missing"
-            }
-            _ => "storage_error",
-        })?;
-    Ok(id)
+        .map_err(|_| "storage_error")?;
+    // The flow is completed separately: the Anthropic upsert is keyed on upstream identity and
+    // does not carry the flow bookkeeping the Codex path folds in.
+    let _ = state
+        .store
+        .onboarding()
+        .complete(flow_id, &account_id, unix_now())
+        .await;
+    Ok(account_id)
 }
 
 #[derive(Debug, Serialize)]
