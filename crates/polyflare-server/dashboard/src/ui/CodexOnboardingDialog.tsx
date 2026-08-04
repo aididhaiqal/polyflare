@@ -30,10 +30,10 @@ function flowErrorText(code: string | undefined, reauth?: ReauthTarget): string 
   switch (code) {
     case "seat_mismatch":
       return reauth
-        ? `That sign-in used a different ChatGPT account than ${reauth.label}${
+        ? `That sign-in used a different account than ${reauth.label}${
             reauth.email ? ` (${reauth.email})` : ""
           }. Nothing was changed — start over and sign in with the matching account.`
-        : "That sign-in used an unexpected ChatGPT account. Nothing was changed.";
+        : "That sign-in used an unexpected account. Nothing was changed.";
     case "intended_account_missing":
       return "The account this flow was repairing no longer exists. Close this dialog and re-check the accounts list.";
     case "device_auth_unavailable":
@@ -183,7 +183,7 @@ export function CodexOnboardingDialog({
                     (<span className="font-mono">{reauth.email}</span>)
                   </>
                 )}
-                . Sign in with that exact ChatGPT account — a different account will be refused and
+                . Sign in with that exact account — a different one will be refused and
                 nothing will change.
               </p>
             ) : (
@@ -234,8 +234,9 @@ export function CodexOnboardingDialog({
           </div>
         ) : browserFlow ? (
           <div className="mt-4 space-y-4">
-            <div className="rounded border border-border bg-muted/40 p-3"><p className="text-[11px] font-semibold">1. Sign in with OpenAI{reauth?.email && <span className="font-normal opacity-60"> — as {reauth.email}</span>}</p><div className="mt-2 flex flex-wrap gap-2"><a href={browserFlow.authorize_url} target="_blank" rel="noreferrer" className="rounded bg-accent px-3 py-1.5 text-[12px] font-semibold text-white">Open sign-in page</a><button type="button" onClick={() => navigator.clipboard.writeText(browserFlow.authorize_url)} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-[12px]"><Copy className="h-3.5 w-3.5" />Copy URL</button></div>
-              {sameMachine && <p className="mt-2 text-[10.5px] opacity-55">This dialog completes automatically after you sign in. If the redirect tab shows a connection error, paste its URL below.</p>}
+            <div className="rounded border border-border bg-muted/40 p-3"><p className="text-[11px] font-semibold">1. Sign in with {isClaude ? "Claude" : "OpenAI"}{reauth?.email && <span className="font-normal opacity-60"> — as {reauth.email}</span>}</p><div className="mt-2 flex flex-wrap gap-2"><a href={browserFlow.authorize_url} target="_blank" rel="noreferrer" className="rounded bg-accent px-3 py-1.5 text-[12px] font-semibold text-white">Open sign-in page</a><button type="button" onClick={() => navigator.clipboard.writeText(browserFlow.authorize_url)} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-[12px]"><Copy className="h-3.5 w-3.5" />Copy URL</button></div>
+              {sameMachine && !isClaude && <p className="mt-2 text-[10.5px] opacity-55">This dialog completes automatically after you sign in. If the redirect tab shows a connection error, paste its URL below.</p>}
+            {isClaude && <p className="mt-2 text-[10.5px] opacity-55">Claude shows you a code after you approve. Copy it and paste it below — this dialog cannot capture it for you.</p>}
             </div>
             <label className="block text-[11px] font-semibold">
               {isClaude
