@@ -1001,6 +1001,9 @@ export interface OAuthOnboardingStart {
   flow_id: string;
   authorize_url: string;
   expires_at: number;
+  /** Anthropic only: whether the OAuth client registration is verified in-repo.
+   * Absent for Codex. Lets the dialog explain a rejection instead of blaming credentials. */
+  client_id_verified?: boolean;
 }
 
 export interface OAuthOnboardingResult {
@@ -1063,6 +1066,8 @@ export function startCodexOnboarding(opts?: {
   initialPool?: string;
   /** Targets an existing account for re-authentication: completion refuses any other seat. */
   accountId?: string;
+  /** `codex` (default) or `anthropic`. The route name is historical — it onboards either. */
+  provider?: "codex" | "anthropic";
 }): Promise<OAuthOnboardingStart> {
   return fetchJson<OAuthOnboardingStart>("/api/account-onboarding/codex", {
     method: "POST",
@@ -1070,6 +1075,7 @@ export function startCodexOnboarding(opts?: {
     body: JSON.stringify({
       initial_pool: opts?.initialPool || null,
       account_id: opts?.accountId || null,
+      provider: opts?.provider ?? "codex",
     }),
   });
 }

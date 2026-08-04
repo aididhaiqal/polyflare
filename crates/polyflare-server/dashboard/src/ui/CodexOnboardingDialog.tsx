@@ -73,23 +73,32 @@ export function CodexOnboardingDialog({
   const [callbackUrl, setCallbackUrl] = useState("");
   const sameMachine = useMemo(isSameMachineAsServer, []);
   const [method, setMethod] = useState<Method>(sameMachine ? "browser" : "device");
+  // Anthropic has no device endpoint and no loopback redirect: its reviewed contract redirects to
+  // a page on claude.com that DISPLAYS a code. So choosing Claude forces the browser+paste path
+  // rather than offering options that cannot work.
+  const [provider, setProvider] = useState<"codex" | "anthropic">("codex");
+  const isClaude = provider === "anthropic";
   const start = useStartCodexOnboarding();
   const startDevice = useStartCodexDeviceOnboarding();
   const complete = useCompleteCodexOnboarding();
   const browserFlow = start.data ?? null;
   const deviceFlow = startDevice.data ?? null;
-  const activeFlowId = method === "browser" ? browserFlow?.flow_id : deviceFlow?.flow_id;
+  const activeFlowId = isClaude || method === "browser" ? browserFlow?.flow_id : deviceFlow?.flow_id;
   const flowStatus = useOnboardingFlowStatus(activeFlowId ?? null);
   useDialogA11y(open, () => onOpenChange(false), dialogRef, closeRef);
 
   if (!open) return null;
   const busy = start.isPending || startDevice.isPending || complete.isPending;
-  const title = reauth ? "Re-authenticate account" : "Add Codex account";
+  const title = reauth
+    ? "Re-authenticate account"
+    : isClaude
+      ? "Add Claude account"
+      : "Add Codex account";
   const succeeded = complete.isSuccess || flowStatus.data?.status === "completed";
   const flowFailed =
     !succeeded &&
     (flowStatus.data?.status === "failed" || flowStatus.data?.status === "expired");
-  const started = method === "browser" ? browserFlow !== null : deviceFlow !== null;
+  const started = isClaude || method === "browser" ? browserFlow !== null : deviceFlow !== null;
   const close = () => {
     if (!busy) onOpenChange(false);
   };
@@ -103,7 +112,8 @@ export function CodexOnboardingDialog({
     const opts = reauth
       ? { accountId: reauth.accountId }
       : { initialPool: pool.trim() || undefined };
-    if (method === "browser") start.mutate(opts);
+    if (isClaude) start.mutate({ ...opts, provider: "anthropic" });
+    else if (method === "browser") start.mutate(opts);
     else startDevice.mutate(opts);
   };
   const methodOption = (value: Method, label: string, hint: string, recommended: boolean) => (
@@ -138,6 +148,32 @@ export function CodexOnboardingDialog({
           <div className="mt-5 rounded border border-success/35 bg-success/10 p-4"><p className="text-sm font-semibold text-success">{reauth ? "Account re-authenticated" : "Account connected"}</p><p className="mt-1 text-[11px] opacity-65">{reauth ? "Fresh credentials are stored and the account is back in rotation." : "The account is ready for routing."}</p><button type="button" onClick={() => onOpenChange(false)} className="mt-4 rounded bg-accent px-3 py-1.5 text-[12px] font-semibold text-white">Done</button></div>
         ) : !started ? (
           <div className="mt-4 space-y-4">
+            {!reauth && (
+              <div className="flex gap-2">
+                {(["codex", "anthropic"] as const).map((value) => (
+                  <button
+                    key={value}
+                    type="button"
+                    onClick={() => setProvider(value)}
+                    className={clsx(
+                      "flex-1 rounded-lg border p-3 text-left",
+                      provider === value
+                        ? "border-accent bg-accent/[0.07]"
+                        : "border-border hover:border-accent/50",
+                    )}
+                  >
+                    <div className="text-[12px] font-semibold">
+                      {value === "codex" ? "Codex" : "Claude"}
+                    </div>
+                    <div className="mt-0.5 text-[10.5px] opacity-60">
+                      {value === "codex"
+                        ? "ChatGPT / Codex subscription seat."
+                        : "Claude subscription seat. Sign in, then paste the code shown."}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
             {reauth ? (
               <p className="rounded border border-warn/40 bg-warn/10 p-3 text-[11px] leading-relaxed">
                 This repairs <b>{reauth.label}</b>
@@ -153,7 +189,7 @@ export function CodexOnboardingDialog({
             ) : (
               <label className="block text-[11px] font-medium">Initial routing group <span className="font-normal opacity-50">(optional)</span><input value={pool} onChange={(e) => setPool(e.target.value)} placeholder="team-a" className="mt-1.5 w-full rounded border border-border bg-bg px-3 py-2 font-mono text-[12px] outline-none focus:border-accent" /></label>
             )}
-            <div className="flex gap-2">
+            <div className={clsx("flex gap-2", isClaude && "hidden")}>
               {methodOption(
                 "browser",
                 "Browser sign-in",
@@ -201,7 +237,29 @@ export function CodexOnboardingDialog({
             <div className="rounded border border-border bg-muted/40 p-3"><p className="text-[11px] font-semibold">1. Sign in with OpenAI{reauth?.email && <span className="font-normal opacity-60"> — as {reauth.email}</span>}</p><div className="mt-2 flex flex-wrap gap-2"><a href={browserFlow.authorize_url} target="_blank" rel="noreferrer" className="rounded bg-accent px-3 py-1.5 text-[12px] font-semibold text-white">Open sign-in page</a><button type="button" onClick={() => navigator.clipboard.writeText(browserFlow.authorize_url)} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-[12px]"><Copy className="h-3.5 w-3.5" />Copy URL</button></div>
               {sameMachine && <p className="mt-2 text-[10.5px] opacity-55">This dialog completes automatically after you sign in. If the redirect tab shows a connection error, paste its URL below.</p>}
             </div>
-            <label className="block text-[11px] font-semibold">2. {sameMachine ? "Only if it didn't complete automatically: paste" : "Paste"} the final redirect URL<textarea rows={3} value={callbackUrl} onChange={(e) => setCallbackUrl(e.target.value)} placeholder="http://localhost:1455/auth/callback?code=...&state=..." className="mt-2 w-full resize-y rounded border border-border bg-bg px-3 py-2 font-mono text-[11px] outline-none focus:border-accent" /></label>
+            <label className="block text-[11px] font-semibold">
+              {isClaude
+                ? "2. Paste the code Claude shows you"
+                : `2. ${sameMachine ? "Only if it didn't complete automatically: paste" : "Paste"} the final redirect URL`}
+              <textarea
+                rows={3}
+                value={callbackUrl}
+                onChange={(e) => setCallbackUrl(e.target.value)}
+                placeholder={
+                  isClaude
+                    ? "abc123…#state — or the full callback URL"
+                    : "http://localhost:1455/auth/callback?code=...&state=..."
+                }
+                className="mt-2 w-full resize-y rounded border border-border bg-bg px-3 py-2 font-mono text-[11px] outline-none focus:border-accent"
+              />
+            </label>
+            {isClaude && browserFlow?.client_id_verified === false && (
+              <p className="rounded border border-warn/40 bg-warn/10 p-2.5 text-[10.5px] leading-relaxed">
+                Claude&apos;s OAuth client registration is not verified against a capture held in
+                this repository. If Anthropic rejects the sign-in, that is the likely cause rather
+                than anything wrong with your account.
+              </p>
+            )}
             {complete.isError && <p className="text-[11px] text-error">{completeErrorText(complete.error, reauth)}</p>}
             {flowFailed && !complete.isError && <p className="text-[11px] text-error">{flowErrorText(flowStatus.data?.error_code, reauth)}</p>}
             <div className="flex justify-end gap-2"><button type="button" disabled={busy} onClick={resetAll} className="rounded border border-border px-3 py-1.5 text-[12px]">Start over</button><button type="button" disabled={busy || !callbackUrl.trim()} onClick={() => complete.mutate({ flowId: browserFlow.flow_id, callbackUrl: callbackUrl.trim() })} className="rounded bg-accent px-3 py-1.5 text-[12px] font-semibold text-white disabled:opacity-45">{complete.isPending ? "Connecting…" : "Complete connection"}</button></div>

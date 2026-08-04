@@ -726,8 +726,11 @@ export function useExportAccountAuth() {
 
 export function useStartCodexOnboarding() {
   return useMutation({
-    mutationFn: (opts?: { initialPool?: string; accountId?: string }) =>
-      startCodexOnboarding(opts),
+    mutationFn: (opts?: {
+      initialPool?: string;
+      accountId?: string;
+      provider?: "codex" | "anthropic";
+    }) => startCodexOnboarding(opts),
   });
 }
 
@@ -751,7 +754,7 @@ export function useOnboardingFlowStatus(flowId: string | null) {
         qc.invalidateQueries({ queryKey: queryKeys.accounts });
         qc.invalidateQueries({ queryKey: queryKeys.pools });
         qc.invalidateQueries({ queryKey: queryKeys.overview });
-        toast({ title: "Codex account connected", variant: "success" });
+        toast({ title: "Account connected", variant: "success" });
       }
       return status;
     },
@@ -774,7 +777,7 @@ export function useCompleteCodexOnboarding() {
       qc.invalidateQueries({ queryKey: queryKeys.accounts });
       qc.invalidateQueries({ queryKey: queryKeys.pools });
       qc.invalidateQueries({ queryKey: queryKeys.overview });
-      toast({ title: "Codex account added", variant: "success" });
+      toast({ title: "Account added", variant: "success" });
     },
     onError: (e) =>
       toast({ title: "Account onboarding failed", description: mutationErrorText(e), variant: "error" }),
