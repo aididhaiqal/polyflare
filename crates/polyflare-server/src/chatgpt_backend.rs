@@ -539,6 +539,22 @@ pub async fn pooled_remote_control_ws_handler(
     remote_control_ws_route(state, ws, headers, uri).await
 }
 
+/// Whether to log remote-control request/response BODIES.
+///
+/// PolyFlare's request logging is content-free by design, and this deliberately breaks that for
+/// one narrow case: diagnosing a controller-enrollment identity mismatch, where the `client_id`
+/// and `account_user_id` being compared exist only in the body. It is therefore:
+///
+/// - off unless `POLYFLARE_REMOTE_CONTROL_TRACE=1` is set explicitly,
+/// - limited to paths containing `remote/control`, so ordinary traffic is never captured,
+/// - logged at WARN so it is obvious in the log that content capture is switched on.
+///
+/// These bodies carry account identifiers and short-lived pairing material. Turn it off, and prune
+/// the captured lines, once the question it was opened for has been answered.
+fn remote_control_trace_enabled() -> bool {
+    std::env::var("POLYFLARE_REMOTE_CONTROL_TRACE").is_ok_and(|value| value == "1")
+}
+
 fn normalized_route(path: &str) -> String {
     let segments: Vec<&str> = path
         .split('/')
@@ -746,9 +762,21 @@ async fn passthrough_route(state: Arc<AppState>, path: String, request: Request<
     };
     let (parts, body) = request.into_parts();
     let headers = end_to_end_headers(&parts.headers);
+    // Opt-in diagnostic capture. See `remote_control_trace_enabled` for why this exists and why
+    // it is not on by default.
+    let trace = remote_control_trace_enabled() && path.contains("remote/control");
     let upstream = if replayable_backend_body_length(&parts.headers).is_some() {
         match to_bytes(body, MAX_REPLAYABLE_BACKEND_REQUEST_BYTES).await {
             Ok(body) => {
+                if trace {
+                    tracing::warn!(
+                        rc_trace = "request",
+                        path = %path,
+                        method = %method,
+                        body = %String::from_utf8_lossy(&body),
+                        "remote-control request body"
+                    );
+                }
                 send_replayable_backend_with_recovery(&state, &method, &target, &headers, &body)
                     .await
             }
@@ -766,6 +794,25 @@ async fn passthrough_route(state: Arc<AppState>, path: String, request: Request<
     };
     let response = match upstream {
         Err(_) => error_response(StatusCode::BAD_GATEWAY, "backend_forward_failed"),
+        Ok(upstream) if trace => {
+            // Buffered ONLY for a traced remote-control call: these responses are small JSON
+            // documents, and the identity fields being diagnosed are in the body. Every other
+            // request keeps the streaming path below untouched.
+            let status = upstream.status();
+            let headers = end_to_end_headers(upstream.headers());
+            let bytes = upstream.bytes().await.unwrap_or_default();
+            tracing::warn!(
+                rc_trace = "response",
+                path = %path,
+                status = status.as_u16(),
+                body = %String::from_utf8_lossy(&bytes),
+                "remote-control response body"
+            );
+            let mut response = Response::new(Body::from(bytes));
+            *response.status_mut() = status;
+            *response.headers_mut() = headers;
+            response
+        }
         Ok(upstream) => {
             let status = upstream.status();
             let headers = end_to_end_headers(upstream.headers());
