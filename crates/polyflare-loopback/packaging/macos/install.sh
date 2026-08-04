@@ -13,10 +13,11 @@ log_path="$log_dir/loopback.log"
 
 "$source_binary" --upstream-origin "$upstream_origin" --check-config
 mkdir -p "$destination_dir" "$agent_dir" "$log_dir"
+launchctl bootout "gui/$(id -u)/com.polyflare.loopback" 2>/dev/null || true
 install -m 755 "$source_binary" "$destination"
 cp "$script_dir/com.polyflare.loopback.plist" "$agent"
-plutil -replace ProgramArguments.0 -string "$destination" "$agent"
-plutil -replace ProgramArguments.2 -string "$upstream_origin" "$agent"
+/usr/libexec/PlistBuddy -c "Set :ProgramArguments:0 $destination" "$agent"
+/usr/libexec/PlistBuddy -c "Set :ProgramArguments:2 $upstream_origin" "$agent"
 plutil -replace StandardOutPath -string "$log_path" "$agent"
 plutil -replace StandardErrorPath -string "$log_path" "$agent"
 plutil -lint "$agent"
