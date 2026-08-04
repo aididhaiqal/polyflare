@@ -373,7 +373,7 @@ pub(crate) async fn anthropic_claim_and_complete(
         .unwrap_or_else(|| client.contract().manual_redirect_uri.to_string());
     let now = unix_now();
     let tokens = match client
-        .exchange_code(code, &verifier, &redirect_uri, now)
+        .exchange_code(code, &verifier, &redirect_uri, &flow.oauth_state, now)
         .await
     {
         Ok(tokens) => tokens,

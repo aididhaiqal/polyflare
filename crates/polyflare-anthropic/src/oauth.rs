@@ -320,20 +320,32 @@ impl AnthropicOAuthClient {
     /// `now` (unix seconds) is supplied by the caller so the absolute expiry is computed here,
     /// once, rather than left for a caller to remember — an access token persisted without its
     /// deadline would be refreshed either never or constantly.
+    /// Exchange an authorization code for tokens.
+    ///
+    /// `state` is sent in the token request, not merely checked locally. Anthropic's callback page
+    /// presents the two values CONCATENATED as `code#state`, which is only necessary if the client
+    /// has to forward both — a state used purely for local CSRF would come back as an ordinary
+    /// query parameter, the way every other provider returns it. Omitting it was answered with a
+    /// bare `HTTP 400` carrying no `error` field, which is what a rejected request SHAPE looks
+    /// like rather than a rejected grant.
     pub async fn exchange_code(
         &self,
         code: &str,
         pkce_verifier: &str,
         redirect_uri: &str,
+        state: &str,
         now: i64,
     ) -> Result<OAuthTokens, OAuthError> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "grant_type": "authorization_code",
             "client_id": self.contract.client_id,
             "code": code,
             "code_verifier": pkce_verifier,
             "redirect_uri": redirect_uri,
         });
+        if !state.is_empty() {
+            body["state"] = Value::String(state.to_string());
+        }
         let response = self.post_token(&body, Duration::from_secs(15)).await?;
         Ok(self.to_tokens(response, None, self.contract.default_scopes, now))
     }
@@ -586,6 +598,7 @@ mod tests {
                 "auth-code",
                 "verifier-xyz",
                 "http://127.0.0.1:49152/callback",
+                "state-xyz",
                 1_000,
             )
             .await
@@ -610,6 +623,33 @@ mod tests {
         // The token endpoint compares the redirect byte-for-byte against the authorize request.
         assert_eq!(body["redirect_uri"], "http://127.0.0.1:49152/callback");
         assert_eq!(body["client_id"], CONTRACT.client_id);
+        // `state` travels IN the exchange, not merely checked locally. Anthropic presents the
+        // callback as `code#state` — concatenated — which is only necessary if the client has to
+        // forward both. Omitting it drew a bare HTTP 400 with no `error` field: a rejected request
+        // shape, not a rejected grant.
+        assert_eq!(body["state"], "state-xyz");
+    }
+
+    /// A caller with no state to send must not put an empty one on the wire.
+    #[tokio::test]
+    async fn an_absent_state_is_omitted_rather_than_sent_empty() {
+        let mock = polyflare_testkit::MockAnthropicOAuth::ok("access-1", "refresh-1");
+        let client = mock_client(mock.clone()).await;
+        client
+            .exchange_code(
+                "auth-code",
+                "verifier-xyz",
+                "http://127.0.0.1:1/cb",
+                "",
+                1_000,
+            )
+            .await
+            .unwrap();
+        let body = mock.last_body().unwrap();
+        assert!(
+            body.get("state").is_none(),
+            "an empty state is worse than none: it asserts a value the client does not have"
+        );
     }
 
     #[tokio::test]
@@ -679,7 +719,7 @@ mod tests {
         let client = mock_client(mock).await;
 
         let tokens = client
-            .exchange_code("code", "verifier", CONTRACT.manual_redirect_uri, 0)
+            .exchange_code("code", "verifier", CONTRACT.manual_redirect_uri, "state", 0)
             .await
             .unwrap();
         assert_eq!(tokens.granted_scopes, "user:inference");
@@ -732,7 +772,13 @@ mod tests {
         ))
         .await;
         let err = client
-            .exchange_code("SECRET-CODE", "SECRET-VERIFIER", "http://127.0.0.1:1/cb", 0)
+            .exchange_code(
+                "SECRET-CODE",
+                "SECRET-VERIFIER",
+                "http://127.0.0.1:1/cb",
+                "SECRET-STATE",
+                0,
+            )
             .await
             .unwrap_err();
         let rendered = format!("{err} {err:?}");
