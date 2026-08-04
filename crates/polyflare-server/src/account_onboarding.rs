@@ -330,7 +330,8 @@ async fn anthropic_complete(state: &AppState, flow_id: &str, pasted: &str) -> Re
         Err(CompleteError::Failed(code)) => {
             let status = match code {
                 "seat_mismatch" | "intended_account_missing" => StatusCode::CONFLICT,
-                "exchange_failed" => StatusCode::BAD_GATEWAY,
+                "exchange_rejected_code" | "exchange_rejected_request" => StatusCode::BAD_REQUEST,
+                "exchange_failed" | "exchange_rejected_client" => StatusCode::BAD_GATEWAY,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             safe_error(status, code)
@@ -376,7 +377,39 @@ pub(crate) async fn anthropic_claim_and_complete(
         .await
     {
         Ok(tokens) => tokens,
-        Err(_) => return Err(fail("exchange_failed").await),
+        // A bare `exchange_failed` is a dead end: it cannot distinguish "the pasted code was
+        // already used" from "our client registration is wrong", and those need opposite
+        // responses from the operator. Anthropic states which in the token response, so it is
+        // recorded on the flow and logged. Status and error CODE only — never the body, which
+        // would risk carrying credential material into a log.
+        Err(error) => {
+            let specific = match &error {
+                polyflare_anthropic::oauth::OAuthError::Endpoint { status, code } => {
+                    tracing::warn!(
+                        status = *status,
+                        oauth_error = code.as_deref().unwrap_or("-"),
+                        "anthropic onboarding token exchange rejected"
+                    );
+                    match code.as_deref() {
+                        // The authorization code itself: expired, already spent, or issued
+                        // against a different redirect. A fresh sign-in fixes it.
+                        Some("invalid_grant") => "exchange_rejected_code",
+                        // The client registration this build ships is not accepted. No operator
+                        // action fixes that, and saying so beats sending them round again.
+                        Some("invalid_client") | Some("unauthorized_client") => {
+                            "exchange_rejected_client"
+                        }
+                        Some("invalid_request") => "exchange_rejected_request",
+                        _ => "exchange_failed",
+                    }
+                }
+                other => {
+                    tracing::warn!(error = %other, "anthropic onboarding token exchange failed");
+                    "exchange_failed"
+                }
+            };
+            return Err(fail(specific).await);
+        }
     };
     match persist_anthropic(
         state,

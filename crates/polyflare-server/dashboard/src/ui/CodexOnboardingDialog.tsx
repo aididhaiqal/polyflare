@@ -34,6 +34,12 @@ function flowErrorText(code: string | undefined, reauth?: ReauthTarget): string 
             reauth.email ? ` (${reauth.email})` : ""
           }. Nothing was changed — start over and sign in with the matching account.`
         : "That sign-in used an unexpected account. Nothing was changed.";
+    case "exchange_rejected_code":
+      return "The provider rejected that authorization code — it had already been used, or it expired. Start a new sign-in and paste the fresh code straight away.";
+    case "exchange_rejected_client":
+      return "The provider rejected this build's OAuth client registration. That is not something your account or your code can fix — the registration itself needs updating.";
+    case "exchange_rejected_request":
+      return "The provider rejected the shape of the token request. Start over; if it repeats, the OAuth contract needs a look.";
     case "intended_account_missing":
       return "The account this flow was repairing no longer exists. Close this dialog and re-check the accounts list.";
     case "device_auth_unavailable":
