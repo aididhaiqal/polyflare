@@ -569,8 +569,9 @@ pub async fn codex_models_handler(State(state): State<Arc<AppState>>) -> Respons
 }
 
 /// `GET /{pool}/models` — resolves the exact active Codex membership of `pool`, refreshes that
-/// account-scoped cache on demand, and advertises only the model intersection supported by every
-/// member. Multi-pool membership is read from `account_pool_memberships`, not the legacy primary
+/// account-scoped cache on demand, and advertises the union of models any member can serve —
+/// selection routes each model to the members that hold it. Multi-pool membership is read from
+/// `account_pool_memberships`, not the legacy primary
 /// `accounts.pool` label.
 pub async fn pooled_codex_models_handler(
     Path(pool): Path<String>,

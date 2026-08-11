@@ -521,7 +521,7 @@ async fn v1_models_with_client_version_also_serves_merged_catalog() {
 }
 
 #[tokio::test]
-async fn scoped_catalog_intersects_only_the_named_accounts_and_isolates_other_pools() {
+async fn scoped_catalog_unions_the_named_accounts_and_isolates_other_pools() {
     let source = ScopedFixedSource(std::collections::HashMap::from([
         (
             "pool-a-1".to_string(),
@@ -550,8 +550,8 @@ async fn scoped_catalog_intersects_only_the_named_accounts_and_isolates_other_po
             .iter()
             .map(|model| model.slug.as_str())
             .collect::<Vec<_>>(),
-        ["gpt-common"],
-        "a pool may advertise only the safe intersection of all active member catalogs"
+        ["gpt-a-only", "gpt-a2-only", "gpt-common"],
+        "a pool advertises the UNION of its members' models (each routed to the member that has it)"
     );
     assert_eq!(
         pool_b
@@ -756,7 +756,8 @@ async fn pooled_handler_uses_active_multi_pool_membership_and_keeps_catalogs_iso
             .iter()
             .map(|model| model["slug"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["gpt-common"]
+        ["gpt-a-only", "gpt-a2-only", "gpt-common"],
+        "the pool advertises the union of its members' models"
     );
     assert_eq!(
         pool_a_body["data"]
@@ -765,8 +766,8 @@ async fn pooled_handler_uses_active_multi_pool_membership_and_keeps_catalogs_iso
             .iter()
             .map(|model| model["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["gpt-common"],
-        "pool discovery must contain only models in the pool intersection"
+        ["gpt-a-only", "gpt-a2-only", "gpt-common"],
+        "pool discovery advertises the union of its members' models"
     );
 
     let pool_b = reqwest::get(format!("{base}/pool-b/models")).await.unwrap();

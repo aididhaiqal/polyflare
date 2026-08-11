@@ -70,8 +70,9 @@ pub struct AccountCatalog {
 }
 
 /// The safe catalog advertised for an exact account scope. Unlike the root cache, a scoped
-/// catalog does not merge the bootstrap floor into authoritative data: every returned model must
-/// be supported by every account in the scope. The floor is used only when no complete
+/// catalog does not merge the bootstrap floor into authoritative data. Every model ANY account
+/// in the scope supports is advertised (a union), and selection routes each to the accounts that
+/// hold it. The floor is used only when no complete
 /// authoritative scoped fetch (or stale scoped value) is available.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScopedCatalog {
@@ -291,8 +292,8 @@ impl ModelCatalogCache {
             .and_then(|cached| cached.etag.clone())
     }
 
-    /// Resolve a catalog for an exact set of accounts. A complete live fetch is intersected by
-    /// slug so the result advertises only models supported by every member. The resulting ETag is
+    /// Resolve a catalog for an exact set of accounts. A complete live fetch is UNIONED by slug
+    /// so the result advertises every model any member can serve. The resulting ETag is
     /// a PolyFlare virtual ETag derived from the normalized scope and every member catalog; an
     /// upstream ETag is never exposed as the scoped identity.
     pub async fn get_or_refresh_scoped(&self, account_ids: &[String]) -> ScopedCatalog {
@@ -643,29 +644,26 @@ fn build_scoped_catalog(
         return None;
     }
 
-    let mut common: HashSet<&str> = account_catalogs[0]
-        .catalog
-        .models
-        .iter()
-        .map(|model| model.slug.as_str())
-        .collect();
-    for account in &account_catalogs[1..] {
-        let supported: HashSet<&str> = account
-            .catalog
-            .models
-            .iter()
-            .map(|model| model.slug.as_str())
-            .collect();
-        common.retain(|slug| supported.contains(slug));
+    // UNION: advertise every model ANY account in the scope can serve, deduplicated by slug
+    // (first account with a slug supplies its metadata). Selection narrows an actual request to the
+    // accounts that hold the requested model (`retain_accounts_supporting`), so a model unique to
+    // one account is offered here and routed only there.
+    //
+    // This replaced an INTERSECTION (models common to EVERY account). The intersection guaranteed
+    // any advertised model was servable pool-wide, but it hid every model a single account uniquely
+    // offered — the opposite of "each account discovers what it can serve, show the whole fleet's
+    // set downstream, route each model to the accounts that have it". A model only one account has
+    // now depends on that account's availability, which is the correct consequence of routing it
+    // only there.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut models: Vec<UpstreamModel> = Vec::new();
+    for account in &account_catalogs {
+        for model in &account.catalog.models {
+            if seen.insert(model.slug.as_str()) {
+                models.push(model.clone());
+            }
+        }
     }
-
-    let mut models: Vec<UpstreamModel> = account_catalogs[0]
-        .catalog
-        .models
-        .iter()
-        .filter(|model| common.contains(model.slug.as_str()))
-        .cloned()
-        .collect();
     models.sort_by(|a, b| a.slug.cmp(&b.slug));
 
     Some(ScopedCatalog {
@@ -1256,7 +1254,20 @@ mod tests {
             default_floor(),
         );
         let scope = vec!["acct-a".to_string(), "acct-b".to_string()];
-        let _ = cache.get_or_refresh_scoped(&scope).await;
+        let scoped = cache.get_or_refresh_scoped(&scope).await;
+
+        // UNION, not intersection: `gpt-5.6-sol` is on acct-a only, `shared` on both. The scoped
+        // catalog advertises BOTH — every model any member can serve — and routing (below) narrows
+        // a request for sol to acct-a. An intersection would have hidden sol entirely.
+        let slugs: Vec<&str> = scoped.models.iter().map(|m| m.slug.as_str()).collect();
+        assert!(
+            slugs.contains(&"gpt-5.6-sol"),
+            "sol (acct-a only) must be advertised: {slugs:?}"
+        );
+        assert!(
+            slugs.contains(&"shared"),
+            "shared (both) must be advertised: {slugs:?}"
+        );
 
         let snap = |id: &str| {
             let mut s = polyflare_core::AccountSnapshot::new(id);
