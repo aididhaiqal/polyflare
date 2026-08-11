@@ -68,6 +68,10 @@ import {
   type TranslationRouteInput,
   type BuiltinModelsView,
   type TranslationRoutesView,
+  getModelSupport,
+  setModelSupport,
+  clearModelSupport,
+  type ModelSupportDeclaration,
 } from "./api";
 import { requestRefreshInterval } from "./requestLive";
 import { useToast } from "../ui/Toast";
@@ -90,6 +94,7 @@ export const queryKeys = {
   sessions: (params: SessionsQueryParams) => ["sessions", params] as const,
   reports: (params: ReportsParams) => ["reports", params] as const,
   settings: ["settings"] as const,
+  modelSupport: ["model-support"] as const,
   priorityPolicy: ["priority-policy"] as const,
   keys: ["keys"] as const,
   providers: ["providers"] as const,
@@ -939,3 +944,43 @@ export function useRemoveSsePin() {
     },
   });
 }
+
+
+/** All per-account model-support declarations (hidden-model overrides). */
+export function useModelSupport() {
+  return useQuery({
+    queryKey: queryKeys.modelSupport,
+    queryFn: getModelSupport,
+  });
+}
+
+export function useSetModelSupport() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (v: { accountId: string; model: string; supported: boolean }) =>
+      setModelSupport(v.accountId, v.model, v.supported),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.modelSupport });
+      toast({ title: "Model access updated", variant: "success" });
+    },
+    onError: (e) =>
+      toast({ title: "Could not update model access", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+export function useClearModelSupport() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (v: { accountId: string; model: string }) => clearModelSupport(v.accountId, v.model),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.modelSupport });
+      toast({ title: "Model access cleared", variant: "success" });
+    },
+    onError: (e) =>
+      toast({ title: "Could not clear model access", description: mutationErrorText(e), variant: "error" }),
+  });
+}
+
+export type { ModelSupportDeclaration };

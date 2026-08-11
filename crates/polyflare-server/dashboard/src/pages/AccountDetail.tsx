@@ -85,9 +85,12 @@ import {
   useAccount,
   useAccountTrends,
   useAccounts,
+  useClearModelSupport,
+  useModelSupport,
   useProbeAccount,
   useRedeemAccountResetCredit,
   useResetCreditPlan,
+  useSetModelSupport,
 } from "../lib/queries";
 import { useAccountActions, type AccountActionsApi } from "../lib/useAccountActions";
 import { useQuotaDisplayPreference } from "../preferences/QuotaDisplayPreference";
@@ -751,6 +754,11 @@ function DetailContent({
             onDeleted={() => navigate("/accounts")}
           />
         </Col>
+        {identity.provider === "codex" && (
+          <Col span={12}>
+            <ModelAccessCard accountId={identity.id} />
+          </Col>
+        )}
       </Grid>
 
       {actions.dialogs}
@@ -1358,5 +1366,103 @@ function OpButton({
       <Icon className="h-3 w-3 shrink-0" strokeWidth={1.9} />
       {label}
     </button>
+  );
+}
+
+/**
+ * Per-account access to models the upstream `/models` endpoint does not list — hidden previews
+ * gated to specific seats (e.g. `gpt-daybreak-blue-latest`). An operator declaration here is
+ * authoritative: it decides whether this account is a routing candidate for the model, and whether
+ * the model appears in a pool's catalog. Probe-sourced rows show too, and can be overridden.
+ */
+function ModelAccessCard({ accountId }: { accountId: string }) {
+  const support = useModelSupport();
+  const setSupport = useSetModelSupport();
+  const clearSupport = useClearModelSupport();
+  const [newModel, setNewModel] = useState("");
+
+  const rows = (support.data?.declarations ?? []).filter((d) => d.account_id === accountId);
+
+  const addModel = () => {
+    const model = newModel.trim();
+    if (!model) return;
+    setSupport.mutate({ accountId, model, supported: true });
+    setNewModel("");
+  };
+
+  return (
+    <Card>
+      <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-fg opacity-65">
+        Hidden model access
+      </div>
+      <p className="mt-1 text-[10.5px] leading-relaxed text-fg opacity-55">
+        Models the provider does not list but this seat can serve. A declaration routes such a model
+        only to accounts marked supported, and surfaces it in their pools&apos; catalogs.
+      </p>
+
+      {rows.length === 0 ? (
+        <p className="mt-3 text-[11px] text-fg opacity-45">No declarations for this account.</p>
+      ) : (
+        <div className="mt-3 space-y-1.5">
+          {rows.map((row) => (
+            <div
+              key={row.model}
+              className="flex items-center justify-between gap-2 rounded border border-border bg-bg/50 px-2.5 py-1.5"
+            >
+              <div className="min-w-0">
+                <span className="truncate font-mono text-[11px] text-fg">{row.model}</span>
+                <span className="ml-2 text-[9px] uppercase tracking-wide opacity-40">
+                  {row.source}
+                </span>
+              </div>
+              <div className="flex shrink-0 items-center gap-1">
+                <button
+                  type="button"
+                  disabled={setSupport.isPending}
+                  onClick={() =>
+                    setSupport.mutate({ accountId, model: row.model, supported: !row.supported })
+                  }
+                  className={clsx(
+                    "rounded px-2 py-1 text-[10px] font-semibold",
+                    row.supported
+                      ? "bg-success/15 text-success"
+                      : "bg-error/10 text-error",
+                  )}
+                >
+                  {row.supported ? "supported" : "excluded"}
+                </button>
+                <button
+                  type="button"
+                  disabled={clearSupport.isPending}
+                  onClick={() => clearSupport.mutate({ accountId, model: row.model })}
+                  aria-label={`Clear declaration for ${row.model}`}
+                  className="rounded border border-border px-2 py-1 text-[10px] text-fg opacity-55 hover:opacity-100"
+                >
+                  clear
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="mt-3 flex gap-2">
+        <input
+          value={newModel}
+          onChange={(e) => setNewModel(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && addModel()}
+          placeholder="gpt-daybreak-blue-latest"
+          className="min-w-0 flex-1 rounded border border-border bg-bg px-2.5 py-1.5 font-mono text-[11px] outline-none focus:border-accent"
+        />
+        <button
+          type="button"
+          disabled={setSupport.isPending || !newModel.trim()}
+          onClick={addModel}
+          className="rounded bg-accent px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-45"
+        >
+          Mark supported
+        </button>
+      </div>
+    </Card>
   );
 }

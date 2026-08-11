@@ -1039,6 +1039,45 @@ export function probeAccount(id: string): Promise<AccountProbeResult> {
   });
 }
 
+/** `model_support_api.rs` — one per-account model declaration. `source` is "operator" | "probe";
+ * an operator declaration outranks a probe. Covers models `/models` does not enumerate (hidden
+ * previews gated to specific seats). */
+export interface ModelSupportDeclaration {
+  account_id: string;
+  model: string;
+  supported: boolean;
+  source: "operator" | "probe";
+  updated_at: number;
+}
+
+export function getModelSupport(): Promise<{ declarations: ModelSupportDeclaration[] }> {
+  return fetchJson<{ declarations: ModelSupportDeclaration[] }>("/api/model-support");
+}
+
+/** Declare (operator override) whether an account can serve a model. Recorded as "operator" and
+ * live on the next request. */
+export function setModelSupport(
+  accountId: string,
+  model: string,
+  supported: boolean,
+): Promise<{ ok: boolean }> {
+  return fetchJson<{ ok: boolean }>("/api/model-support", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ account_id: accountId, model, supported }),
+  });
+}
+
+/** Remove a declaration, reverting the (account, model) to "unknown" (the live /models cache
+ * decides again). */
+export function clearModelSupport(accountId: string, model: string): Promise<{ ok: boolean }> {
+  return fetchJson<{ ok: boolean }>("/api/model-support", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ account_id: accountId, model }),
+  });
+}
+
 /** Export the account's credentials. The response is secret: it is never cached or stored. */
 export function exportAccountAuth(id: string): Promise<ExportedAuthJson> {
   return fetchJson<ExportedAuthJson>(`/api/accounts/${encodeURIComponent(id)}/export-auth`, {
