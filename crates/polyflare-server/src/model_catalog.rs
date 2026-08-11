@@ -476,6 +476,29 @@ impl ModelCatalogCache {
             .collect()
     }
 
+    /// The declared hidden models at least one of `account_ids` supports — for catalog display. A
+    /// model earns a place in a scope's catalog when any member account can serve it; the selection
+    /// filter then narrows an actual request to those members. Sorted for a stable catalog order.
+    pub fn declared_models_supported_by(&self, account_ids: &[String]) -> Vec<String> {
+        let ids: HashSet<&str> = account_ids.iter().map(String::as_str).collect();
+        let mut models: Vec<String> = self
+            .declared_support
+            .read()
+            .expect("declared support lock poisoned")
+            .iter()
+            .filter(|(account_id, _)| ids.contains(account_id.as_str()))
+            .flat_map(|(_, per_model)| {
+                per_model
+                    .iter()
+                    .filter(|(_, supported)| **supported)
+                    .map(|(model, _)| model.clone())
+            })
+            .collect();
+        models.sort();
+        models.dedup();
+        models
+    }
+
     /// Filter `snapshots` down to the accounts that can serve `model` — but ONLY when the catalog
     /// has positive evidence that at least one of them can.
     ///

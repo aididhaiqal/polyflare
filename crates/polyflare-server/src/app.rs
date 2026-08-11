@@ -335,6 +335,12 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             get(crate::admission_api::get_handler).patch(crate::admission_api::patch_handler),
         )
         .route(
+            "/api/model-support",
+            get(crate::model_support_api::get_handler)
+                .put(crate::model_support_api::put_handler)
+                .delete(crate::model_support_api::delete_handler),
+        )
+        .route(
             "/api/ws/sse-pins",
             get(crate::sse_pins::list).post(crate::sse_pins::add),
         )

@@ -494,6 +494,34 @@ pub struct ModelsQuery {
     client_version: Option<String>,
 }
 
+/// Append declared hidden models (those `/models` does not enumerate but an in-scope account was
+/// declared to support) onto a scope's model list, skipping any slug already present.
+///
+/// The upstream `/models` entry does not exist for these, so a minimal one is synthesized: enough
+/// for both catalog shapes to render it (the Codex `models` array requires
+/// `supported_reasoning_levels`, so a standard gpt-5.x set is supplied). This is display metadata
+/// only — routing and the actual served capabilities come from upstream at request time.
+fn append_declared_models(models: &mut Vec<crate::model_catalog::UpstreamModel>, slugs: &[String]) {
+    for slug in slugs {
+        if models.iter().any(|m| &m.slug == slug) {
+            continue;
+        }
+        models.push(crate::model_catalog::UpstreamModel {
+            slug: slug.clone(),
+            display_name: slug.clone(),
+            context_window: None,
+            prefer_websockets: None,
+            raw: serde_json::json!({
+                "slug": slug,
+                "display_name": slug,
+                // Synthesized so the model renders in the Codex catalog shape; upstream is the real
+                // authority on what it actually accepts.
+                "supported_reasoning_levels": ["low", "medium", "high"],
+            }),
+        });
+    }
+}
+
 /// `GET /models` and `GET /backend-api/codex/models` — always the Codex catalog shape. Resolves the
 /// exact active root fleet; an empty fleet serves the static floor without reusing a native ETag
 /// cached for an account that is no longer active.
@@ -503,9 +531,16 @@ pub async fn codex_models_handler(State(state): State<Arc<AppState>>) -> Respons
         .model_catalog
         .get_or_refresh_scoped(&account_ids)
         .await;
-    let native_model_count = scoped.models.len();
+    let mut native_models = scoped.models;
+    append_declared_models(
+        &mut native_models,
+        &state
+            .model_catalog
+            .declared_models_supported_by(&account_ids),
+    );
+    let native_model_count = native_models.len();
     let native_etag = scoped.etag;
-    let models = root_models_with_custom(&state, scoped.models, CatalogSurface::Codex).await;
+    let models = root_models_with_custom(&state, native_models, CatalogSurface::Codex).await;
     let etag = root_catalog_etag(native_etag, native_model_count, &models);
     codex_models_response(
         serde_json::to_value(to_codex_response(&build_catalog(&models)))
@@ -565,8 +600,15 @@ pub async fn pooled_codex_models_handler(
         .model_catalog
         .get_or_refresh_scoped(&account_ids)
         .await;
+    let mut models = scoped.models;
+    append_declared_models(
+        &mut models,
+        &state
+            .model_catalog
+            .declared_models_supported_by(&account_ids),
+    );
     codex_models_response(
-        serde_json::to_value(to_codex_response(&build_catalog(&scoped.models)))
+        serde_json::to_value(to_codex_response(&build_catalog(&models)))
             .expect("catalog serializes"),
         scoped.etag,
     )
@@ -780,6 +822,45 @@ mod tests {
         // codex-parseable `models` array — a partial `ModelInfo` would break codex's parse.
         // `data` (OpenAI shape) is unaffected and still lists every row.
         assert!(v["models"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn declared_models_are_appended_and_render_in_the_codex_shape() {
+        let mut models = vec![UpstreamModel {
+            slug: "gpt-5.6-sol".to_string(),
+            display_name: "GPT-5.6 Sol".to_string(),
+            context_window: None,
+            prefer_websockets: None,
+            raw: serde_json::json!({
+                "slug": "gpt-5.6-sol",
+                "display_name": "GPT-5.6 Sol",
+                "supported_reasoning_levels": ["low", "medium", "high"],
+            }),
+        }];
+        append_declared_models(
+            &mut models,
+            &[
+                "gpt-daybreak-blue-latest".to_string(),
+                "gpt-5.6-sol".to_string(),
+            ],
+        );
+        // The new slug is added; the already-present one is not duplicated.
+        assert_eq!(models.iter().filter(|m| m.slug == "gpt-5.6-sol").count(), 1);
+        assert!(models.iter().any(|m| m.slug == "gpt-daybreak-blue-latest"));
+
+        // It renders in the Codex `models` array (which requires supported_reasoning_levels).
+        let response = to_codex_response(&build_catalog(&models));
+        let value = serde_json::to_value(&response).unwrap();
+        let codex_slugs: Vec<&str> = value["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m.get("slug").and_then(|s| s.as_str()))
+            .collect();
+        assert!(
+            codex_slugs.contains(&"gpt-daybreak-blue-latest"),
+            "a declared hidden model must render in the Codex catalog, got {codex_slugs:?}"
+        );
     }
 
     #[test]

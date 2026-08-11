@@ -26,6 +26,7 @@ pub mod log_bus;
 pub mod metrics;
 pub mod model_catalog;
 pub mod model_probe;
+pub mod model_support_api;
 pub mod network_recovery;
 pub mod oauth_loopback;
 pub mod observability;
