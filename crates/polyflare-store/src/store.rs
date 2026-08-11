@@ -284,6 +284,11 @@ impl Store {
         crate::AdminTokenRepo::new(self.pool.clone())
     }
 
+    /// Per-account support for models the upstream /models endpoint does not enumerate.
+    pub fn account_model_support(&self) -> crate::AccountModelSupportRepo {
+        crate::AccountModelSupportRepo::new(self.pool.clone())
+    }
+
     /// The settings repository over this store's pool (Settings-subsystem Task 3). No
     /// generation-bump wiring: nothing in-process caches `settings` rows today, so there is
     /// nothing here for a generation counter to invalidate.

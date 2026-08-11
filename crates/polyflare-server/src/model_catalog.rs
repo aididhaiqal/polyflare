@@ -130,6 +130,14 @@ pub struct ModelCatalogCache {
     account_retry_after: RwLock<HashMap<String, Instant>>,
     /// Last authoritative model-slug set per account, populated by complete scoped fetches.
     account_models: RwLock<HashMap<String, HashSet<String>>>,
+    /// Operator/probe-declared support for models the upstream `/models` endpoint does not
+    /// enumerate — `account_id -> model -> supported`. Overlays `account_models`: a declared row is
+    /// authoritative and consulted BEFORE the fetched list, so a hidden preview (e.g.
+    /// `gpt-daybreak-blue-latest`, which no account's `/models` lists) can still be routed only to
+    /// the accounts that actually have it. Loaded from `account_model_support` at boot and refreshed
+    /// periodically; empty until a row is written, so a deployment with no declarations behaves
+    /// exactly as before.
+    declared_support: RwLock<HashMap<String, HashMap<String, bool>>>,
     /// Single-flight guard: only one refresh touches the network at a time (concurrent
     /// `get_or_refresh` callers on a cold/expired cache collapse to one upstream fetch).
     refresh_lock: tokio::sync::Mutex<()>,
@@ -161,6 +169,7 @@ impl ModelCatalogCache {
             account_catalogs: RwLock::new(HashMap::new()),
             account_retry_after: RwLock::new(HashMap::new()),
             account_models: RwLock::new(HashMap::new()),
+            declared_support: RwLock::new(HashMap::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
             source,
             floor,
@@ -422,11 +431,49 @@ impl ModelCatalogCache {
     /// `None` means the account catalog has not been authoritatively fetched yet and routing
     /// remains permissive; `Some(false)` is a hard entitlement exclusion.
     pub fn account_supports_model(&self, account_id: &str, model: &str) -> Option<bool> {
+        // A declared row wins over the fetched list. `/models` cannot enumerate a hidden preview,
+        // so for such a model every fetched list says "absent" (`Some(false)`) — which would let it
+        // fail open to every account. An explicit declaration is the only signal that this account
+        // genuinely has it (or explicitly does not), so it is authoritative when present.
+        if let Some(declared) = self
+            .declared_support
+            .read()
+            .expect("declared support lock poisoned")
+            .get(account_id)
+            .and_then(|models| models.get(model))
+        {
+            return Some(*declared);
+        }
         self.account_models
             .read()
             .expect("model support cache lock poisoned")
             .get(account_id)
             .map(|models| models.contains(model))
+    }
+
+    /// Replace the declared-support overlay with the given rows (`account_id`, `model`, `supported`).
+    /// Called at boot and by the periodic reload from `account_model_support`.
+    pub fn set_declared_support(&self, rows: impl IntoIterator<Item = (String, String, bool)>) {
+        let mut map: HashMap<String, HashMap<String, bool>> = HashMap::new();
+        for (account_id, model, supported) in rows {
+            map.entry(account_id).or_default().insert(model, supported);
+        }
+        *self
+            .declared_support
+            .write()
+            .expect("declared support lock poisoned") = map;
+    }
+
+    /// Every account id declared (support = true) for `model`. Used to decide whether a hidden model
+    /// should appear in a pool's catalog: it does when at least one member account supports it.
+    pub fn accounts_declaring_model(&self, model: &str) -> Vec<String> {
+        self.declared_support
+            .read()
+            .expect("declared support lock poisoned")
+            .iter()
+            .filter(|(_, models)| models.get(model) == Some(&true))
+            .map(|(account_id, _)| account_id.clone())
+            .collect()
     }
 
     /// Filter `snapshots` down to the accounts that can serve `model` — but ONLY when the catalog
@@ -1220,6 +1267,91 @@ mod tests {
             "an uncatalogued model must leave every candidate in place and let upstream decide — \
              emptying the list refuses a request every account could have served"
         );
+    }
+
+    /// A hidden model — one no account's `/models` enumerates — routes ONLY to the accounts an
+    /// operator/probe has declared support for. Without the declared overlay it would fail open to
+    /// everyone (the case above); with it, `retain_accounts_supporting` narrows correctly.
+    #[tokio::test]
+    async fn a_declared_hidden_model_routes_only_to_supporting_accounts() {
+        let cache = ModelCatalogCache::new(
+            Box::new(NoneSource),
+            Duration::from_secs(60),
+            default_floor(),
+        );
+        let snap = |id: &str| {
+            let mut s = polyflare_core::AccountSnapshot::new(id);
+            s.plan_type = "pro".to_string();
+            s
+        };
+        let hidden = "gpt-daybreak-blue-latest";
+
+        // Before any declaration, the hidden model is unknown everywhere → fails OPEN (no filter).
+        let mut before = vec![snap("cyber-a"), snap("plain-b")];
+        cache.retain_accounts_supporting(&mut before, hidden);
+        assert_eq!(
+            before.len(),
+            2,
+            "undeclared hidden model must not filter anyone"
+        );
+
+        // Declare: cyber-a supports it, plain-b explicitly does not.
+        cache.set_declared_support([
+            ("cyber-a".to_string(), hidden.to_string(), true),
+            ("plain-b".to_string(), hidden.to_string(), false),
+        ]);
+
+        assert_eq!(cache.account_supports_model("cyber-a", hidden), Some(true));
+        assert_eq!(cache.account_supports_model("plain-b", hidden), Some(false));
+        assert_eq!(
+            cache.accounts_declaring_model(hidden),
+            vec!["cyber-a".to_string()]
+        );
+
+        // Now selection narrows to the declared-supporting account.
+        let mut after = vec![snap("cyber-a"), snap("plain-b")];
+        cache.retain_accounts_supporting(&mut after, hidden);
+        assert_eq!(
+            after
+                .iter()
+                .map(|s| s.id.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["cyber-a".to_string()],
+            "a declared hidden model must route only to the account that has it"
+        );
+
+        // An account with NO declared row for this model stays unknown → not excluded (fail-open).
+        let mut with_unknown = vec![snap("cyber-a"), snap("plain-b"), snap("unknown-c")];
+        cache.retain_accounts_supporting(&mut with_unknown, hidden);
+        let ids: Vec<_> = with_unknown
+            .iter()
+            .map(|s| s.id.as_str().to_string())
+            .collect();
+        assert!(ids.contains(&"cyber-a".to_string()), "declared-yes kept");
+        assert!(
+            !ids.contains(&"plain-b".to_string()),
+            "declared-no excluded"
+        );
+        assert!(
+            ids.contains(&"unknown-c".to_string()),
+            "undeclared stays (fail-open)"
+        );
+    }
+
+    /// The declared overlay must NOT override a normal enumerated model — only fill the gap for
+    /// models `/models` cannot answer.
+    #[tokio::test]
+    async fn a_declared_row_only_overrides_when_present() {
+        let cache = ModelCatalogCache::new(
+            Box::new(NoneSource),
+            Duration::from_secs(60),
+            default_floor(),
+        );
+        cache.set_declared_support([("acct-a".to_string(), "hidden".to_string(), true)]);
+        // A model with no declared row falls through to the (empty) fetched cache → unknown.
+        assert_eq!(cache.account_supports_model("acct-a", "gpt-5.5"), None);
+        // The declared one is answered by the overlay.
+        assert_eq!(cache.account_supports_model("acct-a", "hidden"), Some(true));
     }
 
     fn default_floor() -> Vec<UpstreamModel> {

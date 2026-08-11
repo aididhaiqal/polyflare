@@ -64,6 +64,13 @@ enum Commands {
         #[command(subcommand)]
         command: AdminTokenCommands,
     },
+    /// Per-account support for models the upstream `/models` endpoint does not list — hidden
+    /// previews gated to specific seats (e.g. `gpt-daybreak-blue-latest`). Lets selection route
+    /// such a model only to the accounts that actually have it.
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommands,
+    },
     /// Codex session records. `codex resume` filters by the provider a session was recorded
     /// under, so renaming the provider hides all earlier history until it is re-tagged.
     #[command(name = "codex-sessions")]
@@ -96,6 +103,39 @@ enum CodexSessionsCommands {
         /// Codex home to operate on. Defaults to `$CODEX_HOME`, else `~/.codex`.
         #[arg(long = "codex-home", value_name = "PATH")]
         codex_home: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelsCommands {
+    /// Show declared per-account model support.
+    List,
+    /// Declare (operator override) whether an account supports a model. Authoritative — a later
+    /// probe will not overwrite it. Takes effect on the running server within ~30s.
+    Set {
+        #[arg(long = "account", value_name = "ACCOUNT_ID")]
+        account: String,
+        #[arg(long = "model", value_name = "MODEL")]
+        model: String,
+        /// `true` if the account can serve the model, `false` to explicitly exclude it.
+        #[arg(long = "supported", value_name = "BOOL")]
+        supported: bool,
+    },
+    /// Remove a declaration, reverting the (account, model) to "unknown" (selection falls back to
+    /// the live /models cache for it).
+    Clear {
+        #[arg(long = "account", value_name = "ACCOUNT_ID")]
+        account: String,
+        #[arg(long = "model", value_name = "MODEL")]
+        model: String,
+    },
+    /// Probe every active account against a model and record accept/reject. Seeds support
+    /// automatically; operator declarations are never overwritten. NOTE: a probe observes whether
+    /// upstream ACCEPTS the request, which is not proof the account truly runs the model rather
+    /// than a silent fallback — use `set` to correct any wrong result.
+    Probe {
+        #[arg(long = "model", value_name = "MODEL")]
+        model: String,
     },
 }
 
@@ -249,6 +289,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             AdminTokenCommands::Set { stdin } => admin_token_set(stdin).await,
             AdminTokenCommands::Status => admin_token_status().await,
             AdminTokenCommands::Clear => admin_token_clear().await,
+        },
+        Commands::Models { command } => match command {
+            ModelsCommands::List => models_list().await,
+            ModelsCommands::Set {
+                account,
+                model,
+                supported,
+            } => models_set(&account, &model, supported).await,
+            ModelsCommands::Clear { account, model } => models_clear(&account, &model).await,
+            ModelsCommands::Probe { model } => models_probe(&model).await,
         },
         Commands::CodexSessions { command } => match command {
             CodexSessionsCommands::Census { codex_home } => codex_sessions_census(codex_home).await,
@@ -460,6 +510,168 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+async fn models_list() -> Result<(), Box<dyn std::error::Error>> {
+    let config = ServeConfig::from_env()?;
+    let store = Store::open(&config.db_path).await?;
+    let rows = store.account_model_support().get_all().await?;
+    if rows.is_empty() {
+        println!(
+            "No per-account model declarations. Selection filters by the live /models cache alone."
+        );
+        return Ok(());
+    }
+    // Resolve account ids to emails where possible, so the listing is legible.
+    let accounts = store.accounts().list().await.unwrap_or_default();
+    let email_of = |id: &str| {
+        accounts
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| {
+                if a.email.is_empty() {
+                    a.id.clone()
+                } else {
+                    a.email.clone()
+                }
+            })
+            .unwrap_or_else(|| id.to_string())
+    };
+    for row in rows {
+        println!(
+            "{}\t{}\t{}\t{}",
+            if row.supported {
+                "supported"
+            } else {
+                "excluded"
+            },
+            row.model,
+            email_of(&row.account_id),
+            match row.source {
+                polyflare_store::SupportSource::Operator => "operator",
+                polyflare_store::SupportSource::Probe => "probe",
+            }
+        );
+    }
+    Ok(())
+}
+
+async fn models_set(
+    account: &str,
+    model: &str,
+    supported: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = ServeConfig::from_env()?;
+    let store = Store::open(&config.db_path).await?;
+    if store.accounts().get(account).await?.is_none() {
+        return Err(format!("no account with id {account}").into());
+    }
+    store
+        .account_model_support()
+        .set(
+            account,
+            model,
+            supported,
+            polyflare_store::SupportSource::Operator,
+            unix_now(),
+        )
+        .await?;
+    println!(
+        "Declared: {account} {} {model} (operator). Takes effect on the running server within ~30s.",
+        if supported { "SUPPORTS" } else { "does NOT support" }
+    );
+    Ok(())
+}
+
+async fn models_clear(account: &str, model: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let config = ServeConfig::from_env()?;
+    let store = Store::open(&config.db_path).await?;
+    if store.account_model_support().delete(account, model).await? {
+        println!("Cleared declaration for {account} / {model}; reverts to the live /models cache.");
+    } else {
+        println!("No declaration existed for {account} / {model}.");
+    }
+    Ok(())
+}
+
+async fn models_probe(model: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let config = ServeConfig::from_env()?;
+    let store = Store::open(&config.db_path).await?;
+    let cipher = polyflare_store::TokenCipher::load_or_create(&config.key_path)?;
+    let accounts: Vec<_> = store
+        .accounts()
+        .list()
+        .await?
+        .into_iter()
+        .filter(|a| a.provider == "codex")
+        .collect();
+    if accounts.is_empty() {
+        println!("No Codex accounts to probe.");
+        return Ok(());
+    }
+    println!(
+        "Probing {} Codex account(s) for `{model}`...\n",
+        accounts.len()
+    );
+    let mut supported_count = 0;
+    for account in &accounts {
+        let outcome = polyflare_server::model_probe::probe_account_model(
+            &store,
+            &cipher,
+            &config.upstream_base_url,
+            &account.id,
+            model,
+        )
+        .await;
+        let email = if account.email.is_empty() {
+            account.id.as_str()
+        } else {
+            account.email.as_str()
+        };
+        match outcome {
+            polyflare_server::model_probe::ProbeOutcome::Supported => {
+                store
+                    .account_model_support()
+                    .set(
+                        &account.id,
+                        model,
+                        true,
+                        polyflare_store::SupportSource::Probe,
+                        unix_now(),
+                    )
+                    .await?;
+                supported_count += 1;
+                println!("  SUPPORTED    {email}");
+            }
+            polyflare_server::model_probe::ProbeOutcome::Unsupported => {
+                store
+                    .account_model_support()
+                    .set(
+                        &account.id,
+                        model,
+                        false,
+                        polyflare_store::SupportSource::Probe,
+                        unix_now(),
+                    )
+                    .await?;
+                println!("  unsupported  {email}");
+            }
+            polyflare_server::model_probe::ProbeOutcome::Inconclusive(reason) => {
+                // Do NOT write a row on an inconclusive probe — leaving it unknown is more honest
+                // than recording a guess, and a later probe or an operator can resolve it.
+                println!("  inconclusive {email}  ({reason})");
+            }
+        }
+    }
+    println!(
+        "\n{supported_count}/{} account(s) accepted `{model}`. Operator declarations were left \
+         untouched. Correct any wrong result with `polyflare models set`.",
+        accounts.len()
+    );
+    println!(
+        "Acceptance is not proof of true support — an account may accept and silently fall back."
+    );
+    Ok(())
+}
+
 /// A unix timestamp as a readable UTC date for CLI output.
 fn format_unix_date(seconds: i64) -> String {
     chrono::DateTime::from_timestamp(seconds, 0)
@@ -625,6 +837,15 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         floor_only_cache(model_catalog_floor)
     });
+    // Seed the declared-support overlay from the store so per-account hidden-model routing (e.g.
+    // gpt-daybreak-blue-latest) is in effect from the first request, before the periodic reloader
+    // below runs. Empty on a store with no declarations, so this is a no-op for most deployments.
+    if let Ok(rows) = store.account_model_support().get_all().await {
+        model_catalog.set_declared_support(
+            rows.into_iter()
+                .map(|row| (row.account_id, row.model, row.supported)),
+        );
+    }
     let state = Arc::new(AppState {
         codex_executor,
         control_client,
@@ -708,6 +929,27 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // Runtime usage-refresh loop: keeps each Codex account's rate-limit windows (5h + weekly) and
     // routing gate live, instead of the frozen numbers the importer left.
     polyflare_server::usage_refresh::spawn_usage_refresh(state.clone());
+
+    // Reload the declared-support overlay periodically so a change made by another process — the
+    // `polyflare models` CLI, or (later) a dashboard write — reaches this server without a restart.
+    // The table is tiny; a 30s reload is cheap and bounds how long an operator waits for a
+    // declaration to take effect.
+    {
+        let reload_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Ok(rows) = reload_state.store.account_model_support().get_all().await {
+                    reload_state.model_catalog.set_declared_support(
+                        rows.into_iter()
+                            .map(|row| (row.account_id, row.model, row.supported)),
+                    );
+                }
+            }
+        });
+    }
     // Reset-credit discovery is deliberately independent of routing usage health: failures never
     // bench an account, while successful consumes trigger the usage poller's immediate refresh.
     polyflare_server::reset_credits::spawn_reset_credit_refresh(state.clone());
