@@ -497,27 +497,46 @@ pub struct ModelsQuery {
 /// Append declared hidden models (those `/models` does not enumerate but an in-scope account was
 /// declared to support) onto a scope's model list, skipping any slug already present.
 ///
-/// The upstream `/models` entry does not exist for these, so a minimal one is synthesized: enough
-/// for both catalog shapes to render it (the Codex `models` array requires
-/// `supported_reasoning_levels`, so a standard gpt-5.x set is supplied). This is display metadata
-/// only — routing and the actual served capabilities come from upstream at request time.
+/// The upstream `/models` entry does not exist for these, so a COMPLETE one is synthesized by
+/// CLONING a real full `ModelInfo` from the catalog and overriding only its `slug`/`display_name`.
+///
+/// This must be a full entry, not a partial one. The Codex `models` array is deserialised as a
+/// strict `ModelInfo`; a partial entry (missing the ~40 other fields a real one carries) makes
+/// codex-rs reject the ENTIRE array and fall back to its bundled list — which drops every custom
+/// and native model from the picker, not just the synthesized one. So if no full template exists in
+/// this scope's catalog, the model is left out of the Codex array entirely rather than emitted
+/// broken. Cloning is sound here because a hidden preview is served as (and reports itself as) a
+/// standard model, so inheriting a standard model's shape is truthful enough for a display entry;
+/// upstream remains the authority on what it actually accepts.
 fn append_declared_models(models: &mut Vec<crate::model_catalog::UpstreamModel>, slugs: &[String]) {
+    if slugs.is_empty() {
+        return;
+    }
+    // A full `ModelInfo` carries `supported_reasoning_levels`; the static floor's minimal entries
+    // do not (they are omitted from the Codex array by `to_codex_response`). Only a full one is a
+    // safe template.
+    let Some(template) = models
+        .iter()
+        .find(|m| m.raw.get("supported_reasoning_levels").is_some())
+        .map(|m| m.raw.clone())
+    else {
+        return;
+    };
     for slug in slugs {
         if models.iter().any(|m| &m.slug == slug) {
             continue;
+        }
+        let mut raw = template.clone();
+        if let Some(object) = raw.as_object_mut() {
+            object.insert("slug".into(), serde_json::json!(slug));
+            object.insert("display_name".into(), serde_json::json!(slug));
         }
         models.push(crate::model_catalog::UpstreamModel {
             slug: slug.clone(),
             display_name: slug.clone(),
             context_window: None,
             prefer_websockets: None,
-            raw: serde_json::json!({
-                "slug": slug,
-                "display_name": slug,
-                // Synthesized so the model renders in the Codex catalog shape; upstream is the real
-                // authority on what it actually accepts.
-                "supported_reasoning_levels": ["low", "medium", "high"],
-            }),
+            raw,
         });
     }
 }
@@ -825,17 +844,24 @@ mod tests {
     }
 
     #[test]
-    fn declared_models_are_appended_and_render_in_the_codex_shape() {
+    fn declared_models_are_appended_as_a_complete_clone_of_a_real_entry() {
+        // A realistic full ModelInfo template with several fields — the injected entry must inherit
+        // ALL of them, not be a partial stub. A partial entry breaks codex-rs's parse of the whole
+        // array, which regressed every custom AND native model on 2026-08-12.
+        let template_raw = serde_json::json!({
+            "slug": "gpt-5.6-sol",
+            "display_name": "GPT-5.6 Sol",
+            "supported_reasoning_levels": ["low", "medium", "high"],
+            "base_instructions": "You are Codex.",
+            "context_window": 400000,
+            "auto_review_model_override": serde_json::Value::Null,
+        });
         let mut models = vec![UpstreamModel {
             slug: "gpt-5.6-sol".to_string(),
             display_name: "GPT-5.6 Sol".to_string(),
             context_window: None,
             prefer_websockets: None,
-            raw: serde_json::json!({
-                "slug": "gpt-5.6-sol",
-                "display_name": "GPT-5.6 Sol",
-                "supported_reasoning_levels": ["low", "medium", "high"],
-            }),
+            raw: template_raw.clone(),
         }];
         append_declared_models(
             &mut models,
@@ -846,20 +872,50 @@ mod tests {
         );
         // The new slug is added; the already-present one is not duplicated.
         assert_eq!(models.iter().filter(|m| m.slug == "gpt-5.6-sol").count(), 1);
-        assert!(models.iter().any(|m| m.slug == "gpt-daybreak-blue-latest"));
+        let injected = models
+            .iter()
+            .find(|m| m.slug == "gpt-daybreak-blue-latest")
+            .expect("daybreak injected");
 
-        // It renders in the Codex `models` array (which requires supported_reasoning_levels).
-        let response = to_codex_response(&build_catalog(&models));
-        let value = serde_json::to_value(&response).unwrap();
+        // It carries every field the template did — a COMPLETE ModelInfo, not a stub.
+        assert_eq!(
+            injected.raw.as_object().unwrap().len(),
+            template_raw.as_object().unwrap().len(),
+            "injected entry must clone the full ModelInfo shape, not a partial one"
+        );
+        // ...but with its own identity.
+        assert_eq!(injected.raw["slug"], "gpt-daybreak-blue-latest");
+        assert_eq!(injected.raw["display_name"], "gpt-daybreak-blue-latest");
+        assert_eq!(injected.raw["base_instructions"], "You are Codex.");
+
+        // And it renders in the Codex `models` array.
+        let value = serde_json::to_value(to_codex_response(&build_catalog(&models))).unwrap();
         let codex_slugs: Vec<&str> = value["models"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|m| m.get("slug").and_then(|s| s.as_str()))
             .collect();
+        assert!(codex_slugs.contains(&"gpt-daybreak-blue-latest"));
+    }
+
+    /// With NO full-ModelInfo template in scope (only the minimal floor), a declared model must be
+    /// SKIPPED — emitting a partial entry would break codex-rs's parse of the whole array.
+    #[test]
+    fn declared_models_are_skipped_when_no_full_template_exists() {
+        let mut floor_only = vec![UpstreamModel {
+            slug: "gpt-5.5".to_string(),
+            display_name: "GPT-5.5".to_string(),
+            context_window: None,
+            prefer_websockets: None,
+            raw: serde_json::json!({"slug": "gpt-5.5", "display_name": "GPT-5.5"}),
+        }];
+        append_declared_models(&mut floor_only, &["gpt-daybreak-blue-latest".to_string()]);
         assert!(
-            codex_slugs.contains(&"gpt-daybreak-blue-latest"),
-            "a declared hidden model must render in the Codex catalog, got {codex_slugs:?}"
+            !floor_only
+                .iter()
+                .any(|m| m.slug == "gpt-daybreak-blue-latest"),
+            "no full template ⇒ skip rather than emit a parse-breaking stub"
         );
     }
 
