@@ -59,10 +59,13 @@ impl OAuthContract {
 
 /// The first production OAuth-contract profile.
 ///
-/// Scope policy: request `user:inference` only. `user:profile` is deliberately NOT requested by
-/// default — identity is recovered from the token response's own account fields instead, so an
-/// ordinary login never asks for a broader grant than serving inference requires. Claude Code's
-/// other permissions (MCP, file upload, API-key creation, session management) are never requested.
+/// Scope policy: request `user:inference` and `user:profile`. Inference serves requests; profile
+/// unlocks the free `GET /api/oauth/usage` endpoint the Claude Code CLI polls — a live probe
+/// confirmed it returns `403 OAuth token does not meet scope requirement user:profile` without it,
+/// so per-account usage and plan monitoring is impossible on inference scope alone. Account
+/// identity is still recovered from the token response's own account fields, not from profile.
+/// Claude Code's remaining permissions (MCP, file upload, API-key creation, session management) are
+/// still never requested: the grant widens by exactly the one read scope usage needs, no further.
 pub const CONTRACT: OAuthContract = OAuthContract {
     version: "anthropic-oauth-2026-07",
     // Public, non-secret client registration for the Claude Code CLI — the same class of protocol
@@ -72,7 +75,7 @@ pub const CONTRACT: OAuthContract = OAuthContract {
     authorize_url: "https://claude.com/cai/oauth/authorize",
     token_url: "https://platform.claude.com/v1/oauth/token",
     manual_redirect_uri: "https://platform.claude.com/oauth/code/callback",
-    default_scopes: "user:inference",
+    default_scopes: "user:inference user:profile",
     client_id_provenance: Provenance::UnverifiedInRepo,
 };
 
@@ -126,6 +129,6 @@ mod tests {
         // only once the Outcome 7 probe reproduces the client id, and this test will then fail and
         // force a deliberate update here.
         assert!(!CONTRACT.verified_for_production());
-        assert_eq!(CONTRACT.default_scopes, "user:inference");
+        assert_eq!(CONTRACT.default_scopes, "user:inference user:profile");
     }
 }
