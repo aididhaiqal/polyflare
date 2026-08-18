@@ -346,16 +346,21 @@ async fn anthropic_usage(account: Option<String>) -> Result<(), Box<dyn std::err
             acct.email.as_str()
         };
         println!("=== {short}  {who} ===");
-        match polyflare_server::anthropic_usage::fetch_usage_raw(
-            &store,
-            &cipher,
-            &config.anthropic_upstream_base_url,
-            &acct.id,
-        )
-        .await
-        {
-            Ok((status, body)) => println!("HTTP {status}\n{body}\n"),
-            Err(e) => println!("ERROR: {e}\n"),
+        // `usage` is the confirmed endpoint; the rest are candidate profile paths probed to see if
+        // any names the subscription plan/tier (the usage payload itself carries no plan name).
+        for path in ["usage", "profile", "claude_cli/profile", "organizations"] {
+            match polyflare_server::anthropic_usage::fetch_oauth_raw(
+                &store,
+                &cipher,
+                &config.anthropic_upstream_base_url,
+                &acct.id,
+                path,
+            )
+            .await
+            {
+                Ok((status, body)) => println!("[/api/oauth/{path}] HTTP {status}\n{body}\n"),
+                Err(e) => println!("[/api/oauth/{path}] ERROR: {e}\n"),
+            }
         }
     }
     Ok(())

@@ -19,9 +19,9 @@ const OAUTH_BETA: &str = "oauth-2025-04-20";
 /// `claude-code/<semver>` User-Agent, so a real one is sent rather than a generic agent.
 const CLAUDE_CODE_UA: &str = "claude-code/2.1.209";
 
-/// The usage endpoint sits at the API root (`/api/oauth/usage`), not under any versioned path.
-fn usage_url(upstream_base: &str) -> String {
-    format!("{}/api/oauth/usage", upstream_base.trim_end_matches('/'))
+/// The OAuth endpoints sit at the API root (`/api/oauth/...`), not under any versioned path.
+fn oauth_url(upstream_base: &str, path: &str) -> String {
+    format!("{}/api/oauth/{}", upstream_base.trim_end_matches('/'), path)
 }
 
 /// Fetch one account's usage payload. Returns `(http_status, body_text)`; the caller decides how to
@@ -32,6 +32,18 @@ pub async fn fetch_usage_raw(
     upstream_base: &str,
     account_id: &str,
 ) -> Result<(u16, String), Box<dyn std::error::Error>> {
+    fetch_oauth_raw(store, cipher, upstream_base, account_id, "usage").await
+}
+
+/// Fetch a raw `GET /api/oauth/{path}` body for an account, authenticated with its OAuth bearer and
+/// the oauth beta header. Used both for `usage` and for probing whether a profile endpoint exists.
+pub async fn fetch_oauth_raw(
+    store: &Store,
+    cipher: &TokenCipher,
+    upstream_base: &str,
+    account_id: &str,
+    path: &str,
+) -> Result<(u16, String), Box<dyn std::error::Error>> {
     let tokens = store
         .accounts()
         .decrypt_tokens(account_id, cipher)
@@ -41,7 +53,7 @@ pub async fn fetch_usage_raw(
         .connect_timeout(Duration::from_secs(10))
         .build()?;
     let resp = http
-        .get(usage_url(upstream_base))
+        .get(oauth_url(upstream_base, path))
         .header("Authorization", format!("Bearer {}", tokens.access_token))
         .header("anthropic-beta", OAUTH_BETA)
         .header("User-Agent", CLAUDE_CODE_UA)
@@ -59,14 +71,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn usage_url_is_rooted_and_trims_a_trailing_slash() {
+    fn oauth_url_is_rooted_and_trims_a_trailing_slash() {
         assert_eq!(
-            usage_url("https://api.anthropic.com"),
+            oauth_url("https://api.anthropic.com", "usage"),
             "https://api.anthropic.com/api/oauth/usage"
         );
         assert_eq!(
-            usage_url("https://api.anthropic.com/"),
-            "https://api.anthropic.com/api/oauth/usage"
+            oauth_url("https://api.anthropic.com/", "profile"),
+            "https://api.anthropic.com/api/oauth/profile"
         );
     }
 }
