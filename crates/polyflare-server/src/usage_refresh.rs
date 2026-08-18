@@ -521,6 +521,36 @@ async fn refresh_stale_token(state: &AppState, account_id: &str) {
     }
 }
 
+/// Proactively refresh an idle Anthropic account's token before the usage poll sends it, mirroring
+/// [`refresh_stale_token`] for Codex. Keeps an idle Claude account's opaque token warm so it does
+/// not strand into `reauth_required` between requests.
+async fn refresh_stale_anthropic_token(state: &AppState, account_id: &str) {
+    let reactive = crate::reactive_auth::ReactiveAuth::new(
+        state.store.clone(),
+        state.cipher.clone(),
+        state.oauth.clone(),
+        state.refresh_locks.clone(),
+        state
+            .upstream_base_url_for(polyflare_core::Provider::Codex)
+            .to_string(),
+        state
+            .upstream_base_url_for(polyflare_core::Provider::Anthropic)
+            .to_string(),
+    );
+    match reactive
+        .refresh_stale_anthropic_token(&AccountId::from(account_id), unix_now())
+        .await
+    {
+        Ok(true) => tracing::info!(account_id, "usage sweep rotated a stale Anthropic access token"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            account_id,
+            error = ?e,
+            "usage sweep could not rotate a stale Anthropic access token"
+        ),
+    }
+}
+
 /// Spawn the background usage-refresh loop: every [`REFRESH_INTERVAL`], poll each Codex account.
 pub fn spawn_usage_refresh(state: Arc<AppState>) {
     let http = match reqwest::Client::builder()
@@ -664,6 +694,10 @@ pub fn spawn_usage_refresh(state: Arc<AppState>) {
                 // routing gate, syncs the plan, AND runs the usage-driven health-tier evaluation
                 // internally, so it fully replaces the error-only evaluation below for them.
                 if account.provider == "anthropic" {
+                    // Keep the idle token warm first, so the usage poll below sends a live bearer
+                    // instead of 401-ing and silently skipping (which would leave the account to
+                    // drift toward reauth_required). Mirrors the Codex loop's stale-token sweep.
+                    refresh_stale_anthropic_token(&state, &account.id).await;
                     match refresh_anthropic_account(
                         &state.store,
                         &state.cipher,

@@ -1213,11 +1213,13 @@ function ActionsCard({
             </button>
           </ConfigRow>
 
-          <ConfigRow icon={Flame} label="Warm-up policy">
-            <span className="rounded bg-muted px-2 py-1 text-[10px] text-fg opacity-50">
-              server default
-            </span>
-          </ConfigRow>
+          {resetEligible && (
+            <ConfigRow icon={Flame} label="Warm-up policy">
+              <span className="rounded bg-muted px-2 py-1 text-[10px] text-fg opacity-50">
+                server default
+              </span>
+            </ConfigRow>
+          )}
         </div>
 
         {resetEligible && (
@@ -1305,10 +1307,12 @@ function ActionsCard({
               <OpButton icon={Download} label="Export auth" onClick={onExportAuth} />
             )}
           </div>
-          <div className="rounded-md border border-border/60 bg-muted/35 px-3 py-2 text-[10.5px] leading-relaxed text-fg opacity-50">
-            A probe refreshes this account&apos;s credential and live quota without spending any of
-            it. Exporting credentials reveals a live refresh token and is recorded in the logs.
-          </div>
+          {(onProbe || onExportAuth) && (
+            <div className="rounded-md border border-border/60 bg-muted/35 px-3 py-2 text-[10.5px] leading-relaxed text-fg opacity-50">
+              A probe refreshes this account&apos;s credential and live quota without spending any of
+              it. Exporting credentials reveals a live refresh token and is recorded in the logs.
+            </div>
+          )}
           <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/70 pt-3">
             <span className="text-[10px] font-semibold uppercase tracking-wide text-error opacity-75">
               Danger zone

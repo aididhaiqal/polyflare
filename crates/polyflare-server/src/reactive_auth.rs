@@ -199,6 +199,50 @@ impl ReactiveAuth {
             .is_some())
     }
 
+    /// Proactively refresh an idle Anthropic account's opaque access token before it expires — the
+    /// Anthropic analogue of [`Self::refresh_stale_codex_token`]. Without it, an Anthropic account
+    /// with no request traffic relies solely on the on-request 401→refresh path, so one left idle
+    /// past its access-token lifetime can strand into `reauth_required`. Expiry comes from the
+    /// stored column (the token is opaque, with no JWT `exp`); a `None` column refreshes eagerly.
+    pub(crate) async fn refresh_stale_anthropic_token(
+        &self,
+        picked: &AccountId,
+        now: i64,
+    ) -> Result<bool, ReactiveAuthError> {
+        let repo = self.store.accounts();
+        let lock = self.refresh_locks.handle(picked);
+        let _guard = lock.lock().await;
+        // Fresh read under the lock: a request-path refresh may have rotated while we waited.
+        let (stored_account, stored_tokens, auth) = repo
+            .get_with_tokens_and_auth(picked.as_str(), &self.cipher)
+            .await
+            .map_err(|_| ReactiveAuthError::Internal)?
+            .ok_or(ReactiveAuthError::Internal)?;
+        if !matches!(
+            stored_account.status.as_str(),
+            "active" | "rate_limited" | "quota_exceeded"
+        ) {
+            return Ok(false);
+        }
+        if auth.mode() != AuthMode::AnthropicOauth {
+            return Ok(false);
+        }
+        if !polyflare_anthropic::oauth::should_refresh(auth.access_token_expires_at, now) {
+            return Ok(false);
+        }
+        Ok(self
+            .refresh_anthropic(
+                picked,
+                &stored_account,
+                &stored_tokens,
+                &auth,
+                self.anthropic_base_url.clone(),
+                now,
+            )
+            .await?
+            .is_some())
+    }
+
     /// The shared Codex rotate-and-persist step. The caller MUST hold this account's refresh lock
     /// and have re-read `stored_refresh_token` under it. `Ok(None)` is a transient OAuth failure —
     /// stored credentials untouched, the caller's original error (if any) stays visible.
