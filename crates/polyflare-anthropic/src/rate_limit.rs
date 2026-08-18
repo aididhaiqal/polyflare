@@ -64,6 +64,42 @@ fn retry_after_header(headers: &HeaderMap, _now: i64) -> Option<i64> {
         .filter(|&s| s >= 0)
 }
 
+/// `Retry-After` given as an HTTP-date (RFC 7231 IMF-fixdate, e.g. `Wed, 21 Oct 2026 07:28:00 GMT`)
+/// rather than a delta — converted to seconds from `now`, clamped to the sane window.
+fn retry_after_http_date(headers: &HeaderMap, now: i64) -> Option<i64> {
+    let raw = header(headers, "retry-after")?.trim();
+    // An HTTP-date always ends in the obsolete zone name `GMT`; chrono's RFC 2822 parser wants a
+    // numeric offset, so normalize `GMT` → `+0000` (they denote the same instant).
+    let normalized = raw.replace(" GMT", " +0000");
+    let ts = chrono::DateTime::parse_from_rfc2822(&normalized)
+        .ok()?
+        .timestamp();
+    let delta = ts.checked_sub(now)?;
+    (1..=MAX_RESET_SECONDS).contains(&delta).then_some(delta)
+}
+
+/// `x-ratelimit-reset` as absolute unix-epoch seconds — the last rung of the 529 reset ladder,
+/// converted to a delta from `now` and clamped.
+fn x_ratelimit_reset(headers: &HeaderMap, now: i64) -> Option<i64> {
+    let reset_at = header(headers, "x-ratelimit-reset")?
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    let delta = reset_at.checked_sub(now)?;
+    (1..=MAX_RESET_SECONDS).contains(&delta).then_some(delta)
+}
+
+/// The best available reset time, walking the full ladder better-ccflare uses for a 529: the
+/// per-account unified reset first (most accurate), then a numeric `Retry-After`, then an HTTP-date
+/// `Retry-After`, then the generic `x-ratelimit-reset`. `None` means no usable reset was found — the
+/// caller then applies a floor cooldown so an overloaded upstream still routes away briefly.
+fn reset_ladder(headers: &HeaderMap, now: i64) -> Option<i64> {
+    seconds_until_reset(headers, now)
+        .or_else(|| retry_after_header(headers, now))
+        .or_else(|| retry_after_http_date(headers, now))
+        .or_else(|| x_ratelimit_reset(headers, now))
+}
+
 /// True when the overage (pay-as-you-go) billing is disabled because the account is out of
 /// purchased credits. This is a SCOPED billing signal — the account's plan itself may still serve
 /// other models/requests — distinct from an account-wide rate limit. Mirrors better-ccflare's
@@ -87,8 +123,7 @@ fn is_out_of_credits(headers: &HeaderMap) -> bool {
 /// exhausted account would be retried in a tight loop.
 pub fn failure_signal(status: u16, headers: &HeaderMap, now: i64) -> FailureSignal {
     let unified = unified_status(headers);
-    let retry_after =
-        seconds_until_reset(headers, now).or_else(|| retry_after_header(headers, now));
+    let retry_after = reset_ladder(headers, now);
     let hard = is_hard_limit(unified.as_deref());
     let error_code = if is_out_of_credits(headers) && !hard {
         // Scoped overage/credit rejection, not an account-wide limit → distinguishable so the
@@ -203,6 +238,34 @@ mod tests {
         for status in ["allowed", "allowed_warning", "queueing_soft"] {
             assert!(!is_hard_limit(Some(status)), "{status} is not a hard limit");
         }
+    }
+
+    #[test]
+    fn the_529_ladder_falls_through_to_x_ratelimit_reset() {
+        let now = 1_000_000;
+        // No unified-reset, no numeric/date retry-after → the x-ratelimit-reset rung supplies it.
+        let h = headers(&[("x-ratelimit-reset", "1000090")]);
+        let signal = failure_signal(529, &h, now);
+        assert_eq!(signal.retry_after, Some(90));
+        assert_eq!(signal.error_code.as_deref(), Some("overloaded"));
+    }
+
+    #[test]
+    fn retry_after_as_an_http_date_is_parsed() {
+        // now = 2026-08-19T00:00:00Z = 1_787_097_600 (a Wednesday); the date is 120s later.
+        let now = 1_787_097_600;
+        let h = headers(&[("retry-after", "Wed, 19 Aug 2026 00:02:00 GMT")]);
+        assert_eq!(failure_signal(529, &h, now).retry_after, Some(120));
+    }
+
+    #[test]
+    fn the_ladder_prefers_unified_reset_over_x_ratelimit_reset() {
+        let now = 1_000_000;
+        let h = headers(&[
+            ("anthropic-ratelimit-unified-reset", "1000030"),
+            ("x-ratelimit-reset", "1000090"),
+        ]);
+        assert_eq!(failure_signal(429, &h, now).retry_after, Some(30));
     }
 
     #[test]

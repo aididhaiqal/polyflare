@@ -238,6 +238,22 @@ pub fn parse_response_usage(frame_json: &str) -> Option<ResponseUsage> {
 /// Canonical `input_tokens` therefore includes all three categories, matching the Responses
 /// contract where cached tokens are a subset of total input. This lets the shared pricing path
 /// charge ordinary/cache-write input at the normal input rate and cache reads at the cached rate.
+/// Detect an Anthropic `event: error` frame that a status-200 stream can smuggle mid-response, and
+/// map its `error.type` to the equivalent HTTP status: `rate_limit_error` → 429, `overloaded_error`
+/// → 529. Any other error type (or a non-error frame) is `None` — only the two the router acts on
+/// are surfaced, so an ordinary `invalid_request_error` never benches the account.
+pub(crate) fn parse_anthropic_stream_error(frame_json: &str) -> Option<u16> {
+    let value: Value = serde_json::from_str(frame_json).ok()?;
+    if value.get("type")?.as_str()? != "error" {
+        return None;
+    }
+    match value.get("error")?.get("type")?.as_str()? {
+        "rate_limit_error" => Some(429),
+        "overloaded_error" => Some(529),
+        _ => None,
+    }
+}
+
 pub(crate) fn parse_anthropic_usage(frame_json: &str) -> Option<ResponseUsage> {
     let value: Value = serde_json::from_str(frame_json).ok()?;
     let event_type = value.get("type")?.as_str()?;
@@ -321,6 +337,11 @@ pub struct CapturedUsage {
     pub ttft_ms: Option<i64>,
     pub duration_ms: Option<i64>,
     pub protocol_outcome: polyflare_store::RequestProtocolOutcome,
+    /// When a status-200 Anthropic stream smuggled an `event: error` frame carrying a
+    /// `rate_limit_error` (→ 429) or `overloaded_error` (→ 529), the equivalent HTTP status so the
+    /// caller can cool the account exactly as it would on a real 429/529. `None` for a clean stream.
+    /// Mirrors better-ccflare's mid-stream SSE rate-limit sniffer.
+    pub stream_error_status: Option<u16>,
 }
 
 /// Byte-for-byte passthrough wrapper around an upstream SSE byte stream.
@@ -364,6 +385,8 @@ pub struct UsageCapturingStream<S> {
     /// The tier the terminal frame reported. Set once, from the frame that also carries usage.
     served_tier: Option<ServedTier>,
     terminal_outcome: Option<polyflare_store::RequestProtocolOutcome>,
+    /// First mid-stream Anthropic error status observed (429 rate_limit / 529 overloaded), if any.
+    stream_error_status: Option<u16>,
     eof_outcome: polyflare_store::RequestProtocolOutcome,
     /// Side-buffer of raw SSE bytes accumulated ACROSS chunks, so a `data: {...}` line split by
     /// the transport (real codex `response.completed` frames are ~20 KB, transport chunks are
@@ -456,6 +479,7 @@ impl<S> UsageCapturingStream<S> {
             usage: None,
             served_tier: None,
             terminal_outcome: None,
+            stream_error_status: None,
             eof_outcome,
             pending: Vec::new(),
         }
@@ -560,6 +584,12 @@ impl<S> UsageCapturingStream<S> {
                 },
             };
         }
+        // Sniff a status-200 stream for a smuggled rate-limit/overload error frame, so the account
+        // is cooled as if the upstream had returned a real 429/529 (see `stream_error_status`).
+        if self.protocol == CaptureProtocol::AnthropicMessages && self.stream_error_status.is_none()
+        {
+            self.stream_error_status = parse_anthropic_stream_error(payload);
+        }
     }
 
     /// Fire `on_done` with the usage/TTFT captured so far, guarded by `Option::take` so it never
@@ -588,6 +618,7 @@ impl<S> UsageCapturingStream<S> {
                 ttft_ms: self.ttft_ms,
                 duration_ms: Some(self.start.elapsed().as_millis() as i64),
                 protocol_outcome: self.terminal_outcome.unwrap_or(fallback),
+                stream_error_status: self.stream_error_status,
             });
         }
     }
@@ -780,6 +811,58 @@ mod tests {
             captured.protocol_outcome,
             polyflare_store::RequestProtocolOutcome::Completed
         );
+        assert_eq!(captured.stream_error_status, None, "a clean stream has no error status");
+    }
+
+    #[test]
+    fn parse_anthropic_stream_error_maps_only_the_two_actionable_types() {
+        assert_eq!(
+            parse_anthropic_stream_error(r#"{"type":"error","error":{"type":"rate_limit_error"}}"#),
+            Some(429)
+        );
+        assert_eq!(
+            parse_anthropic_stream_error(r#"{"type":"error","error":{"type":"overloaded_error"}}"#),
+            Some(529)
+        );
+        // An ordinary request error must NOT cool the account.
+        assert_eq!(
+            parse_anthropic_stream_error(
+                r#"{"type":"error","error":{"type":"invalid_request_error"}}"#
+            ),
+            None
+        );
+        // A non-error frame is never a bench signal.
+        assert_eq!(parse_anthropic_stream_error(r#"{"type":"message_stop"}"#), None);
+    }
+
+    #[tokio::test]
+    async fn a_mid_stream_overloaded_error_on_a_200_stream_is_sniffed() {
+        // A status-200 stream that emits an `event: error` overloaded frame must be caught so the
+        // account is cooled — exactly the silent-failure case a status-code-only proxy misses.
+        let frames = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":50,\"output_tokens\":0}}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+            )),
+        ];
+        let expected = frames
+            .iter()
+            .map(|f| f.as_ref().unwrap().clone())
+            .collect::<Vec<_>>();
+        let captured = Arc::new(Mutex::new(None));
+        let captured_2 = captured.clone();
+        let stream = UsageCapturingStream::new_anthropic_with_eof_outcome(
+            stream::iter(frames),
+            Instant::now(),
+            polyflare_store::RequestProtocolOutcome::TransportLost,
+            move |u| *captured_2.lock().unwrap() = Some(u),
+        );
+        let actual = stream.map(|c| c.unwrap()).collect::<Vec<_>>().await;
+        assert_eq!(actual, expected, "bytes must still pass through unchanged");
+        let cu = captured.lock().unwrap().take().unwrap();
+        assert_eq!(cu.stream_error_status, Some(529), "overloaded_error → 529");
     }
 
     #[tokio::test]

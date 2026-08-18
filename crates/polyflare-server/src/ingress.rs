@@ -302,8 +302,12 @@ pub(crate) async fn bench_account_for_failure(
             Some("blocked" | "queueing_hard" | "payment_required")
         )
     });
+    // A 529 is Anthropic's `overloaded_error` (Codex never emits it). Like better-ccflare, treat it
+    // as a cooldown honoring whatever reset the response carried (via `rate_limit::failure_signal`'s
+    // ladder), falling back to the floor cooldown when none is present — so an overloaded upstream
+    // routes away briefly instead of merely accruing error count in the generic 5xx arm below.
     let transition = match sig {
-        Some(sig) if sig.status == 429 || is_anthropic_hard_limit => {
+        Some(sig) if sig.status == 429 || sig.status == 529 || is_anthropic_hard_limit => {
             state.runtime.request_usage_refresh(id);
             let delay = sig
                 .retry_after
@@ -312,10 +316,11 @@ pub(crate) async fn bench_account_for_failure(
                     crate::runtime_state::RATE_LIMITED_MIN_COOLDOWN_SECS,
                     crate::runtime_state::MAX_COOLDOWN_SECS,
                 );
+            let reason = if sig.status == 529 { "overloaded" } else { "rate_limit" };
             let _ = state
                 .store
                 .accounts()
-                .record_routing_cooldown(id.as_str(), now.saturating_add(delay), "rate_limit", now)
+                .record_routing_cooldown(id.as_str(), now.saturating_add(delay), reason, now)
                 .await;
             state
                 .runtime
@@ -3633,6 +3638,9 @@ async fn messages_route(
     // Observe terminal Anthropic usage on the exact client-facing body, then queue the update
     // behind the request-row insert through the same FIFO writer.
     let usage_store = state.store.clone();
+    // Retained so the stream-tap's `on_done` can cool the account if the 200 stream smuggled a
+    // rate-limit/overload error frame (see `stream_error_status`); full state is needed to bench.
+    let state_for_stream_error = state.clone();
     let pressure_runtime = state.runtime.clone();
     // Same reason: `state` moves into a sub-handler below, so grab the log-bus handle first.
     let log_bus = state.log_bus.clone();
@@ -3785,6 +3793,9 @@ async fn messages_route(
         .provider_slug
         .clone()
         .unwrap_or_else(|| builtin_provider.to_string());
+    // The account that served this turn — captured before `outcome` moves into `RequestLog` — so
+    // the stream tap's `on_done` can cool the right account on a mid-stream error frame.
+    let account_id_for_stream_error = outcome.account_id.clone();
     let model_for_cost = outcome.model.clone();
     let custom_pricing = outcome.custom_pricing;
     // The tier the upstream actually served this turn at — cloned here for the same reason
@@ -3870,6 +3881,28 @@ async fn messages_route(
             let store = usage_store;
             let request_id = request_id;
             let model = model_for_cost;
+            // A status-200 stream that smuggled a rate_limit_error/overloaded_error frame cools the
+            // serving account exactly as a real 429/529 would — otherwise the signal is invisible to
+            // a status-code-only proxy and the account keeps being selected into the limit.
+            if let (Some(status), Some(account_id)) =
+                (captured.stream_error_status, account_id_for_stream_error)
+            {
+                let state = state_for_stream_error;
+                tokio::spawn(async move {
+                    let signal = polyflare_core::FailureSignal {
+                        status,
+                        retry_after: None,
+                        error_code: None,
+                    };
+                    bench_account_for_failure(
+                        &state,
+                        &AccountId::from(account_id.as_str()),
+                        Some(&signal),
+                        unix_now(),
+                    )
+                    .await;
+                });
+            }
             if let Some(actual_tokens) = captured
                 .usage
                 .and_then(usage_capture::pressure_equivalent_tokens)
@@ -4970,6 +5003,7 @@ mod tests {
                 ttft_ms: Some(1200),
                 duration_ms: Some(9000),
                 protocol_outcome: polyflare_store::RequestProtocolOutcome::Completed,
+                stream_error_status: None,
             };
             apply_captured_usage(&store, "rq", Some("gpt-5.6-sol"), None, None, captured);
             store.flush_background_writes().await.unwrap();
@@ -5043,6 +5077,7 @@ mod tests {
                     ttft_ms: Some(500),
                     duration_ms: Some(4000),
                     protocol_outcome: polyflare_store::RequestProtocolOutcome::Cancelled,
+                stream_error_status: None,
                 },
             );
             store.flush_background_writes().await.unwrap();
@@ -5089,6 +5124,7 @@ mod tests {
                     ttft_ms: Some(250),
                     duration_ms: Some(2000),
                     protocol_outcome: polyflare_store::RequestProtocolOutcome::Completed,
+                stream_error_status: None,
                 },
             );
             store.flush_background_writes().await.unwrap();
@@ -5134,6 +5170,7 @@ mod tests {
                 ttft_ms: None,
                 duration_ms: Some(10),
                 protocol_outcome: polyflare_store::RequestProtocolOutcome::Completed,
+                stream_error_status: None,
             };
 
             for (request_id, tier, expected) in [
@@ -5189,6 +5226,7 @@ mod tests {
                 ttft_ms: None,
                 duration_ms: Some(10),
                 protocol_outcome: polyflare_store::RequestProtocolOutcome::Completed,
+                stream_error_status: None,
             };
 
             for (id, requested, served, expected) in [
@@ -5279,6 +5317,7 @@ mod tests {
                     ttft_ms: None,
                     duration_ms: Some(10),
                     protocol_outcome: polyflare_store::RequestProtocolOutcome::Completed,
+                stream_error_status: None,
                 },
             );
             store.flush_background_writes().await.unwrap();
