@@ -739,6 +739,7 @@ function DetailContent({
             reset={resetCandidate}
             resetLoading={resetPlan.isLoading}
             resetBusy={redeemReset.isPending}
+            resetEligible={identity.provider === "codex"}
             onRedeemReset={() => setResetRequestId(crypto.randomUUID())}
             actions={actions}
             onReauthenticate={
@@ -1104,6 +1105,7 @@ function ActionsCard({
   reset,
   resetLoading,
   resetBusy,
+  resetEligible,
   onRedeemReset,
   actions,
   onReauthenticate,
@@ -1122,6 +1124,9 @@ function ActionsCard({
   reset?: ResetPlanCandidateView;
   resetLoading: boolean;
   resetBusy: boolean;
+  /** Whether this provider has banked reset credits at all. False for Anthropic (Claude has no
+   * reset-credit mechanism), which hides the Reset reserve section entirely. */
+  resetEligible: boolean;
   onRedeemReset: () => void;
   actions: AccountActionsApi;
   /** Absent when the provider has no targeted re-auth flow (only Codex OAuth has one today). */
@@ -1215,6 +1220,7 @@ function ActionsCard({
           </ConfigRow>
         </div>
 
+        {resetEligible && (
         <div className="flex flex-col gap-3 rounded-lg border border-accent/20 bg-[linear-gradient(145deg,hsl(var(--bg)/0.35),hsl(var(--accent)/0.055))] p-3">
           <div className="flex items-center justify-between gap-2">
             <div className="text-[10px] font-semibold uppercase tracking-wide text-fg opacity-50">
@@ -1269,6 +1275,7 @@ function ActionsCard({
             </div>
           )}
         </div>
+        )}
 
         {/* Operations + Danger */}
         <div className="flex flex-col gap-3 rounded-lg border border-border/70 bg-bg/35 p-3">
