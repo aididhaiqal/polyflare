@@ -281,6 +281,115 @@ async fn refresh_account(
     Ok(true)
 }
 
+/// The two Anthropic usage windows expressed in seconds, so [`is_five_hour`]/[`derive_gate`]
+/// classify them by duration exactly as the codex windows are classified.
+const ANTHROPIC_FIVE_HOUR_SECS: i64 = 5 * 3600;
+const ANTHROPIC_WEEKLY_SECS: i64 = 7 * 24 * 3600;
+
+/// Refresh one Anthropic account's usage and plan from the OAuth `/api/oauth/usage` and
+/// `/api/oauth/profile` endpoints (the ones the Claude Code CLI polls). Persists the `five_hour`
+/// and `seven_day` windows into the SAME `usage_history` slots the codex path uses — so the
+/// dashboard bars, [`derive_gate`] routing, and the usage-driven health tier all light up with no
+/// Anthropic-specific plumbing — and syncs `plan_type` from the profile's `rate_limit_tier`.
+///
+/// Best-effort: a stale-token 401 or any fetch error returns `Ok(false)` (skip this cycle) rather
+/// than erroring, since the next real request refreshes the token reactively.
+#[allow(clippy::too_many_arguments)]
+async fn refresh_anthropic_account(
+    store: &polyflare_store::Store,
+    cipher: &TokenCipher,
+    upstream_base: &str,
+    account: &Account,
+    runtime: &RuntimeStates,
+    soft_drain_enabled: bool,
+    log_bus: &crate::log_bus::LogBus,
+    health_tier_metrics: &crate::observability::HealthTierMetrics,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::anthropic_usage;
+
+    let repo = store.accounts();
+    let usage = match anthropic_usage::fetch_usage(store, cipher, upstream_base, &account.id).await {
+        Ok(u) => u,
+        Err(_) => return Ok(false),
+    };
+
+    // Map the Anthropic windows onto the codex UsageWindow shape, tagged with their real durations
+    // so classification by duration (not slot) works unchanged.
+    let to_window = |w: &anthropic_usage::UsageWindow, secs: i64| UsageWindow {
+        used_percent: w.utilization,
+        reset_at: w.resets_at.as_deref().and_then(anthropic_usage::parse_iso_to_unix),
+        limit_window_seconds: Some(secs),
+    };
+    let primary = usage
+        .five_hour
+        .as_ref()
+        .map(|w| to_window(w, ANTHROPIC_FIVE_HOUR_SECS));
+    let secondary = usage
+        .seven_day
+        .as_ref()
+        .map(|w| to_window(w, ANTHROPIC_WEEKLY_SECS));
+    if primary.is_none() && secondary.is_none() {
+        return Ok(false);
+    }
+    let now = unix_now();
+    for (slot, w) in [("primary", &primary), ("secondary", &secondary)] {
+        if let Some(w) = w {
+            repo.insert_usage_window(
+                &account.id,
+                slot,
+                w.used_percent.unwrap_or(0.0),
+                w.reset_at,
+                w.limit_window_seconds.map(|s| s / 60),
+                now,
+            )
+            .await?;
+        }
+    }
+
+    let mut effective_status: &str = &account.status;
+    if USAGE_CONTROLLED.contains(&account.status.as_str()) {
+        let (status, reset_at) = derive_gate(primary.as_ref(), secondary.as_ref());
+        repo.update_status_and_reset(&account.id, status, reset_at)
+            .await?;
+        runtime.note_account_status_with_reset(&account.id, status, reset_at);
+        effective_status = status;
+    }
+
+    let status_frozen = HEALTH_TIER_FROZEN_STATUSES.contains(&effective_status);
+    let (five_hour_used, weekly_used) =
+        split_usage_by_duration(primary.as_ref(), secondary.as_ref());
+    let transition = runtime.evaluate_with_usage(
+        &AccountId::from(account.id.as_str()),
+        five_hour_used,
+        weekly_used,
+        status_frozen,
+        soft_drain_enabled,
+        now,
+    );
+    if let Some(t) = transition {
+        crate::observability::emit_health_tier_signal(
+            log_bus,
+            health_tier_metrics,
+            &account.id,
+            t.from,
+            t.to,
+            t.reason,
+        );
+    }
+
+    // Plan sync (best-effort): the profile endpoint names the tier the usage endpoint does not.
+    if let Ok(profile) =
+        anthropic_usage::fetch_profile(store, cipher, upstream_base, &account.id).await
+    {
+        let plan = anthropic_usage::plan_slug_from_profile(&profile);
+        if plan != "unknown" && plan != account.plan_type {
+            repo.update_plan_type(&account.id, plan).await?;
+        }
+    }
+
+    Ok(true)
+}
+
 /// Fetch and persist authoritative usage for one account on a safety-sensitive request path.
 ///
 /// `Ok(false)` means no trustworthy usage was obtained (for example, missing tokens or a
@@ -544,6 +653,32 @@ pub fn spawn_usage_refresh(state: Arc<AppState>) {
             // recovery/disable-lever coverage as codex accounts instead of being stranded in
             // DRAINING once the funnel refuses the quiet-timer promotion.
             for account in accounts.iter().filter(|a| a.provider != "codex") {
+                // Anthropic accounts DO have a usage source (the OAuth `/api/oauth/usage` +
+                // `/api/oauth/profile` endpoints), so poll it — this persists windows, sets the
+                // routing gate, syncs the plan, AND runs the usage-driven health-tier evaluation
+                // internally, so it fully replaces the error-only evaluation below for them.
+                if account.provider == "anthropic" {
+                    match refresh_anthropic_account(
+                        &state.store,
+                        &state.cipher,
+                        state.upstream_base_url_for(polyflare_core::Provider::Anthropic),
+                        account,
+                        &state.runtime,
+                        state.runtime_settings.soft_drain_enabled(),
+                        &state.log_bus,
+                        &state.health_tier_metrics,
+                    )
+                    .await
+                    {
+                        Ok(_) => continue,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "anthropic usage refresh failed");
+                            continue;
+                        }
+                    }
+                }
+                // Other non-codex accounts have no usage source: run only the error-driven tier
+                // evaluation so they get the same recovery/disable-lever coverage as codex accounts.
                 let transition = evaluate_non_codex_health_tier(
                     &state.runtime,
                     account,

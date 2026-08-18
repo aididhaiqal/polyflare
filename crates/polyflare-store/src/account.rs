@@ -1147,6 +1147,19 @@ impl AccountRepo {
         Ok(())
     }
 
+    /// Update an account's `plan_type` (the subscription tier slug). Codex derives it from the ID
+    /// token at login; Anthropic has no such claim, so the usage poller sets it from the
+    /// `/api/oauth/profile` `rate_limit_tier`. A no-op write is fine — callers only call on change.
+    pub async fn update_plan_type(&self, id: &str, plan_type: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE accounts SET plan_type = ? WHERE id = ?")
+            .bind(plan_type)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        self.bump_generation();
+        Ok(())
+    }
+
     /// Insert one `usage_history` window row (from a runtime usage refresh). `window` is
     /// `"primary"` (5h) or `"secondary"` (weekly). Append-only, exactly the shape the codex-lb
     /// importer writes, so `latest_usage` reads it back unchanged.
