@@ -142,3 +142,24 @@ export function tpsFmt(n: number | null | undefined): string {
 /** Alias for `tpsFmt` — kept for compatibility with the `tps(n)` naming used in the task-2 SDD
  * brief; prefer `tpsFmt` at new call sites since it disambiguates from the `tps` data field. */
 export const tps = tpsFmt;
+
+/** Human label for an account `plan_type`. Codex tiers arrive as `pro`/`plus`/`team`/`max` (from
+ * the ID-token claim); Anthropic tiers as `max_20x`/`max_5x`/`max`/`pro`/`unknown` (from the OAuth
+ * profile's `rate_limit_tier`, mapped server-side in `anthropic_usage::plan_slug_from_tier`). An
+ * unrecognized value is title-cased so a new tier still reads sensibly instead of breaking. */
+export function planLabel(plan: string | null | undefined): string {
+  if (!plan) return "—";
+  const known: Record<string, string> = {
+    max_20x: "Max 20×",
+    max_5x: "Max 5×",
+    max: "Max",
+    pro: "Pro",
+    plus: "Plus",
+    team: "Team",
+    free: "Free",
+    unknown: "Unknown",
+  };
+  return known[plan] ?? plan.replace(/(^|[_\s])([a-z])/g, (_, sep, c) => (sep ? " " : "") + c.toUpperCase());
+}
+// @check planLabel("max_20x") === "Max 20×"
+// @check planLabel("pro") === "Pro"

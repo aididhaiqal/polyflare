@@ -75,7 +75,7 @@ import {
   type UsageWindowView,
 } from "../lib/api";
 import { accountLabel } from "../lib/accountDisplay";
-import { compactNum, countdown, pct } from "../lib/format";
+import { compactNum, countdown, pct, planLabel } from "../lib/format";
 import {
   quotaDisplayLabel,
   quotaDisplayPercent,
@@ -650,7 +650,7 @@ function DetailContent({
                     {identity.workspace_label && <>{identity.workspace_label} · </>}
                   </>
                 )}
-                <span className="font-semibold text-fg opacity-90">{identity.plan_type}</span> plan
+                <span className="font-semibold text-fg opacity-90">{planLabel(identity.plan_type)}</span> plan
                 {" · "}
                 <span className="font-semibold text-fg opacity-90">
                   {identity.pools.length > 0 ? identity.pools.join(", ") : "unpooled"}
