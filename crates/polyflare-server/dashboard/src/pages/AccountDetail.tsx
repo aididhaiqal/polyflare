@@ -742,7 +742,9 @@ function DetailContent({
             onRedeemReset={() => setResetRequestId(crypto.randomUUID())}
             actions={actions}
             onReauthenticate={
-              identity.provider === "codex" ? () => setReauthOpen(true) : undefined
+              identity.provider === "codex" || identity.provider === "anthropic"
+                ? () => setReauthOpen(true)
+                : undefined
             }
             onProbe={
               identity.provider === "codex" ? () => probe.mutate(identity.id) : undefined
@@ -765,7 +767,12 @@ function DetailContent({
       <CodexOnboardingDialog
         open={reauthOpen}
         onOpenChange={setReauthOpen}
-        reauth={{ accountId: identity.id, label: displayName, email: identity.email }}
+        reauth={{
+          accountId: identity.id,
+          label: displayName,
+          email: identity.email,
+          provider: identity.provider === "anthropic" ? "anthropic" : "codex",
+        }}
       />
       <ExportAuthDialog
         open={exportOpen}

@@ -16,6 +16,9 @@ export interface ReauthTarget {
   accountId: string;
   label: string;
   email?: string | null;
+  /** The seat's provider. During reauth the provider picker is hidden, so this is the only way
+   * the dialog learns whether to run the Codex or the Claude (paste-code) flow. */
+  provider?: "codex" | "anthropic";
 }
 
 type Method = "browser" | "device";
@@ -82,7 +85,7 @@ export function CodexOnboardingDialog({
   // Anthropic has no device endpoint and no loopback redirect: its reviewed contract redirects to
   // a page on claude.com that DISPLAYS a code. So choosing Claude forces the browser+paste path
   // rather than offering options that cannot work.
-  const [provider, setProvider] = useState<"codex" | "anthropic">("codex");
+  const [provider, setProvider] = useState<"codex" | "anthropic">(reauth?.provider ?? "codex");
   const isClaude = provider === "anthropic";
   const start = useStartCodexOnboarding();
   const startDevice = useStartCodexDeviceOnboarding();
