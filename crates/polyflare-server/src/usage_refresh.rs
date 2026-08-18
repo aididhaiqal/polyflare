@@ -304,6 +304,7 @@ async fn refresh_anthropic_account(
     soft_drain_enabled: bool,
     log_bus: &crate::log_bus::LogBus,
     health_tier_metrics: &crate::observability::HealthTierMetrics,
+    model_catalog: &crate::model_catalog::ModelCatalogCache,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     use crate::anthropic_usage;
 
@@ -312,6 +313,11 @@ async fn refresh_anthropic_account(
         Ok(u) => u,
         Err(_) => return Ok(false),
     };
+
+    // Per-model weekly caps at 100% (e.g. Fable) route that model away from THIS account until the
+    // window resets, while the account keeps serving every other model. Replaces the account's cap
+    // set each cycle, so a reset clears within one poll interval.
+    model_catalog.set_capped_models(&account.id, anthropic_usage::models_at_cap(&usage));
 
     // Map the Anthropic windows onto the codex UsageWindow shape, tagged with their real durations
     // so classification by duration (not slot) works unchanged.
@@ -667,6 +673,7 @@ pub fn spawn_usage_refresh(state: Arc<AppState>) {
                         state.runtime_settings.soft_drain_enabled(),
                         &state.log_bus,
                         &state.health_tier_metrics,
+                        &state.model_catalog,
                     )
                     .await
                     {

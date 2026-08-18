@@ -64,24 +64,45 @@ fn retry_after_header(headers: &HeaderMap, _now: i64) -> Option<i64> {
         .filter(|&s| s >= 0)
 }
 
+/// True when the overage (pay-as-you-go) billing is disabled because the account is out of
+/// purchased credits. This is a SCOPED billing signal — the account's plan itself may still serve
+/// other models/requests — distinct from an account-wide rate limit. Mirrors better-ccflare's
+/// `isAnthropicOutOfCredits`.
+fn is_out_of_credits(headers: &HeaderMap) -> bool {
+    header(headers, "anthropic-ratelimit-unified-overage-disabled-reason")
+        .map(|v| v.trim().eq_ignore_ascii_case("out_of_credits"))
+        .unwrap_or(false)
+}
+
 /// Build the `FailureSignal` for a rejected Anthropic response.
 ///
 /// `retry_after` prefers the unified reset (the real per-account recovery time) over the generic
 /// `Retry-After`, falling back to it when the unified header is absent. `error_code` carries the
 /// unified status when present — content-safe (a fixed vocabulary, never a message body) — so a
 /// hard limit is distinguishable downstream from an ordinary 5xx.
+///
+/// `out_of_credits` takes precedence ONLY when the response is not also an account-wide hard limit:
+/// a genuine plan-limit `rate_limited` (which co-carries the overage header for accounts with no
+/// credits) must still cool the account until its reset, not fail over without benching, or an
+/// exhausted account would be retried in a tight loop.
 pub fn failure_signal(status: u16, headers: &HeaderMap, now: i64) -> FailureSignal {
     let unified = unified_status(headers);
     let retry_after =
         seconds_until_reset(headers, now).or_else(|| retry_after_header(headers, now));
-    // A 429/529, or a hard-limit unified status, is the rate-limited case; otherwise pass the
-    // upstream code through. The unified status (when present) is the most specific label.
-    let error_code = unified.clone().or_else(|| match status {
-        429 => Some("rate_limited".to_string()),
-        529 => Some("overloaded".to_string()),
-        _ => None,
-    });
-    let _ = is_hard_limit(unified.as_deref()); // reserved: hard-vs-soft drives future health tiers.
+    let hard = is_hard_limit(unified.as_deref());
+    let error_code = if is_out_of_credits(headers) && !hard {
+        // Scoped overage/credit rejection, not an account-wide limit → distinguishable so the
+        // router fails over WITHOUT benching this account.
+        Some("out_of_credits".to_string())
+    } else {
+        // A 429/529, or a hard-limit unified status, is the rate-limited case; otherwise pass the
+        // upstream code through. The unified status (when present) is the most specific label.
+        unified.clone().or_else(|| match status {
+            429 => Some("rate_limited".to_string()),
+            529 => Some("overloaded".to_string()),
+            _ => None,
+        })
+    };
     FailureSignal {
         status,
         retry_after,
@@ -182,6 +203,37 @@ mod tests {
         for status in ["allowed", "allowed_warning", "queueing_soft"] {
             assert!(!is_hard_limit(Some(status)), "{status} is not a hard limit");
         }
+    }
+
+    #[test]
+    fn out_of_credits_without_a_hard_limit_is_labelled_for_failover() {
+        // Overage disabled for lack of credits, and the account is NOT account-wide rate-limited
+        // → a scoped billing rejection the router should fail over on without benching.
+        let h = headers(&[(
+            "anthropic-ratelimit-unified-overage-disabled-reason",
+            "out_of_credits",
+        )]);
+        assert_eq!(
+            failure_signal(400, &h, unix_now()).error_code.as_deref(),
+            Some("out_of_credits")
+        );
+    }
+
+    #[test]
+    fn a_hard_rate_limit_wins_over_out_of_credits() {
+        // A genuine plan-limit 429 co-carries the overage header for a no-credits account, but it
+        // must still cool the account — the hard `rate_limited` status takes precedence.
+        let h = headers(&[
+            ("anthropic-ratelimit-unified-status", "rate_limited"),
+            (
+                "anthropic-ratelimit-unified-overage-disabled-reason",
+                "out_of_credits",
+            ),
+        ]);
+        assert_eq!(
+            failure_signal(429, &h, unix_now()).error_code.as_deref(),
+            Some("rate_limited")
+        );
     }
 
     #[test]

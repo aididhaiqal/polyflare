@@ -256,6 +256,15 @@ pub(crate) async fn bench_account_for_failure(
 ) {
     if let Some(sig) = sig {
         if let Some(code) = &sig.error_code {
+            if code.as_str() == "out_of_credits" {
+                // Scoped billing rejection (overage credits depleted), not an account-wide limit:
+                // fail over to another account WITHOUT benching, so this account keeps serving the
+                // models/requests that don't draw on exhausted overage. `rate_limit::failure_signal`
+                // only assigns this code when the response is NOT also a hard limit, so a genuine
+                // plan-limit 429 still falls through to the cooldown arm below. Mirrors ccflare's
+                // isAnthropicOutOfCredits fail-over-without-cooldown path.
+                return;
+            }
             if matches!(code.as_str(), "insufficient_quota" | "usage_not_included") {
                 state.runtime.record_quota_exceeded(id, now);
                 let _ = state

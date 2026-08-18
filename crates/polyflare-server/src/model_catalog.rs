@@ -139,6 +139,14 @@ pub struct ModelCatalogCache {
     /// periodically; empty until a row is written, so a deployment with no declarations behaves
     /// exactly as before.
     declared_support: RwLock<HashMap<String, HashMap<String, bool>>>,
+    /// TRANSIENT per-account per-model exhaustion, distinct from `declared_support`'s durable
+    /// capability: `account_id -> lowercased model-name substrings whose per-model weekly cap is
+    /// currently at 100%` (from the Anthropic usage poll's `weekly_scoped` limits, e.g. `"fable"`).
+    /// A capped substring temporarily makes `account_supports_model` answer `Some(false)` for any
+    /// model whose slug contains it, routing that model away from this account until the poll clears
+    /// it (the poll REPLACES each account's list every cycle, so a reset window clears within one
+    /// interval). Empty for every non-Anthropic account and whenever nothing is capped.
+    capped_models: RwLock<HashMap<String, Vec<String>>>,
     /// Single-flight guard: only one refresh touches the network at a time (concurrent
     /// `get_or_refresh` callers on a cold/expired cache collapse to one upstream fetch).
     refresh_lock: tokio::sync::Mutex<()>,
@@ -171,6 +179,7 @@ impl ModelCatalogCache {
             account_retry_after: RwLock::new(HashMap::new()),
             account_models: RwLock::new(HashMap::new()),
             declared_support: RwLock::new(HashMap::new()),
+            capped_models: RwLock::new(HashMap::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
             source,
             floor,
@@ -432,6 +441,20 @@ impl ModelCatalogCache {
     /// `None` means the account catalog has not been authoritatively fetched yet and routing
     /// remains permissive; `Some(false)` is a hard entitlement exclusion.
     pub fn account_supports_model(&self, account_id: &str, model: &str) -> Option<bool> {
+        // A currently-capped per-model window wins over everything: even a genuinely-supported model
+        // must route elsewhere while this account's weekly cap for it is at 100%. Substring match so
+        // one usage signal (`"fable"`) covers every slug variant of that model on this account.
+        if let Some(caps) = self
+            .capped_models
+            .read()
+            .expect("capped models lock poisoned")
+            .get(account_id)
+        {
+            let model_lc = model.to_ascii_lowercase();
+            if caps.iter().any(|name| model_lc.contains(name.as_str())) {
+                return Some(false);
+            }
+        }
         // A declared row wins over the fetched list. `/models` cannot enumerate a hidden preview,
         // so for such a model every fetched list says "absent" (`Some(false)`) — which would let it
         // fail open to every account. An explicit declaration is the only signal that this account
@@ -463,6 +486,24 @@ impl ModelCatalogCache {
             .declared_support
             .write()
             .expect("declared support lock poisoned") = map;
+    }
+
+    /// Replace an account's set of currently-capped model-name substrings (lowercased). Called by
+    /// the Anthropic usage poll each cycle with the `weekly_scoped` limits at 100% — an empty list
+    /// clears the account's caps. Idempotent; only the named account's entry is touched.
+    pub fn set_capped_models(&self, account_id: &str, names: Vec<String>) {
+        let mut map = self
+            .capped_models
+            .write()
+            .expect("capped models lock poisoned");
+        if names.is_empty() {
+            map.remove(account_id);
+        } else {
+            map.insert(
+                account_id.to_string(),
+                names.into_iter().map(|n| n.to_ascii_lowercase()).collect(),
+            );
+        }
     }
 
     /// Every account id declared (support = true) for `model`. Used to decide whether a hidden model
@@ -1386,6 +1427,43 @@ mod tests {
         assert_eq!(cache.account_supports_model("acct-a", "gpt-5.5"), None);
         // The declared one is answered by the overlay.
         assert_eq!(cache.account_supports_model("acct-a", "hidden"), Some(true));
+    }
+
+    /// A per-model cap (from the Anthropic usage poll) makes even a DECLARED-supported model route
+    /// away from that account by substring, and only that model — everything else still serves.
+    #[tokio::test]
+    async fn a_capped_model_overrides_support_by_substring() {
+        let cache = ModelCatalogCache::new(
+            Box::new(NoneSource),
+            Duration::from_secs(60),
+            default_floor(),
+        );
+        cache.set_declared_support([
+            ("acct-a".to_string(), "claude-fable-5".to_string(), true),
+            ("acct-a".to_string(), "claude-opus-5".to_string(), true),
+        ]);
+        // Both supported before any cap.
+        assert_eq!(cache.account_supports_model("acct-a", "claude-fable-5"), Some(true));
+        assert_eq!(cache.account_supports_model("acct-a", "claude-opus-5"), Some(true));
+
+        // Fable's weekly cap hits 100% → the poll caps "Fable" on this account.
+        cache.set_capped_models("acct-a", vec!["Fable".to_string()]);
+        assert_eq!(
+            cache.account_supports_model("acct-a", "claude-fable-5"),
+            Some(false),
+            "a capped model routes away by case-insensitive substring"
+        );
+        assert_eq!(
+            cache.account_supports_model("acct-a", "claude-opus-5"),
+            Some(true),
+            "an uncapped model on the same account is unaffected"
+        );
+        // Only this account is capped.
+        assert_eq!(cache.account_supports_model("acct-b", "claude-fable-5"), None);
+
+        // Window resets → the next poll clears the cap.
+        cache.set_capped_models("acct-a", vec![]);
+        assert_eq!(cache.account_supports_model("acct-a", "claude-fable-5"), Some(true));
     }
 
     fn default_floor() -> Vec<UpstreamModel> {

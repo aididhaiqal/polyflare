@@ -576,8 +576,9 @@ mod tests {
         assert_eq!(params["code_challenge_method"], "S256");
         assert_eq!(params["state"], "state-xyz");
         assert_eq!(params["redirect_uri"], "http://127.0.0.1:49152/callback");
-        // Only the inference scope — never Claude Code's broader permissions.
-        assert_eq!(params["scope"], "user:inference");
+        // Inference + profile (profile unlocks the usage/plan endpoints) — but never Claude Code's
+        // broader permissions (MCP, sessions, file upload, API-key creation).
+        assert_eq!(params["scope"], "user:inference user:profile");
         // The verifier is a secret and must never appear in a URL the browser sees.
         assert!(!url.contains(&pkce.verifier));
     }
