@@ -1293,6 +1293,21 @@ impl AccountRepo {
             .collect())
     }
 
+    /// Every account's stored access-token expiry (unix seconds), for the dashboard token-health
+    /// view. Opaque OAuth tokens (Anthropic) carry no JWT `exp`, so this column is their only
+    /// expiry source; JWT-bearing tokens (Codex) still derive from the JWT and keep this as a
+    /// fallback. A `None` value means the column is unset (no known expiry).
+    pub async fn list_access_token_expiries(
+        &self,
+    ) -> Result<HashMap<String, Option<i64>>, StoreError> {
+        let rows = sqlx::query_as::<_, (String, Option<i64>)>(
+            "SELECT id, access_token_expires_at FROM accounts ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// The most-recent `usage_history` row for each window ("primary"/"secondary") of an account.
     pub async fn latest_usage(&self, account_id: &str) -> Result<UsageSnapshot, StoreError> {
         Ok(UsageSnapshot {

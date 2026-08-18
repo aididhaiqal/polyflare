@@ -68,15 +68,37 @@ struct UsageWindowView {
     stale: bool,
 }
 
-/// The account's stored access-token health, derived from the token's OWN unverified JWT `exp`
-/// claim — never the token itself (see module docs: this surface never returns a token).
-/// `access_state` is `"missing"` (no token / undecryptable / `exp` unreadable), `"expired"`
-/// (`exp < now`), or `"valid"`. `access_expires_at` is the raw expiry unix-epoch-seconds (content-
-/// safe on its own — it identifies a moment in time, not a credential) or `null` when unknown.
+/// The account's stored access-token health. Preferred source is the token's OWN unverified JWT
+/// `exp` claim (Codex tokens are JWTs) — never the token itself (see module docs: this surface
+/// never returns a token). Anthropic access tokens are OPAQUE and carry no JWT `exp`, so the
+/// account's stored `access_token_expires_at` column is used as the fallback; without it those
+/// tokens would always read "missing" despite being valid. `access_state` is `"missing"` (no token
+/// / undecryptable / no expiry from either source), `"expired"` (`exp < now`), or `"valid"`.
+/// `access_expires_at` is the raw expiry unix-epoch-seconds (content-safe on its own — it
+/// identifies a moment in time, not a credential) or `null` when unknown.
 #[derive(Serialize)]
 struct TokenHealthView {
     access_state: &'static str,
     access_expires_at: Option<i64>,
+}
+
+/// Resolve token health from the JWT `exp` (when the token is a JWT) with the stored expiry column
+/// as fallback. Kept in one place so the list and the detail views can never disagree.
+fn derive_token_health(jwt_exp: Option<i64>, stored_exp: Option<i64>, now: i64) -> TokenHealthView {
+    match jwt_exp.or(stored_exp) {
+        Some(exp) if exp < now => TokenHealthView {
+            access_state: "expired",
+            access_expires_at: Some(exp),
+        },
+        Some(exp) => TokenHealthView {
+            access_state: "valid",
+            access_expires_at: Some(exp),
+        },
+        None => TokenHealthView {
+            access_state: "missing",
+            access_expires_at: None,
+        },
+    }
 }
 
 /// One account row for the dashboard. Windows are resolved by DURATION, not storage slot (see
@@ -137,6 +159,11 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         Ok(tokens) => tokens,
         Err(_) => return Response::error(),
     };
+    // Opaque OAuth tokens (Anthropic) have no JWT `exp`; the stored column is their only expiry.
+    let token_expiries = match repo.list_access_token_expiries().await {
+        Ok(expiries) => expiries,
+        Err(_) => return Response::error(),
+    };
     let mut pools_by_account = match repo.list_all_pools().await {
         Ok(pools) => pools,
         Err(_) => return Response::error(),
@@ -180,32 +207,18 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
             });
         }
 
-        // Token health: derived ONLY from the access token's own unverified JWT `exp` — the token
-        // itself never leaves `get_with_tokens`'s scope here. A decrypt failure or missing account
-        // (shouldn't happen — we just listed it) collapses to "missing", same as no token at all.
+        // Token health: preferred source is the access token's own unverified JWT `exp` (the token
+        // itself never leaves scope here); for opaque tokens with no JWT `exp` (Anthropic) it falls
+        // back to the stored `access_token_expires_at` column. A decrypt failure fails the request;
+        // a missing token blob (shouldn't happen — we just listed it) collapses to "missing".
+        let stored_exp = token_expiries.get(&account.id).copied().flatten();
         let token_health = match access_tokens
             .remove(&account.id)
             .map(|encrypted| encrypted.decrypt(&state.cipher))
         {
-            Some(Ok(token)) => match token_exp(token.as_str()) {
-                Some(exp) if exp < now => TokenHealthView {
-                    access_state: "expired",
-                    access_expires_at: Some(exp),
-                },
-                Some(exp) => TokenHealthView {
-                    access_state: "valid",
-                    access_expires_at: Some(exp),
-                },
-                None => TokenHealthView {
-                    access_state: "missing",
-                    access_expires_at: None,
-                },
-            },
+            Some(Ok(token)) => derive_token_health(token_exp(token.as_str()), stored_exp, now),
             Some(Err(_)) => return Response::error(),
-            None => TokenHealthView {
-                access_state: "missing",
-                access_expires_at: None,
-            },
+            None => derive_token_health(None, stored_exp, now),
         };
 
         let request_count_24h = request_counts.get(&account.id).copied().unwrap_or(0);
@@ -320,23 +333,13 @@ pub async fn account_detail_handler(
         });
     }
 
-    // Token status: derived ONLY from the access token's own unverified JWT `exp` — the token
-    // itself never leaves `get_with_tokens`'s scope here (identical pattern to `accounts_handler`).
-    let token_status = match repo.get_with_tokens(&id, &state.cipher).await {
-        Ok(Some((_, tokens))) => match token_exp(&tokens.access_token) {
-            Some(exp) if exp < now => TokenHealthView {
-                access_state: "expired",
-                access_expires_at: Some(exp),
-            },
-            Some(exp) => TokenHealthView {
-                access_state: "valid",
-                access_expires_at: Some(exp),
-            },
-            None => TokenHealthView {
-                access_state: "missing",
-                access_expires_at: None,
-            },
-        },
+    // Token status: preferred source is the access token's own unverified JWT `exp` (the token
+    // never leaves this scope); opaque tokens with no JWT `exp` (Anthropic) fall back to the stored
+    // `access_token_expires_at` column. Identical derivation to `accounts_handler`.
+    let token_status = match repo.get_with_tokens_and_auth(&id, &state.cipher).await {
+        Ok(Some((_, tokens, auth))) => {
+            derive_token_health(token_exp(&tokens.access_token), auth.access_token_expires_at, now)
+        }
         Ok(None) => TokenHealthView {
             access_state: "missing",
             access_expires_at: None,
@@ -2435,6 +2438,48 @@ impl<T: Serialize> axum::response::IntoResponse for Response<T> {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod token_health_tests {
+    use super::*;
+
+    const NOW: i64 = 1_000_000;
+
+    #[test]
+    fn jwt_exp_is_preferred_when_present() {
+        // A future JWT exp wins even if a stored expiry disagrees.
+        let h = derive_token_health(Some(NOW + 100), Some(NOW - 500), NOW);
+        assert_eq!(h.access_state, "valid");
+        assert_eq!(h.access_expires_at, Some(NOW + 100));
+    }
+
+    #[test]
+    fn opaque_token_falls_back_to_stored_expiry() {
+        // Anthropic: no JWT exp, but a valid stored column → "valid", not "missing".
+        let h = derive_token_health(None, Some(NOW + 3600), NOW);
+        assert_eq!(h.access_state, "valid");
+        assert_eq!(h.access_expires_at, Some(NOW + 3600));
+    }
+
+    #[test]
+    fn a_past_expiry_from_either_source_is_expired() {
+        assert_eq!(
+            derive_token_health(Some(NOW - 1), None, NOW).access_state,
+            "expired"
+        );
+        assert_eq!(
+            derive_token_health(None, Some(NOW - 1), NOW).access_state,
+            "expired"
+        );
+    }
+
+    #[test]
+    fn no_expiry_from_either_source_is_missing() {
+        let h = derive_token_health(None, None, NOW);
+        assert_eq!(h.access_state, "missing");
+        assert_eq!(h.access_expires_at, None);
     }
 }
 
