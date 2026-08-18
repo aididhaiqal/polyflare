@@ -78,6 +78,14 @@ enum Commands {
         #[command(subcommand)]
         command: CodexSessionsCommands,
     },
+    /// Read an Anthropic account's subscription usage from the free `/api/oauth/usage` endpoint
+    /// (the same one the Claude Code CLI polls) and print the raw JSON. Read-only diagnostic.
+    #[command(name = "anthropic-usage")]
+    AnthropicUsage {
+        /// Account id to read. Omit to read every Anthropic account.
+        #[arg(long = "account", value_name = "ACCOUNT_ID")]
+        account: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -309,7 +317,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 codex_home,
             } => codex_sessions_retag(&from, &to, dry_run, codex_home).await,
         },
+        Commands::AnthropicUsage { account } => anthropic_usage(account).await,
     }
+}
+
+async fn anthropic_usage(account: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let config = ServeConfig::from_env()?;
+    let store = Store::open(&config.db_path).await?;
+    let cipher = TokenCipher::load_or_create(&config.key_path)?;
+    let accounts: Vec<_> = store
+        .accounts()
+        .list()
+        .await?
+        .into_iter()
+        .filter(|a| {
+            a.provider == "anthropic" && account.as_deref().is_none_or(|id| a.id == id)
+        })
+        .collect();
+    if accounts.is_empty() {
+        println!("No matching Anthropic accounts.");
+        return Ok(());
+    }
+    for acct in &accounts {
+        let short = &acct.id[..acct.id.len().min(12)];
+        let who = if acct.email.is_empty() {
+            "(no email)"
+        } else {
+            acct.email.as_str()
+        };
+        println!("=== {short}  {who} ===");
+        match polyflare_server::anthropic_usage::fetch_usage_raw(
+            &store,
+            &cipher,
+            &config.anthropic_upstream_base_url,
+            &acct.id,
+        )
+        .await
+        {
+            Ok((status, body)) => println!("HTTP {status}\n{body}\n"),
+            Err(e) => println!("ERROR: {e}\n"),
+        }
+    }
+    Ok(())
 }
 
 fn resolve_codex_home(explicit: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
