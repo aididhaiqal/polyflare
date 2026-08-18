@@ -282,8 +282,19 @@ pub(crate) async fn bench_account_for_failure(
             }
         }
     }
+    // An Anthropic subscription HARD limit (`blocked`/`queueing_hard`/`payment_required`, from the
+    // `anthropic-ratelimit-unified-status` header) is a rate-limit even when it does not arrive as a
+    // 429 — treat it exactly like one so the account is cooled until its reset rather than merely
+    // accruing error count. Codex never sets these error codes, so this arm is Anthropic-only in
+    // practice and cannot change Codex behavior.
+    let is_anthropic_hard_limit = sig.is_some_and(|s| {
+        matches!(
+            s.error_code.as_deref(),
+            Some("blocked" | "queueing_hard" | "payment_required")
+        )
+    });
     let transition = match sig {
-        Some(sig) if sig.status == 429 => {
+        Some(sig) if sig.status == 429 || is_anthropic_hard_limit => {
             state.runtime.request_usage_refresh(id);
             let delay = sig
                 .retry_after
@@ -926,6 +937,18 @@ pub(crate) async fn resolve_core_account(
 /// One reactive OAuth recovery after an upstream 401, even when the rejected JWT still has a
 /// future `exp`. The per-account lock plus rejected-token comparison makes concurrent 401s a
 /// single-flight: the first waiter refreshes, later waiters adopt the newly stored token.
+/// Whether a watchdog error is an upstream 401. Both the streaming (`Upstream`) and buffered
+/// (`UpstreamHttp`) shapes carry the status; a rejected bearer surfaces as either.
+pub(crate) fn is_unauthorized(error: &WatchdogError) -> bool {
+    matches!(
+        error,
+        WatchdogError::Upstream(Some(signal)) if signal.status == 401
+    ) || matches!(
+        error,
+        WatchdogError::UpstreamHttp(response) if response.signal.status == 401
+    )
+}
+
 pub(crate) async fn force_refresh_after_unauthorized(
     state: &AppState,
     picked: &AccountId,
@@ -4071,9 +4094,19 @@ async fn messages_handler_native(
     };
 
     let health_id = picked.clone(); // moved into the executor below.
-                                    // C9 Task 2: the native `/v1/messages` streaming selection site — same lease treatment as
-                                    // `/responses`'s Route arm.
-    let response = match execute_with_watchdog_tracked(
+                                    // Captured BEFORE the executor consumes its inputs, so a 401 can be retried on a freshly
+                                    // refreshed token. Anthropic subscription-OAuth tokens are short-lived, and without this an
+                                    // expired token 401s, the account is benched, and it never recovers until an operator
+                                    // re-logs in — reactive refresh existed but was wired ONLY into the Codex `/responses` path.
+    let rejected_access_token = account.bearer_token.clone();
+    let prepared_for_auth_retry = prepared.clone();
+    let ctx_for_auth_retry = ctx.clone();
+    let picked_for_auth_retry = picked.clone();
+    let max_attempts = state.runtime_settings.max_account_attempts();
+
+    // C9 Task 2: the native `/v1/messages` streaming selection site — same lease treatment as
+    // `/responses`'s Route arm.
+    let mut execution = execute_with_watchdog_tracked(
         state.executor_for(provider).as_ref(),
         Arc::new(NoopContinuity) as Arc<dyn Continuity>,
         prepared,
@@ -4082,12 +4115,60 @@ async fn messages_handler_native(
         ctx,
         state.runtime.clone(),
         state.runtime_settings.stream_idle_timeout(),
-        state.runtime_settings.max_account_attempts(),
+        max_attempts,
         CommitWitness::new(),
         Some(in_flight),
     )
-    .await
-    {
+    .await;
+
+    // Reactive refresh-and-retry on a 401, mirroring the Codex path. A rejected bearer cannot have
+    // started sampling, so a single authenticated retry is safe and turns a silent bench into a
+    // served request. `force_refresh_after_unauthorized` dispatches to the Anthropic refresh by the
+    // account's stored `auth_mode`, so no provider branch is needed here.
+    if is_unauthorized_execution(&execution) {
+        match force_refresh_after_unauthorized(
+            &state,
+            &picked_for_auth_retry,
+            &rejected_access_token,
+            unix_now(),
+        )
+        .await
+        {
+            Ok(Some(refreshed_account)) => {
+                if let Some(retry_lease) = state
+                    .runtime
+                    .acquire_pinned_in_flight_weighted(
+                        &picked_for_auth_retry,
+                        unix_now(),
+                        &state.lease_metrics,
+                        sel_ctx.request_pressure_units,
+                    )
+                    .await
+                {
+                    execution = execute_with_watchdog_tracked(
+                        state.executor_for(provider).as_ref(),
+                        Arc::new(NoopContinuity) as Arc<dyn Continuity>,
+                        prepared_for_auth_retry,
+                        &refreshed_account,
+                        picked_for_auth_retry.clone(),
+                        ctx_for_auth_retry,
+                        state.runtime.clone(),
+                        state.runtime_settings.stream_idle_timeout(),
+                        max_attempts,
+                        CommitWitness::new(),
+                        Some(retry_lease),
+                    )
+                    .await;
+                }
+            }
+            // Refresh failed (grant gone, or refresh endpoint rejected it): fall through with the
+            // original 401 so it is recorded and surfaced honestly, exactly as before.
+            Ok(None) => {}
+            Err(refresh_response) => return (refresh_response, outcome),
+        }
+    }
+
+    let response = match execution {
         Ok(stream) => stream_response(stream),
         Err(e) => {
             record_failure(&state, &health_id, &e, unix_now()).await;
@@ -4095,6 +4176,11 @@ async fn messages_handler_native(
         }
     };
     (response, outcome)
+}
+
+/// A 401 on either watchdog-error shape, unwrapped from the executor's `Result`.
+fn is_unauthorized_execution<T>(execution: &Result<T, WatchdogError>) -> bool {
+    matches!(execution, Err(error) if is_unauthorized(error))
 }
 
 async fn messages_handler_custom_native(
@@ -4472,12 +4558,52 @@ async fn messages_handler_codex_aliased(
 mod tests {
     use super::{
         admitted_claude_affinity_identity, apply_scope_models_etag, derive_alias_prompt_cache_key,
-        response_transport, surface_watchdog_error, WaitClient,
+        is_unauthorized, is_unauthorized_execution, response_transport, surface_watchdog_error,
+        WaitClient,
     };
     use crate::watchdog::WatchdogError;
     use axum::body::{to_bytes, Body};
     use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode};
     use serde_json::json;
+
+    fn signal(status: u16) -> polyflare_core::FailureSignal {
+        polyflare_core::FailureSignal {
+            status,
+            retry_after: None,
+            error_code: None,
+        }
+    }
+
+    /// The 401 detection that gates the Anthropic (and Codex) reactive refresh-and-retry. It must
+    /// fire on BOTH watchdog-error shapes and on nothing else — a false negative benches an account
+    /// forever on an expired token; a false positive burns a refresh on an unrelated error.
+    #[test]
+    fn a_401_is_recognised_on_both_error_shapes_and_only_a_401() {
+        assert!(is_unauthorized(&WatchdogError::Upstream(Some(signal(401)))));
+        assert!(is_unauthorized(&WatchdogError::UpstreamHttp(
+            polyflare_core::UpstreamHttpError {
+                signal: signal(401),
+                headers: Vec::new(),
+                body: bytes::Bytes::new(),
+            }
+        )));
+        // Not a 401 → no refresh.
+        assert!(!is_unauthorized(&WatchdogError::Upstream(Some(signal(
+            500
+        )))));
+        assert!(!is_unauthorized(&WatchdogError::Upstream(Some(signal(
+            429
+        )))));
+        assert!(!is_unauthorized(&WatchdogError::AttemptBudgetExhausted));
+
+        // The Result wrapper the executor returns: only an Err(401) qualifies.
+        let ok: Result<(), WatchdogError> = Ok(());
+        assert!(!is_unauthorized_execution(&ok));
+        let err_401: Result<(), WatchdogError> = Err(WatchdogError::Upstream(Some(signal(401))));
+        assert!(is_unauthorized_execution(&err_401));
+        let err_500: Result<(), WatchdogError> = Err(WatchdogError::Upstream(Some(signal(500))));
+        assert!(!is_unauthorized_execution(&err_500));
+    }
 
     #[tokio::test]
     async fn logical_turn_budget_error_is_non_retryable_and_content_safe() {

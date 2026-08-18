@@ -8,6 +8,7 @@ pub mod executor;
 pub mod models;
 pub mod oauth;
 pub mod oauth_contract;
+pub mod rate_limit;
 pub mod reverse;
 pub mod translate;
 

@@ -28,6 +28,14 @@ impl AnthropicExecutor {
     }
 }
 
+fn unix_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[async_trait]
 impl Executor for AnthropicExecutor {
     async fn execute(
@@ -89,17 +97,12 @@ impl Executor for AnthropicExecutor {
             .map_err(|e| ExecError::Upstream(e.to_string()))?;
 
         if !resp.status().is_success() {
-            let retry_after = resp
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.trim().parse::<i64>().ok())
-                .filter(|&s| s >= 0);
-            return Err(ExecError::UpstreamStatus(polyflare_core::FailureSignal {
-                status: resp.status().as_u16(),
-                retry_after,
-                error_code: None,
-            }));
+            let signal = crate::rate_limit::failure_signal(
+                resp.status().as_u16(),
+                resp.headers(),
+                unix_now(),
+            );
+            return Err(ExecError::UpstreamStatus(signal));
         }
 
         let stream = resp
