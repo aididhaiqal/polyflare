@@ -74,6 +74,11 @@ pub struct RuntimeSettings {
     live_logs: AtomicBool,
     chatgpt_backend_passthrough_enabled: AtomicBool,
     wham_usage_replace_main_limit: AtomicBool,
+    // Session-volume circuit breaker (see `crate::session_governor`). Live-tunable, constant
+    // defaults (not `ServeConfig`-backed): warn threshold logs a runaway session; enforce=0 keeps
+    // rejection OFF until an operator opts in.
+    session_warn_per_hour: AtomicU32,
+    session_enforce_per_hour: AtomicU32,
     // Restart-required settings are immutable snapshots of what this process actually applied at
     // boot. PATCH persists a configured value for the next boot but deliberately does not mutate
     // these fields, allowing GET /api/settings to report an honest pending-restart state.
@@ -109,6 +114,13 @@ fn narrow_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
+/// Default session-governor warn threshold: log once when a single client session crosses this many
+/// requests in a rolling hour (a likely runaway subagent fan-out). Mirrors better-ccflare's 300.
+pub const DEFAULT_SESSION_WARN_PER_HOUR: u32 = 300;
+/// Default session-governor ENFORCE threshold: 0 disables rejection (warn-only). An operator raises
+/// it to start rejecting a session's excess requests. Mirrors better-ccflare's off-by-default.
+pub const DEFAULT_SESSION_ENFORCE_PER_HOUR: u32 = 0;
+
 impl RuntimeSettings {
     /// Seed every atomic from an already-clamped `ServeConfig` (durations → `.as_secs()`, the
     /// `f64` field → `to_bits`). Does not itself re-clamp — `ServeConfig::from_env` (or the
@@ -129,6 +141,8 @@ impl RuntimeSettings {
             live_logs: AtomicBool::new(cfg.live_logs),
             chatgpt_backend_passthrough_enabled: AtomicBool::new(true),
             wham_usage_replace_main_limit: AtomicBool::new(true),
+            session_warn_per_hour: AtomicU32::new(DEFAULT_SESSION_WARN_PER_HOUR),
+            session_enforce_per_hour: AtomicU32::new(DEFAULT_SESSION_ENFORCE_PER_HOUR),
             client_websocket_enabled: cfg.client_websocket_enabled,
             http_requests_use_upstream_websocket: cfg.http_requests_use_upstream_websocket,
             http_upstream_websocket_ping: cfg.http_upstream_websocket_ping,
@@ -163,6 +177,8 @@ impl RuntimeSettings {
             live_logs: AtomicBool::new(f.live_logs),
             chatgpt_backend_passthrough_enabled: AtomicBool::new(true),
             wham_usage_replace_main_limit: AtomicBool::new(true),
+            session_warn_per_hour: AtomicU32::new(DEFAULT_SESSION_WARN_PER_HOUR),
+            session_enforce_per_hour: AtomicU32::new(DEFAULT_SESSION_ENFORCE_PER_HOUR),
             client_websocket_enabled: true,
             http_requests_use_upstream_websocket: false,
             http_upstream_websocket_ping: false,
@@ -193,6 +209,14 @@ impl RuntimeSettings {
 
     pub fn inflight_penalty_pct(&self) -> f64 {
         f64::from_bits(self.inflight_penalty_pct.load(Ordering::Relaxed))
+    }
+
+    pub fn session_warn_per_hour(&self) -> u32 {
+        self.session_warn_per_hour.load(Ordering::Relaxed)
+    }
+
+    pub fn session_enforce_per_hour(&self) -> u32 {
+        self.session_enforce_per_hour.load(Ordering::Relaxed)
     }
 
     pub fn soft_drain_enabled(&self) -> bool {
@@ -252,6 +276,19 @@ impl RuntimeSettings {
                 let n = narrow_u32(expect_u64(key, raw)?);
                 let clamped = clamp_max_account_attempts(n);
                 self.max_account_attempts.store(clamped, Ordering::Relaxed);
+                Ok(clamped.to_string())
+            }
+            "session_warn_per_hour" => {
+                // 0 disables the warn tripwire; cap defuses an absurd value.
+                let clamped = narrow_u32(expect_u64(key, raw)?).min(1_000_000);
+                self.session_warn_per_hour.store(clamped, Ordering::Relaxed);
+                Ok(clamped.to_string())
+            }
+            "session_enforce_per_hour" => {
+                // 0 disables rejection (warn-only); cap defuses an absurd value.
+                let clamped = narrow_u32(expect_u64(key, raw)?).min(1_000_000);
+                self.session_enforce_per_hour
+                    .store(clamped, Ordering::Relaxed);
                 Ok(clamped.to_string())
             }
             "starvation_wait_budget" => {
@@ -350,7 +387,9 @@ pub fn parse_setting_value(key: &str, s: &str) -> Option<SettingValue> {
         | "wake_jitter_ms"
         | "stream_idle_timeout"
         | "request_log_retention_days"
-        | "usage_history_retention_days" => s.parse::<u64>().ok().map(SettingValue::U64),
+        | "usage_history_retention_days"
+        | "session_warn_per_hour"
+        | "session_enforce_per_hour" => s.parse::<u64>().ok().map(SettingValue::U64),
         _ => None,
     }
 }

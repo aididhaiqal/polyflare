@@ -1853,7 +1853,7 @@ struct FieldSpec {
 /// `docs/superpowers/specs/2026-07-21-dashboard-settings-design.md`'s "Deferred / read-only"
 /// section exactly.
 const FIELD_SPECS: &[FieldSpec] = &[
-    // --- live (11) ---
+    // --- live (13) ---
     FieldSpec {
         key: "max_account_attempts",
         class: "live",
@@ -1961,6 +1961,24 @@ const FIELD_SPECS: &[FieldSpec] = &[
         min: None,
         max: None,
         default: "true",
+    },
+    FieldSpec {
+        key: "session_warn_per_hour",
+        class: "live",
+        kind: "u32",
+        coercion: Some(FieldKind::U64),
+        min: Some(0.0),
+        max: Some(1_000_000.0),
+        default: "300",
+    },
+    FieldSpec {
+        key: "session_enforce_per_hour",
+        class: "live",
+        kind: "u32",
+        coercion: Some(FieldKind::U64),
+        min: Some(0.0),
+        max: Some(1_000_000.0),
+        default: "0",
     },
     // --- restart-only (10; five WebSocket values are editable for the next boot) ---
     FieldSpec {
@@ -2182,6 +2200,8 @@ pub(crate) const LIVE_KEYS_ORDER: &[&str] = &[
     "live_logs",
     "chatgpt_backend_passthrough_enabled",
     "wham_usage_replace_main_limit",
+    "session_warn_per_hour",
+    "session_enforce_per_hour",
 ];
 
 /// A live field's current value, stringified. Durations emit the whole-seconds number (e.g.
@@ -2203,6 +2223,8 @@ fn live_value(rs: &crate::runtime_settings::RuntimeSettings, key: &str) -> Strin
             rs.chatgpt_backend_passthrough_enabled().to_string()
         }
         "wham_usage_replace_main_limit" => rs.wham_usage_replace_main_limit().to_string(),
+        "session_warn_per_hour" => rs.session_warn_per_hour().to_string(),
+        "session_enforce_per_hour" => rs.session_enforce_per_hour().to_string(),
         _ => unreachable!("live_value called with a non-live key: {key}"),
     }
 }

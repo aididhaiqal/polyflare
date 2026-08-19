@@ -703,6 +703,33 @@ fn upstream_http_error_response(error: &WatchdogError) -> Option<Response> {
     )
 }
 
+/// The local `429` returned when a client session exceeds the governor's enforce limit. Shaped as a
+/// native Anthropic `rate_limit_error` so a Claude client handles it exactly as an upstream limit,
+/// with a `Retry-After` and a marker header so a fronting proxy knows it is a deliberate policy
+/// rejection (not an upstream flake to hold-and-retry).
+fn session_reject_response(verdict: &crate::session_governor::SessionVerdict) -> Response {
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "rate_limit_error",
+            "message": format!(
+                "PolyFlare session budget exceeded: {} requests in the last hour (limit {}). \
+                 This usually indicates runaway subagent fan-out.",
+                verdict.count, verdict.enforce_limit
+            )
+        }
+    });
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            ("x-polyflare-governor", "session-budget".to_string()),
+            ("retry-after", verdict.retry_after_secs.to_string()),
+        ],
+        Json(body),
+    )
+        .into_response()
+}
+
 fn surface_watchdog_error(error: &WatchdogError) -> Response {
     if matches!(error, WatchdogError::AttemptBudgetExhausted) {
         return (
@@ -3633,6 +3660,34 @@ async fn messages_route(
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response(),
     };
     maybe_capture_fingerprint(&state, "POST", "/v1/messages", &headers);
+
+    // Session-volume circuit breaker: contain a runaway client session (a subagent fan-out that
+    // spirals) BEFORE account selection, so its excess costs no upstream quota. Keyed on the Claude
+    // Code session id; anonymous traffic is ungoverned; off unless an operator sets an enforce
+    // limit. Runs first so a rejected request never reaches an account.
+    if let Some(session_key) = headers
+        .get("x-claude-code-session-id")
+        .and_then(|value| value.to_str().ok())
+    {
+        if let Some(verdict) = crate::session_governor::global().record(
+            session_key,
+            unix_now(),
+            state.runtime_settings.session_warn_per_hour(),
+            state.runtime_settings.session_enforce_per_hour(),
+        ) {
+            if verdict.should_warn {
+                tracing::warn!(
+                    count = verdict.count,
+                    "a client session crossed the session-governor warn threshold \
+                     (possible runaway subagent fan-out)"
+                );
+            }
+            if verdict.rejected {
+                return session_reject_response(&verdict);
+            }
+        }
+    }
+
     // Keep the bounded background-writer handle before `state` moves into a sub-handler.
     let log_store = state.store.clone();
     // Observe terminal Anthropic usage on the exact client-facing body, then queue the update
