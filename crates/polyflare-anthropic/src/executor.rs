@@ -6,8 +6,64 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use reqwest::header::HeaderMap;
 
-use polyflare_core::{Account, ExecError, Executor, PreparedRequest, RequestCtx, ResponseStream};
+use polyflare_core::{
+    Account, ExecError, Executor, PreparedRequest, RequestCtx, ResponseStream, UpstreamHttpError,
+};
+
+/// Content-safety cap on how much of a non-2xx error body we read into memory (mirrors the Codex
+/// executor's cap). A hostile or merely huge upstream error body must never be read unbounded.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Read a non-2xx response body up to [`MAX_ERROR_BODY_BYTES`], truncating past the cap. So the
+/// client can be shown the REAL upstream error (a genuine 429 with its message + retry-after) once
+/// failover is exhausted, instead of a generic 502.
+async fn read_bounded_error_body(resp: reqwest::Response) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while buf.len() < MAX_ERROR_BODY_BYTES {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        let Ok(chunk) = chunk else { break };
+        let room = MAX_ERROR_BODY_BYTES - buf.len();
+        let take = room.min(chunk.len());
+        buf.extend_from_slice(&chunk[..take]);
+    }
+    buf
+}
+
+/// Response headers safe to forward to the client verbatim — hop-by-hop and cookie headers dropped.
+/// Keeps `retry-after` and the `anthropic-ratelimit-unified-*` headers so a surfaced 429/529 carries
+/// the real reset the client should honor. Mirrors the Codex executor's filter.
+fn safe_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "connection"
+                    | "content-length"
+                    | "content-encoding"
+                    | "transfer-encoding"
+                    | "keep-alive"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+                    | "te"
+                    | "trailer"
+                    | "upgrade"
+                    | "set-cookie"
+            )
+        })
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect()
+}
 
 /// The Anthropic Messages API version this executor speaks. Every request must carry this header
 /// (doc-verified against the Anthropic TypeScript SDK: `'anthropic-version': '2023-06-01'` is sent
@@ -97,12 +153,22 @@ impl Executor for AnthropicExecutor {
             .map_err(|e| ExecError::Upstream(e.to_string()))?;
 
         if !resp.status().is_success() {
+            // Build the failure signal from the headers (the ladder + out_of_credits/529 logic),
+            // capture the forwardable headers, THEN read the bounded body — so that when account
+            // failover is exhausted the ingress can surface the REAL upstream response (a genuine
+            // 429/529 with its retry-after and message) instead of a generic 502.
             let signal = crate::rate_limit::failure_signal(
                 resp.status().as_u16(),
                 resp.headers(),
                 unix_now(),
             );
-            return Err(ExecError::UpstreamStatus(signal));
+            let headers = safe_response_headers(resp.headers());
+            let body = read_bounded_error_body(resp).await;
+            return Err(ExecError::UpstreamHttp(UpstreamHttpError {
+                signal,
+                headers,
+                body: bytes::Bytes::from(body),
+            }));
         }
 
         let stream = resp

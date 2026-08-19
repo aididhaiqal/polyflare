@@ -68,11 +68,12 @@ async fn executor_surfaces_upstream_error_status() {
         .await
         .err()
         .unwrap();
-    // A non-2xx upstream response now surfaces the structured status (404 here from the missing
-    // base), not a stringly `Upstream` — so the ingress can classify it for routing-health.
+    // A non-2xx upstream response now surfaces the FULL response (status + safe headers + bounded
+    // body) as `UpstreamHttp`, so the ingress can both classify it for routing-health AND forward
+    // the real upstream error to the client once account failover is exhausted (no generic 502).
     assert!(
-        matches!(&err, polyflare_core::ExecError::UpstreamStatus(s) if s.status == 404),
-        "expected UpstreamStatus(404), got {err:?}"
+        matches!(&err, polyflare_core::ExecError::UpstreamHttp(e) if e.signal.status == 404),
+        "expected UpstreamHttp(404), got {err:?}"
     );
 }
 
