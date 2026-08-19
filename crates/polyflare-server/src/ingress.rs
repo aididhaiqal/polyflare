@@ -3284,8 +3284,78 @@ async fn responses_handler_impl_with_max_attempts(
                             )
                             .await
                         }
-                        // A live-anchor pinned turn: surfaces exactly as before this task.
-                        None => surface_watchdog_error(&e),
+                        // A live-anchor pinned turn. Before surfacing, give a REJECTED anchor one
+                        // anchorless retry on the SAME account.
+                        //
+                        // The upstream drops a response id whenever the turn that would have
+                        // created it never completed — a PolyFlare restart mid-stream is the
+                        // common cause — while the client still records the id it expected. Its
+                        // next turn then sends an anchor the upstream has never heard of and the
+                        // thread is stuck: the body is unchanged, so every retry fails the same
+                        // way. `RouteDecision::Recover` already strips the anchor when PolyFlare
+                        // knows in ADVANCE the owner cannot serve; this is the reactive half, for
+                        // when only the upstream knows.
+                        //
+                        // Same account, so conversation ownership is never re-homed — the
+                        // constraint the `resend_req_for_loop` gate above exists to protect.
+                        // Gated on nothing having been relayed, so this can never duplicate output.
+                        // Triggered by the status alone rather than by matching the error text:
+                        // PolyFlare built the request and therefore knows it carried an anchor, and
+                        // this codebase never scrapes error prose. A 400 from a genuinely malformed
+                        // body simply fails again and surfaces unchanged, costing one retry.
+                        None => {
+                            let rejected_anchor = !commit.is_committed()
+                                && matches!(
+                                    &e,
+                                    WatchdogError::UpstreamHttp(r) if r.signal.status == 400
+                                );
+                            let retry = match (rejected_anchor, recovery_for_cyber) {
+                                (true, RecoveryPlan::ResendFull { anchorless_req }) => {
+                                    Some(anchorless_req)
+                                }
+                                _ => None,
+                            };
+                            match retry {
+                                Some(anchorless_req) => {
+                                    state.relay_metrics.record("anchor_rejected_http_retry");
+                                    state
+                                        .runtime
+                                        .refund_logical_turn_attempt(ctx.logical_turn_key.as_deref());
+                                    let lease = state
+                                        .runtime
+                                        .acquire_pinned_in_flight_weighted(
+                                            &id,
+                                            unix_now(),
+                                            &state.lease_metrics,
+                                            sel_ctx.request_pressure_units,
+                                        )
+                                        .await;
+                                    match execute_recovery_tracked(
+                                        state.executor_for(provider).as_ref(),
+                                        state.continuity.clone(),
+                                        anchorless_req,
+                                        &account,
+                                        id.clone(),
+                                        ctx.clone(),
+                                        session_key.clone(),
+                                        state.runtime.clone(),
+                                        state.runtime_settings.stream_idle_timeout(),
+                                        max_attempts,
+                                        commit.clone(),
+                                        lease,
+                                    )
+                                    .await
+                                    {
+                                        Ok(stream) => stream_response(stream),
+                                        // The anchorless resend failed too: surface THAT error, so
+                                        // the client sees the real reason rather than the stale
+                                        // anchor rejection this retry was trying to get past.
+                                        Err(retry_err) => surface_watchdog_error(&retry_err),
+                                    }
+                                }
+                                None => surface_watchdog_error(&e),
+                            }
+                        }
                     }
                 }
             }
