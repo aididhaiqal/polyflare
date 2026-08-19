@@ -291,6 +291,34 @@ mod tests {
     }
 
     #[test]
+    fn model_cap_windows_returns_every_per_model_window_not_only_the_exhausted_ones() {
+        let usage: UsageResponse = serde_json::from_str(USAGE_JSON).unwrap();
+        let windows = model_cap_windows(&usage);
+        // Only `weekly_scoped` entries are per-model; `session`/`weekly_all` are account-level.
+        assert_eq!(windows.len(), 1);
+        let fable = &windows[0];
+        assert_eq!(fable.display_name, "Fable");
+        assert_eq!(fable.percent, 100.0);
+        assert_eq!(fable.resets_at, Some(1_787_543_999)); // 2026-08-24T03:59:59Z
+        // The routing view is the >=100 subset of the same data — one source of truth.
+        assert_eq!(models_at_cap(&usage), vec!["Fable".to_string()]);
+    }
+
+    #[test]
+    fn a_partially_used_model_window_is_reported_but_not_capped() {
+        // Same shape with Fable at 40%: visible to the dashboard, invisible to routing.
+        let json = USAGE_JSON.replace("\"percent\":100", "\"percent\":40");
+        let usage: UsageResponse = serde_json::from_str(&json).unwrap();
+        let windows = model_cap_windows(&usage);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].percent, 40.0);
+        assert!(
+            models_at_cap(&usage).is_empty(),
+            "a sub-100% model must NOT be routed around"
+        );
+    }
+
+    #[test]
     fn detects_out_of_credits() {
         let usage: UsageResponse = serde_json::from_str(USAGE_JSON).unwrap();
         assert_eq!(
