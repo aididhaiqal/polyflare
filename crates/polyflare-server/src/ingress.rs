@@ -4066,6 +4066,14 @@ async fn messages_handler_native(
             .map(|envelope| (envelope, headers, raw))
     });
 
+    // The admitted client's session id, used ONLY as the rendezvous key below so consecutive turns
+    // of one conversation prefer the same seat. Anthropic prompt caches (`cache_control` ephemeral
+    // breakpoints) are scoped PER ACCOUNT, so bouncing a conversation between seats re-prefills its
+    // whole cached prefix every turn — correct, but needlessly expensive. `NoopContinuity` still
+    // applies: Anthropic is stateless, so this is a cost preference, never a correctness pin, and
+    // any seat can still serve any turn when the preferred one is filtered out (cooldown, per-model
+    // cap, drain). Different conversations hash to different seats, so the pool still balances.
+    let mut client_session_id: Option<String> = None;
     let req = match admitted {
         Some((envelope, headers, raw)) => {
             // Content-free compatibility observation: which client shape we admitted, never what
@@ -4075,6 +4083,7 @@ async fn messages_handler_native(
                 claude_client_shape = %envelope.shape_key(),
                 "admitted native Claude request for byte pass-through"
             );
+            client_session_id = Some(envelope.session_id.clone());
             PreparedRequest {
                 body: None,
                 model,
@@ -4122,7 +4131,9 @@ async fn messages_handler_native(
         now,
         require_security_work_authorized: false,
         rng_seed: None,
-        session_id: None,
+        // Soft cache affinity — see `client_session_id` above. `None` for a non-Claude-Code client
+        // (no session id to key on), which simply falls back to plain capacity weighting.
+        session_id: client_session_id,
         // Native Anthropic requests carry no Codex model-alias tier; tier steering is a
         // Codex-pool concern, so leave it unset here.
         tier: None,
