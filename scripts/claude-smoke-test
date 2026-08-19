@@ -32,16 +32,18 @@ echo "   model : $MODEL"
 echo
 
 # --- 1. Snapshot + disable translation so the request reaches native Claude ------------------------
-declare -A WAS_ENABLED
+# macOS ships bash 3.2 (no associative arrays), so snapshot each route's enabled flag to a temp file
+# as "id enabled" lines and restore from it — works on any POSIX-ish bash.
+SNAP_FILE=$(mktemp)
 for r in $ROUTES; do
-  WAS_ENABLED[$r]=$(sql "SELECT enabled FROM translation_routes WHERE id='$r';")
+  echo "$r $(sql "SELECT COALESCE(enabled,1) FROM translation_routes WHERE id='$r';")" >>"$SNAP_FILE"
 done
 
 restore() {
-  for r in $ROUTES; do
-    want="${WAS_ENABLED[$r]:-1}"
-    sql "UPDATE translation_routes SET enabled=$want WHERE id='$r';"
-  done
+  while read -r rid want; do
+    [ -n "$rid" ] && sql "UPDATE translation_routes SET enabled=${want:-1} WHERE id='$rid';"
+  done <"$SNAP_FILE"
+  rm -f "$SNAP_FILE"
   echo "-- translation routes restored to their original state"
 }
 trap restore EXIT
