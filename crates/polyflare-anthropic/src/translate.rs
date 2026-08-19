@@ -88,6 +88,33 @@ fn map_request(body: Value) -> Value {
     map_request_with_contract(body, true)
 }
 
+/// Flatten an Anthropic `system` into the single string Responses' `instructions` requires.
+///
+/// Anthropic accepts either a bare string or an array of content blocks, and a real Claude Code
+/// request always sends the ARRAY form (it needs the block boundaries to place `cache_control`
+/// breakpoints). Responses has no such concept and rejects a non-string outright —
+/// `400 Invalid type for 'instructions': expected a string, but got an array instead` — so passing
+/// the value through untouched broke every genuine client while the string form used in tests
+/// happened to work.
+///
+/// Only `text` blocks carry instructions; anything else (and any block missing `text`) is dropped
+/// rather than guessed at. Blocks are joined by a blank line so their separation survives. Returns
+/// `None` when nothing usable remains, so the caller omits `instructions` entirely instead of
+/// sending an empty string.
+fn flatten_system(system: &Value) -> Option<String> {
+    let text = match system {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block.get("text")?.as_str())
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        _ => return None,
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
 fn map_request_with_contract(body: Value, codex_contract: bool) -> Value {
     let model = body.get("model").cloned().unwrap_or(Value::Null);
     let system = body.get("system").cloned();
@@ -113,8 +140,8 @@ fn map_request_with_contract(body: Value, codex_contract: bool) -> Value {
     } else if let Some(max_tokens) = body.get("max_tokens") {
         map.insert("max_output_tokens".to_string(), max_tokens.clone());
     }
-    if let Some(sys) = system {
-        map.insert("instructions".to_string(), sys);
+    if let Some(sys) = system.as_ref().and_then(flatten_system) {
+        map.insert("instructions".to_string(), Value::String(sys));
     }
     if let Some(t) = tools {
         map.insert("tools".to_string(), map_tools(&t));
@@ -974,6 +1001,55 @@ mod tests {
         });
         let out = map_request(body);
         assert_eq!(out["instructions"], json!("You are a helpful assistant."));
+    }
+
+    /// The shape a REAL Claude Code request sends: `system` as content blocks, because it needs the
+    /// block boundaries to place `cache_control` breakpoints. Responses rejects a non-string
+    /// `instructions` outright, so forwarding the array 400s every genuine client — which the
+    /// string-only test above could never catch.
+    #[test]
+    fn flattens_a_block_form_system_into_a_single_instructions_string() {
+        let body = json!({
+            "model": "claude-sonnet-4-5-20250929",
+            "system": [
+                {"type": "text", "text": "You are a Claude agent."},
+                {"type": "text", "text": "Follow the instructions below.",
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ],
+            "messages": [],
+        });
+        let out = map_request(body);
+        assert_eq!(
+            out["instructions"],
+            json!("You are a Claude agent.\n\nFollow the instructions below."),
+            "blocks join into one string, keeping their separation"
+        );
+        assert!(out["instructions"].is_string(), "Responses requires a string");
+    }
+
+    #[test]
+    fn non_text_and_empty_system_blocks_are_dropped_not_guessed_at() {
+        let body = json!({
+            "model": "m",
+            "system": [
+                {"type": "image", "source": {"type": "base64", "data": "..."}},
+                {"type": "text", "text": "   "},
+                {"type": "text", "text": "Real instruction."}
+            ],
+            "messages": [],
+        });
+        assert_eq!(map_request(body)["instructions"], json!("Real instruction."));
+    }
+
+    #[test]
+    fn a_system_with_nothing_usable_omits_instructions_entirely() {
+        for system in [json!([]), json!([{"type": "image"}]), json!(""), json!(null)] {
+            let out = map_request(json!({"model": "m", "system": system, "messages": []}));
+            assert!(
+                out.get("instructions").is_none(),
+                "an empty instructions string is worse than no field: {system}"
+            );
+        }
     }
 
     #[test]
