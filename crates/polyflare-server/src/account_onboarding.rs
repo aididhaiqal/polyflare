@@ -518,6 +518,11 @@ async fn persist_anthropic(
         .onboarding()
         .complete(flow_id, &account_id, unix_now())
         .await;
+    // Poll this seat's usage/plan right away instead of leaving it at `plan_type = "unknown"`
+    // until the next ten-minute sweep — the first thing an operator sees after adding an account.
+    state
+        .runtime
+        .request_usage_refresh(&polyflare_core::AccountId::from(account_id.as_str()));
     Ok(account_id)
 }
 

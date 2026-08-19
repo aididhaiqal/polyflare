@@ -642,6 +642,31 @@ pub fn spawn_usage_refresh(state: Arc<AppState>) {
                                     "immediate usage refresh failed after capacity signal"
                                 );
                             }
+                        } else if account.provider == "anthropic" {
+                            // Anthropic accounts have their own usage/plan source, so honour the
+                            // same on-demand signal instead of waiting up to a full poll interval.
+                            // Also what makes a NEWLY ONBOARDED seat show its real plan at once
+                            // rather than sitting at `unknown` until the next sweep.
+                            if let Err(e) = refresh_anthropic_account(
+                                &immediate_state.store,
+                                &immediate_state.cipher,
+                                immediate_state
+                                    .upstream_base_url_for(polyflare_core::Provider::Anthropic),
+                                &account,
+                                &immediate_state.runtime,
+                                immediate_state.runtime_settings.soft_drain_enabled(),
+                                &immediate_state.log_bus,
+                                &immediate_state.health_tier_metrics,
+                                &immediate_state.model_catalog,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    account_id = %account.id,
+                                    error = %e,
+                                    "immediate Anthropic usage refresh failed"
+                                );
+                            }
                         }
                     }
                     if !immediate_state.runtime.finish_usage_refresh(&id) {
