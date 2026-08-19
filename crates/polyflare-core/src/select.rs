@@ -41,6 +41,16 @@ pub fn plan_capacity_secondary(plan: &str) -> f64 {
         "plus" | "business" | "team" | "edu" => 7560.0,
         "pro" | "enterprise" => 50400.0,
         "prolite" => 37800.0,
+        // Anthropic subscription tiers (`anthropic_usage::plan_slug_from_tier`). Without these a
+        // Claude Max seat fell through to the FREE-tier capacity below, so two seats on different
+        // Claude plans weighted identically. Scaled off the `pro` arm by the tiers' own naming
+        // (Max 5x / Max 20x are sold as multiples of Pro); only the RATIO between Claude seats
+        // matters, since selection is provider-scoped and Claude seats never weigh against Codex.
+        "max_20x" => 50400.0 * 20.0,
+        "max_5x" => 50400.0 * 5.0,
+        // Bare "max" of unknown multiple: assume the smaller so an unknown seat is never
+        // over-weighted into absorbing traffic it cannot serve.
+        "max" => 50400.0 * 5.0,
         // Any still-unrecognized plan → the free tier (codex-lb UNKNOWN_PLAN_FALLBACK), NOT plus.
         _ => 1134.0,
     }
@@ -1216,6 +1226,28 @@ mod tests {
         assert_eq!(plan_capacity_secondary("  Pro  "), 50400.0);
         assert_eq!(plan_capacity_secondary("PLUS"), 7560.0);
         assert_eq!(plan_capacity_secondary("Free"), 1134.0);
+    }
+
+    /// Anthropic subscription tiers must not fall through to the free-tier capacity, or two Claude
+    /// seats on different plans weight identically and capacity weighting stops meaning anything.
+    #[test]
+    fn plan_capacity_knows_anthropic_max_tiers() {
+        let free = plan_capacity_secondary("free");
+        for tier in ["max_20x", "max_5x", "max"] {
+            assert!(
+                plan_capacity_secondary(tier) > free,
+                "{tier} must not fall through to the free tier"
+            );
+        }
+        // A 20x seat carries strictly more weight than a 5x seat.
+        assert!(plan_capacity_secondary("max_20x") > plan_capacity_secondary("max_5x"));
+        // Case/whitespace normalization applies here too.
+        assert_eq!(
+            plan_capacity_secondary("  MAX_20X  "),
+            plan_capacity_secondary("max_20x")
+        );
+        // An unknown Claude-ish plan still fails safe to free rather than guessing high.
+        assert_eq!(plan_capacity_secondary("max_99x"), free);
     }
 
     #[test]
