@@ -83,6 +83,30 @@ function matchesProvider(provider: string, filter: ProviderFilter): boolean {
   return filter === "all" || providerBrandKey(provider) === filter;
 }
 
+/** Display order for provider sections, so the page doesn't reshuffle as accounts come and go.
+ * Anything unrecognized sorts last, alphabetically, rather than being hidden. */
+const PROVIDER_SECTION_ORDER = ["codex", "claude"];
+
+/** Split accounts into per-provider sections. Only used when no single provider is selected — with
+ * a provider filter active every row already shares one provider, so a header would be noise. */
+function groupByProvider(accounts: AccountView[]): Array<{ key: string; accounts: AccountView[] }> {
+  const groups = new Map<string, AccountView[]>();
+  for (const account of accounts) {
+    const key = providerBrandKey(account.provider);
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(account);
+    else groups.set(key, [account]);
+  }
+  return Array.from(groups.entries())
+    .map(([key, list]) => ({ key, accounts: list }))
+    .sort((a, b) => {
+      const ai = PROVIDER_SECTION_ORDER.indexOf(a.key);
+      const bi = PROVIDER_SECTION_ORDER.indexOf(b.key);
+      if (ai !== -1 || bi !== -1) return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+      return a.key.localeCompare(b.key);
+    });
+}
+
 /** Sentinel `Select.Item` values — Radix Select forbids an empty-string value (reserved for
  * clearing), so the "all pools" / "no pool" choices need non-empty placeholders. */
 const ALL_POOLS = "__all_pools__";
@@ -275,26 +299,37 @@ export function Accounts() {
         <Card>
           <p className="text-[12px] text-fg opacity-50">No accounts match the current filters.</p>
         </Card>
-      ) : view === "cards" ? (
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {filtered.map((a) => (
-            <AccountCard
-              key={a.id}
-              account={a}
-              siblings={accounts}
-              reset={resetByAccount.get(a.id)}
-              nowMs={nowMs}
-              actions={actions}
-            />
-          ))}
-        </div>
       ) : (
-        <AccountsTable
-          accounts={filtered}
-          resetByAccount={resetByAccount}
-          nowMs={nowMs}
-          actions={actions}
-        />
+        // Group into provider sections only when showing "All" — with a provider filter active
+        // every row shares one provider and a header would just be noise.
+        groupByProvider(filtered).map((group, index) => (
+          <div key={group.key} className={clsx(index > 0 && "mt-1")}>
+            {providerFilter === "all" && (
+              <ProviderSectionHeader providerKey={group.key} accounts={group.accounts} />
+            )}
+            {view === "cards" ? (
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+                {group.accounts.map((a) => (
+                  <AccountCard
+                    key={a.id}
+                    account={a}
+                    siblings={accounts}
+                    reset={resetByAccount.get(a.id)}
+                    nowMs={nowMs}
+                    actions={actions}
+                  />
+                ))}
+              </div>
+            ) : (
+              <AccountsTable
+                accounts={group.accounts}
+                resetByAccount={resetByAccount}
+                nowMs={nowMs}
+                actions={actions}
+              />
+            )}
+          </div>
+        ))
       )}
 
       <CodexOnboardingDialog open={addOpen} onOpenChange={setAddOpen} />
@@ -463,6 +498,33 @@ function CardUsageRow({
       <span className="shrink-0 whitespace-nowrap text-right text-fg opacity-70">
         {pct(displayed)} {quotaDisplayLabel(mode)} · {countdown(window.reset_at, nowMs)}
         {window.stale && <span className="text-warn"> · stale</span>}
+      </span>
+    </div>
+  );
+}
+
+/** The heading above one provider's accounts. Carries the counts an operator actually acts on —
+ * how many seats, how many are serving, and how many need attention — so the split is informative
+ * rather than merely decorative. `reauth` is shown only when non-zero, so a healthy fleet stays
+ * quiet instead of displaying a permanent "0 reauth". */
+function ProviderSectionHeader({
+  providerKey,
+  accounts,
+}: {
+  providerKey: string;
+  accounts: AccountView[];
+}) {
+  const active = accounts.filter((a) => statusTone(a.status) === "ok").length;
+  const attention = accounts.filter((a) => statusTone(a.status) === "error").length;
+  return (
+    <div className="mb-2 flex flex-wrap items-center gap-2 border-b border-border/60 pb-1.5">
+      <ProviderTag provider={providerKey} />
+      <span className="text-[12px] font-semibold text-fg">
+        {accounts.length} {accounts.length === 1 ? "account" : "accounts"}
+      </span>
+      <span className="text-[11px] text-fg opacity-45">
+        {active} active
+        {attention > 0 && <span className="text-error opacity-100"> · {attention} need attention</span>}
       </span>
     </div>
   );
