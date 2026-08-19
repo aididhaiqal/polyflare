@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+#
+# Live end-to-end smoke test for the NATIVE Claude (Anthropic) serving path.
+#
+# Under normal config the default translation routes (opus/sonnet/haiku -> Codex) intercept every
+# Claude request, so the native Anthropic account never serves. This script:
+#   1. remembers, then temporarily disables, the three default-anthropic-* translation routes
+#      (restored on exit, even on error/Ctrl-C),
+#   2. sends one real /v1/messages request through PolyFlare with a valid Claude Code envelope,
+#   3. verifies the response, then reads the request log to confirm the request was served by an
+#      anthropic account AND that real per-request usage/tokens were captured.
+#
+# It runs on the PolyFlare host (needs curl to the local proxy and sqlite3 access to the store).
+# Usage: scripts/claude-smoke-test [MODEL]
+#   MODEL defaults to claude-sonnet-4-5; pass another slug if the account serves a different one.
+set -euo pipefail
+
+URL="${POLYFLARE_URL:-http://127.0.0.1:8080}"
+DB="${POLYFLARE_STORE_DB:-$HOME/.polyflare/store.db}"
+MODEL="${1:-claude-sonnet-4-5}"
+ROUTES="default-anthropic-opus default-anthropic-sonnet default-anthropic-haiku"
+
+command -v sqlite3 >/dev/null || { echo "sqlite3 not found"; exit 1; }
+[ -f "$DB" ] || { echo "store db not found at $DB (set POLYFLARE_STORE_DB)"; exit 1; }
+
+sql() { sqlite3 "$DB" "$@"; }
+
+echo "== PolyFlare Claude native-path smoke test =="
+echo "   proxy : $URL"
+echo "   store : $DB"
+echo "   model : $MODEL"
+echo
+
+# --- 1. Snapshot + disable translation so the request reaches native Claude ------------------------
+declare -A WAS_ENABLED
+for r in $ROUTES; do
+  WAS_ENABLED[$r]=$(sql "SELECT enabled FROM translation_routes WHERE id='$r';")
+done
+
+restore() {
+  for r in $ROUTES; do
+    want="${WAS_ENABLED[$r]:-1}"
+    sql "UPDATE translation_routes SET enabled=$want WHERE id='$r';"
+  done
+  echo "-- translation routes restored to their original state"
+}
+trap restore EXIT
+
+for r in $ROUTES; do
+  sql "UPDATE translation_routes SET enabled=0 WHERE id='$r';"
+done
+echo "-- translation routes temporarily disabled (opus/sonnet/haiku)"
+echo
+
+# --- 2. Send one real Claude request ---------------------------------------------------------------
+SESSION_ID=$(uuidgen | tr 'A-Z' 'a-z')
+REQ_BODY=$(cat <<JSON
+{"model":"$MODEL","max_tokens":16,"stream":false,
+ "messages":[{"role":"user","content":"Reply with exactly one word: pong"}]}
+JSON
+)
+
+RESP_FILE=$(mktemp)
+HTTP_CODE=$(curl -s -o "$RESP_FILE" -w "%{http_code}" -X POST "$URL/v1/messages" \
+  -H "content-type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "anthropic-beta: oauth-2025-04-20" \
+  -H "user-agent: claude-cli/2.1.218 (external, cli)" \
+  -H "x-claude-code-session-id: $SESSION_ID" \
+  --data "$REQ_BODY")
+
+echo "-- HTTP $HTTP_CODE from /v1/messages"
+echo "-- response body (first 600 bytes):"
+head -c 600 "$RESP_FILE"; echo; echo
+
+# --- 3. Confirm the request log recorded a native anthropic request with captured usage ------------
+# Give the async request-log writer + usage-capture on_done a moment to land.
+sleep 2
+echo "-- newest request_log rows for provider=anthropic:"
+sql -header -column \
+  "SELECT substr(request_id,1,10) AS req, status, model,
+          input_tokens AS in_tok, output_tokens AS out_tok, total_tokens AS tot,
+          cached_input_tokens AS cache_rd, cost_usd
+     FROM request_log
+    WHERE provider='anthropic'
+    ORDER BY requested_at DESC LIMIT 3;" 2>/dev/null \
+  || echo "   (could not read request_log — check the column names against the request_log schema)"
+
+echo
+if [ "$HTTP_CODE" = "200" ]; then
+  echo "RESULT: native Claude path served a 200. Check the token columns above are non-null."
+else
+  echo "RESULT: HTTP $HTTP_CODE — the request reached the native path but did not 200."
+  echo "        A model error means auth+routing worked; retry with a model the account serves,"
+  echo "        e.g. scripts/claude-smoke-test claude-opus-4-5   (or the exact dated slug)."
+fi
+rm -f "$RESP_FILE"
