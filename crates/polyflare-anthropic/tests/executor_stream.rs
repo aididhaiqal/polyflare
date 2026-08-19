@@ -77,6 +77,72 @@ async fn executor_surfaces_upstream_error_status() {
     );
 }
 
+/// A transient 529 (overloaded, no reset hint) is retried IN PLACE on the same account, up to the
+/// attempt budget, before the error is surfaced — so a momentary overload doesn't immediately cool
+/// the account (and, in a single-account pool, get no failover at all).
+#[tokio::test]
+async fn a_resetless_529_is_retried_in_place() {
+    let mock = MockUpstream::error_status(529, r#"{"type":"error","error":{"type":"overloaded_error"}}"#);
+    let handle = mock.clone();
+    let base = mock.spawn().await;
+    let executor = AnthropicExecutor::new().unwrap();
+    let account = Account {
+        id: "t".into(),
+        base_url: base,
+        bearer_token: "t".into(),
+        chatgpt_account_id: None,
+        is_fedramp: false,
+    };
+    let req = PreparedRequest {
+        body: Some(serde_json::json!({"model": "m"})),
+        model: "m".into(),
+        forward_headers: vec![],
+        raw_body: None,
+    };
+    let err = executor
+        .execute(req, &account, &RequestCtx::default())
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&err, polyflare_core::ExecError::UpstreamHttp(e) if e.signal.status == 529),
+        "a persistent 529 still surfaces after retries: {err:?}"
+    );
+    assert_eq!(
+        handle.request_count(),
+        2,
+        "a resetless 529 is retried in place up to the 2-attempt budget"
+    );
+}
+
+/// A non-529 error is NOT retried in place — only a transient overload is.
+#[tokio::test]
+async fn a_500_is_not_retried_in_place() {
+    let mock = MockUpstream::error_status(500, "boom");
+    let handle = mock.clone();
+    let base = mock.spawn().await;
+    let executor = AnthropicExecutor::new().unwrap();
+    let account = Account {
+        id: "t".into(),
+        base_url: base,
+        bearer_token: "t".into(),
+        chatgpt_account_id: None,
+        is_fedramp: false,
+    };
+    let req = PreparedRequest {
+        body: Some(serde_json::json!({"model": "m"})),
+        model: "m".into(),
+        forward_headers: vec![],
+        raw_body: None,
+    };
+    let _ = executor
+        .execute(req, &account, &RequestCtx::default())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(handle.request_count(), 1, "a 500 is surfaced immediately, not retried");
+}
+
 /// An admitted Claude request must reach upstream byte-identically, with the caller's credential
 /// replaced and nothing else touched. This is the whole value proposition of the pass-through
 /// path: no parse/re-serialize round-trip means no way for PolyFlare to perturb the request.

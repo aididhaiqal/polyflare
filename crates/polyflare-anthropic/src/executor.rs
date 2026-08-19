@@ -16,6 +16,31 @@ use polyflare_core::{
 /// executor's cap). A hostile or merely huge upstream error body must never be read unbounded.
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
+/// In-place retry budget for a transient `529 overloaded_error` that carries no reset hint. Mirrors
+/// better-ccflare's overload retry (≤2 total attempts, base 750ms, 3s cap, FULL jitter). A quick
+/// jittered retry on the SAME account usually rides out a momentary overload without benching it —
+/// which spreads concurrent spikes out instead of cooling every account at once, and is the only
+/// thing that lets a single-account pool survive a 529 (there is no other account to fail over to).
+const OVERLOAD_RETRY_MAX_ATTEMPTS: u32 = 2;
+const OVERLOAD_RETRY_BASE_MS: u64 = 750;
+const OVERLOAD_RETRY_MAX_MS: u64 = 3000;
+
+/// Full-jitter backoff cap for the n-th (1-based) overload retry: `min(base * 2^n, max)`. The actual
+/// sleep is a uniform random draw in `[0, cap]` (full jitter), so retries across accounts desync.
+fn overload_backoff_cap_ms(attempt: u32) -> u64 {
+    OVERLOAD_RETRY_BASE_MS
+        .saturating_mul(1u64 << attempt.min(20))
+        .min(OVERLOAD_RETRY_MAX_MS)
+}
+
+/// A uniform random delay in `[0, cap_ms]` — the full-jitter sleep before an overload retry.
+fn jittered_delay_ms(cap_ms: u64) -> u64 {
+    if cap_ms == 0 {
+        return 0;
+    }
+    (rand::random::<f64>() * cap_ms as f64) as u64
+}
+
 /// Read a non-2xx response body up to [`MAX_ERROR_BODY_BYTES`], truncating past the cap. So the
 /// client can be shown the REAL upstream error (a genuine 429 with its message + retry-after) once
 /// failover is exhausted, instead of a generic 502.
@@ -147,10 +172,35 @@ impl Executor for AnthropicExecutor {
             ),
         };
 
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| ExecError::Upstream(e.to_string()))?;
+        // Send, retrying in place only a transient 529 (overloaded, no reset hint) with full jitter.
+        // `try_clone` succeeds for our cloneable bodies (raw bytes / serialized JSON); if a body is
+        // ever not cloneable we simply send once without retry.
+        let mut attempt: u32 = 0;
+        let resp = loop {
+            let Some(this_attempt) = request.try_clone() else {
+                break request
+                    .send()
+                    .await
+                    .map_err(|e| ExecError::Upstream(e.to_string()))?;
+            };
+            let resp = this_attempt
+                .send()
+                .await
+                .map_err(|e| ExecError::Upstream(e.to_string()))?;
+            if resp.status().as_u16() == 529 && attempt + 1 < OVERLOAD_RETRY_MAX_ATTEMPTS {
+                // Only retry when the 529 gives no reset time; a 529 WITH a reset is a real cooldown
+                // signal the ingress should honor via failover, not something to hammer in place.
+                let signal =
+                    crate::rate_limit::failure_signal(529, resp.headers(), unix_now());
+                if signal.retry_after.is_none() {
+                    attempt += 1;
+                    let delay = jittered_delay_ms(overload_backoff_cap_ms(attempt));
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    continue;
+                }
+            }
+            break resp;
+        };
 
         if !resp.status().is_success() {
             // Build the failure signal from the headers (the ladder + out_of_credits/529 logic),
@@ -176,5 +226,26 @@ impl Executor for AnthropicExecutor {
             .map(|chunk| chunk.map_err(|e| ExecError::Stream(e.to_string())));
 
         Ok(ResponseStream::new(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overload_backoff_cap_grows_then_saturates() {
+        assert_eq!(overload_backoff_cap_ms(1), 1500); // 750 * 2
+        assert_eq!(overload_backoff_cap_ms(2), 3000); // 750 * 4, capped at 3000
+        assert_eq!(overload_backoff_cap_ms(3), 3000); // saturates
+        assert_eq!(overload_backoff_cap_ms(40), 3000); // never overflows the shift
+    }
+
+    #[test]
+    fn jitter_never_exceeds_the_cap() {
+        for _ in 0..1000 {
+            assert!(jittered_delay_ms(1500) <= 1500);
+        }
+        assert_eq!(jittered_delay_ms(0), 0);
     }
 }
