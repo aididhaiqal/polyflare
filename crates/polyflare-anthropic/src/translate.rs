@@ -115,6 +115,19 @@ fn flatten_system(system: &Value) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
+/// Split a messages array into `(system-role messages, everything else)`, preserving order in both.
+/// A non-array body yields two empty lists, matching the old "no messages" behaviour.
+fn split_system_messages(messages: &Value) -> (Vec<Value>, Value) {
+    let Some(arr) = messages.as_array() else {
+        return (Vec::new(), Value::Array(vec![]));
+    };
+    let (system, rest): (Vec<Value>, Vec<Value>) = arr
+        .iter()
+        .cloned()
+        .partition(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"));
+    (system, Value::Array(rest))
+}
+
 fn map_request_with_contract(body: Value, codex_contract: bool) -> Value {
     let model = body.get("model").cloned().unwrap_or(Value::Null);
     let system = body.get("system").cloned();
@@ -133,15 +146,34 @@ fn map_request_with_contract(body: Value, codex_contract: bool) -> Value {
     // So the client's `stream`/`max_tokens` are deliberately NOT forwarded: PolyFlare always streams
     // upstream (and only ever speaks SSE to the client — see `ingress`), and the Anthropic token cap
     // has no Codex equivalent, so it is dropped rather than sent as the rejected `max_output_tokens`.
-    let mut out = json!({"model": model, "input": map_messages(&messages), "stream": true});
+    // The Codex backend rejects a `system`-role input item outright ("System messages are not
+    // allowed"), and Claude Code does send them mid-conversation. A system message IS an
+    // instruction, so lift them into `instructions` rather than dropping content the client meant
+    // the model to obey.
+    let (system_messages, conversation) = split_system_messages(&messages);
+    let mut out = json!({"model": model, "input": map_messages(&conversation), "stream": true});
     let map = out.as_object_mut().expect("json! object literal");
     if codex_contract {
         map.insert("store".to_string(), Value::Bool(false));
     } else if let Some(max_tokens) = body.get("max_tokens") {
         map.insert("max_output_tokens".to_string(), max_tokens.clone());
     }
-    if let Some(sys) = system.as_ref().and_then(flatten_system) {
-        map.insert("instructions".to_string(), Value::String(sys));
+    // Top-level `system` first, then any system-role messages in the order the client sent them.
+    let instructions: Vec<String> = system
+        .as_ref()
+        .and_then(flatten_system)
+        .into_iter()
+        .chain(
+            system_messages
+                .iter()
+                .filter_map(|m| m.get("content").and_then(flatten_system)),
+        )
+        .collect();
+    if !instructions.is_empty() {
+        map.insert(
+            "instructions".to_string(),
+            Value::String(instructions.join("\n\n")),
+        );
     }
     if let Some(t) = tools {
         map.insert("tools".to_string(), map_tools(&t));
@@ -1025,6 +1057,49 @@ mod tests {
             "blocks join into one string, keeping their separation"
         );
         assert!(out["instructions"].is_string(), "Responses requires a string");
+    }
+
+    /// Claude Code sends system-role messages mid-conversation; the Codex backend rejects any
+    /// `system` input item ("System messages are not allowed"). They must be lifted into
+    /// `instructions`, not forwarded and not silently dropped.
+    #[test]
+    fn system_role_messages_are_lifted_into_instructions() {
+        let body = json!({
+            "model": "m",
+            "system": [{"type": "text", "text": "Top-level system."}],
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "system", "content": "Mid-conversation rule."},
+                {"role": "assistant", "content": "hi"}
+            ],
+        });
+        let out = map_request(body);
+        assert_eq!(
+            out["instructions"],
+            json!("Top-level system.\n\nMid-conversation rule."),
+            "top-level system first, then system messages in order"
+        );
+        let roles: Vec<&str> = out["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| i.get("role")?.as_str())
+            .collect();
+        assert_eq!(roles, vec!["user", "assistant"], "no system item may reach the backend");
+    }
+
+    #[test]
+    fn a_system_role_message_with_block_content_is_also_lifted() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "Blocked rule."}]},
+                {"role": "user", "content": "hi"}
+            ],
+        });
+        let out = map_request(body);
+        assert_eq!(out["instructions"], json!("Blocked rule."));
+        assert_eq!(out["input"].as_array().unwrap().len(), 1);
     }
 
     #[test]
