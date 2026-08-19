@@ -56,8 +56,14 @@ echo
 
 # --- 2. Send one real Claude request ---------------------------------------------------------------
 SESSION_ID=$(uuidgen | tr 'A-Z' 'a-z')
+# Anthropic's OAuth/subscription Messages endpoint only serves requests that look like genuine
+# Claude Code: the FIRST system block must be exactly the Claude Code identity string, and the
+# request carries the claude-code beta alongside the oauth beta. A bare request is bounced with a
+# (misleading) rate_limit_error. This mirrors what the real CLI sends so the test exercises a real
+# served turn, not the reject path.
 REQ_BODY=$(cat <<JSON
 {"model":"$MODEL","max_tokens":16,"stream":false,
+ "system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],
  "messages":[{"role":"user","content":"Reply with exactly one word: pong"}]}
 JSON
 )
@@ -66,7 +72,7 @@ RESP_FILE=$(mktemp)
 HTTP_CODE=$(curl -s -o "$RESP_FILE" -w "%{http_code}" -X POST "$URL/v1/messages" \
   -H "content-type: application/json" \
   -H "anthropic-version: 2023-06-01" \
-  -H "anthropic-beta: oauth-2025-04-20" \
+  -H "anthropic-beta: claude-code-20250219,oauth-2025-04-20" \
   -H "user-agent: claude-cli/2.1.218 (external, cli)" \
   -H "x-claude-code-session-id: $SESSION_ID" \
   --data "$REQ_BODY")
