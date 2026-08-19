@@ -488,6 +488,43 @@ impl ModelCatalogCache {
             .expect("declared support lock poisoned") = map;
     }
 
+    /// Drop candidates whose per-model weekly cap for `model` is currently exhausted (100%), so a
+    /// request for that model routes to a seat that can still serve it.
+    ///
+    /// Deliberately NOT folded into [`Self::retain_accounts_supporting`]: that helper fails open
+    /// unless some account answers `Some(true)`, and Anthropic accounts have no per-account
+    /// `/models` list to answer with, so it would filter nothing here. A 100% cap is authoritative
+    /// NEGATIVE knowledge (the upstream told us this seat is done with this model until its reset),
+    /// which is a different thing from "we have no evidence either way".
+    ///
+    /// Fails open when EVERY candidate is capped: attempting and surfacing the real upstream limit
+    /// beats refusing locally on data that may be up to one poll interval stale.
+    pub fn retain_accounts_without_capped_model(
+        &self,
+        snapshots: &mut Vec<polyflare_core::AccountSnapshot>,
+        model: &str,
+    ) {
+        let caps = self
+            .capped_models
+            .read()
+            .expect("capped models lock poisoned");
+        if caps.is_empty() {
+            return;
+        }
+        let model_lc = model.to_ascii_lowercase();
+        let is_capped = |id: &str| {
+            caps.get(id)
+                .is_some_and(|names| names.iter().any(|name| model_lc.contains(name.as_str())))
+        };
+        if snapshots
+            .iter()
+            .all(|snapshot| is_capped(snapshot.id.as_str()))
+        {
+            return;
+        }
+        snapshots.retain(|snapshot| !is_capped(snapshot.id.as_str()));
+    }
+
     /// Replace an account's set of currently-capped model-name substrings (lowercased). Called by
     /// the Anthropic usage poll each cycle with the `weekly_scoped` limits at 100% — an empty list
     /// clears the account's caps. Idempotent; only the named account's entry is touched.
@@ -1464,6 +1501,72 @@ mod tests {
         // Window resets → the next poll clears the cap.
         cache.set_capped_models("acct-a", vec![]);
         assert_eq!(cache.account_supports_model("acct-a", "claude-fable-5"), Some(true));
+    }
+
+    /// A seat whose per-model weekly cap is exhausted is dropped from the candidates for THAT model
+    /// only — the uncapped seat serves it, and the capped seat still serves everything else.
+    #[tokio::test]
+    async fn a_capped_seat_is_dropped_for_that_model_only() {
+        let cache = ModelCatalogCache::new(
+            Box::new(NoneSource),
+            Duration::from_secs(60),
+            default_floor(),
+        );
+        let snap = |id: &str| {
+            let mut s = polyflare_core::AccountSnapshot::new(id);
+            s.plan_type = "max_20x".to_string();
+            s
+        };
+        // Seat A's Fable weekly cap is exhausted; seat B has headroom.
+        cache.set_capped_models("seat-a", vec!["Fable".to_string()]);
+
+        let mut for_fable = vec![snap("seat-a"), snap("seat-b")];
+        cache.retain_accounts_without_capped_model(&mut for_fable, "claude-fable-5");
+        assert_eq!(
+            for_fable.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["seat-b"],
+            "a Fable request must route away from the capped seat"
+        );
+
+        // Every other model is unaffected on the same seat.
+        let mut for_opus = vec![snap("seat-a"), snap("seat-b")];
+        cache.retain_accounts_without_capped_model(&mut for_opus, "claude-opus-5");
+        assert_eq!(for_opus.len(), 2, "an uncapped model keeps every seat");
+    }
+
+    #[tokio::test]
+    async fn capped_filtering_fails_open_when_every_seat_is_capped() {
+        let cache = ModelCatalogCache::new(
+            Box::new(NoneSource),
+            Duration::from_secs(60),
+            default_floor(),
+        );
+        let snap = |id: &str| polyflare_core::AccountSnapshot::new(id);
+        cache.set_capped_models("seat-a", vec!["fable".to_string()]);
+        cache.set_capped_models("seat-b", vec!["fable".to_string()]);
+        let mut all = vec![snap("seat-a"), snap("seat-b")];
+        cache.retain_accounts_without_capped_model(&mut all, "claude-fable-5");
+        assert_eq!(
+            all.len(),
+            2,
+            "when every seat is capped, attempt anyway and let the real upstream limit surface \
+             rather than refusing locally on possibly-stale data"
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_filtering_is_a_noop_when_nothing_is_capped() {
+        let cache = ModelCatalogCache::new(
+            Box::new(NoneSource),
+            Duration::from_secs(60),
+            default_floor(),
+        );
+        let mut snaps = vec![
+            polyflare_core::AccountSnapshot::new("seat-a"),
+            polyflare_core::AccountSnapshot::new("seat-b"),
+        ];
+        cache.retain_accounts_without_capped_model(&mut snaps, "claude-fable-5");
+        assert_eq!(snaps.len(), 2);
     }
 
     fn default_floor() -> Vec<UpstreamModel> {

@@ -4041,6 +4041,8 @@ async fn messages_handler_native(
     // The client-requested model is known up front, regardless of what happens next; the native
     // Anthropic path carries no Codex-style reasoning-effort concept, so that field stays `None`.
     // No codex sub-agent concept either — this is a native Anthropic-Messages request.
+    // Kept for selection (per-model cap filtering) — `model` itself moves into `PreparedRequest`.
+    let requested_model = model.clone();
     let mut outcome = RouteOutcome {
         account_id: None,
         model: Some(model.clone()),
@@ -4107,6 +4109,13 @@ async fn messages_handler_native(
     // A subscription-OAuth grant may serve only byte-faithful pass-through of a genuine client
     // request; translated traffic never becomes a candidate for one.
     let mut snapshots = filter_by_traffic_eligibility(&snapshots, traffic);
+    // Per-model weekly caps: a seat whose cap for THIS model is exhausted (e.g. Fable at 100%)
+    // cannot serve it until its reset, but serves every other model fine — so steer this request to
+    // a seat with headroom instead of burning an attempt on a guaranteed 429. Fails open when every
+    // seat is capped (see the helper), and is a no-op when nothing is capped.
+    state
+        .model_catalog
+        .retain_accounts_without_capped_model(&mut snapshots, &requested_model);
     state.runtime.overlay(&mut snapshots, now);
     let selector = state.selector_for(pool);
     let sel_ctx = SelectionCtx {
