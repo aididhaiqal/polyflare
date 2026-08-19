@@ -291,6 +291,24 @@ struct AccountDetailView {
     routing_policy: String,
     security_work_authorized: bool,
     request_totals: RequestTotalsView,
+    /// Per-model weekly caps this seat is subject to (Anthropic only), most-consumed first. A model
+    /// at 100% cannot be served by THIS seat until its reset — selection already routes such a
+    /// request to a seat with headroom — so surfacing it explains why traffic for one model is
+    /// concentrated elsewhere. Empty for a seat with no per-model limits reported.
+    model_caps: Vec<ModelCapView>,
+}
+
+/// One model's own weekly window on one account (see `anthropic_usage::ModelCapWindow`).
+#[derive(Serialize)]
+struct ModelCapView {
+    /// Upstream display name, e.g. `Fable`.
+    model: String,
+    /// 0..=100 of this model's own weekly allowance.
+    used_percent: f64,
+    /// Unix seconds when this model's window resets, when reported.
+    reset_at: Option<i64>,
+    /// Whether this model is currently exhausted on this seat (routing steers around it).
+    capped: bool,
 }
 
 /// `GET /api/accounts/{id}` — the dashboard's per-account detail view: identity, status, adaptive
@@ -363,6 +381,17 @@ pub async fn account_detail_handler(
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
     };
 
+    let model_caps = state
+        .model_catalog
+        .model_windows_for(&id)
+        .into_iter()
+        .map(|w| ModelCapView {
+            model: w.display_name,
+            used_percent: w.percent,
+            reset_at: w.resets_at,
+            capped: w.percent >= 100.0,
+        })
+        .collect();
     Json(AccountDetailView {
         identity: AccountIdentityView {
             id: account.id,
@@ -382,6 +411,7 @@ pub async fn account_detail_handler(
         routing_policy: account.routing_policy,
         security_work_authorized: account.security_work_authorized,
         request_totals,
+        model_caps,
     })
     .into_response()
 }

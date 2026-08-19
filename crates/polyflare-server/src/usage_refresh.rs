@@ -318,6 +318,8 @@ async fn refresh_anthropic_account(
     // window resets, while the account keeps serving every other model. Replaces the account's cap
     // set each cycle, so a reset clears within one poll interval.
     model_catalog.set_capped_models(&account.id, anthropic_usage::models_at_cap(&usage));
+    // Display mirror: every per-model window (not just the exhausted ones) for the dashboard.
+    model_catalog.set_model_windows(&account.id, anthropic_usage::model_cap_windows(&usage));
 
     // Map the Anthropic windows onto the codex UsageWindow shape, tagged with their real durations
     // so classification by duration (not slot) works unchanged.

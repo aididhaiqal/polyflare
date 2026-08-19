@@ -167,6 +167,19 @@ export interface AccountDetailView {
   routing_policy: string;
   security_work_authorized: boolean;
   request_totals: RequestTotalsView;
+  /** `read_api.rs::ModelCapView[]` — per-model weekly caps on THIS seat (Anthropic only),
+   * most-consumed first. A `capped` model cannot be served by this seat until `reset_at`;
+   * selection already routes those requests to a seat with headroom. Empty for seats with no
+   * per-model limits reported. */
+  model_caps: ModelCapView[];
+}
+
+/** `read_api.rs::ModelCapView` — one model's own weekly window on one account. */
+export interface ModelCapView {
+  model: string;
+  used_percent: number;
+  reset_at: number | null;
+  capped: boolean;
 }
 
 /** `read_api.rs::Point` — one `{t, v}` sample of a `TrendsView` series. */

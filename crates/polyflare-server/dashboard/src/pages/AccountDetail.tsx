@@ -72,6 +72,7 @@ import {
   type ResetPlanCandidateView,
   type RiskLevel,
   type TokenHealthView,
+  type ModelCapView,
   type UsageWindowView,
 } from "../lib/api";
 import { accountLabel } from "../lib/accountDisplay";
@@ -697,6 +698,23 @@ function DetailContent({
               </div>
             )}
 
+            {detail.model_caps.length > 0 && (
+              <>
+                <div className="mt-3 text-[11px] uppercase tracking-wide text-fg opacity-60">
+                  Per-model weekly caps
+                </div>
+                <div className="mt-1.5 space-y-1.5">
+                  {detail.model_caps.map((cap) => (
+                    <ModelCapRow key={cap.model} cap={cap} nowMs={nowMs} />
+                  ))}
+                </div>
+                <p className="mt-1.5 text-[10px] leading-relaxed text-fg opacity-45">
+                  A model at 100% can&apos;t be served by this account until it resets — those
+                  requests route to an account with headroom.
+                </p>
+              </>
+            )}
+
             <div className="mt-2.5 border-t border-border pt-2 text-[10.5px] text-fg opacity-55">
               {compactNum(detail.request_totals.total_tokens)} tok ·{" "}
               {compactNum(detail.request_totals.request_count)} req{" "}
@@ -827,6 +845,40 @@ function HealthMetric({
         {value}
       </div>
       <div className="mt-0.5 text-[10.5px] text-fg opacity-45">{hint}</div>
+    </div>
+  );
+}
+
+/** One model's own weekly cap on this account. Unlike the account-level windows above, a model at
+ * 100% does NOT bench the account — it only makes THIS model route elsewhere, so an exhausted row
+ * is called out explicitly rather than shown as generic danger. */
+function ModelCapRow({ cap, nowMs }: { cap: ModelCapView; nowMs: number }) {
+  const clamped = Math.max(0, Math.min(100, cap.used_percent));
+  const tone = cap.capped ? "error" : usageRiskTone(clamped);
+  return (
+    <div>
+      <div className="flex items-center justify-between text-[11.5px]">
+        <span className="flex items-center gap-1.5 text-fg opacity-70">
+          {cap.model}
+          {cap.capped && (
+            <span className="rounded-full bg-error/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-error">
+              capped
+            </span>
+          )}
+        </span>
+        <b className={TEXT_TONE_CLASS[tone]}>{pct(clamped)}</b>
+      </div>
+      <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
+        <div
+          className={clsx("h-full rounded-full", DOT_CLASS[tone])}
+          style={{ width: `${clamped}%` }}
+        />
+      </div>
+      {cap.reset_at !== null && (
+        <div className="mt-0.5 text-[10px] text-fg opacity-50">
+          Reset {countdown(cap.reset_at, nowMs)}
+        </div>
+      )}
     </div>
   );
 }

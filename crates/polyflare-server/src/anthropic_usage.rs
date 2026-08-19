@@ -199,12 +199,39 @@ pub fn plan_slug_from_profile(profile: &ProfileResponse) -> &'static str {
 /// Display names of models whose per-model (`weekly_scoped`) weekly cap is exhausted (>= 100%).
 /// Routing should avoid these models on this account until the window resets.
 pub fn models_at_cap(usage: &UsageResponse) -> Vec<String> {
+    model_cap_windows(usage)
+        .into_iter()
+        .filter(|w| w.percent >= 100.0)
+        .map(|w| w.display_name)
+        .collect()
+}
+
+/// One model's own weekly window, as the upstream reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelCapWindow {
+    /// The upstream's display name for the model, e.g. `Fable`.
+    pub display_name: String,
+    /// 0..=100 utilization of THIS model's weekly allowance.
+    pub percent: f64,
+    /// Unix seconds when this model's window resets, when the upstream said.
+    pub resets_at: Option<i64>,
+}
+
+/// EVERY per-model weekly window the payload carries — not only the exhausted ones — so the
+/// dashboard can show how close each model is to its own cap, while routing filters on `>= 100`.
+/// Per-model caps arrive ONLY as `weekly_scoped` entries with a `scope.model.display_name`.
+pub fn model_cap_windows(usage: &UsageResponse) -> Vec<ModelCapWindow> {
     usage
         .limits
         .iter()
         .filter(|l| l.kind.as_deref() == Some("weekly_scoped"))
-        .filter(|l| l.percent.map(|p| p >= 100.0).unwrap_or(false))
-        .filter_map(|l| l.scope.as_ref()?.model.as_ref()?.display_name.clone())
+        .filter_map(|l| {
+            Some(ModelCapWindow {
+                display_name: l.scope.as_ref()?.model.as_ref()?.display_name.clone()?,
+                percent: l.percent?,
+                resets_at: l.resets_at.as_deref().and_then(parse_iso_to_unix),
+            })
+        })
         .collect()
 }
 

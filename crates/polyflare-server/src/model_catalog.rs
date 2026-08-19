@@ -147,6 +147,10 @@ pub struct ModelCatalogCache {
     /// it (the poll REPLACES each account's list every cycle, so a reset window clears within one
     /// interval). Empty for every non-Anthropic account and whenever nothing is capped.
     capped_models: RwLock<HashMap<String, Vec<String>>>,
+    /// DISPLAY-ONLY mirror of the same poll: every per-model weekly window with its percentage and
+    /// reset, so the dashboard can show how close each model is to its own cap. Routing never reads
+    /// this — it reads `capped_models` — so a change here can never move a request.
+    model_windows: RwLock<HashMap<String, Vec<crate::anthropic_usage::ModelCapWindow>>>,
     /// Single-flight guard: only one refresh touches the network at a time (concurrent
     /// `get_or_refresh` callers on a cold/expired cache collapse to one upstream fetch).
     refresh_lock: tokio::sync::Mutex<()>,
@@ -180,6 +184,7 @@ impl ModelCatalogCache {
             account_models: RwLock::new(HashMap::new()),
             declared_support: RwLock::new(HashMap::new()),
             capped_models: RwLock::new(HashMap::new()),
+            model_windows: RwLock::new(HashMap::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
             source,
             floor,
@@ -541,6 +546,37 @@ impl ModelCatalogCache {
                 names.into_iter().map(|n| n.to_ascii_lowercase()).collect(),
             );
         }
+    }
+
+    /// Replace an account's per-model weekly windows — ALL of them, not just the exhausted ones —
+    /// for the dashboard. Routing continues to read `capped_models` (the `>= 100` subset), so this
+    /// is display state only and can never change which seat serves a request.
+    pub fn set_model_windows(
+        &self,
+        account_id: &str,
+        windows: Vec<crate::anthropic_usage::ModelCapWindow>,
+    ) {
+        let mut map = self
+            .model_windows
+            .write()
+            .expect("model windows lock poisoned");
+        if windows.is_empty() {
+            map.remove(account_id);
+        } else {
+            map.insert(account_id.to_string(), windows);
+        }
+    }
+
+    /// This account's per-model weekly windows, sorted most-consumed first so the tightest cap
+    /// leads. Empty for a seat with no per-model limits reported (or a non-Anthropic seat).
+    pub fn model_windows_for(&self, account_id: &str) -> Vec<crate::anthropic_usage::ModelCapWindow> {
+        let map = self
+            .model_windows
+            .read()
+            .expect("model windows lock poisoned");
+        let mut windows = map.get(account_id).cloned().unwrap_or_default();
+        windows.sort_by(|a, b| b.percent.total_cmp(&a.percent));
+        windows
     }
 
     /// Every account id declared (support = true) for `model`. Used to decide whether a hidden model
