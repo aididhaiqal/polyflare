@@ -16,6 +16,10 @@
 //! — reused here, not redefined, so the two crates' notion of these codes can never drift apart.
 
 use polyflare_codex::ws::{WS_ANCHOR_MISS_CODE, WS_CONNECTION_LIMIT_CODE};
+
+/// The request field an anchor rejection names in `error.param`. The anchor is the ONLY thing this
+/// field can refer to, so its presence is sufficient to classify the frame without reading prose.
+const ANCHOR_PARAM: &str = "previous_response_id";
 use polyflare_core::FailureSignal;
 
 /// What a raw backend WS text frame means to the relay pump, classified without ever reading
@@ -89,9 +93,22 @@ pub(crate) fn classify_upstream_signal(text: &str) -> UpstreamSignal {
                 .or_else(|| r.as_str().and_then(|s| s.parse().ok()))
         });
 
+    // An anchor rejection does not always arrive as `error.code`. The backend also reports it as an
+    // ordinary invalid-request whose `error.param` NAMES the offending field, with no code we
+    // recognise — which fell through to the generic arm below, skipped the anchorless-resend
+    // recovery, and wedged the thread: the body is unchanged, so every later attempt failed
+    // identically. `param` is structured metadata (a request field name), not `error.message`, so
+    // reading it keeps the module's content-free contract intact.
+    let anchor_param = v
+        .get("error")
+        .and_then(|e| e.get("param"))
+        .and_then(|p| p.as_str())
+        .is_some_and(|p| p == ANCHOR_PARAM);
+
     match code {
         Some(WS_CONNECTION_LIMIT_CODE) => UpstreamSignal::ConnectionLimit,
         Some(WS_ANCHOR_MISS_CODE) => UpstreamSignal::AnchorMissing,
+        _ if anchor_param => UpstreamSignal::AnchorMissing,
         _ => UpstreamSignal::Error(FailureSignal {
             status,
             retry_after,
@@ -103,6 +120,48 @@ pub(crate) fn classify_upstream_signal(text: &str) -> UpstreamSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shape that wedged threads: an anchor rejection reported as an ordinary invalid-request
+    /// naming the field in `param`, with no code the classifier recognises. Before this, it fell to
+    /// the generic error arm, skipped the anchorless-resend recovery, and every later attempt in
+    /// that thread failed identically because the body never changed.
+    #[test]
+    fn an_anchor_rejection_named_only_in_param_is_an_anchor_miss() {
+        for frame in [
+            r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","param":"previous_response_id"}}"#,
+            // No code at all — exactly what the failing rows recorded (blank error_code).
+            r#"{"type":"error","status":400,"error":{"param":"previous_response_id"}}"#,
+            // A code we do not recognise must not shadow the param.
+            r#"{"type":"error","status":400,"error":{"code":"invalid_request_error","param":"previous_response_id"}}"#,
+        ] {
+            assert!(
+                matches!(classify_upstream_signal(frame), UpstreamSignal::AnchorMissing),
+                "must classify as an anchor miss: {frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_original_anchor_miss_code_still_classifies() {
+        assert!(matches!(
+            classify_upstream_signal(
+                r#"{"type":"error","status":400,"error":{"code":"previous_response_not_found"}}"#
+            ),
+            UpstreamSignal::AnchorMissing
+        ));
+    }
+
+    /// `param` naming any OTHER field is an ordinary request error — resending anchorless would not
+    /// fix it, so it must keep its health-signal classification.
+    #[test]
+    fn a_param_naming_another_field_is_not_an_anchor_miss() {
+        assert!(matches!(
+            classify_upstream_signal(
+                r#"{"type":"error","status":400,"error":{"code":"invalid_request_error","param":"model"}}"#
+            ),
+            UpstreamSignal::Error(_)
+        ));
+    }
 
     #[test]
     fn normal_response_frame_is_normal() {
