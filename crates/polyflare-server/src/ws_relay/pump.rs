@@ -882,7 +882,32 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
             }, if upstream.is_some() => {
                 match up {
                     Ok(Some(text)) => {
-                        match classify_upstream_signal(&text) {
+                        // A dead anchor no longer arrives with a `code` to key on. Captured live
+                        // 2026-08-22: `status 400`, `error` holding only `{message, type}` with
+                        // `type = invalid_request_error` — byte-identical in shape to a genuine bad
+                        // request, and the frame alone cannot tell them apart. The discriminator the
+                        // classifier lacks is one the RELAY holds: only a turn that SENT an anchor
+                        // can miss one, and codex sets `previous_response_id` exactly when `input`
+                        // is a bare suffix. So reclassify here, where the in-flight frame is in
+                        // hand, rather than reading `error.message` — which this module's
+                        // content-free contract forbids, and which would key behaviour on upstream
+                        // prose that has already changed once.
+                        //
+                        // An unanchored turn keeps its Error classification: a 400 there is a real
+                        // bad request, and forging a resend would loop the client on it.
+                        let signal = match classify_upstream_signal(&text) {
+                            UpstreamSignal::Error(sig)
+                                if sig.status == 400
+                                    && sig.error_code.is_none()
+                                    && in_flight
+                                        .as_deref()
+                                        .is_some_and(is_anchored_generating_frame) =>
+                            {
+                                UpstreamSignal::AnchorMissing
+                            }
+                            other => other,
+                        };
+                        match signal {
                             UpstreamSignal::ConnectionLimit => {
                                 // The 60-min server cap: INTERCEPT (never forward) and eagerly
                                 // re-dial the SAME account so the client never sees this boundary.
@@ -1731,6 +1756,33 @@ mod tests {
         ));
         assert!(!is_anchored_generating_frame("not json"));
         assert!(!is_anchored_generating_frame(r#""a json string""#));
+    }
+
+    /// The shape a dead anchor actually arrives as (captured live 2026-08-22): `status 400` with
+    /// `error` holding only `{message, type}` — no `code`, no `param`. The classifier cannot tell
+    /// it from a genuine bad request, so the pump reclassifies using what only IT knows: whether
+    /// the in-flight turn sent an anchor. These pin both halves of that discrimination.
+    #[test]
+    fn a_codeless_400_is_an_anchor_miss_only_on_an_anchored_turn() {
+        let dead_anchor = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"..."}}"#;
+        // The classifier alone cannot resolve it — it has no code or param to key on.
+        assert!(
+            matches!(classify_upstream_signal(dead_anchor), UpstreamSignal::Error(sig)
+                if sig.status == 400 && sig.error_code.is_none()),
+            "a codeless 400 must reach the pump as a plain Error for it to reclassify"
+        );
+
+        let anchored = r#"{"type":"response.create","previous_response_id":"resp_1","input":[{"role":"user","content":"tail"}]}"#;
+        let anchorless = r#"{"type":"response.create","input":[{"role":"user","content":"full"}]}"#;
+        assert!(
+            is_anchored_generating_frame(anchored),
+            "an anchored turn is the only one that CAN miss its anchor"
+        );
+        assert!(
+            !is_anchored_generating_frame(anchorless),
+            "an anchorless turn carries full history, so a 400 there is a real bad request and \
+             must keep its Error classification rather than looping the client on a forged resend"
+        );
     }
 
     #[test]
