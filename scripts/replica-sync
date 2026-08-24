@@ -29,6 +29,26 @@ sync_once() {
   tmp="$(mktemp)"
   trap 'rm -f "$tmp"' RETURN
 
+  # `.dump` emits POSITIONAL inserts (`VALUES(...)`, no column names), so the two schemas must
+  # agree exactly. A mismatched count errors out, but a same-count REORDER would silently write
+  # values into the wrong columns — with credentials in this table, that is corruption, not a
+  # failed sync. Refuse to apply anything unless the column lists are identical.
+  local remote_cols local_cols
+  remote_cols="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$MASTER" \
+      "sqlite3 $REMOTE_DB \"SELECT group_concat(name) FROM pragma_table_info('accounts');\"" 2>/dev/null || true)"
+  local_cols="$(sqlite3 "$DB" "SELECT group_concat(name) FROM pragma_table_info('accounts');")"
+  if [ -z "$remote_cols" ]; then
+    echo "$(date '+%H:%M:%S') sync failed: cannot read master schema ($MASTER)" >&2
+    return 1
+  fi
+  if [ "$remote_cols" != "$local_cols" ]; then
+    echo "$(date '+%H:%M:%S') sync ABORTED: accounts schema differs between master and replica." >&2
+    echo "  master:  $remote_cols" >&2
+    echo "  replica: $local_cols" >&2
+    echo "  Upgrade both to the same build before syncing — applying this would corrupt columns." >&2
+    return 1
+  fi
+
   # `.dump` emits CREATE + INSERT; keep only the INSERTs and make them upserts.
   if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$MASTER" \
         "sqlite3 $REMOTE_DB '.dump accounts'" 2>/dev/null \
