@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+#
+# Pull account credentials from the MASTER into this replica's store.
+#
+# Only the master refreshes OAuth tokens. Refresh tokens rotate, so a second refresher burns the
+# grant (`refresh_token_reused` -> the account is forced back through a browser login). This script
+# is the other half of that contract: the replica never rotates, it copies what the master rotated.
+#
+# Only the `accounts` table is synced — it holds the credentials and their expiries. History
+# (request_log, continuity, usage) stays local to each side; the replica polls upstream for its own
+# quota numbers, which are authoritative there anyway.
+#
+# Rows are UPSERTed rather than the table replaced: other tables reference accounts by id, so a
+# DELETE would break those references, and an upsert still picks up every rotation and new account.
+#
+# Usage:  scripts/replica-sync [MASTER_SSH_HOST]      (default: ultraflux)
+#         scripts/replica-sync --loop [MASTER] [SECS] (default every 300s)
+#
+# Requires: ssh access to the master, and THE SAME `key` file on both sides — stored tokens are
+# encrypted with it, so a replica holding a different key cannot decrypt what it copies.
+set -euo pipefail
+
+MASTER="${1:-ultraflux}"
+DB="${POLYFLARE_STORE_DB:-$HOME/.polyflare/store.db}"
+REMOTE_DB="${POLYFLARE_MASTER_STORE_DB:-\$HOME/.polyflare/store.db}"
+
+sync_once() {
+  local tmp
+  tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' RETURN
+
+  # `.dump` emits CREATE + INSERT; keep only the INSERTs and make them upserts.
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$MASTER" \
+        "sqlite3 $REMOTE_DB '.dump accounts'" 2>/dev/null \
+        | grep '^INSERT INTO' \
+        | sed 's/^INSERT INTO/INSERT OR REPLACE INTO/' > "$tmp"; then
+    echo "$(date '+%H:%M:%S') sync failed: cannot reach master ($MASTER)" >&2
+    return 1
+  fi
+
+  local rows
+  rows="$(wc -l < "$tmp" | tr -d ' ')"
+  if [ "$rows" -eq 0 ]; then
+    # Never let an empty read look like success: it would silently leave stale tokens in place
+    # until they expire, and the replica cannot mint new ones.
+    echo "$(date '+%H:%M:%S') sync aborted: master returned no account rows" >&2
+    return 1
+  fi
+
+  { echo "BEGIN IMMEDIATE;"; cat "$tmp"; echo "COMMIT;"; } | sqlite3 "$DB"
+  echo "$(date '+%H:%M:%S') synced $rows account row(s) from $MASTER"
+}
+
+if [ "${1:-}" = "--loop" ]; then
+  MASTER="${2:-ultraflux}"
+  INTERVAL="${3:-300}"
+  echo "replica-sync: every ${INTERVAL}s from $MASTER -> $DB"
+  # Keep going when the master is briefly unreachable: the replica serves on its cached tokens
+  # until they expire, which is the whole point of tolerating a flaky link.
+  while true; do
+    sync_once || true
+    sleep "$INTERVAL"
+  done
+else
+  sync_once
+fi

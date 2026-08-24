@@ -45,6 +45,39 @@ pub(crate) enum ReactiveAuthError {
     AccountUnavailable,
 }
 
+/// Whether this process is a REPLICA: it serves traffic from a pool whose OAuth tokens another
+/// instance owns and rotates.
+///
+/// A replica must NEVER refresh. Refresh tokens rotate, so a second refresher burns the grant — the
+/// loser's next attempt fails `refresh_token_reused`, which classifies as `ReauthRequired` and
+/// forces a browser re-login. That is the single constraint that makes sharing one account pool
+/// across two machines safe: exactly one refresher, everyone else consumes what it rotates.
+///
+/// A replica still adopts a token rotated by the master (see [`ReactiveAuth::refresh_after_unauthorized`]'s
+/// peer check, which runs BEFORE this gate) — it simply never performs the rotation itself. When the
+/// stored token is genuinely stale it surfaces the 401 and waits for the master's next sync rather
+/// than racing for a new one.
+///
+/// Read once, at first use: a deployment mode fixed for the process's lifetime, never per-request.
+static REPLICA_MODE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| parse_replica_flag(std::env::var("POLYFLARE_REPLICA_MODE").ok().as_deref()));
+
+/// Parse the replica flag. Split out from the `LazyLock` so it is testable: the static resolves
+/// once per process, which no test can exercise both ways. Anything that is not an explicit
+/// affirmative means MASTER — the failure that matters is a master silently believing it is a
+/// replica and refreshing nothing, so an unset or unrecognised value must never turn refresh off.
+fn parse_replica_flag(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        Some(v) => v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"),
+        None => false,
+    }
+}
+
+/// See [`REPLICA_MODE`]. Exposed so startup can report the mode it resolved.
+pub fn is_replica() -> bool {
+    *REPLICA_MODE
+}
+
 impl ReactiveAuth {
     pub fn new(
         store: Store,
@@ -125,6 +158,13 @@ impl ReactiveAuth {
             }));
         }
 
+        // The peer check above already adopted a token the master rotated. Reaching here means the
+        // stored token really is the rejected one, and only the master may replace it — so surface
+        // the 401 (credentials untouched) and let the next sync bring a fresh one.
+        if is_replica() {
+            return Ok(None);
+        }
+
         if mode == AuthMode::AnthropicOauth {
             return self
                 .refresh_anthropic(
@@ -186,6 +226,10 @@ impl ReactiveAuth {
         if auth.mode() != AuthMode::CodexOauth {
             return Ok(false);
         }
+        // A replica never rotates: the master owns this grant (see `REPLICA_MODE`).
+        if is_replica() {
+            return Ok(false);
+        }
         if !should_refresh(
             token_exp(&stored_tokens.access_token),
             stored_account.last_refresh,
@@ -225,6 +269,10 @@ impl ReactiveAuth {
             return Ok(false);
         }
         if auth.mode() != AuthMode::AnthropicOauth {
+            return Ok(false);
+        }
+        // A replica never rotates: the master owns this grant (see `REPLICA_MODE`).
+        if is_replica() {
             return Ok(false);
         }
         if !polyflare_anthropic::oauth::should_refresh(auth.access_token_expires_at, now) {
@@ -420,6 +468,20 @@ impl ReactiveAuth {
 
 #[cfg(test)]
 mod tests {
+
+    /// An unset or unrecognised value must mean MASTER. A master that wrongly believes it is a
+    /// replica refreshes nothing, and every account dies silently at its next token expiry.
+    #[test]
+    fn only_an_explicit_affirmative_enables_replica_mode() {
+        for on in ["1", "true", "TRUE", "Yes", " true "] {
+            assert!(super::parse_replica_flag(Some(on)), "{on:?} should enable replica mode");
+        }
+        for off in ["0", "false", "", "  ", "no", "master", "replica"] {
+            assert!(!super::parse_replica_flag(Some(off)), "{off:?} must NOT enable replica mode");
+        }
+        assert!(!super::parse_replica_flag(None), "unset must mean master");
+    }
+
     use super::*;
     use polyflare_store::Account as StoredAccount;
     use polyflare_testkit::MockOAuth;

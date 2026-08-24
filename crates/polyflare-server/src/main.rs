@@ -775,6 +775,17 @@ async fn passkeys_remove(id: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// The M2b server: store-backed multi-account pool selection.
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = ServeConfig::from_env()?;
+    // Which half of a master/replica pair this process is. Announced at startup because the
+    // difference is invisible at runtime until something goes wrong: a replica never rotates OAuth
+    // tokens, so misreading a master AS a replica silently stops all refreshes and every account
+    // dies at its next expiry, while running two masters over one pool burns refresh tokens
+    // (`refresh_token_reused`) and forces browser re-logins. See `reactive_auth::REPLICA_MODE`.
+    if polyflare_server::reactive_auth::is_replica() {
+        eprintln!(
+            "polyflare: REPLICA mode — this process never refreshes OAuth tokens; it serves the \
+             credentials its master rotates (sync them with scripts/replica-sync)"
+        );
+    }
     // Bind BEFORE any startup work. Everything below — opening a multi-hundred-megabyte store,
     // running migrations, warming the model catalog — takes seconds, and until the socket exists a
     // client connecting to this port is REFUSED, not delayed. `launchctl kickstart -k` kills the
