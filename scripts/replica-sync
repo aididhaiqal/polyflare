@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 #
+# BACKSTOP credential sync. `scripts/replica-pull` (HTTP, named-field contract) is the PRIMARY
+# path as of 2026-08-24; this one is kept staggered behind it so a single broken path cannot strand
+# a travelling replica with expiring tokens. Both are idempotent and converge to the same result.
+#
+# Prefer replica-pull: `.dump` emits POSITIONAL inserts, so this script's wire format IS the schema
+# (hence the guard below), and it copies CIPHERTEXT, which requires both nodes to share a key file.
+#
 # Pull account credentials from the MASTER into this replica's store.
 #
 # Only the master refreshes OAuth tokens. Refresh tokens rotate, so a second refresher burns the

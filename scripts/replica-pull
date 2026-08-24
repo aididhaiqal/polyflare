@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+#
+# Pull account credentials from the MASTER over HTTP into this replica's store.
+#
+# Replaces the SSH + `sqlite3 .dump` path (scripts/replica-sync), which coupled the wire format to
+# the accounts schema. See crates/polyflare-server/src/replica_pull.rs for the contract.
+#
+# Only the master refreshes OAuth tokens: refresh tokens rotate, and a second refresher burns the
+# grant (`refresh_token_reused` -> forced browser re-login). This copies what the master rotated.
+#
+# The admin token is read from a 0600 file rather than passed as an argument or baked into the
+# launchd plist: argv is world-readable via `ps`, and a plist is a plain file in a directory that
+# gets backed up and synced.
+#
+# Setup (run once, in your own terminal so the token never lands in a shell history you share):
+#     install -m 600 /dev/null ~/.polyflare/master-token
+#     cat > ~/.polyflare/master-token      # paste the token, then Ctrl-D
+#
+# Usage:  scripts/replica-pull [MASTER_URL]
+set -euo pipefail
+
+MASTER="${1:-${POLYFLARE_MASTER_URL:-https://ultraflux.tail6de914.ts.net}}"
+TOKEN_FILE="${POLYFLARE_MASTER_TOKEN_FILE:-$HOME/.polyflare/master-token}"
+BIN="${POLYFLARE_BIN:-$HOME/.local/bin/polyflare}"
+
+if [ ! -r "$TOKEN_FILE" ]; then
+  echo "no master token at $TOKEN_FILE — see the setup note in this script" >&2
+  exit 1
+fi
+
+# Refuse a token file anyone else can read. A readable refresh-token credential on a laptop that
+# travels is worth more than the inconvenience of this check.
+perms="$(stat -f '%Lp' "$TOKEN_FILE" 2>/dev/null || stat -c '%a' "$TOKEN_FILE")"
+if [ "$perms" != "600" ]; then
+  echo "$TOKEN_FILE is mode $perms; must be 600 (chmod 600 \"$TOKEN_FILE\")" >&2
+  exit 1
+fi
+
+POLYFLARE_ADMIN_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
+export POLYFLARE_ADMIN_TOKEN
+
+if [ -z "$POLYFLARE_ADMIN_TOKEN" ]; then
+  echo "$TOKEN_FILE is empty" >&2
+  exit 1
+fi
+
+echo "$(date '+%H:%M:%S') pulling from $MASTER"
+exec "$BIN" replica pull --master "$MASTER"
