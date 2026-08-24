@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Push this replica's request-log rows up to the master, so one dashboard shows both machines.
+
+Telemetry only. `continuity_*` is deliberately NEVER pushed: anchors are owned by one account on one
+node, and replicating them across nodes recreates the cross-node anchor confusion they exist to
+prevent. Quota is not pushed either — both nodes poll upstream, which is authoritative there.
+
+Runs over SSH rather than an HTTP endpoint: the serving path gets no new write surface, and SSH over
+the tailnet already authenticates. Push (not pull) because the replica can always reach the master,
+while a travelling laptop behind hotel NAT cannot be reached.
+
+Usage:  replica-push [MASTER_SSH_HOST] [--batch N] [--dry-run]
+"""
+
+import argparse
+import os
+import pathlib
+import sqlite3
+import subprocess
+import sys
+
+DB = pathlib.Path(os.environ.get("POLYFLARE_STORE_DB", pathlib.Path.home() / ".polyflare/store.db"))
+REMOTE_DB = os.environ.get("POLYFLARE_MASTER_STORE_DB", "$HOME/.polyflare/store.db")
+WATERMARK = pathlib.Path.home() / ".polyflare/replica-push.watermark"
+TABLE = "request_log"
+
+
+def origin_tag() -> str:
+    host = os.uname().nodename.split(".")[0]
+    return f"replica:{host}"
+
+
+def read_watermark(conn: sqlite3.Connection) -> int:
+    """Last pushed rowid.
+
+    On the FIRST run this seeds to the current max instead of 0, so a replica that carries history
+    from a previous life (this laptop held ~593k pre-migration rows) pushes only what it serves from
+    now on, rather than replaying an archive the master may already have.
+    """
+    if WATERMARK.exists():
+        try:
+            return int(WATERMARK.read_text().strip())
+        except ValueError:
+            pass
+    seed = conn.execute(f"SELECT COALESCE(MAX(id), 0) FROM {TABLE}").fetchone()[0]
+    WATERMARK.write_text(str(seed))
+    print(f"  first run: watermark seeded at id={seed} (existing history is not pushed)")
+    return seed
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("master", nargs="?", default="ultraflux")
+    ap.add_argument("--batch", type=int, default=5000,
+                    help="max rows per run; bounds bandwidth on a hotel link")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    if not DB.exists():
+        print(f"no local store at {DB}", file=sys.stderr)
+        return 1
+
+    conn = sqlite3.connect(f"file:{DB}?mode=rw", uri=True)
+    watermark = read_watermark(conn)
+
+    # `id` is excluded: both nodes number rows from their own sequence, so carrying the local id
+    # would collide with an unrelated master row. The master assigns its own.
+    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({TABLE})") if r[1] != "id"]
+
+    rows = conn.execute(
+        f"SELECT id, {', '.join(cols)} FROM {TABLE} WHERE id > ? ORDER BY id LIMIT ?",
+        (watermark, args.batch),
+    ).fetchall()
+    if not rows:
+        print(f"  nothing new to push (watermark id={watermark})")
+        return 0
+
+    tag = origin_tag()
+    src_idx = cols.index("source") if "source" in cols else None
+    rid_idx = cols.index("request_id") if "request_id" in cols else None
+
+    def lit(v):
+        if v is None:
+            return "NULL"
+        if isinstance(v, (int, float)):
+            return repr(v)
+        if isinstance(v, bytes):
+            return "X'" + v.hex() + "'"
+        return "'" + str(v).replace("'", "''") + "'"
+
+    statements, request_ids, last_id = [], [], watermark
+    for row in rows:
+        last_id = row[0]
+        values = list(row[1:])
+        if src_idx is not None:
+            # Tag which node served it. Without this, trip traffic and home traffic are
+            # indistinguishable on the merged dashboard and every later comparison is ambiguous.
+            values[src_idx] = tag
+        if rid_idx is not None and values[rid_idx]:
+            request_ids.append(str(values[rid_idx]))
+        statements.append(
+            f"INSERT INTO {TABLE} ({', '.join(cols)}) VALUES ({', '.join(lit(v) for v in values)});"
+        )
+
+    # Idempotent: clear any prior copy of these rows first, so a retried batch after a dropped
+    # connection cannot double-count. request_id is 128 random bits, so this can only ever match
+    # the rows we are about to insert.
+    sql = ["BEGIN IMMEDIATE;"]
+    if request_ids:
+        ids = ", ".join("'" + r.replace("'", "''") + "'" for r in request_ids)
+        sql.append(f"DELETE FROM {TABLE} WHERE request_id IN ({ids});")
+    sql.extend(statements)
+    sql.append("COMMIT;")
+    payload = "\n".join(sql)
+
+    if args.dry_run:
+        print(f"  would push {len(statements)} row(s), watermark {watermark} -> {last_id}")
+        return 0
+
+    proc = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", args.master,
+         f"sqlite3 {REMOTE_DB}"],
+        input=payload, text=True, capture_output=True,
+    )
+    if proc.returncode != 0:
+        # Leave the watermark untouched so the same rows retry next run. Losing telemetry is
+        # acceptable; losing track of WHERE we were is not.
+        print(f"  push failed ({proc.returncode}): {proc.stderr.strip()[:200]}", file=sys.stderr)
+        return 1
+
+    WATERMARK.write_text(str(last_id))
+    print(f"  pushed {len(statements)} row(s) to {args.master}, watermark now id={last_id}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
