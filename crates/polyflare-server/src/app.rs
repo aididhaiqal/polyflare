@@ -425,6 +425,12 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         )
         .route("/api/keys/{id}", patch(crate::write_api::patch_key_handler))
         .route("/api/logs/stream", get(crate::sse::logs_stream_handler))
+        // Master half of master/replica. Inside this router, so it inherits `require_admin` —
+        // it serves live OAuth tokens and must never be reachable unauthenticated.
+        .route(
+            "/api/replica/accounts",
+            get(crate::replica_api::replica_accounts_handler),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::require_admin,

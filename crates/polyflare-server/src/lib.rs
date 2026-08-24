@@ -39,6 +39,8 @@ pub mod priority_policy_api;
 pub mod provider_api;
 pub mod reactive_auth;
 pub mod read_api;
+pub mod replica_api;
+pub mod replica_pull;
 pub mod reasoning_transform;
 pub mod session_governor;
 pub mod refresh_locks;

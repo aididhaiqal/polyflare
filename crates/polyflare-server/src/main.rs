@@ -78,6 +78,14 @@ enum Commands {
         #[command(subcommand)]
         command: CodexSessionsCommands,
     },
+    /// Replica-mode sync: pull account credentials down from the master over HTTP.
+    ///
+    /// Only the master refreshes OAuth tokens — refresh tokens rotate, and a second refresher
+    /// burns the grant. This is the copy half of that contract.
+    Replica {
+        #[command(subcommand)]
+        command: ReplicaCommands,
+    },
     /// Read an Anthropic account's subscription usage from the free `/api/oauth/usage` endpoint
     /// (the same one the Claude Code CLI polls) and print the raw JSON. Read-only diagnostic.
     #[command(name = "anthropic-usage")]
@@ -85,6 +93,16 @@ enum Commands {
         /// Account id to read. Omit to read every Anthropic account.
         #[arg(long = "account", value_name = "ACCOUNT_ID")]
         account: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReplicaCommands {
+    /// Fetch every account from the master and reconcile it into this node's store.
+    Pull {
+        /// Master base URL. Defaults to `$POLYFLARE_MASTER_URL`.
+        #[arg(long = "master", value_name = "URL")]
+        master: Option<String>,
     },
 }
 
@@ -317,8 +335,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 codex_home,
             } => codex_sessions_retag(&from, &to, dry_run, codex_home).await,
         },
+        Commands::Replica { command } => match command {
+            ReplicaCommands::Pull { master } => replica_pull(master).await,
+        },
         Commands::AnthropicUsage { account } => anthropic_usage(account).await,
     }
+}
+
+async fn replica_pull(master: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let master = master
+        .or_else(|| std::env::var("POLYFLARE_MASTER_URL").ok())
+        .ok_or("no master URL: pass --master or set POLYFLARE_MASTER_URL")?;
+    // The replica authenticates to the master with the SAME admin token the dashboard uses. No
+    // second credential system for a route that already sits behind `require_admin`.
+    let token = std::env::var("POLYFLARE_ADMIN_TOKEN")
+        .map_err(|_| "POLYFLARE_ADMIN_TOKEN is not set (needed to authenticate to the master)")?;
+
+    let config = ServeConfig::from_env()?;
+    let store = Store::open(&config.db_path).await?;
+    let cipher = TokenCipher::load_or_create(&config.key_path)?;
+
+    let report = polyflare_server::replica_pull::pull(&store, &cipher, &master, &token)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!(
+        "pulled from {master}: {} updated, {} inserted, {} unchanged",
+        report.updated, report.inserted, report.unchanged
+    );
+    Ok(())
 }
 
 async fn anthropic_usage(account: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
