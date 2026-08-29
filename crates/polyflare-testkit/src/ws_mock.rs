@@ -63,6 +63,15 @@ pub enum ScriptedTurn {
     /// A normal turn: emit `events` verbatim as WS text frames, then a terminal
     /// `response.completed` carrying a freshly generated `resp_N` id.
     Turn { events: Vec<String> },
+    /// A completed turn whose terminal `response.completed` carries NO `response.id`.
+    ///
+    /// Real, not hypothetical: the relay's `sniff_completed_id` needs a full JSON parse AND a
+    /// present `response.id`, and the turn-budget release used to hang off that same check — so a
+    /// completed round whose id did not extract stayed charged forever and the turn died at
+    /// `max_account_attempts` SUCCESSFUL rounds
+    /// (`docs/incidents/2026-08-29-ws-turn-budget-leak.md`). Every other scripted turn emits an
+    /// id, which is precisely why the existing tool-loop test could not catch it.
+    TurnWithoutResponseId { events: Vec<String> },
     /// A normal turn whose terminal `response.completed` includes the numeric usage object emitted
     /// by the real Codex WS API. Kept separate from `Turn` so existing relay tests retain their
     /// minimal historical fixture while telemetry tests can exercise the complete wire shape.
@@ -120,6 +129,12 @@ impl ScriptedTurn {
     /// generated id.
     pub fn normal(events: Vec<String>) -> Self {
         ScriptedTurn::Turn { events }
+    }
+
+    /// A COMPLETED turn whose terminal frame omits `response.id` — see
+    /// [`ScriptedTurn::TurnWithoutResponseId`].
+    pub fn normal_without_response_id(events: Vec<String>) -> Self {
+        ScriptedTurn::TurnWithoutResponseId { events }
     }
 
     /// A normal, COMPLETED turn after which the server closes the socket — a between-turns
@@ -595,6 +610,18 @@ async fn handle_socket(mut socket: WebSocket, mock: MockWsUpstream) {
                 }
                 // Loop back around: the socket stays open for a POSSIBLE next turn (the whole
                 // point of the connection-reuse proof) instead of closing after one exchange.
+            }
+            ScriptedTurn::TurnWithoutResponseId { events } => {
+                for e in &events {
+                    if socket.send(Message::Text(e.clone().into())).await.is_err() {
+                        return;
+                    }
+                }
+                // Terminal, completed, but with no id for the relay to sniff.
+                let completed = json!({"type":"response.completed","response":{}}).to_string();
+                if socket.send(Message::Text(completed.into())).await.is_err() {
+                    return;
+                }
             }
             ScriptedTurn::TurnThenClose { events } => {
                 for e in &events {

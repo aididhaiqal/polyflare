@@ -605,7 +605,6 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
     // forwarded completion clears the logical turn's spent attempts (codex reuses one turn id
     // across every tool-call round of a user turn — progress must reset the budget, or round
     // `max_account_attempts + 1` of a healthy loop is rejected as amplification).
-    let mut active_turn_key: Option<String> = None;
     // Retry a mid-session 401 at most once, and only before any upstream frame from this turn has
     // crossed the downstream boundary.
     let mut reactive_auth_attempted = false;
@@ -736,7 +735,6 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                 continue;
                             }
                             turn_telemetry = Some(next_turn);
-                            active_turn_key = logical_turn_key.clone();
                             reactive_auth_attempted = false;
                             reasoning_transform_attempted = false;
                             client_visible_upstream_for_turn = false;
@@ -1363,9 +1361,22 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                     upstream_output_visible_for_turn = true;
                                 }
                                 let mut terminal_seen = false;
+                                // The aggregate turn budget must be released with the SAME key the
+                                // consume charged (`WsTurnTelemetry::logical_turn_key`). Captured
+                                // here because `finish` consumes the telemetry, and ONLY for a
+                                // Completed terminal — a failure terminal keeps its charge, which
+                                // is the amplification bound this budget exists for.
+                                let mut completed_turn_key: Option<String> = None;
                                 if let Some(mut turn) = turn_telemetry.take() {
                                     if let Some(terminal) = turn.observe(&text) {
                                         terminal_seen = true;
+                                        if matches!(
+                                            terminal.protocol_outcome,
+                                            polyflare_store::RequestProtocolOutcome::Completed
+                                        ) {
+                                            completed_turn_key =
+                                                turn.logical_turn_key().map(str::to_owned);
+                                        }
                                         turn.finish(&state, &account.id, terminal).await;
                                     } else {
                                         turn_telemetry = Some(turn);
@@ -1395,13 +1406,23 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                         relay_metrics.record("anchor_resumed_after_redial");
                                         anchored_redial_pending = false;
                                     }
-                                    // Progress also resets the aggregate turn budget: the next
-                                    // tool-call round under this SAME codex turn id is new work,
-                                    // not a retry of a failing turn.
-                                    state
-                                        .runtime
-                                        .clear_logical_turn_attempts(active_turn_key.as_deref());
-                                    active_turn_key = None;
+                                }
+                                // Progress resets the aggregate turn budget: the next tool-call
+                                // round under this SAME codex turn id is new work, not a retry of
+                                // a failing turn.
+                                //
+                                // Deliberately OUTSIDE the `sniff_completed_id` block above. That
+                                // sniff needs a full JSON parse AND a present `response.id`, and
+                                // it feeds anchor ownership, so it must keep both requirements.
+                                // Tying the budget release to it meant that whenever the id did
+                                // not extract, a COMPLETED round stayed charged forever — the turn
+                                // then died at `max_account_attempts` successful rounds with
+                                // `logical_turn_attempts_exhausted` and no failure anywhere.
+                                // Measured 2026-08-29: one WS turn charged 1..9 with zero clears
+                                // while an interleaved HTTP turn paired cleanly every round
+                                // (docs/incidents/2026-08-29-ws-turn-budget-leak.md).
+                                if let Some(key) = completed_turn_key.as_deref() {
+                                    state.runtime.clear_logical_turn_attempts(Some(key));
                                 }
                             }
                         }

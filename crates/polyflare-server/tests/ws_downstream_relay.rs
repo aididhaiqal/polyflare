@@ -3502,6 +3502,58 @@ mod relay_through {
         }
     }
 
+    /// The 2026-08-29 live leak: the pump CHARGED the aggregate budget with the turn's own key on
+    /// every round, but RELEASED it only inside `if let Some(id) = sniff_completed_id(&text)` and
+    /// with a separate `active_turn_key`. A completed round whose `response.id` did not extract
+    /// therefore stayed charged, so a healthy tool loop died at `max_account_attempts` SUCCESSFUL
+    /// rounds with `logical_turn_attempts_exhausted` and no failure anywhere.
+    ///
+    /// Measured before the fix: one WS turn charged 1..9 with zero clears while an interleaved
+    /// HTTP turn paired consume->clear cleanly every round
+    /// (`docs/incidents/2026-08-29-ws-turn-budget-leak.md`). The limit is pinned to 1, so without
+    /// the release every round after the first is rejected.
+    #[tokio::test]
+    async fn completed_round_without_a_response_id_still_releases_the_turn_budget() {
+        const ROUNDS: usize = 4;
+        let script = (0..ROUNDS)
+            .map(|_| ScriptedTurn::normal_without_response_id(vec![]))
+            .collect::<Vec<_>>();
+        let mock_base = MockWsUpstream::scripted(script).spawn().await;
+        let (base, state) = spawn_with_pinned_account("acct-no-resp-id", &mock_base).await;
+        state
+            .runtime_settings
+            .set("max_account_attempts", SettingValue::U64(1))
+            .unwrap();
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake must succeed");
+        for round in 0..ROUNDS {
+            let frame = serde_json::json!({
+                "type": "response.create",
+                "input": [],
+                "client_metadata": {"turn_id": "turn-without-response-ids"}
+            })
+            .to_string();
+            ws.send(TMessage::Text(frame.into())).await.unwrap();
+
+            let reply = tokio::time::timeout(Duration::from_secs(10), ws.next())
+                .await
+                .unwrap_or_else(|_| panic!("round {round} must answer instead of hanging"))
+                .expect("a terminal reply")
+                .expect("no websocket error");
+            let TMessage::Text(reply) = reply else {
+                panic!("expected a text frame in round {round}");
+            };
+            let value: serde_json::Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(
+                value["type"], "response.completed",
+                "round {round} completed upstream, so its budget must have been released even \
+                 though the terminal carried no response id: {reply}"
+            );
+        }
+    }
+
     /// Rotate our leg, not theirs (2026-08-02): when the upstream dies BETWEEN turns, the relay
     /// drops ONLY the upstream and leaves the client connected.
     ///
