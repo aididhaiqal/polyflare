@@ -101,9 +101,26 @@ fn turn_id_from_client_metadata(raw: Option<&RawValue>) -> Option<String> {
     None
 }
 
+/// The budget key for ONE generation of a codex turn.
+///
+/// Scoped by `previous_response_id` — the anchor — as well as the turn id, because codex stamps one
+/// `turn_id` on EVERY tool-call round of a user turn (and on every subagent under it). Keyed on the
+/// turn alone, a healthy turn's rounds all shared a single budget, so the bound had to exceed the
+/// longest turn to avoid killing it: measured 2026-08-29 on a sol-ultra + subagent workload, 64
+/// rounds per turn on average and 312 at the tail, against a limit of 8.
+///
+/// The anchor advances with every completed round while the turn id stays fixed (verified live:
+/// one turn walked 5 distinct anchors across 5 rounds), and a RETRY of a round replays the same
+/// anchor. So this scoping charges retries — the amplification the budget exists to bound — while
+/// letting genuine progress start clean, with no headroom and no dependence on a release firing.
+///
+/// A round with no anchor (a turn's first generation, or a `ResendFull` recovery that strips it)
+/// falls into one shared bucket per turn, which is correct: those ARE the retries of the same
+/// logical position.
 fn logical_turn_key(
     headers: &HeaderMap,
     client_metadata: Option<&RawValue>,
+    previous_response_id: Option<&str>,
     pool: Option<&str>,
 ) -> Option<String> {
     // A reused WebSocket keeps the compatibility headers from its handshake, while every
@@ -119,12 +136,15 @@ fn logical_turn_key(
         .or_else(|| header_str(headers, "x-session-id"));
     let thread =
         header_str(headers, "thread-id").or_else(|| header_str(headers, "x-codex-thread-id"));
+    // v2: the anchor joined the tuple. The tag bump keeps a v1 key from colliding with a v2 one
+    // across a rolling restart, so an in-flight turn cannot inherit a stale budget.
     let encoded = serde_json::to_vec(&(
-        "codex-logical-turn-v1",
+        "codex-logical-turn-v2",
         pool.unwrap_or_default(),
         session.as_deref().unwrap_or_default(),
         thread.as_deref().unwrap_or_default(),
         turn_id,
+        previous_response_id.unwrap_or_default(),
     ))
     .expect("string tuple serializes");
     Some(sha256_hex(&encoded))
@@ -357,13 +377,21 @@ pub fn parse_inbound_scoped(
     let session_key =
         derive_session_key(headers, prompt_cache_key.as_deref(), field("input"), pool);
     let session_id = session_id_from_headers(headers);
+    let client_previous_response_id = raw_as_str(field("previous_response_id"));
     let ctx = RequestCtx {
         session_id,
         session_key: Some(session_key),
         logical_turn_key: generate
-            .then(|| logical_turn_key(headers, field("client_metadata"), pool))
+            .then(|| {
+                logical_turn_key(
+                    headers,
+                    field("client_metadata"),
+                    client_previous_response_id.as_deref(),
+                    pool,
+                )
+            })
             .flatten(),
-        client_previous_response_id: raw_as_str(field("previous_response_id")),
+        client_previous_response_id,
         is_full_resend,
         input_count,
         estimated_tokens,
@@ -415,6 +443,79 @@ mod tests {
     fn session_header_yields_hard_key() {
         let ctx = ctx_of(&hdr(&[("session_id", "sess-1")]), serde_json::json!({}));
         assert_eq!(ctx.session_key.unwrap().strength, KeyStrength::Hard);
+    }
+
+    /// Successive rounds of ONE turn must get DIFFERENT budget keys.
+    ///
+    /// Codex stamps one `turn_id` on every tool-call round (and on every subagent under it), so
+    /// keyed on the turn alone a healthy 64-round turn shared a single budget of 8 and died at
+    /// round 9 with `logical_turn_attempts_exhausted` despite zero failures. The anchor advances
+    /// with progress, so scoping on it gives each generation a clean budget.
+    #[test]
+    fn successive_rounds_of_one_turn_get_distinct_budget_keys() {
+        let metadata = serde_json::json!({"turn_id": "one-turn"}).to_string();
+        let headers = hdr(&[
+            ("session-id", "s"),
+            ("thread-id", "t"),
+            ("x-codex-turn-metadata", &metadata),
+        ]);
+        let round_1 = ctx_of(
+            &headers,
+            serde_json::json!({"previous_response_id": "resp_round_1"}),
+        )
+        .logical_turn_key;
+        let round_2 = ctx_of(
+            &headers,
+            serde_json::json!({"previous_response_id": "resp_round_2"}),
+        )
+        .logical_turn_key;
+
+        assert!(round_1.is_some() && round_2.is_some());
+        assert_ne!(
+            round_1, round_2,
+            "each generation of a turn must start from its own budget"
+        );
+    }
+
+    /// ...but a RETRY of the SAME round replays the same anchor, so it must SHARE the budget —
+    /// that is the amplification this bound exists to catch, and it must still be caught.
+    #[test]
+    fn a_retry_of_the_same_round_shares_its_budget_key() {
+        let metadata = serde_json::json!({"turn_id": "one-turn"}).to_string();
+        let headers = hdr(&[
+            ("session-id", "s"),
+            ("thread-id", "t"),
+            ("x-codex-turn-metadata", &metadata),
+        ]);
+        let body = serde_json::json!({"previous_response_id": "resp_same"});
+        let first = ctx_of(&headers, body.clone()).logical_turn_key;
+        let verbatim_retry = ctx_of(&headers, body).logical_turn_key;
+
+        assert!(first.is_some());
+        assert_eq!(
+            first, verbatim_retry,
+            "a verbatim retry must not escape the budget by looking like a new generation"
+        );
+    }
+
+    /// A first generation carries no anchor. Those share one bucket per turn, which is right:
+    /// retries of a turn's opening round ARE the same logical position.
+    #[test]
+    fn rounds_without_an_anchor_share_one_bucket_per_turn() {
+        let metadata = serde_json::json!({"turn_id": "anchorless"}).to_string();
+        let headers = hdr(&[("x-codex-turn-metadata", &metadata)]);
+        let a = ctx_of(&headers, serde_json::json!({})).logical_turn_key;
+        let b = ctx_of(&headers, serde_json::json!({})).logical_turn_key;
+        assert!(a.is_some());
+        assert_eq!(a, b, "anchorless rounds of one turn must share a budget");
+
+        let other_turn = serde_json::json!({"turn_id": "different"}).to_string();
+        let c = ctx_of(
+            &hdr(&[("x-codex-turn-metadata", &other_turn)]),
+            serde_json::json!({}),
+        )
+        .logical_turn_key;
+        assert_ne!(a, c, "a different turn must never share a budget");
     }
 
     #[test]
