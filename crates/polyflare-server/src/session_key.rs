@@ -114,13 +114,19 @@ fn turn_id_from_client_metadata(raw: Option<&RawValue>) -> Option<String> {
 /// anchor. So this scoping charges retries — the amplification the budget exists to bound — while
 /// letting genuine progress start clean, with no headroom and no dependence on a release firing.
 ///
-/// A round with no anchor (a turn's first generation, or a `ResendFull` recovery that strips it)
-/// falls into one shared bucket per turn, which is correct: those ARE the retries of the same
-/// logical position.
+/// Not every round carries an anchor: measured live, 4 of 26 turn-bearing requests had none, and a
+/// turn whose rounds are all anchorless collapsed back into ONE bucket and died at round 9 of
+/// healthy work (2026-08-29 15:39, key `c4c0e99b…`, eight completed rounds then a refusal).
+/// `input_count` is the fallback: a conversation's input grows by at least one item per round as
+/// tool results accumulate, while a verbatim retry replays the identical input. So it separates
+/// genuine progress and still collapses a replay, exactly like the anchor does.
+///
+/// It is a COUNT, never content — nothing derived from what the input says enters the key.
 fn logical_turn_key(
     headers: &HeaderMap,
     client_metadata: Option<&RawValue>,
     previous_response_id: Option<&str>,
+    input_count: u32,
     pool: Option<&str>,
 ) -> Option<String> {
     // A reused WebSocket keeps the compatibility headers from its handshake, while every
@@ -144,7 +150,12 @@ fn logical_turn_key(
         session.as_deref().unwrap_or_default(),
         thread.as_deref().unwrap_or_default(),
         turn_id,
-        previous_response_id.unwrap_or_default(),
+        // Prefer the anchor; fall back to the input count when a round carries none. Only ONE of
+        // the two ever varies a key, so an anchored round and an anchorless one can never collide.
+        match previous_response_id {
+            Some(anchor) => format!("a:{anchor}"),
+            None => format!("n:{input_count}"),
+        },
     ))
     .expect("string tuple serializes");
     Some(sha256_hex(&encoded))
@@ -387,6 +398,7 @@ pub fn parse_inbound_scoped(
                     headers,
                     field("client_metadata"),
                     client_previous_response_id.as_deref(),
+                    input_count,
                     pool,
                 )
             })
@@ -498,24 +510,73 @@ mod tests {
         );
     }
 
-    /// A first generation carries no anchor. Those share one bucket per turn, which is right:
-    /// retries of a turn's opening round ARE the same logical position.
+    /// Not every round carries an anchor — 4 of 26 turn-bearing requests had none when measured,
+    /// and a turn whose rounds are ALL anchorless collapsed into one bucket and died at round 9 of
+    /// healthy work (2026-08-29 15:39). `input_count` separates them: the conversation grows by at
+    /// least one item per round.
     #[test]
-    fn rounds_without_an_anchor_share_one_bucket_per_turn() {
+    fn anchorless_rounds_are_separated_by_their_growing_input() {
         let metadata = serde_json::json!({"turn_id": "anchorless"}).to_string();
         let headers = hdr(&[("x-codex-turn-metadata", &metadata)]);
-        let a = ctx_of(&headers, serde_json::json!({})).logical_turn_key;
-        let b = ctx_of(&headers, serde_json::json!({})).logical_turn_key;
-        assert!(a.is_some());
-        assert_eq!(a, b, "anchorless rounds of one turn must share a budget");
-
-        let other_turn = serde_json::json!({"turn_id": "different"}).to_string();
-        let c = ctx_of(
-            &hdr(&[("x-codex-turn-metadata", &other_turn)]),
-            serde_json::json!({}),
+        let round_1 = ctx_of(&headers, serde_json::json!({"input": [{"a": 1}]})).logical_turn_key;
+        let round_2 =
+            ctx_of(&headers, serde_json::json!({"input": [{"a": 1}, {"b": 2}]})).logical_turn_key;
+        let round_3 = ctx_of(
+            &headers,
+            serde_json::json!({"input": [{"a": 1}, {"b": 2}, {"c": 3}]}),
         )
         .logical_turn_key;
-        assert_ne!(a, c, "a different turn must never share a budget");
+
+        assert!(round_1.is_some());
+        assert_ne!(
+            round_1, round_2,
+            "an anchorless round must not reuse the previous round's budget"
+        );
+        assert_ne!(
+            round_2, round_3,
+            "every anchorless round needs its own budget"
+        );
+    }
+
+    /// ...and a verbatim retry of an anchorless round replays identical input, so it must still
+    /// SHARE the budget — the amplification bound has to survive the fallback.
+    #[test]
+    fn a_verbatim_retry_of_an_anchorless_round_shares_its_budget() {
+        let metadata = serde_json::json!({"turn_id": "anchorless"}).to_string();
+        let headers = hdr(&[("x-codex-turn-metadata", &metadata)]);
+        let body = serde_json::json!({"input": [{"a": 1}, {"b": 2}]});
+        let first = ctx_of(&headers, body.clone()).logical_turn_key;
+        let retry = ctx_of(&headers, body).logical_turn_key;
+        assert!(first.is_some());
+        assert_eq!(first, retry, "a verbatim retry must not escape the bound");
+
+        let other_turn = serde_json::json!({"turn_id": "different"}).to_string();
+        let elsewhere = ctx_of(
+            &hdr(&[("x-codex-turn-metadata", &other_turn)]),
+            serde_json::json!({"input": [{"a": 1}, {"b": 2}]}),
+        )
+        .logical_turn_key;
+        assert_ne!(
+            first, elsewhere,
+            "a different turn must never share a budget"
+        );
+    }
+
+    /// An anchored round and an anchorless one must never collide, even inside one turn — the
+    /// tagged fallback (`a:` / `n:`) keeps the two namespaces apart.
+    #[test]
+    fn anchored_and_anchorless_rounds_never_collide() {
+        let metadata = serde_json::json!({"turn_id": "mixed"}).to_string();
+        let headers = hdr(&[("x-codex-turn-metadata", &metadata)]);
+        let anchored = ctx_of(
+            &headers,
+            serde_json::json!({"previous_response_id": "2", "input": [{"a": 1}]}),
+        )
+        .logical_turn_key;
+        let anchorless =
+            ctx_of(&headers, serde_json::json!({"input": [{"a": 1}, {"b": 2}]})).logical_turn_key;
+        assert!(anchored.is_some() && anchorless.is_some());
+        assert_ne!(anchored, anchorless);
     }
 
     #[test]
