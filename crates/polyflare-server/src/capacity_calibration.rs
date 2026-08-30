@@ -122,9 +122,10 @@ pub async fn derive_capacities(store: &Store) -> Result<Vec<DerivedCapacity>, sq
     let rows: Vec<(String, f64, Option<i64>, f64, String)> = sqlx::query_as(
         r#"
         SELECT u.account_id,
-               u.used_percent,
+               CAST(u.used_percent AS REAL),
                u.reset_at,
-               (SELECT COALESCE(SUM(r.input_tokens), 0)
+               -- CAST: SUM over an INTEGER column returns INTEGER, which will not decode as f64.
+               (SELECT CAST(COALESCE(SUM(r.input_tokens), 0) AS REAL)
                   FROM request_log r
                  WHERE r.account_id = u.account_id
                    AND r.requested_at <= u.recorded_at
