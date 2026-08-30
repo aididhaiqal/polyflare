@@ -9,6 +9,7 @@ pub mod admission_api;
 pub mod alias;
 pub mod app;
 pub mod auth;
+pub mod capacity_calibration;
 pub mod catalog;
 pub mod chatgpt_backend;
 pub mod codex_sessions;

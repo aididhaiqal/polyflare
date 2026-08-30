@@ -17,8 +17,9 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Build one `AccountSnapshot` per stored account. Capacity is derived from `plan_type` inside
-/// the selector (no per-account override in M2b, so `capacity_credits` stays `None`).
+/// Build one `AccountSnapshot` per stored account. Capacity comes from the calibration cache when
+/// it holds a measured value for the account, else stays `None` so the selector falls back to the
+/// per-plan constant (`crate::capacity_calibration`).
 ///
 /// Candidate order is the account `list()` order (`ORDER BY id` — deterministic, stable across
 /// calls). The selector samples over this input order for seed-reproducible picks (same input
@@ -66,6 +67,12 @@ pub async fn assemble_snapshots(store: &Store) -> Result<Vec<AccountSnapshot>, S
         });
         snap.reset_at = account.reset_at;
         snap.cooldown_until = repo.routing_cooldown(&account.id).await?;
+        // Measured capacity when calibration is ON and this account had enough evidence;
+        // otherwise `None`, which leaves the selector on the per-plan constant. Five accounts all
+        // labelled `pro` were measured to differ by 2.5x in quota burned per unit of work, so the
+        // constant systematically over-weights the smallest of them
+        // (`polyflare_core::capacity_estimate`).
+        snap.capacity_credits = crate::capacity_calibration::CAPACITIES.get(&account.id);
         snap.usage_cap_percent = account.usage_cap_percent;
         snap.usage_cap_override = account.usage_cap_override;
         snap.routing_policy = account.routing_policy;

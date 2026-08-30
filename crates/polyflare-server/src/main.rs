@@ -1065,6 +1065,8 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // C12: hourly age-retention pruning over `request_log` + `usage_history` (disabled by default
     // via POLYFLARE_*_RETENTION_DAYS=0; see `polyflare_server::retention`).
     polyflare_server::retention::spawn_retention_prune(state.clone());
+    // Per-account capacity calibration (off unless POLYFLARE_CAPACITY_CALIBRATION is set).
+    polyflare_server::capacity_calibration::spawn_capacity_calibration(state.clone());
 
     let app = build_app_for_bind(state.clone(), &config.bind_addr);
 
