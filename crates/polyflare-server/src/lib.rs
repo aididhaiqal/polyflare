@@ -38,6 +38,7 @@ pub mod posture;
 pub mod priority_policy;
 pub mod priority_policy_api;
 pub mod provider_api;
+pub mod provider_sync;
 pub mod reactive_auth;
 pub mod read_api;
 pub mod replica_api;

@@ -431,6 +431,13 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             "/api/replica/accounts",
             get(crate::replica_api::replica_accounts_handler),
         )
+        // Catalog merge, both directions (GET serves this node's catalog, PUT merges the peer's
+        // in). Same admin gate: the payload carries provider API keys.
+        .route(
+            "/api/replica/catalog",
+            get(crate::provider_sync::catalog_get_handler)
+                .put(crate::provider_sync::catalog_put_handler),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::require_admin,

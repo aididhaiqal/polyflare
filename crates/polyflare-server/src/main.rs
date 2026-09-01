@@ -362,6 +362,15 @@ async fn replica_pull(master: Option<String>) -> Result<(), Box<dyn std::error::
         "pulled from {master}: {} updated, {} inserted, {} unchanged",
         report.updated, report.inserted, report.unchanged
     );
+    // The catalog merges BOTH ways (operator config is edited on whichever node is closest), so
+    // its failure is reported separately rather than voiding the account pull above.
+    match polyflare_server::replica_pull::sync_catalog(&store, &cipher, &master, &token).await {
+        Ok(catalog) => println!(
+            "catalog merged with {master}: {} applied locally, {} pushed to peer",
+            catalog.pulled, catalog.pushed
+        ),
+        Err(e) => eprintln!("catalog merge failed (accounts were still synced): {e}"),
+    }
     Ok(())
 }
 

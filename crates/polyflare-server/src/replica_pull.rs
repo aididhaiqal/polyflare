@@ -183,3 +183,95 @@ pub async fn pull(
 
     Ok(report)
 }
+
+/// Report of one bidirectional catalog merge (see [`crate::provider_sync`]).
+pub struct CatalogSyncReport {
+    /// Rows the peer had newer/missing that were applied locally.
+    pub pulled: u64,
+    /// Rows this node had newer/missing that were pushed to the peer.
+    pub pushed: u64,
+}
+
+/// Merge the custom-provider catalog with the peer, both directions.
+///
+/// One GET gives the peer's rows; they are applied locally under last-writer-wins. The same
+/// snapshot then tells us which LOCAL rows the peer lacks or holds older copies of, and exactly
+/// those are PUT back. Nothing is deleted in either direction.
+pub async fn sync_catalog(
+    store: &Store,
+    cipher: &TokenCipher,
+    master_base: &str,
+    admin_token: &str,
+) -> Fallible<CatalogSyncReport> {
+    use crate::provider_sync::{
+        apply_catalog, fetch_catalog, rows_newer_than, ApplyReport, CatalogPayload,
+        CATALOG_CONTRACT_VERSION,
+    };
+
+    let base = master_base.trim_end_matches('/');
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let response = client
+        .get(format!("{base}/api/replica/catalog"))
+        .header("authorization", format!("Bearer {admin_token}"))
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        // The body is not echoed: on this route it can carry provider API keys.
+        return Err(format!("peer returned HTTP {status} for the catalog").into());
+    }
+    let remote: CatalogPayload = response.json().await?;
+    if remote.contract != CATALOG_CONTRACT_VERSION {
+        return Err(format!(
+            "peer speaks catalog contract v{}, this build understands v{CATALOG_CONTRACT_VERSION}; \
+             upgrade both sides before syncing",
+            remote.contract
+        )
+        .into());
+    }
+
+    let down = apply_catalog(store, cipher, &remote).await?;
+
+    // The upload half: local rows the peer's snapshot lacks or holds older copies of.
+    let local = fetch_catalog(store, cipher).await?;
+    let upload = CatalogPayload {
+        contract: CATALOG_CONTRACT_VERSION,
+        generated_at: local.generated_at,
+        providers: rows_newer_than(&local.providers, &remote.providers, &["id"]),
+        models: rows_newer_than(&local.models, &remote.models, &["id"]),
+        credentials: rows_newer_than(&local.credentials, &remote.credentials, &["id"]),
+        model_support: rows_newer_than(
+            &local.model_support,
+            &remote.model_support,
+            &["account_id", "model"],
+        ),
+    };
+    let to_push = (upload.providers.len()
+        + upload.models.len()
+        + upload.credentials.len()
+        + upload.model_support.len()) as u64;
+
+    let mut pushed = 0;
+    if to_push > 0 {
+        let response = client
+            .put(format!("{base}/api/replica/catalog"))
+            .header("authorization", format!("Bearer {admin_token}"))
+            .json(&upload)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("peer returned HTTP {status} applying the catalog").into());
+        }
+        let report: ApplyReport = response.json().await?;
+        pushed = report.total_applied();
+    }
+
+    Ok(CatalogSyncReport {
+        pulled: down.total_applied(),
+        pushed,
+    })
+}
