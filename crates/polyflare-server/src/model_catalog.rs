@@ -1117,9 +1117,14 @@ impl ModelSource for HttpModelSource {
                 return None;
             }
         };
+        // Same fleet predicate as `fetch_scoped` and the /models handler: a cooled account
+        // (rate_limited / quota_exceeded) still holds its model entitlements and its catalog
+        // fetch still returns the full list (verified live 2026-09-03: every account returned 9
+        // models regardless of status). Filtering to `active` alone meant an all-exhausted fleet
+        // fetched nothing and the list collapsed to the static floor.
         let account = accounts
             .iter()
-            .find(|a| a.status == "active" && a.provider == "codex")?;
+            .find(|a| crate::catalog::catalog_fleet_status(&a.status) && a.provider == "codex")?;
         self.fetch_account(account).await
     }
 
@@ -1136,9 +1141,16 @@ impl ModelSource for HttpModelSource {
                 return None;
             }
         };
+        // MUST match the fleet the /models handler scopes on (`catalog::catalog_fleet_status`).
+        // The scope is built from that predicate; if this filter is narrower, a scope carrying a
+        // cooled account finds it absent here and the `collect::<Option<_>>()?` below abandons the
+        // ENTIRE fetch — every model collapses to the floor the instant one account cools. That
+        // exact mismatch (scope widened, this left at `active`) is what deleted the list.
         let by_id: HashMap<&str, &Account> = accounts
             .iter()
-            .filter(|account| account.status == "active" && account.provider == "codex")
+            .filter(|account| {
+                crate::catalog::catalog_fleet_status(&account.status) && account.provider == "codex"
+            })
             .map(|account| (account.id.as_str(), account))
             .collect();
         let exact_accounts: Vec<&Account> = scope

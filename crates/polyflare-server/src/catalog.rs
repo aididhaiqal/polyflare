@@ -760,7 +760,7 @@ async fn active_codex_account_ids(state: &AppState) -> Vec<String> {
 ///
 /// `reauth_required` and `deactivated` stay excluded: both are indefinite, and a dead grant can
 /// never refresh its catalog anyway.
-fn catalog_fleet_status(status: &str) -> bool {
+pub(crate) fn catalog_fleet_status(status: &str) -> bool {
     matches!(status, "active" | "rate_limited" | "quota_exceeded")
 }
 

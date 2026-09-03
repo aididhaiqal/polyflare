@@ -280,6 +280,78 @@ fn account(id: &str) -> Account {
     }
 }
 
+/// Insert one account in a COOLED (non-active) status, so a test can prove `/models` still scopes
+/// to it. Mirrors `spawn_with_catalog_and_active_account` but the account is `quota_exceeded`.
+async fn spawn_with_catalog_and_quota_exceeded_account(
+    model_catalog: Arc<ModelCatalogCache>,
+) -> String {
+    let state = test_state(model_catalog).await;
+    let mut acct = account("quota-exceeded-account");
+    acct.status = "quota_exceeded".to_string();
+    state
+        .store
+        .accounts()
+        .insert(
+            &acct,
+            &PlainTokens {
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                id_token: "id".to_string(),
+            },
+            &state.cipher,
+        )
+        .await
+        .unwrap();
+    spawn_app(build_app(state)).await
+}
+
+/// The user-reported bug: when every codex account is out of quota, `/models` deleted the model
+/// list. The catalog advertises ENTITLEMENT, which a `quota_exceeded` account still holds, so its
+/// models must survive — a client polling `/models` while waiting for quota to reset must still
+/// see what will come back. With ONLY a quota_exceeded account present, the merged upstream slug
+/// must still appear.
+#[tokio::test]
+async fn models_endpoint_serves_the_catalog_when_the_only_account_is_quota_exceeded() {
+    let floor = polyflare_server::catalog::codex_bootstrap_floor();
+    let mut upstream = floor.clone();
+    upstream.push(UpstreamModel {
+        slug: "gpt-5.7-nova".to_string(),
+        display_name: "GPT-5.7 Nova".to_string(),
+        context_window: Some(500_000),
+        prefer_websockets: Some(true),
+        raw: serde_json::json!({
+            "slug": "gpt-5.7-nova",
+            "display_name": "GPT-5.7 Nova",
+            "context_window": 500_000,
+            "prefer_websockets": true,
+            "supported_reasoning_levels": [{"effort": "medium", "description": "x"}],
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 1
+        }),
+    });
+    let cache = ModelCatalogCache::new(
+        Box::new(FixedSource(upstream)),
+        Duration::from_secs(3600),
+        floor,
+    );
+
+    let base = spawn_with_catalog_and_quota_exceeded_account(Arc::new(cache)).await;
+    let resp = reqwest::get(format!("{base}/models")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let ids: Vec<String> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        ids.iter().any(|id| id == "gpt-5.7-nova"),
+        "a quota_exceeded account must still advertise its catalog; got {ids:?}"
+    );
+}
+
 /// (a) The cache holds a merged catalog (floor + a stubbed upstream-only slug) — `GET /models`
 /// must include the stub's upstream slug's full `ModelInfo` verbatim in `models` (Task 2: the
 /// codex `models` array only carries entries with a `supported_reasoning_levels` marker — the
