@@ -735,9 +735,33 @@ async fn active_codex_account_ids(state: &AppState) -> Vec<String> {
         .unwrap_or_default();
     snapshots
         .iter()
-        .filter(|snapshot| snapshot.status == "active" && snapshot.provider == Provider::Codex)
+        .filter(|snapshot| {
+            catalog_fleet_status(&snapshot.status) && snapshot.provider == Provider::Codex
+        })
         .map(|snapshot| snapshot.id.to_string())
         .collect()
+}
+
+/// Whether an account belongs to the CATALOG fleet — the set whose model entitlements `/models`
+/// advertises. Deliberately wider than routing eligibility.
+///
+/// The model list is ENTITLEMENT information; availability is enforced per request by the
+/// selector. An account that is `rate_limited` or `quota_exceeded` is only temporarily unable to
+/// serve (both carry a `reset_at`), and being out of quota does not change which models it holds.
+/// Filtering on `active` alone meant that the moment the LAST account tipped into
+/// `quota_exceeded`, the fleet scoped to empty and `get_or_refresh_scoped` returned the static
+/// bootstrap floor — every real model vanished from `/models`, and Codex clients dropped them
+/// (observed live 2026-09-01: four of five accounts `quota_exceeded`, the list surviving on the
+/// one remaining `active` account).
+///
+/// Keeping cooled accounts in the fleet also keeps the SCOPE KEY stable, which is what makes the
+/// scoped stale-cache reachable during an outage — the cache is keyed by the exact account set,
+/// so a shrinking fleet was orphaning its own warm entries.
+///
+/// `reauth_required` and `deactivated` stay excluded: both are indefinite, and a dead grant can
+/// never refresh its catalog anyway.
+fn catalog_fleet_status(status: &str) -> bool {
+    matches!(status, "active" | "rate_limited" | "quota_exceeded")
 }
 
 fn codex_models_response(body: serde_json::Value, etag: Option<String>) -> Response {
@@ -781,6 +805,34 @@ pub async fn v1_models_handler(
 
 #[cfg(test)]
 mod tests {
+
+    /// The 2026-09-01 regression: with every codex account `quota_exceeded`, the catalog fleet
+    /// scoped to EMPTY, `get_or_refresh_scoped` returned the static bootstrap floor, and every
+    /// real model vanished from `/models`. Temporarily-cooled statuses must stay in the fleet —
+    /// the list advertises entitlement; the selector enforces availability per request.
+    #[test]
+    fn cooled_accounts_stay_in_the_catalog_fleet() {
+        assert!(catalog_fleet_status("active"));
+        assert!(
+            catalog_fleet_status("rate_limited"),
+            "a rate-limited account still holds its model entitlements"
+        );
+        assert!(
+            catalog_fleet_status("quota_exceeded"),
+            "an exhausted account still holds its model entitlements — this emptying the fleet \
+             is exactly what deleted the model list"
+        );
+    }
+
+    /// Indefinitely-out accounts stay excluded: a dead grant cannot refresh its catalog, and an
+    /// operator-deactivated account should not advertise anything.
+    #[test]
+    fn indefinitely_out_accounts_stay_excluded_from_the_fleet() {
+        assert!(!catalog_fleet_status("reauth_required"));
+        assert!(!catalog_fleet_status("deactivated"));
+        assert!(!catalog_fleet_status(""));
+        assert!(!catalog_fleet_status("nonsense"));
+    }
     use super::*;
 
     /// The pre-D15 test fixture: `build_catalog` fed exactly the static floor, reproducing the
