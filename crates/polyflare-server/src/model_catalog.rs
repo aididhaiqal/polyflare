@@ -422,12 +422,77 @@ impl ModelCatalogCache {
             };
         }
 
+        // Last resort before the floor: a UNION of whatever accounts in this scope DID return a
+        // fresh, non-empty catalog. Reached only when the strict all-members projection failed AND
+        // there is no stale complete projection to prefer (a cold cache with one member returning
+        // null/empty). Serving the models the available members hold beats deleting the entire
+        // list down to the static floor — the user-reported "one catalog is null and thus we
+        // delete it". A complete-but-stale catalog is still preferred over this partial (handled
+        // by the block above); this only rescues the case where the alternative is the bare floor.
+        let available_projection =
+            self.available_account_catalogs(&scope)
+                .and_then(|(account_catalogs, oldest_fetch)| {
+                    build_available_scoped_catalog(account_catalogs)
+                        .map(|catalog| (catalog, oldest_fetch))
+                });
+        if let Some((catalog, oldest_fetch)) = available_projection {
+            warn!(
+                account_count = scope.len(),
+                partial_model_count = catalog.models.len(),
+                "strict scoped catalog unavailable and no stale projection; serving the \
+                 available-members union instead of the floor"
+            );
+            self.scoped
+                .write()
+                .expect("model catalog scoped cache lock poisoned")
+                .insert(
+                    scope,
+                    Cached {
+                        models: catalog.models.clone(),
+                        etag: catalog.etag.clone(),
+                        fetched_at: oldest_fetch,
+                    },
+                );
+            return catalog;
+        }
+
         warn!(
             account_count = scope.len(),
             floor_model_count = self.floor.len(),
             "scoped model catalog unavailable and cache cold; using static floor"
         );
         self.scoped_floor()
+    }
+
+    /// The present, fresh per-account catalogs for `scope`, TOLERATING accounts that are missing or
+    /// stale. Unlike [`Self::fresh_account_catalogs`] (which is all-or-nothing so a complete
+    /// projection is only ever published from a complete fetch), this returns whatever subset is
+    /// currently fresh, for the last-resort union that keeps one null member from deleting the
+    /// whole list. `None` only when NOTHING is fresh.
+    fn available_account_catalogs(&self, scope: &[String]) -> Option<(Vec<AccountCatalog>, Instant)> {
+        let guard = self
+            .account_catalogs
+            .read()
+            .expect("per-account model catalog cache lock poisoned");
+        let mut oldest_fetch = Instant::now();
+        let mut catalogs = Vec::with_capacity(scope.len());
+        for account_id in scope {
+            let Some(cached) = guard.get(account_id) else {
+                continue;
+            };
+            if cached.fetched_at.elapsed() >= self.ttl || cached.catalog.models.is_empty() {
+                continue;
+            }
+            oldest_fetch = oldest_fetch.min(cached.fetched_at);
+            catalogs.push(AccountCatalog {
+                account_id: account_id.clone(),
+                catalog: cached.catalog.clone(),
+            });
+        }
+        if catalogs.is_empty() {
+            return None;
+        }
+        Some((catalogs, oldest_fetch))
     }
 
     /// Return the virtual ETag for an already-warmed exact account scope without network I/O.
@@ -740,6 +805,35 @@ fn normalize_account_ids(account_ids: &[String]) -> Vec<String> {
 /// deterministic virtual ETag. The first account in sorted-id order supplies the raw model entry;
 /// all account catalogs still participate in the ETag so entitlement/metadata changes cannot
 /// retain a stale scoped identity.
+/// Union the model sets of the given account catalogs (already filtered to non-empty), first
+/// account with a slug supplying its metadata. Unlike [`build_scoped_catalog`] this never rejects:
+/// the caller has already dropped empty/absent members, and this only runs as the last resort
+/// before the floor. `None` only if the input is empty.
+fn build_available_scoped_catalog(account_catalogs: Vec<AccountCatalog>) -> Option<ScopedCatalog> {
+    if account_catalogs.is_empty() {
+        return None;
+    }
+    let mut account_catalogs = account_catalogs;
+    account_catalogs.sort_by(|a, b| a.account_id.cmp(&b.account_id));
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut models: Vec<UpstreamModel> = Vec::new();
+    for account in &account_catalogs {
+        for model in &account.catalog.models {
+            if seen.insert(model.slug.as_str()) {
+                models.push(model.clone());
+            }
+        }
+    }
+    if models.is_empty() {
+        return None;
+    }
+    models.sort_by(|a, b| a.slug.cmp(&b.slug));
+    Some(ScopedCatalog {
+        etag: Some(virtual_scope_etag(&account_catalogs)),
+        models,
+    })
+}
+
 fn build_scoped_catalog(
     scope: &[String],
     mut account_catalogs: Vec<AccountCatalog>,
@@ -1894,10 +1988,19 @@ mod tests {
         );
         let root = vec!["acct-a".to_string(), "acct-b".to_string()];
 
-        let unavailable_root = cache.get_or_refresh_scoped(&root).await;
-        assert_eq!(
-            unavailable_root.etag, None,
-            "an incomplete root must not be published as authoritative"
+        // A cold root scope with one member (acct-b) unavailable now serves the AVAILABLE
+        // member's union rather than the floor. Previously an incomplete root was withheld
+        // entirely (etag None -> floor), which is the "one null catalog deletes the whole list"
+        // the fix targets: acct-a's models are real and servable, so they are advertised, and
+        // selection narrows an actual request to the members that hold each model.
+        let partial_root = cache.get_or_refresh_scoped(&root).await;
+        assert!(
+            partial_root.etag.is_some(),
+            "an incomplete cold root must serve the available members, not the floor"
+        );
+        assert!(
+            partial_root.models.iter().any(|m| m.slug == "gpt-common"),
+            "the available member's models must be advertised"
         );
         assert_eq!(
             cache.account_supports_model("acct-a", "gpt-common"),
@@ -1907,13 +2010,13 @@ mod tests {
 
         let account_a = cache.get_or_refresh_scoped(&["acct-a".to_string()]).await;
         assert!(account_a.etag.is_some());
-        let still_unavailable_root = cache.get_or_refresh_scoped(&root).await;
-        assert_eq!(still_unavailable_root.etag, None);
+        let still_partial_root = cache.get_or_refresh_scoped(&root).await;
+        assert!(still_partial_root.etag.is_some());
         assert_eq!(
             *source.calls.lock().unwrap(),
             vec![root],
-            "overlapping scopes must reuse the successful member and briefly suppress an immediate \
-             retry storm against the unavailable member"
+            "the cached partial root suppresses an immediate retry storm against the unavailable \
+             member (no re-fetch until the scoped entry expires)"
         );
     }
 

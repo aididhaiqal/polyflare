@@ -305,6 +305,110 @@ async fn spawn_with_catalog_and_quota_exceeded_account(
     spawn_app(build_app(state)).await
 }
 
+/// A source where one named account returns a real catalog and another returns an EMPTY one —
+/// the "one catalog is null" shape. Used to prove a single empty member no longer deletes the
+/// whole /models list down to the floor.
+struct OneEmptyMemberSource {
+    good_account: String,
+    models: Vec<UpstreamModel>,
+}
+
+#[async_trait]
+impl ModelSource for OneEmptyMemberSource {
+    async fn fetch(&self) -> Option<FetchedCatalog> {
+        None
+    }
+
+    async fn fetch_scoped(&self, account_ids: &[String]) -> Option<Vec<AccountCatalog>> {
+        Some(
+            account_ids
+                .iter()
+                .map(|account_id| AccountCatalog {
+                    account_id: account_id.clone(),
+                    catalog: FetchedCatalog {
+                        models: if *account_id == self.good_account {
+                            self.models.clone()
+                        } else {
+                            Vec::new() // this member's catalog is null/empty
+                        },
+                        etag: Some(format!("\"{account_id}\"")),
+                    },
+                })
+                .collect(),
+        )
+    }
+}
+
+/// The user-reported "some catalog is null and thus we delete it": with two accounts in the fleet
+/// and ONE returning an empty catalog, `/models` must still advertise the good member's models
+/// rather than collapsing the whole list to the static floor.
+#[tokio::test]
+async fn one_empty_member_does_not_delete_the_whole_model_list() {
+    let floor = polyflare_server::catalog::codex_bootstrap_floor();
+    let mut upstream = floor.clone();
+    upstream.push(UpstreamModel {
+        slug: "gpt-6-astra".to_string(),
+        display_name: "GPT-6 Astra".to_string(),
+        context_window: Some(272_000),
+        prefer_websockets: Some(true),
+        raw: serde_json::json!({
+            "slug": "gpt-6-astra",
+            "display_name": "GPT-6 Astra",
+            "context_window": 272_000,
+            "prefer_websockets": true,
+            "supported_reasoning_levels": [{"effort": "ultra", "description": "x"}],
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 1
+        }),
+    });
+    let cache = ModelCatalogCache::new(
+        Box::new(OneEmptyMemberSource {
+            good_account: "good-account".to_string(),
+            models: upstream,
+        }),
+        Duration::from_secs(3600),
+        floor,
+    );
+
+    // Two active accounts; only "good-account" returns a catalog, "empty-account" returns [].
+    let state = test_state(Arc::new(cache)).await;
+    for id in ["good-account", "empty-account"] {
+        state
+            .store
+            .accounts()
+            .insert(
+                &account(id),
+                &PlainTokens {
+                    access_token: "access".to_string(),
+                    refresh_token: "refresh".to_string(),
+                    id_token: "id".to_string(),
+                },
+                &state.cipher,
+            )
+            .await
+            .unwrap();
+    }
+    let base = spawn_app(build_app(state)).await;
+
+    let body: serde_json::Value = reqwest::get(format!("{base}/models"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<String> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        ids.iter().any(|id| id == "gpt-6-astra"),
+        "the good member's models must survive one empty member; got {ids:?}"
+    );
+}
+
 /// The user-reported bug: when every codex account is out of quota, `/models` deleted the model
 /// list. The catalog advertises ENTITLEMENT, which a `quota_exceeded` account still holds, so its
 /// models must survive — a client polling `/models` while waiting for quota to reset must still
