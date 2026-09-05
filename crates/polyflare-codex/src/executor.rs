@@ -27,8 +27,8 @@ use reqwest::header::{
 };
 
 use polyflare_core::{
-    Account, ExecError, Executor, PreparedRequest, RequestCtx, ResponseMetadata, ResponseStream,
-    UpstreamHttpError,
+    Account, ExecError, Executor, FailureSignal, PreparedRequest, RequestCtx, ResponseMetadata,
+    ResponseStream, UpstreamHttpError,
 };
 
 use crate::chatgpt_cloudflare_cookies::with_chatgpt_cloudflare_cookie_store;
@@ -279,30 +279,66 @@ impl Executor for CodexExecutor {
                     .expect("PreparedRequest: raw_body None ⇒ body Some"),
             ),
         };
-        let resp = builder
-            .send()
-            .await
-            .map_err(|e| ExecError::Upstream(e.to_string()))?;
-        let status = resp.status().as_u16();
-        let response_headers = safe_response_headers(resp.headers());
+        // A transient refusal (burst 429, "server is overloaded") is retried in place, on this
+        // same account, before anything is relayed. This is the only replay an anchored turn can
+        // get: `previous_response_id` pins the conversation to this account, so the cross-account
+        // failover loop is gated off for it, and without this one 429 kills the whole turn.
+        // Nothing has been relayed downstream yet, so the resend is invisible to the client.
+        let mut attempt: u32 = 0;
+        let resp = loop {
+            let Some(this_attempt) = builder.try_clone() else {
+                break builder
+                    .send()
+                    .await
+                    .map_err(|e| ExecError::Upstream(e.to_string()))?;
+            };
+            let resp = this_attempt
+                .send()
+                .await
+                .map_err(|e| ExecError::Upstream(e.to_string()))?;
+            if resp.status().is_success() {
+                break resp;
+            }
 
-        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
             let retry_after = retry_after_secs(resp.headers());
+            let response_headers = safe_response_headers(resp.headers());
             // Bounded read of the error body to extract the code ONLY (content-safety: the
             // message/detail prose is read into `buf` transiently here and then never touched
             // again — not stored, not logged, not placed anywhere on `ExecError`).
             let buf = read_bounded_error_body(resp).await;
             let error_code = extract_error_code(&buf);
+            let signal = FailureSignal {
+                status,
+                retry_after,
+                error_code,
+            };
+
+            if attempt < TRANSIENT_RETRY_MAX_RETRIES {
+                if let Some(delay) = transient_retry_delay(&signal, attempt) {
+                    attempt += 1;
+                    tracing::debug!(
+                        account_id = %account.id,
+                        status,
+                        error_code = signal.error_code.as_deref().unwrap_or(""),
+                        retry_after = ?signal.retry_after,
+                        attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        "transient upstream refusal; retrying in place"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
+
             return Err(ExecError::UpstreamHttp(UpstreamHttpError {
-                signal: polyflare_core::FailureSignal {
-                    status,
-                    retry_after,
-                    error_code,
-                },
+                signal,
                 headers: response_headers,
                 body: bytes::Bytes::from(buf),
             }));
-        }
+        };
+        let status = resp.status().as_u16();
+        let response_headers = safe_response_headers(resp.headers());
 
         let stream = resp
             .bytes_stream()
@@ -318,9 +354,114 @@ impl Executor for CodexExecutor {
     }
 }
 
+/// How many times one send is retried in place after a transient refusal. Two retries with the
+/// backoff below add at most ~4.5 s to a turn; a burst 429 on this upstream clears well inside
+/// that, and anything longer is real pressure that the retry must not paper over.
+const TRANSIENT_RETRY_MAX_RETRIES: u32 = 2;
+const TRANSIENT_RETRY_BASE_MS: u64 = 750;
+const TRANSIENT_RETRY_MAX_MS: u64 = 3000;
+/// A `Retry-After` longer than this is not a burst; sleeping through it would only hold the
+/// slot and the client's turn hostage. Let the failure surface instead.
+const TRANSIENT_RETRY_AFTER_HONOUR_MAX_SECS: i64 = 5;
+
+/// Error codes that mean the account's quota is spent. A 429 carrying one will not clear in
+/// seconds, so it is never retried in place; the caller's cooldown/failover handles it.
+fn is_quota_code(code: &str) -> bool {
+    matches!(code, "insufficient_quota" | "usage_not_included")
+}
+
+/// The delay before retrying this failure in place, or `None` when it must surface as-is.
+///
+/// Retried: a 429 that is not a quota exhaustion, and a 5xx the upstream explicitly labels
+/// `server_is_overloaded`. A short `Retry-After` is honoured verbatim; absent one, the delay is
+/// full-jitter exponential backoff so a burst of parallel sends does not resynchronise.
+fn transient_retry_delay(signal: &FailureSignal, attempt: u32) -> Option<Duration> {
+    let code = signal.error_code.as_deref();
+    let transient = match signal.status {
+        429 => !code.is_some_and(is_quota_code),
+        500..=599 => code == Some("server_is_overloaded"),
+        _ => false,
+    };
+    if !transient {
+        return None;
+    }
+    match signal.retry_after {
+        Some(secs) if secs > TRANSIENT_RETRY_AFTER_HONOUR_MAX_SECS => None,
+        Some(secs) => Some(Duration::from_secs(secs.max(0) as u64)),
+        None => {
+            let cap = TRANSIENT_RETRY_BASE_MS
+                .saturating_mul(1u64 << (attempt + 1).min(20))
+                .min(TRANSIENT_RETRY_MAX_MS);
+            Some(Duration::from_millis(
+                (rand::random::<f64>() * cap as f64) as u64,
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::extract_error_code;
+    use super::{extract_error_code, transient_retry_delay};
+    use polyflare_core::FailureSignal;
+    use std::time::Duration;
+
+    fn signal(status: u16, retry_after: Option<i64>, code: Option<&str>) -> FailureSignal {
+        FailureSignal {
+            status,
+            retry_after,
+            error_code: code.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_burst_429_and_an_overloaded_5xx_are_retried_in_place() {
+        assert!(transient_retry_delay(&signal(429, None, None), 0).is_some());
+        assert!(
+            transient_retry_delay(&signal(429, None, Some("rate_limit_exceeded")), 0).is_some()
+        );
+        assert!(
+            transient_retry_delay(&signal(502, None, Some("server_is_overloaded")), 0).is_some()
+        );
+        assert!(
+            transient_retry_delay(&signal(503, None, Some("server_is_overloaded")), 1).is_some()
+        );
+    }
+
+    #[test]
+    fn quota_exhaustion_and_unlabelled_5xx_are_not_retried() {
+        // A spent quota does not clear in seconds; retrying only delays the failover.
+        assert!(transient_retry_delay(&signal(429, None, Some("insufficient_quota")), 0).is_none());
+        assert!(transient_retry_delay(&signal(429, None, Some("usage_not_included")), 0).is_none());
+        // A bare 5xx may have already done work upstream; replay policy stays with the caller.
+        assert!(transient_retry_delay(&signal(500, None, None), 0).is_none());
+        assert!(transient_retry_delay(&signal(502, None, Some("bad_gateway")), 0).is_none());
+        assert!(transient_retry_delay(&signal(401, None, None), 0).is_none());
+        assert!(transient_retry_delay(&signal(408, None, None), 0).is_none());
+    }
+
+    #[test]
+    fn retry_after_is_honoured_when_short_and_refused_when_long() {
+        assert_eq!(
+            transient_retry_delay(&signal(429, Some(2), None), 0),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            transient_retry_delay(&signal(429, Some(0), None), 0),
+            Some(Duration::ZERO)
+        );
+        assert!(transient_retry_delay(&signal(429, Some(30), None), 0).is_none());
+    }
+
+    #[test]
+    fn backoff_is_bounded_and_grows_with_the_attempt() {
+        for attempt in 0..8 {
+            let delay = transient_retry_delay(&signal(429, None, None), attempt).unwrap();
+            assert!(
+                delay <= Duration::from_millis(3000),
+                "attempt {attempt}: {delay:?}"
+            );
+        }
+    }
 
     #[test]
     fn extracts_code_or_code_like_type_without_reading_message() {

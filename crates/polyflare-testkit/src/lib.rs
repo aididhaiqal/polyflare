@@ -35,6 +35,14 @@ enum MockMode {
     /// injection) — used to drive the HTTP executor's error-body code-extraction path
     /// (failure-code writeback Task 2).
     Error { status: u16, body: String },
+    /// Answer the first `failures` requests exactly like [`MockMode::Error`], then serve the
+    /// scripted `events` as SSE for every request after that. Drives an executor's in-place
+    /// retry: the test can assert both the retry count and that the retried request succeeded.
+    ErrorThenScripted {
+        status: u16,
+        body: String,
+        failures: usize,
+    },
     /// Emit `first_chunk` as a single SSE `data:` frame, then never yield again — no EOF, no
     /// further frames, no keep-alive. Distinct from `silent_on_anchor` (which never sends even the
     /// first byte): this mode DOES deliver one frame, then goes silent — simulating a real upstream
@@ -130,6 +138,24 @@ impl MockUpstream {
             MockMode::Error {
                 status,
                 body: body.into(),
+            },
+        )
+    }
+
+    /// Respond with `status`/`body` to the first `failures` requests, then stream `events` as SSE
+    /// for every request after that. See [`MockMode::ErrorThenScripted`].
+    pub fn error_status_then_events(
+        status: u16,
+        body: impl Into<String>,
+        failures: usize,
+        events: Vec<String>,
+    ) -> Self {
+        Self::build(
+            events,
+            MockMode::ErrorThenScripted {
+                status,
+                body: body.into(),
+                failures,
             },
         )
     }
@@ -312,6 +338,14 @@ fn sse_frame(payload: &str) -> Bytes {
     Bytes::from(format!("data: {payload}\n\n"))
 }
 
+fn error_response(status: u16, body: String) -> Response {
+    Response::builder()
+        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 async fn handler(
     State(mock): State<MockUpstream>,
     headers: HeaderMap,
@@ -380,11 +414,26 @@ async fn handler(
                     .unwrap()
             }
         }
-        MockMode::Error { status, body } => Response::builder()
-            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap(),
+        MockMode::Error { status, body } => error_response(status, body),
+        MockMode::ErrorThenScripted {
+            status,
+            body,
+            failures,
+        } => {
+            // `bodies` already holds this request, so its length is this request's ordinal.
+            let ordinal = mock.bodies.lock().unwrap().len();
+            if ordinal <= failures {
+                error_response(status, body)
+            } else {
+                let events = (*mock.events).clone();
+                let s = stream::iter(
+                    events
+                        .into_iter()
+                        .map(|e| Ok::<Event, Infallible>(Event::default().data(e))),
+                );
+                Sse::new(s).keep_alive(KeepAlive::default()).into_response()
+            }
+        }
         MockMode::Stall { first_chunk } => {
             let first = sse_frame(&first_chunk);
             let s = stream::once(async move { Ok::<Bytes, std::io::Error>(first) })

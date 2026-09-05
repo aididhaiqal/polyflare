@@ -263,6 +263,145 @@ async fn executor_surfaces_upstream_error_status() {
     }
 }
 
+fn retry_account(base_url: String) -> Account {
+    Account {
+        id: "test".into(),
+        base_url,
+        bearer_token: "t".into(),
+        chatgpt_account_id: None,
+        is_fedramp: false,
+    }
+}
+
+fn anchored_request() -> PreparedRequest {
+    PreparedRequest {
+        body: Some(serde_json::json!({"model": "m", "previous_response_id": "resp_1"})),
+        model: "m".into(),
+        forward_headers: vec![],
+        raw_body: None,
+    }
+}
+
+/// The failure from 2026-09-03: a burst 429 on the account that owns the anchor. Cross-account
+/// failover is (correctly) off for an anchored turn, so this retry is the only recovery it gets —
+/// and it must actually deliver the stream, not just resend.
+#[tokio::test]
+async fn a_burst_429_is_retried_in_place_and_the_retry_succeeds() {
+    let mock = MockUpstream::error_status_then_events(
+        429,
+        r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#,
+        1,
+        vec![r#"{"type":"response.completed"}"#.to_string()],
+    );
+    let handle = mock.clone();
+    let base = mock.spawn().await;
+    let executor = CodexExecutor::new().unwrap();
+
+    let mut stream = executor
+        .execute(
+            anchored_request(),
+            &retry_account(base),
+            &RequestCtx::default(),
+        )
+        .await
+        .expect("the retried send succeeds");
+    let mut relayed = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        relayed.extend_from_slice(&chunk.unwrap());
+    }
+    assert!(
+        String::from_utf8_lossy(&relayed).contains("response.completed"),
+        "the retry's stream is the one relayed"
+    );
+    assert_eq!(handle.request_count(), 2, "exactly one retry");
+}
+
+#[tokio::test]
+async fn a_persistent_429_surfaces_after_the_retry_budget() {
+    let mock = MockUpstream::error_status(
+        429,
+        r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#,
+    );
+    let handle = mock.clone();
+    let base = mock.spawn().await;
+    let executor = CodexExecutor::new().unwrap();
+
+    let err = executor
+        .execute(
+            anchored_request(),
+            &retry_account(base),
+            &RequestCtx::default(),
+        )
+        .await
+        .err()
+        .expect("still a 429 once the budget is spent");
+    let signal = err.failure_signal().expect("HTTP failure signal");
+    assert_eq!(signal.status, 429);
+    assert_eq!(signal.error_code.as_deref(), Some("rate_limit_exceeded"));
+    assert_eq!(
+        handle.request_count(),
+        3,
+        "first send plus two retries, then stop"
+    );
+}
+
+#[tokio::test]
+async fn a_quota_429_is_not_retried() {
+    let mock = MockUpstream::error_status(
+        429,
+        r#"{"error":{"code":"insufficient_quota","message":"spent"}}"#,
+    );
+    let handle = mock.clone();
+    let base = mock.spawn().await;
+    let executor = CodexExecutor::new().unwrap();
+
+    let err = executor
+        .execute(
+            anchored_request(),
+            &retry_account(base),
+            &RequestCtx::default(),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.failure_signal().unwrap().status, 429);
+    assert_eq!(
+        handle.request_count(),
+        1,
+        "a spent quota goes straight to the caller"
+    );
+}
+
+#[tokio::test]
+async fn a_429_with_a_long_retry_after_is_not_retried() {
+    let mock = MockUpstream::error_status(
+        429,
+        r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#,
+    )
+    .with_response_header("retry-after", "30");
+    let handle = mock.clone();
+    let base = mock.spawn().await;
+    let executor = CodexExecutor::new().unwrap();
+
+    let err = executor
+        .execute(
+            anchored_request(),
+            &retry_account(base),
+            &RequestCtx::default(),
+        )
+        .await
+        .err()
+        .unwrap();
+    let signal = err.failure_signal().unwrap();
+    assert_eq!(signal.status, 429);
+    assert_eq!(
+        signal.retry_after,
+        Some(30),
+        "the header still reaches the caller"
+    );
+    assert_eq!(handle.request_count(), 1);
+}
+
 async fn run_error_status(status: u16, body: &str) -> polyflare_core::ExecError {
     let base = MockUpstream::error_status(status, body).spawn().await;
     let executor = CodexExecutor::new().unwrap();
