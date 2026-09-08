@@ -469,7 +469,10 @@ impl ModelCatalogCache {
     /// projection is only ever published from a complete fetch), this returns whatever subset is
     /// currently fresh, for the last-resort union that keeps one null member from deleting the
     /// whole list. `None` only when NOTHING is fresh.
-    fn available_account_catalogs(&self, scope: &[String]) -> Option<(Vec<AccountCatalog>, Instant)> {
+    fn available_account_catalogs(
+        &self,
+        scope: &[String],
+    ) -> Option<(Vec<AccountCatalog>, Instant)> {
         let guard = self
             .account_catalogs
             .read()
@@ -634,7 +637,10 @@ impl ModelCatalogCache {
 
     /// This account's per-model weekly windows, sorted most-consumed first so the tightest cap
     /// leads. Empty for a seat with no per-model limits reported (or a non-Anthropic seat).
-    pub fn model_windows_for(&self, account_id: &str) -> Vec<crate::anthropic_usage::ModelCapWindow> {
+    pub fn model_windows_for(
+        &self,
+        account_id: &str,
+    ) -> Vec<crate::anthropic_usage::ModelCapWindow> {
         let map = self
             .model_windows
             .read()
@@ -1060,7 +1066,14 @@ impl HttpModelSource {
         chatgpt_account_id: Option<&str>,
         is_fedramp: bool,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        let version = self.version_cache.cached_or_fallback();
+        // `get_version` (fetch-and-cache when cold), NOT `cached_or_fallback`: the upstream
+        // catalog is gated on `client_version` — on 2026-09-08 `/models` answered 8 models to
+        // anything below 0.153.0 and 9 (with gpt-6-astra) at or above it. The readiness warmup
+        // runs right after boot, before the version cache has warmed, so the sync fallback handed
+        // it the 0.145.0 floor and an astra-less catalog was cached as authoritative for a full
+        // TTL on both nodes. Awaiting the real version costs one bounded fetch, coalesced across
+        // concurrent callers, and still falls back to the floor only when every source fails.
+        let version = self.version_cache.get_version().await;
         let url = models_url(&self.base_url, &version);
         let mut request = self
             .client
@@ -1622,8 +1635,14 @@ mod tests {
             ("acct-a".to_string(), "claude-opus-5".to_string(), true),
         ]);
         // Both supported before any cap.
-        assert_eq!(cache.account_supports_model("acct-a", "claude-fable-5"), Some(true));
-        assert_eq!(cache.account_supports_model("acct-a", "claude-opus-5"), Some(true));
+        assert_eq!(
+            cache.account_supports_model("acct-a", "claude-fable-5"),
+            Some(true)
+        );
+        assert_eq!(
+            cache.account_supports_model("acct-a", "claude-opus-5"),
+            Some(true)
+        );
 
         // Fable's weekly cap hits 100% → the poll caps "Fable" on this account.
         cache.set_capped_models("acct-a", vec!["Fable".to_string()]);
@@ -1638,11 +1657,17 @@ mod tests {
             "an uncapped model on the same account is unaffected"
         );
         // Only this account is capped.
-        assert_eq!(cache.account_supports_model("acct-b", "claude-fable-5"), None);
+        assert_eq!(
+            cache.account_supports_model("acct-b", "claude-fable-5"),
+            None
+        );
 
         // Window resets → the next poll clears the cap.
         cache.set_capped_models("acct-a", vec![]);
-        assert_eq!(cache.account_supports_model("acct-a", "claude-fable-5"), Some(true));
+        assert_eq!(
+            cache.account_supports_model("acct-a", "claude-fable-5"),
+            Some(true)
+        );
     }
 
     /// A seat whose per-model weekly cap is exhausted is dropped from the candidates for THAT model

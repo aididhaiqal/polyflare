@@ -378,6 +378,30 @@ mod tests {
         CodexVersionCache::with_source(Box::new(SharedSource(stub.clone())), ttl)
     }
 
+    /// The contract the model-catalog fetch relies on since 2026-09-08: on a cold cache the sync
+    /// read is only the floor, so anything whose upstream answer depends on `client_version`
+    /// must await `get_version` (which warms from the source first) rather than read the floor.
+    #[tokio::test]
+    async fn a_cold_cache_reads_the_floor_synchronously_but_get_version_warms_first() {
+        let stub = StubSource::new(Some("0.153.4"));
+        let cache = cache_with(&stub, DEFAULT_TTL);
+        assert_eq!(
+            cache.cached_or_fallback(),
+            CODEX_CLI_VERSION,
+            "cold sync read is the floor"
+        );
+        assert_eq!(
+            cache.get_version().await,
+            "0.153.4",
+            "the async read warms from the source"
+        );
+        assert_eq!(
+            cache.cached_or_fallback(),
+            "0.153.4",
+            "and the sync read is warm afterwards"
+        );
+    }
+
     #[test]
     fn cached_or_fallback_returns_floor_when_unwarmed() {
         let stub = StubSource::new(Some("9.9.9"));
