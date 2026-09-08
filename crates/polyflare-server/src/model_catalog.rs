@@ -290,6 +290,31 @@ impl ModelCatalogCache {
     /// A boolean field of a model's upstream catalog entry (`model_info`), e.g.
     /// `node_repl_auto_review_required`. Scoped per-account catalogs are consulted first, then
     /// the unscoped cache / floor. `None` when no cached entry carries the key.
+    /// A string field of a model's upstream catalog entry, e.g. `default_verbosity`.
+    pub fn model_str_flag(&self, slug: &str, key: &str) -> Option<String> {
+        let pick = |model: &UpstreamModel| {
+            model
+                .raw
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        let from_accounts = self
+            .account_catalogs
+            .read()
+            .expect("per-account model catalog cache lock poisoned")
+            .values()
+            .flat_map(|cached| cached.catalog.models.iter())
+            .find(|model| model.slug == slug)
+            .and_then(pick);
+        from_accounts.or_else(|| {
+            self.cached_or_fallback()
+                .iter()
+                .find(|m| m.slug == slug)
+                .and_then(pick)
+        })
+    }
+
     pub fn model_bool_flag(&self, slug: &str, key: &str) -> Option<bool> {
         let from_accounts = self
             .account_catalogs
@@ -1095,11 +1120,19 @@ impl HttpModelSource {
         // concurrent callers, and still falls back to the floor only when every source fails.
         let version = self.version_cache.get_version().await;
         let url = models_url(&self.base_url, &version);
+        // codex-rs sends `originator` + `user-agent` on EVERY request through its default
+        // client (`login/src/auth/default_client.rs::default_headers`), the catalog fetch
+        // included. A bare Authorization+Accept fetch is not a shape a real client produces.
         let mut request = self
             .client
             .get(url)
             .header("Authorization", format!("Bearer {access_token}"))
-            .header("Accept", "application/json");
+            .header("Accept", "application/json")
+            .header("originator", polyflare_codex::codex_headers::originator())
+            .header(
+                "user-agent",
+                polyflare_codex::codex_headers::codex_user_agent(&version),
+            );
         if let Some(chatgpt_account_id) = chatgpt_account_id {
             request = request.header("chatgpt-account-id", chatgpt_account_id);
         }

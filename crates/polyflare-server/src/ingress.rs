@@ -436,21 +436,26 @@ pub(crate) fn forward_headers_from_inbound(headers: &HeaderMap) -> Vec<(String, 
 /// native `/responses` path above, so this is where `polyflare_codex::codex_headers` (built from a
 /// local `openai/codex` source read — see that module's doc) genuinely belongs.
 fn synthesize_codex_forward_headers(
-    body: &serde_json::Value,
+    body: &mut serde_json::Value,
     codex_version: &str,
     flags: &polyflare_codex::codex_headers::ModelTurnFlags,
 ) -> Vec<(String, String)> {
     use polyflare_codex::codex_headers::{
-        codex_user_agent, conversation_key, originator, routing_hint, TurnIdentity,
+        apply_codex_body_defaults, codex_user_agent, conversation_key, originator, routing_hint,
+        TurnIdentity, RESPONSES_LITE_HEADER,
     };
 
     let identity = TurnIdentity::derive(&conversation_key(body));
+    // One turn-metadata document per request: the header and the body's `client_metadata`
+    // must carry the identical string (codex serializes the same payload into both).
+    let turn_metadata = identity.turn_metadata_json_for(flags);
+    apply_codex_body_defaults(body, &identity, flags, &turn_metadata);
     let model = body
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
     let service_tier = body.get("service_tier").and_then(|v| v.as_str());
-    vec![
+    let mut headers = vec![
         ("user-agent".to_string(), codex_user_agent(codex_version)),
         ("originator".to_string(), originator().to_string()),
         ("accept".to_string(), "text/event-stream".to_string()),
@@ -461,17 +466,19 @@ fn synthesize_codex_forward_headers(
             identity.thread_id.clone(),
         ),
         ("x-codex-window-id".to_string(), identity.window_id.clone()),
-        (
-            "x-codex-turn-metadata".to_string(),
-            identity.turn_metadata_json_for(flags),
-        ),
+        ("x-codex-turn-metadata".to_string(), turn_metadata),
         // Always present on an HTTP /responses turn under ChatGPT login since codex-rs 0.145
         // (`core/src/client.rs::build_routing_hint_header`); absent was a fingerprint tell.
         (
             "x-codex-routing-hint".to_string(),
             routing_hint(model, service_tier),
         ),
-    ]
+    ];
+    if flags.use_responses_lite {
+        // `core/src/client.rs::add_responses_lite_header`: every current flagship is lite.
+        headers.push((RESPONSES_LITE_HEADER.to_string(), "true".to_string()));
+    }
+    headers
 }
 
 /// The per-model turn-metadata booleans codex-rs copies from the catalog entry of the model the
@@ -488,6 +495,18 @@ fn model_turn_flags(
         node_repl_disabled: catalog
             .model_bool_flag(model, "node_repl_disabled")
             .unwrap_or(false),
+        use_responses_lite: catalog
+            .model_bool_flag(model, "use_responses_lite")
+            .unwrap_or(false),
+        supports_parallel_tool_calls: catalog
+            .model_bool_flag(model, "supports_parallel_tool_calls")
+            .unwrap_or(true),
+        support_verbosity: catalog
+            .model_bool_flag(model, "support_verbosity")
+            .unwrap_or(false),
+        default_verbosity: catalog.model_str_flag(model, "default_verbosity"),
+        default_reasoning_level: catalog.model_str_flag(model, "default_reasoning_level"),
+        default_reasoning_summary: catalog.model_str_flag(model, "default_reasoning_summary"),
     }
 }
 
@@ -4609,7 +4628,7 @@ async fn messages_handler_codex_aliased(
     // cached) so it tracks the real fleet instead of a stale constant; `cached_or_fallback` is a
     // sync, zero-I/O read warmed out-of-band by the background refresh task.
     let forward_headers = synthesize_codex_forward_headers(
-        &translated_body,
+        &mut translated_body,
         &state.codex_version.cached_or_fallback(),
         &model_turn_flags(&state.model_catalog, &model_alias.target_model),
     );

@@ -100,6 +100,16 @@ fn identity_headers(account: &Account) -> Result<HeaderMap, ResetCreditsError> {
         HeaderValue::from_str(&format!("Bearer {}", account.bearer_token))
             .map_err(|_| ResetCreditsError::InvalidIdentity)?,
     );
+    // codex-rs default client headers, present on every request it makes.
+    headers.insert(
+        HeaderName::from_static("originator"),
+        HeaderValue::from_static(crate::codex_headers::originator()),
+    );
+    if let Ok(ua) = HeaderValue::from_str(&crate::codex_headers::codex_user_agent(
+        crate::codex_headers::CODEX_CLI_VERSION,
+    )) {
+        headers.insert(HeaderName::from_static("user-agent"), ua);
+    }
     headers.insert(
         HeaderName::from_static("chatgpt-account-id"),
         HeaderValue::from_str(account_id).map_err(|_| ResetCreditsError::InvalidIdentity)?,

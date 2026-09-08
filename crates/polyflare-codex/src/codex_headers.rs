@@ -278,11 +278,120 @@ const ROOT_AGENT_PATH: &str = "/root";
 
 /// The per-model booleans codex-rs copies from the model's catalog `model_info` into the
 /// turn metadata (`core/src/turn_metadata.rs::TurnMetadataState::new`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelTurnFlags {
     pub node_repl_auto_review_required: bool,
     pub node_repl_disabled: bool,
+    /// `model_info.use_responses_lite`. True for every current flagship (gpt-5.6-sol,
+    /// gpt-6-astra, ...). Drives the `x-openai-internal-codex-responses-lite: true` header,
+    /// `parallel_tool_calls: false`, and `reasoning.context: "all_turns"`.
+    pub use_responses_lite: bool,
+    /// `model_info.supports_parallel_tool_calls`.
+    pub supports_parallel_tool_calls: bool,
+    /// `model_info.support_verbosity` — when false codex sends no `text` block at all.
+    pub support_verbosity: bool,
+    /// `model_info.default_verbosity` (`"low"` on the current flagships).
+    pub default_verbosity: Option<String>,
+    /// `model_info.default_reasoning_level`, used when the client named no effort.
+    pub default_reasoning_level: Option<String>,
+    /// `model_info.default_reasoning_summary`; `"none"` (the current default) means the
+    /// `reasoning.summary` key is omitted.
+    pub default_reasoning_summary: Option<String>,
 }
+
+/// Shape the translated `/responses` body the way codex-rs 0.153.4 builds
+/// `ResponsesApiRequest` (`codex-api/src/common.rs`, `core/src/client.rs::build_responses_request`)
+/// so the body agrees with the identity headers sent alongside it:
+/// - `prompt_cache_key` IS the session id (`ModelClient::prompt_cache_key` returns
+///   `session_id` absent an override), so it must equal the `session-id` header and the
+///   `session_id` in both metadata blocks.
+/// - `include: ["reasoning.encrypted_content"]`, `tool_choice: "auto"`, `store: false` and
+///   `stream: true` are unconditional.
+/// - `parallel_tool_calls = supports && !use_responses_lite`.
+/// - `text.verbosity` is the model default when the model supports verbosity, else no `text`.
+/// - `reasoning.effort` defaults to the model's `default_reasoning_level`;
+///   `reasoning.context: "all_turns"` under responses-lite; `summary` only when the model's
+///   default summary is not `"none"`.
+/// - `client_metadata` carries the same identity as the headers (`x-codex-installation-id`,
+///   `session_id`, `thread_id`, `x-codex-window-id`, `turn_id`, `x-codex-turn-metadata`), per
+///   `core/src/responses_metadata.rs::client_metadata`.
+///
+/// Fields the client already set (its own effort, tool_choice, tools) are kept; only absent
+/// ones are filled. Never logs the body.
+pub fn apply_codex_body_defaults(
+    body: &mut serde_json::Value,
+    identity: &TurnIdentity,
+    flags: &ModelTurnFlags,
+    turn_metadata_json: &str,
+) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "prompt_cache_key".to_string(),
+        serde_json::Value::String(identity.session_id.clone()),
+    );
+    obj.insert("store".to_string(), serde_json::Value::Bool(false));
+    obj.insert("stream".to_string(), serde_json::Value::Bool(true));
+    obj.insert(
+        "include".to_string(),
+        serde_json::json!(["reasoning.encrypted_content"]),
+    );
+    obj.entry("tool_choice")
+        .or_insert_with(|| serde_json::Value::String("auto".to_string()));
+    obj.insert(
+        "parallel_tool_calls".to_string(),
+        serde_json::Value::Bool(flags.supports_parallel_tool_calls && !flags.use_responses_lite),
+    );
+    if flags.support_verbosity {
+        if let Some(verbosity) = &flags.default_verbosity {
+            obj.entry("text")
+                .or_insert_with(|| serde_json::json!({ "verbosity": verbosity }));
+        }
+    }
+    let reasoning = obj
+        .entry("reasoning")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(reasoning) = reasoning.as_object_mut() {
+        if !reasoning.contains_key("effort") {
+            if let Some(level) = &flags.default_reasoning_level {
+                reasoning.insert(
+                    "effort".to_string(),
+                    serde_json::Value::String(level.clone()),
+                );
+            }
+        }
+        if let Some(summary) = &flags.default_reasoning_summary {
+            if summary != "none" && !reasoning.contains_key("summary") {
+                reasoning.insert(
+                    "summary".to_string(),
+                    serde_json::Value::String(summary.clone()),
+                );
+            }
+        }
+        if flags.use_responses_lite {
+            reasoning.insert(
+                "context".to_string(),
+                serde_json::Value::String("all_turns".to_string()),
+            );
+        }
+    }
+    obj.insert(
+        "client_metadata".to_string(),
+        serde_json::json!({
+            "x-codex-installation-id": identity.installation_id,
+            "session_id": identity.session_id,
+            "thread_id": identity.thread_id,
+            "x-codex-window-id": identity.window_id,
+            "turn_id": identity.turn_id,
+            "x-codex-turn-metadata": turn_metadata_json,
+        }),
+    );
+}
+
+/// The header codex-rs adds on every request for a responses-lite model
+/// (`core/src/client.rs::add_responses_lite_header`).
+pub const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 
 /// The `sandbox` tag codex-rs records for this platform
 /// (`sandboxing/src/manager.rs::get_platform_sandbox` → `SandboxType::as_metric_tag`).
@@ -475,10 +584,92 @@ mod tests {
         assert_eq!(value["node_repl_disabled"], false);
         let astra = identity.turn_metadata_json_for(&ModelTurnFlags {
             node_repl_auto_review_required: true,
-            node_repl_disabled: false,
+            ..ModelTurnFlags::default()
         });
         let astra: serde_json::Value = serde_json::from_str(&astra).unwrap();
         assert_eq!(astra["node_repl_auto_review_required"], true);
+    }
+
+    #[test]
+    fn body_defaults_match_codex_rs_0_153_4_for_a_lite_flagship() {
+        let identity = TurnIdentity::derive("conv-1");
+        let flags = ModelTurnFlags {
+            use_responses_lite: true,
+            supports_parallel_tool_calls: true,
+            support_verbosity: true,
+            default_verbosity: Some("low".into()),
+            default_reasoning_level: Some("low".into()),
+            default_reasoning_summary: Some("none".into()),
+            ..ModelTurnFlags::default()
+        };
+        let meta = identity.turn_metadata_json_for(&flags);
+        let mut body = serde_json::json!({
+            "model": "gpt-5.6-sol", "input": [], "stream": true, "store": false,
+            "prompt_cache_key": "client-supplied-key"
+        });
+        apply_codex_body_defaults(&mut body, &identity, &flags, &meta);
+        assert_eq!(
+            body["prompt_cache_key"], identity.session_id,
+            "cache key IS the session id"
+        );
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(
+            body["parallel_tool_calls"], false,
+            "lite models never parallelize"
+        );
+        assert_eq!(body["text"]["verbosity"], "low");
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert!(
+            body["reasoning"].get("summary").is_none(),
+            "summary omitted when default is none"
+        );
+        let cm = &body["client_metadata"];
+        assert_eq!(cm["session_id"], identity.session_id);
+        assert_eq!(cm["thread_id"], identity.thread_id);
+        assert_eq!(cm["x-codex-window-id"], identity.window_id);
+        assert_eq!(cm["x-codex-installation-id"], identity.installation_id);
+        assert_eq!(
+            cm["x-codex-turn-metadata"], meta,
+            "body metadata equals the header"
+        );
+        assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn body_defaults_keep_what_the_client_set_and_respect_non_lite_models() {
+        let identity = TurnIdentity::derive("conv-2");
+        let flags = ModelTurnFlags {
+            use_responses_lite: false,
+            supports_parallel_tool_calls: true,
+            support_verbosity: false,
+            default_reasoning_level: Some("medium".into()),
+            ..ModelTurnFlags::default()
+        };
+        let meta = identity.turn_metadata_json_for(&flags);
+        let mut body = serde_json::json!({
+            "model": "m", "input": [], "tool_choice": "none",
+            "reasoning": {"effort": "high"}
+        });
+        apply_codex_body_defaults(&mut body, &identity, &flags, &meta);
+        assert_eq!(body["tool_choice"], "none", "client choice preserved");
+        assert_eq!(
+            body["reasoning"]["effort"], "high",
+            "client effort preserved"
+        );
+        assert!(
+            body["reasoning"].get("context").is_none(),
+            "no context off lite"
+        );
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert!(
+            body.get("text").is_none(),
+            "no text block when verbosity unsupported"
+        );
     }
 
     #[test]

@@ -150,10 +150,19 @@ fn usage_request(
     account: &Account,
     tokens: &PlainTokens,
 ) -> reqwest::RequestBuilder {
+    // codex-rs sends `originator` + `user-agent` on every request (default client headers);
+    // the usage poll must look like the client's own `account/rateLimits/read`.
     let mut request = http
         .get(usage_url(upstream_base))
         .header("Authorization", format!("Bearer {}", tokens.access_token))
-        .header("Accept", "application/json");
+        .header("Accept", "application/json")
+        .header("originator", polyflare_codex::codex_headers::originator())
+        .header(
+            "user-agent",
+            polyflare_codex::codex_headers::codex_user_agent(
+                polyflare_codex::codex_headers::CODEX_CLI_VERSION,
+            ),
+        );
     if let Some(chatgpt_account_id) = &account.chatgpt_account_id {
         request = request.header("chatgpt-account-id", chatgpt_account_id);
     }
@@ -309,7 +318,8 @@ async fn refresh_anthropic_account(
     use crate::anthropic_usage;
 
     let repo = store.accounts();
-    let usage = match anthropic_usage::fetch_usage(store, cipher, upstream_base, &account.id).await {
+    let usage = match anthropic_usage::fetch_usage(store, cipher, upstream_base, &account.id).await
+    {
         Ok(u) => u,
         Err(_) => return Ok(false),
     };
@@ -325,7 +335,10 @@ async fn refresh_anthropic_account(
     // so classification by duration (not slot) works unchanged.
     let to_window = |w: &anthropic_usage::UsageWindow, secs: i64| UsageWindow {
         used_percent: w.utilization,
-        reset_at: w.resets_at.as_deref().and_then(anthropic_usage::parse_iso_to_unix),
+        reset_at: w
+            .resets_at
+            .as_deref()
+            .and_then(anthropic_usage::parse_iso_to_unix),
         limit_window_seconds: Some(secs),
     };
     let primary = usage
@@ -543,7 +556,10 @@ async fn refresh_stale_anthropic_token(state: &AppState, account_id: &str) {
         .refresh_stale_anthropic_token(&AccountId::from(account_id), unix_now())
         .await
     {
-        Ok(true) => tracing::info!(account_id, "usage sweep rotated a stale Anthropic access token"),
+        Ok(true) => tracing::info!(
+            account_id,
+            "usage sweep rotated a stale Anthropic access token"
+        ),
         Ok(false) => {}
         Err(e) => tracing::warn!(
             account_id,
