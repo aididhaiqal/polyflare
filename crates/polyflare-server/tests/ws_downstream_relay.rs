@@ -1344,6 +1344,98 @@ mod relay_through {
         );
     }
 
+    /// 2026-09-08, hyperflux: the live overload envelope is a wrapped `error` with NO `status`.
+    /// Codex ignores such a frame ("unhandled responses event") and waits out its 300 s idle
+    /// timer, so one overload cost a subagent ~5.5 minutes, 155 times in five hours. The relay
+    /// now resends in place first (overload clears in seconds, the anchor stays put) and the
+    /// client only ever sees the completed turn.
+    #[tokio::test]
+    async fn a_status_less_overload_is_retried_in_place_and_the_client_sees_only_the_completion() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::server_overloaded_without_status(),
+            ScriptedTurn::normal(Vec::new()),
+        ])
+        .capturing_raw_frames();
+        let upstream = mock.clone().spawn().await;
+        let (base, _state) = spawn_with_pinned_account("acct-overload-retry", &upstream).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        let frame = r#"{"type":"response.create","input":[],"client_metadata":{"turn_id":"turn-overload-retry"}}"#.to_string();
+        ws.send(TMessage::Text(frame.clone().into())).await.unwrap();
+
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("a reply within the retry budget")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            reply["type"], "response.completed",
+            "the overload must be hidden behind the in-place resend: {reply}"
+        );
+        assert_eq!(
+            mock.raw_frames(),
+            vec![frame.clone(), frame],
+            "exactly one verbatim resend on the same account"
+        );
+        assert_eq!(
+            mock.handshake_count(),
+            2,
+            "the resend rides a fresh same-account dial"
+        );
+    }
+
+    /// When the overload does not clear inside the retry budget, the client must HEAR it. The
+    /// forwarded envelope gains the `status` its code implies (503), which is what codex's
+    /// websocket error mapper needs to turn it into a stream error and retry on its own,
+    /// instead of idling for 300 s.
+    #[tokio::test]
+    async fn a_persistent_overload_reaches_the_client_with_a_status_it_can_act_on() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::server_overloaded_without_status(),
+            ScriptedTurn::server_overloaded_without_status(),
+            ScriptedTurn::server_overloaded_without_status(),
+        ])
+        .capturing_raw_frames();
+        let upstream = mock.clone().spawn().await;
+        let (base, _state) = spawn_with_pinned_account("acct-overload-surface", &upstream).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        let frame = r#"{"type":"response.create","input":[],"client_metadata":{"turn_id":"turn-overload-surface"}}"#.to_string();
+        ws.send(TMessage::Text(frame.clone().into())).await.unwrap();
+
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(15), ws.next())
+            .await
+            .expect("a reply once the retry budget is spent")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            reply["type"], "error",
+            "the third overload is surfaced: {reply}"
+        );
+        assert_eq!(reply["error"]["code"], "server_is_overloaded");
+        assert_eq!(
+            reply["status"], 503,
+            "a status-less envelope must be given the status its code implies"
+        );
+        assert_eq!(
+            mock.raw_frames().len(),
+            3,
+            "first send plus two in-place resends"
+        );
+    }
+
     /// An ESTABLISHED relay socket must hear a routing decision (2026-07-29 live): the usage
     /// refresh flipped this connection's owner to `quota_exceeded` and the socket kept pumping
     /// turns to it for the better part of an hour — only NEW selections consult account status,

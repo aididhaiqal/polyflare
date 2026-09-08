@@ -62,7 +62,9 @@ pub struct RecordedFrame {
 pub enum ScriptedTurn {
     /// A normal turn: emit `events` verbatim as WS text frames, then a terminal
     /// `response.completed` carrying a freshly generated `resp_N` id.
-    Turn { events: Vec<String> },
+    Turn {
+        events: Vec<String>,
+    },
     /// A completed turn whose terminal `response.completed` carries NO `response.id`.
     ///
     /// Real, not hypothetical: the relay's `sniff_completed_id` needs a full JSON parse AND a
@@ -71,7 +73,9 @@ pub enum ScriptedTurn {
     /// `max_account_attempts` SUCCESSFUL rounds
     /// (`docs/incidents/2026-08-29-ws-turn-budget-leak.md`). Every other scripted turn emits an
     /// id, which is precisely why the existing tool-loop test could not catch it.
-    TurnWithoutResponseId { events: Vec<String> },
+    TurnWithoutResponseId {
+        events: Vec<String>,
+    },
     /// A normal turn whose terminal `response.completed` includes the numeric usage object emitted
     /// by the real Codex WS API. Kept separate from `Turn` so existing relay tests retain their
     /// minimal historical fixture while telemetry tests can exercise the complete wire shape.
@@ -88,10 +92,15 @@ pub enum ScriptedTurn {
     /// / `QuotaExceeded` / etc.) — NOT what a dead anchor emits; see
     /// [`ScriptedTurn::previous_response_not_found`] for that (it is a wrapped error envelope, not
     /// this variant).
-    Failed { code: String, message: String },
+    Failed {
+        code: String,
+        message: String,
+    },
     /// A terminal `response.incomplete`. The socket remains open for later turns, matching the
     /// reusable upstream connection contract.
-    Incomplete { reason: String },
+    Incomplete {
+        reason: String,
+    },
     /// The WS-only wrapped error envelope (ground truth §3):
     /// `{"type":"error","status":u16,"error":{"code","message",..error_extra},"headers":{...}}`.
     ErrorEnvelope {
@@ -114,13 +123,24 @@ pub enum ScriptedTurn {
     },
     /// Emit `events_before_close` (non-terminal — no `response.completed`/`.failed`), then close
     /// the socket. Models "close mid-stream, before any terminal frame".
-    CloseMidStream { events_before_close: Vec<String> },
+    CloseMidStream {
+        events_before_close: Vec<String>,
+    },
     /// A COMPLETE normal turn (events + terminal `response.completed`), after which the server
     /// closes the socket — a between-turns upstream death (idle reap / server-side teardown while
     /// parked), as opposed to [`ScriptedTurn::CloseMidStream`]'s in-turn drop.
-    TurnThenClose { events: Vec<String> },
+    TurnThenClose {
+        events: Vec<String>,
+    },
     /// Accept the frame (it IS recorded) and never send anything back. Models a stall past the
     /// client's idle timeout.
+    /// Emit `frame` verbatim as one WS text frame, then keep the socket open. For shapes the
+    /// typed constructors cannot express — e.g. the STATUS-LESS overload envelope the live backend
+    /// sends (`{"type":"error","error":{"code":"server_is_overloaded",...}}`, no top-level
+    /// `status`), which codex's websocket error mapper ignores as "unhandled".
+    RawFrame {
+        frame: String,
+    },
     Stall,
 }
 
@@ -267,6 +287,23 @@ impl ScriptedTurn {
     /// Accept the frame (recorded) and never respond.
     pub fn stall() -> Self {
         ScriptedTurn::Stall
+    }
+
+    /// The live backend's overload envelope as captured on 2026-09-08: a wrapped `error` frame
+    /// with NO top-level `status`. Codex only turns a wrapped error into a stream error when it
+    /// carries a non-2xx status, so this exact shape is what left clients waiting out their
+    /// 300 s idle timer.
+    pub fn server_overloaded_without_status() -> Self {
+        ScriptedTurn::RawFrame {
+            frame: serde_json::json!({
+                "type": "error",
+                "error": {
+                    "code": "server_is_overloaded",
+                    "message": "The server is currently overloaded. Please try again later."
+                }
+            })
+            .to_string(),
+        }
     }
 }
 
@@ -721,6 +758,9 @@ async fn handle_socket(mut socket: WebSocket, mock: MockWsUpstream) {
                     "headers": headers_obj,
                 })
                 .to_string();
+                let _ = socket.send(Message::Text(frame.into())).await;
+            }
+            ScriptedTurn::RawFrame { frame } => {
                 let _ = socket.send(Message::Text(frame.into())).await;
             }
             ScriptedTurn::ErrorAfterEvents {

@@ -625,6 +625,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
     // failed live, blind, purely because nothing recorded which frame closed the recovery window.
     let mut output_visible_by: Option<String> = None;
     let mut client_visible_upstream_for_turn = false;
+    // How many times THIS turn has been resent in place after a transient upstream overload
+    // (`server_is_overloaded` / `slow_down`) before anything was relayed. Reset per turn.
+    let mut overload_retries_for_turn: u32 = 0;
     // If the socket/pump disappears with a turn still active, preserve an explicit failed row
     // rather than silently losing the request. Client-side teardown defaults to nginx-style 499;
     // upstream/reconnect exhaustion sites below overwrite this with a server-side status.
@@ -738,6 +741,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                             reactive_auth_attempted = false;
                             reasoning_transform_attempted = false;
                             client_visible_upstream_for_turn = false;
+                            overload_retries_for_turn = 0;
                             upstream_output_visible_for_turn = false;
                             output_visible_by = None;
                         }
@@ -1213,6 +1217,83 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                         continue;
                                     }
                                 }
+                                // A transient overload is retried IN PLACE on the same account
+                                // before anything is relayed: upstream overload clears in
+                                // seconds, the anchor stays where it is, and the client never
+                                // learns a thing. Bounded per turn, and only while no upstream
+                                // event of this turn is client-visible (a replay after output
+                                // could duplicate streamed content). On 2026-09-08 every such
+                                // overload cost a hyperflux subagent ~5.5 min: see below.
+                                if is_transient_overload(&sig)
+                                    && !client_visible_upstream_for_turn
+                                    && overload_retries_for_turn < OVERLOAD_RETRY_MAX_RETRIES
+                                {
+                                    if let Some(frame) = in_flight.clone() {
+                                        overload_retries_for_turn += 1;
+                                        tokio::time::sleep(overload_retry_delay(
+                                            &sig,
+                                            overload_retries_for_turn,
+                                        ))
+                                        .await;
+                                        let redial = super::redial_for_scope(
+                                            &state,
+                                            &headers,
+                                            &account,
+                                            &relay_contract,
+                                            pool.as_deref(),
+                                        )
+                                        .await;
+                                        if let RedialOutcome::Connected(conn) = redial {
+                                            if !try_consume_active_turn_attempt(
+                                                &state,
+                                                &turn_telemetry,
+                                            ) {
+                                                in_flight = None;
+                                                if !surface_attempt_budget_exhausted(
+                                                    &mut downstream,
+                                                    &mut turn_telemetry,
+                                                    &state,
+                                                    &account.id,
+                                                )
+                                                .await
+                                                {
+                                                    break;
+                                                }
+                                                continue;
+                                            }
+                                            let mut conn = *conn;
+                                            let anchored = is_anchored_generating_frame(&frame);
+                                            if conn.send_text(frame).await.is_ok() {
+                                                upstream = Some(conn);
+                                                upstream_since = tokio::time::Instant::now();
+                                                if anchored {
+                                                    relay_metrics
+                                                        .record("anchored_send_after_redial");
+                                                    anchored_redial_pending = true;
+                                                }
+                                                relay_metrics.record("overload_same_account_retry");
+                                                relay_metrics.record("reconnect_same_account");
+                                                reconnects_since_progress += 1;
+                                                if reconnects_since_progress
+                                                    > MAX_RECONNECTS_WITHOUT_PROGRESS
+                                                {
+                                                    unfinished_status = StatusCode::BAD_GATEWAY;
+                                                    break;
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                        // The re-dial or the resend failed: surface the error.
+                                    }
+                                }
+                                // Forward the upstream error, normalized so the client can act on
+                                // it: codex's websocket error mapper turns a wrapped `error` into
+                                // a stream error ONLY when it carries a non-2xx `status`. The live
+                                // overload envelope has none, so codex logged it as an "unhandled
+                                // responses event" and waited out its 300 s idle timer — 155
+                                // times in five hours on 2026-09-08. Injecting the status the
+                                // code implies makes codex fail fast and run its own retry.
+                                let text = normalize_error_envelope_status(&text).unwrap_or(text);
                                 if downstream.send(Message::Text(text.clone().into())).await.is_err() {
                                     break;
                                 }
@@ -1677,6 +1758,77 @@ fn is_anchored_generating_frame(frame: &str) -> bool {
 /// retry resends the full history with no anchor (`client.rs::prepare_websocket_request`). The
 /// code constant is reused from `polyflare_codex::ws` — the same one the pump's own classifier
 /// matches upstream — so the two can never drift.
+/// How many in-place resends one turn gets after a transient upstream overload. Two retries
+/// with the backoff below add at most ~4.5 s; a longer overload is real pressure that must
+/// surface (and bench the account) rather than be hidden.
+const OVERLOAD_RETRY_MAX_RETRIES: u32 = 2;
+const OVERLOAD_RETRY_BASE_MS: u64 = 750;
+const OVERLOAD_RETRY_MAX_MS: u64 = 3000;
+/// A `retry-after` above this is not a burst; the client is better served by hearing the error.
+const OVERLOAD_RETRY_AFTER_HONOUR_MAX_SECS: i64 = 5;
+
+/// An upstream refusal that clears in seconds on the SAME account: the explicit overload codes,
+/// or a bare 503. A 429 is NOT one — quota and rate-limit handling stay with `on_upstream_error`.
+fn is_transient_overload(sig: &FailureSignal) -> bool {
+    matches!(
+        sig.error_code.as_deref(),
+        Some("server_is_overloaded" | "slow_down")
+    ) || (sig.status == 503 && sig.error_code.is_none())
+}
+
+/// The pause before an in-place overload resend: a short `retry-after` verbatim, otherwise
+/// full-jitter exponential backoff so parallel subagents do not resend in lockstep.
+fn overload_retry_delay(sig: &FailureSignal, attempt: u32) -> std::time::Duration {
+    match sig.retry_after {
+        Some(secs) if secs > 0 && secs <= OVERLOAD_RETRY_AFTER_HONOUR_MAX_SECS => {
+            std::time::Duration::from_secs(secs as u64)
+        }
+        _ => {
+            let cap = OVERLOAD_RETRY_BASE_MS
+                .saturating_mul(1u64 << attempt.min(20))
+                .min(OVERLOAD_RETRY_MAX_MS);
+            std::time::Duration::from_millis((rand::random::<f64>() * cap as f64) as u64)
+        }
+    }
+}
+
+/// The HTTP status a wrapped error envelope implies when the upstream omitted one.
+fn status_for_error_code(code: Option<&str>) -> u16 {
+    match code {
+        Some("server_is_overloaded" | "slow_down") => 503,
+        Some("rate_limit_exceeded" | "insufficient_quota" | "usage_not_included") => 429,
+        Some("server_error") => 500,
+        _ => 502,
+    }
+}
+
+/// Give a status-less wrapped `error` envelope the `status` its code implies, so the client's
+/// error mapper treats it as the stream error it is. Everything else in the frame is carried
+/// unchanged (re-serialized, never inspected beyond `type`, `status`, `error.code`, never
+/// logged). Returns `None` when the frame is not a wrapped error or already carries a status.
+pub(crate) fn normalize_error_envelope_status(text: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let object = value.as_object_mut()?;
+    if object.get("type").and_then(serde_json::Value::as_str) != Some("error") {
+        return None;
+    }
+    if object
+        .get("status")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|status| (100..600).contains(&status))
+    {
+        return None;
+    }
+    let status = status_for_error_code(
+        object
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(serde_json::Value::as_str),
+    );
+    object.insert("status".to_string(), serde_json::Value::from(status));
+    Some(value.to_string())
+}
+
 fn client_resend_error_frame() -> String {
     serde_json::json!({
         "type": "error",
@@ -1747,8 +1899,77 @@ async fn send_client_text(
 mod tests {
     use super::{
         classify_upstream_signal, client_resend_error_frame, is_anchored_generating_frame,
-        UpstreamSignal,
+        is_transient_overload, normalize_error_envelope_status, overload_retry_delay,
+        status_for_error_code, UpstreamSignal,
     };
+    use polyflare_core::FailureSignal;
+
+    #[test]
+    fn a_status_less_overload_envelope_gets_the_status_its_code_implies() {
+        let live = r#"{"type":"error","error":{"code":"server_is_overloaded","message":"busy"}}"#;
+        let fixed = normalize_error_envelope_status(live).expect("normalized");
+        let v: serde_json::Value = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(v["status"], 503);
+        assert_eq!(v["error"]["code"], "server_is_overloaded");
+        assert_eq!(
+            v["error"]["message"], "busy",
+            "the rest of the frame is carried unchanged"
+        );
+        assert_eq!(status_for_error_code(Some("server_error")), 500);
+        assert_eq!(status_for_error_code(Some("rate_limit_exceeded")), 429);
+        assert_eq!(status_for_error_code(Some("something_new")), 502);
+    }
+
+    #[test]
+    fn envelopes_that_already_carry_a_status_and_non_error_frames_are_left_alone() {
+        let with_status = r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#;
+        assert!(normalize_error_envelope_status(with_status).is_none());
+        let delta = r#"{"type":"response.output_text.delta","delta":"hi"}"#;
+        assert!(normalize_error_envelope_status(delta).is_none());
+        let failed =
+            r#"{"type":"response.failed","response":{"error":{"code":"server_is_overloaded"}}}"#;
+        assert!(normalize_error_envelope_status(failed).is_none());
+        assert!(normalize_error_envelope_status("not json").is_none());
+    }
+
+    #[test]
+    fn only_overload_shapes_are_retried_in_place() {
+        let sig = |status: u16, code: Option<&str>| FailureSignal {
+            status,
+            retry_after: None,
+            error_code: code.map(str::to_string),
+        };
+        assert!(is_transient_overload(&sig(0, Some("server_is_overloaded"))));
+        assert!(is_transient_overload(&sig(503, Some("slow_down"))));
+        assert!(is_transient_overload(&sig(503, None)));
+        assert!(!is_transient_overload(&sig(
+            429,
+            Some("rate_limit_exceeded")
+        )));
+        assert!(!is_transient_overload(&sig(500, Some("server_error"))));
+        assert!(!is_transient_overload(&sig(400, None)));
+    }
+
+    #[test]
+    fn overload_backoff_honours_a_short_retry_after_and_stays_bounded() {
+        let short = FailureSignal {
+            status: 503,
+            retry_after: Some(2),
+            error_code: None,
+        };
+        assert_eq!(
+            overload_retry_delay(&short, 1),
+            std::time::Duration::from_secs(2)
+        );
+        let long = FailureSignal {
+            status: 503,
+            retry_after: Some(60),
+            error_code: None,
+        };
+        for attempt in 1..6 {
+            assert!(overload_retry_delay(&long, attempt) <= std::time::Duration::from_millis(3000));
+        }
+    }
 
     #[test]
     fn anchored_generating_delta_is_resend_eligible() {
