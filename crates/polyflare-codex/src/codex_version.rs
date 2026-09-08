@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tracing::warn;
 
-use crate::codex_headers::CODEX_CLI_VERSION;
+use crate::codex_headers::{CODEX_CLI_VERSION, FINGERPRINT_VERIFIED_THROUGH};
 
 const GITHUB_RELEASES_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
 const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/@openai/codex/latest";
@@ -172,13 +172,13 @@ impl CodexVersionCache {
     /// the synthesized fingerprint is only verified through [`CODEX_CLI_VERSION`], and a
     /// minor/major bump may have changed the header/turn-metadata structure (a patch bump has not).
     fn warn_if_fingerprint_drift(&self, resolved: &str) {
-        if major_minor(resolved) != major_minor(CODEX_CLI_VERSION) {
+        if major_minor(resolved) != major_minor(FINGERPRINT_VERIFIED_THROUGH) {
             warn!(
                 resolved_version = %resolved,
-                capture_verified_through = %CODEX_CLI_VERSION,
+                capture_verified_through = %FINGERPRINT_VERIFIED_THROUGH,
                 "codex-rs {resolved} differs in minor/major from the capture-verified fingerprint \
-                 floor {CODEX_CLI_VERSION}; the synthesized egress fingerprint is verified only \
-                 through {CODEX_CLI_VERSION} — re-capture (POLYFLARE_CAPTURE_FINGERPRINT) to \
+                 floor {FINGERPRINT_VERIFIED_THROUGH}; the synthesized egress fingerprint is verified only \
+                 through {FINGERPRINT_VERIFIED_THROUGH} — re-capture (POLYFLARE_CAPTURE_FINGERPRINT) to \
                  confirm the header/turn-metadata structure before trusting the newer version"
             );
         }

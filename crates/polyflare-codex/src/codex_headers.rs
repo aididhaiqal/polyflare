@@ -75,7 +75,20 @@ use sha2::{Digest, Sha256};
 /// catalog, never hardcoded here). A byte-level golden re-capture (`POLYFLARE_CAPTURE_FINGERPRINT`)
 /// against a real 0.145.0 client is still recommended to promote 0.145.0 from source-verified to
 /// capture-verified.
-pub const CODEX_CLI_VERSION: &str = "0.145.0";
+///
+/// **2026-09-08:** raised from 0.145.0 to 0.153.4 as a floor. The upstream `/models` catalog is
+/// gated on `client_version` (below 0.153.0 it omits gpt-6-astra), so a cold or source-less
+/// version cache must not fall back to a version the backend treats as obsolete. This is the
+/// version the fleet has been running live from the version cache for weeks. Fingerprint
+/// verification is tracked SEPARATELY in [`FINGERPRINT_VERIFIED_THROUGH`] so raising the floor
+/// never silently claims a byte-capture that was not done.
+pub const CODEX_CLI_VERSION: &str = "0.153.4";
+
+/// The newest codex-rs release whose egress fingerprint (header set, UA format, turn-metadata
+/// keys) PolyFlare has verified — 0.145.0 at the source level (see above). Drives only the
+/// drift warning in `codex_version`; a re-capture (`POLYFLARE_CAPTURE_FINGERPRINT`) against a
+/// real client is what promotes it.
+pub const FINGERPRINT_VERIFIED_THROUGH: &str = "0.145.0";
 
 /// codex-rs's default `originator` (`login/src/auth/default_client.rs::DEFAULT_ORIGINATOR`).
 const ORIGINATOR: &str = "codex_cli_rs";
