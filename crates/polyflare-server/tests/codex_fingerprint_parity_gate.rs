@@ -63,6 +63,7 @@ const EXPECTED_CODEX_IDENTITY_HEADER_NAMES: &[&str] = &[
     "x-client-request-id",
     "x-codex-window-id",
     "x-codex-turn-metadata",
+    "x-codex-routing-hint",
 ];
 
 /// The `x-codex-turn-metadata` JSON field KEY set this milestone synthesizes, verified from
@@ -70,16 +71,22 @@ const EXPECTED_CODEX_IDENTITY_HEADER_NAMES: &[&str] = &[
 /// `forked_from_thread_id`/`parent_thread_id`/`subagent_kind`/`compaction`/`extra` — omitted here
 /// as conditional/rare fields (forking, subagents, compaction requests) out of scope for this M1
 /// baseline-turn synthesis; see `polyflare_codex::codex_headers` module doc.
+/// The interactive-turn key set of codex-rs rust-v0.153.4 (source-verified 2026-09-08; see
+/// `polyflare_codex::codex_headers::FINGERPRINT_VERIFIED_THROUGH`).
 const EXPECTED_TURN_METADATA_KEYS: &[&str] = &[
     "installation_id",
     "session_id",
     "thread_id",
+    "agent_name",
     "turn_id",
     "window_id",
     "request_kind",
-    "sandbox",
     "thread_source",
-    "workspaces",
+    "sandbox",
+    "sandbox_mode",
+    "auto_review_enabled",
+    "node_repl_auto_review_required",
+    "node_repl_disabled",
     "turn_started_at_unix_ms",
 ];
 
@@ -104,7 +111,8 @@ async fn codex_egress_header_structure_matches_the_from_source_codex_rs_golden()
     // executor relays it untouched. A `prompt_cache_key` is present so the stable-id derivation
     // exercises its primary path, not the no-key fallback.
     use polyflare_codex::codex_headers::{
-        codex_user_agent, conversation_key, originator, TurnIdentity, CODEX_CLI_VERSION,
+        codex_user_agent, conversation_key, originator, routing_hint, TurnIdentity,
+        CODEX_CLI_VERSION,
     };
     let body = serde_json::json!({
         "model": "gpt-5.6-sol",
@@ -131,6 +139,10 @@ async fn codex_egress_header_structure_matches_the_from_source_codex_rs_golden()
         (
             "x-codex-turn-metadata".to_string(),
             identity.turn_metadata_json(),
+        ),
+        (
+            "x-codex-routing-hint".to_string(),
+            routing_hint("gpt-5.6-sol", None),
         ),
     ];
     let req = PreparedRequest {

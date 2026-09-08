@@ -316,7 +316,11 @@ pub(crate) async fn bench_account_for_failure(
                     crate::runtime_state::RATE_LIMITED_MIN_COOLDOWN_SECS,
                     crate::runtime_state::MAX_COOLDOWN_SECS,
                 );
-            let reason = if sig.status == 529 { "overloaded" } else { "rate_limit" };
+            let reason = if sig.status == 529 {
+                "overloaded"
+            } else {
+                "rate_limit"
+            };
             let _ = state
                 .store
                 .accounts()
@@ -434,12 +438,18 @@ pub(crate) fn forward_headers_from_inbound(headers: &HeaderMap) -> Vec<(String, 
 fn synthesize_codex_forward_headers(
     body: &serde_json::Value,
     codex_version: &str,
+    flags: &polyflare_codex::codex_headers::ModelTurnFlags,
 ) -> Vec<(String, String)> {
     use polyflare_codex::codex_headers::{
-        codex_user_agent, conversation_key, originator, TurnIdentity,
+        codex_user_agent, conversation_key, originator, routing_hint, TurnIdentity,
     };
 
     let identity = TurnIdentity::derive(&conversation_key(body));
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let service_tier = body.get("service_tier").and_then(|v| v.as_str());
     vec![
         ("user-agent".to_string(), codex_user_agent(codex_version)),
         ("originator".to_string(), originator().to_string()),
@@ -453,9 +463,32 @@ fn synthesize_codex_forward_headers(
         ("x-codex-window-id".to_string(), identity.window_id.clone()),
         (
             "x-codex-turn-metadata".to_string(),
-            identity.turn_metadata_json(),
+            identity.turn_metadata_json_for(flags),
+        ),
+        // Always present on an HTTP /responses turn under ChatGPT login since codex-rs 0.145
+        // (`core/src/client.rs::build_routing_hint_header`); absent was a fingerprint tell.
+        (
+            "x-codex-routing-hint".to_string(),
+            routing_hint(model, service_tier),
         ),
     ]
+}
+
+/// The per-model turn-metadata booleans codex-rs copies from the catalog entry of the model the
+/// turn is sent as (`model_info.node_repl_*`). Falls back to `false` when the catalog has no
+/// cached entry, which matches every catalog model but gpt-6-astra as of 2026-09-08.
+fn model_turn_flags(
+    catalog: &crate::model_catalog::ModelCatalogCache,
+    model: &str,
+) -> polyflare_codex::codex_headers::ModelTurnFlags {
+    polyflare_codex::codex_headers::ModelTurnFlags {
+        node_repl_auto_review_required: catalog
+            .model_bool_flag(model, "node_repl_auto_review_required")
+            .unwrap_or(false),
+        node_repl_disabled: catalog
+            .model_bool_flag(model, "node_repl_disabled")
+            .unwrap_or(false),
+    }
 }
 
 /// A stable, conversation-scoped `prompt_cache_key` for a translated (aliased) Codex body.
@@ -3318,9 +3351,9 @@ async fn responses_handler_impl_with_max_attempts(
                             match retry {
                                 Some(anchorless_req) => {
                                     state.relay_metrics.record("anchor_rejected_http_retry");
-                                    state
-                                        .runtime
-                                        .refund_logical_turn_attempt(ctx.logical_turn_key.as_deref());
+                                    state.runtime.refund_logical_turn_attempt(
+                                        ctx.logical_turn_key.as_deref(),
+                                    );
                                     let lease = state
                                         .runtime
                                         .acquire_pinned_in_flight_weighted(
@@ -4578,6 +4611,7 @@ async fn messages_handler_codex_aliased(
     let forward_headers = synthesize_codex_forward_headers(
         &translated_body,
         &state.codex_version.cached_or_fallback(),
+        &model_turn_flags(&state.model_catalog, &model_alias.target_model),
     );
     let model_for_selection = model_alias.target_model.clone();
     let req = PreparedRequest {
@@ -5222,7 +5256,7 @@ mod tests {
                     ttft_ms: Some(500),
                     duration_ms: Some(4000),
                     protocol_outcome: polyflare_store::RequestProtocolOutcome::Cancelled,
-                stream_error_status: None,
+                    stream_error_status: None,
                 },
             );
             store.flush_background_writes().await.unwrap();
@@ -5269,7 +5303,7 @@ mod tests {
                     ttft_ms: Some(250),
                     duration_ms: Some(2000),
                     protocol_outcome: polyflare_store::RequestProtocolOutcome::Completed,
-                stream_error_status: None,
+                    stream_error_status: None,
                 },
             );
             store.flush_background_writes().await.unwrap();
@@ -5462,7 +5496,7 @@ mod tests {
                     ttft_ms: None,
                     duration_ms: Some(10),
                     protocol_outcome: polyflare_store::RequestProtocolOutcome::Completed,
-                stream_error_status: None,
+                    stream_error_status: None,
                 },
             );
             store.flush_background_writes().await.unwrap();

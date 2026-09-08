@@ -287,6 +287,26 @@ impl ModelCatalogCache {
 
     /// Synchronous, zero-I/O read for the `/models` hot path: the cached catalog (even if past its
     /// TTL) or the static floor when never warmed. Never blocks on the network, never empty.
+    /// A boolean field of a model's upstream catalog entry (`model_info`), e.g.
+    /// `node_repl_auto_review_required`. Scoped per-account catalogs are consulted first, then
+    /// the unscoped cache / floor. `None` when no cached entry carries the key.
+    pub fn model_bool_flag(&self, slug: &str, key: &str) -> Option<bool> {
+        let from_accounts = self
+            .account_catalogs
+            .read()
+            .expect("per-account model catalog cache lock poisoned")
+            .values()
+            .flat_map(|cached| cached.catalog.models.iter())
+            .find(|model| model.slug == slug)
+            .and_then(|model| model.raw.get(key).and_then(serde_json::Value::as_bool));
+        from_accounts.or_else(|| {
+            self.cached_or_fallback()
+                .iter()
+                .find(|model| model.slug == slug)
+                .and_then(|model| model.raw.get(key).and_then(serde_json::Value::as_bool))
+        })
+    }
+
     pub fn cached_or_fallback(&self) -> Vec<UpstreamModel> {
         self.cached
             .read()

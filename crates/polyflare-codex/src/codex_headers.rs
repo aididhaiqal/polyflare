@@ -2,7 +2,7 @@
 //! egress-parity half of the fingerprint-parity gate (see `executor.rs` and
 //! `polyflare-server/tests/codex_fingerprint_parity_gate.rs`).
 //!
-//! # Status: CAPTURE-VERIFIED (codex-cli 0.144.4, 2026-07-15); floor now 0.145.0 (source-verified)
+//! # Status: CAPTURE-VERIFIED (codex-cli 0.144.4, 2026-07-15); SOURCE-VERIFIED through 0.153.4 (2026-09-08)
 //! Originally built from a local `openai/codex` source read, this synthesis has since been
 //! diffed against a live wire capture of the real Codex CLI (`codex-cli 0.144.4`, obtained by
 //! routing a `scripts/codex-polyflare` run through `POLYFLARE_CAPTURE_FINGERPRINT`). The capture
@@ -88,7 +88,20 @@ pub const CODEX_CLI_VERSION: &str = "0.153.4";
 /// keys) PolyFlare has verified — 0.145.0 at the source level (see above). Drives only the
 /// drift warning in `codex_version`; a re-capture (`POLYFLARE_CAPTURE_FINGERPRINT`) against a
 /// real client is what promotes it.
-pub const FINGERPRINT_VERIFIED_THROUGH: &str = "0.145.0";
+///
+/// **2026-09-08: 0.153.4, source-verified** against the released tag `rust-v0.153.4` (openai/codex,
+/// 2026-09-04): `login/src/auth/default_client.rs` (originator, UA format, `default_headers`),
+/// `terminal-detection/src/lib.rs` (`unknown` token), `codex-api/src/requests/headers.rs` and
+/// `codex-api/src/endpoint/responses.rs` (session/thread/x-client-request-id/accept),
+/// `core/src/client.rs` (`x-codex-routing-hint`, turn-state, beta-features, responses-lite),
+/// `core/src/responses_metadata.rs` + `core/src/turn_metadata.rs` + `core/src/sandbox_tags.rs`
+/// and `sandboxing/src/manager.rs` (turn-metadata key set and values), `protocol/src/protocol.rs`
+/// (`ThreadSource` strings). Drift found and fixed in that pass: the always-present
+/// `x-codex-routing-hint` header, and the turn-metadata payload (`agent_name`, `sandbox_mode`,
+/// `auto_review_enabled`, `node_repl_*`, `thread_source: "user"`, platform `sandbox` tag, no
+/// empty `workspaces`). A byte-level re-capture against a real 0.153.4 client is what would
+/// promote this to capture-verified.
+pub const FINGERPRINT_VERIFIED_THROUGH: &str = "0.153.4";
 
 /// codex-rs's default `originator` (`login/src/auth/default_client.rs::DEFAULT_ORIGINATOR`).
 const ORIGINATOR: &str = "codex_cli_rs";
@@ -211,7 +224,30 @@ impl TurnIdentity {
     /// `turn_started_at_unix_ms`. See the module doc for the additional real fields
     /// (`forked_from_thread_id`/`parent_thread_id`/`subagent_kind`/`compaction`/`extra`)
     /// deliberately omitted as out of scope for this baseline-turn synthesis.
+    /// The baseline interactive-turn payload with the per-model flags at their most common
+    /// values (both `node_repl_*` false — every catalog model except gpt-6-astra as of
+    /// 2026-09-08). Prefer [`Self::turn_metadata_json_for`] when the model's catalog entry is
+    /// at hand.
     pub fn turn_metadata_json(&self) -> String {
+        self.turn_metadata_json_for(&ModelTurnFlags::default())
+    }
+
+    /// The `x-codex-turn-metadata` payload codex-rs 0.153.4 sends on an ordinary interactive
+    /// turn (`core/src/turn_metadata.rs::to_responses_metadata` + `responses_metadata_template`,
+    /// `core/src/sandbox_tags.rs::record_metadata`, `core/src/tasks/mod.rs::start_task`):
+    /// - `agent_name` is the root agent path (`AgentPath::root()` → `"/root"`), always.
+    /// - `thread_source` is `ThreadSource::User` → `"user"` (NOT the `SessionSource` `"cli"`).
+    /// - `sandbox` is the platform sandbox tag (`seatbelt` / `seccomp` / `none`) and the policy
+    ///   moved to `sandbox_mode` (`workspace-write`, the CLI default).
+    /// - `auto_review_enabled` is `routes_approval_policy_to_guardian(policy, reviewer)`, which is
+    ///   `false` whenever the reviewer is the default `User`.
+    /// - `node_repl_auto_review_required` / `node_repl_disabled` come from the model's catalog
+    ///   entry (`model_info`), so they are per model.
+    /// - `workspaces` is emitted only when git enrichment found one (`non_empty_workspaces`);
+    ///   an empty `{}` never occurs live, so it is omitted.
+    /// - `turn_started_at_unix_ms` is set unconditionally at task start.
+    /// - `turn_trigger`, `window_number`, `context_window_id` are absent on an ordinary turn.
+    pub fn turn_metadata_json_for(&self, flags: &ModelTurnFlags) -> String {
         let turn_started_at_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -220,15 +256,53 @@ impl TurnIdentity {
             "installation_id": self.installation_id,
             "session_id": self.session_id,
             "thread_id": self.thread_id,
+            "agent_name": ROOT_AGENT_PATH,
             "turn_id": self.turn_id,
             "window_id": self.window_id,
             "request_kind": "turn",
-            "sandbox": "workspace-write",
-            "thread_source": "cli",
-            "workspaces": {},
+            "thread_source": "user",
+            "sandbox": platform_sandbox_tag(),
+            "sandbox_mode": "workspace-write",
+            "auto_review_enabled": false,
+            "node_repl_auto_review_required": flags.node_repl_auto_review_required,
+            "node_repl_disabled": flags.node_repl_disabled,
             "turn_started_at_unix_ms": turn_started_at_unix_ms,
         })
         .to_string()
+    }
+}
+
+/// codex-rs `AgentPath::root()` as it serializes into `agent_name` for the main (non-subagent)
+/// thread.
+const ROOT_AGENT_PATH: &str = "/root";
+
+/// The per-model booleans codex-rs copies from the model's catalog `model_info` into the
+/// turn metadata (`core/src/turn_metadata.rs::TurnMetadataState::new`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelTurnFlags {
+    pub node_repl_auto_review_required: bool,
+    pub node_repl_disabled: bool,
+}
+
+/// The `sandbox` tag codex-rs records for this platform
+/// (`sandboxing/src/manager.rs::get_platform_sandbox` → `SandboxType::as_metric_tag`).
+pub fn platform_sandbox_tag() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "seatbelt"
+    } else if cfg!(target_os = "linux") {
+        "seccomp"
+    } else {
+        "none"
+    }
+}
+
+/// The `x-codex-routing-hint` value codex-rs 0.153.4 sends on every HTTP `/responses` turn under
+/// ChatGPT login (`core/src/client.rs::build_routing_hint_header`): `model=<slug>` or
+/// `model=<slug>;tier=<tier>` when the request names a service tier.
+pub fn routing_hint(model: &str, service_tier: Option<&str>) -> String {
+    match service_tier {
+        Some(tier) if !tier.is_empty() => format!("model={model};tier={tier}"),
+        _ => format!("model={model}"),
     }
 }
 
@@ -351,16 +425,70 @@ mod tests {
             "installation_id",
             "session_id",
             "thread_id",
+            "agent_name",
             "turn_id",
             "window_id",
             "request_kind",
-            "sandbox",
             "thread_source",
-            "workspaces",
+            "sandbox",
+            "sandbox_mode",
+            "auto_review_enabled",
+            "node_repl_auto_review_required",
+            "node_repl_disabled",
             "turn_started_at_unix_ms",
         ] {
             assert!(obj.contains_key(key), "missing turn-metadata key `{key}`");
         }
+        for absent in [
+            "workspaces",
+            "turn_trigger",
+            "window_number",
+            "context_window_id",
+        ] {
+            assert!(
+                !obj.contains_key(absent),
+                "`{absent}` must not appear on an ordinary interactive turn"
+            );
+        }
+    }
+
+    /// Values pinned to codex-rs rust-v0.153.4 (see the const docs).
+    #[test]
+    fn turn_metadata_values_match_codex_rs_0_153_4() {
+        let identity = TurnIdentity::derive("conv-1");
+        let value: serde_json::Value =
+            serde_json::from_str(&identity.turn_metadata_json()).unwrap();
+        assert_eq!(value["agent_name"], "/root");
+        assert_eq!(
+            value["thread_source"], "user",
+            "ThreadSource::User, not SessionSource cli"
+        );
+        assert_eq!(value["request_kind"], "turn");
+        assert_eq!(value["sandbox_mode"], "workspace-write");
+        assert_eq!(value["sandbox"], platform_sandbox_tag());
+        assert!(matches!(
+            value["sandbox"].as_str(),
+            Some("seatbelt" | "seccomp" | "none")
+        ));
+        assert_eq!(value["auto_review_enabled"], false);
+        assert_eq!(value["node_repl_auto_review_required"], false);
+        assert_eq!(value["node_repl_disabled"], false);
+        let astra = identity.turn_metadata_json_for(&ModelTurnFlags {
+            node_repl_auto_review_required: true,
+            node_repl_disabled: false,
+        });
+        let astra: serde_json::Value = serde_json::from_str(&astra).unwrap();
+        assert_eq!(astra["node_repl_auto_review_required"], true);
+    }
+
+    #[test]
+    fn routing_hint_matches_build_routing_hint_header() {
+        assert_eq!(routing_hint("gpt-5.6-sol", None), "model=gpt-5.6-sol");
+        assert_eq!(routing_hint("gpt-5.6-sol", Some("")), "model=gpt-5.6-sol");
+        assert_eq!(
+            routing_hint("gpt-6-astra", Some("priority")),
+            "model=gpt-6-astra;tier=priority"
+        );
     }
 
     #[test]
