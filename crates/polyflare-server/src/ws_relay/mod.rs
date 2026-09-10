@@ -104,7 +104,7 @@ impl Default for WsRelayIdlePolicy {
     fn default() -> Self {
         Self {
             ping_interval: Some(std::time::Duration::from_secs(30)),
-            idle_budget: std::time::Duration::from_secs(1500),
+            idle_budget: std::time::Duration::from_secs(300),
             // 50 minutes: comfortably inside the ~60-minute server cap, leaving room for a long
             // turn started just before the deadline to finish on the old socket.
             max_socket_age: Some(std::time::Duration::from_secs(3000)),
@@ -265,7 +265,7 @@ async fn responses_ws_upgrade(
     {
         Ok(account) => account,
         Err(error) => {
-            if has_codex_visible_custom_models(&state).await {
+            if http_only_fallback_applies(&state).await {
                 return crate::ingress::websocket_fallback_handler().await;
             }
             return relay_error_response(error);
@@ -298,7 +298,7 @@ async fn responses_ws_upgrade(
                         Ok(upstream) => (refreshed_account, upstream),
                         Err(error) => {
                             record_initial_dial_failure(&state, &refreshed_account, &error).await;
-                            if has_codex_visible_custom_models(&state).await {
+                            if http_only_fallback_applies(&state).await {
                                 return crate::ingress::websocket_fallback_handler().await;
                             }
                             return relay_error_response(error);
@@ -308,7 +308,7 @@ async fn responses_ws_upgrade(
                 // Preserve the actionable upstream 401 when OAuth itself had a transient failure.
                 Ok(None) => {
                     record_initial_dial_failure(&state, &account, &error).await;
-                    if has_codex_visible_custom_models(&state).await {
+                    if http_only_fallback_applies(&state).await {
                         return crate::ingress::websocket_fallback_handler().await;
                     }
                     return relay_error_response(error);
@@ -318,7 +318,7 @@ async fn responses_ws_upgrade(
         }
         Err(error) => {
             record_initial_dial_failure(&state, &account, &error).await;
-            if has_codex_visible_custom_models(&state).await {
+            if http_only_fallback_applies(&state).await {
                 return crate::ingress::websocket_fallback_handler().await;
             }
             return relay_error_response(error);
@@ -366,6 +366,30 @@ async fn responses_ws_upgrade(
     response
 }
 
+/// Whether a failed upgrade should be answered `426 Upgrade Required` (send this client to
+/// HTTP for good) rather than the failure itself.
+///
+/// codex-rs treats 426 as "this server cannot do WebSocket": it flips the THREAD to HTTP-SSE and
+/// never tries WebSocket again for that thread (`core/src/client.rs`, `force_http_fallback`). Any
+/// other connect failure only moves the one request to HTTP and the next turn dials WebSocket
+/// again. So 426 is only truthful when HTTP is genuinely the only path: codex-visible custom
+/// models exist AND there is no codex account in the fleet at all. A momentary slot timeout or
+/// an upstream dial error on a fleet that has codex accounts must surface as its own status —
+/// on 2026-09-10 those transient timeouts (per-account open-WS cap full for a few seconds) were
+/// answered 426, and every affected thread stayed on SSE for its whole life.
+async fn http_only_fallback_applies(state: &AppState) -> bool {
+    if !has_codex_visible_custom_models(state).await {
+        return false;
+    }
+    let snapshots = match state.account_cache.snapshots(&state.store).await {
+        Ok(snapshots) => snapshots,
+        Err(_) => return false,
+    };
+    !snapshots
+        .iter()
+        .any(|snapshot| snapshot.provider == polyflare_core::Provider::Codex)
+}
+
 async fn has_codex_visible_custom_models(state: &AppState) -> bool {
     state
         .store
@@ -405,7 +429,14 @@ async fn record_initial_dial_failure(
 fn relay_error_response(error: owner::RelayError) -> Response {
     match error {
         owner::RelayError::NoEligibleAccount => {
-            (StatusCode::SERVICE_UNAVAILABLE, "no eligible account").into_response()
+            // Transient by definition (a slot or an account frees up in seconds): a 503 the
+            // client may retry, never a 426 that would demote the thread to HTTP for life.
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("retry-after", "2")],
+                "no eligible account",
+            )
+                .into_response()
         }
         owner::RelayError::Internal => {
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()

@@ -1436,6 +1436,120 @@ mod relay_through {
         );
     }
 
+    /// Seed one codex-visible custom-provider model, the condition under which the relay used
+    /// to answer EVERY upgrade failure with 426.
+    async fn seed_codex_visible_custom_model(state: &Arc<AppState>, tag: &str) {
+        let timestamp = now();
+        state
+            .store
+            .providers()
+            .create_provider(&NewCustomProvider {
+                id: format!("provider-{tag}"),
+                slug: format!("custom-{tag}"),
+                display_name: "Custom".into(),
+                base_url: "http://127.0.0.1:9/v1".into(),
+                wire_api: "responses".into(),
+                enabled: true,
+                stateless_responses: true,
+                allow_private_hosts: true,
+                connect_timeout_ms: 1_000,
+                stream_idle_timeout_ms: 10_000,
+                request_max_retries: 0,
+                max_concurrency: None,
+                created_at: timestamp,
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .providers()
+            .create_model(&NewProviderModel {
+                priority_input_per_million: None,
+                priority_cached_input_per_million: None,
+                priority_output_per_million: None,
+                id: format!("model-{tag}"),
+                provider_id: format!("provider-{tag}"),
+                public_model: format!("custom/{tag}"),
+                upstream_model: tag.to_string(),
+                display_name: "Custom".into(),
+                context_window: None,
+                max_output_tokens: None,
+                supports_tools: true,
+                supports_vision: false,
+                supports_parallel_tool_calls: true,
+                supports_web_search: false,
+                supports_reasoning_summaries: false,
+                reasoning_levels_json: r#"["high"]"#.into(),
+                model_info_json: None,
+                instruction_mode: "none".into(),
+                instruction_text: String::new(),
+                request_overrides_json: "{}".into(),
+                input_per_million: None,
+                cached_input_per_million: None,
+                output_per_million: None,
+                visible_in_codex: true,
+                visible_in_openai: true,
+                enabled: true,
+                created_at: timestamp,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// 2026-09-10 live: the per-account open-WS cap was full for a few seconds, the upgrade's
+    /// slot wait timed out, and because custom models exist the relay answered 426. codex treats
+    /// 426 as "this server cannot do WebSocket" and pins the THREAD to HTTP-SSE for life, so
+    /// every affected thread lost WebSocket (and its overload protection) permanently. A
+    /// transient refusal on a fleet that HAS codex accounts must be a 503 the client retries.
+    #[tokio::test]
+    async fn a_transient_no_eligible_account_is_a_503_not_a_426_when_codex_accounts_exist() {
+        let mock = MockWsUpstream::new(ScriptedTurn::normal(Vec::new()));
+        let upstream = mock.spawn().await;
+        let (base, state) = spawn_with_pinned_account("acct-transient-503", &upstream).await;
+        seed_codex_visible_custom_model(&state, "transient").await;
+        // The only codex account is out of quota right now: nothing eligible, but the fleet is
+        // a codex fleet and the account comes back at its reset.
+        state
+            .store
+            .accounts()
+            .update_status("acct-transient-503", "quota_exceeded")
+            .await
+            .unwrap();
+        state
+            .runtime
+            .note_account_status("acct-transient-503", "quota_exceeded");
+        state.account_cache.invalidate();
+
+        let status = super::ws_handshake_status(&base).await;
+        assert_eq!(
+            status, 503,
+            "a transient no-eligible refusal must not demote the thread to HTTP for life"
+        );
+    }
+
+    /// The one case 426 is truthful: custom models exist and there is NO codex account at all,
+    /// so HTTP is genuinely the only path this server can offer.
+    #[tokio::test]
+    async fn an_empty_codex_fleet_with_custom_models_still_answers_426() {
+        let mock = MockWsUpstream::new(ScriptedTurn::normal(Vec::new()));
+        let upstream = mock.spawn().await;
+        let (base, state) = spawn_with_pinned_account("acct-to-remove", &upstream).await;
+        seed_codex_visible_custom_model(&state, "only").await;
+        assert!(state
+            .store
+            .accounts()
+            .delete("acct-to-remove", false)
+            .await
+            .unwrap());
+        state.account_cache.invalidate();
+
+        let status = super::ws_handshake_status(&base).await;
+        assert_eq!(
+            status, 426,
+            "custom-only fleets keep the permanent HTTP fallback"
+        );
+    }
+
     /// An ESTABLISHED relay socket must hear a routing decision (2026-07-29 live): the usage
     /// refresh flipped this connection's owner to `quota_exceeded` and the socket kept pumping
     /// turns to it for the better part of an hour — only NEW selections consult account status,

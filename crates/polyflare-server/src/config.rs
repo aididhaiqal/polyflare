@@ -790,7 +790,9 @@ pub fn http_upstream_websocket_ping_from_env() -> bool {
 ///   5s–300s (a sub-5s cadence is pure noise; a longer cadence is unlikely to preserve an idle
 ///   intermediary).
 /// - `POLYFLARE_WEBSOCKET_IDLE_BUDGET_SECS`: how long a parked upstream stays alive before the relay
-///   deliberately closes both legs. Malformed/unset ⇒ the 1500s (25 min) default; well-formed
+///   deliberately closes both legs. Malformed/unset ⇒ the 300s (5 min) default (was 25 min until
+///   2026-09-10: parked subagent relays filled the per-account open-WS cap and upstream's own
+///   per-account socket limit); well-formed
 ///   values clamp to 60s–86400s (24h), preventing both accidental rapid teardown and duration
 ///   overflow from an unbounded environment value.
 pub fn clamp_websocket_idle_ping_secs(secs: u64) -> u64 {
@@ -1221,7 +1223,7 @@ mod tests {
             policy.ping_interval,
             Some(std::time::Duration::from_secs(30))
         );
-        assert_eq!(policy.idle_budget, std::time::Duration::from_secs(1500));
+        assert_eq!(policy.idle_budget, std::time::Duration::from_secs(300));
     }
 
     #[test]
@@ -1294,7 +1296,7 @@ mod tests {
             policy.ping_interval,
             Some(std::time::Duration::from_secs(30))
         );
-        assert_eq!(policy.idle_budget, std::time::Duration::from_secs(1500));
+        assert_eq!(policy.idle_budget, std::time::Duration::from_secs(300));
         clear_ws_relay_idle_env();
     }
 

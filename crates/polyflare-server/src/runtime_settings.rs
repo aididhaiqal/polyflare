@@ -183,7 +183,7 @@ impl RuntimeSettings {
             http_requests_use_upstream_websocket: false,
             http_upstream_websocket_ping: false,
             websocket_idle_ping_secs: 30,
-            websocket_idle_budget_secs: 1500,
+            websocket_idle_budget_secs: 300,
         }
     }
 
@@ -527,7 +527,7 @@ mod tests {
         assert!(!rs.http_requests_use_upstream_websocket());
         assert!(!rs.http_upstream_websocket_ping());
         assert_eq!(rs.websocket_idle_ping_secs(), 30);
-        assert_eq!(rs.websocket_idle_budget_secs(), 1500);
+        assert_eq!(rs.websocket_idle_budget_secs(), 300);
     }
 
     #[test]
