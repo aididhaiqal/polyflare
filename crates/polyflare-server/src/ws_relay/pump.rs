@@ -34,9 +34,10 @@
 //!   socket — previously the pump's own 290s `recv_text` deadline poisoned it (the 2026-07-24
 //!   recurring "Reconnecting n/5": every failing turn had idled > 290s) — and a failed ping send
 //!   surfaces a dead peer immediately. Mid-turn reads keep `recv_text`'s 290s stall bound.
-//! - **A between-turns upstream end closes BOTH legs** (a genuine drop, a ping failure, or the
-//!   idle budget deliberately expiring — labels `honest_close_upstream_drop` /
-//!   `honest_close_idle_budget`). Codex sees its socket die, wipes its ledger, reconnects, and
+//! - **A between-turns upstream end closes BOTH legs** (a genuine drop, a ping failure, or an
+//!   operator-set idle budget expiring — labels `honest_close_upstream_drop` /
+//!   `honest_close_idle_budget`; there is no idle budget by default, see
+//!   `WsRelayIdlePolicy::idle_budget`). Codex sees its socket die, wipes its ledger, reconnects, and
 //!   full-resends natively — silent, exactly its direct-connection behavior — instead of paying a
 //!   failed anchored round-trip to discover what the relay already knew.
 //!
@@ -871,13 +872,18 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                 if turn_active {
                     conn.recv_text().await
                 } else {
-                    // Between turns, wake at whichever comes first: the idle budget, or the
-                    // proactive rotation deadline (see `rotate_after` below).
-                    let idle_wait = match rotate_after {
-                        Some(max_age) => idle_policy
-                            .idle_budget
-                            .min(max_age.saturating_sub(upstream_since.elapsed())),
-                        None => idle_policy.idle_budget,
+                    // Between turns, wake at whichever comes first: the idle budget (if the
+                    // operator set one), or the proactive rotation deadline (see `rotate_after`
+                    // below). With neither, the read simply re-arms every `PARKED_READ_REARM`
+                    // — there is no PolyFlare-side deadline on a parked socket; only the
+                    // backend ends it.
+                    let remaining_age =
+                        rotate_after.map(|max_age| max_age.saturating_sub(upstream_since.elapsed()));
+                    let idle_wait = match (remaining_age, idle_policy.idle_budget) {
+                        (Some(age), Some(budget)) => budget.min(age),
+                        (Some(age), None) => age,
+                        (None, Some(budget)) => budget,
+                        (None, None) => PARKED_READ_REARM,
                     };
                     conn.recv_text_idle(idle_wait, idle_policy.ping_interval).await
                 }
@@ -1518,8 +1524,19 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                     // between turns only — the idle budget elapsed and the relay is deliberately
                     // letting the session go.
                     end @ (Ok(None) | Err(_)) => {
-                        let idle_budget_expired = !turn_active
+                        let parked_read_elapsed = !turn_active
                             && matches!(&end, Err(e) if polyflare_codex::ws::is_read_idle_error(e));
+                        // No idle budget configured and the rotation deadline not yet reached:
+                        // the parked read merely re-armed. Nothing happened to the socket, so
+                        // nothing happens to the session — go back to waiting.
+                        if parked_read_elapsed
+                            && idle_policy.idle_budget.is_none()
+                            && rotate_after
+                                .is_none_or(|max_age| upstream_since.elapsed() < max_age)
+                        {
+                            continue;
+                        }
+                        let idle_budget_expired = parked_read_elapsed;
                         // This task: a mid-turn drop (a turn is in flight) — the client is waiting and
                         // won't resend on its own. Eagerly re-dial the SAME account and replay the
                         // buffered frame so the turn resumes. Between turns (in_flight None) keep the
@@ -1764,6 +1781,11 @@ fn is_anchored_generating_frame(frame: &str) -> bool {
 /// retry resends the full history with no anchor (`client.rs::prepare_websocket_request`). The
 /// code constant is reused from `polyflare_codex::ws` — the same one the pump's own classifier
 /// matches upstream — so the two can never drift.
+/// How often a parked upstream read re-arms when the operator set no idle budget and no
+/// rotation deadline applies. Purely a wake-up cadence for the select loop, never a deadline:
+/// an elapsed re-arm is answered by waiting again.
+const PARKED_READ_REARM: std::time::Duration = std::time::Duration::from_secs(3_600);
+
 /// How many in-place resends one turn gets after a transient upstream overload. Two retries
 /// with the backoff below add at most ~4.5 s; a longer overload is real pressure that must
 /// surface (and bench the account) rather than be hidden.

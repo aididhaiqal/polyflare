@@ -93,18 +93,22 @@ pub struct WsRelayIdlePolicy {
     /// Keepalive ping cadence while parked between turns; `None` sends no pings (the socket then
     /// usually dies to intermediary idle-reaping and the honest close fires on detection).
     pub ping_interval: Option<std::time::Duration>,
-    /// How long a parked upstream is kept alive between turns before the relay deliberately lets
-    /// the session go (honest close of both legs). Bounds "ping-pong forever": an abandoned TUI
-    /// stops costing an upstream socket after this window; the user's return pays one native
-    /// codex reconnect + full resend, exactly as if they had been connected directly.
-    pub idle_budget: std::time::Duration,
+    /// How long a parked upstream is kept alive between turns before the relay deliberately drops
+    /// it. `None` (the default) never drops a socket for idleness: the only boundaries are the
+    /// ones the backend itself imposes (its ~60-minute socket cap, met at an idle moment by
+    /// `max_socket_age`, or a genuine upstream close). A budget is a PolyFlare-side limit the
+    /// client never had against the backend, and every expiry costs the thread's next turn one
+    /// anchor miss and a full resend — 2026-09-14: the 5-minute budget shipped on 09-10 turned
+    /// that once-an-hour event into a visible retry after every pause. Left as an opt-in for an
+    /// operator who would rather reclaim an abandoned TUI's upstream socket sooner.
+    pub idle_budget: Option<std::time::Duration>,
 }
 
 impl Default for WsRelayIdlePolicy {
     fn default() -> Self {
         Self {
             ping_interval: Some(std::time::Duration::from_secs(30)),
-            idle_budget: std::time::Duration::from_secs(300),
+            idle_budget: None,
             // 50 minutes: comfortably inside the ~60-minute server cap, leaving room for a long
             // turn started just before the deadline to finish on the old socket.
             max_socket_age: Some(std::time::Duration::from_secs(3000)),

@@ -150,7 +150,10 @@ impl RuntimeSettings {
                 .websocket_idle_policy
                 .ping_interval
                 .map_or(0, |duration| duration.as_secs()),
-            websocket_idle_budget_secs: cfg.websocket_idle_policy.idle_budget.as_secs(),
+            websocket_idle_budget_secs: cfg
+                .websocket_idle_policy
+                .idle_budget
+                .map_or(0, |duration| duration.as_secs()),
         }
     }
 
@@ -183,7 +186,7 @@ impl RuntimeSettings {
             http_requests_use_upstream_websocket: false,
             http_upstream_websocket_ping: false,
             websocket_idle_ping_secs: 30,
-            websocket_idle_budget_secs: 300,
+            websocket_idle_budget_secs: 0,
         }
     }
 
@@ -527,7 +530,7 @@ mod tests {
         assert!(!rs.http_requests_use_upstream_websocket());
         assert!(!rs.http_upstream_websocket_ping());
         assert_eq!(rs.websocket_idle_ping_secs(), 30);
-        assert_eq!(rs.websocket_idle_budget_secs(), 300);
+        assert_eq!(rs.websocket_idle_budget_secs(), 0);
     }
 
     #[test]

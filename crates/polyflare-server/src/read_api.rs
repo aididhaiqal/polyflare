@@ -2102,9 +2102,9 @@ const FIELD_SPECS: &[FieldSpec] = &[
         class: "restart-only",
         kind: "secs",
         coercion: Some(FieldKind::U64),
-        min: Some(60.0),
+        min: Some(0.0),
         max: Some(86_400.0),
-        default: "1500",
+        default: "0",
     },
     FieldSpec {
         key: "continuity_watchdog",
@@ -2378,7 +2378,7 @@ fn setting_description(key: &'static str) -> &'static str {
             "Ping a healthy relay WebSocket while it is parked between turns. Set 0 to disable."
         }
         "websocket_idle_budget_secs" => {
-            "Close both relay legs honestly after this much between-turn inactivity."
+            "Drop a parked upstream socket after this much between-turn inactivity. 0 (default) never drops for idleness: only the backend's own socket cap or close ends it. Each expiry costs the thread one visible retry on its next turn."
         }
         "chatgpt_backend_passthrough_enabled" => {
             "Enabled by default. Forward non-usage ChatGPT backend HTTP and WebSocket routes with the client's own credentials; disable as a live rollback."

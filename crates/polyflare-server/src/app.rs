@@ -99,8 +99,8 @@ pub struct AppState {
     /// `false` directly when exercising the HTTP fallback.
     pub ws_downstream: bool,
     /// Between-turns relay idle policy (honest-liveness work, 2026-07-24; see
-    /// `crate::ws_relay::WsRelayIdlePolicy`): keepalive ping cadence + idle budget for a parked
-    /// upstream socket. Resolved once at startup from `websocket_idle_ping_secs` and
+    /// `crate::ws_relay::WsRelayIdlePolicy`): keepalive ping cadence + optional idle budget for a
+    /// parked upstream socket. Resolved once at startup from `websocket_idle_ping_secs` and
     /// `websocket_idle_budget_secs`; read only at
     /// pump start (`crate::ws_relay::pump::run_pump`), never per-frame.
     pub ws_relay_idle: crate::ws_relay::WsRelayIdlePolicy,

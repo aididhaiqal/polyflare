@@ -790,11 +790,11 @@ pub fn http_upstream_websocket_ping_from_env() -> bool {
 ///   5s–300s (a sub-5s cadence is pure noise; a longer cadence is unlikely to preserve an idle
 ///   intermediary).
 /// - `POLYFLARE_WEBSOCKET_IDLE_BUDGET_SECS`: how long a parked upstream stays alive before the relay
-///   deliberately closes both legs. Malformed/unset ⇒ the 300s (5 min) default (was 25 min until
-///   2026-09-10: parked subagent relays filled the per-account open-WS cap and upstream's own
-///   per-account socket limit); well-formed
-///   values clamp to 60s–86400s (24h), preventing both accidental rapid teardown and duration
-///   overflow from an unbounded environment value.
+///   deliberately drops it. `0` (the default; also malformed/unset) disables the budget: a parked
+///   socket lives until the backend's own cap or close (see `WsRelayIdlePolicy::idle_budget` for
+///   why — every expiry costs the thread a visible retry). Well-formed non-zero values clamp to
+///   60s–86400s (24h), preventing both accidental rapid teardown and duration overflow from an
+///   unbounded environment value.
 pub fn clamp_websocket_idle_ping_secs(secs: u64) -> u64 {
     if secs == 0 {
         0
@@ -804,7 +804,11 @@ pub fn clamp_websocket_idle_ping_secs(secs: u64) -> u64 {
 }
 
 pub fn clamp_websocket_idle_budget_secs(secs: u64) -> u64 {
-    secs.clamp(60, 86_400)
+    if secs == 0 {
+        0
+    } else {
+        secs.clamp(60, 86_400)
+    }
 }
 
 pub fn websocket_idle_policy_from_env() -> crate::ws_relay::WsRelayIdlePolicy {
@@ -827,7 +831,10 @@ pub fn websocket_idle_policy_from_env() -> crate::ws_relay::WsRelayIdlePolicy {
         "POLYFLARE_WS_IDLE_BUDGET_SECS",
     ) {
         Some(raw) => match raw.trim().parse::<u64>() {
-            Ok(secs) => std::time::Duration::from_secs(clamp_websocket_idle_budget_secs(secs)),
+            Ok(0) => None,
+            Ok(secs) => Some(std::time::Duration::from_secs(
+                clamp_websocket_idle_budget_secs(secs),
+            )),
             Err(_) => default.idle_budget,
         },
         None => default.idle_budget,
@@ -909,8 +916,8 @@ pub fn overlay_persisted_websocket_settings(
         persisted_value_with_alias(values, "websocket_idle_budget_secs", "ws_idle_budget_secs")
             .and_then(|raw| raw.trim().parse::<u64>().ok())
     {
-        config.websocket_idle_policy.idle_budget =
-            Duration::from_secs(clamp_websocket_idle_budget_secs(secs));
+        let secs = clamp_websocket_idle_budget_secs(secs);
+        config.websocket_idle_policy.idle_budget = (secs != 0).then(|| Duration::from_secs(secs));
     }
 }
 
@@ -1223,7 +1230,26 @@ mod tests {
             policy.ping_interval,
             Some(std::time::Duration::from_secs(30))
         );
-        assert_eq!(policy.idle_budget, std::time::Duration::from_secs(300));
+        assert_eq!(
+            policy.idle_budget, None,
+            "no idle budget by default: a parked socket lives until the backend ends it"
+        );
+    }
+
+    #[test]
+    fn ws_relay_idle_zero_budget_disables_the_idle_drop() {
+        let _guard = ws_relay_idle_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_ws_relay_idle_env();
+        unsafe {
+            std::env::set_var("POLYFLARE_WEBSOCKET_IDLE_BUDGET_SECS", "0");
+        }
+        let policy = websocket_idle_policy_from_env();
+        assert_eq!(policy.idle_budget, None);
+        clear_ws_relay_idle_env();
+        assert_eq!(clamp_websocket_idle_budget_secs(0), 0);
+        assert_eq!(clamp_websocket_idle_budget_secs(1), 60);
     }
 
     #[test]
@@ -1256,7 +1282,7 @@ mod tests {
             policy.ping_interval,
             Some(std::time::Duration::from_secs(5))
         );
-        assert_eq!(policy.idle_budget, std::time::Duration::from_secs(60));
+        assert_eq!(policy.idle_budget, Some(std::time::Duration::from_secs(60)));
         clear_ws_relay_idle_env();
     }
 
@@ -1276,7 +1302,10 @@ mod tests {
             policy.ping_interval,
             Some(std::time::Duration::from_secs(300))
         );
-        assert_eq!(policy.idle_budget, std::time::Duration::from_secs(86_400));
+        assert_eq!(
+            policy.idle_budget,
+            Some(std::time::Duration::from_secs(86_400))
+        );
         clear_ws_relay_idle_env();
     }
 
@@ -1296,7 +1325,10 @@ mod tests {
             policy.ping_interval,
             Some(std::time::Duration::from_secs(30))
         );
-        assert_eq!(policy.idle_budget, std::time::Duration::from_secs(300));
+        assert_eq!(
+            policy.idle_budget, None,
+            "malformed ⇒ the no-budget default"
+        );
         clear_ws_relay_idle_env();
     }
 

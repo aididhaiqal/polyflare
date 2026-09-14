@@ -3977,7 +3977,7 @@ mod relay_through {
         let mock_base = mock.clone().spawn().await;
         let idle = polyflare_server::ws_relay::WsRelayIdlePolicy {
             ping_interval: Some(Duration::from_millis(100)),
-            idle_budget: Duration::from_secs(30),
+            idle_budget: Some(Duration::from_secs(30)),
             // Rotation off: these tests pin idle/drop behaviour, not age rotation.
             max_socket_age: None,
         };
@@ -4034,6 +4034,73 @@ mod relay_through {
         );
     }
 
+    /// 2026-09-14: no idle budget by default. A parked socket is a PolyFlare-side limit the client
+    /// never had against the backend, and every expiry cost the thread's next turn an anchor miss
+    /// and a visible retry. With no budget the relay keeps pinging and the next turn, however
+    /// late, rides the SAME upstream socket — no re-dial, no forged resend, no honest close.
+    #[tokio::test]
+    async fn without_an_idle_budget_a_parked_socket_is_never_dropped_for_idleness() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(vec![]),
+            ScriptedTurn::normal(vec![]),
+        ]);
+        let mock_base = mock.clone().spawn().await;
+        let idle = polyflare_server::ws_relay::WsRelayIdlePolicy {
+            ping_interval: Some(Duration::from_millis(50)),
+            idle_budget: None,
+            max_socket_age: None,
+        };
+        let (base, state) =
+            spawn_with_pinned_account_and_idle("acct-no-idle-budget", &mock_base, idle).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake must succeed");
+        for turn in 0..2 {
+            ws.send(TMessage::Text(
+                r#"{"type":"response.create","input":[]}"#.to_string().into(),
+            ))
+            .await
+            .unwrap();
+            let TMessage::Text(reply) = ws.next().await.expect("a reply").expect("no ws error")
+            else {
+                panic!("expected a text frame back from the relay");
+            };
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&reply).unwrap()["type"],
+                "response.completed",
+                "turn {turn}"
+            );
+            if turn == 0 {
+                // Park well past several keepalive pings — longer than the old 300 ms test
+                // budget by a wide margin — with nothing arriving on either leg.
+                let parked = tokio::time::timeout(Duration::from_millis(900), ws.next()).await;
+                assert!(
+                    parked.is_err(),
+                    "nothing may reach the client while parked: {parked:?}"
+                );
+            }
+        }
+
+        assert_eq!(
+            mock.handshake_count(),
+            1,
+            "both turns must ride one upstream socket: no idle drop, no re-dial"
+        );
+        assert!(
+            mock.ping_count() >= 3,
+            "the parked socket is kept alive by pings, got {}",
+            mock.ping_count()
+        );
+        let snapshot = state.relay_metrics.snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .all(|(k, v)| !k.starts_with("honest_close") || *v == 0),
+            "no honest close of any kind: {snapshot:?}"
+        );
+    }
+
     /// Honest-liveness (2026-07-24): the keepalive must not run forever. When the between-turns
     /// idle budget elapses with no client activity, the relay deliberately lets the session go —
     /// closing BOTH legs (label `honest_close_idle_budget`) so codex reconnects natively on the
@@ -4044,7 +4111,7 @@ mod relay_through {
         let mock_base = mock.clone().spawn().await;
         let idle = polyflare_server::ws_relay::WsRelayIdlePolicy {
             ping_interval: Some(Duration::from_millis(50)),
-            idle_budget: Duration::from_millis(300),
+            idle_budget: Some(Duration::from_millis(300)),
             // Rotation off: these tests pin idle/drop behaviour, not age rotation.
             max_socket_age: None,
         };
@@ -4324,7 +4391,7 @@ mod relay_through {
             polyflare_server::ws_relay::WsRelayIdlePolicy {
                 ping_interval: None,
                 // Long enough that the idle budget cannot be what ends this socket...
-                idle_budget: Duration::from_secs(300),
+                idle_budget: Some(Duration::from_secs(300)),
                 // ...while the rotation deadline is immediate.
                 max_socket_age: Some(Duration::from_millis(300)),
             },
