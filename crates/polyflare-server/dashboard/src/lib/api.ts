@@ -136,6 +136,10 @@ export interface AccountView {
   usage: UsageWindowView[];
   token_health: TokenHealthView;
   request_count_24h: number;
+  /** `read_api.rs::ModelCapView[]` — per-model weekly caps on this seat (Anthropic only, e.g.
+   * "Fable"), most-consumed first; the same rows the detail view reports. Empty when the seat has
+   * no per-model limits. */
+  model_caps: ModelCapView[];
 }
 
 /** `read_api.rs::AccountIdentityView` — `AccountDetailView.identity`. */

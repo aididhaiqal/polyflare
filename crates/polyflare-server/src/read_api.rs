@@ -140,6 +140,11 @@ struct AccountView {
     token_health: TokenHealthView,
     /// Requests this account served in the last 24h (from `request_log`).
     request_count_24h: i64,
+    /// Per-model weekly caps this seat is subject to (Anthropic only — e.g. `Fable`), most-consumed
+    /// first; the same rows `GET /api/accounts/{id}` reports as `model_caps`, surfaced on the list
+    /// so the operator sees the per-model window next to the 5h/weekly bars without opening each
+    /// account. Empty for a seat with no per-model limits reported.
+    model_caps: Vec<ModelCapView>,
 }
 
 /// `GET /api/accounts` — every account with its latest usage windows + reset times. This is where
@@ -223,6 +228,7 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
 
         let request_count_24h = request_counts.get(&account.id).copied().unwrap_or(0);
         let pools = pools_by_account.remove(&account.id).unwrap_or_default();
+        let model_caps = model_caps_for(&state, &account.id);
         views.push(AccountView {
             pools,
             id: account.id,
@@ -247,6 +253,7 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
             usage: usage_windows,
             token_health,
             request_count_24h,
+            model_caps,
         });
     }
     Response::ok(views)
@@ -309,6 +316,23 @@ struct ModelCapView {
     reset_at: Option<i64>,
     /// Whether this model is currently exhausted on this seat (routing steers around it).
     capped: bool,
+}
+
+/// The per-model cap rows for one account, from the usage refresh's last observation
+/// (`ModelCatalogCache::model_windows_for`, already most-consumed first). Shared by the list and
+/// detail views so they can never disagree about what "capped" means.
+fn model_caps_for(state: &AppState, account_id: &str) -> Vec<ModelCapView> {
+    state
+        .model_catalog
+        .model_windows_for(account_id)
+        .into_iter()
+        .map(|w| ModelCapView {
+            model: w.display_name,
+            used_percent: w.percent,
+            reset_at: w.resets_at,
+            capped: w.percent >= 100.0,
+        })
+        .collect()
 }
 
 /// `GET /api/accounts/{id}` — the dashboard's per-account detail view: identity, status, adaptive
@@ -381,17 +405,7 @@ pub async fn account_detail_handler(
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
     };
 
-    let model_caps = state
-        .model_catalog
-        .model_windows_for(&id)
-        .into_iter()
-        .map(|w| ModelCapView {
-            model: w.display_name,
-            used_percent: w.percent,
-            reset_at: w.resets_at,
-            capped: w.percent >= 100.0,
-        })
-        .collect();
+    let model_caps = model_caps_for(&state, &id);
     Json(AccountDetailView {
         identity: AccountIdentityView {
             id: account.id,

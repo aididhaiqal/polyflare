@@ -10,6 +10,8 @@
 //                                stays visible as a secondary muted detail alongside it)
 //   provider chip            <- a.provider (via ui/ProviderTag)
 //   email / plan / pool      <- a.email, a.plan_type, a.pool (null -> "unpooled")
+//   per-model cap rows       <- a.model_caps (Anthropic per-model weekly windows, e.g. Fable; a
+//                               capped model routes elsewhere, it does NOT bench the account)
 //   5-hour / weekly bars     <- a.five_hour / a.weekly (WindowView | null — limits the provider
 //                                does not report are omitted instead of rendered as fake rows)
 //   token-health footer      <- a.token_health {access_state, access_expires_at}
@@ -30,6 +32,7 @@ import clsx from "clsx";
 
 import type {
   AccountView,
+  ModelCapView,
   ResetPlanCandidateView,
   TokenHealthView,
   WindowView,
@@ -603,6 +606,9 @@ function AccountCard({
               <CardUsageRow label="5-hour" window={a.five_hour} nowMs={nowMs} />
             )}
             <CardUsageRow label="Weekly" window={a.weekly} nowMs={nowMs} />
+            {a.model_caps.map((cap) => (
+              <CardModelCapRow key={cap.model} cap={cap} nowMs={nowMs} />
+            ))}
           </div>
 
           <div className="mt-auto flex items-center justify-between gap-2 border-t border-border pt-2 text-[10.5px]">
@@ -622,6 +628,34 @@ function AccountCard({
       <div className="absolute right-2 top-2 z-10">
         <AccountRowMenu account={a} actions={actions} />
       </div>
+    </div>
+  );
+}
+
+/** One per-model weekly cap (e.g. Fable) on a card, in the same row shape as the 5-hour/weekly
+ * bars. A capped model does NOT bench the account — only that model routes elsewhere — so 100% is
+ * labelled "capped" rather than left to read as a dead account. */
+function CardModelCapRow({ cap, nowMs }: { cap: ModelCapView; nowMs: number }) {
+  const { mode } = useQuotaDisplayPreference();
+  const clamped = Math.max(0, Math.min(100, cap.used_percent));
+  const displayed = quotaDisplayPercent(clamped, mode);
+  const tone: StatusTone = cap.capped ? "error" : usageRiskTone(clamped);
+  return (
+    <div className="flex items-center gap-2 text-[10.5px]">
+      <span className="w-14 shrink-0 truncate text-fg opacity-60" title={cap.model}>
+        {cap.model}
+      </span>
+      <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
+        <div
+          className={clsx("h-full rounded-full", TONE_BAR_CLASS[tone])}
+          style={{ width: `${displayed}%` }}
+        />
+      </div>
+      <span className="shrink-0 whitespace-nowrap text-right text-fg opacity-70">
+        {pct(displayed)} {quotaDisplayLabel(mode)}
+        {cap.reset_at !== null && <> · {countdown(cap.reset_at, nowMs)}</>}
+        {cap.capped && <span className="text-error"> · capped</span>}
+      </span>
     </div>
   );
 }
@@ -648,6 +682,37 @@ function ListUsageCell({ window }: { window: WindowView | null }) {
   );
 }
 
+/** The per-model caps of one row, stacked: model name, mini bar, percent. Empty → dash. */
+function ListModelCapsCell({ caps }: { caps: ModelCapView[] }) {
+  const { mode } = useQuotaDisplayPreference();
+  if (caps.length === 0) return <span className="text-fg opacity-40">—</span>;
+  return (
+    <div className="flex flex-col gap-1">
+      {caps.map((cap) => {
+        const clamped = Math.max(0, Math.min(100, cap.used_percent));
+        const displayed = quotaDisplayPercent(clamped, mode);
+        const tone: StatusTone = cap.capped ? "error" : usageRiskTone(clamped);
+        return (
+          <div key={cap.model} className="flex items-center gap-1.5 whitespace-nowrap">
+            <span className="w-12 shrink-0 truncate text-fg opacity-60" title={cap.model}>
+              {cap.model}
+            </span>
+            <div className="h-1.5 w-[72px] shrink-0 overflow-hidden rounded-full bg-muted">
+              <div
+                className={clsx("h-full rounded-full", TONE_BAR_CLASS[tone])}
+                style={{ width: `${displayed}%` }}
+              />
+            </div>
+            <span className={clsx("text-fg", cap.capped ? "text-error opacity-100" : "opacity-70")}>
+              {pct(displayed)}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 const TABLE_HEAD_CLASS =
   "px-2.5 py-2 text-left text-[10px] font-medium uppercase tracking-wide text-fg opacity-60";
 
@@ -666,14 +731,14 @@ function AccountsTable({
   const { active } = useScreenShield();
   const { mode } = useQuotaDisplayPreference();
   const showFiveHour = accounts.some((account) => quotaWindowIsPresent(account.five_hour));
+  const showModelCaps = accounts.some((account) => account.model_caps.length > 0);
+  const minWidth = 800 + (showFiveHour ? 80 : 0) + (showModelCaps ? 160 : 0);
   return (
     <Card>
       <div className="overflow-x-auto">
         <table
-          className={clsx(
-            "w-full border-collapse text-[11.5px]",
-            showFiveHour ? "min-w-[880px]" : "min-w-[800px]",
-          )}
+          className="w-full border-collapse text-[11.5px]"
+          style={{ minWidth: `${minWidth}px` }}
         >
           <thead>
             <tr className="border-b border-border">
@@ -686,6 +751,9 @@ function AccountsTable({
                 <th className={TABLE_HEAD_CLASS}>5-hour {quotaDisplayLabel(mode)}</th>
               )}
               <th className={TABLE_HEAD_CLASS}>Weekly {quotaDisplayLabel(mode)}</th>
+              {showModelCaps && (
+                <th className={TABLE_HEAD_CLASS}>Model caps {quotaDisplayLabel(mode)}</th>
+              )}
               <th className={TABLE_HEAD_CLASS}>Token</th>
               <th className={TABLE_HEAD_CLASS}>Reset reserve</th>
               <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>Reqs 24h</th>
@@ -745,6 +813,11 @@ function AccountsTable({
                   <td className="px-2.5 py-2">
                     <ListUsageCell window={a.weekly} />
                   </td>
+                  {showModelCaps && (
+                    <td className="px-2.5 py-2">
+                      <ListModelCapsCell caps={a.model_caps} />
+                    </td>
+                  )}
                   <td className={clsx("whitespace-nowrap px-2.5 py-2", token.className)}>
                     {token.text}
                   </td>

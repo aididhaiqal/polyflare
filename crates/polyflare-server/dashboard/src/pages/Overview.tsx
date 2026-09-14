@@ -18,7 +18,7 @@
 // derivation. The Weekly Pace card now sources GET /api/pace (backend EWMA burn-rate + pool-drain
 // simulation), replacing that earlier client-side per-provider linear-extrapolation estimate; see
 // task-6-report.md (D16) for the field mapping.
-import { useEffect, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useState, type ReactNode } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import clsx from "clsx";
 import {
@@ -2774,6 +2774,12 @@ function AccountHealthCard(
                         </>
                       )}
                       <span className="text-[8px] text-fg opacity-40">Weekly</span><UsageMiniBar usedPercent={account.weekly?.used_percent ?? null} />
+                      {account.model_caps.map((cap) => (
+                        <Fragment key={cap.model}>
+                          <span className="truncate text-[8px] text-fg opacity-40" title={cap.model}>{cap.model}</span>
+                          <UsageMiniBar usedPercent={cap.used_percent} />
+                        </Fragment>
+                      ))}
                     </div>
                     <div className="flex items-center justify-between gap-2 pl-3 sm:justify-end sm:pl-0">
                       <span className="text-[8.5px] text-fg opacity-45"><b className="font-semibold text-fg opacity-100">{compactNum(account.request_count_24h)}</b> · 24h</span>

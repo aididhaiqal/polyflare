@@ -265,6 +265,75 @@ async fn accounts_endpoint_surfaces_usage_windows_and_reset_times() {
 }
 
 #[tokio::test]
+async fn accounts_list_surfaces_per_model_caps_like_the_detail_view() {
+    // The Anthropic usage refresh records each seat's per-model weekly windows (e.g. `Fable`) on
+    // the model catalog. The detail view already reports them as `model_caps`; the LIST must carry
+    // the same rows so the dashboard can show the Fable window beside the 5h/weekly bars, and a
+    // seat with no per-model windows must report an empty list, not a missing field.
+    let (pf, state) = spawn_with_state(seed_store().await).await;
+    state.model_catalog.set_model_windows(
+        "codex-a",
+        vec![
+            polyflare_server::anthropic_usage::ModelCapWindow {
+                display_name: "Fable".to_string(),
+                percent: 100.0,
+                resets_at: Some(1_784_000_000),
+            },
+            polyflare_server::anthropic_usage::ModelCapWindow {
+                display_name: "Opus".to_string(),
+                percent: 41.5,
+                resets_at: None,
+            },
+        ],
+    );
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/accounts"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = body.as_array().unwrap();
+    let a = arr
+        .iter()
+        .find(|a| a["id"] == "codex-a")
+        .expect("codex-a present");
+    let caps = a["model_caps"].as_array().expect("model_caps is an array");
+    assert_eq!(caps.len(), 2, "model_caps: {caps:?}");
+    assert_eq!(caps[0]["model"], "Fable");
+    assert_eq!(caps[0]["used_percent"], 100.0);
+    assert_eq!(caps[0]["reset_at"], 1_784_000_000_i64);
+    assert_eq!(caps[0]["capped"], true);
+    assert_eq!(caps[1]["model"], "Opus");
+    assert_eq!(caps[1]["capped"], false);
+    assert!(caps[1]["reset_at"].is_null());
+
+    let b = arr
+        .iter()
+        .find(|a| a["id"] == "codex-b")
+        .expect("codex-b present");
+    assert_eq!(
+        b["model_caps"],
+        serde_json::json!([]),
+        "a seat with no per-model windows reports an empty list"
+    );
+
+    // Same rows on the detail view.
+    let detail: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/accounts/codex-a"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["model_caps"], a["model_caps"]);
+}
+
+#[tokio::test]
 async fn accounts_endpoint_carries_provider_pool_usage_token_health_and_request_count() {
     // Task 7: /api/accounts must additionally surface provider/pool (already present, re-asserted
     // here for the new shape), an adaptive per-window `usage` array (`{window, used_percent,
