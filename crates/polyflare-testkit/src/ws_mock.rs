@@ -337,6 +337,11 @@ pub struct MockWsUpstream {
     /// Optional authorization requirement per handshake attempt. `None` accepts any bearer; a
     /// `Some` value rejects mismatches with HTTP 401 before upgrading. The final entry repeats.
     handshake_required_authorizations: Arc<Vec<Option<String>>>,
+    /// Optional per-attempt handshake refusal. `Some(status)` answers that attempt with a plain
+    /// HTTP `status` carrying the backend's socket-cap error body instead of upgrading; `None`
+    /// upgrades normally. The final entry repeats. Refused attempts still count in
+    /// `handshake_attempt` but never in `handshake_count`. See [`Self::with_handshake_rejections`].
+    handshake_rejections: Arc<Vec<Option<u16>>>,
     /// When set (opt-in, via [`Self::capturing_raw_frames`]), [`handle_socket`] stashes each received
     /// frame's RAW text — byte-for-byte as it arrived on the wire — into [`Self::raw_frames`], so a
     /// relay VERBATIM-fidelity test can assert the proxy forwarded the client's frame UNCHANGED (key
@@ -377,6 +382,7 @@ impl MockWsUpstream {
             upgrade_turn_state: None,
             upgrade_response_headers: Arc::new(Vec::new()),
             handshake_required_authorizations: Arc::new(Vec::new()),
+            handshake_rejections: Arc::new(Vec::new()),
             capture_raw_frames: false,
             raw_frames: Arc::new(Mutex::new(Vec::new())),
             ping_count: Arc::new(AtomicUsize::new(0)),
@@ -408,6 +414,25 @@ impl MockWsUpstream {
         );
         self.upgrade_response_headers = Arc::new(sequence);
         self
+    }
+
+    /// Refuse handshake attempts by position: `Some(status)` answers that attempt with a plain
+    /// HTTP `status` and the backend's `websocket_connection_limit_reached` error body (the shape
+    /// of a per-account socket-cap refusal at upgrade time), `None` upgrades normally. The final
+    /// entry repeats, so `vec![Some(409), None]` refuses exactly the first dial.
+    pub fn with_handshake_rejections(mut self, sequence: Vec<Option<u16>>) -> Self {
+        assert!(
+            !sequence.is_empty(),
+            "handshake rejection sequence must not be empty"
+        );
+        self.handshake_rejections = Arc::new(sequence);
+        self
+    }
+
+    /// How many WS upgrade attempts reached this mock, refused or not — the companion of
+    /// [`Self::handshake_count`], which counts only accepted upgrades.
+    pub fn handshake_attempts(&self) -> usize {
+        self.handshake_attempt.load(Ordering::SeqCst)
     }
 
     /// Configure accepted Authorization values by handshake attempt. The final entry repeats.
@@ -564,6 +589,28 @@ async fn ws_handler(
         .is_some_and(|required| authorization.as_ref() != Some(required))
     {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Some(status) = mock
+        .handshake_rejections
+        .get(attempt)
+        .or_else(|| mock.handshake_rejections.last())
+        .copied()
+        .flatten()
+    {
+        let body = json!({
+            "error": {
+                "code": "websocket_connection_limit_reached",
+                "message": "the websocket connection limit was reached",
+                "type": "invalid_request_error"
+            }
+        })
+        .to_string();
+        return (
+            StatusCode::from_u16(status).expect("valid rejection status"),
+            [("content-type", "application/json")],
+            body,
+        )
+            .into_response();
     }
     let upgrade_response_headers = mock
         .upgrade_response_headers

@@ -1390,6 +1390,149 @@ mod relay_through {
         );
     }
 
+    /// 2026-09-14, ultraflux: seven overloads on one account in two hours, ZERO in-place retries.
+    /// The live envelope lands AFTER the backend has already sent `response.created` /
+    /// `response.in_progress` for the turn, and the retry was gated on "no frame forwarded yet",
+    /// so it never fired and every overload reached the client as "model is at capacity". Those
+    /// two frames carry no model output — a replay re-delivers metadata the client overwrites —
+    /// so the gate is OUTPUT visibility, and this shape must be retried like the bare one.
+    #[tokio::test]
+    async fn an_overload_after_a_bare_response_created_is_still_retried_in_place() {
+        let created = serde_json::json!({
+            "type": "response.created",
+            "response": {"id": "resp_pending", "status": "in_progress"}
+        })
+        .to_string();
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::ErrorAfterEvents {
+                events: vec![created],
+                status: 503,
+                code: "server_is_overloaded".to_string(),
+                message: "The server is currently overloaded.".to_string(),
+            },
+            ScriptedTurn::normal(Vec::new()),
+        ])
+        .capturing_raw_frames();
+        let upstream = mock.clone().spawn().await;
+        let (base, _state) =
+            spawn_with_pinned_account("acct-overload-after-created", &upstream).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        let frame = r#"{"type":"response.create","input":[],"client_metadata":{"turn_id":"turn-overload-created"}}"#.to_string();
+        ws.send(TMessage::Text(frame.clone().into())).await.unwrap();
+
+        // The client sees the (harmless) `response.created`, then only the completion — never
+        // the overload envelope.
+        let mut seen = Vec::new();
+        loop {
+            let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(10), ws.next())
+                .await
+                .expect("a reply within the retry budget")
+                .expect("frame")
+                .expect("no WS error")
+            else {
+                panic!("expected a text frame");
+            };
+            let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+            let kind = reply["type"].as_str().unwrap_or("").to_string();
+            assert_ne!(
+                kind, "error",
+                "the overload must be hidden behind the in-place resend: {reply}"
+            );
+            seen.push(kind.clone());
+            if kind == "response.completed" {
+                break;
+            }
+        }
+        assert!(
+            seen.iter()
+                .all(|k| k == "response.created" || k == "response.completed"),
+            "only metadata and the completion reach the client: {seen:?}"
+        );
+        assert_eq!(
+            mock.raw_frames(),
+            vec![frame.clone(), frame],
+            "exactly one verbatim resend on the same account"
+        );
+        assert_eq!(
+            mock.handshake_count(),
+            2,
+            "the resend rides a fresh same-account dial"
+        );
+    }
+
+    /// 2026-09-14, the replica: a thread's next turn re-dialed its account (the relay had parked
+    /// and dropped the previous socket) and the backend refused the HANDSHAKE with the
+    /// per-account socket cap — HTTP 409 at upgrade time. The relay passed that 409 straight to
+    /// the client's upgrade, a reply "rejected" in under a second, on a thread whose very next
+    /// dial succeeded. The cap clears in seconds, so the first dial must be retried before the
+    /// client hears anything: the upgrade completes and the turn runs.
+    #[tokio::test]
+    async fn a_capped_first_handshake_is_re_dialed_before_the_client_hears_a_409() {
+        let mock = MockWsUpstream::scripted(vec![ScriptedTurn::normal(Vec::new())])
+            .with_handshake_rejections(vec![Some(409), None]);
+        let upstream = mock.clone().spawn().await;
+        let (base, _state) = spawn_with_pinned_account("acct-capped-dial", &upstream).await;
+
+        let started = std::time::Instant::now();
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("the capped first dial must be retried, not surfaced as a 409 upgrade");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "one refusal costs one short backoff, not the whole recovery budget"
+        );
+        assert_eq!(mock.handshake_attempts(), 2, "refused once, then accepted");
+        assert_eq!(
+            mock.handshake_count(),
+            1,
+            "exactly one socket was established"
+        );
+
+        ws.send(TMessage::Text(
+            r#"{"type":"response.create","input":[],"client_metadata":{"turn_id":"turn-capped"}}"#
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("a reply")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["type"], "response.completed", "{reply}");
+    }
+
+    /// A cap that does NOT clear inside the dial budget still reaches the client as the 409 it
+    /// is — bounded, never an endless re-dial.
+    #[tokio::test]
+    async fn a_persistently_capped_handshake_surfaces_the_409_after_the_dial_budget() {
+        let mock = MockWsUpstream::scripted(vec![ScriptedTurn::normal(Vec::new())])
+            .with_handshake_rejections(vec![Some(409)]);
+        let upstream = mock.clone().spawn().await;
+        let (base, _state) = spawn_with_pinned_account("acct-capped-forever", &upstream).await;
+
+        let error = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect_err("a persistent cap must still reject the upgrade");
+        let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+            panic!("expected an HTTP handshake rejection");
+        };
+        assert_eq!(response.status().as_u16(), 409);
+        assert_eq!(
+            mock.handshake_attempts(),
+            4,
+            "the first dial plus three bounded retries, then the verdict"
+        );
+        assert_eq!(mock.handshake_count(), 0);
+    }
+
     /// When the overload does not clear inside the retry budget, the client must HEAR it. The
     /// forwarded envelope gains the `status` its code implies (503), which is what codex's
     /// websocket error mapper needs to turn it into a stream error and retry on its own,

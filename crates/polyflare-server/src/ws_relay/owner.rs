@@ -155,6 +155,7 @@ async fn dial_owner_upstream_recovering_with_registry(
     let Ok(origin) = crate::network_recovery::OriginKey::parse(&account.base_url) else {
         return dial_owner_upstream(headers, account).await;
     };
+    let mut connection_limit_retries: u32 = 0;
     loop {
         let permit = registry.acquire(&origin, deadline).await.map_err(|_| {
             RelayError::Upstream(polyflare_core::ExecError::Upstream(
@@ -174,12 +175,50 @@ async fn dial_owner_upstream_recovering_with_registry(
                     )));
                 }
             }
+            // The handshake itself was refused with the per-account socket cap (HTTP 409 at
+            // upgrade time — the same limit the in-socket `websocket_connection_limit_reached`
+            // envelope reports). It is transient by construction: the backend still counts a
+            // socket this relay just dropped (idle budget, a sibling node's redial) and lets go
+            // of it within seconds. Surfacing it at once hands the client a bare 409 on its
+            // upgrade — on 2026-09-14 that was a reply "rejected" in under a second on a thread
+            // that succeeded on its very next dial. Retry a few times with a short backoff
+            // before that verdict; anything else on the handshake stays verbatim.
+            Err(RelayError::Upstream(polyflare_core::ExecError::UpstreamHttp(response)))
+                if response.signal.status == CONNECTION_LIMIT_HANDSHAKE_STATUS
+                    && connection_limit_retries < CONNECTION_LIMIT_DIAL_RETRIES
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                permit.success();
+                connection_limit_retries += 1;
+                tracing::info!(
+                    target: "polyflare_server::relay",
+                    account_id = %account.id,
+                    attempt = connection_limit_retries,
+                    "upstream handshake refused by the per-account socket cap; re-dialing"
+                );
+                tokio::time::sleep(connection_limit_dial_delay(connection_limit_retries)).await;
+            }
             Err(error) => {
                 permit.success();
                 return Err(error);
             }
         }
     }
+}
+
+/// HTTP status the backend answers a WS upgrade with when the account's socket cap is full.
+const CONNECTION_LIMIT_HANDSHAKE_STATUS: u16 = 409;
+/// How many extra dials a capped handshake gets before the 409 reaches the client. Three
+/// retries with the backoff below add at most ~3.5 s — well inside codex's connect patience,
+/// and long enough for the backend to notice a socket this relay or a sibling node dropped.
+const CONNECTION_LIMIT_DIAL_RETRIES: u32 = 3;
+
+/// 500 ms, 1 s, 2 s — doubling from a half-second, capped at two seconds.
+fn connection_limit_dial_delay(attempt: u32) -> std::time::Duration {
+    let ms = 500u64
+        .saturating_mul(1u64 << attempt.saturating_sub(1).min(4))
+        .min(2_000);
+    std::time::Duration::from_millis(ms)
 }
 
 #[cfg(test)]

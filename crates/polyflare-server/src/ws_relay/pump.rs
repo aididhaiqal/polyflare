@@ -1220,12 +1220,18 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                 // A transient overload is retried IN PLACE on the same account
                                 // before anything is relayed: upstream overload clears in
                                 // seconds, the anchor stays where it is, and the client never
-                                // learns a thing. Bounded per turn, and only while no upstream
-                                // event of this turn is client-visible (a replay after output
-                                // could duplicate streamed content). On 2026-09-08 every such
-                                // overload cost a hyperflux subagent ~5.5 min: see below.
+                                // learns a thing. Bounded per turn, and only while no model
+                                // OUTPUT of this turn is client-visible (a replay after output
+                                // could duplicate streamed content). Metadata frames do not
+                                // count: the live overload arrives AFTER `response.created` /
+                                // `response.in_progress`, and gating on any forwarded frame
+                                // meant the retry never fired — every 2026-09-14 overload
+                                // (7 on one account, 0 retries) reached the client as "model
+                                // is at capacity". A repeated `response.created` is state the
+                                // client overwrites (see `is_non_output_frame`). On 2026-09-08
+                                // every such overload cost a hyperflux subagent ~5.5 min.
                                 if is_transient_overload(&sig)
-                                    && !client_visible_upstream_for_turn
+                                    && !upstream_output_visible_for_turn
                                     && overload_retries_for_turn < OVERLOAD_RETRY_MAX_RETRIES
                                 {
                                     if let Some(frame) = in_flight.clone() {
