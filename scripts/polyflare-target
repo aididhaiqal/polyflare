@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+#
+# polyflare-target — point this Mac's Codex at the LOCAL replica or the MAIN (master) node.
+#
+# Both nodes serve the same fleet; they differ in where the turn is executed and which
+# process holds the upstream sockets:
+#
+#   replica  http://127.0.0.1:8080          this Mac. No network hop, works offline from
+#                                           Tailscale, but only serves credentials the master
+#                                           has synced down (scripts/replica-sync).
+#   main     https://ultraflux.tail6de914…  the master. Refreshes its own OAuth tokens, holds
+#                                           the authoritative store, reachable only over
+#                                           Tailscale.
+#
+# It rewrites exactly ONE line — `base_url` inside `[model_providers.polyflare]` in
+# ~/.codex/config.toml — and leaves the provider NAME alone on purpose: `codex resume`
+# filters sessions by the provider they were recorded under, so renaming it (or adding a
+# second provider) would hide every earlier session until they were re-tagged.
+#
+# Usage:
+#   polyflare-target                 # show where Codex points and whether both nodes answer
+#   polyflare-target replica|local   # point at this Mac
+#   polyflare-target main|master     # point at ultraflux
+#   polyflare-target toggle          # flip to the other one
+#
+# Flags:
+#   --force      switch even when the destination does not answer /v1/models
+#   --quiet      print only the resulting target
+#
+# Env overrides:
+#   POLYFLARE_REPLICA_URL   default http://127.0.0.1:8080
+#   POLYFLARE_MAIN_URL      default https://ultraflux.tail6de914.ts.net
+#   CODEX_HOME              default $HOME/.codex
+#
+# A running Codex session keeps the target it started with — start a new session (or restart
+# the Codex app) for the switch to take effect.
+#
+# NOTE: this touches the CODEX config only. Claude Code is deliberately left alone:
+# ANTHROPIC_BASE_URL disables its remote control, so that side is routed per-subprocess
+# instead of globally.
+set -euo pipefail
+
+REPLICA_URL="${POLYFLARE_REPLICA_URL:-http://127.0.0.1:8080}"
+MAIN_URL="${POLYFLARE_MAIN_URL:-https://ultraflux.tail6de914.ts.net}"
+CONFIG="${CODEX_HOME:-$HOME/.codex}/config.toml"
+PROVIDER="polyflare"
+
+FORCE=0
+QUIET=0
+ACTION=""
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=1 ;;
+    --quiet) QUIET=1 ;;
+    -h|--help) sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) ACTION="$arg" ;;
+  esac
+done
+
+say() { [ "$QUIET" = 1 ] || echo "$@"; }
+
+[ -f "$CONFIG" ] || { echo "polyflare-target: no config at $CONFIG" >&2; exit 1; }
+
+# Read the base_url currently set on the polyflare provider. Prints nothing when the provider
+# block or its base_url is missing, which every caller below treats as "unknown".
+current_url() {
+  python3 - "$CONFIG" "$PROVIDER" <<'PY'
+import re, sys
+path, provider = sys.argv[1], sys.argv[2]
+lines = open(path, encoding="utf-8").read().split("\n")
+header = f"[model_providers.{provider}]"
+inside = False
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("["):
+        inside = stripped == header
+        continue
+    if inside:
+        m = re.match(r'\s*base_url\s*=\s*"([^"]*)"', line)
+        if m:
+            print(m.group(1))
+            break
+PY
+}
+
+# Rewrite that one line in place, atomically, keeping a timestamped backup.
+set_url() {
+  local url="$1"
+  python3 - "$CONFIG" "$PROVIDER" "$url" <<'PY'
+import os, re, sys, time
+path, provider, url = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(path, encoding="utf-8").read()
+lines = text.split("\n")
+header = f"[model_providers.{provider}]"
+inside = False
+done = False
+for i, line in enumerate(lines):
+    stripped = line.strip()
+    if stripped.startswith("["):
+        inside = stripped == header
+        continue
+    if inside and re.match(r'\s*base_url\s*=', line):
+        indent = line[: len(line) - len(line.lstrip())]
+        comment = ""
+        m = re.search(r'"\s*(#.*)$', line)
+        if m:
+            comment = "  " + m.group(1)
+        lines[i] = f'{indent}base_url = "{url}"{comment}'
+        done = True
+        break
+if not done:
+    sys.exit(f"provider [{provider}] has no base_url to rewrite")
+backup = f"{path}.bak-polyflare-target-{time.strftime('%Y%m%d-%H%M%S')}"
+open(backup, "w", encoding="utf-8").write(text)
+tmp = f"{path}.tmp-polyflare-target"
+with open(tmp, "w", encoding="utf-8") as handle:
+    handle.write("\n".join(lines))
+os.replace(tmp, path)
+print(backup)
+PY
+}
+
+# `/v1/models` is unauthenticated on both nodes, so it is the honest liveness probe: a 200
+# means this node would actually serve a turn right now.
+probe() {
+  local url="$1"
+  local code
+  # curl already prints `000` on a connect failure, so the `|| true` must NOT add a second one.
+  code="$(curl -s -o /dev/null -m 6 -w '%{http_code}' "$url/v1/models" 2>/dev/null || true)"
+  code="${code:-000}"
+  [ "$code" = "200" ] && echo "up" || echo "down($code)"
+}
+
+label_for() {
+  case "$1" in
+    "$REPLICA_URL") echo "replica" ;;
+    "$MAIN_URL") echo "main" ;;
+    "") echo "unset" ;;
+    *) echo "custom" ;;
+  esac
+}
+
+now="$(current_url)"
+now_label="$(label_for "$now")"
+
+case "${ACTION:-status}" in
+  status|"")
+    say "codex provider : $PROVIDER  ($CONFIG)"
+    say "target         : $now_label  ${now:-<none>}"
+    say "replica        : $(probe "$REPLICA_URL")  $REPLICA_URL"
+    say "main           : $(probe "$MAIN_URL")  $MAIN_URL"
+    [ "$QUIET" = 1 ] && echo "$now_label"
+    exit 0
+    ;;
+  replica|local) want="$REPLICA_URL"; want_label="replica" ;;
+  main|master)   want="$MAIN_URL";    want_label="main" ;;
+  toggle)
+    if [ "$now_label" = "replica" ]; then want="$MAIN_URL"; want_label="main"
+    else want="$REPLICA_URL"; want_label="replica"; fi
+    ;;
+  *) echo "polyflare-target: unknown action '$ACTION' (status|replica|main|toggle)" >&2; exit 2 ;;
+esac
+
+if [ "$want" = "$now" ]; then
+  say "already on $want_label  $want"
+  [ "$QUIET" = 1 ] && echo "$want_label"
+  exit 0
+fi
+
+health="$(probe "$want")"
+if [ "$health" != "up" ] && [ "$FORCE" != 1 ]; then
+  echo "polyflare-target: $want_label is $health ($want) — not switching. Re-run with --force to switch anyway." >&2
+  exit 1
+fi
+
+backup="$(set_url "$want")"
+say "switched to $want_label  $want"
+say "was         $now_label  ${now:-<none>}  (backup: $backup)"
+[ "$health" = "up" ] || say "warning: $want_label answered $health"
+say "start a NEW codex session (or restart the Codex app) — running sessions keep the old target"
+[ "$QUIET" = 1 ] && echo "$want_label"
+exit 0
