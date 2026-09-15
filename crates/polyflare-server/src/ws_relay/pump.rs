@@ -1320,26 +1320,13 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                                     continue;
                                                 }
                                             } else {
-                                                if !try_consume_active_turn_attempt(
-                                                    &state,
-                                                    &turn_telemetry,
-                                                ) {
-                                                    account = new_account;
-                                                    upstream = Some(new_upstream);
-                                                    upstream_since = tokio::time::Instant::now();
-                                                    in_flight = None;
-                                                    if !surface_attempt_budget_exhausted(
-                                                        &mut downstream,
-                                                        &mut turn_telemetry,
-                                                        &state,
-                                                        &account.id,
-                                                    )
-                                                    .await
-                                                    {
-                                                        break;
-                                                    }
-                                                    continue;
-                                                }
+                                                // Relay-internal: bounded by
+                                                // `OVERLOAD_RETRY_MAX_RETRIES`, so it does NOT
+                                                // charge the logical-turn attempt budget — that
+                                                // budget bounds what the CLIENT can amplify, and
+                                                // 2026-09-15 15:02 the relay's own moves spent it
+                                                // (8 of 8) and then refused codex's retries with
+                                                // "attempt budget exhausted".
                                                 if new_upstream.send_text(frame).await.is_ok() {
                                                     account = new_account;
                                                     upstream = Some(new_upstream);
@@ -1405,23 +1392,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                         )
                                         .await;
                                         if let RedialOutcome::Connected(conn) = redial {
-                                            if !try_consume_active_turn_attempt(
-                                                &state,
-                                                &turn_telemetry,
-                                            ) {
-                                                in_flight = None;
-                                                if !surface_attempt_budget_exhausted(
-                                                    &mut downstream,
-                                                    &mut turn_telemetry,
-                                                    &state,
-                                                    &account.id,
-                                                )
-                                                .await
-                                                {
-                                                    break;
-                                                }
-                                                continue;
-                                            }
+                                            // Relay-internal and bounded by
+                                            // `OVERLOAD_RETRY_MAX_RETRIES`: no logical-turn
+                                            // attempt charge (see the move above).
                                             let mut conn = *conn;
                                             let anchored = is_anchored_generating_frame(&frame);
                                             if conn.send_text(frame).await.is_ok() {

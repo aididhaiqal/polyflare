@@ -1725,6 +1725,50 @@ mod relay_through {
         assert_eq!(count("overload_move_cross_account"), 2, "{snapshot:?}");
     }
 
+    /// 2026-09-15 15:02: the relay's own overload moves spent the whole logical-turn attempt
+    /// budget (8 of 8) and codex's next retries were refused with "attempt budget exhausted".
+    /// The budget bounds what the CLIENT can amplify; relay-internal moves are bounded by their
+    /// own constant and must not draw on it. With a budget of ONE, the client's single send plus
+    /// two relay moves must still complete.
+    #[tokio::test]
+    async fn relay_overload_moves_do_not_spend_the_clients_attempt_budget() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::server_overloaded_without_status(),
+            ScriptedTurn::server_overloaded_without_status(),
+            ScriptedTurn::normal(Vec::new()),
+        ]);
+        let mock_base = mock.clone().spawn().await;
+        let (base, _state) = spawn_with_accounts_and_attempts(
+            &["acct-budget-a", "acct-budget-b", "acct-budget-c"],
+            &mock_base,
+            1,
+        )
+        .await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        ws.send(TMessage::Text(
+            r#"{"type":"response.create","input":[{"role":"user","content":"a"}],"client_metadata":{"turn_id":"t-budget"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(15), ws.next())
+            .await
+            .expect("a reply")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            reply["type"], "response.completed",
+            "two relay moves on a budget of one must not exhaust it: {reply}"
+        );
+        assert_eq!(mock.handshake_count(), 3, "a → b → c");
+    }
+
     /// The anchored variant: the anchor cannot follow the move, so the client gets the forged
     /// resend signal — but the sibling account is ALREADY dialed when it arrives, and the client's
     /// full resend rides that socket. No round trip is spent on the degraded account.
@@ -2100,6 +2144,15 @@ mod relay_through {
     /// [`spawn_with_two_accounts`] for any number of accounts. RoundRobin ties to the
     /// lexicographically smallest id, so the pick order is the sorted id order.
     async fn spawn_with_accounts(ids: &[&str], mock_base: &str) -> (String, Arc<AppState>) {
+        spawn_with_accounts_and_attempts(ids, mock_base, 3).await
+    }
+
+    /// [`spawn_with_accounts`] with an explicit per-logical-turn upstream attempt budget.
+    async fn spawn_with_accounts_and_attempts(
+        ids: &[&str],
+        mock_base: &str,
+        max_account_attempts: u32,
+    ) -> (String, Arc<AppState>) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("store.db")).await.unwrap();
         std::mem::forget(dir);
@@ -2176,7 +2229,7 @@ mod relay_through {
             token_cache: Default::default(),
             admin_token: None,
             runtime_settings: Arc::new(RuntimeSettings::new_from_fields(RuntimeSettingsFields {
-                max_account_attempts: 3,
+                max_account_attempts,
                 starvation_wait_budget: Duration::from_secs(60),
                 starvation_heartbeat: Duration::from_secs(10),
                 wake_jitter_ms: 0,
