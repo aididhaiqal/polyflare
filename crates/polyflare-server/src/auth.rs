@@ -173,12 +173,20 @@ pub async fn whoami_handler() -> impl IntoResponse {
 /// `admin_token_configured` is presence only, never the token or its hash — the Settings page
 /// needs to state whether one exists, and it can now change at runtime (`polyflare admin-token
 /// set`/`clear`), so it cannot be inferred from a startup-time config snapshot.
+///
+/// `node_role` / `node_label` name WHICH node is being looked at. The master and a replica serve
+/// byte-identical dashboards, so without this the only way to tell them apart is the address bar
+/// — and an action taken on the wrong one (pausing an account, editing a setting) looks like it
+/// worked while the authoritative node never heard about it. `node_label` is an operator-set
+/// friendly name (`POLYFLARE_NODE_LABEL`), absent unless configured.
 pub async fn capabilities_handler(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     let admin_token_configured =
         crate::admin_token::configured(s.admin_token.as_deref(), &s.store).await;
     Json(serde_json::json!({
         "live_logs": s.runtime_settings.live_logs(),
         "admin_token_configured": admin_token_configured,
+        "node_role": if crate::reactive_auth::is_replica() { "replica" } else { "main" },
+        "node_label": crate::config::node_label(),
     }))
 }
 

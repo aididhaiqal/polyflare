@@ -49,6 +49,12 @@ async fn capabilities_reports_live_logs_flag() {
     assert_eq!(r.status(), 200);
     let v: serde_json::Value = r.json().await.unwrap();
     assert_eq!(v["live_logs"], true);
+    // The master and a replica serve byte-identical dashboards; the SPA needs to say which node
+    // it is looking at, because an account or settings change made on a replica is not
+    // authoritative. Tests run without `POLYFLARE_REPLICA_MODE`, so this process is the master,
+    // and no operator label is configured.
+    assert_eq!(v["node_role"], "main");
+    assert!(v["node_label"].is_null(), "node_label: {}", v["node_label"]);
 }
 
 #[tokio::test]

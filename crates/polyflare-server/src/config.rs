@@ -936,6 +936,20 @@ fn live_logs_enabled_value(raw: Option<&str>) -> bool {
     })
 }
 
+/// An operator-set friendly name for THIS node (`POLYFLARE_NODE_LABEL`), e.g. `MacBook` or
+/// `ultraflux`. Optional: the dashboard falls back to the master/replica role, which is what
+/// actually decides whether an action here is authoritative. Resolved once — a deployment fact,
+/// never a per-request env read.
+pub fn node_label() -> Option<&'static str> {
+    static LABEL: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
+        std::env::var("POLYFLARE_NODE_LABEL")
+            .ok()
+            .map(|raw| raw.trim().to_string())
+            .filter(|raw| !raw.is_empty())
+    });
+    LABEL.as_deref()
+}
+
 pub fn live_logs_enabled_from_env() -> bool {
     let raw = std::env::var("POLYFLARE_LIVE_LOGS").ok();
     live_logs_enabled_value(raw.as_deref())

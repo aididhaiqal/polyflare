@@ -647,6 +647,12 @@ export interface CapabilitiesView {
   /** Whether an admin token is configured, from EITHER `POLYFLARE_ADMIN_TOKEN` or the store
    * (`polyflare admin-token set`). Presence only — the token never reaches the browser. */
   admin_token_configured: boolean;
+  /** Which node is serving this dashboard. A replica serves the fleet from credentials the
+   * master syncs down and never rotates its own tokens, so an account or settings change made
+   * here is not authoritative. */
+  node_role: "main" | "replica";
+  /** Operator-set friendly name for this node (`POLYFLARE_NODE_LABEL`), when configured. */
+  node_label: string | null;
 }
 
 /** `log_bus.rs::LogLevel` — `#[serde(rename_all = "lowercase")]`. */

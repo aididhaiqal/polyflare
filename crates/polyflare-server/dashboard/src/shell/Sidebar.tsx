@@ -165,6 +165,34 @@ export function Sidebar() {
   );
 }
 
+/** Which node is serving this dashboard. The master and a replica look identical, and an action
+ * taken on the wrong one (pausing an account, changing a setting) appears to work while the
+ * authoritative node never hears about it — so the replica is called out in the signal colour and
+ * the master stays quiet. Absent until capabilities resolve, rather than guessing "main". */
+function NodeBadge({ compact }: { compact: boolean }) {
+  const { nodeRole, nodeLabel } = useCapabilityFlags();
+  if (nodeRole === null) return null;
+  const replica = nodeRole === "replica";
+  return (
+    <span
+      title={
+        replica
+          ? `Replica${nodeLabel ? ` · ${nodeLabel}` : ""} — serves the fleet from credentials the master syncs down; account and settings changes belong on main.`
+          : `Master${nodeLabel ? ` · ${nodeLabel}` : ""} — the authoritative node.`
+      }
+      className={clsx(
+        "rounded-full border px-1.5 py-0.5 font-semibold uppercase tracking-[0.12em]",
+        compact ? "text-[8px]" : "text-[8.5px]",
+        replica
+          ? "border-signal/40 bg-signal/[0.12] text-signal"
+          : "border-border bg-muted/60 text-fg opacity-60",
+      )}
+    >
+      {nodeLabel ?? nodeRole}
+    </span>
+  );
+}
+
 export function BrandMark({ compact = false }: { compact?: boolean }) {
   return (
     <div className={clsx("flex items-center", compact ? "gap-2" : "gap-3 px-2")}>
@@ -174,8 +202,9 @@ export function BrandMark({ compact = false }: { compact?: boolean }) {
         <span className="absolute h-px w-5 rotate-[-34deg] bg-gradient-to-r from-transparent via-signal to-transparent opacity-80" />
       </span>
       <span>
-        <span className="pf-wordmark block text-[16px] font-bold leading-none text-fg">
-          Poly<span className="text-accent">Flare</span>
+        <span className="pf-wordmark flex items-center gap-1.5 text-[16px] font-bold leading-none text-fg">
+          Poly<span className="-ml-1.5 text-accent">Flare</span>
+          <NodeBadge compact={compact} />
         </span>
         {!compact && (
           <span className="mt-1 block text-[7px] font-semibold uppercase tracking-[0.23em] text-signal opacity-65">
