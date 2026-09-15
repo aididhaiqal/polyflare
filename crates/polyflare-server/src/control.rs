@@ -97,7 +97,7 @@ pub(crate) async fn resolve_owner_affine_account_with_capability(
         require_security_work_authorized,
         ReservationKind::None,
         None,
-        None,
+        &[],
     )
     .await?;
     Ok((account, id))
@@ -116,24 +116,26 @@ pub(crate) async fn resolve_owner_affine_ws_account_with_capability(
         session_id,
         pool,
         require_security_work_authorized,
-        None,
+        &[],
     )
     .await
 }
 
-/// [`resolve_owner_affine_ws_account_with_capability`] with one account ruled out: the session's
+/// [`resolve_owner_affine_ws_account_with_capability`] with accounts ruled out: the session's
 /// current owner that has just proven unable to serve THIS turn (an upstream overload before any
-/// output). The owner is treated exactly as an ineligible owner — the same never-stranded
-/// fallback to any other eligible account — and is removed from that fallback pool too. `None`
-/// exclusion is the plain resolution. Fails with the usual `503` when no OTHER account is
-/// eligible, so a single-account fleet keeps its in-place behaviour.
+/// output), plus every account already tried for the same turn — so a turn moves forward
+/// through the fleet instead of bouncing back to one it just left. An excluded owner is treated
+/// exactly as an ineligible owner — the same never-stranded fallback to any other eligible
+/// account — and excluded accounts are removed from that fallback pool too. An empty slice is
+/// the plain resolution. Fails with the usual `503` when no OTHER account is eligible, so a
+/// single-account fleet keeps its in-place behaviour.
 pub(crate) async fn resolve_owner_affine_ws_account_excluding(
     state: &AppState,
     session_key: Option<&polyflare_core::SessionKey>,
     session_id: Option<&str>,
     pool: Option<&str>,
     require_security_work_authorized: bool,
-    exclude: Option<&AccountId>,
+    exclude: &[AccountId],
 ) -> Result<(Account, AccountId, WsSocketGuard), Response> {
     let (account, id, reservation) = resolve_owner_affine_account_inner(
         state,
@@ -166,7 +168,7 @@ async fn resolve_owner_affine_unary_account(
         false,
         ReservationKind::InFlight,
         model,
-        None,
+        &[],
     )
     .await?;
     let OwnerReservation::InFlight(lease) = lease else {
@@ -222,7 +224,7 @@ async fn resolve_owner_affine_account_inner(
     require_security_work_authorized: bool,
     reservation_kind: ReservationKind,
     model: Option<&str>,
-    exclude: Option<&AccountId>,
+    exclude: &[AccountId],
 ) -> Result<(Account, AccountId, OwnerReservation), Response> {
     let now = unix_now();
 
@@ -231,10 +233,10 @@ async fn resolve_owner_affine_account_inner(
         Err(_) => return Err(internal_error()),
     };
     let mut snapshots = filter_by_provider_and_pool(&snapshots, Provider::Codex, pool);
-    // An excluded account is absent from the pool outright, so an owner that matches it takes
+    // An excluded account is absent from the pool outright, so an owner that matches one takes
     // the ordinary ineligible-owner fallback below and can never be re-picked as the fallback.
-    if let Some(excluded) = exclude {
-        snapshots.retain(|s| &s.id != excluded);
+    if !exclude.is_empty() {
+        snapshots.retain(|s| !exclude.contains(&s.id));
     }
     if let Some(model) = model {
         // Fails open when NO account claims the model — see `retain_accounts_supporting`.

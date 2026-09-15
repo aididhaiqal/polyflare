@@ -649,7 +649,7 @@ async fn relay(
         let session_id = session_id.clone();
         let relay_contract = relay_contract.clone();
         let ws_pressure = ws_pressure.clone();
-        move |current: Account, sig: FailureSignal| {
+        move |current: Account, sig: FailureSignal, tried: Vec<AccountId>| {
             let state = state.clone();
             let headers = headers.clone();
             let session_key = session_key.clone();
@@ -663,16 +663,32 @@ async fn relay(
                 let current_id = AccountId::from(current.id.as_str());
                 crate::ingress::bench_account_for_failure(&state, &current_id, Some(&sig), now)
                     .await;
-                let (new_account, new_ws_guard) = owner::resolve_owner_excluding(
+                // Everything this turn has already overloaded on, current account included:
+                // the move goes forward through the fleet, never back to one it just left.
+                let mut exclude = tried;
+                if !exclude.contains(&current_id) {
+                    exclude.push(current_id.clone());
+                }
+                let resolved = owner::resolve_owner_excluding(
                     &state,
                     &session_key,
                     session_id.as_deref(),
                     pool.as_deref(),
                     require_security_work_authorized,
-                    &current_id,
+                    &exclude,
                 )
-                .await
-                .ok()?;
+                .await;
+                let Ok((new_account, new_ws_guard)) = resolved else {
+                    tracing::info!(
+                        target: "polyflare_server::relay",
+                        from_account = %current.id,
+                        tried = exclude.len(),
+                        error_code = sig.error_code.as_deref().unwrap_or("-"),
+                        "upstream overload before output; no sibling account eligible, staying"
+                    );
+                    return None;
+                };
+                let to_id = new_account.id.clone();
                 let redial = redial_with_reactive_auth(
                     &state,
                     &headers,
@@ -680,9 +696,30 @@ async fn relay(
                     &relay_contract,
                     pool.as_deref(),
                 )
-                .await?;
-                *ws_pressure.lock().unwrap_or_else(|e| e.into_inner()) = Some(new_ws_guard);
-                Some(redial)
+                .await;
+                match redial {
+                    Some(redial) => {
+                        tracing::info!(
+                            target: "polyflare_server::relay",
+                            from_account = %current.id,
+                            to_account = %to_id,
+                            tried = exclude.len(),
+                            error_code = sig.error_code.as_deref().unwrap_or("-"),
+                            "upstream overload before output; moved the turn to a sibling account"
+                        );
+                        *ws_pressure.lock().unwrap_or_else(|e| e.into_inner()) = Some(new_ws_guard);
+                        Some(redial)
+                    }
+                    None => {
+                        tracing::warn!(
+                            target: "polyflare_server::relay",
+                            from_account = %current.id,
+                            to_account = %to_id,
+                            "upstream overload before output; sibling dial failed, staying"
+                        );
+                        None
+                    }
+                }
             }
         }
     };

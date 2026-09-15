@@ -552,7 +552,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
     Fut: Future<Output = ()>,
     G: Fn(Account, FailureSignal) -> GFut,
     GFut: Future<Output = Option<(Account, WsConn)>>,
-    M: Fn(Account, FailureSignal) -> MFut,
+    M: Fn(Account, FailureSignal, Vec<AccountId>) -> MFut,
     MFut: Future<Output = Option<(Account, WsConn)>>,
     H: Fn(Account) -> HFut,
     HFut: Future<Output = Option<(Account, WsConn)>>,
@@ -632,6 +632,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
     // How many times THIS turn has been resent in place after a transient upstream overload
     // (`server_is_overloaded` / `slow_down`) before anything was relayed. Reset per turn.
     let mut overload_retries_for_turn: u32 = 0;
+    // Accounts this turn has already overloaded on (the move excludes them all, so a turn walks
+    // forward through the fleet rather than bouncing between two degraded accounts).
+    let mut overload_tried_for_turn: Vec<AccountId> = Vec::new();
     // If the socket/pump disappears with a turn still active, preserve an explicit failed row
     // rather than silently losing the request. Client-side teardown defaults to nginx-style 499;
     // upstream/reconnect exhaustion sites below overwrite this with a server-side status.
@@ -746,6 +749,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                             reasoning_transform_attempted = false;
                             client_visible_upstream_for_turn = false;
                             overload_retries_for_turn = 0;
+                            overload_tried_for_turn.clear();
                             upstream_output_visible_for_turn = false;
                             output_visible_by = None;
                         }
@@ -1267,8 +1271,17 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                     // resend rides the NEW socket. `None` = no other eligible
                                     // account; fall through to the same-account paths below.
                                     if let Some(frame) = in_flight.clone() {
+                                        let current_id = AccountId::from(account.id.as_str());
+                                        if !overload_tried_for_turn.contains(&current_id) {
+                                            overload_tried_for_turn.push(current_id);
+                                        }
                                         if let Some((new_account, mut new_upstream)) =
-                                            on_overload_move(account.clone(), sig.clone()).await
+                                            on_overload_move(
+                                                account.clone(),
+                                                sig.clone(),
+                                                overload_tried_for_turn.clone(),
+                                            )
+                                            .await
                                         {
                                             overload_retries_for_turn += 1;
                                             relay_metrics.record("overload_move_cross_account");

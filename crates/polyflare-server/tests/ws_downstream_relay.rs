@@ -1675,6 +1675,56 @@ mod relay_through {
         assert_eq!(count("overload_same_account_retry"), 0, "{snapshot:?}");
     }
 
+    /// A turn that overloads on its second account must not bounce back to the first: every
+    /// account already tried for the turn is excluded, so the third sibling serves it.
+    #[tokio::test]
+    async fn an_overload_walks_forward_through_the_fleet_never_back_to_a_tried_account() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::server_overloaded_without_status(),
+            ScriptedTurn::server_overloaded_without_status(),
+            ScriptedTurn::normal(Vec::new()),
+        ])
+        .capturing_raw_frames();
+        let mock_base = mock.clone().spawn().await;
+        let (base, state) =
+            spawn_with_accounts(&["acct-walk-a", "acct-walk-b", "acct-walk-c"], &mock_base).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        let frame = r#"{"type":"response.create","input":[{"role":"user","content":"a"}],"client_metadata":{"turn_id":"t-walk"}}"#.to_string();
+        ws.send(TMessage::Text(frame.clone().into())).await.unwrap();
+
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(15), ws.next())
+            .await
+            .expect("a reply within the retry budget")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["type"], "response.completed", "{reply}");
+        assert_eq!(
+            mock.handshake_authorizations(),
+            vec![
+                Some("Bearer tok-acct-walk-a".to_string()),
+                Some("Bearer tok-acct-walk-b".to_string()),
+                Some("Bearer tok-acct-walk-c".to_string())
+            ],
+            "a → b → c, never back to a"
+        );
+        let snapshot = state.relay_metrics.snapshot();
+        let count = |k: &str| {
+            snapshot
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| *v)
+                .unwrap_or(0)
+        };
+        assert_eq!(count("overload_move_cross_account"), 2, "{snapshot:?}");
+    }
+
     /// The anchored variant: the anchor cannot follow the move, so the client gets the forged
     /// resend signal — but the sibling account is ALREADY dialed when it arrives, and the client's
     /// full resend rides that socket. No round trip is spent on the degraded account.
@@ -2044,12 +2094,18 @@ mod relay_through {
         id_b: &str,
         mock_base: &str,
     ) -> (String, Arc<AppState>) {
+        spawn_with_accounts(&[id_a, id_b], mock_base).await
+    }
+
+    /// [`spawn_with_two_accounts`] for any number of accounts. RoundRobin ties to the
+    /// lexicographically smallest id, so the pick order is the sorted id order.
+    async fn spawn_with_accounts(ids: &[&str], mock_base: &str) -> (String, Arc<AppState>) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("store.db")).await.unwrap();
         std::mem::forget(dir);
 
         let cipher = TokenCipher::from_key_bytes(&[11u8; 32]).unwrap();
-        for id in [id_a, id_b] {
+        for &id in ids {
             store
                 .accounts()
                 .insert(

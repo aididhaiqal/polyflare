@@ -104,17 +104,18 @@ pub(crate) async fn resolve_owner(
     }
 }
 
-/// [`resolve_owner`] with the session's current owner ruled out: used when that owner has just
-/// answered the in-flight turn with an overload before any output, so the turn (or the client's
-/// full resend) can land on a DIFFERENT eligible account. `Err(NoEligibleAccount)` when no other
-/// account is eligible — the caller then keeps its same-account behaviour.
+/// [`resolve_owner`] with accounts ruled out: the session's current owner that has just answered
+/// the in-flight turn with an overload before any output, and every account already tried for
+/// that turn — so the turn (or the client's full resend) lands on a DIFFERENT eligible account
+/// and never bounces back to one it just left. `Err(NoEligibleAccount)` when no other account
+/// is eligible — the caller then keeps its same-account behaviour.
 pub(crate) async fn resolve_owner_excluding(
     state: &AppState,
     session_key: &SessionKey,
     session_id: Option<&str>,
     pool: Option<&str>,
     require_security_work_authorized: bool,
-    exclude: &polyflare_core::AccountId,
+    exclude: &[polyflare_core::AccountId],
 ) -> Result<(Account, WsSocketGuard), RelayError> {
     match crate::control::resolve_owner_affine_ws_account_excluding(
         state,
@@ -122,7 +123,7 @@ pub(crate) async fn resolve_owner_excluding(
         session_id,
         pool,
         require_security_work_authorized,
-        Some(exclude),
+        exclude,
     )
     .await
     {
