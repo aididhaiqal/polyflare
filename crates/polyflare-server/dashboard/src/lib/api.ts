@@ -140,6 +140,23 @@ export interface AccountView {
    * "Fable"), most-consumed first; the same rows the detail view reports. Empty when the seat has
    * no per-model limits. */
   model_caps: ModelCapView[];
+  /** `read_api.rs::RoutingHealthView` — live routing health from the runtime overlay the
+   * selector reads: why selection is steering around an account whose `status` still says
+   * "active" (a rate-limit / overload cooldown, or the soft-drain tier after upstream errors). */
+  routing: RoutingHealthView;
+}
+
+/** `read_api.rs::RoutingHealthView` — one account's live routing health. */
+export interface RoutingHealthView {
+  /** 0 healthy, 1 draining, 2 probing. */
+  tier: number;
+  tier_label: "healthy" | "draining" | "probing";
+  /** Unix seconds until the active cooldown ends, or null when none is active. */
+  cooldown_until: number | null;
+  recent_errors: number;
+  last_error_at: number | null;
+  /** True when selection currently avoids this account. */
+  sidelined: boolean;
 }
 
 /** `read_api.rs::AccountIdentityView` — `AccountDetailView.identity`. */

@@ -16,6 +16,13 @@ export interface AccountHealthInput {
   weekly: { used_percent: number; stale: boolean } | null;
   five_hour: { used_percent: number; stale: boolean } | null;
   request_count_24h: number;
+  /** Live routing health (`AccountView.routing`); optional so older callers keep working. */
+  routing?: {
+    tier: number;
+    cooldown_until: number | null;
+    recent_errors: number;
+    sidelined: boolean;
+  };
 }
 
 export interface AccountHealthReason {
@@ -51,6 +58,10 @@ function reason(
   return { key, label, level, weight };
 }
 
+function keysHave(reasons: AccountHealthReason[], ...keys: string[]): boolean {
+  return reasons.some((item) => keys.includes(item.key));
+}
+
 function classifyAccount(account: AccountHealthInput): AccountHealthAccount {
   const reasons: AccountHealthReason[] = [];
   const tokenState = account.token_health.access_state;
@@ -75,6 +86,29 @@ function classifyAccount(account: AccountHealthInput): AccountHealthAccount {
     reasons.push(reason("cooldown", "Route cooling down", "watch", 70));
   } else if (account.status !== "active") {
     reasons.push(reason("unknown_status", account.status.replace(/_/g, " "), "watch", 60));
+  }
+
+  // Live routing health: the selector is steering around this account right now even though
+  // its stored status is "active". A cooldown benches it outright; a non-healthy soft-drain
+  // tier de-prefers it after upstream errors (overloads, 5xx) or high usage.
+  const routing = account.routing;
+  if (routing) {
+    if (routing.cooldown_until !== null && !keysHave(reasons, "rate_limited", "cooldown")) {
+      reasons.push(reason("cooldown", "Benched: cooling down", "watch", 79));
+    } else if (routing.tier === 1) {
+      reasons.push(
+        reason(
+          "draining",
+          routing.recent_errors > 0
+            ? `Draining after ${routing.recent_errors} upstream error${routing.recent_errors === 1 ? "" : "s"}`
+            : "Draining: de-preferred by the router",
+          "watch",
+          77,
+        ),
+      );
+    } else if (routing.tier === 2) {
+      reasons.push(reason("probing", "Probing: recovering from errors", "watch", 66));
+    }
   }
 
   const weeklyUsed = account.weekly?.used_percent;
@@ -113,9 +147,11 @@ function classifyAccount(account: AccountHealthInput): AccountHealthAccount {
   } else if (keys.has("deactivated") || keys.has("paused")) {
     nextAction = "resume_or_exclude";
     nextActionLabel = "Resume it or keep it out of rotation";
-  } else if (keys.has("weekly_constrained") || keys.has("five_hour_constrained")) {
+  } else if (keys.has("weekly_constrained") || keys.has("five_hour_constrained") || keys.has("draining")) {
     nextAction = "reduce_traffic";
-    nextActionLabel = "Shift new traffic to cooler routes";
+    nextActionLabel = keys.has("draining")
+      ? "Router is already steering around it; watch for recovery"
+      : "Shift new traffic to cooler routes";
   } else if (keys.has("weekly_stale")) {
     nextAction = "refresh_evidence";
     nextActionLabel = "Refresh quota evidence before routing";

@@ -334,6 +334,59 @@ async fn accounts_list_surfaces_per_model_caps_like_the_detail_view() {
 }
 
 #[tokio::test]
+async fn accounts_list_surfaces_live_routing_health_from_the_runtime_overlay() {
+    // 2026-09-15: a degraded account was moved away from turn after turn (overload → bench →
+    // sibling) while the dashboard showed it as plain "active". The list must carry the same
+    // runtime overlay the selector reads: a rate-limit cooldown benches codex-a, two upstream
+    // errors inside a minute soft-drain codex-b, and a never-touched account is plainly healthy.
+    let (pf, state) = spawn_with_state(seed_store().await).await;
+    let now = now();
+    let a = polyflare_core::AccountId::from("codex-a");
+    state
+        .runtime
+        .record_rate_limit(&a, Some(120), now, &state.rate_limit_metrics);
+    let b = polyflare_core::AccountId::from("codex-b");
+    state.runtime.record_transient_error(&b, now);
+    state.runtime.record_transient_error(&b, now);
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/accounts"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = body.as_array().unwrap();
+    let find = |id: &str| arr.iter().find(|a| a["id"] == id).expect("account present");
+
+    let ra = &find("codex-a")["routing"];
+    assert_eq!(
+        ra["sidelined"], true,
+        "a live cooldown sidelines the account: {ra}"
+    );
+    let until = ra["cooldown_until"].as_i64().expect("cooldown_until set");
+    assert!(
+        until >= now + 60 && until <= now + 121,
+        "cooldown_until: {until} vs now {now}"
+    );
+
+    let rb = &find("codex-b")["routing"];
+    assert_eq!(rb["recent_errors"], 2, "{rb}");
+    assert_eq!(
+        rb["tier"], 1,
+        "two errors inside a minute soft-drain the account: {rb}"
+    );
+    assert_eq!(rb["tier_label"], "draining");
+    assert_eq!(rb["sidelined"], true);
+    assert!(
+        rb["cooldown_until"].is_null(),
+        "errors alone set no cooldown: {rb}"
+    );
+}
+
+#[tokio::test]
 async fn accounts_endpoint_carries_provider_pool_usage_token_health_and_request_count() {
     // Task 7: /api/accounts must additionally surface provider/pool (already present, re-asserted
     // here for the new shape), an adaptive per-window `usage` array (`{window, used_percent,

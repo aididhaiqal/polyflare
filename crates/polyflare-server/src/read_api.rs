@@ -145,6 +145,85 @@ struct AccountView {
     /// so the operator sees the per-model window next to the 5h/weekly bars without opening each
     /// account. Empty for a seat with no per-model limits reported.
     model_caps: Vec<ModelCapView>,
+    /// Live routing health from the in-memory runtime overlay: why selection is steering around
+    /// an account whose stored `status` still says `active` — a rate-limit / overload cooldown,
+    /// or the soft-drain tier after upstream errors. 2026-09-15: a degraded account was moved
+    /// away from turn after turn while the dashboard showed it as plain "active".
+    routing: RoutingHealthView,
+}
+
+/// One account's live routing health (see `AccountView::routing`). Sourced from the runtime
+/// overlay the selector itself reads (`RuntimeStates::overlay`), so the dashboard and the router
+/// can never disagree about whether an account is being avoided.
+#[derive(Serialize, Clone)]
+struct RoutingHealthView {
+    /// Soft-drain tier: `0` healthy, `1` draining (errors or usage pushed it out of preference),
+    /// `2` probing (recovering; a success streak promotes it back).
+    tier: u8,
+    /// `healthy` | `draining` | `probing`.
+    tier_label: &'static str,
+    /// Unix seconds until which the account is benched (rate limit, quota, or overload
+    /// cooldown), when a cooldown is active right now.
+    cooldown_until: Option<i64>,
+    /// Upstream errors the runtime has counted against this account since its last recovery.
+    recent_errors: u32,
+    /// When the most recent of those errors landed.
+    last_error_at: Option<i64>,
+    /// Whether selection currently avoids this account: an active cooldown, or a non-healthy
+    /// tier. `false` means it competes normally.
+    sidelined: bool,
+}
+
+impl RoutingHealthView {
+    fn healthy() -> Self {
+        Self {
+            tier: 0,
+            tier_label: "healthy",
+            cooldown_until: None,
+            recent_errors: 0,
+            last_error_at: None,
+            sidelined: false,
+        }
+    }
+
+    fn from_snapshot(snap: &polyflare_core::AccountSnapshot, now: i64) -> Self {
+        let cooldown_until = snap.cooldown_until.filter(|until| *until > now);
+        let tier_label = match snap.health_tier {
+            0 => "healthy",
+            1 => "draining",
+            _ => "probing",
+        };
+        Self {
+            tier: snap.health_tier,
+            tier_label,
+            cooldown_until,
+            recent_errors: snap.error_count,
+            last_error_at: snap.last_error_at,
+            sidelined: cooldown_until.is_some() || snap.health_tier != 0,
+        }
+    }
+}
+
+/// The live routing health of every account, keyed by id — one snapshot read plus the runtime
+/// overlay, exactly what the selector sees.
+async fn routing_health_by_account(
+    state: &AppState,
+    now: i64,
+) -> std::collections::HashMap<String, RoutingHealthView> {
+    let Ok(snapshots) = state.account_cache.snapshots(&state.store).await else {
+        return Default::default();
+    };
+    let mut snapshots: Vec<polyflare_core::AccountSnapshot> = (*snapshots).clone();
+    state.runtime.overlay(&mut snapshots, now);
+    snapshots
+        .iter()
+        .map(|snap| {
+            (
+                snap.id.as_str().to_string(),
+                RoutingHealthView::from_snapshot(snap, now),
+            )
+        })
+        .collect()
 }
 
 /// `GET /api/accounts` — every account with its latest usage windows + reset times. This is where
@@ -186,6 +265,7 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         Ok(counts) => counts,
         Err(_) => return Response::error(),
     };
+    let mut routing_by_account = routing_health_by_account(&state, now).await;
     let mut views = Vec::with_capacity(accounts.len());
     for account in accounts {
         let usage = usage_by_account.remove(&account.id).unwrap_or_default();
@@ -229,6 +309,9 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         let request_count_24h = request_counts.get(&account.id).copied().unwrap_or(0);
         let pools = pools_by_account.remove(&account.id).unwrap_or_default();
         let model_caps = model_caps_for(&state, &account.id);
+        let routing = routing_by_account
+            .remove(&account.id)
+            .unwrap_or_else(RoutingHealthView::healthy);
         views.push(AccountView {
             pools,
             id: account.id,
@@ -254,6 +337,7 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
             token_health,
             request_count_24h,
             model_caps,
+            routing,
         });
     }
     Response::ok(views)

@@ -34,6 +34,7 @@ import type {
   AccountView,
   ModelCapView,
   ResetPlanCandidateView,
+  RoutingHealthView,
   TokenHealthView,
   WindowView,
 } from "../lib/api";
@@ -582,6 +583,7 @@ function AccountCard({
               </span>
             )}
             <StatusPill status={a.status} className="ml-auto shrink-0" />
+            <RoutingBadge routing={a.routing} nowMs={nowMs} className="shrink-0" />
           </div>
 
           <div className="flex items-center gap-1 truncate text-[11px] text-fg opacity-60">
@@ -629,6 +631,47 @@ function AccountCard({
         <AccountRowMenu account={a} actions={actions} />
       </div>
     </div>
+  );
+}
+
+/** The router's live verdict on an "active" account: benched by a cooldown, draining after
+ * upstream errors, or probing its way back. Renders nothing for a healthy account, so the
+ * badge only ever appears when selection is actually steering around the account. */
+function RoutingBadge({
+  routing,
+  nowMs,
+  className,
+}: {
+  routing: RoutingHealthView;
+  nowMs: number;
+  className?: string;
+}) {
+  let label: string | null = null;
+  let title = "";
+  if (routing.cooldown_until !== null) {
+    label = `cooling · ${countdown(routing.cooldown_until, nowMs)}`;
+    title = "Benched by a rate-limit / overload cooldown; the router sends nothing here until it ends.";
+  } else if (routing.tier === 1) {
+    label =
+      routing.recent_errors > 0
+        ? `draining · ${routing.recent_errors} err${routing.recent_errors === 1 ? "" : "s"}`
+        : "draining";
+    title = "Soft-drained after upstream errors or high usage; the router prefers healthier accounts.";
+  } else if (routing.tier === 2) {
+    label = "probing";
+    title = "Recovering: a streak of successes promotes it back to healthy.";
+  }
+  if (label === null) return null;
+  return (
+    <span
+      title={title}
+      className={clsx(
+        "inline-block rounded-full bg-warn/15 px-1.5 py-0.5 text-[9.5px] font-semibold text-warn",
+        className,
+      )}
+    >
+      {label}
+    </span>
   );
 }
 
@@ -802,8 +845,9 @@ function AccountsTable({
                     {a.pools.length > 0 ? a.pools.join(", ") : "unpooled"}
                   </td>
                   <td className="px-2.5 py-2 text-fg opacity-80">{planLabel(a.plan_type)}</td>
-                  <td className="px-2.5 py-2">
+                  <td className="whitespace-nowrap px-2.5 py-2">
                     <StatusPill status={a.status} />
+                    <RoutingBadge routing={a.routing} nowMs={nowMs} className="ml-1" />
                   </td>
                   {showFiveHour && (
                     <td className="px-2.5 py-2">
