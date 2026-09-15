@@ -1533,6 +1533,89 @@ mod relay_through {
         assert_eq!(mock.handshake_count(), 0);
     }
 
+    /// 2026-09-15: an overload on an ANCHORED turn must not be "retried" by re-dialing — the
+    /// anchor lived on the retired socket, so the resend misses every time (107 of 107 on the
+    /// master) and the turn pays a whole extra upstream round trip before the forged resend
+    /// signal finally goes out. The relay must send that signal at once, with NO re-dial and NO
+    /// resend of the anchored frame; codex's own full resend then completes on a fresh socket.
+    #[tokio::test]
+    async fn an_overload_on_an_anchored_turn_goes_straight_to_the_client_resend_signal() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(Vec::new()),
+            ScriptedTurn::server_overloaded_without_status(),
+            ScriptedTurn::normal(Vec::new()),
+        ])
+        .capturing_raw_frames();
+        let upstream = mock.clone().spawn().await;
+        let (base, _state) = spawn_with_pinned_account("acct-overload-anchored", &upstream).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        // Turn 1: anchorless, completes and establishes the anchor.
+        let first = r#"{"type":"response.create","input":[{"role":"user","content":"a"}],"client_metadata":{"turn_id":"t1"}}"#.to_string();
+        ws.send(TMessage::Text(first.clone().into())).await.unwrap();
+        let TMessage::Text(reply) = ws.next().await.expect("frame").expect("no WS error") else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["type"], "response.completed");
+        let anchor = reply["response"]["id"]
+            .as_str()
+            .expect("anchor id")
+            .to_string();
+
+        // Turn 2: an anchored delta that the upstream answers with an overload.
+        let delta = format!(
+            r#"{{"type":"response.create","previous_response_id":"{anchor}","input":[{{"role":"user","content":"b"}}],"client_metadata":{{"turn_id":"t2"}}}}"#
+        );
+        let started = std::time::Instant::now();
+        ws.send(TMessage::Text(delta.clone().into())).await.unwrap();
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("a reply well inside the old retry budget")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["type"], "error", "{reply}");
+        assert_eq!(
+            reply["error"]["code"], "websocket_connection_limit_reached",
+            "the one shape codex retries as a FULL resend: {reply}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "one overload backoff, not a wasted re-dial round trip"
+        );
+        assert_eq!(
+            mock.raw_frames(),
+            vec![first.clone(), delta.clone()],
+            "the anchored delta must NOT be resent on a fresh socket"
+        );
+        assert_eq!(mock.handshake_count(), 1, "no re-dial before the signal");
+
+        // Codex's reaction: a full anchorless resend, which the relay serves on a fresh socket.
+        let full = r#"{"type":"response.create","input":[{"role":"user","content":"a"},{"role":"user","content":"b"}],"client_metadata":{"turn_id":"t2"}}"#.to_string();
+        ws.send(TMessage::Text(full.clone().into())).await.unwrap();
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("a reply")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["type"], "response.completed", "{reply}");
+        assert_eq!(
+            mock.handshake_count(),
+            2,
+            "the full resend rides the lazy re-dial"
+        );
+    }
+
     /// When the overload does not clear inside the retry budget, the client must HEAR it. The
     /// forwarded envelope gains the `status` its code implies (503), which is what codex's
     /// websocket error mapper needs to turn it into a stream error and retry on its own,

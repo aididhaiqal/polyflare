@@ -1240,6 +1240,49 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                     && !upstream_output_visible_for_turn
                                     && overload_retries_for_turn < OVERLOAD_RETRY_MAX_RETRIES
                                 {
+                                    // An ANCHORED turn cannot be retried by the relay at all:
+                                    // its `previous_response_id` names state that lived on the
+                                    // socket the error just retired, so a resend on a fresh
+                                    // same-account socket misses without exception (master,
+                                    // 2026-09-14/15: 107 anchored resends after a redial, 107
+                                    // anchor misses) and only then reaches the forged resend
+                                    // signal — one whole upstream round trip, tens of seconds
+                                    // under overload, spent to learn what is already known.
+                                    // Skip straight to that signal: codex's own full resend
+                                    // becomes the retry, riding the lazy re-dial of its next
+                                    // frame. Same one-signal-at-a-time contract as the
+                                    // anchor-miss arm (`anchor_resend_pending`).
+                                    let anchored_in_flight = in_flight
+                                        .as_deref()
+                                        .is_some_and(is_anchored_generating_frame);
+                                    if anchored_in_flight && !anchor_resend_pending {
+                                        overload_retries_for_turn += 1;
+                                        tokio::time::sleep(overload_retry_delay(
+                                            &sig,
+                                            overload_retries_for_turn,
+                                        ))
+                                        .await;
+                                        let forged = client_resend_error_frame();
+                                        if downstream
+                                            .send(Message::Text(forged.clone().into()))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                        client_visible_upstream_for_turn = true;
+                                        if let Some(mut turn) = turn_telemetry.take() {
+                                            if let Some(terminal) = turn.observe(&forged) {
+                                                turn.finish(&state, &account.id, terminal).await;
+                                            } else {
+                                                turn_telemetry = Some(turn);
+                                            }
+                                        }
+                                        in_flight = None;
+                                        anchor_resend_pending = true;
+                                        relay_metrics.record("overload_anchored_client_resend");
+                                        continue;
+                                    }
                                     if let Some(frame) = in_flight.clone() {
                                         overload_retries_for_turn += 1;
                                         tokio::time::sleep(overload_retry_delay(
