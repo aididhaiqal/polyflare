@@ -633,6 +633,60 @@ async fn relay(
         }
     };
 
+    // Overload fallback (2026-09-15): an upstream `server_is_overloaded` before any output is,
+    // in practice, one degraded ACCOUNT (codex_6e88f37c ran 5.3% errors across every model
+    // while its siblings ran 0.2%), so retrying it on the same account mostly repeats the
+    // failure. Bench the current owner with the ordinary 5xx policy (error-count → soft
+    // drain), then resolve a DIFFERENT eligible account for this session and dial it. `None`
+    // when no other account is eligible — the pump then keeps its same-account behaviour, so a
+    // single-account fleet is unchanged. The old open-WS guard is released only once the new
+    // account's socket is up, so a failed move leaves the pump's accounting intact.
+    let on_overload_move = {
+        let state = state.clone();
+        let headers = headers.clone();
+        let session_key = session_key.clone();
+        let pool = pool.clone();
+        let session_id = session_id.clone();
+        let relay_contract = relay_contract.clone();
+        let ws_pressure = ws_pressure.clone();
+        move |current: Account, sig: FailureSignal| {
+            let state = state.clone();
+            let headers = headers.clone();
+            let session_key = session_key.clone();
+            let pool = pool.clone();
+            let session_id = session_id.clone();
+            let relay_contract = relay_contract.clone();
+            let ws_pressure = ws_pressure.clone();
+            let require_security_work_authorized = require_security_work_authorized;
+            async move {
+                let now = unix_now();
+                let current_id = AccountId::from(current.id.as_str());
+                crate::ingress::bench_account_for_failure(&state, &current_id, Some(&sig), now)
+                    .await;
+                let (new_account, new_ws_guard) = owner::resolve_owner_excluding(
+                    &state,
+                    &session_key,
+                    session_id.as_deref(),
+                    pool.as_deref(),
+                    require_security_work_authorized,
+                    &current_id,
+                )
+                .await
+                .ok()?;
+                let redial = redial_with_reactive_auth(
+                    &state,
+                    &headers,
+                    new_account,
+                    &relay_contract,
+                    pool.as_deref(),
+                )
+                .await?;
+                *ws_pressure.lock().unwrap_or_else(|e| e.into_inner()) = Some(new_ws_guard);
+                Some(redial)
+            }
+        }
+    };
+
     let on_pre_output_unauthorized = {
         let state = state.clone();
         let headers = headers.clone();
@@ -663,6 +717,7 @@ async fn relay(
         account,
         on_completed_id,
         on_upstream_error,
+        on_overload_move,
         on_pre_output_unauthorized,
         state,
         session_key,

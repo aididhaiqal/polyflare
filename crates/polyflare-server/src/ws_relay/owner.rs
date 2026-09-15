@@ -104,6 +104,36 @@ pub(crate) async fn resolve_owner(
     }
 }
 
+/// [`resolve_owner`] with the session's current owner ruled out: used when that owner has just
+/// answered the in-flight turn with an overload before any output, so the turn (or the client's
+/// full resend) can land on a DIFFERENT eligible account. `Err(NoEligibleAccount)` when no other
+/// account is eligible — the caller then keeps its same-account behaviour.
+pub(crate) async fn resolve_owner_excluding(
+    state: &AppState,
+    session_key: &SessionKey,
+    session_id: Option<&str>,
+    pool: Option<&str>,
+    require_security_work_authorized: bool,
+    exclude: &polyflare_core::AccountId,
+) -> Result<(Account, WsSocketGuard), RelayError> {
+    match crate::control::resolve_owner_affine_ws_account_excluding(
+        state,
+        Some(session_key),
+        session_id,
+        pool,
+        require_security_work_authorized,
+        Some(exclude),
+    )
+    .await
+    {
+        Ok((account, _id, guard)) => Ok((account, guard)),
+        Err(resp) => match resp.status() {
+            axum::http::StatusCode::SERVICE_UNAVAILABLE => Err(RelayError::NoEligibleAccount),
+            _ => Err(RelayError::Internal),
+        },
+    }
+}
+
 /// Task 4: dial the (already-resolved, pinned) `account`'s upstream Codex WS and hand back the open
 /// [`WsConn`] the relay pump (Task 6) drives via [`WsConn::send_text`] / [`WsConn::recv_text`].
 ///

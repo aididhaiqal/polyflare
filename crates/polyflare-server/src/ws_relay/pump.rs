@@ -533,13 +533,14 @@ async fn try_relay_custom_frame(
 /// `on_upstream_error` returns a DIFFERENT account, reset to `false` the moment a `response.
 /// completed` is forwarded. Never carries anything beyond the four fixed label strings.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
+pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
     mut downstream: WebSocket,
     upstream_conn: WsConn,
     headers: HeaderMap,
     account: Account,
     on_completed_id: F,
     on_upstream_error: G,
+    on_overload_move: M,
     on_pre_output_unauthorized: H,
     state: std::sync::Arc<AppState>,
     session_key: SessionKey,
@@ -551,6 +552,8 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
     Fut: Future<Output = ()>,
     G: Fn(Account, FailureSignal) -> GFut,
     GFut: Future<Output = Option<(Account, WsConn)>>,
+    M: Fn(Account, FailureSignal) -> MFut,
+    MFut: Future<Output = Option<(Account, WsConn)>>,
     H: Fn(Account) -> HFut,
     HFut: Future<Output = Option<(Account, WsConn)>>,
 {
@@ -1255,6 +1258,96 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, H, HFut>(
                                     let anchored_in_flight = in_flight
                                         .as_deref()
                                         .is_some_and(is_anchored_generating_frame);
+                                    // FIRST CHOICE: a different account. An overload is mostly
+                                    // one degraded account, so bench it and move this session to
+                                    // a sibling with headroom before anything is retried here.
+                                    // Anchorless frame: replayed there verbatim, the client never
+                                    // learns a thing. Anchored frame: its anchor cannot follow,
+                                    // so the client gets the forged resend signal and its full
+                                    // resend rides the NEW socket. `None` = no other eligible
+                                    // account; fall through to the same-account paths below.
+                                    if let Some(frame) = in_flight.clone() {
+                                        if let Some((new_account, mut new_upstream)) =
+                                            on_overload_move(account.clone(), sig.clone()).await
+                                        {
+                                            overload_retries_for_turn += 1;
+                                            relay_metrics.record("overload_move_cross_account");
+                                            account_changed_since_completed = true;
+                                            if anchored_in_flight {
+                                                account = new_account;
+                                                upstream = Some(new_upstream);
+                                                upstream_since = tokio::time::Instant::now();
+                                                if anchor_resend_pending {
+                                                    // A signal is already outstanding; the
+                                                    // client is not honouring it. Surface the
+                                                    // overload verbatim below.
+                                                } else {
+                                                    let forged = client_resend_error_frame();
+                                                    if downstream
+                                                        .send(Message::Text(forged.clone().into()))
+                                                        .await
+                                                        .is_err()
+                                                    {
+                                                        break;
+                                                    }
+                                                    client_visible_upstream_for_turn = true;
+                                                    if let Some(mut turn) = turn_telemetry.take() {
+                                                        if let Some(terminal) = turn.observe(&forged)
+                                                        {
+                                                            turn.finish(&state, &account.id, terminal)
+                                                                .await;
+                                                        } else {
+                                                            turn_telemetry = Some(turn);
+                                                        }
+                                                    }
+                                                    in_flight = None;
+                                                    anchor_resend_pending = true;
+                                                    relay_metrics
+                                                        .record("overload_anchored_client_resend");
+                                                    continue;
+                                                }
+                                            } else {
+                                                if !try_consume_active_turn_attempt(
+                                                    &state,
+                                                    &turn_telemetry,
+                                                ) {
+                                                    account = new_account;
+                                                    upstream = Some(new_upstream);
+                                                    upstream_since = tokio::time::Instant::now();
+                                                    in_flight = None;
+                                                    if !surface_attempt_budget_exhausted(
+                                                        &mut downstream,
+                                                        &mut turn_telemetry,
+                                                        &state,
+                                                        &account.id,
+                                                    )
+                                                    .await
+                                                    {
+                                                        break;
+                                                    }
+                                                    continue;
+                                                }
+                                                if new_upstream.send_text(frame).await.is_ok() {
+                                                    account = new_account;
+                                                    upstream = Some(new_upstream);
+                                                    upstream_since = tokio::time::Instant::now();
+                                                    reconnects_since_progress += 1;
+                                                    if reconnects_since_progress
+                                                        > MAX_RECONNECTS_WITHOUT_PROGRESS
+                                                    {
+                                                        unfinished_status = StatusCode::BAD_GATEWAY;
+                                                        break;
+                                                    }
+                                                    continue;
+                                                }
+                                                // The send on the new socket failed: keep the
+                                                // moved-to account and let the same-account
+                                                // paths below retry from there.
+                                                account = new_account;
+                                                upstream = None;
+                                            }
+                                        }
+                                    }
                                     if anchored_in_flight && !anchor_resend_pending {
                                         overload_retries_for_turn += 1;
                                         tokio::time::sleep(overload_retry_delay(

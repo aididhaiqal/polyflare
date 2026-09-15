@@ -1616,6 +1616,152 @@ mod relay_through {
         );
     }
 
+    /// 2026-09-15: "model at capacity" was one degraded ACCOUNT (5.3% errors across every model
+    /// while its siblings ran 0.2%), so retrying on the same account mostly repeated the failure.
+    /// With a sibling available, an overload before any output must MOVE the turn: the anchorless
+    /// frame is replayed verbatim on the other account and the client sees only the completion.
+    #[tokio::test]
+    async fn an_overload_moves_an_anchorless_turn_to_a_sibling_account_silently() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::server_overloaded_without_status(),
+            ScriptedTurn::normal(Vec::new()),
+        ])
+        .capturing_raw_frames();
+        let mock_base = mock.clone().spawn().await;
+        let (base, state) = spawn_with_two_accounts("acct-ovl-a", "acct-ovl-b", &mock_base).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        let frame = r#"{"type":"response.create","input":[{"role":"user","content":"a"}],"client_metadata":{"turn_id":"t-move"}}"#.to_string();
+        ws.send(TMessage::Text(frame.clone().into())).await.unwrap();
+
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("a reply within the retry budget")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            reply["type"], "response.completed",
+            "the overload must be hidden behind the move: {reply}"
+        );
+        assert_eq!(
+            mock.raw_frames(),
+            vec![frame.clone(), frame],
+            "one verbatim replay of the same frame"
+        );
+        // RoundRobin ties to the smaller id, so turn 1 dialed A; the replay dialed B.
+        assert_eq!(
+            mock.handshake_authorizations(),
+            vec![
+                Some("Bearer tok-acct-ovl-a".to_string()),
+                Some("Bearer tok-acct-ovl-b".to_string())
+            ],
+            "the replay must ride a DIFFERENT account"
+        );
+        let snapshot = state.relay_metrics.snapshot();
+        let count = |k: &str| {
+            snapshot
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| *v)
+                .unwrap_or(0)
+        };
+        assert_eq!(count("overload_move_cross_account"), 1, "{snapshot:?}");
+        assert_eq!(count("overload_same_account_retry"), 0, "{snapshot:?}");
+    }
+
+    /// The anchored variant: the anchor cannot follow the move, so the client gets the forged
+    /// resend signal — but the sibling account is ALREADY dialed when it arrives, and the client's
+    /// full resend rides that socket. No round trip is spent on the degraded account.
+    #[tokio::test]
+    async fn an_overload_on_an_anchored_turn_moves_and_serves_the_resend_on_the_sibling() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(Vec::new()),
+            ScriptedTurn::server_overloaded_without_status(),
+            ScriptedTurn::normal(Vec::new()),
+        ]);
+        let mock_base = mock.clone().spawn().await;
+        let (base, state) = spawn_with_two_accounts("acct-ovla-a", "acct-ovla-b", &mock_base).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        ws.send(TMessage::Text(
+            r#"{"type":"response.create","input":[{"role":"user","content":"a"}],"client_metadata":{"turn_id":"t1"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let TMessage::Text(reply) = ws.next().await.expect("frame").expect("no WS error") else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["type"], "response.completed");
+        let anchor = reply["response"]["id"]
+            .as_str()
+            .expect("anchor id")
+            .to_string();
+
+        let delta = format!(
+            r#"{{"type":"response.create","previous_response_id":"{anchor}","input":[{{"role":"user","content":"b"}}],"client_metadata":{{"turn_id":"t2"}}}}"#
+        );
+        ws.send(TMessage::Text(delta.into())).await.unwrap();
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("a reply")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["type"], "error", "{reply}");
+        assert_eq!(
+            reply["error"]["code"], "websocket_connection_limit_reached",
+            "{reply}"
+        );
+        assert_eq!(
+            mock.handshake_authorizations(),
+            vec![
+                Some("Bearer tok-acct-ovla-a".to_string()),
+                Some("Bearer tok-acct-ovla-b".to_string())
+            ],
+            "the sibling is dialed before the signal goes out"
+        );
+
+        let full = r#"{"type":"response.create","input":[{"role":"user","content":"a"},{"role":"user","content":"b"}],"client_metadata":{"turn_id":"t2"}}"#.to_string();
+        ws.send(TMessage::Text(full.into())).await.unwrap();
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("a reply")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["type"], "response.completed", "{reply}");
+        assert_eq!(
+            mock.handshake_count(),
+            2,
+            "the full resend rides the already-open sibling socket"
+        );
+        let snapshot = state.relay_metrics.snapshot();
+        let count = |k: &str| {
+            snapshot
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| *v)
+                .unwrap_or(0)
+        };
+        assert_eq!(count("overload_move_cross_account"), 1, "{snapshot:?}");
+        assert_eq!(count("overload_anchored_client_resend"), 1, "{snapshot:?}");
+    }
+
     /// When the overload does not clear inside the retry budget, the client must HEAR it. The
     /// forwarded envelope gains the `status` its code implies (503), which is what codex's
     /// websocket error mapper needs to turn it into a stream error and retry on its own,
