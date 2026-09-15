@@ -320,6 +320,164 @@ mod tests {
         assert!(expired.verifier_enc.is_empty());
     }
 
+    /// A ChatGPT TEAM workspace shares one `chatgpt_account_id` across every member. Matching on
+    /// it alone made the SECOND member's login land on the FIRST member's row — tokens replaced,
+    /// identity still showing the previous member, and no new account anywhere (2026-09-15).
+    /// Each member must get its own seat.
+    #[tokio::test]
+    async fn two_members_of_one_team_workspace_get_their_own_seats() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[5u8; 32]).unwrap();
+
+        let mut first = account("codex_team-ws");
+        first.chatgpt_account_id = Some("team-ws".into());
+        first.chatgpt_user_id = Some("user-AAAA1111zzzz".into());
+        first.email = "first@team.test".into();
+        let first_id = complete_login(&store, &cipher, "flow-a", &first).await;
+
+        let mut second = account("codex_team-ws");
+        second.chatgpt_account_id = Some("team-ws".into());
+        second.chatgpt_user_id = Some("user-BBBB2222zzzz".into());
+        second.email = "second@team.test".into();
+        let second_id = complete_login(&store, &cipher, "flow-b", &second).await;
+
+        assert_eq!(first_id, "codex_team-ws");
+        assert_eq!(
+            second_id, "codex_team-ws_BBBB2222",
+            "the newcomer is scoped to its user instead of taking the first member's row"
+        );
+        let kept = store.accounts().get(&first_id).await.unwrap().unwrap();
+        assert_eq!(
+            kept.email, "first@team.test",
+            "the first member's seat is untouched"
+        );
+        assert_eq!(kept.chatgpt_user_id.as_deref(), Some("user-AAAA1111zzzz"));
+        let added = store.accounts().get(&second_id).await.unwrap().unwrap();
+        assert_eq!(added.email, "second@team.test");
+        assert_eq!(added.chatgpt_user_id.as_deref(), Some("user-BBBB2222zzzz"));
+    }
+
+    /// The same member logging in again still updates ONE row, and the row takes on the identity
+    /// the login just proved rather than keeping a stale email/plan.
+    #[tokio::test]
+    async fn the_same_seat_re_logging_in_updates_in_place_and_refreshes_its_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[5u8; 32]).unwrap();
+
+        let mut seat = account("codex_solo");
+        seat.chatgpt_account_id = Some("solo".into());
+        seat.chatgpt_user_id = Some("user-SOLO0001".into());
+        seat.email = "old@solo.test".into();
+        seat.plan_type = "pro".into();
+        let id = complete_login(&store, &cipher, "flow-a", &seat).await;
+
+        let mut again = seat.clone();
+        again.email = "new@solo.test".into();
+        again.plan_type = "unknown".into(); // a login that cannot see the plan must not erase it
+        let same = complete_login(&store, &cipher, "flow-b", &again).await;
+
+        assert_eq!(same, id, "one seat, one row");
+        let row = store.accounts().get(&id).await.unwrap().unwrap();
+        assert_eq!(row.email, "new@solo.test", "identity follows the login");
+        assert_eq!(
+            row.plan_type, "pro",
+            "an unknown plan never erases a known one"
+        );
+    }
+
+    /// Rows that predate user-id capture are still repairable by a re-login, but only by the seat
+    /// that owns them: a different member of the same workspace gets its own row.
+    #[tokio::test]
+    async fn a_legacy_row_without_a_user_id_is_repaired_only_by_its_own_seat() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[5u8; 32]).unwrap();
+
+        let mut legacy = account("legacy-row");
+        legacy.chatgpt_account_id = Some("team-ws".into());
+        legacy.chatgpt_user_id = None;
+        legacy.email = "owner@team.test".into();
+        store
+            .accounts()
+            .insert(&legacy, &plain_tokens(), &cipher)
+            .await
+            .unwrap();
+
+        let mut stranger = account("codex_team-ws");
+        stranger.chatgpt_account_id = Some("team-ws".into());
+        stranger.chatgpt_user_id = Some("user-STRANGER".into());
+        stranger.email = "stranger@team.test".into();
+        let stranger_id = complete_login(&store, &cipher, "flow-a", &stranger).await;
+        assert_ne!(
+            stranger_id, "legacy-row",
+            "a different member never adopts it"
+        );
+        let untouched = store.accounts().get("legacy-row").await.unwrap().unwrap();
+        assert_eq!(untouched.email, "owner@team.test");
+        assert!(untouched.chatgpt_user_id.is_none());
+
+        let mut owner = account("codex_team-ws");
+        owner.chatgpt_account_id = Some("team-ws".into());
+        owner.chatgpt_user_id = Some("user-OWNER01".into());
+        owner.email = "Owner@Team.Test".into(); // same seat, different case
+        let owner_id = complete_login(&store, &cipher, "flow-b", &owner).await;
+        assert_eq!(
+            owner_id, "legacy-row",
+            "its own seat repairs the row instead of duplicating it"
+        );
+        let repaired = store.accounts().get("legacy-row").await.unwrap().unwrap();
+        assert_eq!(
+            repaired.chatgpt_user_id.as_deref(),
+            Some("user-OWNER01"),
+            "the missing user id is backfilled by the repair"
+        );
+    }
+
+    fn plain_tokens() -> PlainTokens {
+        PlainTokens {
+            access_token: "a".into(),
+            refresh_token: "r".into(),
+            id_token: "i".into(),
+        }
+    }
+
+    /// Run one onboarding flow to completion for `candidate`, returning the account id it wrote.
+    async fn complete_login(
+        store: &Store,
+        cipher: &TokenCipher,
+        flow_id: &str,
+        candidate: &Account,
+    ) -> String {
+        let flow = OnboardingFlow {
+            id: flow_id.into(),
+            provider: "codex".into(),
+            oauth_state: format!("state-{flow_id}"),
+            verifier_enc: cipher.encrypt("verifier").unwrap(),
+            initial_pool: None,
+            status: "pending".into(),
+            created_at: 1,
+            expires_at: 1_000_000,
+            finished_at: None,
+            account_id: None,
+            error_code: None,
+            redirect_uri: None,
+            intended_account_id: None,
+            method: "browser".into(),
+            device_auth_id: None,
+            user_code: None,
+            interval_seconds: None,
+        };
+        store.onboarding().create(&flow).await.unwrap();
+        store.onboarding().claim(flow_id, 2).await.unwrap().unwrap();
+        store
+            .accounts()
+            .upsert_oauth_and_complete_flow(candidate, &plain_tokens(), cipher, flow_id, None)
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn account_write_rolls_back_when_flow_cannot_complete() {
         let dir = tempfile::tempdir().unwrap();

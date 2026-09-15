@@ -297,6 +297,59 @@ pub struct AccountRepo {
     token_generation: Arc<AtomicU64>,
 }
 
+/// A free row id for a newly onboarded account. `candidate.id` is derived from the upstream
+/// account id, which a ChatGPT TEAM shares across every member — so the second member of a
+/// workspace derives an id the first member already owns. Scope the newcomer to its user
+/// (`…_qGYT4zcJ`), falling back to a numeric suffix when the login carried no user id.
+async fn unique_account_row_id(
+    conn: &mut sqlx::SqliteConnection,
+    candidate: &Account,
+) -> Result<String, StoreError> {
+    async fn is_free(conn: &mut sqlx::SqliteConnection, id: &str) -> Result<bool, StoreError> {
+        let taken = sqlx::query_scalar::<_, String>("SELECT id FROM accounts WHERE id = ?")
+            .bind(id)
+            .fetch_optional(conn)
+            .await?;
+        Ok(taken.is_none())
+    }
+
+    if is_free(conn, &candidate.id).await? {
+        return Ok(candidate.id.clone());
+    }
+    if let Some(suffix) = candidate
+        .chatgpt_user_id
+        .as_deref()
+        .map(user_id_suffix)
+        .filter(|suffix| !suffix.is_empty())
+    {
+        let scoped = format!("{}_{suffix}", candidate.id);
+        if is_free(conn, &scoped).await? {
+            return Ok(scoped);
+        }
+    }
+    for n in 2..100u32 {
+        let numbered = format!("{}_{n}", candidate.id);
+        if is_free(conn, &numbered).await? {
+            return Ok(numbered);
+        }
+    }
+    Err(StoreError::InvalidState(
+        "could not derive a free account id".into(),
+    ))
+}
+
+/// The readable, stable part of a ChatGPT user id: `user-qGYT4zcJoLkcIRIWXb0rG8Eb` -> `qGYT4zcJ`.
+/// Alphanumerics only, so it can never introduce a separator the id format relies on.
+fn user_id_suffix(user_id: &str) -> String {
+    user_id
+        .trim()
+        .trim_start_matches("user-")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect()
+}
+
 impl AccountRepo {
     pub fn new(
         pool: SqlitePool,
@@ -421,10 +474,52 @@ impl AccountRepo {
             }
             found
         } else if let Some(chatgpt_id) = candidate.chatgpt_account_id.as_deref() {
-            sqlx::query_scalar::<_, String>("SELECT id FROM accounts WHERE chatgpt_account_id = ?")
-                .bind(chatgpt_id)
-                .fetch_optional(&mut *tx)
-                .await?
+            // MATCH THE SEAT, NOT THE WORKSPACE. Every member of a ChatGPT TEAM shares one
+            // `chatgpt_account_id`, so matching on it alone made a second member's login land on
+            // the FIRST member's row: tokens overwritten, identity left showing the previous
+            // member, and no new account anywhere (2026-09-15, workspace 6da27c17). A seat is
+            // the workspace PLUS the user inside it.
+            let candidate_user = candidate
+                .chatgpt_user_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|user| !user.is_empty());
+            let by_seat = match candidate_user {
+                Some(user) => {
+                    sqlx::query_scalar::<_, String>(
+                        "SELECT id FROM accounts \
+                         WHERE chatgpt_account_id = ? AND chatgpt_user_id = ?",
+                    )
+                    .bind(chatgpt_id)
+                    .bind(user)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                }
+                None => None,
+            };
+            match by_seat {
+                Some(id) => Some(id),
+                // A row that predates user-id capture is still REPAIRABLE by a re-login, but only
+                // when it is the same seat: either this login carries no user id to tell members
+                // apart, or the email matches. Anything else is a different member of the same
+                // workspace and must get its own row rather than steal this one.
+                None => {
+                    let legacy = sqlx::query_as::<_, (String, String)>(
+                        "SELECT id, COALESCE(email, '') FROM accounts \
+                         WHERE chatgpt_account_id = ? AND COALESCE(chatgpt_user_id, '') = ''",
+                    )
+                    .bind(chatgpt_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    legacy.and_then(|(id, email)| {
+                        let same_seat = candidate_user.is_none()
+                            || (!email.is_empty()
+                                && !candidate.email.is_empty()
+                                && email.eq_ignore_ascii_case(&candidate.email));
+                        same_seat.then_some(id)
+                    })
+                }
+            }
         } else {
             None
         };
@@ -432,10 +527,22 @@ impl AccountRepo {
         let account_id = if let Some(id) = existing_id {
             // COALESCE backfills a NULL ChatGPT id on a targeted repair; for the untargeted path
             // the row was FOUND by that id, so it is a no-op.
+            // Refresh the IDENTITY the login just proved, alongside the credentials: a matched
+            // row that keeps the previous member's email/user id describes the wrong person while
+            // holding the new person's tokens. Operator settings (alias, routing policy,
+            // security capability, usage caps) are deliberate choices and stay untouched, and a
+            // blank/unknown incoming value never erases a known one.
             sqlx::query(
                 "UPDATE accounts SET access_token_enc = ?, refresh_token_enc = ?, \
                  id_token_enc = ?, last_refresh = ?, \
                  chatgpt_account_id = COALESCE(chatgpt_account_id, ?), \
+                 chatgpt_user_id = CASE WHEN COALESCE(?, '') <> '' THEN ? \
+                     ELSE chatgpt_user_id END, \
+                 email = CASE WHEN ? <> '' THEN ? ELSE email END, \
+                 plan_type = CASE WHEN ? NOT IN ('', 'unknown') THEN ? ELSE plan_type END, \
+                 workspace_id = COALESCE(?, workspace_id), \
+                 workspace_label = COALESCE(?, workspace_label), \
+                 seat_type = COALESCE(?, seat_type), \
                  status = CASE WHEN status = 'reauth_required' THEN 'active' ELSE status END \
                  WHERE id = ?",
             )
@@ -444,6 +551,15 @@ impl AccountRepo {
             .bind(enc.id_token_enc.as_slice())
             .bind(candidate.last_refresh)
             .bind(candidate.chatgpt_account_id.as_deref())
+            .bind(candidate.chatgpt_user_id.as_deref())
+            .bind(candidate.chatgpt_user_id.as_deref())
+            .bind(&candidate.email)
+            .bind(&candidate.email)
+            .bind(&candidate.plan_type)
+            .bind(&candidate.plan_type)
+            .bind(candidate.workspace_id.as_deref())
+            .bind(candidate.workspace_label.as_deref())
+            .bind(candidate.seat_type.as_deref())
             .bind(&id)
             .execute(&mut *tx)
             .await?;
@@ -467,6 +583,10 @@ impl AccountRepo {
             }
             id
         } else {
+            // Two members of one team workspace derive the SAME id from the shared
+            // `chatgpt_account_id`, so the newcomer's row is scoped to its user instead of
+            // colliding with (or silently replacing) the seat already there.
+            let insert_id = unique_account_row_id(&mut tx, candidate).await?;
             sqlx::query(
                 "INSERT INTO accounts (id, chatgpt_account_id, chatgpt_user_id, email, alias, \
                     workspace_id, workspace_label, seat_type, plan_type, routing_policy, \
@@ -474,7 +594,7 @@ impl AccountRepo {
                     status, deactivation_reason, reset_at, blocked_at, security_work_authorized, \
                     provider, pool) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
-            .bind(&candidate.id)
+            .bind(&insert_id)
             .bind(candidate.chatgpt_account_id.as_deref())
             .bind(candidate.chatgpt_user_id.as_deref())
             .bind(&candidate.email)
@@ -502,12 +622,12 @@ impl AccountRepo {
                 sqlx::query(
                     "INSERT INTO account_pool_memberships (account_id, pool) VALUES (?, ?)",
                 )
-                .bind(&candidate.id)
+                .bind(&insert_id)
                 .bind(pool)
                 .execute(&mut *tx)
                 .await?;
             }
-            candidate.id.clone()
+            insert_id
         };
 
         let completed = sqlx::query(
