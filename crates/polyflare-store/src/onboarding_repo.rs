@@ -399,6 +399,7 @@ mod tests {
         legacy.chatgpt_account_id = Some("team-ws".into());
         legacy.chatgpt_user_id = None;
         legacy.email = "owner@team.test".into();
+        legacy.plan_type = "team".into();
         store
             .accounts()
             .insert(&legacy, &plain_tokens(), &cipher)
@@ -409,6 +410,7 @@ mod tests {
         stranger.chatgpt_account_id = Some("team-ws".into());
         stranger.chatgpt_user_id = Some("user-STRANGER".into());
         stranger.email = "stranger@team.test".into();
+        stranger.plan_type = "team".into();
         let stranger_id = complete_login(&store, &cipher, "flow-a", &stranger).await;
         assert_ne!(
             stranger_id, "legacy-row",
@@ -421,6 +423,7 @@ mod tests {
         let mut owner = account("codex_team-ws");
         owner.chatgpt_account_id = Some("team-ws".into());
         owner.chatgpt_user_id = Some("user-OWNER01".into());
+        owner.plan_type = "team".into();
         owner.email = "Owner@Team.Test".into(); // same seat, different case
         let owner_id = complete_login(&store, &cipher, "flow-b", &owner).await;
         assert_eq!(
@@ -433,6 +436,38 @@ mod tests {
             Some("user-OWNER01"),
             "the missing user id is backfilled by the repair"
         );
+    }
+
+    /// On a PERSONAL plan the upstream account id already identifies the seat, so an ordinary
+    /// re-login must adopt its row even when the email has changed. Requiring an email match there
+    /// would strand a routine re-auth as a duplicate account.
+    #[tokio::test]
+    async fn a_personal_seat_re_logs_in_even_when_its_email_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[5u8; 32]).unwrap();
+
+        let mut legacy = account("legacy-solo");
+        legacy.chatgpt_account_id = Some("solo-ws".into());
+        legacy.chatgpt_user_id = None;
+        legacy.email = "old@solo.test".into();
+        legacy.plan_type = "pro".into();
+        store
+            .accounts()
+            .insert(&legacy, &plain_tokens(), &cipher)
+            .await
+            .unwrap();
+
+        let mut again = account("codex_solo-ws");
+        again.chatgpt_account_id = Some("solo-ws".into());
+        again.chatgpt_user_id = Some("user-SOLO01".into());
+        again.email = "new@solo.test".into();
+        again.plan_type = "pro".into();
+        let id = complete_login(&store, &cipher, "flow-a", &again).await;
+        assert_eq!(id, "legacy-solo", "the personal seat keeps its row");
+        let row = store.accounts().get("legacy-solo").await.unwrap().unwrap();
+        assert_eq!(row.email, "new@solo.test");
+        assert_eq!(row.chatgpt_user_id.as_deref(), Some("user-SOLO01"));
     }
 
     fn plain_tokens() -> PlainTokens {

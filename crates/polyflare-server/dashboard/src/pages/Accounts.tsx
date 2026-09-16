@@ -648,7 +648,14 @@ function RoutingBadge({
 }) {
   let label: string | null = null;
   let title = "";
-  if (routing.cooldown_until !== null) {
+  if (routing.overload_backoff_until !== null) {
+    // Ranked above the generic tiers on purpose: this is the state that used to be invisible,
+    // because an overloaded account keeps completing warm turns and so never looked unhealthy.
+    label = `${routing.overload_isolated ? "overloaded" : "busy"} · ${countdown(routing.overload_backoff_until, nowMs)}`;
+    title = routing.overload_isolated
+      ? "Upstream keeps refusing this account's new turns. Isolated: new work goes elsewhere while any sibling is eligible. Its live sessions are unaffected."
+      : "Upstream refused several of this account's new turns. New work prefers a sibling for a short while. Its live sessions are unaffected.";
+  } else if (routing.cooldown_until !== null) {
     label = `cooling · ${countdown(routing.cooldown_until, nowMs)}`;
     title = "Benched by a rate-limit / overload cooldown; the router sends nothing here until it ends.";
   } else if (routing.tier === 1) {

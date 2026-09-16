@@ -254,6 +254,36 @@ pub(crate) async fn bench_account_for_failure(
     sig: Option<&FailureSignal>,
     now: i64,
 ) {
+    // Upstream ADMISSION rejections get their own sliding window BEFORE the ordinary health
+    // arms below, and independently of them. `server_is_overloaded` says upstream refuses to
+    // start a NEW response for this account while its live sessions keep flowing — so the
+    // account keeps succeeding, `record_success` keeps zeroing `error_count`, the drain tier
+    // never latches, and selection keeps feeding the account upstream is refusing. Observed
+    // 2026-09-15/16: one account rejecting fresh admissions for hours at 26s per rejection
+    // while its siblings were clean. See `RuntimeStates::record_overload_rejection`.
+    if let Some(code) = sig.and_then(|s| s.error_code.as_deref()) {
+        let hard = crate::runtime_state::UPSTREAM_OVERLOAD_CODES.contains(&code);
+        let soft = crate::runtime_state::UPSTREAM_SOFT_OVERLOAD_CODES.contains(&code);
+        if hard || soft {
+            if let Some(trip) = state.runtime.record_overload_rejection(
+                id,
+                now,
+                soft,
+                crate::runtime_state::OVERLOAD_ISOLATION_SECS,
+            ) {
+                tracing::warn!(
+                    target: "polyflare_server::routing",
+                    account_id = %id.as_str(),
+                    level = trip.level,
+                    seconds = trip.until - now,
+                    isolated = trip.isolated,
+                    error_code = code,
+                    "upstream keeps rejecting this account's admissions as overloaded; fresh \
+                     selection now steers around it while another candidate is eligible"
+                );
+            }
+        }
+    }
     if let Some(sig) = sig {
         if let Some(code) = &sig.error_code {
             if code.as_str() == "out_of_credits" {

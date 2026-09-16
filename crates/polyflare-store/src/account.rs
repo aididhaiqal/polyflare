@@ -338,6 +338,16 @@ async fn unique_account_row_id(
     ))
 }
 
+/// Whether `plan` names a plan whose `chatgpt_account_id` is a SHARED workspace rather than one
+/// person's account — the only case where two different people legitimately present the same
+/// upstream account id (2026-09-15: a second team member's login replaced the first member's
+/// seat). Matched loosely: upstream has shipped several spellings and an unknown plan must not
+/// silently become "personal" for a workspace that is not.
+fn is_shared_workspace_plan(plan: &str) -> bool {
+    let plan = plan.trim().to_ascii_lowercase();
+    plan.contains("team") || plan.contains("enterprise") || plan.contains("business")
+}
+
 /// The readable, stable part of a ChatGPT user id: `user-qGYT4zcJoLkcIRIWXb0rG8Eb` -> `qGYT4zcJ`.
 /// Alphanumerics only, so it can never introduce a separator the id format relies on.
 fn user_id_suffix(user_id: &str) -> String {
@@ -504,18 +514,27 @@ impl AccountRepo {
                 // apart, or the email matches. Anything else is a different member of the same
                 // workspace and must get its own row rather than steal this one.
                 None => {
-                    let legacy = sqlx::query_as::<_, (String, String)>(
-                        "SELECT id, COALESCE(email, '') FROM accounts \
+                    let legacy = sqlx::query_as::<_, (String, String, String)>(
+                        "SELECT id, COALESCE(email, ''), COALESCE(plan_type, '') FROM accounts \
                          WHERE chatgpt_account_id = ? AND COALESCE(chatgpt_user_id, '') = ''",
                     )
                     .bind(chatgpt_id)
                     .fetch_optional(&mut *tx)
                     .await?;
-                    legacy.and_then(|(id, email)| {
+                    legacy.and_then(|(id, email, plan)| {
+                        // Only a SHARED workspace can put two people behind one
+                        // `chatgpt_account_id`. On a personal plan the id already identifies the
+                        // seat, so a re-login adopts its row even when the email has changed —
+                        // refusing there would strand an ordinary re-auth. On a team plan the
+                        // email is the only thing separating members, so a row whose email does
+                        // not match belongs to somebody else.
+                        let shared_workspace = is_shared_workspace_plan(&plan)
+                            || is_shared_workspace_plan(&candidate.plan_type);
                         let same_seat = candidate_user.is_none()
-                            || (!email.is_empty()
-                                && !candidate.email.is_empty()
-                                && email.eq_ignore_ascii_case(&candidate.email));
+                            || !shared_workspace
+                            || email.is_empty()
+                            || candidate.email.is_empty()
+                            || email.eq_ignore_ascii_case(&candidate.email);
                         same_seat.then_some(id)
                     })
                 }

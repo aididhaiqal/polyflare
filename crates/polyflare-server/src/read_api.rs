@@ -169,8 +169,14 @@ struct RoutingHealthView {
     recent_errors: u32,
     /// When the most recent of those errors landed.
     last_error_at: Option<i64>,
-    /// Whether selection currently avoids this account: an active cooldown, or a non-healthy
-    /// tier. `false` means it competes normally.
+    /// Unix seconds until which FRESH selection steers around this account because upstream kept
+    /// rejecting its admissions as overloaded. Distinct from `cooldown_until`: the account is not
+    /// benched — its live sessions keep flowing and it still serves if nothing else is eligible.
+    overload_backoff_until: Option<i64>,
+    /// Whether that backoff reached the ISOLATION stage (sustained overload).
+    overload_isolated: bool,
+    /// Whether selection currently avoids this account: an active cooldown, an overload backoff,
+    /// or a non-healthy tier. `false` means it competes normally.
     sidelined: bool,
 }
 
@@ -182,6 +188,8 @@ impl RoutingHealthView {
             cooldown_until: None,
             recent_errors: 0,
             last_error_at: None,
+            overload_backoff_until: None,
+            overload_isolated: false,
             sidelined: false,
         }
     }
@@ -193,13 +201,20 @@ impl RoutingHealthView {
             1 => "draining",
             _ => "probing",
         };
+        let overload_backoff_until = snap.overload_backoff_until.filter(|until| *until > now);
         Self {
             tier: snap.health_tier,
             tier_label,
             cooldown_until,
             recent_errors: snap.error_count,
             last_error_at: snap.last_error_at,
-            sidelined: cooldown_until.is_some() || snap.health_tier != 0,
+            overload_backoff_until,
+            overload_isolated: snap
+                .overload_isolated_until
+                .is_some_and(|until| until > now),
+            sidelined: cooldown_until.is_some()
+                || overload_backoff_until.is_some()
+                || snap.health_tier != 0,
         }
     }
 }
@@ -463,9 +478,11 @@ pub async fn account_detail_handler(
     // never leaves this scope); opaque tokens with no JWT `exp` (Anthropic) fall back to the stored
     // `access_token_expires_at` column. Identical derivation to `accounts_handler`.
     let token_status = match repo.get_with_tokens_and_auth(&id, &state.cipher).await {
-        Ok(Some((_, tokens, auth))) => {
-            derive_token_health(token_exp(&tokens.access_token), auth.access_token_expires_at, now)
-        }
+        Ok(Some((_, tokens, auth))) => derive_token_health(
+            token_exp(&tokens.access_token),
+            auth.access_token_expires_at,
+            now,
+        ),
         Ok(None) => TokenHealthView {
             access_state: "missing",
             access_expires_at: None,

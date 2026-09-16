@@ -143,6 +143,48 @@ pub fn backoff_secs(error_count: u32) -> i64 {
     (BACKOFF_BASE_MS * (1i64 << shift)) / 1000
 }
 
+/// Upstream error codes meaning "admission refused: overloaded".
+pub const UPSTREAM_OVERLOAD_CODES: [&str; 2] = ["server_is_overloaded", "overloaded_error"];
+/// Codes carrying the same observable shape without naming overload. Upstream returns a bare
+/// `server_error` for both genuine one-off faults and sustained capacity refusal, so these count
+/// at [`SOFT_OVERLOAD_TRIP_WEIGHT`]: a lone fault can never trip the window by itself.
+pub const UPSTREAM_SOFT_OVERLOAD_CODES: [&str; 1] = ["server_error"];
+pub const SOFT_OVERLOAD_TRIP_WEIGHT: f64 = 0.5;
+/// Trip when this much weight lands inside the window. Three keeps a lone rejection (an upstream
+/// hiccup) from deprioritizing an account, while a genuinely rejected account under real traffic
+/// trips within a minute or two.
+const OVERLOAD_TRIP_COUNT: f64 = 3.0;
+const OVERLOAD_WINDOW_SECS: i64 = 120;
+/// Bounded exponential deprioritization: 60s, 120s, 240s, 480s, capped at 10 min.
+const OVERLOAD_BACKOFF_BASE_SECS: i64 = 60;
+const OVERLOAD_BACKOFF_MAX_SECS: i64 = 600;
+const OVERLOAD_LEVEL_DECAY_SECS: i64 = 1800;
+/// Levels saturate at the first level whose interval hits the cap, so the stored level and the
+/// exponent are both bounded.
+const OVERLOAD_MAX_LEVEL: u32 = 5;
+/// The trip level at which sustained overload escalates from deprioritization to isolation: a
+/// third trip means at least nine rejections in a few minutes despite two prior backoffs.
+const OVERLOAD_ISOLATION_TRIP_LEVEL: u32 = 3;
+/// How long an isolated account is held out of fresh selection. `0` disables the stage.
+pub const OVERLOAD_ISOLATION_SECS: i64 = 1800;
+
+/// The deprioritization interval for a trip at `level` (1-based, saturating).
+fn overload_backoff_secs(level: u32) -> i64 {
+    let exponent = level.saturating_sub(1).min(OVERLOAD_MAX_LEVEL - 1);
+    OVERLOAD_BACKOFF_BASE_SECS
+        .saturating_mul(1i64 << exponent)
+        .min(OVERLOAD_BACKOFF_MAX_SECS)
+}
+
+/// What one overload rejection did to the account, when it tripped the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverloadTrip {
+    pub level: u32,
+    pub until: i64,
+    /// Whether this trip reached the isolation stage (sustained overload).
+    pub isolated: bool,
+}
+
 /// The live routing state for one account. All fields default to the neutral "healthy" values, so a
 /// never-seen account (absent from the map) overlays as a no-op.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -173,6 +215,25 @@ pub struct RuntimeState {
     pub in_flight_pressure: u32,
     /// Long-lived upstream WebSocket connections, including idle sockets between turns.
     pub open_ws: u32,
+    /// Timestamps of upstream ADMISSION rejections (`server_is_overloaded`) inside the sliding
+    /// window. Deliberately NOT cleared by a success: an account whose warm sessions keep
+    /// completing while upstream refuses its fresh admissions is exactly the case this exists for,
+    /// and [`RuntimeStates::record_success`] zeroing `error_count` is why the ordinary drain tier
+    /// never latched on one.
+    pub overload_rejections: Vec<i64>,
+    /// As `overload_rejections`, for terminals carrying the same observable shape without naming
+    /// overload (a bare `server_error`). Counted at [`SOFT_OVERLOAD_TRIP_WEIGHT`] so one fault can
+    /// never trip the window alone while sustained refusal still does.
+    pub soft_overload_rejections: Vec<i64>,
+    /// How many times the window has tripped, saturating at `OVERLOAD_MAX_LEVEL`. Drives the
+    /// exponential backoff interval and the isolation threshold.
+    pub overload_backoff_level: u32,
+    /// Deadline until which FRESH selection deprioritizes this account.
+    pub overload_backoff_until: Option<i64>,
+    /// Deadline of the isolation stage (sustained overload).
+    pub overload_isolated_until: Option<i64>,
+    /// When the window last tripped, for the level decay.
+    pub overload_last_trip_at: Option<i64>,
 }
 
 impl RuntimeState {
@@ -1138,6 +1199,12 @@ impl RuntimeStates {
                 snap.in_flight = rt.in_flight;
                 snap.in_flight_pressure = rt.in_flight_pressure;
                 snap.open_ws = rt.open_ws;
+                // Only while ACTIVE, like `cooldown_until` above: a stale deadline handed to the
+                // selector would read as a live backoff forever.
+                snap.overload_backoff_until =
+                    rt.overload_backoff_until.filter(|&until| now < until);
+                snap.overload_isolated_until =
+                    rt.overload_isolated_until.filter(|&until| now < until);
             }
         }
     }
@@ -1289,6 +1356,81 @@ impl RuntimeStates {
     /// point still applies here too: it refuses to let this call promote an unrelated DRAINING
     /// account to PROBING (see its doc) — only the PROBING->HEALTHY streak edge, or a no-op, can
     /// result from a success.
+    /// Record ONE upstream overload rejection for `id`, returning the new backoff deadline when
+    /// it tripped the window (else `None`).
+    ///
+    /// `server_is_overloaded` is an ADMISSION rejection — upstream refuses to start a new response
+    /// for this account while its already-admitted streams keep flowing — so it needs a window the
+    /// generic transient-error path cannot express:
+    ///
+    /// - It is account-scoped and bursty, and the rejection takes tens of seconds to arrive (ours
+    ///   averaged 26s, worst 115s over 24h), so every fresh admission routed there costs the
+    ///   client that wait before failover even starts.
+    /// - It says nothing bad about the account's LIVE sessions. Warm turns keep completing, and
+    ///   [`Self::record_success`] zeroes `error_count`/`last_error_at`, so the drain tier
+    ///   (`error_count >= 2` within 60s) never latched and selection kept feeding the account
+    ///   upstream was refusing. That is why this window is never reset by a success.
+    ///
+    /// Ported from codex-lb's `overload_backoff.py`, constants included.
+    pub fn record_overload_rejection(
+        &self,
+        id: &AccountId,
+        now: i64,
+        soft: bool,
+        isolation_secs: i64,
+    ) -> Option<OverloadTrip> {
+        self.mutate(id, |rt| {
+            // The level decays back to the base once the account has gone this long without
+            // tripping AND without being held out, so a recovered account is not punished for the
+            // last hour while an account leaving isolation keeps its level.
+            let quiet_since = match (rt.overload_last_trip_at, rt.overload_backoff_until) {
+                (Some(trip), Some(until)) => Some(trip.max(until)),
+                (trip, until) => trip.or(until),
+            };
+            if quiet_since.is_some_and(|since| now - since >= OVERLOAD_LEVEL_DECAY_SECS) {
+                rt.overload_backoff_level = 0;
+            }
+            let window_start = now - OVERLOAD_WINDOW_SECS;
+            rt.overload_rejections.retain(|at| *at > window_start);
+            rt.soft_overload_rejections.retain(|at| *at > window_start);
+            if soft {
+                rt.soft_overload_rejections.push(now);
+            } else {
+                rt.overload_rejections.push(now);
+            }
+            let weight = rt.overload_rejections.len() as f64
+                + rt.soft_overload_rejections.len() as f64 * SOFT_OVERLOAD_TRIP_WEIGHT;
+            if weight < OVERLOAD_TRIP_COUNT {
+                return None;
+            }
+            rt.overload_rejections.clear();
+            rt.soft_overload_rejections.clear();
+            rt.overload_backoff_level = (rt.overload_backoff_level + 1).min(OVERLOAD_MAX_LEVEL);
+            rt.overload_last_trip_at = Some(now);
+            let isolated =
+                isolation_secs > 0 && rt.overload_backoff_level >= OVERLOAD_ISOLATION_TRIP_LEVEL;
+            let interval = if isolated {
+                isolation_secs
+            } else {
+                overload_backoff_secs(rt.overload_backoff_level)
+            };
+            // A trip while already deprioritized (rejections keep arriving from admissions that
+            // were already in flight) EXTENDS, never shortens, the deadline.
+            let deadline = rt
+                .overload_backoff_until
+                .map_or(now + interval, |existing| existing.max(now + interval));
+            rt.overload_backoff_until = Some(deadline);
+            if isolated {
+                rt.overload_isolated_until = Some(deadline);
+            }
+            Some(OverloadTrip {
+                level: rt.overload_backoff_level,
+                until: deadline,
+                isolated,
+            })
+        })
+    }
+
     pub fn record_success(&self, id: &AccountId) -> Option<HealthTierTransition> {
         self.mutate(id, |rt| {
             rt.error_count = 0;
@@ -2105,6 +2247,152 @@ impl RuntimeStates {
 
 #[cfg(test)]
 mod tests {
+    use super::{OVERLOAD_ISOLATION_SECS, SOFT_OVERLOAD_TRIP_WEIGHT};
+
+    /// The whole reason this window exists: an account whose warm turns keep completing while
+    /// upstream refuses its FRESH admissions. Successes zero `error_count`, so the drain tier
+    /// never latches — the overload window must survive them and trip anyway.
+    #[test]
+    fn successes_between_rejections_never_reset_the_overload_window() {
+        let runtime = RuntimeStates::default();
+        let id = AccountId::from("hot");
+        for n in 0..2 {
+            assert!(
+                runtime
+                    .record_overload_rejection(&id, 1_000 + n, false, OVERLOAD_ISOLATION_SECS)
+                    .is_none(),
+                "two rejections must not trip the window yet"
+            );
+            runtime.record_success(&id);
+        }
+        let trip = runtime
+            .record_overload_rejection(&id, 1_002, false, OVERLOAD_ISOLATION_SECS)
+            .expect("the third rejection trips despite the successes in between");
+        assert_eq!(trip.level, 1);
+        assert_eq!(trip.until, 1_002 + 60, "level 1 deprioritizes for 60s");
+        assert!(!trip.isolated);
+    }
+
+    /// Rejections older than the window fall out of it, so a slow trickle never trips.
+    #[test]
+    fn rejections_outside_the_window_do_not_accumulate() {
+        let runtime = RuntimeStates::default();
+        let id = AccountId::from("trickle");
+        for n in 0..6 {
+            assert!(
+                runtime
+                    .record_overload_rejection(&id, 1_000 + n * 121, false, OVERLOAD_ISOLATION_SECS)
+                    .is_none(),
+                "a rejection every 121s (window is 120s) must never trip"
+            );
+        }
+    }
+
+    /// A bare `server_error` is ambiguous — upstream returns it for one-off faults AND for
+    /// sustained capacity refusal — so it counts at half weight: two alone cannot trip, but
+    /// sustained soft rejections still do.
+    #[test]
+    fn soft_observations_need_twice_as_many_to_trip() {
+        assert_eq!(SOFT_OVERLOAD_TRIP_WEIGHT, 0.5);
+        let runtime = RuntimeStates::default();
+        let id = AccountId::from("soft");
+        for n in 0..5 {
+            assert!(
+                runtime
+                    .record_overload_rejection(&id, 1_000 + n, true, OVERLOAD_ISOLATION_SECS)
+                    .is_none(),
+                "five soft observations are only 2.5 weight"
+            );
+        }
+        assert!(
+            runtime
+                .record_overload_rejection(&id, 1_005, true, OVERLOAD_ISOLATION_SECS)
+                .is_some(),
+            "the sixth reaches 3.0 and trips"
+        );
+    }
+
+    /// Repeated trips escalate 60s, 120s, then isolation; the ladder saturates rather than
+    /// growing without bound.
+    #[test]
+    fn repeated_trips_escalate_then_isolate() {
+        let runtime = RuntimeStates::default();
+        let id = AccountId::from("sustained");
+        let mut now = 1_000;
+        let mut trips = Vec::new();
+        for _ in 0..3 {
+            for _ in 0..3 {
+                if let Some(trip) =
+                    runtime.record_overload_rejection(&id, now, false, OVERLOAD_ISOLATION_SECS)
+                {
+                    trips.push(trip);
+                }
+                now += 1;
+            }
+        }
+        assert_eq!(trips.len(), 3, "three windows tripped: {trips:?}");
+        assert_eq!(trips[0].level, 1);
+        assert_eq!(trips[1].level, 2);
+        assert_eq!(trips[2].level, 3);
+        assert!(!trips[0].isolated && !trips[1].isolated);
+        assert!(
+            trips[2].isolated,
+            "the third trip is sustained overload: isolation"
+        );
+        assert_eq!(
+            trips[2].until - 1_008,
+            OVERLOAD_ISOLATION_SECS,
+            "isolation holds for its own, longer interval"
+        );
+    }
+
+    /// A trip while already deprioritized extends the deadline; it can never shorten it (late
+    /// rejections keep arriving from admissions that were already in flight).
+    #[test]
+    fn a_later_trip_never_shortens_an_existing_deadline() {
+        let runtime = RuntimeStates::default();
+        let id = AccountId::from("extend");
+        let mut now = 1_000;
+        for _ in 0..3 {
+            runtime.record_overload_rejection(&id, now, false, OVERLOAD_ISOLATION_SECS);
+            now += 1;
+        }
+        let mut snaps = vec![AccountSnapshot::new("extend")];
+        runtime.overlay(&mut snaps, now);
+        let first = snaps[0].overload_backoff_until.expect("backed off");
+        // Three more rejections a second later trip level 2 (120s) — later, so it extends.
+        for _ in 0..3 {
+            runtime.record_overload_rejection(&id, now, false, OVERLOAD_ISOLATION_SECS);
+            now += 1;
+        }
+        let mut snaps = vec![AccountSnapshot::new("extend")];
+        runtime.overlay(&mut snaps, now);
+        assert!(
+            snaps[0].overload_backoff_until.expect("still backed off") > first,
+            "a second trip must extend the deadline"
+        );
+    }
+
+    /// The overlay hands the selector only a LIVE deadline; a stale one would read as a
+    /// permanent backoff.
+    #[test]
+    fn the_overlay_hides_an_expired_backoff() {
+        let runtime = RuntimeStates::default();
+        let id = AccountId::from("expired");
+        for n in 0..3 {
+            runtime.record_overload_rejection(&id, 1_000 + n, false, OVERLOAD_ISOLATION_SECS);
+        }
+        let mut snaps = vec![AccountSnapshot::new("expired")];
+        runtime.overlay(&mut snaps, 1_010);
+        assert!(snaps[0].overload_backoff_until.is_some(), "live deadline");
+        let mut snaps = vec![AccountSnapshot::new("expired")];
+        runtime.overlay(&mut snaps, 1_002 + 60 + 1);
+        assert!(
+            snaps[0].overload_backoff_until.is_none(),
+            "an elapsed deadline must not reach the selector"
+        );
+    }
+
     use super::*;
 
     #[test]

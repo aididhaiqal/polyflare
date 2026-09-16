@@ -454,6 +454,16 @@ pub struct AccountSnapshot {
     /// Every named routing group this account can serve. `pool` remains the backward-compatible
     /// primary label; routing membership checks use this complete set.
     pub pools: Vec<String>,
+    /// Deadline until which FRESH selection deprioritizes this account after upstream kept
+    /// rejecting its admissions as overloaded (`server_is_overloaded`). Distinct from
+    /// `cooldown_until`: an overloaded account's LIVE sessions keep flowing, so it is never
+    /// benched outright — it is only dropped from the candidate pool while another candidate
+    /// remains. `None`, or a past deadline, means no backoff.
+    pub overload_backoff_until: Option<i64>,
+    /// Deadline of the ISOLATION stage (sustained overload). Implies `overload_backoff_until`;
+    /// carried separately because isolation additionally releases soft sticky owners, which a
+    /// short backoff deliberately does not.
+    pub overload_isolated_until: Option<i64>,
     /// Whether this account's upstream credential is a subscription-OAuth grant rather than an API
     /// key or static bearer.
     ///
@@ -482,6 +492,8 @@ impl AccountSnapshot {
             usage_cap_override: false,
             routing_policy: "normal".to_string(),
             health_tier: 0,
+            overload_backoff_until: None,
+            overload_isolated_until: None,
             error_count: 0,
             cooldown_until: None,
             last_error_at: None,

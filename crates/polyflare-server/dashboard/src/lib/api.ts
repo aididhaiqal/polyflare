@@ -155,6 +155,12 @@ export interface RoutingHealthView {
   cooldown_until: number | null;
   recent_errors: number;
   last_error_at: number | null;
+  /** Unix seconds until fresh selection stops steering around this account after upstream kept
+   * rejecting its admissions as overloaded. Not a bench: live sessions keep flowing and it still
+   * serves if nothing else is eligible. */
+  overload_backoff_until: number | null;
+  /** Whether that backoff reached the isolation stage (sustained overload). */
+  overload_isolated: boolean;
   /** True when selection currently avoids this account. */
   sidelined: boolean;
 }

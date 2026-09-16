@@ -563,8 +563,44 @@ fn standard_pool<'a>(candidates: &'a [AccountSnapshot], ctx: &SelectionCtx) -> V
     if eligible.is_empty() {
         return Vec::new();
     }
+    let eligible = drop_overload_backoff(eligible, ctx.now);
     let pool = health_tier_pool(&eligible, ctx.now);
     policy_waterfall(&pool)
+}
+
+/// Whether FRESH selection should currently steer around `snap` because upstream keeps rejecting
+/// its admissions as overloaded. See [`AccountSnapshot::overload_backoff_until`].
+pub fn overload_backoff_active(snap: &AccountSnapshot, now: i64) -> bool {
+    snap.overload_backoff_until.is_some_and(|until| now < until)
+}
+
+/// Drop the candidates currently in overload backoff — but ONLY while that leaves someone behind.
+///
+/// `server_is_overloaded` is an ADMISSION rejection, not an account fault: the account's live
+/// sessions keep flowing, and every success zeroes `error_count`, so the ordinary transient-error
+/// backoff and the drain tier never latch and selection keeps feeding the account upstream is
+/// refusing (2026-09-15/16: one account rejected ~0.5-7% of fresh admissions for hours, each
+/// rejection arriving 26s later on average, while its siblings were clean).
+///
+/// Applied to the ALREADY-ELIGIBLE pool, so this can only ever express a PREFERENCE among
+/// accounts the eligibility gates already accepted: it can never turn usable capacity into "no
+/// eligible account", and an all-backed-off fleet keeps serving.
+fn drop_overload_backoff<'a>(eligible: Vec<Candidate<'a>>, now: i64) -> Vec<Candidate<'a>> {
+    if !eligible
+        .iter()
+        .any(|c| overload_backoff_active(c.snap, now))
+    {
+        return eligible;
+    }
+    let kept: Vec<Candidate<'a>> = eligible
+        .iter()
+        .filter(|c| !overload_backoff_active(c.snap, now))
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        return eligible;
+    }
+    kept
 }
 
 /// The lexicographic min of `pool` by `key` ascending, then account id ascending (deterministic).
@@ -804,6 +840,82 @@ impl RoutingStrategy {
 
 #[cfg(test)]
 mod tests {
+    use super::{drop_overload_backoff, overload_backoff_active};
+
+    /// An account upstream keeps rejecting must lose FRESH selection to a clean sibling — the
+    /// whole point of the window: it stays eligible (its live sessions are fine) but is not
+    /// preferred.
+    #[test]
+    fn an_overloaded_account_loses_fresh_selection_to_a_clean_sibling() {
+        let mut hot = AccountSnapshot::new("hot");
+        hot.overload_backoff_until = Some(1_000 + 60);
+        let clean = AccountSnapshot::new("clean");
+        let ctx = SelectionCtx {
+            now: 1_000,
+            ..Default::default()
+        };
+        let picked = RoundRobin.pick(&[hot.clone(), clean.clone()], &ctx);
+        assert_eq!(
+            picked.as_ref().map(AccountId::as_str),
+            Some("clean"),
+            "the backed-off account must not be picked while a sibling is eligible"
+        );
+        // Once the deadline passes it competes normally again (RoundRobin ties to the smaller id).
+        let later = SelectionCtx {
+            now: 1_000 + 61,
+            ..Default::default()
+        };
+        assert_eq!(
+            RoundRobin
+                .pick(&[hot, clean], &later)
+                .as_ref()
+                .map(AccountId::as_str),
+            Some("clean"),
+        );
+    }
+
+    /// The filter may only ever express a PREFERENCE: when every eligible candidate is backed off
+    /// the pool must serve anyway, never collapse to "no eligible account".
+    #[test]
+    fn an_all_overloaded_fleet_still_serves() {
+        let mut a = AccountSnapshot::new("a");
+        let mut b = AccountSnapshot::new("b");
+        a.overload_backoff_until = Some(1_060);
+        b.overload_backoff_until = Some(1_060);
+        let ctx = SelectionCtx {
+            now: 1_000,
+            ..Default::default()
+        };
+        assert!(
+            RoundRobin.pick(&[a, b], &ctx).is_some(),
+            "a fully backed-off fleet must keep serving"
+        );
+    }
+
+    #[test]
+    fn a_past_deadline_is_not_an_active_backoff() {
+        let mut snap = AccountSnapshot::new("x");
+        snap.overload_backoff_until = Some(500);
+        assert!(!overload_backoff_active(&snap, 500));
+        assert!(!overload_backoff_active(&snap, 501));
+        assert!(overload_backoff_active(&snap, 499));
+        assert!(!overload_backoff_active(&AccountSnapshot::new("y"), 0));
+    }
+
+    #[test]
+    fn dropping_nothing_returns_the_pool_untouched() {
+        let snaps = [AccountSnapshot::new("a"), AccountSnapshot::new("b")];
+        let ctx = SelectionCtx {
+            now: 1_000,
+            ..Default::default()
+        };
+        let eligible: Vec<_> = snaps
+            .iter()
+            .filter_map(|s| eligibility(s, ctx.now, ctx.inflight_penalty_pct).into_eligible())
+            .collect();
+        assert_eq!(drop_overload_backoff(eligible, ctx.now).len(), 2);
+    }
+
     use super::*;
     use crate::traits::Selector;
     use crate::types::{AccountSnapshot, SelectionCtx};
