@@ -598,6 +598,12 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
     // honoring the signal resends FULL history (anchorless — it cannot miss again); a client that
     // instead repeats an anchored attempt gets the raw miss verbatim rather than a signal loop.
     let mut anchor_resend_pending = false;
+    // One capacity-retry substitution until something SUCCEEDS on this connection. Resetting it
+    // per `response.create` would hand a fresh substitution to each of the client's own retries,
+    // so a persistently capacity-bound upstream would be answered "retry" over and over until the
+    // attempt budget ran out — every one of them a full-history resend. After one unheeded
+    // substitution the client gets the real error and can decide for itself.
+    let mut capacity_retry_pending = false;
     // Custom Responses targets are stateless behind the WS-to-SSE bridge. An anchored Codex delta
     // therefore needs the same bounded client full-resend handshake as a moved native socket.
     let mut custom_anchor_resend_pending = false;
@@ -1438,6 +1444,22 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                 // times in five hours on 2026-09-08. Injecting the status the
                                 // code implies makes codex fail fast and run its own retry.
                                 let text = normalize_error_envelope_status(&text).unwrap_or(text);
+                                // A capacity terminal that we could neither retry nor place would
+                                // reach codex as its non-retryable "Selected model is at capacity"
+                                // dead end. Nothing of this turn has been shown (the guard below
+                                // is the same one that gates replay), so hand the client the one
+                                // envelope codex retries instead — its resend then rides whatever
+                                // account `on_upstream_error` moves us to a few lines down.
+                                let substitute_capacity_retry = is_transient_overload(&sig)
+                                    && !upstream_output_visible_for_turn
+                                    && !capacity_retry_pending;
+                                let text = if substitute_capacity_retry {
+                                    capacity_retry_pending = true;
+                                    relay_metrics.record("capacity_retry_substituted");
+                                    capacity_retry_error_frame()
+                                } else {
+                                    text
+                                };
                                 if downstream.send(Message::Text(text.clone().into())).await.is_err() {
                                     break;
                                 }
@@ -1648,6 +1670,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                 // (docs/incidents/2026-08-29-ws-turn-budget-leak.md).
                                 if let Some(key) = completed_turn_key.as_deref() {
                                     state.runtime.clear_logical_turn_attempts(Some(key));
+                                    // Something got through, so the connection has earned another
+                                    // capacity-retry substitution if it is refused again later.
+                                    capacity_retry_pending = false;
                                 }
                             }
                         }
@@ -2001,6 +2026,34 @@ pub(crate) fn normalize_error_envelope_status(text: &str) -> Option<String> {
     );
     object.insert("status".to_string(), serde_json::Value::from(status));
     Some(value.to_string())
+}
+
+/// The retryable envelope substituted for a capacity terminal the relay could not place.
+///
+/// Codex maps `server_is_overloaded` to `ApiError::ServerOverloaded`, renders it as "Selected
+/// model is at capacity. Please try a different model." and does NOT retry — a dead end for a
+/// condition that is usually over in seconds. `websocket_connection_limit_reached` is the one
+/// shape its websocket mapper classifies as `ApiError::Retryable`, so substituting it turns that
+/// dead end into codex's own bounded retry, which arrives as a full resend on whatever account
+/// the bench-and-move below has just put the connection on.
+///
+/// Only substituted when NOTHING of this turn has reached the client, so the retry cannot
+/// duplicate output, and only once per turn — a client that ignores the signal gets the real
+/// error next time. The per-turn attempt budget bounds the retry itself, so an upstream that
+/// stays at capacity ends in `logical_turn_attempts_exhausted` rather than looping.
+///
+/// The message is ours and says what actually happened; codex only keys its retry off the code.
+fn capacity_retry_error_frame() -> String {
+    serde_json::json!({
+        "type": "error",
+        "status": 409,
+        "error": {
+            "code": WS_CONNECTION_LIMIT_CODE,
+            "message": "Upstream is at capacity for this account and PolyFlare has moved the \
+                        conversation; retrying resends the full conversation.",
+        },
+    })
+    .to_string()
 }
 
 fn client_resend_error_frame() -> String {

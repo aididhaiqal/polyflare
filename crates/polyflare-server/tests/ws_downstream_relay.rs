@@ -1533,6 +1533,78 @@ mod relay_through {
         assert_eq!(mock.handshake_count(), 0);
     }
 
+    /// Codex renders `server_is_overloaded` as "Selected model is at capacity. Please try a
+    /// different model." and does NOT retry it — a dead end for a condition usually over in
+    /// seconds. When the relay cannot place the turn (single-account fleet here, so no sibling
+    /// exists), the client must instead get the one envelope codex retries, and the retry must
+    /// then succeed.
+    #[tokio::test]
+    async fn an_unplaceable_capacity_terminal_reaches_the_client_as_a_retryable_signal() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::server_overloaded_without_status(),
+            ScriptedTurn::server_overloaded_without_status(),
+            ScriptedTurn::server_overloaded_without_status(),
+            ScriptedTurn::normal(Vec::new()),
+        ]);
+        let upstream = mock.clone().spawn().await;
+        let (base, state) = spawn_with_pinned_account("acct-capacity-retry", &upstream).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        ws.send(TMessage::Text(
+            r#"{"type":"response.create","input":[{"role":"user","content":"a"}],"client_metadata":{"turn_id":"t-cap"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(20), ws.next())
+            .await
+            .expect("a reply")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["type"], "error", "{reply}");
+        assert_eq!(
+            reply["error"]["code"], "websocket_connection_limit_reached",
+            "the client must get the shape codex RETRIES, not the capacity dead end: {reply}"
+        );
+        assert_ne!(
+            reply["error"]["code"], "server_is_overloaded",
+            "codex does not retry this one"
+        );
+        let snapshot = state.relay_metrics.snapshot();
+        assert_eq!(
+            snapshot
+                .iter()
+                .find(|(k, _)| k == "capacity_retry_substituted")
+                .map(|(_, v)| *v)
+                .unwrap_or(0),
+            1,
+            "{snapshot:?}"
+        );
+
+        // Codex honours it with a full resend, which completes.
+        ws.send(TMessage::Text(
+            r#"{"type":"response.create","input":[{"role":"user","content":"a"}],"client_metadata":{"turn_id":"t-cap"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(20), ws.next())
+            .await
+            .expect("a reply")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["type"], "response.completed", "{reply}");
+    }
+
     /// 2026-09-16: the lazy re-dial never restarted the socket's age clock, so once a connection
     /// passed `max_socket_age` ONCE, every later turn's socket was retired the instant the turn
     /// ended — and the next anchored delta paid a forged full-history resend, for the rest of the
@@ -1982,10 +2054,12 @@ mod relay_through {
         assert_eq!(count("overload_anchored_client_resend"), 1, "{snapshot:?}");
     }
 
-    /// When the overload does not clear inside the retry budget, the client must HEAR it. The
-    /// forwarded envelope gains the `status` its code implies (503), which is what codex's
-    /// websocket error mapper needs to turn it into a stream error and retry on its own,
-    /// instead of idling for 300 s.
+    /// When the overload does not clear inside the retry budget, the client must HEAR it — but as
+    /// something it can ACT on. codex renders `server_is_overloaded` as "Selected model is at
+    /// capacity. Please try a different model." and does not retry it, so the first unplaceable
+    /// capacity terminal of a turn is substituted with the one envelope codex does retry, and the
+    /// SECOND one (the substitution is once per turn) is forwarded verbatim, carrying the `status`
+    /// its code implies so codex's mapper turns it into a stream error instead of idling 300 s.
     #[tokio::test]
     async fn a_persistent_overload_reaches_the_client_with_a_status_it_can_act_on() {
         let mock = MockWsUpstream::scripted(vec![
@@ -2016,15 +2090,33 @@ mod relay_through {
             reply["type"], "error",
             "the third overload is surfaced: {reply}"
         );
-        assert_eq!(reply["error"]["code"], "server_is_overloaded");
         assert_eq!(
-            reply["status"], 503,
-            "a status-less envelope must be given the status its code implies"
+            reply["error"]["code"], "websocket_connection_limit_reached",
+            "the first unplaceable capacity terminal is substituted for one codex retries: {reply}"
         );
         assert_eq!(
             mock.raw_frames().len(),
             3,
             "first send plus two in-place resends"
+        );
+
+        // The client honours it with a resend, which this upstream also refuses. The substitution
+        // is spent for that turn, so this time the real envelope reaches the client — with the
+        // status its code implies, which is what codex's mapper needs.
+        ws.send(TMessage::Text(frame.clone().into())).await.unwrap();
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(15), ws.next())
+            .await
+            .expect("a reply")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["error"]["code"], "server_is_overloaded", "{reply}");
+        assert_eq!(
+            reply["status"], 503,
+            "a status-less envelope must be given the status its code implies"
         );
     }
 
