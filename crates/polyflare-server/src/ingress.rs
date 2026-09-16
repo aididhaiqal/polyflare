@@ -336,6 +336,40 @@ pub(crate) async fn bench_account_for_failure(
     // as a cooldown honoring whatever reset the response carried (via `rate_limit::failure_signal`'s
     // ladder), falling back to the floor cooldown when none is present — so an overloaded upstream
     // routes away briefly instead of merely accruing error count in the generic 5xx arm below.
+    // A CODE-LESS 429 is a momentary per-account burst rejection, not a quota event: the body
+    // carries only a message, and the same account succeeds again within seconds. Benching it
+    // like a plan limit (a 30s+ cooldown plus a `rate_limited` status write) overstates a blip —
+    // and every 429 we saw in the last week was this shape. A long `Retry-After` is upstream
+    // telling us otherwise, so that still takes the ordinary rate-limit path below.
+    if let Some(sig) = sig {
+        let codeless_burst = sig.status == 429
+            && sig.error_code.is_none()
+            && sig
+                .retry_after
+                .is_none_or(|secs| secs <= crate::runtime_state::BURST_BACKOFF_MAX_SECS);
+        if codeless_burst {
+            // Still counted as the rate-limit hit it is, with the same labels the bench path
+            // uses: declining to bench the account must not make the rejection invisible.
+            state
+                .rate_limit_metrics
+                .record(if sig.retry_after.is_some() {
+                    "upstream"
+                } else {
+                    "backoff"
+                });
+            let seconds = state
+                .runtime
+                .record_burst_rejection(id, now, sig.retry_after);
+            tracing::info!(
+                target: "polyflare_server::routing",
+                account_id = %id.as_str(),
+                seconds,
+                retry_after = sig.retry_after.unwrap_or(-1),
+                "code-less upstream 429: short burst cooldown, account not benched"
+            );
+            return;
+        }
+    }
     let transition = match sig {
         Some(sig) if sig.status == 429 || sig.status == 529 || is_anthropic_hard_limit => {
             state.runtime.request_usage_refresh(id);

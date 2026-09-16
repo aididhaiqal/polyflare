@@ -143,6 +143,12 @@ pub fn backoff_secs(error_count: u32) -> i64 {
     (BACKOFF_BASE_MS * (1i64 << shift)) / 1000
 }
 
+/// Burst cooldown bounds for a code-less upstream 429. The default covers the observed recovery
+/// window (the same account succeeds again within seconds); an upstream `Retry-After` raises the
+/// deadline up to the cap, so a stale or hostile header cannot bench an account for minutes.
+pub const BURST_BACKOFF_DEFAULT_SECS: i64 = 5;
+pub const BURST_BACKOFF_MAX_SECS: i64 = 30;
+
 /// Outcome bucket width for the recent-error-rate weight.
 const ERROR_RATE_BUCKET_SECS: i64 = 60;
 /// Ten minutes of outcomes: long enough to smooth a burst, short enough that a recovered account
@@ -265,6 +271,10 @@ pub struct RuntimeState {
     pub overload_isolated_until: Option<i64>,
     /// When the window last tripped, for the level decay.
     pub overload_last_trip_at: Option<i64>,
+    /// Short deadline after a CODE-LESS upstream 429 — a momentary per-account burst rejection,
+    /// not a quota event. Steers fresh selection to a sibling without benching the account or
+    /// touching its status; established sticky owners keep their session.
+    pub burst_backoff_until: Option<i64>,
     /// Minute buckets of upstream outcomes — `bucket index -> (successes, failures)` — behind the
     /// recent-error-rate draw weight. Separate from `error_count` because that is a LATCH: the
     /// next success zeroes it, so an account failing one request in three never looked unhealthy
@@ -1238,8 +1248,15 @@ impl RuntimeStates {
                 snap.selection_weight_multiplier = error_rate_weight_multiplier(rt, now);
                 // Only while ACTIVE, like `cooldown_until` above: a stale deadline handed to the
                 // selector would read as a live backoff forever.
-                snap.overload_backoff_until =
-                    rt.overload_backoff_until.filter(|&until| now < until);
+                // A burst cooldown steers fresh selection exactly like an overload backoff, so
+                // the selector reads one deadline — the later of the two. It is NOT folded into
+                // `overload_isolated_until`: a momentary burst must never release sticky owners.
+                let overload = rt.overload_backoff_until.filter(|&until| now < until);
+                let burst = rt.burst_backoff_until.filter(|&until| now < until);
+                snap.overload_backoff_until = match (overload, burst) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
                 snap.overload_isolated_until =
                     rt.overload_isolated_until.filter(|&until| now < until);
             }
@@ -1427,6 +1444,30 @@ impl RuntimeStates {
                 entry.1 = entry.1.saturating_add(1);
             }
         })
+    }
+
+    /// Engage (or extend) the short burst cooldown for a code-less upstream 429, returning the
+    /// applied seconds.
+    ///
+    /// A 429 whose body carries only a message — no `rate_limit_exceeded` or usage code — is a
+    /// momentary per-account burst/concurrency rejection, not a quota event: the same account
+    /// typically succeeds again within seconds. It must therefore neither flip the persisted
+    /// status nor write `cooldown_until`; it only steers FRESH selection away for a few seconds.
+    /// A rejection while already cooling down extends, never shortens, the deadline.
+    pub fn record_burst_rejection(
+        &self,
+        id: &AccountId,
+        now: i64,
+        retry_after: Option<i64>,
+    ) -> i64 {
+        let seconds = retry_after
+            .unwrap_or(BURST_BACKOFF_DEFAULT_SECS)
+            .clamp(BURST_BACKOFF_DEFAULT_SECS, BURST_BACKOFF_MAX_SECS);
+        self.mutate(id, |rt| {
+            let deadline = now + seconds;
+            rt.burst_backoff_until = Some(rt.burst_backoff_until.unwrap_or(deadline).max(deadline));
+        });
+        seconds
     }
 
     pub fn record_overload_rejection(
@@ -2408,6 +2449,68 @@ mod tests {
                 .values()
                 .fold((0, 0), |(ok, bad), (s, f)| (ok + s, bad + f)),
             (2, 0),
+        );
+    }
+
+    /// A code-less 429 is a blip, not a limit: it steers fresh selection for a few seconds and
+    /// leaves the account's bench state completely alone.
+    #[test]
+    fn a_burst_rejection_steers_selection_without_benching_the_account() {
+        let runtime = RuntimeStates::default();
+        let id = AccountId::from("bursty");
+        assert_eq!(runtime.record_burst_rejection(&id, 1_000, None), 5);
+        let mut snaps = vec![AccountSnapshot::new("bursty")];
+        runtime.overlay(&mut snaps, 1_001);
+        assert_eq!(
+            snaps[0].overload_backoff_until,
+            Some(1_005),
+            "fresh selection steers around it"
+        );
+        assert!(
+            snaps[0].overload_isolated_until.is_none(),
+            "a burst must never release sticky owners"
+        );
+        assert!(snaps[0].cooldown_until.is_none(), "never a bench");
+        assert_eq!(snaps[0].error_count, 0, "never an account-health mark");
+        // It ages out on its own.
+        let mut snaps = vec![AccountSnapshot::new("bursty")];
+        runtime.overlay(&mut snaps, 1_006);
+        assert!(snaps[0].overload_backoff_until.is_none());
+    }
+
+    /// `Retry-After` raises the deadline but a stale or hostile header cannot bench an account
+    /// for minutes, and a repeat while cooling extends rather than shortens.
+    #[test]
+    fn a_burst_cooldown_is_clamped_and_only_ever_extends() {
+        let runtime = RuntimeStates::default();
+        let id = AccountId::from("clamped");
+        assert_eq!(runtime.record_burst_rejection(&id, 1_000, Some(9_999)), 30);
+        assert_eq!(runtime.record_burst_rejection(&id, 1_000, Some(0)), 5);
+        let mut snaps = vec![AccountSnapshot::new("clamped")];
+        runtime.overlay(&mut snaps, 1_001);
+        assert_eq!(
+            snaps[0].overload_backoff_until,
+            Some(1_030),
+            "the later deadline stands"
+        );
+    }
+
+    /// The burst deadline and an overload backoff both mean "steer fresh work away", so the
+    /// selector reads whichever runs longer.
+    #[test]
+    fn a_burst_and_an_overload_backoff_resolve_to_the_later_deadline() {
+        let runtime = RuntimeStates::default();
+        let id = AccountId::from("both");
+        for n in 0..3 {
+            runtime.record_overload_rejection(&id, 1_000 + n, false, OVERLOAD_ISOLATION_SECS);
+        }
+        runtime.record_burst_rejection(&id, 1_002, Some(30));
+        let mut snaps = vec![AccountSnapshot::new("both")];
+        runtime.overlay(&mut snaps, 1_003);
+        assert_eq!(
+            snaps[0].overload_backoff_until,
+            Some(1_062),
+            "the 60s overload backoff outlasts the 30s burst"
         );
     }
 
