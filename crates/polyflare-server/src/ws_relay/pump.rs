@@ -598,12 +598,6 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
     // honoring the signal resends FULL history (anchorless — it cannot miss again); a client that
     // instead repeats an anchored attempt gets the raw miss verbatim rather than a signal loop.
     let mut anchor_resend_pending = false;
-    // One capacity-retry substitution until something SUCCEEDS on this connection. Resetting it
-    // per `response.create` would hand a fresh substitution to each of the client's own retries,
-    // so a persistently capacity-bound upstream would be answered "retry" over and over until the
-    // attempt budget ran out — every one of them a full-history resend. After one unheeded
-    // substitution the client gets the real error and can decide for itself.
-    let mut capacity_retry_pending = false;
     // Custom Responses targets are stateless behind the WS-to-SSE bridge. An anchored Codex delta
     // therefore needs the same bounded client full-resend handshake as a moved native socket.
     let mut custom_anchor_resend_pending = false;
@@ -1452,9 +1446,13 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                 // account `on_upstream_error` moves us to a few lines down.
                                 let substitute_capacity_retry = is_transient_overload(&sig)
                                     && !upstream_output_visible_for_turn
-                                    && !capacity_retry_pending;
+                                    && state.runtime.try_consume_capacity_substitution(
+                                        turn_telemetry
+                                            .as_ref()
+                                            .and_then(WsTurnTelemetry::logical_turn_key),
+                                        unix_now(),
+                                    );
                                 let text = if substitute_capacity_retry {
-                                    capacity_retry_pending = true;
                                     relay_metrics.record("capacity_retry_substituted");
                                     capacity_retry_error_frame()
                                 } else {
@@ -1670,9 +1668,6 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                 // (docs/incidents/2026-08-29-ws-turn-budget-leak.md).
                                 if let Some(key) = completed_turn_key.as_deref() {
                                     state.runtime.clear_logical_turn_attempts(Some(key));
-                                    // Something got through, so the connection has earned another
-                                    // capacity-retry substitution if it is refused again later.
-                                    capacity_retry_pending = false;
                                 }
                             }
                         }

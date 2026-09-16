@@ -88,6 +88,11 @@ const LOGICAL_TURN_ATTEMPT_CLEANUP_INTERVAL_SECS: i64 = 60;
 
 #[derive(Clone, Copy)]
 struct LogicalTurnAttempts {
+    /// Whether this logical turn has already spent its ONE capacity-retry substitution. Lives
+    /// here, not on the pump, because codex answers a retryable error by opening a NEW
+    /// connection: a per-connection flag reset on every retry, so the substitution recurred until
+    /// the attempt budget died (2026-09-17 07:23: seven forged resends in 70s, then a hard 400).
+    capacity_substitution_used: bool,
     consumed: u32,
     expires_at: i64,
     /// When the budget was last spent. An exhausted entry older than
@@ -907,6 +912,7 @@ impl RuntimeStates {
         registry.entries.insert(
             key.to_owned(),
             LogicalTurnAttempts {
+                capacity_substitution_used: false,
                 consumed: 1,
                 expires_at: now.saturating_add(LOGICAL_TURN_ATTEMPT_TTL_SECS),
                 last_consumed_at: now,
@@ -1430,6 +1436,50 @@ impl RuntimeStates {
     /// funnel as [`Self::record_success`]; failures are recorded ONLY for account-attributable
     /// upstream failures — a local refusal (our own capacity squeeze) is evidence about us, not
     /// about the account, and rate limits and quota have their own cooldown paths.
+    /// Claim this logical turn's ONE capacity-retry substitution, returning `true` if it was
+    /// still available.
+    ///
+    /// Scoped to the logical turn rather than the connection because codex answers a retryable
+    /// error by opening a NEW connection — a per-connection flag reset on every retry, so the
+    /// substitution recurred until the attempt budget died. A turn with no key (no `turn_id`)
+    /// cannot be tracked across reconnects, so it is refused: an untrackable substitution is the
+    /// unbounded case this exists to prevent.
+    pub fn try_consume_capacity_substitution(
+        &self,
+        logical_turn_key: Option<&str>,
+        now: i64,
+    ) -> bool {
+        let Some(key) = logical_turn_key else {
+            return false;
+        };
+        let mut registry = self
+            .logical_turn_attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match registry.entries.get_mut(key) {
+            Some(entry) if entry.capacity_substitution_used => false,
+            Some(entry) => {
+                entry.capacity_substitution_used = true;
+                true
+            }
+            // No entry yet means no attempt has been charged for this turn, which cannot happen
+            // on the path that reaches here (the send charged one). Record the claim so a later
+            // reconnect for the same turn cannot claim it again.
+            None => {
+                registry.entries.insert(
+                    key.to_owned(),
+                    LogicalTurnAttempts {
+                        capacity_substitution_used: true,
+                        consumed: 0,
+                        expires_at: now.saturating_add(LOGICAL_TURN_ATTEMPT_TTL_SECS),
+                        last_consumed_at: now,
+                    },
+                );
+                true
+            }
+        }
+    }
+
     pub fn record_outcome(&self, id: &AccountId, now: i64, success: bool) {
         self.mutate(id, |rt| {
             let oldest = error_rate_bucket(now - ERROR_RATE_WINDOW_SECS);
@@ -2471,6 +2521,50 @@ mod tests {
             (snaps[0].selection_weight_multiplier - 0.5).abs() < 0.01,
             "5 failures in 10 outcomes ⇒ 0.5, got {}",
             snaps[0].selection_weight_multiplier
+        );
+    }
+
+    /// The substitution must be spent ONCE per logical turn and stay spent across reconnects —
+    /// codex answers a retryable error by opening a new connection, so a per-connection flag reset
+    /// on every retry and the substitution recurred until the attempt budget died.
+    #[test]
+    fn a_capacity_substitution_is_one_per_logical_turn_across_reconnects() {
+        let runtime = RuntimeStates::default();
+        assert!(
+            runtime.try_consume_capacity_substitution(Some("turn-1"), 1_000),
+            "the first claim wins"
+        );
+        for _ in 0..5 {
+            assert!(
+                !runtime.try_consume_capacity_substitution(Some("turn-1"), 1_000),
+                "every later claim for the same turn is refused, connection or not"
+            );
+        }
+        assert!(
+            runtime.try_consume_capacity_substitution(Some("turn-2"), 1_000),
+            "a different turn has its own"
+        );
+        assert!(
+            !runtime.try_consume_capacity_substitution(None, 1_000),
+            "a turn with no key cannot be bounded across reconnects, so it is refused"
+        );
+    }
+
+    /// Claiming the substitution must not hand the turn a free attempt, or the anti-amplification
+    /// budget would be loosened by the very thing it bounds.
+    #[test]
+    fn claiming_a_substitution_does_not_grant_an_attempt() {
+        let runtime = RuntimeStates::default();
+        assert!(runtime.try_consume_capacity_substitution(Some("turn-x"), 1_000));
+        for n in 0..3 {
+            assert!(
+                runtime.try_consume_logical_turn_attempt(Some("turn-x"), 3, 1_000),
+                "attempt {n} must still be available"
+            );
+        }
+        assert!(
+            !runtime.try_consume_logical_turn_attempt(Some("turn-x"), 3, 1_000),
+            "and the budget still ends where it should"
         );
     }
 
