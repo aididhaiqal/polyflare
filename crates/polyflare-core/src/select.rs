@@ -477,6 +477,17 @@ fn sample_weighted(
     if pool.is_empty() {
         return None;
     }
+    // Discount each candidate by its recent upstream error rate. `error_count` is a latch — the
+    // next success zeroes it — so an account failing one request in three never looked unhealthy
+    // to the weighted strategies even though a third of the traffic routed there paid the
+    // failure. A fully failing account keeps a floor of its weight so the window keeps sampling
+    // it and the discount lifts the moment it recovers. DETERMINISTIC strategies never see this.
+    let weights: Vec<f64> = weights
+        .iter()
+        .zip(pool)
+        .map(|(weight, candidate)| weight * candidate.snap.selection_weight_multiplier)
+        .collect();
+    let weights = weights.as_slice();
     if weights.iter().all(|w| *w <= 0.0) {
         return Some(deterministic_min(pool).snap.id.clone());
     }
@@ -521,13 +532,23 @@ fn affinity_or_weighted_pick(
         return None;
     }
 
+    // Same error-rate discount as `sample_weighted` (the branches are mutually exclusive, so it
+    // is applied exactly once): a flaky account is a worse rendezvous target too.
     pool.iter()
         .zip(weights)
         .filter(|(_, weight)| weight.is_finite() && **weight > 0.0)
         .min_by(|(a, a_weight), (b, b_weight)| {
-            rendezvous_cost(session_id, a.snap.id.as_str(), **a_weight)
-                .total_cmp(&rendezvous_cost(session_id, b.snap.id.as_str(), **b_weight))
-                .then(a.snap.id.as_str().cmp(b.snap.id.as_str()))
+            rendezvous_cost(
+                session_id,
+                a.snap.id.as_str(),
+                **a_weight * a.snap.selection_weight_multiplier,
+            )
+            .total_cmp(&rendezvous_cost(
+                session_id,
+                b.snap.id.as_str(),
+                **b_weight * b.snap.selection_weight_multiplier,
+            ))
+            .then(a.snap.id.as_str().cmp(b.snap.id.as_str()))
         })
         .map(|(candidate, _)| candidate.snap.id.clone())
         .or_else(|| sample_weighted(pool, weights, ctx))
@@ -841,6 +862,63 @@ impl RoutingStrategy {
 #[cfg(test)]
 mod tests {
     use super::{drop_overload_backoff, overload_backoff_active};
+
+    /// `error_count` is a latch — the next success zeroes it — so a flaky account kept its full
+    /// weighted share. The multiplier is the standing discount that fixes that: with a seeded
+    /// draw, a heavily discounted account must lose share to a clean sibling of equal capacity.
+    #[test]
+    fn a_flaky_account_loses_weighted_share_but_never_all_of_it() {
+        let mut flaky = AccountSnapshot::new("flaky");
+        flaky.plan_type = "pro".to_string();
+        flaky.selection_weight_multiplier = 0.05;
+        let mut clean = AccountSnapshot::new("clean");
+        clean.plan_type = "pro".to_string();
+        let snaps = [flaky, clean];
+        let mut flaky_picks = 0;
+        for seed in 0..200u64 {
+            let ctx = SelectionCtx {
+                now: 1_000,
+                rng_seed: Some(seed),
+                ..Default::default()
+            };
+            if CapacityWeighted
+                .pick(&snaps, &ctx)
+                .as_ref()
+                .map(AccountId::as_str)
+                == Some("flaky")
+            {
+                flaky_picks += 1;
+            }
+        }
+        assert!(
+            flaky_picks > 0,
+            "the floor must keep sampling it so the discount can lift"
+        );
+        assert!(
+            flaky_picks < 40,
+            "a 0.05 multiplier must cost it most of its share, got {flaky_picks}/200"
+        );
+    }
+
+    /// Deterministic strategies pick by a stated rule, so the weight discount must not touch them.
+    #[test]
+    fn deterministic_strategies_ignore_the_weight_multiplier() {
+        let mut flaky = AccountSnapshot::new("a-flaky");
+        flaky.selection_weight_multiplier = 0.05;
+        let clean = AccountSnapshot::new("b-clean");
+        let ctx = SelectionCtx {
+            now: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            RoundRobin
+                .pick(&[flaky, clean], &ctx)
+                .as_ref()
+                .map(AccountId::as_str),
+            Some("a-flaky"),
+            "RoundRobin ties to the smaller id regardless of the weight discount"
+        );
+    }
 
     /// An account upstream keeps rejecting must lose FRESH selection to a clean sibling — the
     /// whole point of the window: it stays eligible (its live sessions are fine) but is not

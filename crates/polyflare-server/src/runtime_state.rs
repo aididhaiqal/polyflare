@@ -143,6 +143,37 @@ pub fn backoff_secs(error_count: u32) -> i64 {
     (BACKOFF_BASE_MS * (1i64 << shift)) / 1000
 }
 
+/// Outcome bucket width for the recent-error-rate weight.
+const ERROR_RATE_BUCKET_SECS: i64 = 60;
+/// Ten minutes of outcomes: long enough to smooth a burst, short enough that a recovered account
+/// regains its full share within one window.
+const ERROR_RATE_WINDOW_SECS: i64 = 600;
+/// Below this many outcomes the rate is noise and the multiplier stays neutral, so a quiet or
+/// brand-new account is never penalized on thin evidence.
+const ERROR_RATE_MIN_SAMPLES: u32 = 10;
+/// A fully failing account keeps this share of its weight, so the window keeps sampling it and the
+/// discount lifts as soon as it recovers.
+const ERROR_RATE_WEIGHT_FLOOR: f64 = 0.05;
+
+fn error_rate_bucket(now: i64) -> i64 {
+    now.div_euclid(ERROR_RATE_BUCKET_SECS)
+}
+
+/// The draw-weight multiplier in `[floor, 1.0]` for `rt`'s recent upstream error rate.
+fn error_rate_weight_multiplier(rt: &RuntimeState, now: i64) -> f64 {
+    let oldest = error_rate_bucket(now - ERROR_RATE_WINDOW_SECS);
+    let (successes, failures) = rt
+        .outcome_buckets
+        .range(oldest..)
+        .fold((0u32, 0u32), |(ok, bad), (_, (s, f))| (ok + s, bad + f));
+    let samples = successes + failures;
+    if samples < ERROR_RATE_MIN_SAMPLES {
+        return 1.0;
+    }
+    let error_rate = f64::from(failures) / f64::from(samples);
+    (1.0 - error_rate).max(ERROR_RATE_WEIGHT_FLOOR)
+}
+
 /// Upstream error codes meaning "admission refused: overloaded".
 pub const UPSTREAM_OVERLOAD_CODES: [&str; 2] = ["server_is_overloaded", "overloaded_error"];
 /// Codes carrying the same observable shape without naming overload. Upstream returns a bare
@@ -234,6 +265,11 @@ pub struct RuntimeState {
     pub overload_isolated_until: Option<i64>,
     /// When the window last tripped, for the level decay.
     pub overload_last_trip_at: Option<i64>,
+    /// Minute buckets of upstream outcomes — `bucket index -> (successes, failures)` — behind the
+    /// recent-error-rate draw weight. Separate from `error_count` because that is a LATCH: the
+    /// next success zeroes it, so an account failing one request in three never looked unhealthy
+    /// to the weighted strategies even though a third of the traffic there paid the failure.
+    pub outcome_buckets: std::collections::BTreeMap<i64, (u32, u32)>,
 }
 
 impl RuntimeState {
@@ -1199,6 +1235,7 @@ impl RuntimeStates {
                 snap.in_flight = rt.in_flight;
                 snap.in_flight_pressure = rt.in_flight_pressure;
                 snap.open_ws = rt.open_ws;
+                snap.selection_weight_multiplier = error_rate_weight_multiplier(rt, now);
                 // Only while ACTIVE, like `cooldown_until` above: a stale deadline handed to the
                 // selector would read as a live backoff forever.
                 snap.overload_backoff_until =
@@ -1372,6 +1409,26 @@ impl RuntimeStates {
     ///   upstream was refusing. That is why this window is never reset by a success.
     ///
     /// Ported from codex-lb's `overload_backoff.py`, constants included.
+    /// Record one upstream outcome for the recent-error-rate weight. Successes come from the same
+    /// funnel as [`Self::record_success`]; failures are recorded ONLY for account-attributable
+    /// upstream failures — a local refusal (our own capacity squeeze) is evidence about us, not
+    /// about the account, and rate limits and quota have their own cooldown paths.
+    pub fn record_outcome(&self, id: &AccountId, now: i64, success: bool) {
+        self.mutate(id, |rt| {
+            let oldest = error_rate_bucket(now - ERROR_RATE_WINDOW_SECS);
+            rt.outcome_buckets.retain(|bucket, _| *bucket >= oldest);
+            let entry = rt
+                .outcome_buckets
+                .entry(error_rate_bucket(now))
+                .or_default();
+            if success {
+                entry.0 = entry.0.saturating_add(1);
+            } else {
+                entry.1 = entry.1.saturating_add(1);
+            }
+        })
+    }
+
     pub fn record_overload_rejection(
         &self,
         id: &AccountId,
@@ -1433,6 +1490,17 @@ impl RuntimeStates {
 
     pub fn record_success(&self, id: &AccountId) -> Option<HealthTierTransition> {
         self.mutate(id, |rt| {
+            // The success half of the recent-error-rate weight, recorded on the same funnel that
+            // clears the latch — so the window can never see failures without the successes that
+            // put them in proportion.
+            let bucket_now = unix_now();
+            let oldest = error_rate_bucket(bucket_now - ERROR_RATE_WINDOW_SECS);
+            rt.outcome_buckets.retain(|bucket, _| *bucket >= oldest);
+            let entry = rt
+                .outcome_buckets
+                .entry(error_rate_bucket(bucket_now))
+                .or_default();
+            entry.0 = entry.0.saturating_add(1);
             rt.error_count = 0;
             rt.last_error_at = None;
             if rt.health_tier == 2 {
@@ -2249,6 +2317,109 @@ impl RuntimeStates {
 mod tests {
     use super::{OVERLOAD_ISOLATION_SECS, SOFT_OVERLOAD_TRIP_WEIGHT};
 
+    /// The whole point of the outcome window: `error_count` is zeroed by the next success, so an
+    /// account failing one request in three looked perfectly healthy. The weight multiplier must
+    /// see the real rate.
+    #[test]
+    fn a_one_in_three_failure_rate_discounts_the_draw_weight() {
+        let runtime = RuntimeStates::default();
+        let id = AccountId::from("flaky");
+        let now = 10_000;
+        for _ in 0..4 {
+            runtime.record_outcome(&id, now, true);
+            runtime.record_outcome(&id, now, true);
+            runtime.record_outcome(&id, now, false);
+        }
+        let mut snaps = vec![AccountSnapshot::new("flaky")];
+        runtime.overlay(&mut snaps, now);
+        let multiplier = snaps[0].selection_weight_multiplier;
+        assert!(
+            (multiplier - 2.0 / 3.0).abs() < 0.02,
+            "4 failures in 12 outcomes ⇒ ~0.67, got {multiplier}"
+        );
+    }
+
+    /// Thin evidence must never penalize a quiet or brand-new account.
+    #[test]
+    fn too_few_samples_leave_the_weight_neutral() {
+        let runtime = RuntimeStates::default();
+        let id = AccountId::from("quiet");
+        for _ in 0..9 {
+            runtime.record_outcome(&id, 10_000, false);
+        }
+        let mut snaps = vec![AccountSnapshot::new("quiet")];
+        runtime.overlay(&mut snaps, 10_000);
+        assert_eq!(
+            snaps[0].selection_weight_multiplier, 1.0,
+            "nine outcomes is below the sample floor"
+        );
+        runtime.record_outcome(&id, 10_000, false);
+        let mut snaps = vec![AccountSnapshot::new("quiet")];
+        runtime.overlay(&mut snaps, 10_000);
+        assert!(
+            snaps[0].selection_weight_multiplier < 1.0,
+            "the tenth outcome reaches the floor and the discount applies"
+        );
+    }
+
+    /// A fully failing account keeps a floor of its weight, so the window keeps sampling it and
+    /// the discount can lift; and the window is only ten minutes, so recovery is fast.
+    #[test]
+    fn a_totally_failing_account_keeps_the_floor_and_recovers_within_the_window() {
+        let runtime = RuntimeStates::default();
+        let id = AccountId::from("down");
+        for _ in 0..12 {
+            runtime.record_outcome(&id, 10_000, false);
+        }
+        let mut snaps = vec![AccountSnapshot::new("down")];
+        runtime.overlay(&mut snaps, 10_000);
+        assert!(
+            snaps[0].selection_weight_multiplier > 0.0,
+            "never zero: it must stay reachable to prove it recovered"
+        );
+        assert!(snaps[0].selection_weight_multiplier <= 0.05 + f64::EPSILON);
+        // Everything ages out of the ten-minute window (past the boundary bucket).
+        let mut snaps = vec![AccountSnapshot::new("down")];
+        runtime.overlay(&mut snaps, 10_000 + 700);
+        assert_eq!(
+            snaps[0].selection_weight_multiplier, 1.0,
+            "a recovered account regains its full share within one window"
+        );
+    }
+
+    /// The success half must ride the SAME funnel that clears the latch, or the window would see
+    /// failures without the successes that put them in proportion and punish a healthy account.
+    #[test]
+    fn record_success_feeds_the_outcome_window_too() {
+        let runtime = RuntimeStates::default();
+        let id = AccountId::from("served");
+        runtime.record_success(&id);
+        runtime.record_success(&id);
+        let entry = runtime
+            .inner
+            .read()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .expect("entry present");
+        assert_eq!(
+            entry
+                .outcome_buckets
+                .values()
+                .fold((0, 0), |(ok, bad), (s, f)| (ok + s, bad + f)),
+            (2, 0),
+        );
+    }
+
+    /// An account nobody has touched carries the neutral weight.
+    #[test]
+    fn an_unknown_account_is_neutral() {
+        let runtime = RuntimeStates::default();
+        let mut snaps = vec![AccountSnapshot::new("never-seen")];
+        runtime.overlay(&mut snaps, 10_000);
+        assert_eq!(snaps[0].selection_weight_multiplier, 1.0);
+    }
+
     /// The whole reason this window exists: an account whose warm turns keep completing while
     /// upstream refuses its FRESH admissions. Successes zero `error_count`, so the drain tier
     /// never latches — the overload window must survive them and trip anyway.
@@ -2986,10 +3157,22 @@ mod tests {
         );
         assert_eq!(snaps[0].error_count, 0);
         assert_eq!(snaps[0].last_error_at, None);
+        // The recent-error-rate window still holds those three successes, so the entry is no
+        // longer "fully neutral" the instant the tier clears — it is GC'd once the window ages
+        // out instead. Dropping it sooner would throw away the evidence that separates a healthy
+        // account from one whose failures were merely latched away by its next success.
+        let remaining = peek(&rs, &id).expect("the outcome window keeps the entry alive");
+        assert_eq!(remaining.health_tier, 0);
+        assert_eq!(remaining.error_count, 0);
+        assert!(remaining.drain_entered_at.is_none());
+        assert!(remaining.cooldown_until.is_none());
         assert_eq!(
-            peek(&rs, &id),
-            None,
-            "HEALTHY + cleared aux + zero error state is fully neutral ⇒ GC'd from the map"
+            remaining
+                .outcome_buckets
+                .values()
+                .fold((0, 0), |(ok, bad), (s, f)| (ok + s, bad + f)),
+            (3, 0),
+            "HEALTHY + cleared aux + zero error state ⇒ only the outcome window remains"
         );
     }
 

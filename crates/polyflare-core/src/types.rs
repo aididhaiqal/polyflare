@@ -454,6 +454,10 @@ pub struct AccountSnapshot {
     /// Every named routing group this account can serve. `pool` remains the backward-compatible
     /// primary label; routing membership checks use this complete set.
     pub pools: Vec<String>,
+    /// Multiplier in `[0,1]` applied to this account's WEIGHTED draw weight, from its recent
+    /// upstream error rate. `1.0` is neutral (quiet account, or too few samples to judge).
+    /// Deterministic strategies and sticky owners never consult it.
+    pub selection_weight_multiplier: f64,
     /// Deadline until which FRESH selection deprioritizes this account after upstream kept
     /// rejecting its admissions as overloaded (`server_is_overloaded`). Distinct from
     /// `cooldown_until`: an overloaded account's LIVE sessions keep flowing, so it is never
@@ -492,6 +496,7 @@ impl AccountSnapshot {
             usage_cap_override: false,
             routing_policy: "normal".to_string(),
             health_tier: 0,
+            selection_weight_multiplier: 1.0,
             overload_backoff_until: None,
             overload_isolated_until: None,
             error_count: 0,
