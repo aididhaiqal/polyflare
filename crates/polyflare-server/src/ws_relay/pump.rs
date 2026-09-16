@@ -1919,10 +1919,24 @@ const OVERLOAD_RETRY_AFTER_HONOUR_MAX_SECS: i64 = 5;
 
 /// An upstream refusal that clears in seconds on the SAME account: the explicit overload codes,
 /// or a bare 503. A 429 is NOT one — quota and rate-limit handling stay with `on_upstream_error`.
+/// Whether this failure is a CAPACITY-SHAPED terminal — upstream took the turn and then gave it
+/// back without producing anything — so the relay may move or resend it.
+///
+/// `server_error` is included deliberately. Upstream returns a bare `server_error` for both a
+/// one-off fault AND sustained capacity refusal, and the two are indistinguishable in the frame,
+/// so excluding it meant the single most common failure our clients actually saw was forwarded
+/// verbatim while a sibling sat idle: 19 of 34 user-visible failures in six hours on 2026-09-16,
+/// every one of them before a single output token.
+///
+/// Replaying is safe precisely because the caller gates this on `upstream_output_visible_for_turn`
+/// being false. Every side effect of a turn is reported as an output item or as billed output
+/// tokens, so a turn that produced neither is as replay-safe as one that failed before it was
+/// created. The retry/move budget is bounded per turn, so a genuinely deterministic 500 still
+/// reaches the client after those attempts rather than looping.
 fn is_transient_overload(sig: &FailureSignal) -> bool {
     matches!(
         sig.error_code.as_deref(),
-        Some("server_is_overloaded" | "slow_down")
+        Some("server_is_overloaded" | "overloaded_error" | "slow_down" | "server_error")
     ) || (sig.status == 503 && sig.error_code.is_none())
 }
 
@@ -2096,8 +2110,16 @@ mod tests {
             429,
             Some("rate_limit_exceeded")
         )));
-        assert!(!is_transient_overload(&sig(500, Some("server_error"))));
+        // A capacity-shaped terminal: upstream took the turn and returned nothing. Indistinguishable
+        // from a one-off fault in the frame, and the caller only reaches here with no output
+        // visible, so it is moved/resent rather than forwarded.
+        assert!(is_transient_overload(&sig(500, Some("server_error"))));
+        assert!(is_transient_overload(&sig(503, Some("overloaded_error"))));
         assert!(!is_transient_overload(&sig(400, None)));
+        assert!(!is_transient_overload(&sig(
+            400,
+            Some("invalid_request_error")
+        )));
     }
 
     #[test]

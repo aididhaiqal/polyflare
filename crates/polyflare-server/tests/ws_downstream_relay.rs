@@ -1533,6 +1533,64 @@ mod relay_through {
         assert_eq!(mock.handshake_count(), 0);
     }
 
+    /// 2026-09-16: a bare `server_error` with no output was the single most common failure the
+    /// client actually saw — 19 of 34 in six hours, every one before a token — because it fell
+    /// outside the capacity-terminal set and was forwarded verbatim while a sibling sat idle.
+    /// It must be moved like any other capacity-shaped terminal.
+    #[tokio::test]
+    async fn a_bare_server_error_with_no_output_moves_to_a_sibling() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::Failed {
+                code: "server_error".to_string(),
+                message: "internal".to_string(),
+            },
+            ScriptedTurn::normal(Vec::new()),
+        ]);
+        let mock_base = mock.clone().spawn().await;
+        let (base, state) = spawn_with_two_accounts("acct-se-a", "acct-se-b", &mock_base).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        ws.send(TMessage::Text(
+            r#"{"type":"response.create","input":[{"role":"user","content":"a"}],"client_metadata":{"turn_id":"t-se"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(15), ws.next())
+            .await
+            .expect("a reply")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            reply["type"], "response.completed",
+            "the server_error must be hidden behind the move, got: {reply}"
+        );
+        assert_eq!(
+            mock.handshake_authorizations(),
+            vec![
+                Some("Bearer tok-acct-se-a".to_string()),
+                Some("Bearer tok-acct-se-b".to_string())
+            ],
+            "the retry must ride a DIFFERENT account"
+        );
+        let snapshot = state.relay_metrics.snapshot();
+        assert_eq!(
+            snapshot
+                .iter()
+                .find(|(k, _)| k == "overload_move_cross_account")
+                .map(|(_, v)| *v)
+                .unwrap_or(0),
+            1,
+            "{snapshot:?}"
+        );
+    }
+
     /// 2026-09-15: an overload on an ANCHORED turn must not be "retried" by re-dialing — the
     /// anchor lived on the retired socket, so the resend misses every time (107 of 107 on the
     /// master) and the turn pays a whole extra upstream round trip before the forged resend
