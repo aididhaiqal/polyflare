@@ -135,7 +135,10 @@ mod tests {
             r#"{"type":"error","status":400,"error":{"code":"invalid_request_error","param":"previous_response_id"}}"#,
         ] {
             assert!(
-                matches!(classify_upstream_signal(frame), UpstreamSignal::AnchorMissing),
+                matches!(
+                    classify_upstream_signal(frame),
+                    UpstreamSignal::AnchorMissing
+                ),
                 "must classify as an anchor miss: {frame}"
             );
         }

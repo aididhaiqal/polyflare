@@ -863,6 +863,27 @@ impl RoutingStrategy {
 mod tests {
     use super::{drop_overload_backoff, overload_backoff_active};
 
+    /// A SHORT backoff must leave an established owner alone — a brief burst must not churn warm
+    /// sessions — while the pool still steers FRESH work away from it. Only isolation releases the
+    /// owner, and that decision lives in the resolver, not here.
+    #[test]
+    fn a_backed_off_account_is_still_selectable_when_it_is_the_only_candidate() {
+        let mut hot = AccountSnapshot::new("hot");
+        hot.overload_backoff_until = Some(2_000);
+        let ctx = SelectionCtx {
+            now: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            RoundRobin
+                .pick(std::slice::from_ref(&hot), &ctx)
+                .as_ref()
+                .map(AccountId::as_str),
+            Some("hot"),
+            "a narrowed owner pool of one must still yield its owner"
+        );
+    }
+
     /// `error_count` is a latch — the next success zeroes it — so a flaky account kept its full
     /// weighted share. The multiplier is the standing discount that fixes that: with a seeded
     /// draw, a heavily discounted account must lose share to a clean sibling of equal capacity.

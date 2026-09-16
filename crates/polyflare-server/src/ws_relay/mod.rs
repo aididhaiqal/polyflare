@@ -258,7 +258,7 @@ async fn responses_ws_upgrade(
         .get(crate::config::CAPABILITY_HEADER)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.trim() == crate::config::SECURITY_WORK_CAPABILITY);
-    let (account, ws_guard) = match resolve_owner(
+    let (account, ws_guard, spilled_from) = match resolve_owner(
         &state,
         &session_key,
         session_id.as_deref(),
@@ -335,7 +335,17 @@ async fn responses_ws_upgrade(
         .clone()
         .with_models_etag(catalog_etag.clone());
     let ws_pressure = Arc::new(Mutex::new(Some(ws_guard)));
+    if let Some(owner) = spilled_from.as_ref() {
+        tracing::info!(
+            target: "polyflare_server::routing",
+            owner_account = %owner.as_str(),
+            served_by = %account.id,
+            "session owner is in overload isolation; this connection is served by a sibling and \
+             the session stays pointed home"
+        );
+    }
     let routing_scope = RelayRoutingScope {
+        spilled_from,
         pool,
         session_id,
         require_security_work_authorized,
@@ -471,6 +481,10 @@ struct RelayRoutingScope {
     pool: Option<String>,
     session_id: Option<String>,
     require_security_work_authorized: bool,
+    /// Set when this connection was handed a sibling because the session's own owner is in
+    /// sustained overload isolation. Fences the completion writeback so the session row keeps
+    /// pointing at the owner and the thread returns home once isolation lifts.
+    spilled_from: Option<AccountId>,
 }
 
 /// The post-upgrade relay future. Owner resolution and the initial upstream handshake have already
@@ -505,9 +519,11 @@ async fn relay(
     let on_completed_id = {
         let continuity = continuity.clone();
         let session_key = session_key.clone();
+        let spilled_from = routing_scope.spilled_from.clone();
         move |account_id: AccountId, response_id: String| {
             let continuity = continuity.clone();
             let session_key = session_key.clone();
+            let spilled_from = spilled_from.clone();
             async move {
                 let _ = continuity
                     .observe(
@@ -522,14 +538,22 @@ async fn relay(
                             input_fingerprint: String::new(),
                             input_count: 0,
                             reasoning: None,
-                            // `None` = unfenced, deliberately (the soft-affinity fence on
-                            // `record_completion` is for the HTTP spill path). The relay's account
-                            // only ever changes through the exhaustion-move engine below, which
-                            // RE-ESTABLISHES the conversation on the new account — the same
-                            // "deliberate owner-mover" category as `record_recovery` — so the
-                            // account that produced this id must become the owner, per the
-                            // per-call-account note above.
-                            expected_owner: None,
+                            // Normally `None` — unfenced. The relay's account only changes
+                            // through the exhaustion-move engine below, which RE-ESTABLISHES the
+                            // conversation on the new account (the same "deliberate owner-mover"
+                            // category as `record_recovery`), so the account that produced this
+                            // id must become the owner.
+                            //
+                            // The ONE exception is an ISOLATION RELEASE: this connection was
+                            // handed a sibling only because the session's own owner is in
+                            // sustained overload. That release is request-local, so the fence
+                            // keeps `owning_account_id` pointing home and the thread returns
+                            // there once isolation lifts. Rebinding instead is what codex-lb
+                            // measured as strictly worse — nothing ever returned a rebound
+                            // thread to its owner.
+                            expected_owner: spilled_from
+                                .as_ref()
+                                .map(|owner| owner.as_str().to_string()),
                         },
                         &RequestCtx::default(),
                     )
@@ -608,7 +632,7 @@ async fn relay(
                 // otherwise a global limit of one (or a saturated fleet) deadlocks the handoff on
                 // its own stale guard until the admission timeout expires.
                 drop(ws_pressure.lock().unwrap_or_else(|e| e.into_inner()).take());
-                let (new_account, new_ws_guard) = resolve_owner(
+                let (new_account, new_ws_guard, _spilled_from) = resolve_owner(
                     &state,
                     &session_key,
                     session_id.as_deref(),

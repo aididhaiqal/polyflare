@@ -81,7 +81,7 @@ pub(crate) async fn resolve_owner(
     session_id: Option<&str>,
     pool: Option<&str>,
     require_security_work_authorized: bool,
-) -> Result<(Account, WsSocketGuard), RelayError> {
+) -> Result<(Account, WsSocketGuard, Option<polyflare_core::AccountId>), RelayError> {
     // The returned `AccountId` is discarded — the caller pins the full `Account`; the ownership map
     // is written later by Task 6 (`observe`), not here.
     match crate::control::resolve_owner_affine_ws_account_with_capability(
@@ -93,7 +93,7 @@ pub(crate) async fn resolve_owner(
     )
     .await
     {
-        Ok((account, _id, guard)) => Ok((account, guard)),
+        Ok((account, _id, guard, spilled_from)) => Ok((account, guard, spilled_from)),
         // Map the shared engine's client-facing error `Response` back into a relay error by status:
         // `503` is `no_eligible()` (no owner AND no selectable fallback); anything else is the
         // generic `internal_error()` (e.g. a snapshot/account read failure).
@@ -117,6 +117,9 @@ pub(crate) async fn resolve_owner_excluding(
     require_security_work_authorized: bool,
     exclude: &[polyflare_core::AccountId],
 ) -> Result<(Account, WsSocketGuard), RelayError> {
+    // The mid-turn move is a DELIBERATE owner-mover (the account failed while serving this
+    // connection), so it re-homes the session as before and never fences the writeback — unlike
+    // the isolation release at handshake time, which is request-local.
     match crate::control::resolve_owner_affine_ws_account_excluding(
         state,
         Some(session_key),
@@ -127,7 +130,7 @@ pub(crate) async fn resolve_owner_excluding(
     )
     .await
     {
-        Ok((account, _id, guard)) => Ok((account, guard)),
+        Ok((account, _id, guard, _spilled_from)) => Ok((account, guard)),
         Err(resp) => match resp.status() {
             axum::http::StatusCode::SERVICE_UNAVAILABLE => Err(RelayError::NoEligibleAccount),
             _ => Err(RelayError::Internal),
@@ -417,7 +420,7 @@ mod tests {
         let key = session_key("conv-owned");
         pin_owner(&state.store, &key, "B").await;
 
-        let (account, _guard) = resolve_owner(&state, &key, None, None, false)
+        let (account, _guard, _spilled) = resolve_owner(&state, &key, None, None, false)
             .await
             .expect("pinned owner reused");
         assert_eq!(
@@ -435,7 +438,7 @@ mod tests {
         seed_account(&state.store, &state.cipher, "B", "tokB").await;
         let key = session_key("conv-fresh-unseen");
 
-        let (account, _guard) = resolve_owner(&state, &key, None, None, false)
+        let (account, _guard, _spilled) = resolve_owner(&state, &key, None, None, false)
             .await
             .expect("an unpinned conversation must select a healthy account, not error");
         assert_eq!(
@@ -471,7 +474,7 @@ mod tests {
         seed_account(&state.store, &state.cipher, "B", "tokB").await;
         let key = session_key("conv-family-affinity");
 
-        let (account, _socket_guard) =
+        let (account, _socket_guard, _spilled) =
             resolve_owner(&state, &key, Some("family-main-and-subagents"), None, false)
                 .await
                 .expect("an unpinned WS conversation must use the family-aware selector");
@@ -507,7 +510,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (account, _guard) = resolve_owner(&state, &key, None, None, false)
+        let (account, _guard, _spilled) = resolve_owner(&state, &key, None, None, false)
             .await
             .expect("the authorized account is eligible");
         assert_eq!(
@@ -635,7 +638,7 @@ mod tests {
             &state.rate_limit_metrics,
         );
 
-        let (account, _guard) = resolve_owner(&state, &key, None, None, false)
+        let (account, _guard, _spilled) = resolve_owner(&state, &key, None, None, false)
             .await
             .expect("an ineligible pin must re-select, never strand the connection");
         assert_ne!(account.id, "A", "must NOT return the benched pinned owner");

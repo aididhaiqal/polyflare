@@ -89,7 +89,7 @@ pub(crate) async fn resolve_owner_affine_account_with_capability(
     pool: Option<&str>,
     require_security_work_authorized: bool,
 ) -> Result<(Account, AccountId), Response> {
-    let (account, id, _reservation) = resolve_owner_affine_account_inner(
+    let (account, id, _reservation, _spilled_from) = resolve_owner_affine_account_inner(
         state,
         session_key,
         None,
@@ -109,7 +109,7 @@ pub(crate) async fn resolve_owner_affine_ws_account_with_capability(
     session_id: Option<&str>,
     pool: Option<&str>,
     require_security_work_authorized: bool,
-) -> Result<(Account, AccountId, WsSocketGuard), Response> {
+) -> Result<(Account, AccountId, WsSocketGuard, Option<AccountId>), Response> {
     resolve_owner_affine_ws_account_excluding(
         state,
         session_key,
@@ -136,8 +136,8 @@ pub(crate) async fn resolve_owner_affine_ws_account_excluding(
     pool: Option<&str>,
     require_security_work_authorized: bool,
     exclude: &[AccountId],
-) -> Result<(Account, AccountId, WsSocketGuard), Response> {
-    let (account, id, reservation) = resolve_owner_affine_account_inner(
+) -> Result<(Account, AccountId, WsSocketGuard, Option<AccountId>), Response> {
+    let (account, id, reservation, spilled_from) = resolve_owner_affine_account_inner(
         state,
         session_key,
         session_id,
@@ -151,7 +151,7 @@ pub(crate) async fn resolve_owner_affine_ws_account_excluding(
     let OwnerReservation::OpenWs(guard) = reservation else {
         unreachable!("WS account resolution always reserves socket pressure")
     };
-    Ok((account, id, guard))
+    Ok((account, id, guard, spilled_from))
 }
 
 async fn resolve_owner_affine_unary_account(
@@ -160,7 +160,7 @@ async fn resolve_owner_affine_unary_account(
     pool: Option<&str>,
     model: Option<&str>,
 ) -> Result<(Account, AccountId, InFlightGuard), Response> {
-    let (account, id, lease) = resolve_owner_affine_account_inner(
+    let (account, id, lease, _spilled_from) = resolve_owner_affine_account_inner(
         state,
         session_key,
         None,
@@ -225,7 +225,7 @@ async fn resolve_owner_affine_account_inner(
     reservation_kind: ReservationKind,
     model: Option<&str>,
     exclude: &[AccountId],
-) -> Result<(Account, AccountId, OwnerReservation), Response> {
+) -> Result<(Account, AccountId, OwnerReservation, Option<AccountId>), Response> {
     let now = unix_now();
 
     let snapshots = match state.account_cache.snapshots(&state.store).await {
@@ -269,6 +269,29 @@ async fn resolve_owner_affine_account_inner(
     };
 
     // Step 2 (eligibility) + Step 3 (inviolable fallback).
+    // ISOLATION RELEASE. A short overload backoff deliberately leaves an established owner
+    // alone — a brief burst must not churn warm sessions. Sustained overload is different: the
+    // owner is refusing most fresh admissions, and every turn that re-enters it is a fresh
+    // admission, so keeping the thread pinned just replays the rejection wait per turn. While
+    // the owner is isolated AND some sibling is outside the overload window, the turn is served
+    // by that sibling instead.
+    //
+    // The release is REQUEST-LOCAL: the caller fences the completion writeback with
+    // `spilled_from`, so the session row keeps pointing at the owner and the thread returns home
+    // once isolation lifts. codex-lb measured the alternative — rebinding the thread — as
+    // strictly worse: nothing ever returned a rebound thread to its owner, so every isolation
+    // episode a conversation touched added one more account to it permanently (accounts per
+    // conversation 1.02 quiet, 2.29 healthy day, 3.45 during an incident).
+    let isolated_owner = owner.as_ref().filter(|owner_id| {
+        snapshots.iter().any(|s| {
+            &&s.id == owner_id && s.overload_isolated_until.is_some_and(|until| until > now)
+        }) && snapshots.iter().any(|s| {
+            Some(&s.id) != owner.as_ref()
+                && !polyflare_core::select::overload_backoff_active(s, now)
+        })
+    });
+    let spilled_from = isolated_owner.cloned();
+    let owner = if spilled_from.is_some() { None } else { owner };
     let (picked, reservation) = match owner {
         Some(owner_id) => {
             let narrowed: Vec<_> = snapshots
@@ -328,7 +351,11 @@ async fn resolve_owner_affine_account_inner(
     };
 
     let (account, _provider) = resolve_core_account(state, &picked, now).await?;
-    Ok((account, picked, reservation))
+    // Only a genuine substitution is a spill: if the isolated owner ended up serving anyway (no
+    // sibling survived the selector's own gates), the turn is on its own account and nothing
+    // needs fencing.
+    let spilled_from = spilled_from.filter(|owner_id| owner_id != &picked);
+    Ok((account, picked, reservation, spilled_from))
 }
 
 /// D17's control-endpoint entry point. Control requests have no body ⇒ a header-only session key
