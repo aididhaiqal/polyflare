@@ -175,8 +175,19 @@ struct RoutingHealthView {
     overload_backoff_until: Option<i64>,
     /// Whether that backoff reached the ISOLATION stage (sustained overload).
     overload_isolated: bool,
-    /// Whether selection currently avoids this account: an active cooldown, an overload backoff,
-    /// or a non-healthy tier. `false` means it competes normally.
+    /// Set when the account's STORED status is what keeps it out of selection, naming the gate:
+    /// `hard_blocked` (`reauth_required`/`deactivated`/`paused` — selection refuses it outright,
+    /// no reset will help) or `awaiting_reset` (`rate_limited`/`quota_exceeded` — it returns when
+    /// its window rolls). `None` while the status itself is not blocking.
+    blocked_by_status: Option<&'static str>,
+    /// Whether selection currently avoids this account, for ANY reason: a blocking status, an
+    /// active cooldown, an overload backoff, or a non-healthy tier. `false` means it competes
+    /// normally.
+    ///
+    /// This must consider the stored status too. It did not, and an account that selection
+    /// HARD-BLOCKS (2026-09-16: the team seat left `reauth_required` by the seat-collision bug,
+    /// holding the only spare weekly quota in the fleet) was reported as `healthy` and not
+    /// sidelined — so the dashboard showed eight usable accounts when only two could serve.
     sidelined: bool,
 }
 
@@ -190,6 +201,7 @@ impl RoutingHealthView {
             last_error_at: None,
             overload_backoff_until: None,
             overload_isolated: false,
+            blocked_by_status: None,
             sidelined: false,
         }
     }
@@ -202,6 +214,13 @@ impl RoutingHealthView {
             _ => "probing",
         };
         let overload_backoff_until = snap.overload_backoff_until.filter(|until| *until > now);
+        // Mirrors `select::eligibility`'s own status gates, so the dashboard and the selector can
+        // never disagree about whether an account is usable at all.
+        let blocked_by_status = match snap.status.as_str() {
+            "reauth_required" | "deactivated" | "paused" => Some("hard_blocked"),
+            "rate_limited" | "quota_exceeded" => Some("awaiting_reset"),
+            _ => None,
+        };
         Self {
             tier: snap.health_tier,
             tier_label,
@@ -212,7 +231,9 @@ impl RoutingHealthView {
             overload_isolated: snap
                 .overload_isolated_until
                 .is_some_and(|until| until > now),
-            sidelined: cooldown_until.is_some()
+            blocked_by_status,
+            sidelined: blocked_by_status.is_some()
+                || cooldown_until.is_some()
                 || overload_backoff_until.is_some()
                 || snap.health_tier != 0,
         }

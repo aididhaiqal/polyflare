@@ -648,7 +648,13 @@ function RoutingBadge({
 }) {
   let label: string | null = null;
   let title = "";
-  if (routing.overload_backoff_until !== null) {
+  if (routing.blocked_by_status === "hard_blocked") {
+    // Ranked first: no amount of waiting fixes this one, and an account in this state used to
+    // read as "healthy" here while selection refused it outright.
+    label = "unusable";
+    title =
+      "Selection refuses this account outright — it needs attention (re-authentication, or it is paused/deactivated). No reset will bring it back.";
+  } else if (routing.overload_backoff_until !== null) {
     // Ranked above the generic tiers on purpose: this is the state that used to be invisible,
     // because an overloaded account keeps completing warm turns and so never looked unhealthy.
     label = `${routing.overload_isolated ? "overloaded" : "busy"} · ${countdown(routing.overload_backoff_until, nowMs)}`;

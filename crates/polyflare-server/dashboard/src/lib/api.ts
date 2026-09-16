@@ -161,6 +161,9 @@ export interface RoutingHealthView {
   overload_backoff_until: number | null;
   /** Whether that backoff reached the isolation stage (sustained overload). */
   overload_isolated: boolean;
+  /** Set when the stored status is what keeps this account out of selection: "hard_blocked"
+   * (reauth/deactivated/paused — no reset will help) or "awaiting_reset". */
+  blocked_by_status: "hard_blocked" | "awaiting_reset" | null;
   /** True when selection currently avoids this account. */
   sidelined: boolean;
 }

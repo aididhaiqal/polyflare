@@ -372,6 +372,43 @@ async fn accounts_list_surfaces_live_routing_health_from_the_runtime_overlay() {
         "cooldown_until: {until} vs now {now}"
     );
 
+    // An account whose STORED status hard-blocks selection must read as sidelined. It did not,
+    // and the one account holding spare quota showed as healthy while selection refused it.
+    state
+        .store
+        .accounts()
+        .update_status("codex-b", "reauth_required")
+        .await
+        .unwrap();
+    state.account_cache.invalidate();
+    let blocked: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/accounts"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rb_blocked = &blocked
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "codex-b")
+        .expect("codex-b")["routing"];
+    assert_eq!(
+        rb_blocked["blocked_by_status"], "hard_blocked",
+        "{rb_blocked}"
+    );
+    assert_eq!(rb_blocked["sidelined"], true, "{rb_blocked}");
+    state
+        .store
+        .accounts()
+        .update_status("codex-b", "active")
+        .await
+        .unwrap();
+    state.account_cache.invalidate();
+
     let rb = &find("codex-b")["routing"];
     assert_eq!(rb["recent_errors"], 2, "{rb}");
     assert_eq!(
