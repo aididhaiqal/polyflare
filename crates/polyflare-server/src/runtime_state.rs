@@ -2452,6 +2452,28 @@ mod tests {
         );
     }
 
+    /// The failure half of the window must be fed by the SAME funnel that benches an account, or
+    /// the window only ever sees successes and every multiplier stays neutral — which is what
+    /// happened in production: `record_outcome` shipped with no caller outside tests.
+    #[test]
+    fn the_failure_half_of_the_window_is_reachable_from_the_bench_funnel() {
+        let runtime = RuntimeStates::default();
+        let id = AccountId::from("served");
+        for _ in 0..5 {
+            runtime.record_success(&id);
+        }
+        for _ in 0..5 {
+            runtime.record_outcome(&id, unix_now(), false);
+        }
+        let mut snaps = vec![AccountSnapshot::new("served")];
+        runtime.overlay(&mut snaps, unix_now());
+        assert!(
+            (snaps[0].selection_weight_multiplier - 0.5).abs() < 0.01,
+            "5 failures in 10 outcomes ⇒ 0.5, got {}",
+            snaps[0].selection_weight_multiplier
+        );
+    }
+
     /// A code-less 429 is a blip, not a limit: it steers fresh selection for a few seconds and
     /// leaves the account's bench state completely alone.
     #[test]

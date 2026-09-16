@@ -849,6 +849,16 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                 // resend).
                                 in_flight = Some(frame);
                                 if redialed {
+                                    // A FRESH socket starts its own age clock. Missing this, the
+                                    // lazy re-dial — the only way a socket is created after an age
+                                    // rotation drops the old one — left `upstream_since` pinned at
+                                    // the original dial. Once that passed `max_socket_age` the
+                                    // parked read's `remaining_age` was permanently zero, so every
+                                    // subsequent turn's socket was retired microseconds after the
+                                    // turn ended and the next anchored delta paid a forged
+                                    // full-history resend. Every other re-dial site already did
+                                    // this; this one was the omission.
+                                    upstream_since = tokio::time::Instant::now();
                                     relay_metrics.record("reconnect_same_account");
                                     reconnects_since_progress += 1;
                                     if reconnects_since_progress > MAX_RECONNECTS_WITHOUT_PROGRESS {

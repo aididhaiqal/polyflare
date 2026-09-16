@@ -397,6 +397,12 @@ pub(crate) async fn bench_account_for_failure(
         // 5xx (server error), 401/403 (bad credential / account-scoped auth), 408 (request timeout):
         // an ACCOUNT-health problem — bump the error count so a repeat offender hits the backoff gate.
         Some(sig) if (500..=599).contains(&sig.status) || matches!(sig.status, 401 | 403 | 408) => {
+            // Also the FAILURE half of the recent-error-rate draw weight. Only this arm: a rate
+            // limit or quota has its own cooldown above, and `bench_after_local_refusal` is
+            // evidence about our own capacity, not the account's. Without this the window only
+            // ever saw successes, every multiplier stayed at 1.0, and the weighting shipped in
+            // 33a0045 was inert in production.
+            state.runtime.record_outcome(id, now, false);
             state.runtime.record_transient_error(id, now)
         }
         Some(_) => None, // other 4xx (400/404/422/…): request-level, not account-health.

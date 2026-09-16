@@ -1533,6 +1533,74 @@ mod relay_through {
         assert_eq!(mock.handshake_count(), 0);
     }
 
+    /// 2026-09-16: the lazy re-dial never restarted the socket's age clock, so once a connection
+    /// passed `max_socket_age` ONCE, every later turn's socket was retired the instant the turn
+    /// ended — and the next anchored delta paid a forged full-history resend, for the rest of the
+    /// connection's life. Three turns across a short rotation must cost exactly one rotation.
+    #[tokio::test]
+    async fn the_age_clock_restarts_on_a_lazy_redial_so_rotation_happens_once() {
+        let mock = MockWsUpstream::scripted(vec![ScriptedTurn::normal(Vec::new())]);
+        let mock_base = mock.clone().spawn().await;
+        let idle = polyflare_server::ws_relay::WsRelayIdlePolicy {
+            ping_interval: Some(Duration::from_millis(40)),
+            // Production default: no idle budget, so `remaining_age` alone drives the parked read.
+            idle_budget: None,
+            max_socket_age: Some(Duration::from_millis(400)),
+        };
+        let (base, state) =
+            spawn_with_pinned_account_and_idle("acct-age-clock", &mock_base, idle).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        for turn in 0..3 {
+            ws.send(TMessage::Text(
+                format!(
+                    r#"{{"type":"response.create","input":[],"client_metadata":{{"turn_id":"t{turn}"}}}}"#
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+            let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(10), ws.next())
+                .await
+                .expect("a reply")
+                .expect("frame")
+                .expect("no WS error")
+            else {
+                panic!("expected a text frame");
+            };
+            let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(reply["type"], "response.completed", "turn {turn}: {reply}");
+            // Park after every turn — the parked read is where the age decision is made. The
+            // first park outlives `max_socket_age` so the original socket rotates; the later ones
+            // are well inside it, so the REPLACEMENT must survive them. With a stale age clock
+            // the replacement's remaining age is permanently zero and it is retired on the first
+            // of these short parks instead.
+            tokio::time::sleep(Duration::from_millis(if turn == 0 { 550 } else { 120 })).await;
+        }
+
+        assert_eq!(
+            mock.handshake_count(),
+            2,
+            "one dial, one rotation — a stale age clock would retire the socket after every turn"
+        );
+        let snapshot = state.relay_metrics.snapshot();
+        let count = |k: &str| {
+            snapshot
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| *v)
+                .unwrap_or(0)
+        };
+        assert_eq!(count("honest_close_age_rotation"), 1, "{snapshot:?}");
+        assert_eq!(
+            count("anchor_miss_client_resend"),
+            0,
+            "no forged resend: these turns are anchorless"
+        );
+    }
+
     /// 2026-09-16: a bare `server_error` with no output was the single most common failure the
     /// client actually saw — 19 of 34 in six hours, every one before a token — because it fell
     /// outside the capacity-terminal set and was forwarded verbatim while a sibling sat idle.
