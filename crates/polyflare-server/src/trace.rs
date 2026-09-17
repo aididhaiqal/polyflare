@@ -83,6 +83,18 @@ pub struct TraceTurn {
     frame_lines: u32,
     first_output: Option<(String, i64)>,
     last_error_code: Option<String>,
+    finished: bool,
+}
+
+/// A trace dropped without a terminal is a stream torn down before its terminal frame — the
+/// client hung up, the relay was cancelled, or the process is shutting down. Say so, with what
+/// was seen, rather than leaving the request line dangling.
+impl Drop for TraceTurn {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.emit_terminal("dropped", None, None, None);
+        }
+    }
 }
 
 fn short(s: Option<&str>) -> String {
@@ -111,6 +123,7 @@ impl TraceTurn {
             frame_lines: 0,
             first_output: None,
             last_error_code: None,
+            finished: false,
         };
         tracing::info!(
             target: "polyflare_server::trace",
@@ -221,11 +234,22 @@ impl TraceTurn {
     /// The attempt's end. `outcome` is a short fixed vocabulary word (`completed`, `refused`,
     /// `failed`, `transport_loss`, `stream_error`, `idle_timeout`, `capacity_pre_commit`, …).
     pub fn terminal(
-        self,
+        mut self,
         outcome: &str,
         code: Option<&str>,
         status: Option<u16>,
         usage: Option<Usage>,
+    ) {
+        self.emit_terminal(outcome, code, status, usage.as_ref());
+        self.finished = true;
+    }
+
+    fn emit_terminal(
+        &self,
+        outcome: &str,
+        code: Option<&str>,
+        status: Option<u16>,
+        usage: Option<&Usage>,
     ) {
         let elapsed_ms = self.started.elapsed().as_millis() as i64;
         let code = code.or(self.last_error_code.as_deref());
@@ -234,11 +258,15 @@ impl TraceTurn {
             .as_ref()
             .map(|(t, ms)| (t.as_str(), *ms))
             .unwrap_or(("-", -1));
-        let usage = usage.unwrap_or(Usage {
-            input: None,
-            cached: None,
-            output: None,
-        });
+        let (input, cached, output) = usage
+            .map(|u| {
+                (
+                    u.input.unwrap_or(-1),
+                    u.cached.unwrap_or(-1),
+                    u.output.unwrap_or(-1),
+                )
+            })
+            .unwrap_or((-1, -1, -1));
         tracing::info!(
             target: "polyflare_server::trace",
             trace = %self.id,
@@ -252,9 +280,9 @@ impl TraceTurn {
             first_output = first_type,
             first_output_ms = first_ms,
             elapsed_ms,
-            input_tokens = usage.input.unwrap_or(-1),
-            cached_input_tokens = usage.cached.unwrap_or(-1),
-            output_tokens = usage.output.unwrap_or(-1),
+            input_tokens = input,
+            cached_input_tokens = cached,
+            output_tokens = output,
             "trace"
         );
         self.publish(
@@ -262,13 +290,10 @@ impl TraceTurn {
             status,
             format!(
                 "terminal {outcome} code={} status={} frames={} first_output={first_type}@{first_ms}ms \
-                 elapsed={elapsed_ms}ms in={} cached={} out={}",
+                 elapsed={elapsed_ms}ms in={input} cached={cached} out={output}",
                 code.unwrap_or("-"),
                 status.unwrap_or(0),
                 self.frames,
-                usage.input.unwrap_or(-1),
-                usage.cached.unwrap_or(-1),
-                usage.output.unwrap_or(-1)
             ),
         );
     }

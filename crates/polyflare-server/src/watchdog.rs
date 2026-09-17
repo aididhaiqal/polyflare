@@ -1114,6 +1114,21 @@ impl ResponseIdSniffer {
             if ty == "response.completed" {
                 self.trace_usage = trace::usage_facts(payload);
             }
+            // codex drops the connection the moment it sees the terminal frame, so the stream
+            // rarely reaches EOF: log the terminal HERE, at the frame, not at EOF.
+            if matches!(
+                ty,
+                "response.completed" | "response.failed" | "response.incomplete" | "error"
+            ) {
+                if let Some(t) = self.trace.take() {
+                    let outcome = match ty {
+                        "response.completed" => "completed",
+                        "response.incomplete" => "incomplete",
+                        _ => "failed",
+                    };
+                    t.terminal(outcome, code, status.or(Some(200)), self.trace_usage.take());
+                }
+            }
         }
         let response_id = v
             .pointer("/response/id")
