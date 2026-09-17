@@ -30,7 +30,7 @@ fn cyber_policy_frame(message: &str) -> String {
 }
 
 fn non_cyber_failed_frame() -> String {
-    r#"{"type":"response.failed","response":{"id":"resp_fatal_x","status":"failed","error":{"code":"server_is_overloaded","message":"try later"}}}"#.to_string()
+    r#"{"type":"response.failed","response":{"id":"resp_fatal_x","status":"failed","error":{"code":"context_length_exceeded","message":"try later"}}}"#.to_string()
 }
 
 fn created_frame(id: &str) -> String {
@@ -193,8 +193,64 @@ async fn cyber_policy_message_never_leaks_into_the_signal() {
     );
 }
 
-/// Regression: a NON-cyber `response.failed` as the first frame must behave EXACTLY as before —
-/// treated as "alive", rebuilt, and relayed untouched (no `CapabilityRejection`).
+/// 2026-09-17: a CAPACITY `response.failed` behind the prelude used to be relayed untouched inside
+/// an HTTP 200 — the client rendered it as a non-retryable "at capacity", the failover loop never
+/// saw it (a byte was already out), and the request_log row said success; 263 such turns in seven
+/// days. Nothing has been relayed while the scan buffers past the prelude, so it is now a
+/// PRE-COMMIT failure the loop can retry or move — carrying the code, never the message.
+#[tokio::test]
+async fn capacity_response_failed_before_content_is_a_pre_commit_failure() {
+    const LEAK: &str = "capacity message that must never leak";
+    let frames = vec![
+        r#"{"type":"response.created","response":{"id":"resp_cap","status":"in_progress"}}"#
+            .to_string(),
+        format!(
+            r#"{{"type":"response.failed","response":{{"id":"resp_cap","status":"failed","error":{{"code":"server_is_overloaded","message":"{LEAK}"}}}}}}"#
+        ),
+    ];
+    let mock = MockUpstream::new(frames);
+    let base = mock.spawn().await;
+    let exec = CodexExecutor::new().unwrap();
+    let cont: Arc<dyn Continuity> = Arc::new(NoopContinuity);
+
+    let prepared = armed_full_resend(
+        serde_json::json!({"previous_response_id": "resp_a", "input": [{"a":1}]}),
+    );
+    let err = execute_with_watchdog(
+        &exec,
+        cont,
+        prepared,
+        &core_account(base),
+        polyflare_core::AccountId::from("acct"),
+        RequestCtx::default(),
+        Default::default(),
+        Duration::ZERO,
+    )
+    .await
+    .err()
+    .expect("a capacity terminal with nothing relayed must be a pre-commit failure, not a stream");
+
+    match &err {
+        polyflare_server::watchdog::WatchdogError::Upstream(Some(sig)) => {
+            assert_eq!(sig.status, 503, "{sig:?}");
+            assert_eq!(sig.error_code.as_deref(), Some("server_is_overloaded"));
+        }
+        other => panic!("expected Upstream(Some(capacity signal)), got {other:?}"),
+    }
+    let display = format!("{err}");
+    let debug = format!("{err:?}");
+    assert!(
+        !display.contains(LEAK),
+        "Display leaked the message: {display}"
+    );
+    assert!(!debug.contains(LEAK), "Debug leaked the message: {debug}");
+}
+
+/// Regression: a NON-cyber, REQUEST-LEVEL `response.failed` as the first frame must behave
+/// EXACTLY as before — treated as "alive", rebuilt, and relayed untouched (no
+/// `CapabilityRejection`, and no failover either: retrying a malformed or oversized request on
+/// another account cannot help). A CAPACITY `response.failed` is a different class now — see
+/// `capacity_response_failed_before_content_is_a_pre_commit_failure` below.
 #[tokio::test]
 async fn non_cyber_response_failed_is_unaffected() {
     let mock = MockUpstream::new(vec![non_cyber_failed_frame()]);
@@ -217,12 +273,12 @@ async fn non_cyber_response_failed_is_unaffected() {
         Duration::ZERO, // idle_timeout: disabled, not under test here
     )
     .await
-    .expect("a non-cyber response.failed must relay exactly as before");
+    .expect("a request-level response.failed must relay exactly as before");
 
     let body = drain(stream).await;
     assert!(
-        body.contains("server_is_overloaded"),
-        "non-cyber failure frame relayed untouched: {body}"
+        body.contains("context_length_exceeded"),
+        "request-level failure frame relayed untouched: {body}"
     );
     assert_eq!(handle.request_count(), 1);
 }

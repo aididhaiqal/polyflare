@@ -15,8 +15,8 @@ use futures_core::Stream;
 use futures_util::stream::{self, StreamExt};
 use polyflare_core::{
     Account, AccountId, AccountSnapshot, Continuity, ContinuityDirective, ExecError, Executor,
-    Prepared, PreparedRequest, RecoveryPlan, RequestCtx, ResponseStream, SelectionCtx, Selector,
-    SessionKey, TurnOutcome, WatchdogArm,
+    FailureSignal, Prepared, PreparedRequest, RecoveryPlan, RequestCtx, ResponseStream,
+    SelectionCtx, Selector, SessionKey, TurnOutcome, WatchdogArm,
 };
 
 use crate::runtime_state::{InFlightGuard, RuntimeStates};
@@ -269,27 +269,155 @@ pub async fn execute_with_watchdog_tracked(
 
     match directive.watchdog {
         WatchdogArm::Disarmed => {
-            // No anchor ⇒ cannot be silent. Relay + sniff + observe(Completed).
+            // No anchor ⇒ no silence-recovery machinery. But an ANCHORLESS turn is exactly what
+            // codex sends over HTTP-SSE, so this branch is where every SSE turn lands — and until
+            // now it relayed the very first chunk unseen. A capacity `response.failed` behind the
+            // prelude therefore went straight to the client inside an HTTP 200 (rendered as the
+            // non-retryable "Selected model is at capacity"), the failover loop never saw it (a
+            // byte was out, so the commit barrier held) and the request_log row said success.
+            //
+            // So peek-before-relay here too: buffer past the lifecycle prelude until the first
+            // decisive frame, exactly as the Armed branch does, and hand a pre-content capacity
+            // terminal to the failover loop as the pre-commit failure it is. The per-read
+            // deadline is `idle_timeout`, which already bounds this stream's silences; when that
+            // is disabled (zero) the scan is skipped and the stream is relayed as before.
             let stream = executor
                 .execute(req, account, &ctx)
                 .await
                 .map_err(map_executor_error)?;
-            Ok(wrap_stream(
-                stream,
-                continuity,
-                ctx,
-                account_id,
-                session_key,
-                OutcomeKind::Completed {
-                    fp,
-                    count,
-                    expected_owner,
-                },
-                runtime,
-                idle_timeout,
-                commit,
-                in_flight,
-            ))
+            if idle_timeout.is_zero() {
+                return Ok(wrap_stream(
+                    stream,
+                    continuity,
+                    ctx,
+                    account_id,
+                    session_key,
+                    OutcomeKind::Completed {
+                        fp,
+                        count,
+                        expected_owner,
+                    },
+                    runtime,
+                    idle_timeout,
+                    commit,
+                    in_flight,
+                ));
+            }
+            let mut stream = stream;
+            let first = match tokio::time::timeout(idle_timeout, stream.next()).await {
+                Ok(Some(Ok(first))) => first,
+                // Errored on its first read. Exactly as before the scan: the relay sees a stream
+                // that errors mid-air, post-commit — never a second attempt.
+                Ok(Some(Err(e))) => {
+                    let metadata = stream.metadata().clone();
+                    let relayed = ResponseStream::with_metadata(
+                        stream::iter(std::iter::once(Err::<Bytes, ExecError>(e))).chain(stream),
+                        metadata,
+                    );
+                    return Ok(wrap_stream(
+                        relayed,
+                        continuity,
+                        ctx,
+                        account_id,
+                        session_key,
+                        OutcomeKind::Completed {
+                            fp,
+                            count,
+                            expected_owner,
+                        },
+                        runtime,
+                        idle_timeout,
+                        commit,
+                        in_flight,
+                    ));
+                }
+                // Empty stream: nothing to scan, nothing to relay — same as before.
+                Ok(None) => {
+                    return Ok(wrap_stream(
+                        ResponseStream::new(stream::empty()),
+                        continuity,
+                        ctx,
+                        account_id,
+                        session_key,
+                        OutcomeKind::Completed {
+                            fp,
+                            count,
+                            expected_owner,
+                        },
+                        runtime,
+                        idle_timeout,
+                        commit,
+                        in_flight,
+                    ));
+                }
+                // Silent before its first byte. NOT a failure: the idle deadline on an anchorless
+                // turn is post-commit by contract and must never cause a second attempt, so hand
+                // the untouched stream straight to the relay exactly as before the scan existed.
+                Err(_) => {
+                    return Ok(wrap_stream(
+                        stream,
+                        continuity,
+                        ctx,
+                        account_id,
+                        session_key,
+                        OutcomeKind::Completed {
+                            fp,
+                            count,
+                            expected_owner,
+                        },
+                        runtime,
+                        idle_timeout,
+                        commit,
+                        in_flight,
+                    ));
+                }
+            };
+            match scan_past_lifecycle(first, stream, idle_timeout).await {
+                ScanOutcome::Capacity(code) => {
+                    let status = match code.as_str() {
+                        "server_error" => 500,
+                        _ => 503,
+                    };
+                    let _ = continuity
+                        .observe(
+                            TurnOutcome::Failed {
+                                session_key: session_key.clone(),
+                            },
+                            &ctx,
+                        )
+                        .await;
+                    Err(WatchdogError::Upstream(Some(FailureSignal {
+                        status,
+                        retry_after: None,
+                        error_code: Some(code),
+                    })))
+                }
+                // Everything else is relayed EXACTLY as it would have been without the scan: the
+                // anchorless cyber handling is deliberately untouched (its reroute is scoped to
+                // anchored turns), a hard error still surfaces mid-air post-commit, and silence
+                // never becomes a second attempt. Only a capacity frame changes anything here.
+                ScanOutcome::CyberPolicy(rebuilt)
+                | ScanOutcome::HardError {
+                    relayed: rebuilt, ..
+                }
+                | ScanOutcome::Silence(rebuilt)
+                | ScanOutcome::Alive(rebuilt) => Ok(wrap_stream(
+                    rebuilt,
+                    continuity,
+                    ctx,
+                    account_id,
+                    session_key,
+                    OutcomeKind::Completed {
+                        fp,
+                        count,
+                        expected_owner,
+                    },
+                    runtime,
+                    idle_timeout,
+                    commit,
+                    in_flight,
+                )),
+            }
         }
         WatchdogArm::Armed { timeout } => {
             let mut stream = executor
@@ -311,7 +439,7 @@ pub async fn execute_with_watchdog_tracked(
                     // client byte written for a rejected turn). No reroute in this task (TA6b Task 2
                     // consumes the signal).
                     match scan_past_lifecycle(first, stream, timeout).await {
-                        ScanOutcome::CyberPolicy => {
+                        ScanOutcome::CyberPolicy(_) => {
                             let _ = continuity
                                 .observe(
                                     TurnOutcome::Failed {
@@ -324,11 +452,44 @@ pub async fn execute_with_watchdog_tracked(
                                 capability: "security_work",
                             })
                         }
-                        ScanOutcome::HardError(e) => {
+                        ScanOutcome::Capacity(code) => {
+                            // ACCEPTED, OUTPUT-FREE CAPACITY FAILURE ON THE SSE PATH.
+                            //
+                            // Until now this frame was relayed verbatim inside an HTTP 200: the
+                            // client rendered it as "Selected model is at capacity" (codex does not
+                            // retry that), the failover loop never saw it (a byte was already out,
+                            // so the commit barrier held), and the request_log row said `200` with
+                            // no error code. 2026-09-17: 263 such turns in seven days, invisible in
+                            // every per-status statistic, and every one of a user's "back to back"
+                            // capacity errors that morning.
+                            //
+                            // Nothing has been relayed (the scan buffered past the prelude), so
+                            // this is a PRE-COMMIT failure like the cyber and hard-error arms: hand
+                            // the failover loop the signal it already knows how to retry or move,
+                            // and let `bench_account_for_failure` feed the overload window. The
+                            // status mirrors the WS classifier's mapping for the same codes.
+                            let status = match code.as_str() {
+                                "server_error" => 500,
+                                _ => 503,
+                            };
+                            let _ = continuity
+                                .observe(
+                                    TurnOutcome::Failed {
+                                        session_key: session_key.clone(),
+                                    },
+                                    &ctx,
+                                )
+                                .await;
+                            Err(WatchdogError::Upstream(Some(FailureSignal {
+                                status,
+                                retry_after: None,
+                                error_code: Some(code),
+                            })))
+                        }
+                        ScanOutcome::HardError { signal, .. } => {
                             // A hard error surfaced while scanning (before any client byte was
                             // relayed) is exactly the "hard upstream error before any client byte"
                             // case below — same handling.
-                            let signal = e.failure_signal();
                             let _ = continuity
                                 .observe(
                                     TurnOutcome::Failed {
@@ -359,7 +520,7 @@ pub async fn execute_with_watchdog_tracked(
                                 in_flight,
                             ))
                         }
-                        ScanOutcome::Silence => {
+                        ScanOutcome::Silence(_) => {
                             // Re-review fix: a silence discovered DURING the scan (post-`created`,
                             // before any decisive frame) is recoverable exactly like a silence on
                             // the initial peek — nothing has been relayed yet either way. The
@@ -750,25 +911,47 @@ enum ScanOutcome {
     /// whatever the inner stream has left. This is the (renamed, otherwise unchanged) "ALIVE" path.
     Alive(ResponseStream),
     /// A `cyber_policy` `response.failed` frame appeared before any decisive frame. Peek-before-
-    /// relay is preserved: nothing buffered during the scan is relayed.
-    CyberPolicy,
+    /// relay is preserved for an ANCHORED caller: nothing buffered during the scan is relayed.
+    /// Carries the buffered frames chained with the rest so an ANCHORLESS caller can relay them
+    /// untouched — its cyber handling is deliberately unchanged by the scan (see the Disarmed arm).
+    CyberPolicy(ResponseStream),
+    /// A capacity `response.failed` appeared before any decisive frame (see
+    /// `ScanVerdict::Capacity`). Nothing buffered is relayed, so the turn is a PRE-COMMIT failure
+    /// and the ordinary failover loop may retry or move it — codex-lb's `accepted_replay` for the
+    /// HTTP path, achieved with this module's existing peek-before-relay.
+    Capacity(String),
     /// The inner stream produced a hard error while scanning, i.e. before anything was relayed —
-    /// identical in every observable way to a hard error on the very first frame.
-    HardError(ExecError),
+    /// identical in every observable way to a hard error on the very first frame. `signal` is
+    /// what an ANCHORED caller surfaces; `relayed` replays the buffered frames and then the error
+    /// itself, so an ANCHORLESS caller sees exactly what it would have without the scan (a stream
+    /// that errors mid-air, post-commit).
+    HardError {
+        signal: Option<FailureSignal>,
+        relayed: ResponseStream,
+    },
     /// The scan-loop's per-read `timeout` elapsed before a decisive frame arrived (re-review
     /// finding: upstream sent `response.created` then went silent). Peek-before-relay holds across
-    /// the WHOLE scan window — nothing buffered here has been relayed — so this is recoverable
-    /// exactly like a first-chunk silence: the caller drops the stream and routes into the same
-    /// `ResendFull`/`SignalClient` recovery as `Ok(None) | Err(_)` on the initial peek.
-    Silence,
+    /// the WHOLE scan window — nothing buffered here has been relayed — so an ANCHORED caller
+    /// drops the stream and routes into the same `ResendFull`/`SignalClient` recovery as
+    /// `Ok(None) | Err(_)` on the initial peek. Carries the buffered frames chained with the
+    /// rest of the stream so an ANCHORLESS caller, which has no such recovery and whose idle
+    /// deadline is post-commit by contract, can relay it exactly as it would have without the
+    /// scan — silence must never become a second attempt there.
+    Silence(ResponseStream),
 }
 
 /// A single buffered frame's classification, once its `type` can be read.
+#[derive(Debug, PartialEq, Eq)]
 enum ScanVerdict {
     /// A `response.failed` whose `error.code == "cyber_policy"` — the wire truth (`codex-rs`'s
     /// `codex-api/src/sse/responses.rs` `is_cyber_policy_error`: `error.code.as_deref() ==
     /// Some("cyber_policy")`).
     CyberPolicy,
+    /// A `response.failed` carrying a CAPACITY code (`server_is_overloaded`, `overloaded_error`,
+    /// `model_at_capacity`, `slow_down`, or the ambiguous `server_error`) seen before any content
+    /// — upstream accepted the turn and gave it back having produced nothing. Carries the code
+    /// (never the message) so the failover loop and the overload window can act on it.
+    Capacity(String),
     /// Anything else recognized as NOT a pure lifecycle frame: actual model content
     /// (`response.output_text.delta`, `response.output_item.added`, ...), any terminal frame that
     /// isn't the cyber rejection (`response.completed`, a non-cyber `response.failed`), or an
@@ -793,10 +976,16 @@ fn classify_frame(v: &serde_json::Value) -> Option<ScanVerdict> {
                 .and_then(|r| r.get("error"))
                 .and_then(|e| e.get("code"))
                 .and_then(|c| c.as_str());
-            Some(if code == Some("cyber_policy") {
-                ScanVerdict::CyberPolicy
-            } else {
-                ScanVerdict::Decisive
+            Some(match code {
+                Some("cyber_policy") => ScanVerdict::CyberPolicy,
+                Some(
+                    c @ ("server_is_overloaded"
+                    | "overloaded_error"
+                    | "model_at_capacity"
+                    | "slow_down"
+                    | "server_error"),
+                ) => ScanVerdict::Capacity(c.to_string()),
+                _ => ScanVerdict::Decisive,
             })
         }
         _ => Some(ScanVerdict::Decisive),
@@ -849,10 +1038,16 @@ async fn scan_past_lifecycle(
 ) -> ScanOutcome {
     let mut relay_chunks: Vec<Bytes> = vec![first.clone()];
     let mut scan_buf: Vec<u8> = first.to_vec();
+    let mut silent = false;
+    let mut cyber = false;
 
     loop {
         match scan_buffered_frames(&scan_buf) {
-            Some(ScanVerdict::CyberPolicy) => return ScanOutcome::CyberPolicy,
+            Some(ScanVerdict::CyberPolicy) => {
+                cyber = true;
+                break;
+            }
+            Some(ScanVerdict::Capacity(code)) => return ScanOutcome::Capacity(code),
             Some(ScanVerdict::Decisive) => break,
             None => {
                 if scan_buf.len() > MAX_SCAN_BYTES {
@@ -863,9 +1058,25 @@ async fn scan_past_lifecycle(
                         scan_buf.extend_from_slice(&next);
                         relay_chunks.push(next);
                     }
-                    Ok(Some(Err(e))) => return ScanOutcome::HardError(e),
+                    Ok(Some(Err(e))) => {
+                        let signal = e.failure_signal();
+                        let metadata = stream.metadata().clone();
+                        let relayed = ResponseStream::with_metadata(
+                            stream::iter(
+                                relay_chunks
+                                    .into_iter()
+                                    .map(Ok::<Bytes, ExecError>)
+                                    .chain(std::iter::once(Err(e))),
+                            ),
+                            metadata,
+                        );
+                        return ScanOutcome::HardError { signal, relayed };
+                    }
                     Ok(None) => break, // stream ended before a decisive frame; relay what we have
-                    Err(_) => return ScanOutcome::Silence, // per-read timeout elapsed: silence
+                    Err(_) => {
+                        silent = true; // per-read timeout elapsed: silence
+                        break;
+                    }
                 }
             }
         }
@@ -876,7 +1087,13 @@ async fn scan_past_lifecycle(
         stream::iter(relay_chunks.into_iter().map(Ok::<Bytes, ExecError>)).chain(stream),
         metadata,
     );
-    ScanOutcome::Alive(rebuilt)
+    if cyber {
+        ScanOutcome::CyberPolicy(rebuilt)
+    } else if silent {
+        ScanOutcome::Silence(rebuilt)
+    } else {
+        ScanOutcome::Alive(rebuilt)
+    }
 }
 
 enum ObserveState {
@@ -1724,11 +1941,36 @@ mod tests {
         ));
     }
 
+    /// A capacity `response.failed` before any content is a pre-commit failure the failover loop
+    /// can act on — it must NOT be treated as decisive-and-relay, which is how it reached clients
+    /// as a non-retryable "at capacity" inside an HTTP 200.
     #[test]
-    fn scan_treats_non_cyber_response_failed_as_decisive() {
+    fn scan_detects_a_capacity_response_failed_before_content() {
+        for code in [
+            "server_is_overloaded",
+            "overloaded_error",
+            "model_at_capacity",
+            "server_error",
+        ] {
+            let sse = format!(
+                "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_x\"}}}}\n\n\
+                 data: {{\"type\":\"response.failed\",\"response\":{{\"id\":\"resp_x\",\
+                 \"error\":{{\"code\":\"{code}\",\"message\":\"do not leak this\"}}}}}}\n\n"
+            );
+            match scan_buffered_frames(sse.as_bytes()) {
+                Some(ScanVerdict::Capacity(c)) => assert_eq!(c, code),
+                other => panic!("{code}: expected Capacity, got {other:?}"),
+            }
+        }
+    }
+
+    /// A request-level `response.failed` (bad input, policy) stays decisive: retrying it elsewhere
+    /// cannot help, so it is relayed as before.
+    #[test]
+    fn scan_treats_a_request_level_response_failed_as_decisive() {
         let sse = concat!(
             "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_x\",",
-            "\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"slow down\"}}}\n\n",
+            "\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}}\n\n",
         )
         .as_bytes();
         assert!(matches!(

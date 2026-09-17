@@ -100,6 +100,10 @@ enum AttemptBehavior {
     /// A pre-relay 400 carrying `invalid_encrypted_content`: the upstream proving it cannot decrypt
     /// a reasoning envelope in the request's history (a cross-provider thread switch).
     InvalidEncryptedContent,
+    /// Upstream ACCEPTS the turn (a 200 stream that opens with `response.created`) and then
+    /// refuses it with a capacity `response.failed` before producing any content — the shape that
+    /// reached clients as a non-retryable "at capacity" inside a successful-looking response.
+    AcceptedThenCapacity,
 }
 
 /// A test-only `Executor` keyed by `Account.id`: each account has a FIFO queue of
@@ -193,6 +197,18 @@ impl Executor for FailoverStubExecutor {
                 retry_after: None,
                 error_code: None,
             })),
+            AttemptBehavior::AcceptedThenCapacity => {
+                let id = format!("resp_{}", account.id);
+                let created =
+                    format!(r#"{{"type":"response.created","response":{{"id":"{id}"}}}}"#);
+                let failed = format!(
+                    r#"{{"type":"response.failed","response":{{"id":"{id}","error":{{"code":"server_is_overloaded","message":"do not leak this"}}}}}}"#
+                );
+                Ok(ResponseStream::new(stream::iter(vec![
+                    Ok::<Bytes, ExecError>(Bytes::from(format!("data: {created}\n\n"))),
+                    Ok(Bytes::from(format!("data: {failed}\n\n"))),
+                ])))
+            }
             AttemptBehavior::ByteThenDrop => {
                 let first = Ok::<Bytes, ExecError>(Bytes::from_static(
                     b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
@@ -439,6 +455,58 @@ async fn security_floor_never_attempts_a_non_authorized_account() {
 
 /// (d) COMMIT BARRIER: A relays a byte then drops mid-stream -> the error surfaces in-band (the
 /// client keeps the byte it got, the stream then errors), and B is NEVER called.
+/// 2026-09-17: on the SSE path a capacity `response.failed` arriving behind the prelude was relayed
+/// inside an HTTP 200. The client rendered it as "Selected model is at capacity" and did not retry;
+/// the failover loop never saw it (a byte was already out); the request_log row said success. 263
+/// such turns in seven days, and every one of a user's "back to back" errors that morning. With
+/// nothing but the prelude buffered, it must now fail over exactly like a pre-relay 5xx.
+#[tokio::test]
+async fn an_accepted_capacity_failure_on_sse_fails_over_before_any_byte_is_relayed() {
+    let (store, cipher, _dir) = spawn_store().await;
+    store
+        .accounts()
+        .insert(&account("A", false), &tokens("tokA"), &cipher)
+        .await
+        .unwrap();
+    store
+        .accounts()
+        .insert(&account("B", false), &tokens("tokB"), &cipher)
+        .await
+        .unwrap();
+    let exec = Arc::new(FailoverStubExecutor::new());
+    exec.script("A", vec![AttemptBehavior::AcceptedThenCapacity]);
+    exec.script("B", vec![AttemptBehavior::Success]);
+    let state = build_state(store, cipher, exec.clone());
+    let pf = spawn_app(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "m", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the client gets B's clean stream");
+    let body = drain(resp).await;
+    assert!(
+        body.contains("response.completed") && body.contains("resp_B"),
+        "B's clean completion is what the client reads: {body}"
+    );
+    assert!(
+        !body.contains("server_is_overloaded") && !body.contains("do not leak this"),
+        "A's refusal never reaches the client: {body}"
+    );
+    assert_eq!(
+        body.matches("response.created").count(),
+        1,
+        "one lifecycle: A's buffered prelude was never relayed: {body}"
+    );
+    assert_eq!(
+        exec.calls(),
+        vec!["A".to_string(), "B".to_string()],
+        "A refused before any byte was relayed, so the loop moved to B"
+    );
+}
+
 #[tokio::test]
 async fn commit_barrier_never_fails_over_after_a_relayed_byte() {
     let (store, cipher, _dir) = spawn_store().await;
