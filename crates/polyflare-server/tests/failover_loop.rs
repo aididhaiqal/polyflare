@@ -108,6 +108,10 @@ enum AttemptBehavior {
     /// the shape that actually arrives over SSE in production, and the one the scan and sniffer
     /// both ignored.
     AcceptedThenCapacityEnvelope,
+    /// The 2026-09-17 10:15 / 10:18 shape on both nodes: prelude, then backend METADATA
+    /// (`codex.rate_limits`), then seconds later the capacity envelope. The metadata frame ended the
+    /// scan as "decisive", the handler returned, and the refusal was relayed as content.
+    AcceptedThenMetadataThenCapacityEnvelope,
 }
 
 /// A test-only `Executor` keyed by `Account.id`: each account has a FIFO queue of
@@ -220,6 +224,22 @@ impl Executor for FailoverStubExecutor {
                 let envelope = r#"{"type":"error","error":{"code":"server_is_overloaded","message":"do not leak this"}}"#;
                 Ok(ResponseStream::new(stream::iter(vec![
                     Ok::<Bytes, ExecError>(Bytes::from(format!("data: {created}\n\n"))),
+                    Ok(Bytes::from(format!("data: {envelope}\n\n"))),
+                ])))
+            }
+            AttemptBehavior::AcceptedThenMetadataThenCapacityEnvelope => {
+                let id = format!("resp_{}", account.id);
+                let created =
+                    format!(r#"{{"type":"response.created","response":{{"id":"{id}"}}}}"#);
+                let in_progress =
+                    format!(r#"{{"type":"response.in_progress","response":{{"id":"{id}"}}}}"#);
+                let metadata =
+                    r#"{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":12}}}"#;
+                let envelope = r#"{"type":"error","error":{"code":"server_is_overloaded","message":"do not leak this"}}"#;
+                Ok(ResponseStream::new(stream::iter(vec![
+                    Ok::<Bytes, ExecError>(Bytes::from(format!("data: {created}\n\n"))),
+                    Ok(Bytes::from(format!("data: {in_progress}\n\n"))),
+                    Ok(Bytes::from(format!("data: {metadata}\n\n"))),
                     Ok(Bytes::from(format!("data: {envelope}\n\n"))),
                 ])))
             }
@@ -539,6 +559,53 @@ async fn an_accepted_capacity_envelope_on_sse_fails_over_before_any_byte_is_rela
         .unwrap();
     let exec = Arc::new(FailoverStubExecutor::new());
     exec.script("A", vec![AttemptBehavior::AcceptedThenCapacityEnvelope]);
+    exec.script("B", vec![AttemptBehavior::Success]);
+    let state = build_state(store, cipher, exec.clone());
+    let pf = spawn_app(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "m", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the client gets B's clean stream");
+    let body = drain(resp).await;
+    assert!(
+        body.contains("response.completed") && body.contains("resp_B"),
+        "B's clean completion is what the client reads: {body}"
+    );
+    assert!(
+        !body.contains("server_is_overloaded") && !body.contains("do not leak this"),
+        "A's refusal never reaches the client: {body}"
+    );
+    assert_eq!(
+        body.matches("response.created").count(),
+        1,
+        "one lifecycle: {body}"
+    );
+    assert_eq!(exec.calls(), vec!["A".to_string(), "B".to_string()]);
+}
+
+/// Metadata (`codex.*`) between the prelude and the refusal must not close the scan.
+#[tokio::test]
+async fn a_capacity_envelope_after_backend_metadata_still_fails_over_before_any_byte_is_relayed() {
+    let (store, cipher, _dir) = spawn_store().await;
+    store
+        .accounts()
+        .insert(&account("A", false), &tokens("tokA"), &cipher)
+        .await
+        .unwrap();
+    store
+        .accounts()
+        .insert(&account("B", false), &tokens("tokB"), &cipher)
+        .await
+        .unwrap();
+    let exec = Arc::new(FailoverStubExecutor::new());
+    exec.script(
+        "A",
+        vec![AttemptBehavior::AcceptedThenMetadataThenCapacityEnvelope],
+    );
     exec.script("B", vec![AttemptBehavior::Success]);
     let state = build_state(store, cipher, exec.clone());
     let pf = spawn_app(state).await;
