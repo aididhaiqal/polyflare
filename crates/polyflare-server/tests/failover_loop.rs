@@ -1092,3 +1092,100 @@ async fn http_invalid_encrypted_content_retries_once_with_reasoning_stripped() {
         "the repair retries the SAME account (nothing about the account was unhealthy)"
     );
 }
+
+/// 2026-09-17 11:22–11:35 on master: both eligible accounts refused a turn for capacity before any
+/// byte, the loop fell into a 60 s starvation wait for a third (hard-rate-limited) account, failed
+/// anyway, and four client retries later the logical-turn budget answered 400. A momentary refusal
+/// everywhere is a "retry shortly": a fast 503 with `Retry-After`, and the refunded attempts mean
+/// the client's retry of the SAME logical turn is served, not refused.
+#[tokio::test]
+async fn capacity_refused_on_every_account_is_a_fast_retryable_503_and_refunds_the_turn() {
+    let (store, cipher, _dir) = spawn_store().await;
+    store
+        .accounts()
+        .insert(&account("A", false), &tokens("tokA"), &cipher)
+        .await
+        .unwrap();
+    store
+        .accounts()
+        .insert(&account("B", false), &tokens("tokB"), &cipher)
+        .await
+        .unwrap();
+    let exec = Arc::new(FailoverStubExecutor::new());
+    exec.script(
+        "A",
+        vec![
+            AttemptBehavior::AcceptedThenCapacityEnvelope,
+            AttemptBehavior::AcceptedThenCapacityEnvelope,
+            AttemptBehavior::AcceptedThenCapacityEnvelope,
+            AttemptBehavior::AcceptedThenCapacityEnvelope,
+            AttemptBehavior::Success,
+        ],
+    );
+    exec.script(
+        "B",
+        vec![
+            AttemptBehavior::AcceptedThenCapacityEnvelope,
+            AttemptBehavior::AcceptedThenCapacityEnvelope,
+            AttemptBehavior::AcceptedThenCapacityEnvelope,
+            AttemptBehavior::AcceptedThenCapacityEnvelope,
+            AttemptBehavior::Success,
+        ],
+    );
+    let state = build_state(store, cipher, exec.clone());
+    let pf = spawn_app(state).await;
+    let client = reqwest::Client::new();
+
+    // max_account_attempts is 3 in this harness: four client retries of one logical turn would
+    // exhaust it (2 refused attempts each) if the refusals were charged.
+    for retry in 0..4 {
+        let started = std::time::Instant::now();
+        let resp = client
+            .post(format!("{pf}/responses"))
+            .header("session_id", "sess-cap")
+            .header("x-codex-turn-metadata", r#"{"turn_id":"turn-cap-1"}"#)
+            .json(&serde_json::json!({"model": "m", "input": "hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            503,
+            "retry {retry}: a retryable 503, not a 400/502"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap()),
+            Some("3"),
+            "retry {retry}: the client is told when to come back"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "retry {retry}: no starvation wait — took {:?}",
+            started.elapsed()
+        );
+        let body = drain(resp).await;
+        assert!(
+            body.contains("server_is_overloaded") && !body.contains("do not leak this"),
+            "retry {retry}: the code is named, the upstream message is not: {body}"
+        );
+    }
+
+    // The fifth attempt of the SAME logical turn is served: nothing was charged for the refusals.
+    let resp = client
+        .post(format!("{pf}/responses"))
+        .header("session_id", "sess-cap")
+        .header("x-codex-turn-metadata", r#"{"turn_id":"turn-cap-1"}"#)
+        .json(&serde_json::json!({"model": "m", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the turn is still alive after four refused retries"
+    );
+    let body = drain(resp).await;
+    assert!(body.contains("response.completed"), "{body}");
+}

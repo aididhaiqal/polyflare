@@ -935,10 +935,7 @@ impl ResponseIdSniffer {
         );
         if !is_terminal {
             self.frames_before_terminal = self.frames_before_terminal.saturating_add(1);
-            if self.output_visible_by.is_none()
-                && !matches!(ty, "response.created" | "response.in_progress")
-                && !ty.starts_with("codex.")
-            {
+            if self.output_visible_by.is_none() && !is_non_output_frame_type(ty) {
                 self.output_visible_by = Some(ty.to_string());
             }
         }
@@ -1065,17 +1062,57 @@ enum ScanVerdict {
 /// Content-safety: reads ONLY `type` and, for `response.failed`, the nested `response.error.code`
 /// — the frame's `message` is never read into any local, returned, or logged value (mirrors
 /// `polyflare_codex::executor::extract_error_code`'s code-only extraction for the non-2xx path).
+/// The upstream error codes that mean "this account/model is momentarily at capacity" — a refusal
+/// that says nothing about the request and everything about the moment. One list, shared by the
+/// pre-content scan, the sniffer, and the failover loop's "every candidate refused" exit, so the
+/// three can never disagree about what counts.
+pub(crate) fn is_capacity_code(code: &str) -> bool {
+    matches!(
+        code,
+        "server_is_overloaded"
+            | "overloaded_error"
+            | "model_at_capacity"
+            | "slow_down"
+            | "server_error"
+    )
+}
+
+/// A pre-commit upstream failure whose cause is momentary capacity, not this request: the scan's
+/// capacity terminal (a capacity code), or a bare 503. Used by the failover loop to decide that
+/// running out of candidates is a "retry shortly" situation rather than a starvation wait.
+pub fn is_transient_capacity_refusal(err: &WatchdogError) -> bool {
+    let sig = match err {
+        WatchdogError::Upstream(Some(sig)) => sig,
+        WatchdogError::UpstreamHttp(response) => &response.signal,
+        _ => return false,
+    };
+    match sig.error_code.as_deref() {
+        Some(code) => is_capacity_code(code),
+        None => sig.status == 503,
+    }
+}
+
+/// Frame types that carry no model output: the lifecycle prelude, backend `codex.*` metadata, and
+/// upstream keepalives. The pre-content scan keeps scanning past these; the sniffer does not count
+/// them as "output became visible". Same prefix rule as the WS pump's `is_non_output_frame`, for
+/// the same reason — the backend ships types this repository has never seen (2026-09-17 11:26 and
+/// 11:28 on master: `keepalive`, which no fixture contained, closed the scan and the capacity
+/// envelope behind it was relayed as content).
+fn is_non_output_frame_type(ty: &str) -> bool {
+    matches!(
+        ty,
+        "response.created" | "response.in_progress" | "keepalive" | "ping"
+    ) || ty.starts_with("codex.")
+}
+
 fn classify_frame(v: &serde_json::Value) -> Option<ScanVerdict> {
     let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
     match ty {
-        "response.created" | "response.in_progress" => None, // keep scanning
-        // Backend METADATA (`codex.rate_limits`, `codex.response.metadata`, …) — never model
-        // output. Same prefix rule as the WS pump's `is_non_output_frame`, for the same reason:
-        // the backend ships metadata types this repository has never seen. 2026-09-17 10:15 and
+        // Lifecycle prelude, backend metadata, keepalives: keep scanning. 2026-09-17 10:15 and
         // 10:18: on both nodes the handler returned the stream seconds BEFORE the capacity
-        // envelope arrived, i.e. something non-lifecycle ended the scan as "decisive" and the
-        // refusal that followed was relayed as content. Metadata must keep the scan open.
-        t if t.starts_with("codex.") => None,
+        // envelope arrived, i.e. a non-lifecycle, non-output frame ended the scan as "decisive"
+        // and the refusal that followed was relayed as content.
+        t if is_non_output_frame_type(t) => None,
         "response.failed" => {
             let code = v
                 .get("response")
@@ -1084,13 +1121,7 @@ fn classify_frame(v: &serde_json::Value) -> Option<ScanVerdict> {
                 .and_then(|c| c.as_str());
             Some(match code {
                 Some("cyber_policy") => ScanVerdict::CyberPolicy,
-                Some(
-                    c @ ("server_is_overloaded"
-                    | "overloaded_error"
-                    | "model_at_capacity"
-                    | "slow_down"
-                    | "server_error"),
-                ) => ScanVerdict::Capacity(c.to_string()),
+                Some(c) if is_capacity_code(c) => ScanVerdict::Capacity(c.to_string()),
                 _ => ScanVerdict::Decisive,
             })
         }
@@ -1107,13 +1138,7 @@ fn classify_frame(v: &serde_json::Value) -> Option<ScanVerdict> {
                 .and_then(|e| e.get("code"))
                 .and_then(|c| c.as_str());
             Some(match code {
-                Some(
-                    c @ ("server_is_overloaded"
-                    | "overloaded_error"
-                    | "model_at_capacity"
-                    | "slow_down"
-                    | "server_error"),
-                ) => ScanVerdict::Capacity(c.to_string()),
+                Some(c) if is_capacity_code(c) => ScanVerdict::Capacity(c.to_string()),
                 _ => ScanVerdict::Decisive,
             })
         }
@@ -2096,6 +2121,23 @@ mod tests {
     /// The WRAPPED envelope is how a capacity refusal actually arrives over SSE. It must be caught
     /// exactly like a capacity `response.failed`, and a wrapped error with a request-level code
     /// must stay decisive.
+    #[test]
+    fn scan_keeps_scanning_past_upstream_keepalives() {
+        let buf = concat!(
+            "data: {\"type\":\"keepalive\"}\n\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n",
+            "data: {\"type\":\"keepalive\"}\n\n",
+        );
+        assert_eq!(scan_buffered_frames(buf.as_bytes()), None);
+        let buf = format!(
+            "{buf}data: {{\"type\":\"error\",\"error\":{{\"code\":\"server_is_overloaded\"}}}}\n\n"
+        );
+        assert_eq!(
+            scan_buffered_frames(buf.as_bytes()),
+            Some(ScanVerdict::Capacity("server_is_overloaded".into()))
+        );
+    }
+
     #[test]
     fn scan_keeps_scanning_past_backend_metadata_frames() {
         // `codex.*` frames are metadata, not output (the WS pump's `is_non_output_frame` rule).

@@ -41,8 +41,9 @@ use crate::starvation;
 use crate::translate_stream::wrap_translating_stream;
 use crate::usage_capture;
 use crate::watchdog::{
-    apply_ownership, execute_recovery_tracked, execute_with_watchdog_tracked, signal_client_stream,
-    CommitWitness, RouteDecision, WatchdogError,
+    apply_ownership, execute_recovery_tracked, execute_with_watchdog_tracked,
+    is_transient_capacity_refusal, signal_client_stream, CommitWitness, RouteDecision,
+    WatchdogError,
 };
 
 fn unix_now() -> i64 {
@@ -2002,11 +2003,19 @@ async fn run_failover_loop(
     let mut failed_id = first_failed_id;
     let mut err = first_err;
     let mut committed = first_committed;
+    // True while EVERY refusal this loop has seen was a pre-commit capacity refusal (a
+    // `server_is_overloaded`-class terminal caught before any byte, or a bare 503). See the
+    // `None` arm below for what that changes.
+    let mut every_refusal_was_capacity = !committed && is_transient_capacity_refusal(&err);
 
     loop {
         // `tried.len()` does NOT yet include `failed_id` — see the doc's "Bookkeeping order".
         let attempts_left = (tried.len() as u32) + 1 < max_attempts;
         if failover_verdict(&err, attempts_left, committed) == FailoverVerdict::Surface {
+            if every_refusal_was_capacity && !attempts_left {
+                tried.insert(failed_id);
+                return capacity_refused_everywhere(state, &tried, &err, &ctx);
+            }
             return surface_watchdog_error(&err);
         }
         // FailoverNext: this account is excluded from every future pick this request (T2). Clone
@@ -2019,6 +2028,19 @@ async fn run_failover_loop(
         let fresh = match selector.pick(&candidates, sel_ctx) {
             Some(id) => id,
             None => {
+                // Every eligible account refused this turn for capacity within seconds of each
+                // other and nothing was relayed. 2026-09-17 11:22–11:35 on master: the loop then
+                // fell into the starvation wait for a THIRD, hard-rate-limited account (the tried
+                // ones are excluded from the census, so their 60 s overload backoff never counted
+                // as "recovering soon"), waited the whole 60 s budget, failed the turn anyway, the
+                // client retried, each retry cost two more attempts, and the fourth retry hit the
+                // logical-turn budget: a 400 the client cannot retry. Thirteen minutes to tell the
+                // user "at capacity". A momentary refusal is a "retry shortly" answer, not a wait
+                // for a different account — surface it as one the client already knows how to
+                // back off from, and give the attempts back: the upstream did no work for them.
+                if every_refusal_was_capacity {
+                    return capacity_refused_everywhere(state, &tried, &err, &ctx);
+                }
                 // B5 Task 3 — Layer 1: before surfacing the exhaustion error below, try the
                 // guarded serve-soonest-error-backoff candidate over the SAME `candidates` (already
                 // `exclude_tried`'d, so an account this request already tried is never re-served).
@@ -2150,9 +2172,52 @@ async fn run_failover_loop(
                 failed_id = health_id;
                 err = e2;
                 committed = commit.is_committed();
+                every_refusal_was_capacity &= !committed && is_transient_capacity_refusal(&err);
             }
         }
     }
+}
+
+/// The failover loop's exit when EVERY candidate refused for capacity before any byte: a 503 the
+/// client backs off from and retries (codex-rs retries 5xx with its own backoff and honours
+/// `Retry-After`), never a starvation wait and never the logical-turn 400. The attempts those
+/// refusals consumed are refunded — the upstream did no generation for them, and charging them
+/// is what turned "the model is busy" into "this turn is dead". Content-free: the body names the
+/// code, never the upstream message.
+fn capacity_refused_everywhere(
+    state: &AppState,
+    tried: &HashSet<AccountId>,
+    err: &WatchdogError,
+    ctx: &RequestCtx,
+) -> Response {
+    for _ in 0..tried.len() {
+        state
+            .runtime
+            .refund_logical_turn_attempt(ctx.logical_turn_key.as_deref());
+    }
+    let code = watchdog_error_code(err).unwrap_or_else(|| "server_is_overloaded".to_string());
+    state.relay_metrics.record("capacity_refused_everywhere");
+    tracing::warn!(
+        target: "polyflare_server::failover",
+        accounts_tried = tried.len(),
+        error_code = %code,
+        "every eligible account refused this turn for capacity before any output; \
+         surfaced as a retryable 503 with attempts refunded"
+    );
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [("retry-after", "3")],
+        Json(serde_json::json!({
+            "type": "error",
+            "error": {
+                "code": code,
+                "type": "server_error",
+                "message": "Every eligible upstream account refused this turn for capacity \
+                            before producing output. Retry shortly.",
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// The bare `/responses` ingress entrypoint: selects over ALL Codex accounts (no pool filter).
