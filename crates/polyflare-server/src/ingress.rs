@@ -2007,6 +2007,8 @@ async fn run_failover_loop(
     // `server_is_overloaded`-class terminal caught before any byte, or a bare 503). See the
     // `None` arm below for what that changes.
     let mut every_refusal_was_capacity = !committed && is_transient_capacity_refusal(&err);
+    let loop_started = std::time::Instant::now();
+    let mut ride_out_rounds: u32 = 0;
 
     loop {
         // `tried.len()` does NOT yet include `failed_id` — see the doc's "Bookkeeping order".
@@ -2027,7 +2029,7 @@ async fn run_failover_loop(
         let candidates = exclude_tried(snapshots, &tried);
         let fresh = match selector.pick(&candidates, sel_ctx) {
             Some(id) => id,
-            None => {
+            None => 'pick: {
                 // Every eligible account refused this turn for capacity within seconds of each
                 // other and nothing was relayed. 2026-09-17 11:22–11:35 on master: the loop then
                 // fell into the starvation wait for a THIRD, hard-rate-limited account (the tried
@@ -2039,6 +2041,25 @@ async fn run_failover_loop(
                 // for a different account — surface it as one the client already knows how to
                 // back off from, and give the attempts back: the upstream did no work for them.
                 if every_refusal_was_capacity {
+                    // Ride the wave out first: 2026-09-17 17:27–17:40 one-word probes on both
+                    // accounts and two models were refused in synchronized streaks of 40 s to
+                    // 5 min, then accepted again. A 503 here makes codex spend its five retries
+                    // inside one streak. Sleep, give the attempts back, and knock again on the
+                    // whole pool while the (pre-header, so shorter) budget lasts.
+                    if let Some(id) = ride_out_capacity_wave(
+                        state,
+                        &mut tried,
+                        &ctx,
+                        snapshots,
+                        selector,
+                        sel_ctx,
+                        loop_started,
+                        &mut ride_out_rounds,
+                    )
+                    .await
+                    {
+                        break 'pick id;
+                    }
                     return capacity_refused_everywhere(state, &tried, &err, &ctx);
                 }
                 // B5 Task 3 — Layer 1: before surfacing the exhaustion error below, try the
@@ -2176,6 +2197,57 @@ async fn run_failover_loop(
             }
         }
     }
+}
+
+/// Pre-header ride-out of an upstream capacity wave on the HTTP path. Sleeps a growing interval
+/// (5, 10, 15, 20 s) while the elapsed time stays inside the budget — the live
+/// `capacity_ride_out_secs`, capped at 60 s here because nothing has been sent to the client yet
+/// and its request timer is running — refunds the attempts the refused round consumed, clears
+/// the tried set, and hands back a fresh pick over the WHOLE pool for the next round. `None`
+/// when the budget is spent (or the pool is empty), i.e. surface the 503.
+#[allow(clippy::too_many_arguments)]
+async fn ride_out_capacity_wave(
+    state: &AppState,
+    tried: &mut HashSet<AccountId>,
+    ctx: &RequestCtx,
+    snapshots: &[AccountSnapshot],
+    selector: &dyn Selector,
+    sel_ctx: &SelectionCtx,
+    loop_started: std::time::Instant,
+    rounds: &mut u32,
+) -> Option<AccountId> {
+    const PRE_HEADER_CAP_SECS: u64 = 60;
+    let budget =
+        u64::from(state.runtime_settings.capacity_ride_out_secs()).min(PRE_HEADER_CAP_SECS);
+    let pause = Duration::from_secs(match *rounds {
+        0 => 5,
+        1 => 10,
+        2 => 15,
+        _ => 20,
+    });
+    if budget == 0 || loop_started.elapsed() + pause > Duration::from_secs(budget) {
+        return None;
+    }
+    for _ in 0..tried.len() {
+        state
+            .runtime
+            .refund_logical_turn_attempt(ctx.logical_turn_key.as_deref());
+    }
+    *rounds += 1;
+    state.relay_metrics.record("capacity_ride_out_round");
+    tracing::info!(
+        target: "polyflare_server::failover",
+        round = *rounds,
+        pause_secs = pause.as_secs(),
+        accounts_refused = tried.len(),
+        "every eligible account refused this turn for capacity; riding the wave out before \
+         surfacing"
+    );
+    tokio::time::sleep(pause).await;
+    tried.clear();
+    let id = selector.pick(snapshots, sel_ctx)?;
+    state.runtime.record_selected(&id, unix_now());
+    Some(id)
 }
 
 /// The failover loop's exit when EVERY candidate refused for capacity before any byte: a 503 the

@@ -75,6 +75,11 @@ pub struct RuntimeSettings {
     /// Content-free per-request debug trace (see `crate::trace`). Not a `ServeConfig` field:
     /// seeded from `POLYFLARE_DEBUG_TRACE` (default off) and live-toggled via the settings API.
     debug_trace: AtomicBool,
+    /// How long a turn may ride out an upstream capacity wave before it is surfaced (seconds;
+    /// 0 disables). Not a `ServeConfig` field: seeded from `POLYFLARE_CAPACITY_RIDE_OUT_SECS`
+    /// (default 240), live-tunable. See `crate::runtime_state::try_consume_capacity_substitution`
+    /// and `crate::ingress::ride_out_capacity_wave`.
+    capacity_ride_out_secs: AtomicU32,
     chatgpt_backend_passthrough_enabled: AtomicBool,
     wham_usage_replace_main_limit: AtomicBool,
     // Session-volume circuit breaker (see `crate::session_governor`). Live-tunable, constant
@@ -143,6 +148,7 @@ impl RuntimeSettings {
             usage_history_retention_days: AtomicU32::new(cfg.usage_history_retention_days),
             live_logs: AtomicBool::new(cfg.live_logs),
             debug_trace: AtomicBool::new(debug_trace_enabled_from_env()),
+            capacity_ride_out_secs: AtomicU32::new(capacity_ride_out_secs_from_env()),
             chatgpt_backend_passthrough_enabled: AtomicBool::new(true),
             wham_usage_replace_main_limit: AtomicBool::new(true),
             session_warn_per_hour: AtomicU32::new(DEFAULT_SESSION_WARN_PER_HOUR),
@@ -183,6 +189,7 @@ impl RuntimeSettings {
             usage_history_retention_days: AtomicU32::new(f.usage_history_retention_days),
             live_logs: AtomicBool::new(f.live_logs),
             debug_trace: AtomicBool::new(debug_trace_enabled_from_env()),
+            capacity_ride_out_secs: AtomicU32::new(capacity_ride_out_secs_from_env()),
             chatgpt_backend_passthrough_enabled: AtomicBool::new(true),
             wham_usage_replace_main_limit: AtomicBool::new(true),
             session_warn_per_hour: AtomicU32::new(DEFAULT_SESSION_WARN_PER_HOUR),
@@ -245,6 +252,10 @@ impl RuntimeSettings {
 
     pub fn debug_trace(&self) -> bool {
         self.debug_trace.load(Ordering::Relaxed)
+    }
+
+    pub fn capacity_ride_out_secs(&self) -> u32 {
+        self.capacity_ride_out_secs.load(Ordering::Relaxed)
     }
 
     pub fn chatgpt_backend_passthrough_enabled(&self) -> bool {
@@ -365,6 +376,11 @@ impl RuntimeSettings {
                 self.debug_trace.store(b, Ordering::Relaxed);
                 Ok(b.to_string())
             }
+            "capacity_ride_out_secs" => {
+                let n = narrow_u32(expect_u64(key, raw)?).min(CAPACITY_RIDE_OUT_MAX_SECS);
+                self.capacity_ride_out_secs.store(n, Ordering::Relaxed);
+                Ok(n.to_string())
+            }
             "chatgpt_backend_passthrough_enabled" => {
                 let b = expect_bool(key, raw)?;
                 self.chatgpt_backend_passthrough_enabled
@@ -403,6 +419,7 @@ pub fn parse_setting_value(key: &str, s: &str) -> Option<SettingValue> {
         | "starvation_wait_budget"
         | "starvation_heartbeat"
         | "wake_jitter_ms"
+        | "capacity_ride_out_secs"
         | "stream_idle_timeout"
         | "request_log_retention_days"
         | "usage_history_retention_days"
@@ -473,6 +490,19 @@ fn expect_f64(key: &str, raw: SettingValue) -> Result<f64, SettingsError> {
 /// Kind-check helper for `set`'s flag fields: only `SettingValue::Bool` is accepted.
 /// `POLYFLARE_DEBUG_TRACE`: `1`/`true`/`yes`/`on` (case-insensitive) enables the per-request
 /// debug trace at boot; anything else, including unset, leaves it off.
+/// Upper bound for `capacity_ride_out_secs`: fifteen minutes is longer than any wave observed
+/// (the longest refused streak on 2026-09-17 was ~5 minutes) and shorter than a client's patience.
+pub const CAPACITY_RIDE_OUT_MAX_SECS: u32 = 900;
+const CAPACITY_RIDE_OUT_DEFAULT_SECS: u32 = 240;
+
+fn capacity_ride_out_secs_from_env() -> u32 {
+    std::env::var("POLYFLARE_CAPACITY_RIDE_OUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(CAPACITY_RIDE_OUT_DEFAULT_SECS)
+        .min(CAPACITY_RIDE_OUT_MAX_SECS)
+}
+
 fn debug_trace_enabled_from_env() -> bool {
     std::env::var("POLYFLARE_DEBUG_TRACE").is_ok_and(|raw| {
         matches!(

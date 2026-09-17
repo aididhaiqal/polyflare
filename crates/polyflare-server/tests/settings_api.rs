@@ -447,6 +447,7 @@ async fn get_returns_every_field_with_the_correct_class() {
         "usage_history_retention_days",
         "live_logs",
         "debug_trace",
+        "capacity_ride_out_secs",
         "chatgpt_backend_passthrough_enabled",
         "wham_usage_replace_main_limit",
         "session_warn_per_hour",

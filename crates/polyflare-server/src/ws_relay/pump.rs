@@ -1520,6 +1520,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                                 .as_ref()
                                                 .and_then(WsTurnTelemetry::logical_turn_key),
                                             unix_now(),
+                                            state.runtime_settings.capacity_ride_out_secs(),
                                         )
                                     })
                                     .flatten();
@@ -1547,7 +1548,13 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                     // showed both accounts shedding for minutes at a stretch.
                                     // The upstream already took 20–80 s to refuse, so a few
                                     // seconds more before the forged frame costs nothing.
-                                    let pause = Duration::from_secs(5 * u64::from(ordinal));
+                                    let pause = Duration::from_secs(match ordinal {
+                                        0 => 0,
+                                        1 => 5,
+                                        2 => 10,
+                                        3 => 20,
+                                        _ => 30,
+                                    });
                                     if !pause.is_zero() {
                                         tokio::time::sleep(pause).await;
                                     }

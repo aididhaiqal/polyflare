@@ -32,7 +32,7 @@ use polyflare_core::{
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::continuity::CodexContinuity;
 use polyflare_server::ingress::responses_handler_impl_for_test;
-use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields};
+use polyflare_server::runtime_settings::{RuntimeSettings, RuntimeSettingsFields, SettingValue};
 use polyflare_store::{PlainTokens, Store, TokenCipher};
 
 fn account(id: &str, security_work_authorized: bool) -> polyflare_store::Account {
@@ -1133,6 +1133,11 @@ async fn capacity_refused_on_every_account_is_a_fast_retryable_503_and_refunds_t
         ],
     );
     let state = build_state(store, cipher, exec.clone());
+    // This test is about the exit itself; the pre-header ride-out is exercised separately.
+    state
+        .runtime_settings
+        .set("capacity_ride_out_secs", SettingValue::U64(0))
+        .unwrap();
     let pf = spawn_app(state).await;
     let client = reqwest::Client::new();
 
@@ -1188,4 +1193,60 @@ async fn capacity_refused_on_every_account_is_a_fast_retryable_503_and_refunds_t
     );
     let body = drain(resp).await;
     assert!(body.contains("response.completed"), "{body}");
+}
+
+/// 2026-09-17 17:27–17:40: capacity refusals come in synchronized streaks of 40 s to a few
+/// minutes on every account and model, then clear. When every account refuses, the loop sleeps
+/// and knocks again over the whole pool instead of spending the client's five retries inside one
+/// streak: here both accounts refuse round one, the loop waits 5 s, and A serves round two.
+#[tokio::test]
+async fn a_capacity_wave_is_ridden_out_before_any_byte_instead_of_surfacing_a_503() {
+    let (store, cipher, _dir) = spawn_store().await;
+    store
+        .accounts()
+        .insert(&account("A", false), &tokens("tokA"), &cipher)
+        .await
+        .unwrap();
+    store
+        .accounts()
+        .insert(&account("B", false), &tokens("tokB"), &cipher)
+        .await
+        .unwrap();
+    let exec = Arc::new(FailoverStubExecutor::new());
+    exec.script(
+        "A",
+        vec![
+            AttemptBehavior::AcceptedThenCapacityEnvelope,
+            AttemptBehavior::Success,
+        ],
+    );
+    exec.script("B", vec![AttemptBehavior::AcceptedThenCapacityEnvelope]);
+    let state = build_state(store, cipher, exec.clone());
+    let pf = spawn_app(state).await;
+
+    let started = std::time::Instant::now();
+    let resp = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .header("session_id", "sess-wave")
+        .header("x-codex-turn-metadata", r#"{"turn_id":"turn-wave-1"}"#)
+        .json(&serde_json::json!({"model": "m", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "served after the wave, not a 503");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(5),
+        "the loop waited out the first streak"
+    );
+    let body = drain(resp).await;
+    assert!(
+        body.contains("response.completed") && body.contains("resp_A"),
+        "A's clean second attempt is what the client reads: {body}"
+    );
+    assert!(!body.contains("do not leak this"), "{body}");
+    assert_eq!(
+        exec.calls(),
+        vec!["A".to_string(), "B".to_string(), "A".to_string()],
+        "round one on A then B, a pause, round two back on the whole pool"
+    );
 }
