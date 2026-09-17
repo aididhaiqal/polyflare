@@ -431,6 +431,43 @@ mod tests {
 
     /// A conversation with NO pin on record selects a healthy Codex account (any eligible one) — it
     /// must not error. `RoundRobin` over two fresh accounts ties to "A".
+    /// The owner refused a fresh admission for capacity moments ago and a sibling is clean: this
+    /// turn goes to the sibling (request-local — `spilled_from` names the owner so the writeback
+    /// is fenced and the thread returns home later). Once the owner's refusal is stale, or the
+    /// sibling has refused too, the owner is reused as before.
+    #[tokio::test]
+    async fn resolve_owner_spills_to_a_clean_sibling_after_a_fresh_capacity_refusal() {
+        let state = build_state(Arc::new(RoundRobin)).await;
+        seed_account(&state.store, &state.cipher, "A", "tokA").await;
+        seed_account(&state.store, &state.cipher, "B", "tokB").await;
+        let key = session_key("conv-owned-refused");
+        pin_owner(&state.store, &key, "B").await;
+        let t = now();
+        state
+            .runtime
+            .record_overload_rejection(&AccountId::from("B"), t, false, 0);
+
+        let (account, _guard, spilled) = resolve_owner(&state, &key, None, None, false)
+            .await
+            .expect("resolved");
+        assert_eq!(account.id, "A", "the clean sibling serves this turn");
+        assert_eq!(
+            spilled.as_ref().map(|id| id.as_str()),
+            Some("B"),
+            "request-local: the owner is named so the writeback is fenced"
+        );
+
+        // The sibling refused too: nobody is clean, so the owner is reused (no pointless hop).
+        state
+            .runtime
+            .record_overload_rejection(&AccountId::from("A"), t, false, 0);
+        let (account, _guard, spilled) = resolve_owner(&state, &key, None, None, false)
+            .await
+            .expect("resolved");
+        assert_eq!(account.id, "B");
+        assert!(spilled.is_none());
+    }
+
     #[tokio::test]
     async fn resolve_owner_selects_when_unpinned() {
         let state = build_state(Arc::new(RoundRobin)).await;

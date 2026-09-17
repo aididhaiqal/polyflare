@@ -290,6 +290,12 @@ pub struct RuntimeState {
     pub overload_isolated_until: Option<i64>,
     /// When the window last tripped, for the level decay.
     pub overload_last_trip_at: Option<i64>,
+    /// When the upstream last refused this account for capacity (any trip state). Read by the
+    /// owner-affine resolution: a thread whose owner refused within
+    /// `crate::control::OVERLOAD_RECENT_REFUSAL_SPILL_SECS` is served by a clean sibling for that
+    /// request rather than paying the refusal wait again (measured 2026-09-17: median 16 s,
+    /// p90 57 s per refusal before failover could even start).
+    pub overload_last_rejection_at: Option<i64>,
     /// Short deadline after a CODE-LESS upstream 429 — a momentary per-account burst rejection,
     /// not a quota event. Steers fresh selection to a sibling without benching the account or
     /// touching its status; established sticky owners keep their session.
@@ -1507,6 +1513,19 @@ impl RuntimeStates {
         }
     }
 
+    /// Whether the upstream refused `id` for capacity within the last `within_secs`.
+    pub fn recently_refused_for_capacity(
+        &self,
+        id: &AccountId,
+        now: i64,
+        within_secs: i64,
+    ) -> bool {
+        self.mutate(id, |rt| {
+            rt.overload_last_rejection_at
+                .is_some_and(|at| now.saturating_sub(at) < within_secs)
+        })
+    }
+
     pub fn record_outcome(&self, id: &AccountId, now: i64, success: bool) {
         self.mutate(id, |rt| {
             let oldest = error_rate_bucket(now - ERROR_RATE_WINDOW_SECS);
@@ -1565,6 +1584,7 @@ impl RuntimeStates {
             if quiet_since.is_some_and(|since| now - since >= OVERLOAD_LEVEL_DECAY_SECS) {
                 rt.overload_backoff_level = 0;
             }
+            rt.overload_last_rejection_at = Some(now);
             let window_start = now - OVERLOAD_WINDOW_SECS;
             rt.overload_rejections.retain(|at| *at > window_start);
             rt.soft_overload_rejections.retain(|at| *at > window_start);

@@ -216,6 +216,11 @@ async fn select_unowned_reservation(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// How long after an upstream capacity refusal a thread's owner is bypassed for fresh
+/// admissions while a clean sibling exists (see the fresh-refusal release in
+/// `resolve_owner_affine_account_inner`). Matches the overload window.
+pub const OVERLOAD_RECENT_REFUSAL_SPILL_SECS: i64 = 120;
+
 async fn resolve_owner_affine_account_inner(
     state: &AppState,
     session_key: Option<&polyflare_core::SessionKey>,
@@ -290,7 +295,41 @@ async fn resolve_owner_affine_account_inner(
                 && !polyflare_core::select::overload_backoff_active(s, now)
         })
     });
-    let spilled_from = isolated_owner.cloned();
+    // FRESH-REFUSAL RELEASE. Between "leave a short burst alone" and "isolated" there is the
+    // case that actually costs the user: the owner refused a fresh admission moments ago and the
+    // refusal itself took 16–57 s to arrive (2026-09-17 trace, n=64: median 16 s, p90 57 s), so
+    // sending the next turn back to it means paying that wait again before failover can even
+    // begin — 18:18–18:22 on master: three turns, each 8–52 s on the owner, each served by the
+    // sibling afterwards. While the owner refused within the last
+    // `OVERLOAD_RECENT_REFUSAL_SPILL_SECS` and some sibling has NOT (and is outside backoff),
+    // serve this turn from the sibling. Request-local, exactly like isolation: the session row
+    // keeps pointing at the owner, and the thread returns home once the owner stops refusing.
+    let recently_refused_owner = owner.as_ref().filter(|owner_id| {
+        isolated_owner.is_none()
+            && state.runtime.recently_refused_for_capacity(
+                owner_id,
+                now,
+                OVERLOAD_RECENT_REFUSAL_SPILL_SECS,
+            )
+            && snapshots.iter().any(|s| {
+                Some(&s.id) != owner.as_ref()
+                    && !polyflare_core::select::overload_backoff_active(s, now)
+                    && !state.runtime.recently_refused_for_capacity(
+                        &s.id,
+                        now,
+                        OVERLOAD_RECENT_REFUSAL_SPILL_SECS,
+                    )
+            })
+    });
+    if let Some(owner_id) = recently_refused_owner {
+        tracing::info!(
+            target: "polyflare_server::routing",
+            owner = %owner_id,
+            "owner refused a fresh admission for capacity moments ago; serving this turn from a \
+             clean sibling instead of paying the refusal wait again"
+        );
+    }
+    let spilled_from = isolated_owner.or(recently_refused_owner).cloned();
     let owner = if spilled_from.is_some() { None } else { owner };
     let (picked, reservation) = match owner {
         Some(owner_id) => {
