@@ -633,6 +633,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
     // (`server_is_overloaded` / `slow_down`) before anything was relayed. Reset per turn.
     let mut overload_retries_for_turn: u32 = 0;
     let mut same_socket_replays_for_turn: u32 = 0;
+    // Whether this turn's lifecycle prelude has already reached the client; a replay's duplicate
+    // is suppressed so the client reads exactly one lifecycle.
+    let mut prelude_forwarded_for_turn = false;
     // Accounts this turn has already overloaded on (the move excludes them all, so a turn walks
     // forward through the fleet rather than bouncing between two degraded accounts).
     let mut overload_tried_for_turn: Vec<AccountId> = Vec::new();
@@ -751,6 +754,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                             client_visible_upstream_for_turn = false;
                             overload_retries_for_turn = 0;
                             same_socket_replays_for_turn = 0;
+                            prelude_forwarded_for_turn = false;
                             overload_tried_for_turn.clear();
                             upstream_output_visible_for_turn = false;
                             output_visible_by = None;
@@ -1628,6 +1632,32 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                             }
                             // Normal: forward VERBATIM, then sniff for ownership.
                             UpstreamSignal::Normal => {
+                                // ONE LIFECYCLE PER TURN. A replay (any rung of the capacity
+                                // ladder) re-runs the turn upstream, which mints a fresh
+                                // `response.created` / `response.in_progress` pair. Forwarding
+                                // those would show the client two preludes, with two different
+                                // response ids, for the one turn it believes it is reading.
+                                //
+                                // codex-lb solves this with prelude suppression plus id
+                                // rewriting so the client keeps reading the id it first saw. We
+                                // suppress but do NOT rewrite, deliberately: the client's anchor
+                                // for the NEXT turn comes from the terminal it receives, so
+                                // letting the terminal carry the replay's real id keeps that
+                                // anchor pointing at state upstream actually has. Rewriting it to
+                                // the first attempt's id would hand the client an anchor for a
+                                // response that was never produced.
+                                //
+                                // Their extra guard — refuse to replay once a SEQUENCED prelude
+                                // has gone downstream, since a fresh generation restarts the
+                                // counter — has no analogue here: codex's WS frames carry no
+                                // sequence numbers.
+                                if is_prelude_frame(&text) {
+                                    if prelude_forwarded_for_turn {
+                                        relay_metrics.record("replay_prelude_suppressed");
+                                        continue;
+                                    }
+                                    prelude_forwarded_for_turn = true;
+                                }
                                 if let Some((selected, aggregate)) = rewrite_rate_limit_frames(
                                     &state,
                                     pool.as_deref(),
@@ -1958,6 +1988,18 @@ fn is_non_output_frame(frame: &str) -> bool {
     // the same argument that already makes a repeated `response.created` safe.
     frame_type.starts_with("codex.")
         || matches!(frame_type, "response.created" | "response.in_progress")
+}
+
+/// Whether `frame` is a lifecycle PRELUDE — the `response.created` / `response.in_progress` pair
+/// upstream emits before any content. Reads only the bounded `type` discriminant.
+fn is_prelude_frame(frame: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(frame) else {
+        return false;
+    };
+    matches!(
+        value.get("type").and_then(serde_json::Value::as_str),
+        Some("response.created" | "response.in_progress")
+    )
 }
 
 /// True when `frame` is a generating `response.create` carrying a top-level

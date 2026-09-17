@@ -1543,6 +1543,98 @@ mod relay_through {
         assert_eq!(mock.handshake_count(), 0);
     }
 
+    /// ONE LIFECYCLE PER TURN. A replay re-runs the turn upstream, which mints a fresh
+    /// `response.created`; forwarding it would show the client two preludes with two different
+    /// response ids for the one turn it believes it is reading. The duplicate is suppressed —
+    /// and the TERMINAL still carries the replay's real id, so the client's anchor for the next
+    /// turn points at state upstream actually has.
+    #[tokio::test]
+    async fn a_replay_shows_the_client_one_lifecycle_not_two() {
+        let created = |id: &str| {
+            serde_json::json!({"type": "response.created", "response": {"id": id}}).to_string()
+        };
+        let mock = MockWsUpstream::scripted(vec![
+            // Accepted (prelude reaches the client), then refused with nothing produced.
+            ScriptedTurn::ErrorAfterEvents {
+                events: vec![created("resp_first")],
+                status: 503,
+                code: "server_is_overloaded".to_string(),
+                message: "overloaded".to_string(),
+            },
+            // The replay mints its own prelude before completing.
+            ScriptedTurn::normal(vec![created("resp_replay")]),
+        ]);
+        let upstream = mock.clone().spawn().await;
+        let (base, state) = spawn_with_pinned_account("acct-one-lifecycle", &upstream).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        ws.send(TMessage::Text(
+            r#"{"type":"response.create","input":[],"client_metadata":{"turn_id":"t-lifecycle"}}"#
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+        let mut seen = Vec::new();
+        loop {
+            let TMessage::Text(frame) = tokio::time::timeout(Duration::from_secs(15), ws.next())
+                .await
+                .expect("a reply")
+                .expect("frame")
+                .expect("no WS error")
+            else {
+                panic!("expected a text frame");
+            };
+            let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            seen.push(frame.clone());
+            if frame["type"] == "response.completed" {
+                break;
+            }
+            assert_ne!(
+                frame["type"], "error",
+                "the refusal must stay invisible: {frame}"
+            );
+        }
+
+        let preludes: Vec<_> = seen
+            .iter()
+            .filter(|f| f["type"] == "response.created")
+            .collect();
+        assert_eq!(
+            preludes.len(),
+            1,
+            "exactly one lifecycle reaches the client: {seen:?}"
+        );
+        assert_eq!(
+            preludes[0]["response"]["id"], "resp_first",
+            "the client keeps the prelude it first read"
+        );
+        // The terminal carries the REPLAY's own id, not the suppressed prelude's — that is what
+        // makes the client's next anchor point at state upstream actually has. (The mock mints
+        // the terminal id itself, so the invariant is that it differs from the prelude's.)
+        let terminal = seen.last().expect("terminal");
+        assert_ne!(
+            terminal["response"]["id"], preludes[0]["response"]["id"],
+            "the terminal must not be rewritten back to the first attempt's id: {terminal}"
+        );
+        assert!(
+            terminal["response"]["id"].is_string(),
+            "and it must still carry one: {terminal}"
+        );
+        let snapshot = state.relay_metrics.snapshot();
+        assert_eq!(
+            snapshot
+                .iter()
+                .find(|(k, _)| k == "replay_prelude_suppressed")
+                .map(|(_, v)| *v)
+                .unwrap_or(0),
+            1,
+            "{snapshot:?}"
+        );
+    }
+
     /// RUNG 1 of the capacity ladder. An accepted, output-free refusal is replayed on the SAME
     /// SOCKET, so the connection-scoped anchor survives: no re-dial, no cross-account move, and
     /// above all no full-history resend of a thread that can run past 130k tokens. Measured
