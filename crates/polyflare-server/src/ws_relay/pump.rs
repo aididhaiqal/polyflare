@@ -632,6 +632,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
     // How many times THIS turn has been resent in place after a transient upstream overload
     // (`server_is_overloaded` / `slow_down`) before anything was relayed. Reset per turn.
     let mut overload_retries_for_turn: u32 = 0;
+    let mut same_socket_replays_for_turn: u32 = 0;
     // Accounts this turn has already overloaded on (the move excludes them all, so a turn walks
     // forward through the fleet rather than bouncing between two degraded accounts).
     let mut overload_tried_for_turn: Vec<AccountId> = Vec::new();
@@ -749,6 +750,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                             reasoning_transform_attempted = false;
                             client_visible_upstream_for_turn = false;
                             overload_retries_for_turn = 0;
+                            same_socket_replays_for_turn = 0;
                             overload_tried_for_turn.clear();
                             upstream_output_visible_for_turn = false;
                             output_visible_by = None;
@@ -1014,6 +1016,60 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                             // reacts to it exactly as it would over HTTP-SSE), THEN bench + re-select
                             // + re-dial via the caller-provided move engine.
                             UpstreamSignal::Error(sig) => {
+                                // ── CAPACITY LADDER, RUNG 1: replay on the socket that refused ──
+                                //
+                                // Upstream accepted the turn and then refused it without producing
+                                // anything. Measured over 24h, that refusal is INDEPENDENT OF LOAD:
+                                // a lone turn on an otherwise idle account fails 3.3% of the time,
+                                // a turn with four siblings already in flight fails 0%. So an
+                                // immediate resend is overwhelmingly likely to succeed, and the
+                                // socket is almost certainly still healthy.
+                                //
+                                // That matters more than it sounds. The conversation anchor is
+                                // CONNECTION-SCOPED, so retiring the socket first — as the generic
+                                // path below does — destroys it, and every remaining rung then
+                                // costs either a cross-account move or a full-history resend of a
+                                // thread that can run past 130k tokens. Replaying here keeps the
+                                // anchor and the client never learns anything happened.
+                                //
+                                // codex-lb reaches the same conclusion from the other direction:
+                                // its `accepted_replay` re-sends such a turn once, to ANOTHER
+                                // account when the body is account-neutral and "otherwise to the
+                                // account that accepted it", because an anchored body belongs to
+                                // its owner. Quota and rate-limit terminals stay fail-closed there
+                                // and here — `is_transient_overload` never matches them.
+                                //
+                                // Gated on no output having been forwarded, the same guard that
+                                // gates every other replay, so it can never duplicate what the
+                                // client already read.
+                                if is_transient_overload(&sig)
+                                    && !upstream_output_visible_for_turn
+                                    && same_socket_replays_for_turn < SAME_SOCKET_REPLAY_MAX
+                                {
+                                    if let (Some(frame), Some(conn)) =
+                                        (in_flight.clone(), upstream.as_mut())
+                                    {
+                                        same_socket_replays_for_turn += 1;
+                                        tokio::time::sleep(overload_retry_delay(
+                                            &sig,
+                                            same_socket_replays_for_turn,
+                                        ))
+                                        .await;
+                                        if conn.send_text(frame).await.is_ok() {
+                                            relay_metrics.record("capacity_replay_same_socket");
+                                            reconnects_since_progress += 1;
+                                            if reconnects_since_progress
+                                                > MAX_RECONNECTS_WITHOUT_PROGRESS
+                                            {
+                                                unfinished_status = StatusCode::BAD_GATEWAY;
+                                                break;
+                                            }
+                                            continue;
+                                        }
+                                        // The socket really was dead: fall through to the rungs
+                                        // below, which dial a replacement.
+                                    }
+                                }
                                 // This upstream has emitted a terminal protocol error and cannot
                                 // serve another turn. Retire it before any same-account refresh or
                                 // cross-account move dials a replacement, so the open-WS hard cap
@@ -1942,6 +1998,12 @@ const PARKED_READ_REARM: std::time::Duration = std::time::Duration::from_secs(3_
 /// with the backoff below add at most ~4.5 s; a longer overload is real pressure that must
 /// surface (and bench the account) rather than be hidden.
 const OVERLOAD_RETRY_MAX_RETRIES: u32 = 2;
+/// Rung 1 of the capacity ladder: how many times one turn may be replayed on the SOCKET THAT
+/// REFUSED IT before the move rungs take over. One — the refusal is load-independent (see the
+/// call site), so a single immediate resend captures nearly all of the benefit and anything
+/// further is better spent finding a different account. Its own budget, so it can never consume
+/// [`OVERLOAD_RETRY_MAX_RETRIES`] and strand a turn the cheap replay could not fix.
+const SAME_SOCKET_REPLAY_MAX: u32 = 1;
 const OVERLOAD_RETRY_BASE_MS: u64 = 750;
 const OVERLOAD_RETRY_MAX_MS: u64 = 3000;
 /// A `retry-after` above this is not a burst; the client is better served by hearing the error.
@@ -1966,7 +2028,13 @@ const OVERLOAD_RETRY_AFTER_HONOUR_MAX_SECS: i64 = 5;
 fn is_transient_overload(sig: &FailureSignal) -> bool {
     matches!(
         sig.error_code.as_deref(),
-        Some("server_is_overloaded" | "overloaded_error" | "slow_down" | "server_error")
+        Some(
+            "server_is_overloaded"
+                | "overloaded_error"
+                | "model_at_capacity"
+                | "slow_down"
+                | "server_error"
+        )
     ) || (sig.status == 503 && sig.error_code.is_none())
 }
 

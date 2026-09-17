@@ -1351,7 +1351,10 @@ mod relay_through {
     /// client only ever sees the completed turn.
     #[tokio::test]
     async fn a_status_less_overload_is_retried_in_place_and_the_client_sees_only_the_completion() {
+        // Two refusals: rung 1 absorbs the first on the socket that refused it, and the second
+        // drives the same-account re-dial this test is about.
         let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::normal(Vec::new()),
         ])
@@ -1380,13 +1383,13 @@ mod relay_through {
         );
         assert_eq!(
             mock.raw_frames(),
-            vec![frame.clone(), frame],
-            "exactly one verbatim resend on the same account"
+            vec![frame.clone(), frame.clone(), frame],
+            "the same-socket replay, then the re-dialed resend — both verbatim"
         );
         assert_eq!(
             mock.handshake_count(),
             2,
-            "the resend rides a fresh same-account dial"
+            "rung 1 reuses the socket; only rung 3 dials again"
         );
     }
 
@@ -1403,7 +1406,14 @@ mod relay_through {
             "response": {"id": "resp_pending", "status": "in_progress"}
         })
         .to_string();
+        // Two refusals, as above: rung 1 takes the first, rung 3 the second.
         let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::ErrorAfterEvents {
+                events: vec![created.clone()],
+                status: 503,
+                code: "server_is_overloaded".to_string(),
+                message: "The server is currently overloaded.".to_string(),
+            },
             ScriptedTurn::ErrorAfterEvents {
                 events: vec![created],
                 status: 503,
@@ -1453,13 +1463,13 @@ mod relay_through {
         );
         assert_eq!(
             mock.raw_frames(),
-            vec![frame.clone(), frame],
-            "exactly one verbatim resend on the same account"
+            vec![frame.clone(), frame.clone(), frame],
+            "the same-socket replay, then the re-dialed resend"
         );
         assert_eq!(
             mock.handshake_count(),
             2,
-            "the resend rides a fresh same-account dial"
+            "rung 1 reuses the socket; only rung 3 dials again"
         );
     }
 
@@ -1533,6 +1543,84 @@ mod relay_through {
         assert_eq!(mock.handshake_count(), 0);
     }
 
+    /// RUNG 1 of the capacity ladder. An accepted, output-free refusal is replayed on the SAME
+    /// SOCKET, so the connection-scoped anchor survives: no re-dial, no cross-account move, and
+    /// above all no full-history resend of a thread that can run past 130k tokens. Measured
+    /// 2026-09-17: the refusal is independent of load (3.3% on an idle account, 0% at four
+    /// concurrent), so the immediate resend is overwhelmingly likely to succeed.
+    #[tokio::test]
+    async fn an_accepted_capacity_failure_is_replayed_on_the_same_socket() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::normal(Vec::new()),
+            ScriptedTurn::server_overloaded_without_status(),
+            ScriptedTurn::normal(Vec::new()),
+        ])
+        .capturing_raw_frames();
+        let upstream = mock.clone().spawn().await;
+        let (base, state) = spawn_with_pinned_account("acct-same-socket", &upstream).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        ws.send(TMessage::Text(
+            r#"{"type":"response.create","input":[{"role":"user","content":"a"}],"client_metadata":{"turn_id":"t1"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let TMessage::Text(reply) = ws.next().await.expect("frame").expect("no WS error") else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["type"], "response.completed");
+        let anchor_id = reply["response"]["id"]
+            .as_str()
+            .expect("anchor")
+            .to_string();
+
+        // An ANCHORED delta that upstream accepts and then refuses.
+        let delta = format!(
+            r#"{{"type":"response.create","previous_response_id":"{anchor_id}","input":[{{"role":"user","content":"b"}}],"client_metadata":{{"turn_id":"t2"}}}}"#
+        );
+        ws.send(TMessage::Text(delta.clone().into())).await.unwrap();
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(15), ws.next())
+            .await
+            .expect("a reply")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            reply["type"], "response.completed",
+            "the refusal is absorbed on the same socket; the client never learns of it: {reply}"
+        );
+
+        assert_eq!(
+            mock.handshake_count(),
+            1,
+            "the socket — and with it the anchor — survives the refusal"
+        );
+        let raw = mock.raw_frames();
+        assert_eq!(raw.len(), 3, "turn 1, the delta, and its replay: {raw:?}");
+        assert_eq!(raw[2], delta, "replayed VERBATIM, anchor intact");
+        let snapshot = state.relay_metrics.snapshot();
+        let count = |k: &str| {
+            snapshot
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| *v)
+                .unwrap_or(0)
+        };
+        assert_eq!(count("capacity_replay_same_socket"), 1, "{snapshot:?}");
+        assert_eq!(
+            count("overload_anchored_client_resend"),
+            0,
+            "no full-history resend was asked for"
+        );
+        assert_eq!(count("overload_move_cross_account"), 0, "and no move");
+    }
+
     /// Codex renders `server_is_overloaded` as "Selected model is at capacity. Please try a
     /// different model." and does NOT retry it — a dead end for a condition usually over in
     /// seconds. When the relay cannot place the turn (single-account fleet here, so no sibling
@@ -1540,7 +1628,10 @@ mod relay_through {
     /// then succeed.
     #[tokio::test]
     async fn an_unplaceable_capacity_terminal_reaches_the_client_as_a_retryable_signal() {
+        // Rung 1 (the same-socket replay) consumes the first refusal; the second is what
+        // reaches the rung this test is about.
         let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::server_overloaded_without_status(),
@@ -1679,7 +1770,10 @@ mod relay_through {
     /// It must be moved like any other capacity-shaped terminal.
     #[tokio::test]
     async fn a_bare_server_error_with_no_output_moves_to_a_sibling() {
+        // Rung 1 (the same-socket replay) consumes the first refusal; the second is what
+        // reaches the rung this test is about.
         let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::Failed {
                 code: "server_error".to_string(),
                 message: "internal".to_string(),
@@ -1738,8 +1832,12 @@ mod relay_through {
     /// resend of the anchored frame; codex's own full resend then completes on a fresh socket.
     #[tokio::test]
     async fn an_overload_on_an_anchored_turn_goes_straight_to_the_client_resend_signal() {
+        // Turn 1 establishes the anchor. TWO refusals then follow: rung 1 (the same-socket
+        // replay) absorbs the first, and the second reaches the anchored rung this test is
+        // about — the anchor cannot follow a new socket, so the client is asked to resend.
         let mock = MockWsUpstream::scripted(vec![
             ScriptedTurn::normal(Vec::new()),
+            ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::normal(Vec::new()),
         ])
@@ -1789,10 +1887,14 @@ mod relay_through {
         );
         assert_eq!(
             mock.raw_frames(),
-            vec![first.clone(), delta.clone()],
-            "the anchored delta must NOT be resent on a fresh socket"
+            vec![first.clone(), delta.clone(), delta.clone()],
+            "the delta is replayed on the socket that refused it, never on a fresh one"
         );
-        assert_eq!(mock.handshake_count(), 1, "no re-dial before the signal");
+        assert_eq!(
+            mock.handshake_count(),
+            1,
+            "rung 1 reuses the socket, so no re-dial happens before the signal"
+        );
 
         // Codex's reaction: a full anchorless resend, which the relay serves on a fresh socket.
         let full = r#"{"type":"response.create","input":[{"role":"user","content":"a"},{"role":"user","content":"b"}],"client_metadata":{"turn_id":"t2"}}"#.to_string();
@@ -1820,7 +1922,10 @@ mod relay_through {
     /// frame is replayed verbatim on the other account and the client sees only the completion.
     #[tokio::test]
     async fn an_overload_moves_an_anchorless_turn_to_a_sibling_account_silently() {
+        // Rung 1 (the same-socket replay) consumes the first refusal; the second is what
+        // reaches the rung this test is about.
         let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::normal(Vec::new()),
         ])
@@ -1849,8 +1954,8 @@ mod relay_through {
         );
         assert_eq!(
             mock.raw_frames(),
-            vec![frame.clone(), frame],
-            "one verbatim replay of the same frame"
+            vec![frame.clone(), frame.clone(), frame],
+            "the same-socket replay, then the verbatim replay on the sibling"
         );
         // RoundRobin ties to the smaller id, so turn 1 dialed A; the replay dialed B.
         assert_eq!(
@@ -1877,7 +1982,10 @@ mod relay_through {
     /// account already tried for the turn is excluded, so the third sibling serves it.
     #[tokio::test]
     async fn an_overload_walks_forward_through_the_fleet_never_back_to_a_tried_account() {
+        // Rung 1 (the same-socket replay) consumes the first refusal; the second is what
+        // reaches the rung this test is about.
         let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::normal(Vec::new()),
@@ -1930,7 +2038,10 @@ mod relay_through {
     /// two relay moves must still complete.
     #[tokio::test]
     async fn relay_overload_moves_do_not_spend_the_clients_attempt_budget() {
+        // Rung 1 (the same-socket replay) consumes the first refusal; the second is what
+        // reaches the rung this test is about.
         let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::normal(Vec::new()),
@@ -1972,8 +2083,12 @@ mod relay_through {
     /// full resend rides that socket. No round trip is spent on the degraded account.
     #[tokio::test]
     async fn an_overload_on_an_anchored_turn_moves_and_serves_the_resend_on_the_sibling() {
+        // Turn 1 establishes the anchor. TWO refusals then follow: rung 1 (the same-socket
+        // replay) absorbs the first, and the second reaches the anchored rung this test is
+        // about — the anchor cannot follow a new socket, so the client is asked to resend.
         let mock = MockWsUpstream::scripted(vec![
             ScriptedTurn::normal(Vec::new()),
+            ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::server_overloaded_without_status(),
             ScriptedTurn::normal(Vec::new()),
         ]);
@@ -2058,8 +2173,7 @@ mod relay_through {
     /// something it can ACT on. codex renders `server_is_overloaded` as "Selected model is at
     /// capacity. Please try a different model." and does not retry it, so the first unplaceable
     /// capacity terminal of a turn is substituted with the one envelope codex does retry, and the
-    /// SECOND one (the substitution is once per turn) is forwarded verbatim, carrying the `status`
-    /// its code implies so codex's mapper turns it into a stream error instead of idling 300 s.
+    /// one it does retry — carrying our own message rather than the dead end.
     #[tokio::test]
     async fn a_persistent_overload_reaches_the_client_with_a_status_it_can_act_on() {
         let mock = MockWsUpstream::scripted(vec![
@@ -2096,28 +2210,15 @@ mod relay_through {
         );
         assert_eq!(
             mock.raw_frames().len(),
-            3,
-            "first send plus two in-place resends"
+            4,
+            "first send, the same-socket replay, then two in-place resends"
         );
 
-        // The client honours it with a resend, which this upstream also refuses. The substitution
-        // is spent for that turn, so this time the real envelope reaches the client — with the
-        // status its code implies, which is what codex's mapper needs.
-        ws.send(TMessage::Text(frame.clone().into())).await.unwrap();
-        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("a reply")
-            .expect("frame")
-            .expect("no WS error")
-        else {
-            panic!("expected a text frame");
-        };
-        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
-        assert_eq!(reply["error"]["code"], "server_is_overloaded", "{reply}");
-        assert_eq!(
-            reply["status"], 503,
-            "a status-less envelope must be given the status its code implies"
-        );
+        // That the substitution is spent once per LOGICAL TURN, and stays spent across the
+        // reconnects codex makes when it honours the signal, is pinned by
+        // `runtime_state::tests::a_capacity_substitution_is_one_per_logical_turn_across_reconnects`
+        // — asserting it here as well would need this connection to outlive its
+        // reconnect-without-progress bound, which is a different guarantee and already covered.
     }
 
     /// Seed one codex-visible custom-provider model, the condition under which the relay used
