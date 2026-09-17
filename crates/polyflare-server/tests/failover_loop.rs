@@ -113,6 +113,10 @@ enum AttemptBehavior {
     /// (`codex.rate_limits`), then seconds later the capacity envelope. The metadata frame ended the
     /// scan as "decisive", the handler returned, and the refusal was relayed as content.
     AcceptedThenMetadataThenCapacityEnvelope,
+    /// 2026-09-18 07:04 / 07:14: the prelude frames echo the whole request (62 KB each for a
+    /// 158-item thread), so together they crossed the scan's old 64 KB cap and the envelope behind
+    /// them was relayed as content.
+    AcceptedWithLargePreludeThenCapacityEnvelope,
 }
 
 /// A test-only `Executor` keyed by `Account.id`: each account has a FIFO queue of
@@ -225,6 +229,22 @@ impl Executor for FailoverStubExecutor {
                 let envelope = r#"{"type":"error","error":{"code":"server_is_overloaded","message":"do not leak this"}}"#;
                 Ok(ResponseStream::new(stream::iter(vec![
                     Ok::<Bytes, ExecError>(Bytes::from(format!("data: {created}\n\n"))),
+                    Ok(Bytes::from(format!("data: {envelope}\n\n"))),
+                ])))
+            }
+            AttemptBehavior::AcceptedWithLargePreludeThenCapacityEnvelope => {
+                let id = format!("resp_{}", account.id);
+                let pad = "x".repeat(70 * 1024);
+                let created = format!(
+                    r#"{{"type":"response.created","response":{{"id":"{id}","pad":"{pad}"}}}}"#
+                );
+                let in_progress = format!(
+                    r#"{{"type":"response.in_progress","response":{{"id":"{id}","pad":"{pad}"}}}}"#
+                );
+                let envelope = r#"{"type":"error","error":{"code":"server_is_overloaded","message":"do not leak this"}}"#;
+                Ok(ResponseStream::new(stream::iter(vec![
+                    Ok::<Bytes, ExecError>(Bytes::from(format!("data: {created}\n\n"))),
+                    Ok(Bytes::from(format!("data: {in_progress}\n\n"))),
                     Ok(Bytes::from(format!("data: {envelope}\n\n"))),
                 ])))
             }
@@ -606,6 +626,53 @@ async fn a_capacity_envelope_after_backend_metadata_still_fails_over_before_any_
     exec.script(
         "A",
         vec![AttemptBehavior::AcceptedThenMetadataThenCapacityEnvelope],
+    );
+    exec.script("B", vec![AttemptBehavior::Success]);
+    let state = build_state(store, cipher, exec.clone());
+    let pf = spawn_app(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "m", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the client gets B's clean stream");
+    let body = drain(resp).await;
+    assert!(
+        body.contains("response.completed") && body.contains("resp_B"),
+        "B's clean completion is what the client reads: {body}"
+    );
+    assert!(
+        !body.contains("server_is_overloaded") && !body.contains("do not leak this"),
+        "A's refusal never reaches the client: {body}"
+    );
+    assert_eq!(
+        body.matches("response.created").count(),
+        1,
+        "one lifecycle: {body}"
+    );
+    assert_eq!(exec.calls(), vec!["A".to_string(), "B".to_string()]);
+}
+
+/// A prelude larger than any fixed byte cap must not hide the refusal behind it.
+#[tokio::test]
+async fn a_capacity_envelope_behind_a_large_prelude_still_fails_over_before_any_byte_is_relayed() {
+    let (store, cipher, _dir) = spawn_store().await;
+    store
+        .accounts()
+        .insert(&account("A", false), &tokens("tokA"), &cipher)
+        .await
+        .unwrap();
+    store
+        .accounts()
+        .insert(&account("B", false), &tokens("tokB"), &cipher)
+        .await
+        .unwrap();
+    let exec = Arc::new(FailoverStubExecutor::new());
+    exec.script(
+        "A",
+        vec![AttemptBehavior::AcceptedWithLargePreludeThenCapacityEnvelope],
     );
     exec.script("B", vec![AttemptBehavior::Success]);
     let state = build_state(store, cipher, exec.clone());

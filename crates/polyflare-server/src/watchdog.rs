@@ -1356,30 +1356,46 @@ fn classify_frame(v: &serde_json::Value) -> Option<ScanVerdict> {
 /// pure lifecycle (or nothing parses yet, e.g. a chunk boundary split a line) — the caller should
 /// buffer more and rescan. Mirrors `extract_response_id`'s tolerant, re-parse-the-whole-buffer-each-
 /// time style: malformed/partial trailing JSON is silently skipped, never treated as decisive.
+#[cfg(test)]
 fn scan_buffered_frames(buf: &[u8]) -> Option<ScanVerdict> {
-    let text = String::from_utf8_lossy(buf);
-    for line in text.lines() {
-        let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
-            continue;
-        };
-        if payload.is_empty() || payload == "[DONE]" {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
-            continue;
-        };
-        if let Some(verdict) = classify_frame(&v) {
-            return Some(verdict);
-        }
-    }
-    None
+    scan_buffered_frames_consuming(buf).0
 }
 
-/// Bounded buffer cap for [`scan_past_lifecycle`] — mirrors `ResponseIdSniffer`'s give-up
-/// threshold. A real turn always produces a decisive frame (content or terminal) within a handful
-/// of small lifecycle frames; if a pathological upstream never does, give up scanning rather than
-/// buffer unboundedly and fall back to the ALIVE path with whatever was collected.
-const MAX_SCAN_BYTES: usize = 64 * 1024;
+/// As [`scan_buffered_frames`], plus how many leading bytes hold COMPLETE lines that were all
+/// non-decisive (lifecycle prelude, metadata, keepalives, blanks, unparseable): the caller drops
+/// those from its scan buffer — they are already queued for relay — so the buffer cap bounds only
+/// the pending partial line, not the whole prelude. 2026-09-18 07:04 and 07:14: this thread's
+/// `response.created` and `response.in_progress` each echoed a 158-item request at 62 KB, the two
+/// together crossed the 64 KB cap, the scan gave up as "alive", and the capacity envelope one
+/// second behind them was relayed to the client as "Selected model is at capacity".
+fn scan_buffered_frames_consuming(buf: &[u8]) -> (Option<ScanVerdict>, usize) {
+    let text = String::from_utf8_lossy(buf);
+    let mut consumed = 0usize;
+    let mut pos = 0usize;
+    while let Some(nl) = text[pos..].find('\n') {
+        let line_end = pos + nl + 1;
+        let line = text[pos..line_end].trim_end_matches(['\n', '\r']);
+        pos = line_end;
+        if let Some(payload) = line.strip_prefix("data:").map(str::trim) {
+            if !payload.is_empty() && payload != "[DONE]" {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                    if let Some(verdict) = classify_frame(&v) {
+                        return (Some(verdict), consumed);
+                    }
+                }
+            }
+        }
+        consumed = line_end;
+    }
+    (None, consumed)
+}
+
+/// Bound on the UNPARSED tail [`scan_past_lifecycle`] keeps while waiting for a line to complete
+/// (classified lines are drained, see `scan_buffered_frames_consuming`). A single lifecycle frame
+/// echoes the whole request, so it scales with context: 62 KB for a 158-item thread on 2026-09-18,
+/// more for bigger ones. Generous by design; if a pathological upstream never completes a line,
+/// give up scanning rather than buffer unboundedly and fall back to the ALIVE path.
+const MAX_SCAN_BYTES: usize = 4 * 1024 * 1024;
 
 /// Buffers upstream chunks (bounded; see [`MAX_SCAN_BYTES`]) past pure lifecycle frames
 /// (`response.created`/`response.in_progress`), scanning for the first DECISIVE frame — mirrors
@@ -1401,7 +1417,8 @@ async fn scan_past_lifecycle(
     let mut cyber = false;
 
     loop {
-        match scan_buffered_frames(&scan_buf) {
+        let (verdict, consumed) = scan_buffered_frames_consuming(&scan_buf);
+        match verdict {
             Some(ScanVerdict::CyberPolicy) => {
                 cyber = true;
                 break;
@@ -1409,6 +1426,11 @@ async fn scan_past_lifecycle(
             Some(ScanVerdict::Capacity(code)) => return ScanOutcome::Capacity(code),
             Some(ScanVerdict::Decisive) => break,
             None => {
+                // Classified prelude lines are relayed from `relay_chunks`; the scan buffer only
+                // needs the unparsed tail.
+                if consumed > 0 {
+                    scan_buf.drain(..consumed);
+                }
                 if scan_buf.len() > MAX_SCAN_BYTES {
                     break; // bounded: give up scanning, treat as alive with what we have
                 }
@@ -2346,6 +2368,33 @@ mod tests {
     /// The WRAPPED envelope is how a capacity refusal actually arrives over SSE. It must be caught
     /// exactly like a capacity `response.failed`, and a wrapped error with a request-level code
     /// must stay decisive.
+    #[test]
+    fn scan_drains_classified_prelude_so_a_large_prelude_never_hides_the_refusal() {
+        // Two prelude frames far above any sane per-line cap, then the capacity envelope.
+        let big = "x".repeat(3 * 1024 * 1024);
+        let buf = format!(
+            "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"r\",\"pad\":\"{big}\"}}}}\n\n\
+             data: {{\"type\":\"response.in_progress\",\"response\":{{\"id\":\"r\",\"pad\":\"{big}\"}}}}\n\n"
+        );
+        let (verdict, consumed) = scan_buffered_frames_consuming(buf.as_bytes());
+        assert_eq!(verdict, None);
+        assert_eq!(
+            consumed,
+            buf.len(),
+            "every complete prelude line is drainable"
+        );
+        let tail = "data: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\"}}\n\n";
+        assert_eq!(
+            scan_buffered_frames_consuming(tail.as_bytes()).0,
+            Some(ScanVerdict::Capacity("server_is_overloaded".into()))
+        );
+        // A partial trailing line is never consumed.
+        let partial = "data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"err";
+        let (v, c) = scan_buffered_frames_consuming(partial.as_bytes());
+        assert_eq!(v, None);
+        assert_eq!(c, partial.find("data: {\"type\":\"err").unwrap());
+    }
+
     #[test]
     fn scan_keeps_scanning_past_upstream_keepalives() {
         let buf = concat!(
