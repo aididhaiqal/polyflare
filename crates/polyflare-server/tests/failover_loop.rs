@@ -104,6 +104,10 @@ enum AttemptBehavior {
     /// refuses it with a capacity `response.failed` before producing any content — the shape that
     /// reached clients as a non-retryable "at capacity" inside a successful-looking response.
     AcceptedThenCapacity,
+    /// As above, but the refusal is the WRAPPED envelope `{"type":"error","error":{"code":..}}` —
+    /// the shape that actually arrives over SSE in production, and the one the scan and sniffer
+    /// both ignored.
+    AcceptedThenCapacityEnvelope,
 }
 
 /// A test-only `Executor` keyed by `Account.id`: each account has a FIFO queue of
@@ -207,6 +211,16 @@ impl Executor for FailoverStubExecutor {
                 Ok(ResponseStream::new(stream::iter(vec![
                     Ok::<Bytes, ExecError>(Bytes::from(format!("data: {created}\n\n"))),
                     Ok(Bytes::from(format!("data: {failed}\n\n"))),
+                ])))
+            }
+            AttemptBehavior::AcceptedThenCapacityEnvelope => {
+                let id = format!("resp_{}", account.id);
+                let created =
+                    format!(r#"{{"type":"response.created","response":{{"id":"{id}"}}}}"#);
+                let envelope = r#"{"type":"error","error":{"code":"server_is_overloaded","message":"do not leak this"}}"#;
+                Ok(ResponseStream::new(stream::iter(vec![
+                    Ok::<Bytes, ExecError>(Bytes::from(format!("data: {created}\n\n"))),
+                    Ok(Bytes::from(format!("data: {envelope}\n\n"))),
                 ])))
             }
             AttemptBehavior::ByteThenDrop => {
@@ -505,6 +519,52 @@ async fn an_accepted_capacity_failure_on_sse_fails_over_before_any_byte_is_relay
         vec!["A".to_string(), "B".to_string()],
         "A refused before any byte was relayed, so the loop moved to B"
     );
+}
+
+/// The production shape: the same refusal as the test above, but as the wrapped
+/// `{"type":"error"}` envelope. 2026-09-17 10:02: the first fix caught `response.failed` only, and
+/// this envelope sailed straight through to the client on the very first turn after deploy.
+#[tokio::test]
+async fn an_accepted_capacity_envelope_on_sse_fails_over_before_any_byte_is_relayed() {
+    let (store, cipher, _dir) = spawn_store().await;
+    store
+        .accounts()
+        .insert(&account("A", false), &tokens("tokA"), &cipher)
+        .await
+        .unwrap();
+    store
+        .accounts()
+        .insert(&account("B", false), &tokens("tokB"), &cipher)
+        .await
+        .unwrap();
+    let exec = Arc::new(FailoverStubExecutor::new());
+    exec.script("A", vec![AttemptBehavior::AcceptedThenCapacityEnvelope]);
+    exec.script("B", vec![AttemptBehavior::Success]);
+    let state = build_state(store, cipher, exec.clone());
+    let pf = spawn_app(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "m", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the client gets B's clean stream");
+    let body = drain(resp).await;
+    assert!(
+        body.contains("response.completed") && body.contains("resp_B"),
+        "B's clean completion is what the client reads: {body}"
+    );
+    assert!(
+        !body.contains("server_is_overloaded") && !body.contains("do not leak this"),
+        "A's refusal never reaches the client: {body}"
+    );
+    assert_eq!(
+        body.matches("response.created").count(),
+        1,
+        "one lifecycle: {body}"
+    );
+    assert_eq!(exec.calls(), vec!["A".to_string(), "B".to_string()]);
 }
 
 #[tokio::test]

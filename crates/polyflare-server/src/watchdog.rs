@@ -783,6 +783,39 @@ enum ProtocolFailureKind {
     Request,
 }
 
+/// The health class of a streamed terminal failure, keyed on its bounded `error.code` only.
+fn failure_kind_for_code(code: Option<&str>) -> ProtocolFailureKind {
+    match code {
+        Some("rate_limit_exceeded") => ProtocolFailureKind::RateLimited,
+        Some("insufficient_quota" | "usage_not_included") => ProtocolFailureKind::QuotaExceeded,
+        Some("server_is_overloaded" | "overloaded_error" | "model_at_capacity" | "slow_down") => {
+            ProtocolFailureKind::Transient
+        }
+        Some(
+            "context_length_exceeded"
+            | "invalid_prompt"
+            | "bio_policy"
+            | "cyber_policy"
+            | "invalid_request_error",
+        ) => ProtocolFailureKind::Request,
+        // codex-rs treats all other terminal errors as retryable.
+        _ => ProtocolFailureKind::Transient,
+    }
+}
+
+/// One content-free line per streamed terminal failure: the frame TYPE, the bounded `error.code`
+/// and the health class — never the message. This is the evidence that was missing when 263
+/// such failures hid behind `status=200` rows with no code.
+fn trace_streamed_failure(frame_type: &str, code: Option<&str>, kind: ProtocolFailureKind) {
+    tracing::warn!(
+        target: "polyflare_server::watchdog",
+        frame_type,
+        error_code = code.unwrap_or("-"),
+        kind = ?kind,
+        "streamed terminal failure"
+    );
+}
+
 /// Bounded, non-buffering sniffer for the streamed terminal outcome. A `response.created` id is
 /// retained only as a candidate; continuation is committed exclusively after a matching
 /// `response.completed`. Failed, incomplete, malformed, or clean EOF without completion are never
@@ -866,21 +899,21 @@ impl ResponseIdSniffer {
                 let code = v
                     .pointer("/response/error/code")
                     .and_then(serde_json::Value::as_str);
-                let kind = match code {
-                    Some("rate_limit_exceeded") => ProtocolFailureKind::RateLimited,
-                    Some("insufficient_quota" | "usage_not_included") => {
-                        ProtocolFailureKind::QuotaExceeded
-                    }
-                    Some("server_is_overloaded" | "slow_down") => ProtocolFailureKind::Transient,
-                    Some(
-                        "context_length_exceeded"
-                        | "invalid_prompt"
-                        | "bio_policy"
-                        | "cyber_policy",
-                    ) => ProtocolFailureKind::Request,
-                    // codex-rs treats all other response.failed errors as retryable.
-                    _ => ProtocolFailureKind::Transient,
-                };
+                let kind = failure_kind_for_code(code);
+                trace_streamed_failure(ty, code, kind);
+                self.terminal = TerminalOutcome::Failed { kind };
+            }
+            // The wrapped envelope (see `classify_frame`). Until now it hit the `_ => {}` arm
+            // below, so the terminal stayed `Pending`, `finish()` called it a transport loss,
+            // and the row carried no code — a capacity refusal indistinguishable from a dropped
+            // connection in every statistic.
+            "error" => {
+                let code = v
+                    .get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(serde_json::Value::as_str);
+                let kind = failure_kind_for_code(code);
+                trace_streamed_failure(ty, code, kind);
                 self.terminal = TerminalOutcome::Failed { kind };
             }
             "response.incomplete" => {
@@ -978,6 +1011,29 @@ fn classify_frame(v: &serde_json::Value) -> Option<ScanVerdict> {
                 .and_then(|c| c.as_str());
             Some(match code {
                 Some("cyber_policy") => ScanVerdict::CyberPolicy,
+                Some(
+                    c @ ("server_is_overloaded"
+                    | "overloaded_error"
+                    | "model_at_capacity"
+                    | "slow_down"
+                    | "server_error"),
+                ) => ScanVerdict::Capacity(c.to_string()),
+                _ => ScanVerdict::Decisive,
+            })
+        }
+        // The WRAPPED envelope — `{"type":"error","error":{"code":..}}`, the same shape the WS
+        // relay classifies in `ws_relay::signal`. This is how a capacity refusal actually arrives
+        // on the SSE path (the client renders its message as "stream disconnected before
+        // completion: …request ID…" when it is a fault, and "at capacity" when it is
+        // `server_is_overloaded`). It was falling through to Decisive and being relayed as if it
+        // were content — every one of 2026-09-17's "back to back" failures. A wrapped error with
+        // a REQUEST-level code stays decisive: retrying it elsewhere cannot help.
+        "error" => {
+            let code = v
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_str());
+            Some(match code {
                 Some(
                     c @ ("server_is_overloaded"
                     | "overloaded_error"
@@ -1962,6 +2018,32 @@ mod tests {
                 other => panic!("{code}: expected Capacity, got {other:?}"),
             }
         }
+    }
+
+    /// The WRAPPED envelope is how a capacity refusal actually arrives over SSE. It must be caught
+    /// exactly like a capacity `response.failed`, and a wrapped error with a request-level code
+    /// must stay decisive.
+    #[test]
+    fn scan_detects_a_wrapped_error_envelope_with_a_capacity_code() {
+        let sse = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_x\"}}\n\n",
+            "data: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",",
+            "\"message\":\"do not leak this\"}}\n\n",
+        )
+        .as_bytes();
+        match scan_buffered_frames(sse) {
+            Some(ScanVerdict::Capacity(c)) => assert_eq!(c, "server_is_overloaded"),
+            other => panic!("expected Capacity, got {other:?}"),
+        }
+        let request_level = concat!(
+            "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",",
+            "\"message\":\"bad\"}}\n\n",
+        )
+        .as_bytes();
+        assert!(matches!(
+            scan_buffered_frames(request_level),
+            Some(ScanVerdict::Decisive)
+        ));
     }
 
     /// A request-level `response.failed` (bad input, policy) stays decisive: retrying it elsewhere
