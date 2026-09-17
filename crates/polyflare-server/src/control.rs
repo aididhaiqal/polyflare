@@ -215,12 +215,12 @@ async fn select_unowned_reservation(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// How long after an upstream capacity refusal a thread's owner is bypassed for fresh
 /// admissions while a clean sibling exists (see the fresh-refusal release in
 /// `resolve_owner_affine_account_inner`). Matches the overload window.
 pub const OVERLOAD_RECENT_REFUSAL_SPILL_SECS: i64 = 120;
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_owner_affine_account_inner(
     state: &AppState,
     session_key: Option<&polyflare_core::SessionKey>,
