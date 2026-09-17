@@ -79,6 +79,7 @@ impl Selector for FirstEligible {
     fn pick(&self, candidates: &[AccountSnapshot], ctx: &SelectionCtx) -> Option<AccountId> {
         candidates
             .iter()
+            .filter(|s| s.cooldown_until.is_none_or(|cd| cd <= ctx.now))
             .find(|s| !ctx.require_security_work_authorized || s.security_work_authorized)
             .map(|s| s.id.clone())
     }
@@ -1248,5 +1249,79 @@ async fn a_capacity_wave_is_ridden_out_before_any_byte_instead_of_surfacing_a_50
         exec.calls(),
         vec!["A".to_string(), "B".to_string(), "A".to_string()],
         "round one on A then B, a pause, round two back on the whole pool"
+    );
+}
+
+/// 2026-09-17 20:13–20:14 on master: the thread's owner was ineligible (rate-limited), so every
+/// turn took the recovery route, which executed ONE fresh attempt and surfaced a bare 502 on a
+/// capacity refusal. Codex retried within seconds, each retry cost an attempt, and the eighth
+/// answered "logical turn attempt budget exhausted". The recovery route now hands a refusal to the
+/// failover loop like the normal route does: turn 1 makes A the owner, A becomes ineligible, the
+/// fresh pick B refuses, and C serves the turn.
+#[tokio::test]
+async fn a_recovered_turn_fails_over_instead_of_surfacing_a_502_after_one_refusal() {
+    let (store, cipher, _dir) = spawn_store().await;
+    for (id, tok) in [("A", "tokA"), ("B", "tokB"), ("C", "tokC")] {
+        store
+            .accounts()
+            .insert(&account(id, false), &tokens(tok), &cipher)
+            .await
+            .unwrap();
+    }
+    let exec = Arc::new(FailoverStubExecutor::new());
+    exec.script("A", vec![AttemptBehavior::Success]);
+    exec.script("B", vec![AttemptBehavior::AcceptedThenCapacityEnvelope]);
+    exec.script("C", vec![AttemptBehavior::Success]);
+    let state = build_state(store, cipher, exec.clone());
+    let pf = spawn_app(state.clone()).await;
+    let client = reqwest::Client::new();
+
+    // Turn 1: A serves and becomes the session's owner.
+    let resp = client
+        .post(format!("{pf}/responses"))
+        .header("session_id", "sess-recover")
+        .json(&serde_json::json!({"model": "m", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = drain(resp).await;
+    assert!(body.contains("resp_A"), "{body}");
+
+    // The owner becomes ineligible (a cooldown, as a rate limit would leave it) ⇒ the next turn
+    // takes the recovery route.
+    state.runtime.set_cooldown_until_for_test(
+        &AccountId::from("A"),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 3_600,
+    );
+
+    let started = std::time::Instant::now();
+    let resp = client
+        .post(format!("{pf}/responses"))
+        .header("session_id", "sess-recover")
+        .header("x-codex-turn-metadata", r#"{"turn_id":"turn-recover-2"}"#)
+        .json(&serde_json::json!({"model": "m", "input": "hi again"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "B's refusal failed over to C, not a 502"
+    );
+    let body = drain(resp).await;
+    assert!(
+        body.contains("resp_C") && !body.contains("do not leak this"),
+        "C's clean stream is what the client reads: {body}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(
+        exec.calls(),
+        vec!["A".to_string(), "B".to_string(), "C".to_string()],
+        "turn 1 on A; turn 2 recovered on B, refused, failed over to C"
     );
 }

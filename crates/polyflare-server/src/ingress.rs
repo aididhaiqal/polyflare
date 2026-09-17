@@ -3693,18 +3693,26 @@ async fn responses_handler_impl_with_max_attempts(
                             outcome,
                         );
                     };
+                    // The recovered attempt is an anchorless resend on a freshly selected
+                    // account, so a failure here is exactly what the bounded cross-account
+                    // failover loop exists for. Before 2026-09-17 it surfaced a bare 502 after
+                    // ONE refusal: the client retried within seconds, each retry cost one
+                    // attempt, and eight refusals later the logical-turn budget answered 400
+                    // (20:13–20:14 on master, eight 502s in 52 s, then the 400).
+                    let resend_for_loop = anchorless_req.clone();
+                    let commit = CommitWitness::new();
                     match execute_recovery_tracked(
                         state.executor_for(provider).as_ref(),
                         state.continuity.clone(),
                         anchorless_req,
                         &account,
                         fresh,
-                        ctx,
-                        session_key,
+                        ctx.clone(),
+                        session_key.clone(),
                         state.runtime.clone(),
                         state.runtime_settings.stream_idle_timeout(),
                         max_attempts,
-                        CommitWitness::new(),
+                        commit.clone(),
                         Some(in_flight),
                     )
                     .await
@@ -3712,7 +3720,26 @@ async fn responses_handler_impl_with_max_attempts(
                         Ok(stream) => stream_response(stream),
                         Err(e) => {
                             record_failure(&state, &health_id, &e, unix_now()).await;
-                            surface_watchdog_error(&e)
+                            run_failover_loop(
+                                &state,
+                                health_id,
+                                e,
+                                commit.is_committed(),
+                                resend_for_loop,
+                                &snapshots,
+                                selector.as_ref(),
+                                selector.clone(),
+                                &sel_ctx,
+                                ctx,
+                                session_key,
+                                now,
+                                max_attempts,
+                                pool_owned.clone(),
+                                starvation_budget,
+                                starvation_heartbeat,
+                                &mut outcome,
+                            )
+                            .await
                         }
                     }
                 }
@@ -3750,6 +3777,7 @@ async fn responses_handler_impl_with_max_attempts(
                                         return (r, outcome);
                                     }
                                 };
+                            let resend_for_loop = prepared.req.clone();
                             let fallback = Prepared {
                                 req: prepared.req,
                                 directive: ContinuityDirective {
@@ -3792,17 +3820,21 @@ async fn responses_handler_impl_with_max_attempts(
                                     outcome,
                                 );
                             };
+                            // Same reasoning as the `ResendFull` arm above: this request is
+                            // anchorless by construction, so a refusal fails over instead of
+                            // surfacing a bare 502 the client retries into the budget.
+                            let commit = CommitWitness::new();
                             match execute_with_watchdog_tracked(
                                 state.executor_for(provider).as_ref(),
                                 state.continuity.clone(),
                                 fallback,
                                 &account,
                                 fresh,
-                                ctx,
+                                ctx.clone(),
                                 state.runtime.clone(),
                                 state.runtime_settings.stream_idle_timeout(),
                                 max_attempts,
-                                CommitWitness::new(),
+                                commit.clone(),
                                 Some(in_flight),
                             )
                             .await
@@ -3810,7 +3842,26 @@ async fn responses_handler_impl_with_max_attempts(
                                 Ok(stream) => stream_response(stream),
                                 Err(e) => {
                                     record_failure(&state, &health_id, &e, unix_now()).await;
-                                    surface_watchdog_error(&e)
+                                    run_failover_loop(
+                                        &state,
+                                        health_id,
+                                        e,
+                                        commit.is_committed(),
+                                        resend_for_loop,
+                                        &snapshots,
+                                        selector.as_ref(),
+                                        selector.clone(),
+                                        &sel_ctx,
+                                        ctx,
+                                        session_key.clone(),
+                                        now,
+                                        max_attempts,
+                                        pool_owned.clone(),
+                                        starvation_budget,
+                                        starvation_heartbeat,
+                                        &mut outcome,
+                                    )
+                                    .await
                                 }
                             }
                         }
