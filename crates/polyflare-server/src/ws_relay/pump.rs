@@ -100,7 +100,7 @@
 //! `eprintln!` in this module.
 
 use std::future::Future;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket};
@@ -1504,16 +1504,37 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                 // is the same one that gates replay), so hand the client the one
                                 // envelope codex retries instead — its resend then rides whatever
                                 // account `on_upstream_error` moves us to a few lines down.
-                                let substitute_capacity_retry = is_transient_overload(&sig)
-                                    && !upstream_output_visible_for_turn
-                                    && state.runtime.try_consume_capacity_substitution(
-                                        turn_telemetry
-                                            .as_ref()
-                                            .and_then(WsTurnTelemetry::logical_turn_key),
-                                        unix_now(),
-                                    );
-                                let text = if substitute_capacity_retry {
+                                let substitution = (is_transient_overload(&sig)
+                                    && !upstream_output_visible_for_turn)
+                                    .then(|| {
+                                        state.runtime.try_consume_capacity_substitution(
+                                            turn_telemetry
+                                                .as_ref()
+                                                .and_then(WsTurnTelemetry::logical_turn_key),
+                                            unix_now(),
+                                        )
+                                    })
+                                    .flatten();
+                                let text = if let Some(ordinal) = substitution {
                                     relay_metrics.record("capacity_retry_substituted");
+                                    tracing::info!(
+                                        target: "polyflare_server::relay",
+                                        account_id = %account.id,
+                                        error_code = sig.error_code.as_deref().unwrap_or("-"),
+                                        substitution = ordinal + 1,
+                                        max = crate::runtime_state::CAPACITY_SUBSTITUTION_MAX,
+                                        "upstream capacity refusal before output; handing the \
+                                         client a retryable error instead"
+                                    );
+                                    // Space the client's resends out: codex retries a
+                                    // disconnect within ~200 ms, and 2026-09-17 12:42–12:45
+                                    // showed both accounts shedding for minutes at a stretch.
+                                    // The upstream already took 20–80 s to refuse, so a few
+                                    // seconds more before the forged frame costs nothing.
+                                    let pause = Duration::from_secs(5 * u64::from(ordinal));
+                                    if !pause.is_zero() {
+                                        tokio::time::sleep(pause).await;
+                                    }
                                     capacity_retry_error_frame()
                                 } else {
                                     text

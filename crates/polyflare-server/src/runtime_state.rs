@@ -88,11 +88,16 @@ const LOGICAL_TURN_ATTEMPT_CLEANUP_INTERVAL_SECS: i64 = 60;
 
 #[derive(Clone, Copy)]
 struct LogicalTurnAttempts {
-    /// Whether this logical turn has already spent its ONE capacity-retry substitution. Lives
-    /// here, not on the pump, because codex answers a retryable error by opening a NEW
-    /// connection: a per-connection flag reset on every retry, so the substitution recurred until
-    /// the attempt budget died (2026-09-17 07:23: seven forged resends in 70s, then a hard 400).
-    capacity_substitution_used: bool,
+    /// How many capacity-retry substitutions this logical turn has spent, bounded by
+    /// [`CAPACITY_SUBSTITUTION_MAX`]. Lives here, not on the pump, because codex answers a
+    /// retryable error by opening a NEW connection: a per-connection flag reset on every retry, so
+    /// the substitution recurred until the attempt budget died (2026-09-17 07:23: seven forged
+    /// resends in 70s, then a hard 400). Widened from one to three on 2026-09-17 12:45: with two
+    /// usable accounts both being shed by the upstream, the single substitution was spent on the
+    /// first refusal and the very next one surfaced as the client's "at capacity" dead end —
+    /// codex itself allows five stream retries per sampling request, so a bounded few more forged
+    /// retries, spaced out by the pump, are well inside what the client already tolerates.
+    capacity_substitutions: u8,
     consumed: u32,
     expires_at: i64,
     /// When the budget was last spent. An exhausted entry older than
@@ -107,6 +112,9 @@ struct LogicalTurnAttempts {
 
 /// How long an exhausted budget refuses before granting a single probe attempt.
 const LOGICAL_TURN_PROBE_INTERVAL_SECS: i64 = 60;
+
+/// Capacity-retry substitutions per logical turn (see `LogicalTurnAttempts::capacity_substitutions`).
+pub const CAPACITY_SUBSTITUTION_MAX: u8 = 3;
 
 #[derive(Default)]
 struct LogicalTurnAttemptRegistry {
@@ -912,7 +920,7 @@ impl RuntimeStates {
         registry.entries.insert(
             key.to_owned(),
             LogicalTurnAttempts {
-                capacity_substitution_used: false,
+                capacity_substitutions: 0,
                 consumed: 1,
                 expires_at: now.saturating_add(LOGICAL_TURN_ATTEMPT_TTL_SECS),
                 last_consumed_at: now,
@@ -1448,34 +1456,33 @@ impl RuntimeStates {
         &self,
         logical_turn_key: Option<&str>,
         now: i64,
-    ) -> bool {
-        let Some(key) = logical_turn_key else {
-            return false;
-        };
+    ) -> Option<u8> {
+        let key = logical_turn_key?;
         let mut registry = self
             .logical_turn_attempts
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         match registry.entries.get_mut(key) {
-            Some(entry) if entry.capacity_substitution_used => false,
+            Some(entry) if entry.capacity_substitutions >= CAPACITY_SUBSTITUTION_MAX => None,
             Some(entry) => {
-                entry.capacity_substitution_used = true;
-                true
+                let ordinal = entry.capacity_substitutions;
+                entry.capacity_substitutions += 1;
+                Some(ordinal)
             }
             // No entry yet means no attempt has been charged for this turn, which cannot happen
             // on the path that reaches here (the send charged one). Record the claim so a later
-            // reconnect for the same turn cannot claim it again.
+            // reconnect for the same turn cannot claim past the bound.
             None => {
                 registry.entries.insert(
                     key.to_owned(),
                     LogicalTurnAttempts {
-                        capacity_substitution_used: true,
+                        capacity_substitutions: 1,
                         consumed: 0,
                         expires_at: now.saturating_add(LOGICAL_TURN_ATTEMPT_TTL_SECS),
                         last_consumed_at: now,
                     },
                 );
-                true
+                Some(0)
             }
         }
     }
@@ -2528,25 +2535,31 @@ mod tests {
     /// codex answers a retryable error by opening a new connection, so a per-connection flag reset
     /// on every retry and the substitution recurred until the attempt budget died.
     #[test]
-    fn a_capacity_substitution_is_one_per_logical_turn_across_reconnects() {
+    fn capacity_substitutions_are_bounded_per_logical_turn_across_reconnects() {
         let runtime = RuntimeStates::default();
-        assert!(
-            runtime.try_consume_capacity_substitution(Some("turn-1"), 1_000),
-            "the first claim wins"
-        );
+        for expected in 0..CAPACITY_SUBSTITUTION_MAX {
+            assert_eq!(
+                runtime.try_consume_capacity_substitution(Some("turn-1"), 1_000),
+                Some(expected),
+                "claims up to the bound are granted, in order"
+            );
+        }
         for _ in 0..5 {
-            assert!(
-                !runtime.try_consume_capacity_substitution(Some("turn-1"), 1_000),
+            assert_eq!(
+                runtime.try_consume_capacity_substitution(Some("turn-1"), 1_000),
+                None,
                 "every later claim for the same turn is refused, connection or not"
             );
         }
-        assert!(
+        assert_eq!(
             runtime.try_consume_capacity_substitution(Some("turn-2"), 1_000),
+            Some(0),
             "a different turn has its own"
         );
-        assert!(
-            !runtime.try_consume_capacity_substitution(None, 1_000),
-            "a turn with no key cannot be bounded across reconnects, so it is refused"
+        assert_eq!(
+            runtime.try_consume_capacity_substitution(None, 1_000),
+            None,
+            "no logical-turn key, no substitution"
         );
     }
 
@@ -2555,7 +2568,9 @@ mod tests {
     #[test]
     fn claiming_a_substitution_does_not_grant_an_attempt() {
         let runtime = RuntimeStates::default();
-        assert!(runtime.try_consume_capacity_substitution(Some("turn-x"), 1_000));
+        assert!(runtime
+            .try_consume_capacity_substitution(Some("turn-x"), 1_000)
+            .is_some());
         for n in 0..3 {
             assert!(
                 runtime.try_consume_logical_turn_attempt(Some("turn-x"), 3, 1_000),
