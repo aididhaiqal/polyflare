@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::trace::{self, RequestFacts, TraceTurn};
 use bytes::Bytes;
 use futures_core::Stream;
 use futures_util::stream::{self, StreamExt};
@@ -254,6 +255,46 @@ pub async fn execute_with_watchdog_tracked(
     // the release-on-failed-attempt behavior the crux requires.
     in_flight: Option<InFlightGuard>,
 ) -> Result<ResponseStream, WatchdogError> {
+    let mut trace = begin_sse_trace(&account_id, &prepared.req, &ctx);
+    let result = execute_with_watchdog_tracked_inner(
+        executor,
+        continuity,
+        prepared,
+        account,
+        account_id,
+        ctx,
+        runtime,
+        idle_timeout,
+        max_attempts,
+        commit,
+        in_flight,
+        &mut trace,
+    )
+    .await;
+    finish_trace_pre_relay(trace, &result);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_with_watchdog_tracked_inner(
+    executor: &dyn Executor,
+    continuity: Arc<dyn Continuity>,
+    prepared: Prepared,
+    account: &Account,
+    account_id: AccountId,
+    ctx: RequestCtx,
+    runtime: Arc<RuntimeStates>,
+    idle_timeout: Duration,
+    max_attempts: u32,
+    commit: CommitWitness,
+    // C9 Task 2: the in-flight lease the CALLER already acquired for `account_id` at selection
+    // (`None` for a caller that never acquired one). Moves into whichever `wrap_stream`/
+    // `recover_from_silence` branch below actually fires for THIS attempt — every other branch
+    // (a pre-relay `Err` return) simply drops it when this function's scope ends, which is exactly
+    // the release-on-failed-attempt behavior the crux requires.
+    in_flight: Option<InFlightGuard>,
+    trace: &mut Option<TraceTurn>,
+) -> Result<ResponseStream, WatchdogError> {
     consume_logical_turn_attempt(&runtime, &ctx, max_attempts)?;
     let Prepared { req, directive } = prepared;
     let session_key = directive.session_key.clone();
@@ -290,6 +331,7 @@ pub async fn execute_with_watchdog_tracked(
                 idle_timeout,
                 commit,
                 in_flight,
+                trace,
             )
             .await
         }
@@ -392,6 +434,7 @@ pub async fn execute_with_watchdog_tracked(
                                 idle_timeout,
                                 commit,
                                 in_flight,
+                                trace.take(),
                             ))
                         }
                         ScanOutcome::Silence(_) => {
@@ -555,6 +598,7 @@ async fn scan_anchorless_then_wrap(
     idle_timeout: Duration,
     commit: CommitWitness,
     in_flight: Option<InFlightGuard>,
+    trace: &mut Option<TraceTurn>,
 ) -> Result<ResponseStream, WatchdogError> {
     if idle_timeout.is_zero() {
         return Ok(wrap_stream(
@@ -568,6 +612,7 @@ async fn scan_anchorless_then_wrap(
             idle_timeout,
             commit,
             in_flight,
+            trace.take(),
         ));
     }
     let first = match tokio::time::timeout(idle_timeout, stream.next()).await {
@@ -591,6 +636,7 @@ async fn scan_anchorless_then_wrap(
                 idle_timeout,
                 commit,
                 in_flight,
+                trace.take(),
             ));
         }
         Ok(None) => {
@@ -605,6 +651,7 @@ async fn scan_anchorless_then_wrap(
                 idle_timeout,
                 commit,
                 in_flight,
+                trace.take(),
             ));
         }
         // Silent before its first byte: NOT a failure here (post-commit deadline by contract).
@@ -620,6 +667,7 @@ async fn scan_anchorless_then_wrap(
                 idle_timeout,
                 commit,
                 in_flight,
+                trace.take(),
             ));
         }
     };
@@ -630,6 +678,9 @@ async fn scan_anchorless_then_wrap(
                 "server_error" => 500,
                 _ => 503,
             };
+            if let Some(t) = trace.take() {
+                t.terminal("capacity_pre_commit", Some(&code), Some(status), None);
+            }
             let _ = continuity
                 .observe(
                     TurnOutcome::Failed {
@@ -661,11 +712,83 @@ async fn scan_anchorless_then_wrap(
             idle_timeout,
             commit,
             in_flight,
+            trace.take(),
         )),
     }
 }
 
 #[allow(clippy::too_many_arguments)] // internal fn; each param is a distinct, clearly-named handle.
+/// The SSE-side request line of the debug trace (see `crate::trace`): shape only.
+fn begin_sse_trace(
+    account_id: &AccountId,
+    req: &PreparedRequest,
+    ctx: &RequestCtx,
+) -> Option<TraceTurn> {
+    if !trace::enabled() {
+        return None;
+    }
+    let body_bytes = req
+        .raw_body
+        .as_ref()
+        .map(|b| b.len())
+        .or_else(|| {
+            req.body
+                .as_ref()
+                .and_then(|b| serde_json::to_vec(b).ok())
+                .map(|v| v.len())
+        })
+        .unwrap_or(0);
+    TraceTurn::begin(
+        "sse",
+        account_id.as_str(),
+        RequestFacts {
+            model: &req.model,
+            effort: None,
+            anchored: ctx.client_previous_response_id.is_some(),
+            full_resend: ctx.is_full_resend,
+            input_count: ctx.input_count,
+            estimated_tokens: ctx.estimated_tokens,
+            body_bytes,
+            session_key: ctx.session_key.as_ref().map(|k| k.value.as_str()),
+            turn_key: ctx.logical_turn_key.as_deref(),
+            subagent: ctx.subagent.as_deref(),
+        },
+    )
+}
+
+/// A trace still held after the executor returned means no stream was handed to the relay: log
+/// the pre-relay verdict as the attempt's terminal.
+fn finish_trace_pre_relay(
+    trace: Option<TraceTurn>,
+    result: &Result<ResponseStream, WatchdogError>,
+) {
+    let Some(t) = trace else { return };
+    match result {
+        Ok(_) => t.terminal("relayed", None, None, None),
+        Err(WatchdogError::Upstream(Some(sig))) => t.terminal(
+            "refused_pre_relay",
+            sig.error_code.as_deref(),
+            Some(sig.status),
+            None,
+        ),
+        Err(WatchdogError::UpstreamHttp(r)) => t.terminal(
+            "refused_pre_relay",
+            r.signal.error_code.as_deref(),
+            Some(r.signal.status),
+            None,
+        ),
+        Err(WatchdogError::Upstream(None)) => t.terminal("transport_error", None, None, None),
+        Err(WatchdogError::Continuity) => t.terminal("continuity", None, None, None),
+        Err(WatchdogError::AttemptBudgetExhausted) => {
+            t.terminal("attempt_budget", None, None, None)
+        }
+        Err(WatchdogError::CapabilityRejection { .. }) => {
+            t.terminal("capability_rejection", None, None, None)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_recovery_tracked(
     executor: &dyn Executor,
     continuity: Arc<dyn Continuity>,
@@ -682,6 +805,46 @@ pub async fn execute_recovery_tracked(
     // `wrap_stream` call below on success; drops here (this function's scope) on the `?`-propagated
     // pre-relay `Err` above.
     in_flight: Option<InFlightGuard>,
+) -> Result<ResponseStream, WatchdogError> {
+    let mut trace = begin_sse_trace(&account_id, &anchorless_req, &ctx);
+    let result = execute_recovery_tracked_inner(
+        executor,
+        continuity,
+        anchorless_req,
+        account,
+        account_id,
+        ctx,
+        session_key,
+        runtime,
+        idle_timeout,
+        max_attempts,
+        commit,
+        in_flight,
+        &mut trace,
+    )
+    .await;
+    finish_trace_pre_relay(trace, &result);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_recovery_tracked_inner(
+    executor: &dyn Executor,
+    continuity: Arc<dyn Continuity>,
+    anchorless_req: PreparedRequest,
+    account: &Account,
+    account_id: AccountId,
+    ctx: RequestCtx,
+    session_key: Option<SessionKey>,
+    runtime: Arc<RuntimeStates>,
+    idle_timeout: Duration,
+    max_attempts: u32,
+    commit: CommitWitness,
+    // C9 Task 2: see `execute_with_watchdog_tracked`'s matching param doc — moves into the single
+    // `wrap_stream` call below on success; drops here (this function's scope) on the `?`-propagated
+    // pre-relay `Err` above.
+    in_flight: Option<InFlightGuard>,
+    trace: &mut Option<TraceTurn>,
 ) -> Result<ResponseStream, WatchdogError> {
     consume_logical_turn_attempt(&runtime, &ctx, max_attempts)?;
     let stream = executor
@@ -704,6 +867,7 @@ pub async fn execute_recovery_tracked(
         idle_timeout,
         commit,
         in_flight,
+        trace,
     )
     .await
 }
@@ -864,6 +1028,9 @@ struct ResponseIdSniffer {
     output_visible_by: Option<String>,
     /// Frames observed before the terminal frame (any type).
     frames_before_terminal: u32,
+    /// The per-request debug trace for this attempt, when the operator turned it on.
+    trace: Option<TraceTurn>,
+    trace_usage: Option<trace::Usage>,
 }
 
 impl ResponseIdSniffer {
@@ -875,6 +1042,15 @@ impl ResponseIdSniffer {
             dropping_oversized_line: false,
             output_visible_by: None,
             frames_before_terminal: 0,
+            trace: None,
+            trace_usage: None,
+        }
+    }
+
+    fn with_trace(trace: Option<TraceTurn>) -> Self {
+        Self {
+            trace,
+            ..Self::new()
         }
     }
 
@@ -925,6 +1101,20 @@ impl ResponseIdSniffer {
             return;
         };
         let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+        if let Some(t) = self.trace.as_mut() {
+            let code = v
+                .pointer("/error/code")
+                .or_else(|| v.pointer("/response/error/code"))
+                .and_then(serde_json::Value::as_str);
+            let status = v
+                .get("status")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|s| u16::try_from(s).ok());
+            t.frame(ty, payload.len(), code, status);
+            if ty == "response.completed" {
+                self.trace_usage = trace::usage_facts(payload);
+            }
+        }
         let response_id = v
             .pointer("/response/id")
             .and_then(serde_json::Value::as_str)
@@ -1389,6 +1579,9 @@ impl Stream for ObservingStream {
                         // response then failed. Count it as a transient error, then forward the error.
                         this.runtime
                             .record_transient_error(&this.account, unix_now());
+                        if let Some(t) = this.sniffer.trace.take() {
+                            t.terminal("stream_error", None, None, None);
+                        }
                         this.state = ObserveState::Done;
                         return Poll::Ready(Some(Err(e)));
                     }
@@ -1397,6 +1590,16 @@ impl Stream for ObservingStream {
                         // after response.completed, so failed/incomplete/unterminated streams must
                         // neither clear account errors nor advance continuity.
                         let terminal = this.sniffer.finish();
+                        if let Some(t) = this.sniffer.trace.take() {
+                            let outcome = match &terminal {
+                                TerminalOutcome::Completed { .. } => "completed".to_string(),
+                                TerminalOutcome::Failed { kind } => {
+                                    format!("failed_{kind:?}").to_ascii_lowercase()
+                                }
+                                TerminalOutcome::Pending => "transport_loss".to_string(),
+                            };
+                            t.terminal(&outcome, None, None, this.sniffer.trace_usage.take());
+                        }
                         match &terminal {
                             TerminalOutcome::Completed { .. } => {
                                 this.runtime.record_success(&this.account);
@@ -1463,6 +1666,9 @@ impl Stream for ObservingStream {
                         // byte-for-byte as before this task — whenever the idle timeout is off.
                         return match this.idle_deadline.poll(cx) {
                             Poll::Ready(()) => {
+                                if let Some(t) = this.sniffer.trace.take() {
+                                    t.terminal("idle_timeout", None, None, None);
+                                }
                                 // Genuine silence past the deadline. This is POST-commit (bytes were
                                 // already relayed — commit-barrier doc on `CommitWitness`), so this
                                 // TERMINATES the stream rather than recovering: a reselect here would
@@ -1522,12 +1728,13 @@ fn wrap_stream(
     // one, e.g. every existing `execute_with_watchdog`/`execute_recovery` caller before this task)
     // moves into the returned stream's `_in_flight` field here, and ONLY here.
     in_flight: Option<InFlightGuard>,
+    trace: Option<TraceTurn>,
 ) -> ResponseStream {
     let metadata = inner.metadata().clone();
     ResponseStream::with_metadata(
         ObservingStream {
             inner,
-            sniffer: ResponseIdSniffer::new(),
+            sniffer: ResponseIdSniffer::with_trace(trace),
             continuity,
             ctx,
             account,
@@ -1908,6 +2115,7 @@ mod tests {
             Duration::ZERO,
             CommitWitness::new(),
             None,
+            None,
         );
 
         while observing.next().await.is_some() {}
@@ -1956,6 +2164,7 @@ mod tests {
                 Duration::ZERO,
                 CommitWitness::new(),
                 None,
+                None,
             );
             while observing.next().await.is_some() {}
 
@@ -1994,6 +2203,7 @@ mod tests {
             runtime.clone(),
             Duration::ZERO,
             CommitWitness::new(),
+            None,
             None,
         );
         while observing.next().await.is_some() {}
@@ -2400,6 +2610,7 @@ mod tests {
             Duration::ZERO, // idle watchdog disabled: not under test here
             CommitWitness::new(),
             None,
+            None,
         );
         while let Some(item) = wrapped.next().await {
             item.expect("the completing stream must relay cleanly");
@@ -2451,6 +2662,7 @@ mod tests {
             runtime.clone(),
             Duration::ZERO, // idle watchdog disabled: not under test here
             CommitWitness::new(),
+            None,
             None,
         );
         wrapped
@@ -2535,6 +2747,7 @@ mod tests {
             runtime.clone(),
             idle,
             CommitWitness::new(),
+            None,
             None,
         );
 
@@ -2690,6 +2903,7 @@ mod tests {
             idle,
             CommitWitness::new(),
             None,
+            None,
         );
 
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -2744,6 +2958,7 @@ mod tests {
             runtime.clone(),
             Duration::ZERO, // disabled
             CommitWitness::new(),
+            None,
             None,
         );
 
@@ -2824,6 +3039,7 @@ mod tests {
             runtime,
             idle,
             CommitWitness::new(),
+            None,
             None,
         );
 

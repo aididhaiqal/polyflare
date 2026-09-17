@@ -72,6 +72,9 @@ pub struct RuntimeSettings {
     request_log_retention_days: AtomicU32,
     usage_history_retention_days: AtomicU32,
     live_logs: AtomicBool,
+    /// Content-free per-request debug trace (see `crate::trace`). Not a `ServeConfig` field:
+    /// seeded from `POLYFLARE_DEBUG_TRACE` (default off) and live-toggled via the settings API.
+    debug_trace: AtomicBool,
     chatgpt_backend_passthrough_enabled: AtomicBool,
     wham_usage_replace_main_limit: AtomicBool,
     // Session-volume circuit breaker (see `crate::session_governor`). Live-tunable, constant
@@ -139,6 +142,7 @@ impl RuntimeSettings {
             request_log_retention_days: AtomicU32::new(cfg.request_log_retention_days),
             usage_history_retention_days: AtomicU32::new(cfg.usage_history_retention_days),
             live_logs: AtomicBool::new(cfg.live_logs),
+            debug_trace: AtomicBool::new(debug_trace_enabled_from_env()),
             chatgpt_backend_passthrough_enabled: AtomicBool::new(true),
             wham_usage_replace_main_limit: AtomicBool::new(true),
             session_warn_per_hour: AtomicU32::new(DEFAULT_SESSION_WARN_PER_HOUR),
@@ -178,6 +182,7 @@ impl RuntimeSettings {
             request_log_retention_days: AtomicU32::new(f.request_log_retention_days),
             usage_history_retention_days: AtomicU32::new(f.usage_history_retention_days),
             live_logs: AtomicBool::new(f.live_logs),
+            debug_trace: AtomicBool::new(debug_trace_enabled_from_env()),
             chatgpt_backend_passthrough_enabled: AtomicBool::new(true),
             wham_usage_replace_main_limit: AtomicBool::new(true),
             session_warn_per_hour: AtomicU32::new(DEFAULT_SESSION_WARN_PER_HOUR),
@@ -236,6 +241,10 @@ impl RuntimeSettings {
 
     pub fn live_logs(&self) -> bool {
         self.live_logs.load(Ordering::Relaxed)
+    }
+
+    pub fn debug_trace(&self) -> bool {
+        self.debug_trace.load(Ordering::Relaxed)
     }
 
     pub fn chatgpt_backend_passthrough_enabled(&self) -> bool {
@@ -351,6 +360,11 @@ impl RuntimeSettings {
                 self.live_logs.store(b, Ordering::Relaxed);
                 Ok(b.to_string())
             }
+            "debug_trace" => {
+                let b = expect_bool(key, raw)?;
+                self.debug_trace.store(b, Ordering::Relaxed);
+                Ok(b.to_string())
+            }
             "chatgpt_backend_passthrough_enabled" => {
                 let b = expect_bool(key, raw)?;
                 self.chatgpt_backend_passthrough_enabled
@@ -381,6 +395,7 @@ pub fn parse_setting_value(key: &str, s: &str) -> Option<SettingValue> {
     match key {
         "soft_drain_enabled"
         | "live_logs"
+        | "debug_trace"
         | "chatgpt_backend_passthrough_enabled"
         | "wham_usage_replace_main_limit" => s.parse::<bool>().ok().map(SettingValue::Bool),
         "inflight_penalty_pct" => s.parse::<f64>().ok().map(SettingValue::F64),
@@ -456,6 +471,17 @@ fn expect_f64(key: &str, raw: SettingValue) -> Result<f64, SettingsError> {
 }
 
 /// Kind-check helper for `set`'s flag fields: only `SettingValue::Bool` is accepted.
+/// `POLYFLARE_DEBUG_TRACE`: `1`/`true`/`yes`/`on` (case-insensitive) enables the per-request
+/// debug trace at boot; anything else, including unset, leaves it off.
+fn debug_trace_enabled_from_env() -> bool {
+    std::env::var("POLYFLARE_DEBUG_TRACE").is_ok_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 fn expect_bool(key: &str, raw: SettingValue) -> Result<bool, SettingsError> {
     match raw {
         SettingValue::Bool(b) => Ok(b),

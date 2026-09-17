@@ -184,6 +184,7 @@ pub async fn capabilities_handler(State(s): State<Arc<AppState>>) -> impl IntoRe
         crate::admin_token::configured(s.admin_token.as_deref(), &s.store).await;
     Json(serde_json::json!({
         "live_logs": s.runtime_settings.live_logs(),
+        "debug_trace": s.runtime_settings.debug_trace(),
         "admin_token_configured": admin_token_configured,
         "node_role": if crate::reactive_auth::is_replica() { "replica" } else { "main" },
         "node_label": crate::config::node_label(),

@@ -22,6 +22,7 @@ use crate::app::AppState;
 use crate::observability::RequestLog;
 use crate::runtime_state::InFlightGuard;
 use crate::session_key::parse_inbound_scoped;
+use crate::trace::{self, RequestFacts, TraceTurn};
 use crate::usage_capture::{
     is_output_delta, parse_response_usage, pressure_equivalent_tokens, ResponseUsage,
 };
@@ -51,6 +52,18 @@ pub(crate) struct WsTurnTelemetry {
     /// One lease per generating turn, not per long-lived socket. Its `Drop` releases selection
     /// pressure on every terminal and teardown path.
     _in_flight: Option<InFlightGuard>,
+    /// Shape of the client frame, kept only while the debug trace is on (see `crate::trace`):
+    /// the request line is emitted once the serving account is known (`track_in_flight`).
+    trace_facts: Option<TraceFacts>,
+    trace: Option<TraceTurn>,
+}
+
+/// Owned, content-free request shape for the debug trace.
+struct TraceFacts {
+    anchored: bool,
+    full_resend: bool,
+    input_count: u32,
+    body_bytes: usize,
 }
 
 /// The terminal facts extracted from an upstream frame.
@@ -107,6 +120,12 @@ pub(crate) fn start_turn(
     // Reuse the native HTTP ingress parser so model/effort/tier/subagent semantics cannot drift
     // between transports. It shallow-parses the top-level object and never materializes content.
     let facts = parse_inbound_scoped(headers, frame.as_bytes(), pool)?;
+    let trace_facts = trace::enabled().then(|| TraceFacts {
+        anchored: fields.contains_key("previous_response_id"),
+        full_resend: facts.ctx.is_full_resend,
+        input_count: facts.ctx.input_count,
+        body_bytes: frame.len(),
+    });
     Some(WsTurnTelemetry {
         started_at: Instant::now(),
         model: (!facts.model.is_empty()).then_some(facts.model),
@@ -121,6 +140,8 @@ pub(crate) fn start_turn(
         ttft_ms: None,
         log_request: generate,
         _in_flight: None,
+        trace_facts,
+        trace: None,
     })
 }
 
@@ -168,7 +189,39 @@ impl WsTurnTelemetry {
                 pressure_units,
             )
             .await;
+        if let Some(f) = self.trace_facts.take() {
+            self.trace = TraceTurn::begin(
+                "ws",
+                account_id.as_str(),
+                RequestFacts {
+                    model: self.model.as_deref().unwrap_or("-"),
+                    effort: self.reasoning_effort.as_deref(),
+                    anchored: f.anchored,
+                    full_resend: f.full_resend,
+                    input_count: f.input_count,
+                    estimated_tokens: self.estimated_tokens,
+                    body_bytes: f.body_bytes,
+                    session_key: self.session_key.as_deref(),
+                    turn_key: self.logical_turn_key.as_deref(),
+                    subagent: self.subagent.as_deref(),
+                },
+            );
+        }
         self._in_flight.is_some()
+    }
+
+    /// A relay-side event on this turn for the debug trace: the upstream refusal being reacted
+    /// to (code/status), and the account the turn is on now. No-op when the trace is off.
+    pub(crate) fn trace_note(
+        &mut self,
+        event: &str,
+        code: Option<&str>,
+        status: Option<u16>,
+        account: &str,
+    ) {
+        if let Some(t) = self.trace.as_mut() {
+            t.note(event, code, status, account);
+        }
     }
 
     /// Observe an upstream frame after the pump has decided it is client-visible. Returns a
@@ -179,7 +232,19 @@ impl WsTurnTelemetry {
         }
 
         let value: Value = serde_json::from_str(frame).ok()?;
-        match value.get("type").and_then(Value::as_str)? {
+        let frame_type = value.get("type").and_then(Value::as_str)?;
+        if let Some(t) = self.trace.as_mut() {
+            let code = value
+                .pointer("/error/code")
+                .or_else(|| value.pointer("/response/error/code"))
+                .and_then(Value::as_str);
+            let status = value
+                .get("status")
+                .and_then(Value::as_u64)
+                .and_then(|raw| u16::try_from(raw).ok());
+            t.frame(frame_type, frame.len(), code, status);
+        }
+        match frame_type {
             "response.completed" => {
                 // Prefer the tier the RESPONSE reports over the one the policy asked for: an
                 // upstream may accept a priority request and still serve it as standard, and
@@ -256,8 +321,32 @@ impl WsTurnTelemetry {
     }
 
     /// Persist and publish the same observability shape as an HTTP-SSE completion.
-    pub(crate) async fn finish(self, state: &AppState, account_id: &str, terminal: WsTurnTerminal) {
+    pub(crate) async fn finish(
+        mut self,
+        state: &AppState,
+        account_id: &str,
+        terminal: WsTurnTerminal,
+    ) {
         let health_id = AccountId::from(account_id);
+        let trace_id = self.trace.as_ref().map(|t| t.id.clone());
+        if let Some(t) = self.trace.take() {
+            let outcome = match (terminal.routing, terminal.protocol_outcome) {
+                (WsRoutingOutcome::TransportLoss, _) => "transport_loss",
+                (_, RequestProtocolOutcome::Completed) => "completed",
+                (_, RequestProtocolOutcome::Incomplete) => "incomplete",
+                _ => "failed",
+            };
+            t.terminal(
+                outcome,
+                terminal.error_code.as_deref(),
+                Some(terminal.status.as_u16()),
+                terminal.usage.map(|u| trace::Usage {
+                    input: u.input_tokens,
+                    cached: u.cached_input_tokens,
+                    output: u.output_tokens,
+                }),
+            );
+        }
         match terminal.routing {
             WsRoutingOutcome::Completed => {
                 state.runtime.record_success(&health_id);
@@ -299,7 +388,7 @@ impl WsTurnTelemetry {
                 )
             });
         let duration_ms = self.started_at.elapsed().as_millis() as u64;
-        let request_id = format!("{:032x}", rand::random::<u128>());
+        let request_id = trace_id.unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
         let log = RequestLog {
             requested_service_tier: self.requested_service_tier,
             actual_service_tier: self.actual_service_tier,

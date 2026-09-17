@@ -1020,6 +1020,14 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                             // reacts to it exactly as it would over HTTP-SSE), THEN bench + re-select
                             // + re-dial via the caller-provided move engine.
                             UpstreamSignal::Error(sig) => {
+                                if let Some(turn) = turn_telemetry.as_mut() {
+                                    turn.trace_note(
+                                        "upstream_error",
+                                        sig.error_code.as_deref(),
+                                        Some(sig.status),
+                                        &account.id,
+                                    );
+                                }
                                 // ── CAPACITY LADDER, RUNG 1: replay on the socket that refused ──
                                 //
                                 // Upstream accepted the turn and then refused it without producing
@@ -1526,6 +1534,14 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                         "upstream capacity refusal before output; handing the \
                                          client a retryable error instead"
                                     );
+                                    if let Some(turn) = turn_telemetry.as_mut() {
+                                        turn.trace_note(
+                                            "substitute_retryable",
+                                            sig.error_code.as_deref(),
+                                            Some(sig.status),
+                                            &account.id,
+                                        );
+                                    }
                                     // Space the client's resends out: codex retries a
                                     // disconnect within ~200 ms, and 2026-09-17 12:42–12:45
                                     // showed both accounts shedding for minutes at a stretch.

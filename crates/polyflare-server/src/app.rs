@@ -253,6 +253,7 @@ pub fn build_codex_executor_with_client(
 }
 
 pub fn build_app(state: Arc<AppState>) -> Router {
+    crate::trace::install(state.runtime_settings.clone(), state.log_bus.clone());
     // The dashboard API: every route sits behind `require_admin`. A configured token is required;
     // without one, only `build_app_for_bind` may install the startup-resolved loopback marker.
     // Register only routes whose handlers exist today.

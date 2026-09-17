@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Tabulate PolyFlare's per-request debug trace, one upstream attempt per row.
+
+Reads `polyflare_server::trace` lines from a node's stdout log (ANSI-stripped), groups them by
+trace id, and prints request shape next to outcome so "what did we send, what came back" can be
+read one request at a time. Content-free by construction: the trace never carries message text.
+
+  polyflare-trace-report                       # ~/.polyflare/stdout.log, last 2 hours
+  polyflare-trace-report --since 13:00         # local time today
+  polyflare-trace-report --refused             # only attempts that did not complete
+  polyflare-trace-report --frames <trace-id>   # the frame timeline of one attempt
+  ssh ultraflux 'cat ~/.polyflare/stdout.log' | polyflare-trace-report -   # a remote node
+
+Enable the trace on a node with the settings API (live, no restart):
+  curl -X PATCH -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+       http://127.0.0.1:8080/api/settings -d '{"debug_trace":true}'
+"""
+import argparse, re, sys, os, datetime, collections
+
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+KV = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\S+)')
+
+def parse_line(line):
+    line = ANSI.sub("", line)
+    if "polyflare_server::trace" not in line:
+        return None
+    ts = line[:27]
+    try:
+        t = datetime.datetime.strptime(ts[:26], "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    fields = {}
+    for k, v in KV.findall(line):
+        if v.startswith('"'):
+            v = v[1:-1]
+        fields[k] = v
+    if "trace" not in fields or "phase" not in fields:
+        return None
+    fields["_t"] = t.astimezone()
+    return fields
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("log", nargs="?", default=os.path.expanduser("~/.polyflare/stdout.log"))
+    ap.add_argument("--since", help="HH:MM local (today) or ISO datetime")
+    ap.add_argument("--refused", action="store_true", help="only attempts that did not complete")
+    ap.add_argument("--frames", metavar="TRACE_ID", help="print the frame timeline of one attempt")
+    args = ap.parse_args()
+
+    now = datetime.datetime.now().astimezone()
+    if args.since:
+        if re.fullmatch(r"\d{1,2}:\d{2}", args.since):
+            h, m = map(int, args.since.split(":"))
+            since = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        else:
+            since = datetime.datetime.fromisoformat(args.since).astimezone()
+    else:
+        since = now - datetime.timedelta(hours=2)
+
+    src = sys.stdin if args.log == "-" else open(args.log, errors="replace")
+    turns = collections.OrderedDict()
+    for line in src:
+        f = parse_line(line)
+        if not f or f["_t"] < since:
+            continue
+        tid = f["trace"]
+        turn = turns.setdefault(tid, {"request": None, "notes": [], "frames": [], "terminal": None})
+        ph = f["phase"]
+        if ph == "request":
+            turn["request"] = f
+        elif ph == "note":
+            turn["notes"].append(f)
+        elif ph == "frame":
+            turn["frames"].append(f)
+        elif ph == "terminal":
+            turn["terminal"] = f
+
+    if args.frames:
+        turn = turns.get(args.frames)
+        if not turn:
+            sys.exit(f"no trace {args.frames} since {since:%H:%M}")
+        req = turn["request"]
+        if req:
+            print(f"{req['_t']:%H:%M:%S.%f} request  {req.get('transport')} account={req.get('account','')[:13]} "
+                  f"anchored={req.get('anchored')} full_resend={req.get('full_resend')} items={req.get('input_count')} "
+                  f"est_tokens={req.get('estimated_tokens')} body_bytes={req.get('body_bytes')}")
+        events = [("note", n) for n in turn["notes"]] + [("frame", fr) for fr in turn["frames"]]
+        events.sort(key=lambda e: int(e[1].get("elapsed_ms", 0)))
+        for kind, e in events:
+            if kind == "note":
+                print(f"  +{int(e['elapsed_ms']):7d}ms note   {e.get('event')} code={e.get('error_code')} "
+                      f"status={e.get('status')} account={e.get('account','')[:13]}")
+            else:
+                extra = "" if e.get("error_code") == "-" else f" code={e.get('error_code')} status={e.get('status')}"
+                print(f"  +{int(e['elapsed_ms']):7d}ms frame  #{e.get('n'):>4} {e.get('frame_type')} ({e.get('bytes')}B){extra}")
+        t = turn["terminal"]
+        if t:
+            print(f"  +{int(t['elapsed_ms']):7d}ms terminal {t.get('outcome')} code={t.get('error_code')} "
+                  f"status={t.get('status')} frames={t.get('frames')} in={t.get('input_tokens')} "
+                  f"cached={t.get('cached_input_tokens')} out={t.get('output_tokens')}")
+        return
+
+    hdr = f"{'time':8s} {'tr':3s} {'account':13s} {'anch':4s} {'full':4s} {'items':>5s} {'kB':>5s} {'est_tok':>7s} " \
+          f"{'outcome':22s} {'code':22s} {'st':>3s} {'1st_out':>7s} {'total':>7s} {'in_tok':>7s} {'cached':>7s} {'out':>5s} ladder"
+    print(hdr)
+    print("-" * len(hdr))
+    n_rows = n_refused = 0
+    for tid, turn in turns.items():
+        req, term = turn["request"], turn["terminal"]
+        if not req:
+            continue
+        outcome = term.get("outcome") if term else "(no terminal)"
+        completed = outcome == "completed"
+        if args.refused and completed:
+            continue
+        n_rows += 1
+        n_refused += not completed
+        ladder = " ".join(f"{n.get('event')}:{n.get('error_code')}" for n in turn["notes"])
+        code = (term or {}).get("error_code", "-")
+        if code == "-":
+            for n in turn["notes"]:
+                if n.get("error_code") not in (None, "-"):
+                    code = n["error_code"]
+        kb = int(req.get("body_bytes", 0)) // 1024
+        first = (term or {}).get("first_output_ms", "-")
+        print(f"{req['_t']:%H:%M:%S} {req.get('transport',''):3s} {req.get('account','')[:13]:13s} "
+              f"{('y' if req.get('anchored')=='true' else 'n'):4s} {('y' if req.get('full_resend')=='true' else 'n'):4s} "
+              f"{req.get('input_count',''):>5s} {kb:>5d} {req.get('estimated_tokens',''):>7s} "
+              f"{outcome:22s} {code:22s} {(term or {}).get('status','-'):>3s} {first:>7s} "
+              f"{(term or {}).get('elapsed_ms','-'):>7s} {(term or {}).get('input_tokens','-'):>7s} "
+              f"{(term or {}).get('cached_input_tokens','-'):>7s} {(term or {}).get('output_tokens','-'):>5s} {ladder}")
+    print(f"\n{n_rows} attempts since {since:%H:%M}, {n_refused} did not complete. "
+          f"Use --frames <trace-id> for one attempt's timeline (ids are in the log lines).")
+
+if __name__ == "__main__":
+    main()
