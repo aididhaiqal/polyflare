@@ -80,6 +80,8 @@ pub struct RuntimeSettings {
     /// (default 240), live-tunable. See `crate::runtime_state::try_consume_capacity_substitution`
     /// and `crate::ingress::ride_out_capacity_wave`.
     capacity_ride_out_secs: AtomicU32,
+    /// Scheduler switch for `crate::reset_kick`. Live-toggled; default on.
+    reset_kick_enabled: AtomicBool,
     chatgpt_backend_passthrough_enabled: AtomicBool,
     wham_usage_replace_main_limit: AtomicBool,
     // Session-volume circuit breaker (see `crate::session_governor`). Live-tunable, constant
@@ -149,6 +151,7 @@ impl RuntimeSettings {
             live_logs: AtomicBool::new(cfg.live_logs),
             debug_trace: AtomicBool::new(debug_trace_enabled_from_env()),
             capacity_ride_out_secs: AtomicU32::new(capacity_ride_out_secs_from_env()),
+            reset_kick_enabled: AtomicBool::new(true),
             chatgpt_backend_passthrough_enabled: AtomicBool::new(true),
             wham_usage_replace_main_limit: AtomicBool::new(true),
             session_warn_per_hour: AtomicU32::new(DEFAULT_SESSION_WARN_PER_HOUR),
@@ -190,6 +193,7 @@ impl RuntimeSettings {
             live_logs: AtomicBool::new(f.live_logs),
             debug_trace: AtomicBool::new(debug_trace_enabled_from_env()),
             capacity_ride_out_secs: AtomicU32::new(capacity_ride_out_secs_from_env()),
+            reset_kick_enabled: AtomicBool::new(true),
             chatgpt_backend_passthrough_enabled: AtomicBool::new(true),
             wham_usage_replace_main_limit: AtomicBool::new(true),
             session_warn_per_hour: AtomicU32::new(DEFAULT_SESSION_WARN_PER_HOUR),
@@ -256,6 +260,10 @@ impl RuntimeSettings {
 
     pub fn capacity_ride_out_secs(&self) -> u32 {
         self.capacity_ride_out_secs.load(Ordering::Relaxed)
+    }
+
+    pub fn reset_kick_enabled(&self) -> bool {
+        self.reset_kick_enabled.load(Ordering::Relaxed)
     }
 
     pub fn chatgpt_backend_passthrough_enabled(&self) -> bool {
@@ -376,6 +384,11 @@ impl RuntimeSettings {
                 self.debug_trace.store(b, Ordering::Relaxed);
                 Ok(b.to_string())
             }
+            "reset_kick_enabled" => {
+                let b = expect_bool(key, raw)?;
+                self.reset_kick_enabled.store(b, Ordering::Relaxed);
+                Ok(b.to_string())
+            }
             "capacity_ride_out_secs" => {
                 let n = narrow_u32(expect_u64(key, raw)?).min(CAPACITY_RIDE_OUT_MAX_SECS);
                 self.capacity_ride_out_secs.store(n, Ordering::Relaxed);
@@ -412,6 +425,7 @@ pub fn parse_setting_value(key: &str, s: &str) -> Option<SettingValue> {
         "soft_drain_enabled"
         | "live_logs"
         | "debug_trace"
+        | "reset_kick_enabled"
         | "chatgpt_backend_passthrough_enabled"
         | "wham_usage_replace_main_limit" => s.parse::<bool>().ok().map(SettingValue::Bool),
         "inflight_penalty_pct" => s.parse::<f64>().ok().map(SettingValue::F64),

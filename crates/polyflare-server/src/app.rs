@@ -388,6 +388,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             post(crate::account_ops::probe_handler),
         )
         .route(
+            "/api/accounts/{id}/kick",
+            post(crate::reset_kick::kick_handler),
+        )
+        .route(
             "/api/accounts/{id}/export-auth",
             post(crate::account_ops::export_auth_handler),
         )

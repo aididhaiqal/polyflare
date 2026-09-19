@@ -46,6 +46,7 @@ pub mod refresh_locks;
 pub mod replica_api;
 pub mod replica_pull;
 pub mod reset_credits;
+pub mod reset_kick;
 pub mod retention;
 pub mod runtime_settings;
 pub mod runtime_state;

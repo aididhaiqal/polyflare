@@ -415,6 +415,45 @@ async fn refresh_anthropic_account(
 ///
 /// `Ok(false)` means no trustworthy usage was obtained (for example, missing tokens or a
 /// non-success upstream response). Callers must fail closed rather than spending from cached data.
+/// Refresh one Codex account's usage into the store from OUTSIDE the server (the CLI): fresh
+/// runtime scaffolding, nothing shared. The running server reconciles from the store afterwards.
+pub async fn refresh_account_standalone(
+    store: &polyflare_store::Store,
+    cipher: &TokenCipher,
+    upstream_base: &str,
+    account_id: &str,
+) -> bool {
+    let repo = store.accounts();
+    let Ok(Some(account)) = repo.get(account_id).await else {
+        return false;
+    };
+    if account.provider != "codex" {
+        return false;
+    }
+    let Ok(http) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    else {
+        return false;
+    };
+    let runtime = RuntimeStates::default();
+    let log_bus = crate::log_bus::LogBus::new(16);
+    let metrics = crate::observability::HealthTierMetrics::new();
+    refresh_account(
+        &repo,
+        cipher,
+        &http,
+        upstream_base,
+        &account,
+        &runtime,
+        true,
+        &log_bus,
+        &metrics,
+    )
+    .await
+    .unwrap_or(false)
+}
+
 pub(crate) async fn refresh_account_now(state: &AppState, account_id: &str) -> Result<bool, ()> {
     let repo = state.store.accounts();
     let account = repo

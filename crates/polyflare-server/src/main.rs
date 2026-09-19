@@ -250,6 +250,16 @@ enum AccountsCommands {
         #[arg(long = "security-work", value_name = "BOOL", action = clap::ArgAction::Set)]
         security_work: bool,
     },
+    /// Send one minimal generation on an account so its weekly window starts NOW instead of
+    /// sliding until the first real request (see `reset_kick`), then refresh its usage.
+    Kick {
+        /// The account id to kick (as shown by `accounts` listing / the dashboard).
+        #[arg(long = "id", value_name = "ACCOUNT_ID")]
+        id: String,
+        /// Model for the one-word generation (default: the cheapest fleet-wide model).
+        #[arg(long = "model", value_name = "MODEL")]
+        model: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -301,6 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             AccountsCommands::SetCapability { id, security_work } => {
                 accounts_set_capability(&id, security_work).await
             }
+            AccountsCommands::Kick { id, model } => accounts_kick(&id, model.as_deref()).await,
         },
         Commands::Keys { command } => match command {
             KeysCommands::Create { label } => keys_create(label).await,
@@ -383,9 +394,7 @@ async fn anthropic_usage(account: Option<String>) -> Result<(), Box<dyn std::err
         .list()
         .await?
         .into_iter()
-        .filter(|a| {
-            a.provider == "anthropic" && account.as_deref().is_none_or(|id| a.id == id)
-        })
+        .filter(|a| a.provider == "anthropic" && account.as_deref().is_none_or(|id| a.id == id))
         .collect();
     if accounts.is_empty() {
         println!("No matching Anthropic accounts.");
@@ -1047,6 +1056,8 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // Runtime usage-refresh loop: keeps each Codex account's rate-limit windows (5h + weekly) and
     // routing gate live, instead of the frozen numbers the importer left.
     polyflare_server::usage_refresh::spawn_usage_refresh(state.clone());
+    // Pin each account's weekly window the moment it resets (see `reset_kick`).
+    polyflare_server::reset_kick::spawn_reset_kick(state.clone());
 
     // Reload the declared-support overlay periodically so a change made by another process — the
     // `polyflare models` CLI, or (later) a dashboard write — reaches this server without a restart.
@@ -1506,6 +1517,21 @@ async fn accounts_set_pool(
         Some(slug) => println!("account {id} assigned to pool {slug}"),
         None => println!("account {id} pool cleared (unpooled)"),
     }
+    Ok(())
+}
+
+async fn accounts_kick(id: &str, model: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = config::data_dir_from_env();
+    let store = Store::open(&config::db_path(&data_dir)).await?;
+    let cipher = TokenCipher::load_or_create(&config::key_path(&data_dir))?;
+    let upstream = std::env::var("POLYFLARE_UPSTREAM_URL")
+        .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex".to_string());
+    if store.accounts().get(id).await?.is_none() {
+        return Err(format!("no account with id {id}").into());
+    }
+    let out =
+        polyflare_server::reset_kick::kick_standalone(&store, &cipher, &upstream, id, model).await;
+    println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
 }
 
