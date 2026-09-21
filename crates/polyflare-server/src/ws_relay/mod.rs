@@ -340,8 +340,8 @@ async fn responses_ws_upgrade(
             target: "polyflare_server::routing",
             owner_account = %owner.as_str(),
             served_by = %account.id,
-            "session owner is in overload isolation; this connection is served by a sibling and \
-             the session stays pointed home"
+            "session owner is unavailable for this connection (isolated, freshly refused, or at \
+             its websocket cap); served by a sibling and the session stays pointed home"
         );
     }
     let routing_scope = RelayRoutingScope {

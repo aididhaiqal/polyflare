@@ -329,7 +329,7 @@ async fn resolve_owner_affine_account_inner(
              clean sibling instead of paying the refusal wait again"
         );
     }
-    let spilled_from = isolated_owner.or(recently_refused_owner).cloned();
+    let mut spilled_from = isolated_owner.or(recently_refused_owner).cloned();
     let owner = if spilled_from.is_some() { None } else { owner };
     let (picked, reservation) = match owner {
         Some(owner_id) => {
@@ -344,23 +344,63 @@ async fn resolve_owner_affine_account_inner(
                 // be that owner) — soft affinity hit.
                 Some(id) => {
                     let reservation = match reservation_kind {
-                        ReservationKind::None => OwnerReservation::None,
-                        ReservationKind::InFlight => OwnerReservation::InFlight(
-                            state
-                                .runtime
-                                .acquire_pinned_in_flight(&id, now, &state.lease_metrics)
-                                .await
-                                .ok_or_else(no_eligible)?,
-                        ),
-                        ReservationKind::OpenWs => OwnerReservation::OpenWs(
-                            state
-                                .runtime
-                                .acquire_pinned_open_ws(&id, now)
-                                .await
-                                .ok_or_else(no_eligible)?,
-                        ),
+                        ReservationKind::None => Some(OwnerReservation::None),
+                        ReservationKind::InFlight => state
+                            .runtime
+                            .acquire_pinned_in_flight(&id, now, &state.lease_metrics)
+                            .await
+                            .map(OwnerReservation::InFlight),
+                        ReservationKind::OpenWs => state
+                            .runtime
+                            .acquire_pinned_open_ws(&id, now)
+                            .await
+                            .map(OwnerReservation::OpenWs),
                     };
-                    (id, reservation)
+                    match reservation {
+                        Some(reservation) => (id, reservation),
+                        // SOCKET-CAP RELEASE. The owner is eligible but every one of its
+                        // websocket slots is taken and none freed within the socket wait.
+                        // Master 2026-09-21 14:55 / 22:40 / 22:42: eighteen owner-scoped
+                        // socket waits, zero acquired, and each handshake answered
+                        // "no eligible account" while six sibling accounts sat idle — the
+                        // client retried six times and gave the thread up. A session-row pin
+                        // is a locality hint, not server-side state: serve THIS connection
+                        // from a sibling with a free slot, request-local exactly like the
+                        // isolation release (the writeback stays fenced on `spilled_from`,
+                        // so the session returns home once a slot frees). An anchored frame
+                        // on the spilled socket meets the pump's anchor-miss handling and
+                        // the client resends its history — one round trip, never a dead
+                        // thread. A pinned in-flight (HTTP) reservation keeps its old
+                        // contract and still surfaces.
+                        None if matches!(reservation_kind, ReservationKind::OpenWs) => {
+                            snapshots.retain(|s| s.id != id);
+                            match select_unowned_reservation(
+                                state,
+                                &mut snapshots,
+                                selector.as_ref(),
+                                &sel_ctx,
+                                reservation_kind,
+                                now,
+                            )
+                            .await
+                            {
+                                Some((sibling, reservation)) => {
+                                    state.relay_metrics.record("owner_socket_cap_spill");
+                                    tracing::info!(
+                                        target: "polyflare_server::routing",
+                                        owner = %id,
+                                        served_by = %sibling,
+                                        "session owner is at its websocket cap; this connection \
+                                         is served by a sibling and the session stays pointed home"
+                                    );
+                                    spilled_from = Some(id);
+                                    (sibling, reservation)
+                                }
+                                None => return Err(no_eligible()),
+                            }
+                        }
+                        None => return Err(no_eligible()),
+                    }
                 }
                 // Owner absent from the pool entirely, or present but currently ineligible
                 // (benched/cooled-down/inactive/wrong-provider) ⇒ NEVER stranded: fall through to
@@ -1470,6 +1510,78 @@ mod tests {
 
     /// (d) No eligible account at all (empty pool) ⇒ a clean 503, matching `/responses`'s
     /// `no_eligible()` — never a panic, never a hang.
+    /// Master 2026-09-21: the pinned owner had every websocket slot taken, the pinned socket
+    /// wait timed out, and the handshake answered 503 "no eligible account" while siblings sat
+    /// idle. The connection now goes to a sibling with a free slot, request-local (`spilled_from`
+    /// names the owner so the writeback is fenced and the session returns home).
+    #[tokio::test]
+    async fn a_pinned_owner_at_its_websocket_cap_spills_the_connection_to_a_sibling() {
+        let state = build_state(Arc::new(RoundRobin)).await;
+        seed_account(&state.store, &state.cipher, "A", "tokA").await;
+        seed_account(&state.store, &state.cipher, "B", "tokB").await;
+        let headers = hdr(&[("x-codex-turn-state", "ts-socket-cap")]);
+        let sk = header_session_key(&headers, None).unwrap();
+        let now = now();
+        state
+            .store
+            .continuity()
+            .ensure_session(&sk.value, "hard", now)
+            .await
+            .unwrap();
+        state
+            .store
+            .continuity()
+            .record_completion(&sk.value, "hard", "B", None, "resp_owner", "fp", 1, now)
+            .await
+            .unwrap();
+        let mut limits = state.runtime.admission_limits();
+        limits.account_open_ws = 1;
+        limits.owner_recovery_reserve = 0;
+        limits.socket_wait_timeout = Duration::from_millis(100);
+        state.runtime.set_admission_limits(limits);
+        // B's only socket slot is taken.
+        let _held = state
+            .runtime
+            .acquire_pinned_open_ws(&AccountId::from("B"), now)
+            .await
+            .expect("the first socket on B");
+
+        let (account, picked, guard, spilled) =
+            match resolve_owner_affine_ws_account_with_capability(
+                &state,
+                Some(&sk),
+                None,
+                None,
+                false,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(resp) => panic!("served by the sibling, never {}", resp.status()),
+            };
+        assert_eq!(picked, AccountId::from("A"));
+        assert_eq!(account.id, "A");
+        assert_eq!(
+            spilled,
+            Some(AccountId::from("B")),
+            "request-local: the owner is named so the writeback is fenced"
+        );
+        drop(guard);
+
+        // With no sibling that has a free slot either, the handshake still surfaces.
+        let _held_a = state
+            .runtime
+            .acquire_pinned_open_ws(&AccountId::from("A"), now)
+            .await
+            .expect("the first socket on A");
+        match resolve_owner_affine_ws_account_with_capability(&state, Some(&sk), None, None, false)
+            .await
+        {
+            Ok(_) => panic!("every slot everywhere is taken; must surface"),
+            Err(err) => assert_eq!(err.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE),
+        }
+    }
+
     #[tokio::test]
     async fn no_eligible_account_at_all_yields_503() {
         let state = build_state(Arc::new(RoundRobin)).await;

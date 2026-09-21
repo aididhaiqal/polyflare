@@ -74,6 +74,8 @@ pub struct AccountMetric {
     pub pool: Option<String>,
     pub in_flight: u32,
     pub in_flight_pressure: u32,
+    /// Open upstream websockets held for this account (the per-account socket cap applies here).
+    pub open_ws: u32,
     pub error_count: u32,
     pub health_tier: u8,
     pub cooldown_active: bool,
@@ -172,6 +174,13 @@ pub fn render_prometheus_text(snapshot: &MetricsSnapshot) -> String {
         "polyflare_account_inflight_pressure",
         "Current weighted request-pressure units per account.",
         |a| a.in_flight_pressure as u64,
+    );
+    write_account_gauge(
+        &mut out,
+        &snapshot.accounts,
+        "polyflare_account_open_ws",
+        "Open upstream websockets held per account (compare with the per-account socket cap).",
+        |a| a.open_ws as u64,
     );
     write_account_gauge(
         &mut out,
@@ -524,6 +533,7 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
             pool: snap.pool.clone(),
             in_flight: snap.in_flight,
             in_flight_pressure: snap.in_flight_pressure,
+            open_ws: snap.open_ws,
             error_count: snap.error_count,
             health_tier: snap.health_tier,
             cooldown_active: snap.cooldown_until.is_some_and(|c| now < c),
@@ -578,6 +588,7 @@ mod tests {
             pool: None,
             in_flight: 0,
             in_flight_pressure: 0,
+            open_ws: 0,
             error_count: 0,
             health_tier: 0,
             cooldown_active: false,
@@ -621,6 +632,7 @@ mod tests {
                     pool: Some("fast".to_string()),
                     in_flight: 2,
                     in_flight_pressure: 7,
+                    open_ws: 0,
                     error_count: 1,
                     health_tier: 0,
                     cooldown_active: false,
@@ -632,6 +644,7 @@ mod tests {
                     pool: None,
                     in_flight: 0,
                     in_flight_pressure: 0,
+                    open_ws: 0,
                     error_count: 4,
                     health_tier: 1,
                     cooldown_active: true,
