@@ -1,0 +1,18 @@
+#!/bin/zsh
+# Master deploy (run FROM THE LAPTOP): wait for the release build on ultraflux, swap the binary atomically, then restart
+# only when polyflare_lease_inflight == 0 (polled FROM LOCAL — an on-master poller died silently once).
+TOK=$(cat ~/.polyflare/master-token)
+for i in {1..40}; do ssh -o ConnectTimeout=8 ultraflux 'grep -q "Finished" /tmp/pf-build.log' && break; sleep 15; done
+ssh -o ConnectTimeout=8 ultraflux 'tail -1 /tmp/pf-build.log; grep -c "^error" /tmp/pf-build.log'
+ssh -o ConnectTimeout=8 ultraflux 'cp ~/Development/Codex-LoadBalancer/polyflare/target/release/polyflare ~/.local/bin/polyflare.new && mv -f ~/.local/bin/polyflare.new ~/.local/bin/polyflare && echo "master binary swapped"'
+for i in {1..240}; do
+  n=$(curl -s -m 8 -H "Authorization: Bearer $TOK" https://ultraflux.tail6de914.ts.net/metrics | grep -E '^polyflare_lease_inflight ' | awk '{print $2}')
+  echo "$(date +%T) inflight=$n"
+  if [ "$n" = "0" ]; then
+    ssh -o ConnectTimeout=8 ultraflux 'launchctl kickstart -k gui/$(id -u)/com.polyflare.server && echo "master restarted"' && break
+  fi
+  sleep 15
+done
+sleep 5
+echo "master /v1/models HTTP $(curl -s -o /dev/null -w '%{http_code}' -m 8 https://ultraflux.tail6de914.ts.net/v1/models)"
+ssh -o ConnectTimeout=8 ultraflux 'ps -o lstart= -p "$(pgrep -f "polyflare serve" | head -1)"'
