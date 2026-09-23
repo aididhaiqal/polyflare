@@ -2,7 +2,7 @@
 //! egress-parity half of the fingerprint-parity gate (see `executor.rs` and
 //! `polyflare-server/tests/codex_fingerprint_parity_gate.rs`).
 //!
-//! # Status: CAPTURE-VERIFIED (codex-cli 0.144.4, 2026-07-15); SOURCE-VERIFIED through 0.153.4 (2026-09-08)
+//! # Status: CAPTURE-VERIFIED (codex-cli 0.155.0-alpha.9.2, 2026-09-23); SOURCE-VERIFIED through 0.156.1 (2026-09-23)
 //! Originally built from a local `openai/codex` source read, this synthesis has since been
 //! diffed against a live wire capture of the real Codex CLI (`codex-cli 0.144.4`, obtained by
 //! routing a `scripts/codex-polyflare` run through `POLYFLARE_CAPTURE_FINGERPRINT`). The capture
@@ -82,7 +82,9 @@ use sha2::{Digest, Sha256};
 /// version the fleet has been running live from the version cache for weeks. Fingerprint
 /// verification is tracked SEPARATELY in [`FINGERPRINT_VERIFIED_THROUGH`] so raising the floor
 /// never silently claims a byte-capture that was not done.
-pub const CODEX_CLI_VERSION: &str = "0.153.4";
+/// **2026-09-23:** raised to 0.156.0, the `openai/codex` `releases/latest` tag of 2026-09-22 (the
+/// ChatGPT.app of 2026-09-18 bundles 0.155.0-alpha.9.2; the resolver reported 0.155.1 in production).
+pub const CODEX_CLI_VERSION: &str = "0.156.0";
 
 /// The newest codex-rs release whose egress fingerprint (header set, UA format, turn-metadata
 /// keys) PolyFlare has verified — 0.145.0 at the source level (see above). Drives only the
@@ -101,7 +103,23 @@ pub const CODEX_CLI_VERSION: &str = "0.153.4";
 /// `auto_review_enabled`, `node_repl_*`, `thread_source: "user"`, platform `sandbox` tag, no
 /// empty `workspaces`). A byte-level re-capture against a real 0.153.4 client is what would
 /// promote this to capture-verified.
-pub const FINGERPRINT_VERIFIED_THROUGH: &str = "0.153.4";
+///
+/// **2026-09-23: 0.156.1, source-verified AND capture-verified (0.155.0-alpha.9.2).** A live
+/// capture of the ChatGPT.app-bundled `codex exec` against a local recorder, diffed with the
+/// `rust-v0.156.1` tree (`core/src/responses_metadata.rs`, `core/src/turn_metadata.rs`,
+/// `core/src/session/mod.rs::current_window`, `codex-api/src/common.rs`,
+/// `login/src/auth/default_client.rs`). Drift found and fixed in that pass, all in the
+/// turn-metadata payload and `client_metadata`: `window_id` now ends in the window NUMBER
+/// (`{thread_id}:0`, counting auto-compaction windows from zero) with a sibling
+/// `window_number`; a `context_window_id` UUID per context window; `root_turn_id` (the turn's
+/// own id on a root turn) in both the payload and `client_metadata`; `analytics_enabled`; and
+/// the execution `model` / `reasoning_effort` (`turn_metadata.rs::ExecutionMetadata::apply_to`).
+/// Header set, UA format and body defaults were unchanged. The UA's optional ` (originator;
+/// version)` suffix is set only by the app-server `initialize` (Desktop, VS Code) — the TUI
+/// identity this module synthesizes carries none. `x-codex-routing-hint` is sent only against
+/// the codex backend (`client.rs::build_routing_hint_header`), which is exactly where this
+/// module's output goes, so it stays always-present here.
+pub const FINGERPRINT_VERIFIED_THROUGH: &str = "0.156.1";
 
 /// codex-rs's default `originator` (`login/src/auth/default_client.rs::DEFAULT_ORIGINATOR`).
 const ORIGINATOR: &str = "codex_cli_rs";
@@ -187,7 +205,12 @@ pub struct TurnIdentity {
     pub session_id: String,
     pub thread_id: String,
     pub turn_id: String,
+    /// `{thread_id}:{window_number}` (`session/mod.rs::current_window`).
     pub window_id: String,
+    /// Auto-compaction window ordinal; a fresh thread is window 0.
+    pub window_number: u64,
+    /// The UUID codex-rs mints per context window (`state.auto_compact_window_ids().window_id`).
+    pub context_window_id: String,
 }
 
 impl TurnIdentity {
@@ -202,11 +225,14 @@ impl TurnIdentity {
     /// per turn) — PolyFlare's executor has no turn sequence counter yet (capture-pending).
     pub fn derive(conversation_key: &str) -> Self {
         let thread_id = deterministic_uuid_shaped("thread", conversation_key);
+        let window_number = 0;
         Self {
             installation_id: deterministic_uuid_shaped("installation", conversation_key),
             session_id: deterministic_uuid_shaped("session", conversation_key),
             turn_id: deterministic_uuid_shaped("turn", conversation_key),
-            window_id: format!("{thread_id}:1"),
+            window_id: format!("{thread_id}:{window_number}"),
+            window_number,
+            context_window_id: deterministic_uuid_shaped("context-window", conversation_key),
             thread_id,
         }
     }
@@ -252,14 +278,18 @@ impl TurnIdentity {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        serde_json::json!({
+        let mut payload = serde_json::json!({
             "installation_id": self.installation_id,
             "session_id": self.session_id,
             "thread_id": self.thread_id,
             "agent_name": ROOT_AGENT_PATH,
             "turn_id": self.turn_id,
             "window_id": self.window_id,
+            "window_number": self.window_number,
+            "context_window_id": self.context_window_id,
             "request_kind": "turn",
+            // A root turn names itself (`turn_metadata.rs`: `root_turn_id: Some(turn_id)`).
+            "root_turn_id": self.turn_id,
             "thread_source": "user",
             "sandbox": platform_sandbox_tag(),
             "sandbox_mode": "workspace-write",
@@ -267,8 +297,26 @@ impl TurnIdentity {
             "node_repl_auto_review_required": flags.node_repl_auto_review_required,
             "node_repl_disabled": flags.node_repl_disabled,
             "turn_started_at_unix_ms": turn_started_at_unix_ms,
-        })
-        .to_string()
+            // `analytics_events_client.is_enabled()`: on for a ChatGPT-authenticated client.
+            "analytics_enabled": true,
+        });
+        // `ExecutionMetadata::apply_to`: the execution model always, the effective reasoning
+        // effort when one is resolved.
+        if let Some(obj) = payload.as_object_mut() {
+            if let Some(model) = &flags.model {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(model.clone()),
+                );
+            }
+            if let Some(effort) = &flags.reasoning_effort {
+                obj.insert(
+                    "reasoning_effort".to_string(),
+                    serde_json::Value::String(effort.clone()),
+                );
+            }
+        }
+        payload.to_string()
     }
 }
 
@@ -280,6 +328,11 @@ const ROOT_AGENT_PATH: &str = "/root";
 /// turn metadata (`core/src/turn_metadata.rs::TurnMetadataState::new`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelTurnFlags {
+    /// The execution model slug, carried into the turn-metadata payload (`model`).
+    pub model: Option<String>,
+    /// The EFFECTIVE reasoning effort for this turn (the request's own, else the model default),
+    /// carried into the turn-metadata payload (`reasoning_effort`); omitted when unresolved.
+    pub reasoning_effort: Option<String>,
     pub node_repl_auto_review_required: bool,
     pub node_repl_disabled: bool,
     /// `model_info.use_responses_lite`. True for every current flagship (gpt-5.6-sol,
@@ -384,6 +437,7 @@ pub fn apply_codex_body_defaults(
             "thread_id": identity.thread_id,
             "x-codex-window-id": identity.window_id,
             "turn_id": identity.turn_id,
+            "root_turn_id": identity.turn_id,
             "x-codex-turn-metadata": turn_metadata_json,
         }),
     );
@@ -500,7 +554,7 @@ mod tests {
     #[test]
     fn window_id_follows_thread_id_colon_n_format() {
         let identity = TurnIdentity::derive("conv-1");
-        assert_eq!(identity.window_id, format!("{}:1", identity.thread_id));
+        assert_eq!(identity.window_id, format!("{}:0", identity.thread_id));
     }
 
     #[test]
@@ -528,7 +582,12 @@ mod tests {
     fn turn_metadata_json_has_the_expected_field_set() {
         let identity = TurnIdentity::derive("conv-1");
         let value: serde_json::Value =
-            serde_json::from_str(&identity.turn_metadata_json()).unwrap();
+            serde_json::from_str(&identity.turn_metadata_json_for(&ModelTurnFlags {
+                model: Some("gpt-5.6-sol".into()),
+                reasoning_effort: Some("medium".into()),
+                ..ModelTurnFlags::default()
+            }))
+            .unwrap();
         let obj = value.as_object().unwrap();
         for key in [
             "installation_id",
@@ -537,6 +596,12 @@ mod tests {
             "agent_name",
             "turn_id",
             "window_id",
+            "window_number",
+            "context_window_id",
+            "root_turn_id",
+            "analytics_enabled",
+            "model",
+            "reasoning_effort",
             "request_kind",
             "thread_source",
             "sandbox",
@@ -548,12 +613,7 @@ mod tests {
         ] {
             assert!(obj.contains_key(key), "missing turn-metadata key `{key}`");
         }
-        for absent in [
-            "workspaces",
-            "turn_trigger",
-            "window_number",
-            "context_window_id",
-        ] {
+        for absent in ["workspaces", "turn_trigger"] {
             assert!(
                 !obj.contains_key(absent),
                 "`{absent}` must not appear on an ordinary interactive turn"
@@ -563,7 +623,7 @@ mod tests {
 
     /// Values pinned to codex-rs rust-v0.153.4 (see the const docs).
     #[test]
-    fn turn_metadata_values_match_codex_rs_0_153_4() {
+    fn turn_metadata_values_match_codex_rs_0_156_1() {
         let identity = TurnIdentity::derive("conv-1");
         let value: serde_json::Value =
             serde_json::from_str(&identity.turn_metadata_json()).unwrap();
@@ -582,16 +642,27 @@ mod tests {
         assert_eq!(value["auto_review_enabled"], false);
         assert_eq!(value["node_repl_auto_review_required"], false);
         assert_eq!(value["node_repl_disabled"], false);
+        assert_eq!(value["window_id"], format!("{}:0", identity.thread_id));
+        assert_eq!(value["window_number"], 0);
+        assert_eq!(value["context_window_id"], identity.context_window_id);
+        assert_eq!(value["root_turn_id"], identity.turn_id);
+        assert_eq!(value["analytics_enabled"], true);
+        assert!(value.get("model").is_none(), "no model resolved, no key");
+        assert!(value.get("reasoning_effort").is_none());
         let astra = identity.turn_metadata_json_for(&ModelTurnFlags {
             node_repl_auto_review_required: true,
+            model: Some("gpt-6-astra".into()),
+            reasoning_effort: Some("xhigh".into()),
             ..ModelTurnFlags::default()
         });
         let astra: serde_json::Value = serde_json::from_str(&astra).unwrap();
         assert_eq!(astra["node_repl_auto_review_required"], true);
+        assert_eq!(astra["model"], "gpt-6-astra");
+        assert_eq!(astra["reasoning_effort"], "xhigh");
     }
 
     #[test]
-    fn body_defaults_match_codex_rs_0_153_4_for_a_lite_flagship() {
+    fn body_defaults_match_codex_rs_0_156_1_for_a_lite_flagship() {
         let identity = TurnIdentity::derive("conv-1");
         let flags = ModelTurnFlags {
             use_responses_lite: true,
@@ -633,6 +704,7 @@ mod tests {
         assert_eq!(cm["thread_id"], identity.thread_id);
         assert_eq!(cm["x-codex-window-id"], identity.window_id);
         assert_eq!(cm["x-codex-installation-id"], identity.installation_id);
+        assert_eq!(cm["root_turn_id"], identity.turn_id);
         assert_eq!(
             cm["x-codex-turn-metadata"], meta,
             "body metadata equals the header"

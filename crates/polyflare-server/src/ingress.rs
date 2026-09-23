@@ -519,6 +519,19 @@ fn synthesize_codex_forward_headers(
     let identity = TurnIdentity::derive(&conversation_key(body));
     // One turn-metadata document per request: the header and the body's `client_metadata`
     // must carry the identical string (codex serializes the same payload into both).
+    // The payload carries the execution model and the EFFECTIVE reasoning effort — the request's
+    // own when it names one, else the model default `apply_codex_body_defaults` would fill in.
+    let mut flags = flags.clone();
+    flags.model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    flags.reasoning_effort = body
+        .pointer("/reasoning/effort")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| flags.default_reasoning_level.clone());
+    let flags = &flags;
     let turn_metadata = identity.turn_metadata_json_for(flags);
     apply_codex_body_defaults(body, &identity, flags, &turn_metadata);
     let model = body
@@ -560,6 +573,8 @@ fn model_turn_flags(
     model: &str,
 ) -> polyflare_codex::codex_headers::ModelTurnFlags {
     polyflare_codex::codex_headers::ModelTurnFlags {
+        model: Some(model.to_string()),
+        reasoning_effort: None,
         node_repl_auto_review_required: catalog
             .model_bool_flag(model, "node_repl_auto_review_required")
             .unwrap_or(false),

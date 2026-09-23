@@ -71,7 +71,8 @@ const EXPECTED_CODEX_IDENTITY_HEADER_NAMES: &[&str] = &[
 /// `forked_from_thread_id`/`parent_thread_id`/`subagent_kind`/`compaction`/`extra` — omitted here
 /// as conditional/rare fields (forking, subagents, compaction requests) out of scope for this M1
 /// baseline-turn synthesis; see `polyflare_codex::codex_headers` module doc.
-/// The interactive-turn key set of codex-rs rust-v0.153.4 (source-verified 2026-09-08; see
+/// The interactive-turn key set of codex-rs rust-v0.156.1 (source-verified 2026-09-23 and
+/// capture-verified against the ChatGPT.app-bundled 0.155.0-alpha.9.2 the same day; see
 /// `polyflare_codex::codex_headers::FINGERPRINT_VERIFIED_THROUGH`).
 const EXPECTED_TURN_METADATA_KEYS: &[&str] = &[
     "installation_id",
@@ -80,6 +81,12 @@ const EXPECTED_TURN_METADATA_KEYS: &[&str] = &[
     "agent_name",
     "turn_id",
     "window_id",
+    "window_number",
+    "context_window_id",
+    "root_turn_id",
+    "analytics_enabled",
+    "model",
+    "reasoning_effort",
     "request_kind",
     "thread_source",
     "sandbox",
@@ -111,7 +118,7 @@ async fn codex_egress_header_structure_matches_the_from_source_codex_rs_golden()
     // executor relays it untouched. A `prompt_cache_key` is present so the stable-id derivation
     // exercises its primary path, not the no-key fallback.
     use polyflare_codex::codex_headers::{
-        codex_user_agent, conversation_key, originator, routing_hint, TurnIdentity,
+        codex_user_agent, conversation_key, originator, routing_hint, ModelTurnFlags, TurnIdentity,
         CODEX_CLI_VERSION,
     };
     let body = serde_json::json!({
@@ -138,7 +145,12 @@ async fn codex_egress_header_structure_matches_the_from_source_codex_rs_golden()
         ("x-codex-window-id".to_string(), identity.window_id.clone()),
         (
             "x-codex-turn-metadata".to_string(),
-            identity.turn_metadata_json(),
+            // As production synthesizes it: the execution model and the effective effort.
+            identity.turn_metadata_json_for(&ModelTurnFlags {
+                model: Some("gpt-5.6-sol".to_string()),
+                reasoning_effort: Some("medium".to_string()),
+                ..ModelTurnFlags::default()
+            }),
         ),
         (
             "x-codex-routing-hint".to_string(),
