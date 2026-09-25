@@ -293,6 +293,22 @@ impl ScriptedTurn {
     /// with NO top-level `status`. Codex only turns a wrapped error into a stream error when it
     /// carries a non-2xx status, so this exact shape is what left clients waiting out their
     /// 300 s idle timer.
+    /// The upstream's per-account model gate: the model exists in the catalog but THIS account
+    /// cannot generate with it (2026-09-23, `gpt-6-sol` mid-rollout).
+    pub fn model_not_found(model: &str) -> Self {
+        ScriptedTurn::RawFrame {
+            frame: serde_json::json!({
+                "type": "error",
+                "status": 404,
+                "error": {
+                    "code": "model_not_found",
+                    "message": format!("The model `{model}` does not exist or you do not have access to it.")
+                }
+            })
+            .to_string(),
+        }
+    }
+
     pub fn server_overloaded_without_status() -> Self {
         ScriptedTurn::RawFrame {
             frame: serde_json::json!({

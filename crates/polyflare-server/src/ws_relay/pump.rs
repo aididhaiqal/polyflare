@@ -547,12 +547,13 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
     relay_contract: WsRelayContract,
     pool: Option<String>,
     require_security_work_authorized: bool,
+    ws_pressure: std::sync::Arc<std::sync::Mutex<Option<crate::runtime_state::WsSocketGuard>>>,
 ) where
     F: Fn(AccountId, String) -> Fut,
     Fut: Future<Output = ()>,
     G: Fn(Account, FailureSignal) -> GFut,
     GFut: Future<Output = Option<(Account, WsConn)>>,
-    M: Fn(Account, FailureSignal, Vec<AccountId>) -> MFut,
+    M: Fn(Account, FailureSignal, Vec<AccountId>, Option<String>) -> MFut,
     MFut: Future<Output = Option<(Account, WsConn)>>,
     H: Fn(Account) -> HFut,
     HFut: Future<Output = Option<(Account, WsConn)>>,
@@ -765,6 +766,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                             &account,
                             &relay_contract,
                             &state,
+                            &ws_pressure,
                             pool.as_deref(),
                             frame.clone(),
                             logical_turn_key.as_deref(),
@@ -949,8 +951,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                     unfinished_status = StatusCode::BAD_GATEWAY;
                                     break;
                                 }
-                                let redial = super::redial_for_scope(
+                                let redial = super::redial_for_scope_with_slot(
                                     &state,
+                                    &ws_pressure,
                                     &headers,
                                     &account,
                                     &relay_contract,
@@ -1199,8 +1202,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                     if let Some(frame) = transformed {
                                         refund_active_turn_attempt(&state, &turn_telemetry);
                                         if let RedialOutcome::Connected(conn) =
-                                            super::redial_for_scope(
+                                            super::redial_for_scope_with_slot(
                                                 &state,
+                                                &ws_pressure,
                                                 &headers,
                                                 &account,
                                                 &relay_contract,
@@ -1321,7 +1325,28 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                 // is at capacity". A repeated `response.created` is state the
                                 // client overwrites (see `is_non_output_frame`). On 2026-09-08
                                 // every such overload cost a hyperflux subagent ~5.5 min.
-                                if is_transient_overload(&sig)
+                                // A `model_not_found` takes the SAME cross-account rung (2)
+                                // and none of the same-socket / same-account ones: this account
+                                // cannot serve the model right now, a sibling may (2026-09-23,
+                                // `gpt-6-sol` mid-rollout: the catalog listed it everywhere,
+                                // one account said 404, another served it). Flag the pair so
+                                // the move — and every later pick — skips this account.
+                                let model_missing = is_model_not_found(&sig);
+                                let turn_model = turn_telemetry
+                                    .as_ref()
+                                    .and_then(WsTurnTelemetry::model)
+                                    .map(str::to_string);
+                                if model_missing {
+                                    if let Some(model) = turn_model.as_deref() {
+                                        state.model_catalog.note_model_unavailable(
+                                            &account.id,
+                                            model,
+                                            unix_now(),
+                                        );
+                                        relay_metrics.record("model_not_found_move");
+                                    }
+                                }
+                                if (is_transient_overload(&sig) || model_missing)
                                     && !upstream_output_visible_for_turn
                                     && overload_retries_for_turn < OVERLOAD_RETRY_MAX_RETRIES
                                 {
@@ -1358,6 +1383,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                                 account.clone(),
                                                 sig.clone(),
                                                 overload_tried_for_turn.clone(),
+                                                turn_model.clone(),
                                             )
                                             .await
                                         {
@@ -1426,7 +1452,8 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                             }
                                         }
                                     }
-                                    if anchored_in_flight && !anchor_resend_pending {
+                                    if anchored_in_flight && !anchor_resend_pending && !model_missing
+                                    {
                                         overload_retries_for_turn += 1;
                                         tokio::time::sleep(overload_retry_delay(
                                             &sig,
@@ -1454,15 +1481,19 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                         relay_metrics.record("overload_anchored_client_resend");
                                         continue;
                                     }
-                                    if let Some(frame) = in_flight.clone() {
+                                    // Rung 3 (same-account redial) is pointless for a model the
+                                    // account cannot serve: surface instead.
+                                    if let Some(frame) = in_flight.clone().filter(|_| !model_missing)
+                                    {
                                         overload_retries_for_turn += 1;
                                         tokio::time::sleep(overload_retry_delay(
                                             &sig,
                                             overload_retries_for_turn,
                                         ))
                                         .await;
-                                        let redial = super::redial_for_scope(
+                                        let redial = super::redial_for_scope_with_slot(
                                             &state,
+                                            &ws_pressure,
                                             &headers,
                                             &account,
                                             &relay_contract,
@@ -1828,8 +1859,9 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                 unfinished_status = StatusCode::BAD_GATEWAY;
                                 break;
                             }
-                            let redial = super::redial_for_scope(
+                            let redial = super::redial_for_scope_with_slot(
                                 &state,
+                                &ws_pressure,
                                 &headers,
                                 &account,
                                 &relay_contract,
@@ -1951,6 +1983,16 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                 break;
                             }
                             // Nothing in flight: drop only our leg and leave the client connected.
+                            // Parked: no upstream socket, so no socket slot. The next frame's lazy re-dial
+                            // takes one back (`redial_for_scope_with_slot`).
+                            if ws_pressure
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .take()
+                                .is_some()
+                            {
+                                relay_metrics.record("socket_slot_released_parked");
+                            }
                             upstream = None;
                             continue;
                         }
@@ -2111,6 +2153,10 @@ const OVERLOAD_RETRY_AFTER_HONOUR_MAX_SECS: i64 = 5;
 /// tokens, so a turn that produced neither is as replay-safe as one that failed before it was
 /// created. The retry/move budget is bounded per turn, so a genuinely deterministic 500 still
 /// reaches the client after those attempts rather than looping.
+fn is_model_not_found(sig: &FailureSignal) -> bool {
+    crate::failover::is_model_not_found(sig)
+}
+
 fn is_transient_overload(sig: &FailureSignal) -> bool {
     matches!(
         sig.error_code.as_deref(),
@@ -2238,6 +2284,7 @@ async fn send_client_text(
     account: &Account,
     relay_contract: &WsRelayContract,
     state: &AppState,
+    ws_pressure: &std::sync::Arc<std::sync::Mutex<Option<crate::runtime_state::WsSocketGuard>>>,
     pool: Option<&str>,
     text: String,
     logical_turn_key: Option<&str>,
@@ -2245,7 +2292,16 @@ async fn send_client_text(
     let mut redialed = false;
     for _ in 0..2 {
         if upstream.is_none() {
-            match super::redial_for_scope(state, headers, account, relay_contract, pool).await {
+            match super::redial_for_scope_with_slot(
+                state,
+                ws_pressure,
+                headers,
+                account,
+                relay_contract,
+                pool,
+            )
+            .await
+            {
                 RedialOutcome::Connected(conn) => *upstream = Some(*conn),
                 RedialOutcome::Unauthorized => return SendClientOutcome::Unauthorized,
                 RedialOutcome::ContractDrift | RedialOutcome::Unavailable => {

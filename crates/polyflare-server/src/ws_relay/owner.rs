@@ -115,6 +115,7 @@ pub(crate) async fn resolve_owner_excluding(
     session_id: Option<&str>,
     pool: Option<&str>,
     require_security_work_authorized: bool,
+    model: Option<&str>,
     exclude: &[polyflare_core::AccountId],
 ) -> Result<(Account, WsSocketGuard), RelayError> {
     // The mid-turn move is a DELIBERATE owner-mover (the account failed while serving this
@@ -126,6 +127,7 @@ pub(crate) async fn resolve_owner_excluding(
         session_id,
         pool,
         require_security_work_authorized,
+        model,
         exclude,
     )
     .await

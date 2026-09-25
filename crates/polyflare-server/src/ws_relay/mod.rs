@@ -200,6 +200,53 @@ pub(crate) async fn redial_for_scope(
     .await
 }
 
+/// [`redial_for_scope`] that also owns the account's SOCKET SLOT. The per-account socket cap
+/// exists to bound live UPSTREAM sockets, but until 2026-09-25 the slot was held for the life of
+/// the downstream connection: a relay whose upstream had been dropped between turns (age
+/// rotation, upstream drop) kept its slot while parked. Master that morning: 167 downstream
+/// connections, 3 upstream sockets, every account at its 24-slot cap, and every new handshake
+/// answered "no eligible account". The pump now releases the slot when it parks, and this takes
+/// one back — waiting the socket budget like a handshake would — before dialing again. A dial
+/// that fails gives a freshly taken slot straight back.
+pub(crate) async fn redial_for_scope_with_slot(
+    state: &AppState,
+    ws_pressure: &Arc<Mutex<Option<crate::runtime_state::WsSocketGuard>>>,
+    headers: &HeaderMap,
+    account: &Account,
+    relay_contract: &polyflare_codex::WsRelayContract,
+    pool: Option<&str>,
+) -> RedialOutcome {
+    let account_id = AccountId::from(account.id.as_str());
+    let held = ws_pressure
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|guard| guard.account_id() == &account_id);
+    let mut fresh = false;
+    if !held {
+        let Some(guard) = state
+            .runtime
+            .acquire_pinned_open_ws(&account_id, unix_now())
+            .await
+        else {
+            state
+                .relay_metrics
+                .record("socket_slot_unavailable_on_redial");
+            return RedialOutcome::Unavailable;
+        };
+        *ws_pressure.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
+        state
+            .relay_metrics
+            .record("socket_slot_reacquired_on_redial");
+        fresh = true;
+    }
+    let outcome = redial_for_scope(state, headers, account, relay_contract, pool).await;
+    if fresh && !matches!(outcome, RedialOutcome::Connected(_)) {
+        drop(ws_pressure.lock().unwrap_or_else(|e| e.into_inner()).take());
+    }
+    outcome
+}
+
 /// Accepts the codex CLI's downstream WebSocket upgrade on `/responses` (routed here only when
 /// `AppState::ws_downstream` is on — see `crate::app::build_app`). Returns `101 Switching
 /// Protocols` only after the upstream socket is ready; otherwise returns the pre-upgrade failure.
@@ -673,7 +720,7 @@ async fn relay(
         let session_id = session_id.clone();
         let relay_contract = relay_contract.clone();
         let ws_pressure = ws_pressure.clone();
-        move |current: Account, sig: FailureSignal, tried: Vec<AccountId>| {
+        move |current: Account, sig: FailureSignal, tried: Vec<AccountId>, model: Option<String>| {
             let state = state.clone();
             let headers = headers.clone();
             let session_key = session_key.clone();
@@ -699,6 +746,7 @@ async fn relay(
                     session_id.as_deref(),
                     pool.as_deref(),
                     require_security_work_authorized,
+                    model.as_deref(),
                     &exclude,
                 )
                 .await;
@@ -785,6 +833,7 @@ async fn relay(
         relay_contract,
         pool,
         require_security_work_authorized,
+        ws_pressure,
     )
     .await;
 }

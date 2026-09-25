@@ -2072,6 +2072,71 @@ mod relay_through {
 
     /// A turn that overloads on its second account must not bounce back to the first: every
     /// account already tried for the turn is excluded, so the third sibling serves it.
+    /// Master 2026-09-23 10:53: the session's owner answered 404 `model_not_found` for
+    /// `gpt-6-sol` three times on the same socket while a sibling served the model. The 404 is a
+    /// capability answer: no same-socket replay, no same-account redial — the turn moves to the
+    /// sibling and the client sees only the completion.
+    #[tokio::test]
+    async fn a_model_not_found_moves_the_turn_to_a_sibling_without_retrying_the_same_account() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::model_not_found("gpt-6-sol"),
+            ScriptedTurn::normal(Vec::new()),
+        ])
+        .capturing_raw_frames();
+        let mock_base = mock.clone().spawn().await;
+        let (base, state) = spawn_with_two_accounts("acct-mnf-a", "acct-mnf-b", &mock_base).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        let frame = r#"{"type":"response.create","model":"gpt-6-sol","input":[{"role":"user","content":"a"}],"client_metadata":{"turn_id":"t-mnf"}}"#.to_string();
+        ws.send(TMessage::Text(frame.clone().into())).await.unwrap();
+
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("a reply")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            reply["type"], "response.completed",
+            "the model gate is hidden behind the move: {reply}"
+        );
+        assert_eq!(
+            mock.raw_frames(),
+            vec![frame.clone(), frame],
+            "one attempt on the owner, one verbatim replay on the sibling — no same-socket replay"
+        );
+        assert_eq!(
+            mock.handshake_authorizations(),
+            vec![
+                Some("Bearer tok-acct-mnf-a".to_string()),
+                Some("Bearer tok-acct-mnf-b".to_string())
+            ],
+            "the replay rides the sibling, never a redial of the same account"
+        );
+        let snapshot = state.relay_metrics.snapshot();
+        let count = |k: &str| {
+            snapshot
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| *v)
+                .unwrap_or(0)
+        };
+        assert_eq!(count("model_not_found_move"), 1, "{snapshot:?}");
+        assert_eq!(count("overload_move_cross_account"), 1, "{snapshot:?}");
+        assert_eq!(count("capacity_replay_same_socket"), 0, "{snapshot:?}");
+        assert!(
+            state
+                .model_catalog
+                .model_unavailable("acct-mnf-a", "gpt-6-sol", now()),
+            "the pair is flagged so later picks skip the owner for this model"
+        );
+    }
+
     #[tokio::test]
     async fn an_overload_walks_forward_through_the_fleet_never_back_to_a_tried_account() {
         // Rung 1 (the same-socket replay) consumes the first refusal; the second is what

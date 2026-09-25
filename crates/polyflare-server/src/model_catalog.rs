@@ -112,6 +112,18 @@ struct CachedAccount {
     fetched_at: Instant,
 }
 
+/// How long a live `model_not_found` keeps an (account, model) pair out of selection. One hour is
+/// long enough that a rollout in progress does not cost a failed-over attempt per request, short
+/// enough that an account which gains the model the same day is used the same day.
+pub const MODEL_UNAVAILABLE_TTL_SECS: i64 = 3600;
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Caches the merged (upstream-onto-floor) model catalog behind a TTL, single-flighting refreshes
 /// and degrading gracefully — down to the static floor — when upstream is unavailable.
 pub struct ModelCatalogCache {
@@ -147,6 +159,13 @@ pub struct ModelCatalogCache {
     /// it (the poll REPLACES each account's list every cycle, so a reset window clears within one
     /// interval). Empty for every non-Anthropic account and whenever nothing is capped.
     capped_models: RwLock<HashMap<String, Vec<String>>>,
+    /// TRANSIENT `account_id -> model -> unix deadline`: the upstream answered `model_not_found`
+    /// for this exact (account, model) pair moments ago. 2026-09-23: `gpt-6-sol` appeared in every
+    /// account's `/models` catalog at once while generation access reached accounts one by one,
+    /// so the fleet catalog said yes and a given account said 404 — for minutes on one account,
+    /// hours on another. A flagged pair is routed around while a sibling remains, and expires on
+    /// its own so a rollout that catches up is noticed with one cheap, failed-over attempt.
+    unavailable_models: RwLock<HashMap<String, HashMap<String, i64>>>,
     /// DISPLAY-ONLY mirror of the same poll: every per-model weekly window with its percentage and
     /// reset, so the dashboard can show how close each model is to its own cap. Routing never reads
     /// this — it reads `capped_models` — so a change here can never move a request.
@@ -184,6 +203,7 @@ impl ModelCatalogCache {
             account_models: RwLock::new(HashMap::new()),
             declared_support: RwLock::new(HashMap::new()),
             capped_models: RwLock::new(HashMap::new()),
+            unavailable_models: RwLock::new(HashMap::new()),
             model_windows: RwLock::new(HashMap::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
             source,
@@ -751,12 +771,52 @@ impl ModelCatalogCache {
         let anyone_supports = snapshots
             .iter()
             .any(|snapshot| self.account_supports_model(snapshot.id.as_str(), model) == Some(true));
-        if !anyone_supports {
+        if anyone_supports {
+            snapshots.retain(|snapshot| {
+                self.account_supports_model(snapshot.id.as_str(), model) != Some(false)
+            });
+        }
+        self.retain_accounts_available_for(snapshots, model, unix_now());
+    }
+
+    /// Record that `account_id` just answered `model_not_found` for `model`; the pair is routed
+    /// around for [`MODEL_UNAVAILABLE_TTL_SECS`] (see `unavailable_models`).
+    pub fn note_model_unavailable(&self, account_id: &str, model: &str, now: i64) {
+        self.unavailable_models
+            .write()
+            .expect("unavailable models lock poisoned")
+            .entry(account_id.to_string())
+            .or_default()
+            .insert(model.to_string(), now + MODEL_UNAVAILABLE_TTL_SECS);
+    }
+
+    /// Whether `account_id` is currently flagged as unable to serve `model`.
+    pub fn model_unavailable(&self, account_id: &str, model: &str, now: i64) -> bool {
+        self.unavailable_models
+            .read()
+            .expect("unavailable models lock poisoned")
+            .get(account_id)
+            .and_then(|models| models.get(model))
+            .is_some_and(|until| now < *until)
+    }
+
+    /// Drop candidates flagged unavailable for `model` — but ONLY while that leaves someone behind:
+    /// when every candidate is flagged, the flags are stale or the model is gone everywhere, and a
+    /// real attempt (which refreshes the flag) beats an empty pool.
+    pub fn retain_accounts_available_for(
+        &self,
+        snapshots: &mut Vec<polyflare_core::AccountSnapshot>,
+        model: &str,
+        now: i64,
+    ) {
+        let available = snapshots
+            .iter()
+            .filter(|snapshot| !self.model_unavailable(snapshot.id.as_str(), model, now))
+            .count();
+        if available == 0 || available == snapshots.len() {
             return;
         }
-        snapshots.retain(|snapshot| {
-            self.account_supports_model(snapshot.id.as_str(), model) != Some(false)
-        });
+        snapshots.retain(|snapshot| !self.model_unavailable(snapshot.id.as_str(), model, now));
     }
 
     fn fresh_scoped(&self, scope: &[String]) -> Option<ScopedCatalog> {
@@ -1676,6 +1736,49 @@ mod tests {
 
     /// A per-model cap (from the Anthropic usage poll) makes even a DECLARED-supported model route
     /// away from that account by substring, and only that model — everything else still serves.
+    /// 2026-09-23: `gpt-6-sol` was in every account's catalog while one account answered
+    /// `model_not_found`. A live 404 flags that (account, model) pair; selection skips it while a
+    /// sibling remains, never empties the pool on the flag alone, and forgets it after the TTL.
+    #[tokio::test]
+    async fn a_live_model_not_found_routes_the_pair_away_until_it_expires() {
+        let cache = ModelCatalogCache::new(
+            Box::new(NoneSource),
+            Duration::from_secs(60),
+            default_floor(),
+        );
+        let snap = |id: &str| polyflare_core::AccountSnapshot::new(id);
+        let now = 1_000;
+        cache.note_model_unavailable("acct-a", "gpt-6-sol", now);
+
+        let mut pool = vec![snap("acct-a"), snap("acct-b")];
+        cache.retain_accounts_available_for(&mut pool, "gpt-6-sol", now);
+        assert_eq!(
+            pool.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["acct-b"],
+            "the flagged account is skipped while a sibling remains"
+        );
+
+        let mut other = vec![snap("acct-a"), snap("acct-b")];
+        cache.retain_accounts_available_for(&mut other, "gpt-6-astra", now);
+        assert_eq!(other.len(), 2, "the flag is per model");
+
+        let mut alone = vec![snap("acct-a")];
+        cache.retain_accounts_available_for(&mut alone, "gpt-6-sol", now);
+        assert_eq!(alone.len(), 1, "a flag never empties the pool");
+
+        let mut later = vec![snap("acct-a"), snap("acct-b")];
+        cache.retain_accounts_available_for(
+            &mut later,
+            "gpt-6-sol",
+            now + MODEL_UNAVAILABLE_TTL_SECS,
+        );
+        assert_eq!(
+            later.len(),
+            2,
+            "expired: a rollout that caught up is noticed again"
+        );
+    }
+
     #[tokio::test]
     async fn a_capped_model_overrides_support_by_substring() {
         let cache = ModelCatalogCache::new(

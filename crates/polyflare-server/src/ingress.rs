@@ -2022,6 +2022,11 @@ async fn run_failover_loop(
     // `server_is_overloaded`-class terminal caught before any byte, or a bare 503). See the
     // `None` arm below for what that changes.
     let mut every_refusal_was_capacity = !committed && is_transient_capacity_refusal(&err);
+    if crate::failover::watchdog_error_is_model_not_found(&err) {
+        state
+            .model_catalog
+            .note_model_unavailable(failed_id.as_str(), &resend_req.model, now);
+    }
     let loop_started = std::time::Instant::now();
     let mut ride_out_rounds: u32 = 0;
 
@@ -2041,7 +2046,12 @@ async fn run_failover_loop(
         let from_id = failed_id.clone();
         tried.insert(failed_id);
 
-        let candidates = exclude_tried(snapshots, &tried);
+        let mut candidates = exclude_tried(snapshots, &tried);
+        // Skip siblings flagged unavailable for this model (a live `model_not_found` moments ago),
+        // while at least one candidate remains.
+        state
+            .model_catalog
+            .retain_accounts_supporting(&mut candidates, &resend_req.model);
         let fresh = match selector.pick(&candidates, sel_ctx) {
             Some(id) => id,
             None => 'pick: {
@@ -2209,6 +2219,13 @@ async fn run_failover_loop(
                 err = e2;
                 committed = commit.is_committed();
                 every_refusal_was_capacity &= !committed && is_transient_capacity_refusal(&err);
+                if crate::failover::watchdog_error_is_model_not_found(&err) {
+                    state.model_catalog.note_model_unavailable(
+                        failed_id.as_str(),
+                        &resend_req.model,
+                        unix_now(),
+                    );
+                }
             }
         }
     }

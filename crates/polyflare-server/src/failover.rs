@@ -118,6 +118,13 @@ fn classify_upstream(signal: Option<&FailureSignal>) -> FailoverVerdict {
         }
     }
 
+    // `model_not_found` is a CAPABILITY answer, not a request problem: the same request served
+    // by a sibling account moments later (2026-09-23, `gpt-6-sol` mid-rollout). Try the next
+    // account; `ingress::run_failover_loop` flags the pair so later picks skip it.
+    if is_model_not_found(sig) {
+        return FailoverVerdict::FailoverNext;
+    }
+
     match sig.status {
         // rate_limit.
         429 => FailoverVerdict::FailoverNext,
@@ -144,6 +151,20 @@ fn classify_upstream(signal: Option<&FailureSignal>) -> FailoverVerdict {
 /// Content-safety: every arm returns a fixed `&'static str` or reads `sig.status`/`sig.error_code`
 /// (both already audited content-free fields, per [`FailureSignal`]'s own doc) — never
 /// `Display`/`Debug` of the error, never a body/message.
+/// A 404 whose code names the model: this account cannot serve the requested model right now.
+pub fn is_model_not_found(sig: &FailureSignal) -> bool {
+    sig.error_code.as_deref() == Some("model_not_found")
+}
+
+/// [`is_model_not_found`] over a watchdog error's carried signal.
+pub fn watchdog_error_is_model_not_found(err: &WatchdogError) -> bool {
+    match err {
+        WatchdogError::Upstream(Some(sig)) => is_model_not_found(sig),
+        WatchdogError::UpstreamHttp(response) => is_model_not_found(&response.signal),
+        _ => false,
+    }
+}
+
 pub fn failover_reason_code(err: &WatchdogError) -> &'static str {
     match err {
         WatchdogError::Upstream(Some(sig)) => {
@@ -151,6 +172,9 @@ pub fn failover_reason_code(err: &WatchdogError) -> &'static str {
                 if classify_failure(code).status().is_some() {
                     return "permanent_auth";
                 }
+            }
+            if is_model_not_found(sig) {
+                return "model_not_found";
             }
             match sig.status {
                 429 => "rate_limited",
@@ -166,6 +190,9 @@ pub fn failover_reason_code(err: &WatchdogError) -> &'static str {
                 if classify_failure(code).status().is_some() {
                     return "permanent_auth";
                 }
+            }
+            if is_model_not_found(sig) {
+                return "model_not_found";
             }
             match sig.status {
                 429 => "rate_limited",

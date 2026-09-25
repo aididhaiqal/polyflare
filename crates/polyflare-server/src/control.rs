@@ -116,6 +116,7 @@ pub(crate) async fn resolve_owner_affine_ws_account_with_capability(
         session_id,
         pool,
         require_security_work_authorized,
+        None,
         &[],
     )
     .await
@@ -135,6 +136,7 @@ pub(crate) async fn resolve_owner_affine_ws_account_excluding(
     session_id: Option<&str>,
     pool: Option<&str>,
     require_security_work_authorized: bool,
+    model: Option<&str>,
     exclude: &[AccountId],
 ) -> Result<(Account, AccountId, WsSocketGuard, Option<AccountId>), Response> {
     let (account, id, reservation, spilled_from) = resolve_owner_affine_account_inner(
@@ -144,7 +146,7 @@ pub(crate) async fn resolve_owner_affine_ws_account_excluding(
         pool,
         require_security_work_authorized,
         ReservationKind::OpenWs,
-        None,
+        model,
         exclude,
     )
     .await?;

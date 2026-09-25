@@ -27,7 +27,7 @@ use futures_util::{stream, StreamExt};
 use polyflare_codex::oauth::OAuthClient;
 use polyflare_core::{
     Account, AccountId, AccountSnapshot, Continuity, ExecError, Executor, FailureSignal,
-    PreparedRequest, RequestCtx, ResponseStream, SelectionCtx, Selector,
+    PreparedRequest, RequestCtx, ResponseStream, SelectionCtx, Selector, UpstreamHttpError,
 };
 use polyflare_server::app::{build_app, AppState};
 use polyflare_server::continuity::CodexContinuity;
@@ -95,6 +95,9 @@ enum AttemptBehavior {
     Success,
     /// `execute()` itself fails with a plain non-2xx status (no error code) — a pre-relay failure.
     Fail(u16),
+    /// The upstream's per-account model gate: 404 `model_not_found` (2026-09-23, `gpt-6-sol` in
+    /// every catalog while one account could not generate with it).
+    ModelNotFound,
     /// `execute()` succeeds and the stream yields ONE real content byte, then a mid-stream
     /// `ExecError::Stream` — the commit-barrier case.
     ByteThenDrop,
@@ -209,6 +212,17 @@ impl Executor for FailoverStubExecutor {
                 status,
                 retry_after: None,
                 error_code: None,
+            })),
+            AttemptBehavior::ModelNotFound => Err(ExecError::UpstreamHttp(UpstreamHttpError {
+                signal: FailureSignal {
+                    status: 404,
+                    retry_after: None,
+                    error_code: Some("model_not_found".to_string()),
+                },
+                headers: Vec::new(),
+                body: Bytes::from_static(
+                    b"{\"error\":{\"code\":\"model_not_found\",\"message\":\"do not leak this\"}}",
+                ),
             })),
             AttemptBehavior::AcceptedThenCapacity => {
                 let id = format!("resp_{}", account.id);
@@ -1391,4 +1405,76 @@ async fn a_recovered_turn_fails_over_instead_of_surfacing_a_502_after_one_refusa
         vec!["A".to_string(), "B".to_string(), "C".to_string()],
         "turn 1 on A; turn 2 recovered on B, refused, failed over to C"
     );
+}
+
+/// Master 2026-09-23 10:53: `gpt-6-sol` was in every account's catalog, one account answered
+/// 404 `model_not_found` and the client saw "does not exist or you do not have access", while a
+/// sibling served the same model in the same minute. A model gate is a capability answer: the
+/// turn fails over to a sibling, and the (account, model) pair is skipped by later picks.
+#[tokio::test]
+async fn a_model_not_found_fails_over_to_a_sibling_and_later_picks_skip_the_account() {
+    let (store, cipher, _dir) = spawn_store().await;
+    store
+        .accounts()
+        .insert(&account("A", false), &tokens("tokA"), &cipher)
+        .await
+        .unwrap();
+    store
+        .accounts()
+        .insert(&account("B", false), &tokens("tokB"), &cipher)
+        .await
+        .unwrap();
+    let exec = Arc::new(FailoverStubExecutor::new());
+    exec.script(
+        "A",
+        vec![AttemptBehavior::ModelNotFound, AttemptBehavior::Success],
+    );
+    exec.script(
+        "B",
+        vec![AttemptBehavior::Success, AttemptBehavior::Success],
+    );
+    let state = build_state(store, cipher, exec.clone());
+    let pf = spawn_app(state).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "gpt-6-sol", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "served by the sibling, not a 404");
+    let body = drain(resp).await;
+    assert!(
+        body.contains("resp_B") && !body.contains("do not leak this"),
+        "B's stream is what the client reads: {body}"
+    );
+
+    // A different session asking for the same model goes straight to B: A is flagged.
+    let resp = client
+        .post(format!("{pf}/responses"))
+        .header("session_id", "sess-other")
+        .json(&serde_json::json!({"model": "gpt-6-sol", "input": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = drain(resp).await;
+    assert!(body.contains("resp_B"), "{body}");
+    assert_eq!(
+        exec.calls(),
+        vec!["A".to_string(), "B".to_string(), "B".to_string()],
+        "A refused the model once and is not asked again for it"
+    );
+
+    // Another model is unaffected: A still serves it.
+    let resp = client
+        .post(format!("{pf}/responses"))
+        .header("session_id", "sess-astra")
+        .json(&serde_json::json!({"model": "gpt-6-astra", "input": "hey"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(exec.calls().last().map(String::as_str), Some("A"));
 }

@@ -844,6 +844,13 @@ pub struct WsSocketGuard {
     id: AccountId,
 }
 
+impl WsSocketGuard {
+    /// The account whose per-account socket slot this guard holds.
+    pub(crate) fn account_id(&self) -> &AccountId {
+        &self.id
+    }
+}
+
 impl Drop for WsSocketGuard {
     fn drop(&mut self) {
         self.runtime.mutate(&self.id, |rt| {

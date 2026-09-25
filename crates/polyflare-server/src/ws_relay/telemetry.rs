@@ -165,6 +165,11 @@ impl WsTurnTelemetry {
         }
     }
 
+    /// The turn's model slug, when the frame named one.
+    pub(crate) fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
     pub(crate) fn logical_turn_key(&self) -> Option<&str> {
         self.log_request
             .then_some(self.logical_turn_key.as_deref())
