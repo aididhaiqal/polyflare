@@ -651,7 +651,7 @@ function DetailContent({
                     {identity.workspace_label && <>{identity.workspace_label} · </>}
                   </>
                 )}
-                <span className="font-semibold text-fg opacity-90">{planLabel(identity.plan_type)}</span> plan
+                <span className="font-semibold text-fg opacity-90">{planLabel(identity.plan_type, identity.provider)}</span> plan
                 {" · "}
                 <span className="font-semibold text-fg opacity-90">
                   {identity.pools.length > 0 ? identity.pools.join(", ") : "unpooled"}

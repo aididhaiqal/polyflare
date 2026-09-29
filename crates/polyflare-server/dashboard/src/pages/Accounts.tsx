@@ -596,7 +596,7 @@ function AccountCard({
                 {a.alias && a.email && <span className="opacity-60">{a.email} · </span>}
               </>
             )}
-            <span className="font-medium text-fg opacity-90">{planLabel(a.plan_type)}</span> · pool{" "}
+            <span className="font-medium text-fg opacity-90">{planLabel(a.plan_type, a.provider)}</span> · pool{" "}
             <span className="font-medium text-fg opacity-90">
               {a.pools.length > 0 ? a.pools.join(", ") : "unpooled"}
             </span>
@@ -857,7 +857,7 @@ function AccountsTable({
                   <td className="px-2.5 py-2 text-fg opacity-60">
                     {a.pools.length > 0 ? a.pools.join(", ") : "unpooled"}
                   </td>
-                  <td className="px-2.5 py-2 text-fg opacity-80">{planLabel(a.plan_type)}</td>
+                  <td className="px-2.5 py-2 text-fg opacity-80">{planLabel(a.plan_type, a.provider)}</td>
                   <td className="whitespace-nowrap px-2.5 py-2">
                     <StatusPill status={a.status} />
                     <RoutingBadge routing={a.routing} nowMs={nowMs} className="ml-1" />

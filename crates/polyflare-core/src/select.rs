@@ -41,6 +41,13 @@ pub fn plan_capacity_secondary(plan: &str) -> f64 {
         "plus" | "business" | "team" | "edu" => 7560.0,
         "pro" | "enterprise" => 50400.0,
         "prolite" => 37800.0,
+        // ChatGPT Pro tiers on the wire (`chatgpt_plan_type` claim / `wham/usage.plan_type`):
+        // `prolite` = Pro 100 (5x Plus), `pro` = Pro 200 (20x Plus, cut to 10x from 2026-09),
+        // `promax` = Pro 500 (2026-09-25, "highest included usage", no published multiple). Only
+        // the RATIO between tiers matters here; `promax` is scaled off `pro` by the sticker price
+        // (2.5x) so a Pro 500 seat never falls through to the free tier and always outweighs a
+        // Pro 200. Revisit when OpenAI publishes the Pro 500 multiple.
+        "promax" => 50400.0 * 2.5,
         // Anthropic subscription tiers (`anthropic_usage::plan_slug_from_tier`). Without these a
         // Claude Max seat fell through to the FREE-tier capacity below, so two seats on different
         // Claude plans weighted identically. Scaled off the `pro` arm by the tiers' own naming
@@ -1429,6 +1436,22 @@ mod tests {
                 "probing(2) must outrank draining(1)"
             );
         }
+    }
+
+    /// The three ChatGPT Pro tiers (Pro 100 / Pro 200 / Pro 500 = `prolite` / `pro` / `promax`)
+    /// must rank in that order, and the new `promax` must never fall through to the free tier
+    /// (which is what an unknown slug does — and what happened before it was added).
+    #[test]
+    fn plan_capacity_ranks_the_three_pro_tiers() {
+        let free = plan_capacity_secondary("free");
+        assert!(plan_capacity_secondary("promax") > plan_capacity_secondary("pro"));
+        assert!(plan_capacity_secondary("pro") > plan_capacity_secondary("prolite"));
+        assert!(plan_capacity_secondary("prolite") > plan_capacity_secondary("plus"));
+        assert!(plan_capacity_secondary("promax") > free);
+        assert_eq!(
+            plan_capacity_secondary(" ProMax "),
+            plan_capacity_secondary("promax")
+        );
     }
 
     #[test]

@@ -45,6 +45,11 @@ const HEALTH_TIER_FROZEN_STATUSES: &[&str] = &[
 #[derive(Deserialize, Default)]
 struct UsagePayload {
     rate_limit: Option<RateLimitPayload>,
+    /// The account's CURRENT plan slug (`prolite` = Pro 100, `pro` = Pro 200, `promax` = Pro 500,
+    /// `plus`, `team`, ...). The store's `plan_type` is captured once from the ID-token claim at
+    /// onboarding, so without this an upgraded or downgraded seat kept its onboarding tier —
+    /// and its capacity weight — forever.
+    plan_type: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -200,6 +205,7 @@ async fn refresh_account(
         return Ok(false);
     }
     let payload: UsagePayload = resp.json().await?;
+    sync_plan_type(repo, account, payload.plan_type.as_deref()).await?;
     let rl = payload.rate_limit.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -288,6 +294,32 @@ async fn refresh_account(
     }
 
     Ok(true)
+}
+
+/// Persist the plan slug the usage endpoint reports when it differs from the stored one. The
+/// slug is normalized the way `plan_capacity_secondary` reads it (trimmed, lowercase); an absent
+/// or empty value changes nothing, so a payload that omits the field can never blank a plan.
+/// Plan slugs are account metadata, not conversation content, so the change is logged.
+async fn sync_plan_type(
+    repo: &AccountRepo,
+    account: &Account,
+    reported: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(reported) = reported else {
+        return Ok(());
+    };
+    let plan = reported.trim().to_ascii_lowercase();
+    if plan.is_empty() || plan == account.plan_type {
+        return Ok(());
+    }
+    tracing::info!(
+        account = %account.id,
+        from = %account.plan_type,
+        to = %plan,
+        "plan type changed upstream; capacity weight follows"
+    );
+    repo.update_plan_type(&account.id, &plan).await?;
+    Ok(())
 }
 
 /// The two Anthropic usage windows expressed in seconds, so [`is_five_hour`]/[`derive_gate`]
@@ -964,6 +996,112 @@ mod tests {
         assert_eq!(s.used_percent, Some(73.5));
         assert_eq!(s.reset_at, Some(1783900000));
         assert_eq!(s.limit_window_seconds, Some(604800));
+    }
+
+    /// A seat moved between Pro tiers upstream (Pro 200 `pro` -> Pro 500 `promax`) must show its
+    /// new slug after the next usage poll, not the slug captured at onboarding; an omitted or
+    /// empty `plan_type` must leave the stored one alone.
+    #[tokio::test]
+    async fn usage_poll_follows_the_plan_the_upstream_reports() {
+        async fn usage() -> axum::Json<serde_json::Value> {
+            axum::Json(serde_json::json!({
+                "plan_type": " ProMax ",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 12.0, "reset_at": 1793000000, "limit_window_seconds": 604800}
+                }
+            }))
+        }
+        async fn usage_without_plan() -> axum::Json<serde_json::Value> {
+            axum::Json(serde_json::json!({
+                "plan_type": "",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 12.0, "reset_at": 1793000000, "limit_window_seconds": 604800}
+                }
+            }))
+        }
+
+        let app = axum::Router::new()
+            .route("/with/backend-api/wham/usage", axum::routing::get(usage))
+            .route(
+                "/without/backend-api/wham/usage",
+                axum::routing::get(usage_without_plan),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = polyflare_store::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let cipher = TokenCipher::from_key_bytes(&[22u8; 32]).unwrap();
+        let repo = store.accounts();
+        let seat = account("codex-upgraded", "codex", "active");
+        assert_eq!(seat.plan_type, "pro", "fixture starts on Pro 200");
+        repo.insert(
+            &seat,
+            &PlainTokens {
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                id_token: "id".into(),
+            },
+            &cipher,
+        )
+        .await
+        .unwrap();
+
+        async fn poll(
+            repo: &AccountRepo,
+            cipher: &TokenCipher,
+            seat: &Account,
+            base: String,
+        ) -> bool {
+            refresh_account(
+                repo,
+                cipher,
+                &reqwest::Client::new(),
+                &base,
+                seat,
+                &RuntimeStates::new(),
+                true,
+                &crate::log_bus::LogBus::new(8),
+                &crate::observability::HealthTierMetrics::new(),
+            )
+            .await
+            .unwrap()
+        }
+
+        assert!(
+            poll(
+                &repo,
+                &cipher,
+                &seat,
+                format!("http://{address}/with/backend-api/codex")
+            )
+            .await
+        );
+        assert_eq!(
+            repo.get("codex-upgraded").await.unwrap().unwrap().plan_type,
+            "promax",
+            "the reported slug is stored trimmed and lowercased"
+        );
+
+        // A later poll that omits the plan (empty) must not blank what we know.
+        assert!(
+            poll(
+                &repo,
+                &cipher,
+                &seat,
+                format!("http://{address}/without/backend-api/codex")
+            )
+            .await
+        );
+        assert_eq!(
+            repo.get("codex-upgraded").await.unwrap().unwrap().plan_type,
+            "promax"
+        );
     }
 
     #[tokio::test]

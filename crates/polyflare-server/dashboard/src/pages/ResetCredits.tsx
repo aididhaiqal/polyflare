@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import clsx from "clsx";
 
 import type { ResetCreditRecommendation, ResetPlanCandidateView } from "../lib/api";
+import { planLabel } from "../lib/format";
 import {
   useRedeemAccountResetCredit,
   useRedeemFleetResetCredits,
@@ -553,7 +554,7 @@ function CandidateRow({
           {/* The title above is already the email unless a nickname replaced it, so the address
               belongs here only in the nicknamed case — never the internal id in its place. */}
           {candidate.alias && <>{candidate.email} · </>}
-          {candidate.plan_type} ·{" "}
+          {planLabel(candidate.plan_type)} ·{" "}
           {candidate.pools.length > 0 ? candidate.pools.join(", ") : "unpooled"}
         </div>
         <p className="mt-1.5 text-[9.5px] leading-relaxed text-fg opacity-60">

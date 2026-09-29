@@ -143,23 +143,34 @@ export function tpsFmt(n: number | null | undefined): string {
  * brief; prefer `tpsFmt` at new call sites since it disambiguates from the `tps` data field. */
 export const tps = tpsFmt;
 
-/** Human label for an account `plan_type`. Codex tiers arrive as `pro`/`plus`/`team`/`max` (from
- * the ID-token claim); Anthropic tiers as `max_20x`/`max_5x`/`max`/`pro`/`unknown` (from the OAuth
- * profile's `rate_limit_tier`, mapped server-side in `anthropic_usage::plan_slug_from_tier`). An
- * unrecognized value is title-cased so a new tier still reads sensibly instead of breaking. */
-export function planLabel(plan: string | null | undefined): string {
+/** Human label for an account `plan_type`. Codex tiers arrive as the ChatGPT plan slug from the
+ * ID-token claim and the usage endpoint: `prolite` / `pro` / `promax` are the three Pro tiers that
+ * ChatGPT sells as Pro 100 / Pro 200 / Pro 500 (the names codex-rs shows since 2026-09-28), plus
+ * `plus` / `team` / `free`. Anthropic tiers are `max_20x` / `max_5x` / `max` / `pro` (from the OAuth
+ * profile's `rate_limit_tier`, mapped server-side in `anthropic_usage::plan_slug_from_tier`) — the
+ * `pro` slug is shared, so a Claude Pro seat also reads "Pro 200" here; pass the provider to
+ * disambiguate. An unrecognized value is title-cased so a new tier still reads sensibly. */
+export function planLabel(plan: string | null | undefined, provider?: string | null): string {
   if (!plan) return "—";
+  const slug = plan.trim().toLowerCase();
+  if (provider === "anthropic") {
+    const claude: Record<string, string> = { max_20x: "Max 20×", max_5x: "Max 5×", max: "Max", pro: "Pro" };
+    if (slug in claude) return claude[slug];
+  }
   const known: Record<string, string> = {
+    prolite: "Pro 100",
+    pro: "Pro 200",
+    promax: "Pro 500",
     max_20x: "Max 20×",
     max_5x: "Max 5×",
     max: "Max",
-    pro: "Pro",
     plus: "Plus",
     team: "Team",
     free: "Free",
     unknown: "Unknown",
   };
-  return known[plan] ?? plan.replace(/(^|[_\s])([a-z])/g, (_, sep, c) => (sep ? " " : "") + c.toUpperCase());
+  return known[slug] ?? slug.replace(/(^|[_\s])([a-z])/g, (_, sep, c) => (sep ? " " : "") + c.toUpperCase());
 }
 // @check planLabel("max_20x") === "Max 20×"
-// @check planLabel("pro") === "Pro"
+// @check planLabel("promax") === "Pro 500"
+// @check planLabel("pro", "anthropic") === "Pro"
