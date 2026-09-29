@@ -76,7 +76,7 @@ import {
   type UsageWindowView,
 } from "../lib/api";
 import { accountLabel } from "../lib/accountDisplay";
-import { compactNum, countdown, pct, planLabel } from "../lib/format";
+import { billingLabel, compactNum, countdown, pct, planLabel } from "../lib/format";
 import {
   quotaDisplayLabel,
   quotaDisplayPercent,
@@ -589,6 +589,7 @@ function DetailContent({
   const displayName = accountLabel(identity, siblings);
   const tone = statusTone(detail.status);
   const token = tokenStatusText(detail.token_status, nowMs);
+  const billing = billingLabel(detail.subscription, nowMs);
   const quotaRows = detail.quota_windows
     .filter((row) => row.window !== "five_hour" || quotaWindowIsPresent(row))
     .sort((a, b) => (WINDOW_ORDER[a.window] ?? 99) - (WINDOW_ORDER[b.window] ?? 99));
@@ -679,6 +680,7 @@ function DetailContent({
           <HealthMetric label="Token" value={token.text} hint="access credential" tone={detail.token_status.access_state === "valid" ? "ok" : detail.token_status.access_state === "expired" ? "error" : "warn"} />
           <HealthMetric label="Requests" value={compactNum(detail.request_totals.request_count)} hint="all time" />
           <HealthMetric label="Tokens routed" value={compactNum(detail.request_totals.total_tokens)} hint="all time" />
+          {billing && <HealthMetric label="Billing" value={billing.value} hint={billing.hint} tone={billing.stale ? "warn" : "ok"} />}
         </div>
       </Card>
 

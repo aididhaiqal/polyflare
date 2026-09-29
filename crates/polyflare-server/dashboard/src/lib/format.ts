@@ -174,3 +174,36 @@ export function planLabel(plan: string | null | undefined, provider?: string | n
 // @check planLabel("max_20x") === "Max 20×"
 // @check planLabel("promax") === "Pro 500"
 // @check planLabel("pro", "anthropic") === "Pro"
+
+/** Calendar date for a unix-seconds timestamp, e.g. `"29 Oct"`, with the year appended when it is
+ * not the year of `nowMs` (`"8 Aug 2025"`). UTC-stable so tests are deterministic. */
+export function shortDate(unixSecs: number, nowMs: number): string {
+  const d = new Date(unixSecs * 1000);
+  const day = d.getUTCDate();
+  const month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][d.getUTCMonth()];
+  const year = d.getUTCFullYear();
+  return year === new Date(nowMs).getUTCFullYear() ? `${day} ${month}` : `${day} ${month} ${year}`;
+}
+
+/** The billing card on the account profile, from `AccountDetailView.subscription`. The claims come
+ * from the seat's last FULL login and are never refreshed by the refresh grant, so the hint always
+ * carries the as-of date; a period that has already ended is labelled stale rather than shown as
+ * a fact, because the seat is plainly still serving. Returns `null` when there is nothing to show. */
+export function billingLabel(
+  sub: { active_until: number | null; last_checked: number | null } | null | undefined,
+  nowMs: number,
+): { value: string; hint: string; stale: boolean } | null {
+  if (!sub || sub.active_until === null) return null;
+  const asOf = sub.last_checked === null ? "" : ` · as of ${shortDate(sub.last_checked, nowMs)}`;
+  const stale = sub.active_until * 1000 < nowMs;
+  if (stale) {
+    return {
+      value: `Ended ${shortDate(sub.active_until, nowMs)}`,
+      hint: `stale claim${asOf} · re-login refreshes`,
+      stale,
+    };
+  }
+  return { value: `Renews ${shortDate(sub.active_until, nowMs)}`, hint: `in ${countdown(sub.active_until, nowMs)}${asOf}`, stale };
+}
+// @check billingLabel({ active_until: 1_793_243_736, last_checked: 1_790_651_761 }, 1_790_800_000_000)?.value === "Renews 29 Oct"
+// @check billingLabel(null, 1_790_800_000_000) === null

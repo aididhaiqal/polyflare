@@ -37,6 +37,12 @@ pub struct Claims {
     pub workspace_id: Option<String>,
     pub workspace_label: Option<String>,
     pub seat_type: Option<String>,
+    /// Billing-period claims OpenAI stamps into the ID token at a FULL login (RFC 3339 strings).
+    /// The refresh grant does not update them — a token re-issued weeks later still carries the
+    /// values from the last login — so anything that shows them must show `last_checked` too.
+    pub chatgpt_subscription_active_start: Option<String>,
+    pub chatgpt_subscription_active_until: Option<String>,
+    pub chatgpt_subscription_last_checked: Option<String>,
     pub exp: Option<i64>,
 }
 
@@ -176,6 +182,9 @@ pub fn decode_claims(id_token: &str) -> Result<Claims, OAuthError> {
         workspace_id: pick("workspace_id"),
         workspace_label: pick("workspace_label"),
         seat_type: pick("seat_type"),
+        chatgpt_subscription_active_start: pick("chatgpt_subscription_active_start"),
+        chatgpt_subscription_active_until: pick("chatgpt_subscription_active_until"),
+        chatgpt_subscription_last_checked: pick("chatgpt_subscription_last_checked"),
         exp: v.get("exp").and_then(Value::as_i64),
     })
 }
@@ -693,11 +702,22 @@ mod tests {
                 "chatgpt_account_id": "acct-xyz",
                 "chatgpt_user_id": "user-auth",
                 "chatgpt_plan_type": "pro",
-                "chatgpt_account_is_fedramp": true
+                "chatgpt_account_is_fedramp": true,
+                "chatgpt_subscription_active_start": "2026-09-29T03:15:36+00:00",
+                "chatgpt_subscription_active_until": "2026-10-29T03:15:36+00:00",
+                "chatgpt_subscription_last_checked": "2026-09-29T03:16:01.279319+00:00"
             }
         });
         let claims = decode_claims(&make_jwt(&payload)).unwrap();
         assert_eq!(claims.email.as_deref(), Some("user@example.test"));
+        assert_eq!(
+            claims.chatgpt_subscription_active_until.as_deref(),
+            Some("2026-10-29T03:15:36+00:00")
+        );
+        assert_eq!(
+            claims.chatgpt_subscription_last_checked.as_deref(),
+            Some("2026-09-29T03:16:01.279319+00:00")
+        );
         assert_eq!(claims.chatgpt_account_id.as_deref(), Some("acct-xyz"));
         assert_eq!(claims.chatgpt_user_id.as_deref(), Some("user-auth")); // auth-claim wins
         assert_eq!(claims.chatgpt_plan_type.as_deref(), Some("pro"));

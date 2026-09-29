@@ -1594,6 +1594,89 @@ async fn account_detail_returns_identity_status_quota_and_token_status_and_404s_
 /// `reasoning_tokens` is set on the imported-shaped row (to a value that would double-count the
 /// total if wrongly added) so a wrong implementation shows up as a wrong sum, not a
 /// coincidentally-passing test.
+/// An unsigned JWT whose payload is `claims` — the shape OpenAI's ID token has once decoded.
+fn id_token_with(claims: serde_json::Value) -> String {
+    use base64::Engine as _;
+    let enc = |v: &serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap())
+    };
+    format!(
+        "{}.{}.sig",
+        enc(&serde_json::json!({"alg": "none"})),
+        enc(&claims)
+    )
+}
+
+#[tokio::test]
+async fn account_detail_surfaces_the_billing_period_from_the_id_token_claims() {
+    // OpenAI stamps `chatgpt_subscription_active_until` / `_last_checked` into the ID token at a
+    // full login. The detail view turns them into unix seconds so the profile can show the renewal
+    // date WITH its as-of date (the refresh grant never updates the claims). A token without the
+    // claims (the fixture's opaque "SECRET-ID") yields `subscription: null`, never an error.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
+    let repo = store.accounts();
+    let mut with_claims = tokens();
+    with_claims.id_token = id_token_with(serde_json::json!({
+        "sub": "sub-1",
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "acct-billing",
+            "chatgpt_plan_type": "promax",
+            "chatgpt_subscription_active_start": "2026-09-29T03:15:36+00:00",
+            "chatgpt_subscription_active_until": "2026-10-29T03:15:36+00:00",
+            "chatgpt_subscription_last_checked": "2026-09-29T03:16:01.279319+00:00"
+        }
+    }));
+    repo.insert(
+        &account("acct-billing", "billing@example.test", None),
+        &with_claims,
+        &cipher,
+    )
+    .await
+    .unwrap();
+    repo.insert(
+        &account("acct-plain", "plain@example.test", None),
+        &tokens(),
+        &cipher,
+    )
+    .await
+    .unwrap();
+    std::mem::forget(dir);
+
+    let pf = spawn(store).await;
+    let client = reqwest::Client::new();
+
+    let body: serde_json::Value = client
+        .get(format!("{pf}/api/accounts/acct-billing"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["subscription"]["active_start"], 1_790_651_736i64);
+    assert_eq!(body["subscription"]["active_until"], 1_793_243_736i64);
+    assert_eq!(body["subscription"]["last_checked"], 1_790_651_761i64);
+    let text = body.to_string();
+    assert!(
+        !text.contains("SECRET") && !text.contains("sig"),
+        "the token must never reach the response: {text}"
+    );
+
+    let plain: serde_json::Value = client
+        .get(format!("{pf}/api/accounts/acct-plain"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(plain["subscription"].is_null(), "{plain}");
+}
+
 #[tokio::test]
 async fn account_detail_request_totals_fall_back_to_input_plus_output_tokens() {
     let dir = tempfile::tempdir().unwrap();

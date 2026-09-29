@@ -188,6 +188,15 @@ export interface RequestTotalsView {
   total_tokens: number;
 }
 
+/** `read_api.rs::SubscriptionView` — `AccountDetailView.subscription`: the billing period from the
+ * seat's ID token (unix seconds), stamped at the last FULL login and NOT refreshed by the refresh
+ * grant, so `last_checked` says how current it is. */
+export interface SubscriptionView {
+  active_start: number | null;
+  active_until: number | null;
+  last_checked: number | null;
+}
+
 /** `read_api.rs::AccountDetailView` — `GET /api/accounts/{id}` response. */
 export interface AccountDetailView {
   identity: AccountIdentityView;
@@ -197,6 +206,8 @@ export interface AccountDetailView {
   routing_policy: string;
   security_work_authorized: boolean;
   request_totals: RequestTotalsView;
+  /** `read_api.rs::SubscriptionView` — null for seats whose token carries no billing claims. */
+  subscription: SubscriptionView | null;
   /** `read_api.rs::ModelCapView[]` — per-model weekly caps on THIS seat (Anthropic only),
    * most-consumed first. A `capped` model cannot be served by this seat until `reset_at`;
    * selection already routes those requests to a seat with headroom. Empty for seats with no

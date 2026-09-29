@@ -18,7 +18,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use polyflare_codex::oauth::token_exp;
+use polyflare_codex::oauth::{decode_claims, token_exp};
 use polyflare_store::{ApiKeyRow, ReportTrafficScope, RequestsFilter};
 
 use crate::app::AppState;
@@ -423,6 +423,40 @@ struct AccountDetailView {
     /// request to a seat with headroom — so surfacing it explains why traffic for one model is
     /// concentrated elsewhere. Empty for a seat with no per-model limits reported.
     model_caps: Vec<ModelCapView>,
+    /// The billing period from the seat's stored ID token, when it carries one (ChatGPT seats).
+    subscription: Option<SubscriptionView>,
+}
+
+/// `AccountDetailView::subscription`: the billing period OpenAI stamped into the seat's ID token
+/// at its last FULL login, as unix seconds. `last_checked` is when OpenAI last looked at the
+/// subscription. The refresh grant does not update these claims — a seat that has not been
+/// re-logged-in for weeks shows a period that may have rolled over since — which is why the
+/// dashboard prints the as-of date next to the renewal. Absent for providers without such
+/// claims (Anthropic) and for tokens issued before OpenAI added them.
+#[derive(Serialize)]
+struct SubscriptionView {
+    active_start: Option<i64>,
+    active_until: Option<i64>,
+    last_checked: Option<i64>,
+}
+
+/// RFC 3339 claim text (`2026-10-29T03:15:36+00:00`, fractional seconds allowed) to unix seconds.
+fn rfc3339_secs(value: Option<&str>) -> Option<i64> {
+    value
+        .and_then(|v| chrono::DateTime::parse_from_rfc3339(v.trim()).ok())
+        .map(|dt| dt.timestamp())
+}
+
+/// The subscription claims of one seat's stored ID token, if it carries any. Decoding reads the
+/// unverified payload only; the token itself never leaves this function.
+fn subscription_from_id_token(id_token: &str) -> Option<SubscriptionView> {
+    let claims = decode_claims(id_token).ok()?;
+    let view = SubscriptionView {
+        active_start: rfc3339_secs(claims.chatgpt_subscription_active_start.as_deref()),
+        active_until: rfc3339_secs(claims.chatgpt_subscription_active_until.as_deref()),
+        last_checked: rfc3339_secs(claims.chatgpt_subscription_last_checked.as_deref()),
+    };
+    (view.active_until.is_some() || view.active_start.is_some()).then_some(view)
 }
 
 /// One model's own weekly window on one account (see `anthropic_usage::ModelCapWindow`).
@@ -498,16 +532,23 @@ pub async fn account_detail_handler(
     // Token status: preferred source is the access token's own unverified JWT `exp` (the token
     // never leaves this scope); opaque tokens with no JWT `exp` (Anthropic) fall back to the stored
     // `access_token_expires_at` column. Identical derivation to `accounts_handler`.
-    let token_status = match repo.get_with_tokens_and_auth(&id, &state.cipher).await {
-        Ok(Some((_, tokens, auth))) => derive_token_health(
-            token_exp(&tokens.access_token),
-            auth.access_token_expires_at,
-            now,
+    let (token_status, subscription) = match repo.get_with_tokens_and_auth(&id, &state.cipher).await
+    {
+        Ok(Some((_, tokens, auth))) => (
+            derive_token_health(
+                token_exp(&tokens.access_token),
+                auth.access_token_expires_at,
+                now,
+            ),
+            subscription_from_id_token(&tokens.id_token),
         ),
-        Ok(None) => TokenHealthView {
-            access_state: "missing",
-            access_expires_at: None,
-        },
+        Ok(None) => (
+            TokenHealthView {
+                access_state: "missing",
+                access_expires_at: None,
+            },
+            None,
+        ),
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
     };
 
@@ -548,6 +589,7 @@ pub async fn account_detail_handler(
         security_work_authorized: account.security_work_authorized,
         request_totals,
         model_caps,
+        subscription,
     })
     .into_response()
 }
