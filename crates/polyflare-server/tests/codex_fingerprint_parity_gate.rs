@@ -71,8 +71,8 @@ const EXPECTED_CODEX_IDENTITY_HEADER_NAMES: &[&str] = &[
 /// `forked_from_thread_id`/`parent_thread_id`/`subagent_kind`/`compaction`/`extra` — omitted here
 /// as conditional/rare fields (forking, subagents, compaction requests) out of scope for this M1
 /// baseline-turn synthesis; see `polyflare_codex::codex_headers` module doc.
-/// The interactive-turn key set of codex-rs rust-v0.156.1 (source-verified 2026-09-23 and
-/// capture-verified against the ChatGPT.app-bundled 0.155.0-alpha.9.2 the same day; see
+/// The interactive-turn key set of codex-rs rust-v0.159.0 (source-verified 2026-09-30 and
+/// capture-verified against the 0.159.0 release binary and the app-bundled 0.158.0-alpha.2.1; see
 /// `polyflare_codex::codex_headers::FINGERPRINT_VERIFIED_THROUGH`).
 const EXPECTED_TURN_METADATA_KEYS: &[&str] = &[
     "installation_id",
@@ -87,6 +87,7 @@ const EXPECTED_TURN_METADATA_KEYS: &[&str] = &[
     "analytics_enabled",
     "model",
     "reasoning_effort",
+    "turn_trigger",
     "request_kind",
     "thread_source",
     "sandbox",

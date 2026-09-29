@@ -2,7 +2,7 @@
 //! egress-parity half of the fingerprint-parity gate (see `executor.rs` and
 //! `polyflare-server/tests/codex_fingerprint_parity_gate.rs`).
 //!
-//! # Status: CAPTURE-VERIFIED (codex-cli 0.155.0-alpha.9.2, 2026-09-23); SOURCE-VERIFIED through 0.156.1 (2026-09-23)
+//! # Status: CAPTURE-VERIFIED (codex-cli 0.159.0 and the ChatGPT.app-bundled 0.158.0-alpha.2.1, 2026-09-30); SOURCE-VERIFIED through 0.159.0 (2026-09-30)
 //! Originally built from a local `openai/codex` source read, this synthesis has since been
 //! diffed against a live wire capture of the real Codex CLI (`codex-cli 0.144.4`, obtained by
 //! routing a `scripts/codex-polyflare` run through `POLYFLARE_CAPTURE_FINGERPRINT`). The capture
@@ -84,7 +84,9 @@ use sha2::{Digest, Sha256};
 /// never silently claims a byte-capture that was not done.
 /// **2026-09-23:** raised to 0.156.0, the `openai/codex` `releases/latest` tag of 2026-09-22 (the
 /// ChatGPT.app of 2026-09-18 bundles 0.155.0-alpha.9.2; the resolver reported 0.155.1 in production).
-pub const CODEX_CLI_VERSION: &str = "0.156.0";
+/// **2026-09-30:** raised to 0.159.0 (`releases/latest` of 2026-09-29; the ChatGPT.app of 2026-09-24
+/// bundles 0.158.0-alpha.2.1).
+pub const CODEX_CLI_VERSION: &str = "0.159.0";
 
 /// The newest codex-rs release whose egress fingerprint (header set, UA format, turn-metadata
 /// keys) PolyFlare has verified — 0.145.0 at the source level (see above). Drives only the
@@ -119,7 +121,22 @@ pub const CODEX_CLI_VERSION: &str = "0.156.0";
 /// identity this module synthesizes carries none. `x-codex-routing-hint` is sent only against
 /// the codex backend (`client.rs::build_routing_hint_header`), which is exactly where this
 /// module's output goes, so it stays always-present here.
-pub const FINGERPRINT_VERIFIED_THROUGH: &str = "0.156.1";
+///
+/// **2026-09-30: 0.159.0, source- and capture-verified** (release binary 0.159.0 and the
+/// app-bundled 0.158.0-alpha.2.1, both against a local recorder; `rust-v0.159.0` tree diffed
+/// against `rust-v0.156.1`). One drift, fixed: the turn-metadata payload now always carries
+/// `turn_trigger` (`turn_metadata.rs::set_turn_trigger` from `TurnStartOptions`: the TUI composer
+/// sends `"user"`, `codex exec` sends `"exec"`, others `"steer"`, `"retry"`, `"automation"`, …).
+/// Unchanged: header set, UA format, body defaults, `client_metadata` keys. Not adopted:
+/// `client_metadata.mcp_attribution` (only with MCP attribution and `include_internal`),
+/// `x-codex-parent-thread-id` (subagents only), the routing hint's new guardian-reviewer
+/// exemption (this module never synthesizes a guardian turn), and the numeric
+/// `reasoning.effort` serializer (custom efforts only).
+pub const FINGERPRINT_VERIFIED_THROUGH: &str = "0.159.0";
+
+/// The `turn_trigger` of the interactive TUI turn this module impersonates (see
+/// [`FINGERPRINT_VERIFIED_THROUGH`]).
+pub const TURN_TRIGGER: &str = "user";
 
 /// codex-rs's default `originator` (`login/src/auth/default_client.rs::DEFAULT_ORIGINATOR`).
 const ORIGINATOR: &str = "codex_cli_rs";
@@ -291,6 +308,7 @@ impl TurnIdentity {
             // A root turn names itself (`turn_metadata.rs`: `root_turn_id: Some(turn_id)`).
             "root_turn_id": self.turn_id,
             "thread_source": "user",
+            "turn_trigger": TURN_TRIGGER,
             "sandbox": platform_sandbox_tag(),
             "sandbox_mode": "workspace-write",
             "auto_review_enabled": false,
@@ -603,6 +621,7 @@ mod tests {
             "model",
             "reasoning_effort",
             "request_kind",
+            "turn_trigger",
             "thread_source",
             "sandbox",
             "sandbox_mode",
@@ -613,7 +632,7 @@ mod tests {
         ] {
             assert!(obj.contains_key(key), "missing turn-metadata key `{key}`");
         }
-        for absent in ["workspaces", "turn_trigger"] {
+        for absent in ["workspaces", "history_ingest_requested"] {
             assert!(
                 !obj.contains_key(absent),
                 "`{absent}` must not appear on an ordinary interactive turn"
@@ -623,7 +642,7 @@ mod tests {
 
     /// Values pinned to codex-rs rust-v0.153.4 (see the const docs).
     #[test]
-    fn turn_metadata_values_match_codex_rs_0_156_1() {
+    fn turn_metadata_values_match_codex_rs_0_159_0() {
         let identity = TurnIdentity::derive("conv-1");
         let value: serde_json::Value =
             serde_json::from_str(&identity.turn_metadata_json()).unwrap();
@@ -647,6 +666,7 @@ mod tests {
         assert_eq!(value["context_window_id"], identity.context_window_id);
         assert_eq!(value["root_turn_id"], identity.turn_id);
         assert_eq!(value["analytics_enabled"], true);
+        assert_eq!(value["turn_trigger"], TURN_TRIGGER);
         assert!(value.get("model").is_none(), "no model resolved, no key");
         assert!(value.get("reasoning_effort").is_none());
         let astra = identity.turn_metadata_json_for(&ModelTurnFlags {
@@ -662,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn body_defaults_match_codex_rs_0_156_1_for_a_lite_flagship() {
+    fn body_defaults_match_codex_rs_0_159_0_for_a_lite_flagship() {
         let identity = TurnIdentity::derive("conv-1");
         let flags = ModelTurnFlags {
             use_responses_lite: true,
