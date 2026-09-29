@@ -13,6 +13,12 @@ for i in {1..240}; do
   fi
   sleep 15
 done
-sleep 5
-echo "master /v1/models HTTP $(curl -s -o /dev/null -w '%{http_code}' -m 8 https://ultraflux.tail6de914.ts.net/v1/models)"
-ssh -o ConnectTimeout=8 ultraflux 'ps -o lstart= -p "$(pgrep -f "polyflare serve" | head -1)"'
+# The drain + relaunch takes ~12 s; a fixed 5 s wait reported a false 502 / empty pid on 2026-09-30.
+for i in {1..20}; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m 8 https://ultraflux.tail6de914.ts.net/v1/models)
+  [ "$code" = "200" ] && break
+  sleep 3
+done
+echo "master /v1/models HTTP $code after restart"
+ssh -o ConnectTimeout=8 ultraflux 'pid=$(pgrep -f "polyflare serve" | head -1); [ -n "$pid" ] && ps -o lstart= -p "$pid" || echo "NO polyflare serve PROCESS"'
+[ "$code" = "200" ]
