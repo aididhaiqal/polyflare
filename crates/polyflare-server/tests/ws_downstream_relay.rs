@@ -2137,6 +2137,64 @@ mod relay_through {
         );
     }
 
+    /// Ultrafast is sold only with Pro 500, and the upstream serves it on any other plan at the
+    /// default speed with no error (verified 2026-09-30) — so the relay must move the turn to
+    /// the Pro 500 seat BEFORE the frame is sent; nothing in a reply could trigger a move later.
+    #[tokio::test]
+    async fn an_ultrafast_turn_moves_to_the_pro_500_seat_before_it_is_sent() {
+        let mock =
+            MockWsUpstream::scripted(vec![ScriptedTurn::normal(Vec::new())]).capturing_raw_frames();
+        let mock_base = mock.clone().spawn().await;
+        let (base, state) = spawn_with_plans_and_attempts(
+            &[("acct-pro200", "pro"), ("acct-pro500", "promax")],
+            &mock_base,
+            3,
+        )
+        .await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        let frame = r#"{"type":"response.create","model":"gpt-6-astra","service_tier":"ultrafast","input":[{"role":"user","content":"a"}],"client_metadata":{"turn_id":"t-uf"}}"#.to_string();
+        ws.send(TMessage::Text(frame.clone().into())).await.unwrap();
+
+        let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("a reply")
+            .expect("frame")
+            .expect("no WS error")
+        else {
+            panic!("expected a text frame");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["type"], "response.completed", "{reply}");
+        assert_eq!(
+            mock.raw_frames(),
+            vec![frame],
+            "exactly one upstream send — the Pro 200 owner never sees the ultrafast turn"
+        );
+        assert_eq!(
+            mock.handshake_authorizations().last(),
+            Some(&Some("Bearer tok-acct-pro500".to_string())),
+            "the turn rides the Pro 500 seat: {:?}",
+            mock.handshake_authorizations()
+        );
+        let snapshot = state.relay_metrics.snapshot();
+        let count = |k: &str| {
+            snapshot
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| *v)
+                .unwrap_or(0)
+        };
+        assert_eq!(count("tier_move_cross_account"), 1, "{snapshot:?}");
+        assert_eq!(
+            count("overload_move_cross_account"),
+            0,
+            "a tier move is not a failure move: {snapshot:?}"
+        );
+    }
+
     #[tokio::test]
     async fn an_overload_walks_forward_through_the_fleet_never_back_to_a_tried_account() {
         // Rung 1 (the same-socket replay) consumes the first refusal; the second is what
@@ -2629,12 +2687,22 @@ mod relay_through {
         mock_base: &str,
         max_account_attempts: u32,
     ) -> (String, Arc<AppState>) {
+        let accounts: Vec<(&str, &str)> = ids.iter().map(|id| (*id, "pro")).collect();
+        spawn_with_plans_and_attempts(&accounts, mock_base, max_account_attempts).await
+    }
+
+    /// Two-plan fleet builder: every seat is `active`, on the given ChatGPT plan slug.
+    async fn spawn_with_plans_and_attempts(
+        accounts: &[(&str, &str)],
+        mock_base: &str,
+        max_account_attempts: u32,
+    ) -> (String, Arc<AppState>) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("store.db")).await.unwrap();
         std::mem::forget(dir);
 
         let cipher = TokenCipher::from_key_bytes(&[11u8; 32]).unwrap();
-        for &id in ids {
+        for &(id, plan_type) in accounts {
             store
                 .accounts()
                 .insert(
@@ -2647,7 +2715,7 @@ mod relay_through {
                         workspace_id: None,
                         workspace_label: None,
                         seat_type: None,
-                        plan_type: "pro".to_string(),
+                        plan_type: plan_type.to_string(),
                         routing_policy: "normal".to_string(),
                         last_refresh: now(), // fresh: never triggers a live OAuth refresh
                         created_at: now(),

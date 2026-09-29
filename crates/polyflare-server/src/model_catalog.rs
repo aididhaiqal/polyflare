@@ -779,6 +779,88 @@ impl ModelCatalogCache {
         self.retain_accounts_available_for(snapshots, model, unix_now());
     }
 
+    /// The model gate and the service-tier gate in one call, for the selection sites.
+    pub fn retain_accounts_serving(
+        &self,
+        snapshots: &mut Vec<polyflare_core::AccountSnapshot>,
+        model: &str,
+        service_tier: Option<&str>,
+    ) {
+        self.retain_accounts_supporting(snapshots, model);
+        self.retain_accounts_supporting_tier(snapshots, model, service_tier);
+    }
+
+    /// Narrow `snapshots` to the seats that can serve `model` at `service_tier`. Same rule as
+    /// [`Self::retain_accounts_supporting`]: fail CLOSED on evidence (some candidate serves the
+    /// tier ⇒ keep only the candidates not known to lack it), fail OPEN on ignorance. When no
+    /// eligible seat serves the tier the pool is left whole and the turn runs at the default
+    /// speed — which is exactly what the upstream does with a tier the seat's plan does not
+    /// include: it serves the turn at `default` with no error (verified on a Pro 200 seat asking
+    /// for `ultrafast`, 2026-09-30). That silent downgrade is why this gate is proactive: nothing
+    /// in the response would ever tell a reactive failover to move.
+    pub fn retain_accounts_supporting_tier(
+        &self,
+        snapshots: &mut Vec<polyflare_core::AccountSnapshot>,
+        model: &str,
+        service_tier: Option<&str>,
+    ) {
+        let Some(tier) = normalize_tier(service_tier) else {
+            return;
+        };
+        let verdict = |snapshot: &polyflare_core::AccountSnapshot| {
+            self.account_serves_tier(snapshot.id.as_str(), &snapshot.plan_type, model, &tier)
+        };
+        if snapshots
+            .iter()
+            .any(|snapshot| verdict(snapshot) == Some(true))
+        {
+            snapshots.retain(|snapshot| verdict(snapshot) != Some(false));
+        } else if !snapshots.is_empty() {
+            tracing::info!(
+                target: "polyflare_server::routing",
+                tier = %tier,
+                model = %model,
+                candidates = snapshots.len(),
+                "no eligible seat serves the requested service tier; the turn runs at the default speed"
+            );
+        }
+    }
+
+    /// Whether `account_id` (on `plan_type`) can serve `model` at `tier`: the seat's own catalog
+    /// entry decides when it lists `service_tiers` (the upstream advertises `ultrafast` on
+    /// `gpt-6-astra` only to a Pro 500 seat), else plan-level knowledge, else `None`.
+    pub fn account_serves_tier(
+        &self,
+        account_id: &str,
+        plan_type: &str,
+        model: &str,
+        tier: &str,
+    ) -> Option<bool> {
+        self.catalog_tier_verdict(account_id, model, tier)
+            .or_else(|| plan_grants_tier(plan_type, tier))
+    }
+
+    fn catalog_tier_verdict(&self, account_id: &str, model: &str, tier: &str) -> Option<bool> {
+        let catalogs = self
+            .account_catalogs
+            .read()
+            .expect("per-account model catalog cache lock poisoned");
+        let entry = catalogs
+            .get(account_id)?
+            .catalog
+            .models
+            .iter()
+            .find(|candidate| candidate.slug == model)?;
+        let tiers = entry.raw.get("service_tiers")?.as_array()?;
+        Some(tiers.iter().any(|advertised| {
+            advertised
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| advertised.as_str())
+                == Some(tier)
+        }))
+    }
+
     /// Record that `account_id` just answered `model_not_found` for `model`; the pair is routed
     /// around for [`MODEL_UNAVAILABLE_TTL_SECS`] (see `unavailable_models`).
     pub fn note_model_unavailable(&self, account_id: &str, model: &str, now: i64) {
@@ -1020,6 +1102,24 @@ fn virtual_scope_etag(account_catalogs: &[AccountCatalog]) -> String {
 /// slugs are NEVER removed, even when upstream omits them. Deterministic order: floor order is
 /// preserved (with upstream's data substituted in on collision), then new upstream slugs are
 /// appended in upstream order.
+/// The gate-relevant form of a requested `service_tier`: trimmed and lowercased, or `None` for
+/// the tiers every seat can ask for — absent, `default`/`standard` (no tier), and `flex`, an API
+/// option the Codex catalog never lists.
+pub fn normalize_tier(service_tier: Option<&str>) -> Option<String> {
+    let tier = service_tier?.trim().to_ascii_lowercase();
+    (!matches!(tier.as_str(), "" | "default" | "standard" | "flex")).then_some(tier)
+}
+
+/// Plan-level knowledge of a tier, for seats whose own catalog has not been fetched: Ultrafast
+/// (GPT-6 Astra) is sold only with Pro 500 (`promax`, 2026-09-25). Every other tier is unknown
+/// at plan level — `priority` (fast mode) is on every plan's catalog and needs no rule.
+fn plan_grants_tier(plan_type: &str, tier: &str) -> Option<bool> {
+    match tier {
+        "ultrafast" => Some(plan_type.trim().eq_ignore_ascii_case("promax")),
+        _ => None,
+    }
+}
+
 pub fn merge_onto_floor(upstream: &[UpstreamModel], floor: &[UpstreamModel]) -> Vec<UpstreamModel> {
     let mut merged: Vec<UpstreamModel> = floor.to_vec();
 
@@ -1652,6 +1752,125 @@ mod tests {
     /// A hidden model — one no account's `/models` enumerates — routes ONLY to the accounts an
     /// operator/probe has declared support for. Without the declared overlay it would fail open to
     /// everyone (the case above); with it, `retain_accounts_supporting` narrows correctly.
+    /// The catalog decides: the seat whose `/models` entry lists `ultrafast` is the only one an
+    /// ultrafast turn may land on; `priority` (on every seat) narrows nothing; a tier nobody
+    /// advertises fails open (the upstream serves it at the default speed rather than refusing).
+    #[tokio::test]
+    async fn a_tier_only_one_seat_advertises_narrows_to_that_seat() {
+        fn model_with_tiers(slug: &str, tiers: &[&str]) -> UpstreamModel {
+            UpstreamModel {
+                slug: slug.to_string(),
+                display_name: slug.to_string(),
+                context_window: None,
+                prefer_websockets: None,
+                raw: serde_json::json!({
+                    "slug": slug,
+                    "service_tiers": tiers.iter().map(|t| serde_json::json!({"id": t, "name": t, "description": ""})).collect::<Vec<_>>()
+                }),
+            }
+        }
+        struct PerAccount;
+        #[async_trait]
+        impl ModelSource for PerAccount {
+            async fn fetch(&self) -> Option<FetchedCatalog> {
+                None
+            }
+            async fn fetch_scoped(&self, account_ids: &[String]) -> Option<Vec<AccountCatalog>> {
+                Some(
+                    account_ids
+                        .iter()
+                        .map(|id| AccountCatalog {
+                            account_id: id.clone(),
+                            catalog: FetchedCatalog {
+                                models: vec![model_with_tiers(
+                                    "gpt-6-astra",
+                                    if id == "pro500" {
+                                        &["priority", "ultrafast"]
+                                    } else {
+                                        &["priority"]
+                                    },
+                                )],
+                                etag: None,
+                            },
+                        })
+                        .collect(),
+                )
+            }
+        }
+        let cache = ModelCatalogCache::new(
+            Box::new(PerAccount),
+            Duration::from_secs(60),
+            default_floor(),
+        );
+        let scope = vec!["pro200".to_string(), "pro500".to_string()];
+        let _ = cache.get_or_refresh_scoped(&scope).await;
+        let snap = |id: &str| polyflare_core::AccountSnapshot::new(id);
+        let ids = |snapshots: &[polyflare_core::AccountSnapshot]| {
+            snapshots
+                .iter()
+                .map(|s| s.id.as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let mut ultrafast = vec![snap("pro200"), snap("pro500")];
+        cache.retain_accounts_serving(&mut ultrafast, "gpt-6-astra", Some(" Ultrafast "));
+        assert_eq!(ids(&ultrafast), vec!["pro500".to_string()]);
+
+        let mut priority = vec![snap("pro200"), snap("pro500")];
+        cache.retain_accounts_serving(&mut priority, "gpt-6-astra", Some("priority"));
+        assert_eq!(priority.len(), 2, "fast mode is on every seat");
+
+        for ungated in [
+            None,
+            Some("default"),
+            Some("standard"),
+            Some("flex"),
+            Some(""),
+        ] {
+            let mut all = vec![snap("pro200"), snap("pro500")];
+            cache.retain_accounts_serving(&mut all, "gpt-6-astra", ungated);
+            assert_eq!(all.len(), 2, "{ungated:?} must not narrow");
+        }
+
+        let mut unknown = vec![snap("pro200"), snap("pro500")];
+        cache.retain_accounts_serving(&mut unknown, "gpt-6-astra", Some("warp"));
+        assert_eq!(unknown.len(), 2, "a tier nobody advertises fails open");
+
+        let mut only_pro200 = vec![snap("pro200")];
+        cache.retain_accounts_serving(&mut only_pro200, "gpt-6-astra", Some("ultrafast"));
+        assert_eq!(
+            only_pro200.len(),
+            1,
+            "when the only eligible seat cannot serve the tier the pool stays whole"
+        );
+    }
+
+    /// Before any per-seat catalog is cached the plan decides: `ultrafast` goes to `promax`
+    /// seats; a fleet without one keeps every candidate.
+    #[test]
+    fn ultrafast_falls_back_to_the_pro_500_plan_when_no_catalog_is_cached() {
+        let cache = floor_only_cache(default_floor());
+        let snap = |id: &str, plan: &str| {
+            let mut s = polyflare_core::AccountSnapshot::new(id);
+            s.plan_type = plan.to_string();
+            s
+        };
+        let mut mixed = vec![snap("a", "pro"), snap("b", "promax"), snap("c", "prolite")];
+        cache.retain_accounts_serving(&mut mixed, "gpt-6-astra", Some("ultrafast"));
+        assert_eq!(
+            mixed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["b"]
+        );
+        let mut none_promax = vec![snap("a", "pro"), snap("c", "prolite")];
+        cache.retain_accounts_serving(&mut none_promax, "gpt-6-astra", Some("ultrafast"));
+        assert_eq!(none_promax.len(), 2);
+        assert_eq!(
+            cache.account_serves_tier("a", "pro", "gpt-6-astra", "priority"),
+            None,
+            "no plan rule for fast mode"
+        );
+    }
+
     #[tokio::test]
     async fn a_declared_hidden_model_routes_only_to_supporting_accounts() {
         let cache = ModelCatalogCache::new(

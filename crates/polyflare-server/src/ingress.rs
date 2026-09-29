@@ -1698,9 +1698,11 @@ fn layer2_wait_stream(
         };
         let mut fresh_snapshots =
             filter_by_provider_and_pool(&fresh_snapshots, pool_provider, pool.as_deref());
-        state
-            .model_catalog
-            .retain_accounts_supporting(&mut fresh_snapshots, &req.model);
+        state.model_catalog.retain_accounts_serving(
+            &mut fresh_snapshots,
+            &req.model,
+            prepared_service_tier(&req).as_deref(),
+        );
         state.runtime.overlay(&mut fresh_snapshots, fresh_now);
 
         let fresh = match selector.pick(&fresh_snapshots, &fresh_sel_ctx) {
@@ -1984,6 +1986,26 @@ async fn reroute_cyber_rejection(
 /// contract stays honest and any FUTURE change to the watchdog's `Err` shape can't silently
 /// reintroduce a double-relay risk without this loop's own logic changing to match.
 #[allow(clippy::too_many_arguments)]
+/// The service tier a prepared request asks for: from `body` when the request was re-shaped,
+/// else a field-only pass over `raw_body`. Only the failover and starvation paths need this —
+/// the parsed inbound facts are out of scope there — so the hot path never pays for it.
+fn prepared_service_tier(req: &PreparedRequest) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct TierOnly {
+        service_tier: Option<String>,
+    }
+    if let Some(body) = req.body.as_ref() {
+        return body
+            .get("service_tier")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+    }
+    req.raw_body
+        .as_ref()
+        .and_then(|raw| serde_json::from_slice::<TierOnly>(raw).ok())
+        .and_then(|only| only.service_tier)
+}
+
 async fn run_failover_loop(
     // B5 Task 4: widened from `&AppState` to `&Arc<AppState>` SOLELY so this function can hand an
     // owned `Arc<AppState>` (`state.clone()`) into `try_layer2_recovery_wait`'s 'static stream —
@@ -2049,9 +2071,11 @@ async fn run_failover_loop(
         let mut candidates = exclude_tried(snapshots, &tried);
         // Skip siblings flagged unavailable for this model (a live `model_not_found` moments ago),
         // while at least one candidate remains.
-        state
-            .model_catalog
-            .retain_accounts_supporting(&mut candidates, &resend_req.model);
+        state.model_catalog.retain_accounts_serving(
+            &mut candidates,
+            &resend_req.model,
+            prepared_service_tier(&resend_req).as_deref(),
+        );
         let fresh = match selector.pick(&candidates, sel_ctx) {
             Some(id) => id,
             None => 'pick: {
@@ -3276,9 +3300,11 @@ async fn responses_handler_impl_with_max_attempts(
     // M4a has no cross-format translator (that's M4b): `/responses` may only ever pick a
     // Codex-provider account. One pass also narrows to the requested pool (`None` = all accounts).
     let mut snapshots = filter_by_provider_and_pool(&snapshots, Provider::Codex, pool);
-    state
-        .model_catalog
-        .retain_accounts_supporting(&mut snapshots, &model_for_selection);
+    state.model_catalog.retain_accounts_serving(
+        &mut snapshots,
+        &model_for_selection,
+        facts.service_tier.as_deref(),
+    );
     // Overlay live per-account routing state (error_count/cooldown/last_error) onto the filtered
     // slice so the selector's eligibility gates see real failure signal, not neutral defaults.
     state.runtime.overlay(&mut snapshots, now);
@@ -4923,6 +4949,10 @@ async fn messages_handler_codex_aliased(
         &model_turn_flags(&state.model_catalog, &model_alias.target_model),
     );
     let model_for_selection = model_alias.target_model.clone();
+    let service_tier_for_selection = translated_body
+        .get("service_tier")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     let req = PreparedRequest {
         // Translated alias body is built, not a raw pass-through ⇒ serialized by the executor.
         body: Some(translated_body),
@@ -4944,9 +4974,11 @@ async fn messages_handler_codex_aliased(
     // The mirror of `/responses`'s Codex-only filter: an aliased-to-Codex turn may only ever pick
     // a Codex-provider account, regardless of what `/v1/messages` itself would otherwise select.
     let mut snapshots = filter_by_provider_and_pool(&snapshots, Provider::Codex, pool);
-    state
-        .model_catalog
-        .retain_accounts_supporting(&mut snapshots, &model_for_selection);
+    state.model_catalog.retain_accounts_serving(
+        &mut snapshots,
+        &model_for_selection,
+        service_tier_for_selection.as_deref(),
+    );
     state.runtime.overlay(&mut snapshots, now);
     let selector = state.selector_for(pool);
     let sel_ctx = SelectionCtx {

@@ -720,7 +720,11 @@ async fn relay(
         let session_id = session_id.clone();
         let relay_contract = relay_contract.clone();
         let ws_pressure = ws_pressure.clone();
-        move |current: Account, sig: FailureSignal, tried: Vec<AccountId>, model: Option<String>| {
+        move |current: Account,
+              sig: Option<FailureSignal>,
+              tried: Vec<AccountId>,
+              model: Option<String>,
+              service_tier: Option<String>| {
             let state = state.clone();
             let headers = headers.clone();
             let session_key = session_key.clone();
@@ -732,8 +736,22 @@ async fn relay(
             async move {
                 let now = unix_now();
                 let current_id = AccountId::from(current.id.as_str());
-                crate::ingress::bench_account_for_failure(&state, &current_id, Some(&sig), now)
-                    .await;
+                // A move for a service tier the seat's plan does not include is not a failure
+                // of the seat: nothing to bench.
+                if let Some(sig) = sig.as_ref() {
+                    crate::ingress::bench_account_for_failure(&state, &current_id, Some(sig), now)
+                        .await;
+                }
+                let error_code = sig
+                    .as_ref()
+                    .and_then(|sig| sig.error_code.as_deref())
+                    .unwrap_or("-")
+                    .to_string();
+                let reason = if sig.is_some() {
+                    "upstream_failure"
+                } else {
+                    "service_tier"
+                };
                 // Everything this turn has already overloaded on, current account included:
                 // the move goes forward through the fleet, never back to one it just left.
                 let mut exclude = tried;
@@ -747,6 +765,7 @@ async fn relay(
                     pool.as_deref(),
                     require_security_work_authorized,
                     model.as_deref(),
+                    service_tier.as_deref(),
                     &exclude,
                 )
                 .await;
@@ -755,8 +774,9 @@ async fn relay(
                         target: "polyflare_server::relay",
                         from_account = %current.id,
                         tried = exclude.len(),
-                        error_code = sig.error_code.as_deref().unwrap_or("-"),
-                        "upstream overload before output; no sibling account eligible, staying"
+                        reason,
+                        error_code = %error_code,
+                        "cannot move the turn before output; no sibling account eligible, staying"
                     );
                     return None;
                 };
@@ -776,8 +796,9 @@ async fn relay(
                             from_account = %current.id,
                             to_account = %to_id,
                             tried = exclude.len(),
-                            error_code = sig.error_code.as_deref().unwrap_or("-"),
-                            "upstream overload before output; moved the turn to a sibling account"
+                            reason,
+                            error_code = %error_code,
+                            "moved the turn to a sibling account before output"
                         );
                         *ws_pressure.lock().unwrap_or_else(|e| e.into_inner()) = Some(new_ws_guard);
                         Some(redial)
@@ -787,7 +808,8 @@ async fn relay(
                             target: "polyflare_server::relay",
                             from_account = %current.id,
                             to_account = %to_id,
-                            "upstream overload before output; sibling dial failed, staying"
+                            reason,
+                            "moving the turn before output; sibling dial failed, staying"
                         );
                         None
                     }

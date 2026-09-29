@@ -97,6 +97,7 @@ pub(crate) async fn resolve_owner_affine_account_with_capability(
         require_security_work_authorized,
         ReservationKind::None,
         None,
+        None,
         &[],
     )
     .await?;
@@ -116,6 +117,7 @@ pub(crate) async fn resolve_owner_affine_ws_account_with_capability(
         session_id,
         pool,
         require_security_work_authorized,
+        None,
         None,
         &[],
     )
@@ -137,6 +139,7 @@ pub(crate) async fn resolve_owner_affine_ws_account_excluding(
     pool: Option<&str>,
     require_security_work_authorized: bool,
     model: Option<&str>,
+    service_tier: Option<&str>,
     exclude: &[AccountId],
 ) -> Result<(Account, AccountId, WsSocketGuard, Option<AccountId>), Response> {
     let (account, id, reservation, spilled_from) = resolve_owner_affine_account_inner(
@@ -147,6 +150,7 @@ pub(crate) async fn resolve_owner_affine_ws_account_excluding(
         require_security_work_authorized,
         ReservationKind::OpenWs,
         model,
+        service_tier,
         exclude,
     )
     .await?;
@@ -161,6 +165,7 @@ async fn resolve_owner_affine_unary_account(
     session_key: Option<&polyflare_core::SessionKey>,
     pool: Option<&str>,
     model: Option<&str>,
+    service_tier: Option<&str>,
 ) -> Result<(Account, AccountId, InFlightGuard), Response> {
     let (account, id, lease, _spilled_from) = resolve_owner_affine_account_inner(
         state,
@@ -170,6 +175,7 @@ async fn resolve_owner_affine_unary_account(
         false,
         ReservationKind::InFlight,
         model,
+        service_tier,
         &[],
     )
     .await?;
@@ -231,6 +237,7 @@ async fn resolve_owner_affine_account_inner(
     require_security_work_authorized: bool,
     reservation_kind: ReservationKind,
     model: Option<&str>,
+    service_tier: Option<&str>,
     exclude: &[AccountId],
 ) -> Result<(Account, AccountId, OwnerReservation, Option<AccountId>), Response> {
     let now = unix_now();
@@ -246,10 +253,11 @@ async fn resolve_owner_affine_account_inner(
         snapshots.retain(|s| !exclude.contains(&s.id));
     }
     if let Some(model) = model {
-        // Fails open when NO account claims the model — see `retain_accounts_supporting`.
+        // Fails open when NO account claims the model (or the tier) — see
+        // `retain_accounts_supporting` / `retain_accounts_supporting_tier`.
         state
             .model_catalog
-            .retain_accounts_supporting(&mut snapshots, model);
+            .retain_accounts_serving(&mut snapshots, model, service_tier);
     }
     state.runtime.overlay(&mut snapshots, now);
     let selector = state.selector_for(pool);
@@ -760,6 +768,7 @@ async fn control_route(
         session_key.as_ref(),
         pool.as_deref(),
         None,
+        None,
     )
     .await
     {
@@ -1148,6 +1157,7 @@ async fn compact_route(
             session_key.as_ref(),
             pool.as_deref(),
             model.as_deref(),
+            None,
         )
         .await
         {

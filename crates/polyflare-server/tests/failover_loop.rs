@@ -61,6 +61,13 @@ fn account(id: &str, security_work_authorized: bool) -> polyflare_store::Account
     }
 }
 
+/// [`account`] on an explicit ChatGPT plan slug (`pro` = Pro 200, `promax` = Pro 500).
+fn account_on_plan(id: &str, plan_type: &str) -> polyflare_store::Account {
+    let mut account = account(id, false);
+    account.plan_type = plan_type.to_string();
+    account
+}
+
 fn tokens(access_token: &str) -> PlainTokens {
     PlainTokens {
         access_token: access_token.to_string(),
@@ -432,6 +439,64 @@ async fn a_429_fails_over_to_b_which_succeeds() {
 
 /// (b) A, B, C all 429 with the default bound (3) -> surface after EXACTLY 3 attempts, no loop
 /// past the bound.
+/// Ultrafast is sold only with Pro 500. The upstream does not refuse it on a smaller plan — it
+/// serves the turn at the default speed with no error (verified 2026-09-30) — so the gate has to
+/// be proactive: an `ultrafast` turn must never be offered to the first-eligible Pro 200 seat
+/// while a Pro 500 seat is eligible, and an ordinary turn must still land on the first seat.
+#[tokio::test]
+async fn an_ultrafast_turn_is_served_only_by_a_pro_500_seat() {
+    let (store, cipher, _dir) = spawn_store().await;
+    store
+        .accounts()
+        .insert(&account_on_plan("A", "pro"), &tokens("tokA"), &cipher)
+        .await
+        .unwrap();
+    store
+        .accounts()
+        .insert(&account_on_plan("B", "promax"), &tokens("tokB"), &cipher)
+        .await
+        .unwrap();
+    let exec = Arc::new(FailoverStubExecutor::new());
+    exec.script(
+        "A",
+        vec![AttemptBehavior::Success, AttemptBehavior::Success],
+    );
+    exec.script(
+        "B",
+        vec![AttemptBehavior::Success, AttemptBehavior::Success],
+    );
+    let state = build_state(store, cipher, exec.clone());
+    let pf = spawn_app(state).await;
+    let client = reqwest::Client::new();
+
+    // An ordinary turn lands on the first-eligible seat, the Pro 200 one.
+    let resp = client
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "m", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    drain(resp).await;
+    assert_eq!(exec.calls(), vec!["A".to_string()]);
+
+    // The ultrafast turn from the same client skips that seat — first-eligible or not — for
+    // the Pro 500 seat.
+    let resp = client
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "m", "service_tier": "ultrafast", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    drain(resp).await;
+    assert_eq!(
+        exec.calls(),
+        vec!["A".to_string(), "B".to_string()],
+        "the Pro 200 seat never sees the ultrafast turn"
+    );
+}
+
 #[tokio::test]
 async fn all_429_surfaces_after_exactly_three_attempts() {
     let (store, cipher, _dir) = spawn_store().await;

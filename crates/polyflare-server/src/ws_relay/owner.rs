@@ -109,6 +109,27 @@ pub(crate) async fn resolve_owner(
 /// that turn — so the turn (or the client's full resend) lands on a DIFFERENT eligible account
 /// and never bounces back to one it just left. `Err(NoEligibleAccount)` when no other account
 /// is eligible — the caller then keeps its same-account behaviour.
+/// Whether the seat currently serving a connection can serve `model` at `service_tier`, by the
+/// catalog-then-plan rule of `ModelCatalogCache::account_serves_tier`. `None` when nothing is
+/// known (or the tier is one every seat can ask for), so the caller leaves the turn where it is.
+pub(crate) async fn seat_serves_tier(
+    state: &AppState,
+    account_id: &str,
+    model: &str,
+    service_tier: &str,
+) -> Option<bool> {
+    let tier = crate::model_catalog::normalize_tier(Some(service_tier))?;
+    let snapshots = state.account_cache.snapshots(&state.store).await.ok()?;
+    let plan_type = snapshots
+        .iter()
+        .find(|snapshot| snapshot.id.as_str() == account_id)
+        .map(|snapshot| snapshot.plan_type.clone())
+        .unwrap_or_default();
+    state
+        .model_catalog
+        .account_serves_tier(account_id, &plan_type, model, &tier)
+}
+
 pub(crate) async fn resolve_owner_excluding(
     state: &AppState,
     session_key: &SessionKey,
@@ -116,6 +137,7 @@ pub(crate) async fn resolve_owner_excluding(
     pool: Option<&str>,
     require_security_work_authorized: bool,
     model: Option<&str>,
+    service_tier: Option<&str>,
     exclude: &[polyflare_core::AccountId],
 ) -> Result<(Account, WsSocketGuard), RelayError> {
     // The mid-turn move is a DELIBERATE owner-mover (the account failed while serving this
@@ -128,6 +150,7 @@ pub(crate) async fn resolve_owner_excluding(
         pool,
         require_security_work_authorized,
         model,
+        service_tier,
         exclude,
     )
     .await

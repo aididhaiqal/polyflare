@@ -553,7 +553,7 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
     Fut: Future<Output = ()>,
     G: Fn(Account, FailureSignal) -> GFut,
     GFut: Future<Output = Option<(Account, WsConn)>>,
-    M: Fn(Account, FailureSignal, Vec<AccountId>, Option<String>) -> MFut,
+    M: Fn(Account, Option<FailureSignal>, Vec<AccountId>, Option<String>, Option<String>) -> MFut,
     MFut: Future<Output = Option<(Account, WsConn)>>,
     H: Fn(Account) -> HFut,
     HFut: Future<Output = Option<(Account, WsConn)>>,
@@ -737,6 +737,36 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                             }
                             logical_turn_key =
                                 next_turn.logical_turn_key().map(str::to_owned);
+                            // A tier this seat's plan does not include (Ultrafast is Pro 500
+                            // only) must move BEFORE the frame is sent: the upstream serves such
+                            // a turn at the default speed with no error, so nothing downstream
+                            // of the send could ever trigger the reactive rungs.
+                            let turn_model = next_turn.model().map(str::to_owned);
+                            let turn_tier = next_turn.requested_service_tier().map(str::to_owned);
+                            if let (Some(model), Some(tier)) =
+                                (turn_model.as_deref(), turn_tier.as_deref())
+                            {
+                                if super::owner::seat_serves_tier(&state, &account.id, model, tier)
+                                    .await
+                                    == Some(false)
+                                {
+                                    if let Some((new_account, new_upstream)) = on_overload_move(
+                                        account.clone(),
+                                        None,
+                                        Vec::new(),
+                                        turn_model.clone(),
+                                        turn_tier.clone(),
+                                    )
+                                    .await
+                                    {
+                                        relay_metrics.record("tier_move_cross_account");
+                                        account = new_account;
+                                        upstream = Some(new_upstream);
+                                        upstream_since = tokio::time::Instant::now();
+                                        account_changed_since_completed = true;
+                                    }
+                                }
+                            }
                             if !next_turn
                                 .track_in_flight(
                                     &state,
@@ -1336,6 +1366,10 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                     .as_ref()
                                     .and_then(WsTurnTelemetry::model)
                                     .map(str::to_string);
+                                let turn_tier = turn_telemetry
+                                    .as_ref()
+                                    .and_then(WsTurnTelemetry::requested_service_tier)
+                                    .map(str::to_string);
                                 if model_missing {
                                     if let Some(model) = turn_model.as_deref() {
                                         state.model_catalog.note_model_unavailable(
@@ -1381,9 +1415,10 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                         if let Some((new_account, mut new_upstream)) =
                                             on_overload_move(
                                                 account.clone(),
-                                                sig.clone(),
+                                                Some(sig.clone()),
                                                 overload_tried_for_turn.clone(),
                                                 turn_model.clone(),
+                                                turn_tier.clone(),
                                             )
                                             .await
                                         {

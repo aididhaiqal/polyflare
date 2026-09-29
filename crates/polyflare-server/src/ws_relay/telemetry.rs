@@ -170,6 +170,11 @@ impl WsTurnTelemetry {
         self.model.as_deref()
     }
 
+    /// The tier this turn asks of the upstream after the priority policy had its say.
+    pub(crate) fn requested_service_tier(&self) -> Option<&str> {
+        self.requested_service_tier.as_deref()
+    }
+
     pub(crate) fn logical_turn_key(&self) -> Option<&str> {
         self.log_request
             .then_some(self.logical_turn_key.as_deref())
