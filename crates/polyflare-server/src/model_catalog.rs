@@ -1008,12 +1008,12 @@ fn build_available_scoped_catalog(account_catalogs: Vec<AccountCatalog>) -> Opti
     }
     let mut account_catalogs = account_catalogs;
     account_catalogs.sort_by(|a, b| a.account_id.cmp(&b.account_id));
-    let mut seen: HashSet<&str> = HashSet::new();
     let mut models: Vec<UpstreamModel> = Vec::new();
     for account in &account_catalogs {
         for model in &account.catalog.models {
-            if seen.insert(model.slug.as_str()) {
-                models.push(model.clone());
+            match models.iter_mut().find(|kept| kept.slug == model.slug) {
+                Some(kept) => merge_model_capabilities(kept, model),
+                None => models.push(model.clone()),
             }
         }
     }
@@ -1056,12 +1056,12 @@ fn build_scoped_catalog(
     // set downstream, route each model to the accounts that have it". A model only one account has
     // now depends on that account's availability, which is the correct consequence of routing it
     // only there.
-    let mut seen: HashSet<&str> = HashSet::new();
     let mut models: Vec<UpstreamModel> = Vec::new();
     for account in &account_catalogs {
         for model in &account.catalog.models {
-            if seen.insert(model.slug.as_str()) {
-                models.push(model.clone());
+            match models.iter_mut().find(|kept| kept.slug == model.slug) {
+                Some(kept) => merge_model_capabilities(kept, model),
+                None => models.push(model.clone()),
             }
         }
     }
@@ -1071,6 +1071,48 @@ fn build_scoped_catalog(
         etag: Some(virtual_scope_etag(&account_catalogs)),
         models,
     })
+}
+
+/// Fold a second seat's entry for the same slug into the kept one. A scoped catalog is the union
+/// of what ANY member seat can serve, and the seats differ in more than which slugs they list:
+/// the Pro 500 seat's `gpt-6-astra` entry advertises `service_tiers` `priority` + `ultrafast`
+/// while every other plan's lists `priority` alone. Keeping the first seat's entry verbatim hid
+/// Ultrafast from every client whenever a smaller-plan seat sorted first (2026-09-30), so the
+/// tier-bearing arrays are unioned — by `id` for `service_tiers`, by value for
+/// `additional_speed_tiers` — in first-seen order. Everything else stays the first seat's.
+fn merge_model_capabilities(kept: &mut UpstreamModel, other: &UpstreamModel) {
+    let Some(kept_obj) = kept.raw.as_object_mut() else {
+        return;
+    };
+    for key in ["service_tiers", "additional_speed_tiers"] {
+        let Some(extra) = other.raw.get(key).and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        let identity = |value: &serde_json::Value| {
+            value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| value.as_str())
+                .map(str::to_string)
+        };
+        let merged = kept_obj
+            .entry(key)
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        let Some(merged) = merged.as_array_mut() else {
+            continue;
+        };
+        for value in extra {
+            let Some(id) = identity(value) else {
+                continue;
+            };
+            if !merged
+                .iter()
+                .any(|have| identity(have).as_deref() == Some(id.as_str()))
+            {
+                merged.push(value.clone());
+            }
+        }
+    }
 }
 
 fn virtual_scope_etag(account_catalogs: &[AccountCatalog]) -> String {
@@ -1752,6 +1794,79 @@ mod tests {
     /// A hidden model — one no account's `/models` enumerates — routes ONLY to the accounts an
     /// operator/probe has declared support for. Without the declared overlay it would fail open to
     /// everyone (the case above); with it, `retain_accounts_supporting` narrows correctly.
+    /// The union a client sees must advertise every tier ANY member seat serves: with a Pro 200
+    /// seat sorting first, its `priority`-only astra entry used to win and Ultrafast never
+    /// reached the client's speed picker.
+    #[tokio::test]
+    async fn the_scoped_union_advertises_every_tier_any_seat_serves() {
+        fn astra(tiers: &[&str], speeds: &[&str]) -> UpstreamModel {
+            UpstreamModel {
+                slug: "gpt-6-astra".to_string(),
+                display_name: "Astra".to_string(),
+                context_window: None,
+                prefer_websockets: None,
+                raw: serde_json::json!({
+                    "slug": "gpt-6-astra",
+                    "supported_reasoning_levels": [],
+                    "service_tiers": tiers.iter().map(|t| serde_json::json!({"id": t, "name": t, "description": ""})).collect::<Vec<_>>(),
+                    "additional_speed_tiers": speeds,
+                }),
+            }
+        }
+        struct PerAccount;
+        #[async_trait]
+        impl ModelSource for PerAccount {
+            async fn fetch(&self) -> Option<FetchedCatalog> {
+                None
+            }
+            async fn fetch_scoped(&self, account_ids: &[String]) -> Option<Vec<AccountCatalog>> {
+                Some(
+                    account_ids
+                        .iter()
+                        .map(|id| AccountCatalog {
+                            account_id: id.clone(),
+                            catalog: FetchedCatalog {
+                                models: vec![if id == "b-pro500" {
+                                    astra(&["priority", "ultrafast"], &["fast", "ultrafast"])
+                                } else {
+                                    astra(&["priority"], &["fast"])
+                                }],
+                                etag: None,
+                            },
+                        })
+                        .collect(),
+                )
+            }
+        }
+        let cache = ModelCatalogCache::new(
+            Box::new(PerAccount),
+            Duration::from_secs(60),
+            default_floor(),
+        );
+        // "a-pro200" sorts first, so its entry is the one kept — and it must be folded, not
+        // the Pro 500 seat's dropped.
+        let scoped = cache
+            .get_or_refresh_scoped(&["a-pro200".to_string(), "b-pro500".to_string()])
+            .await;
+        let astra_entry = scoped
+            .models
+            .iter()
+            .find(|m| m.slug == "gpt-6-astra")
+            .expect("astra in the union");
+        let tier_ids: Vec<&str> = astra_entry.raw["service_tiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(tier_ids, vec!["priority", "ultrafast"]);
+        assert_eq!(
+            astra_entry.raw["additional_speed_tiers"],
+            serde_json::json!(["fast", "ultrafast"])
+        );
+        assert_eq!(scoped.models.len(), 1, "still one entry per slug");
+    }
+
     /// The catalog decides: the seat whose `/models` entry lists `ultrafast` is the only one an
     /// ultrafast turn may land on; `priority` (on every seat) narrows nothing; a tier nobody
     /// advertises fails open (the upstream serves it at the default speed rather than refusing).
