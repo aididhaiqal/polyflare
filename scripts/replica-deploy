@@ -1,0 +1,19 @@
+#!/bin/zsh
+# Replica deploy (this machine): swap ~/.local/bin/polyflare atomically from target/release, restart
+# the launchd service only when the replica is idle, and make sure the new instance actually comes
+# up — launchd has answered the first kickstart after a swap with "job state = spawn failed" twice
+# (2026-09-30 14:46 and 16:42); a second kickstart brought it straight back both times.
+set -u
+BIN=${1:-target/release/polyflare}
+[ -x "$BIN" ] || { echo "no binary at $BIN"; exit 1; }
+N=$(sqlite3 ~/.polyflare/store.db "SELECT COUNT(*) FROM request_log WHERE requested_at > strftime('%s','now')-120")
+if [ "$N" != "0" ]; then echo "replica served $N requests in the last 120 s; not restarting"; exit 2; fi
+cp "$BIN" ~/.local/bin/polyflare.new && mv -f ~/.local/bin/polyflare.new ~/.local/bin/polyflare && echo "replica binary swapped"
+probe() { curl -s -o /dev/null -w '%{http_code}' -m 5 http://127.0.0.1:8080/v1/models; }
+for attempt in 1 2 3; do
+  launchctl kickstart -k gui/$(id -u)/com.polyflare.server && echo "kickstart #$attempt"
+  for i in {1..12}; do code=$(probe); [ "$code" = "200" ] && break; sleep 3; done
+  if [ "$code" = "200" ]; then echo "replica /v1/models HTTP 200 (pid $(pgrep -f 'polyflare serve' | head -1))"; exit 0; fi
+  echo "replica not answering after kickstart #$attempt: $(launchctl print gui/$(id -u)/com.polyflare.server 2>/dev/null | grep -E 'job state|state =' | head -2 | tr -s ' ' | paste -sd';' -)"
+done
+echo "replica did not come back after 3 kickstarts"; exit 3
