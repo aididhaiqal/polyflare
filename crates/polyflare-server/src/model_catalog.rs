@@ -500,13 +500,19 @@ impl ModelCatalogCache {
                     build_available_scoped_catalog(account_catalogs)
                         .map(|catalog| (catalog, oldest_fetch))
                 });
-        if let Some((catalog, oldest_fetch)) = available_projection {
+        if let Some((catalog, _oldest_fetch)) = available_projection {
             warn!(
                 account_count = scope.len(),
                 partial_model_count = catalog.models.len(),
                 "strict scoped catalog unavailable and no stale projection; serving the \
                  available-members union instead of the floor"
             );
+            // A PARTIAL projection is missing whatever only the absent seats can serve — on
+            // 2026-09-30 the Pro 500 seat's fetch got a 503 at warmup and the union served for
+            // the whole TTL had no Ultrafast on Astra although the seat was active the entire
+            // time. So it is cached only until the failed seats may be retried, not for the
+            // full TTL: the next `/models` after that re-fetches the missing members and, once
+            // they answer, the strict projection replaces this one.
             self.scoped
                 .write()
                 .expect("model catalog scoped cache lock poisoned")
@@ -515,7 +521,7 @@ impl ModelCatalogCache {
                     Cached {
                         models: catalog.models.clone(),
                         etag: catalog.etag.clone(),
-                        fetched_at: oldest_fetch,
+                        fetched_at: self.partial_projection_fetched_at(),
                     },
                 );
             return catalog;
@@ -944,6 +950,14 @@ impl ModelCatalogCache {
         self.ttl
             .min(Duration::from_secs(30))
             .max(Duration::from_millis(10))
+    }
+
+    /// The `fetched_at` a partial (available-members) projection is cached with: backdated so
+    /// it expires after [`Self::failed_refresh_retry_delay`] instead of the full TTL.
+    fn partial_projection_fetched_at(&self) -> Instant {
+        let now = Instant::now();
+        let early_by = self.ttl.saturating_sub(self.failed_refresh_retry_delay());
+        now.checked_sub(early_by).unwrap_or(now)
     }
 
     fn fresh_account_catalogs(&self, scope: &[String]) -> Option<(Vec<AccountCatalog>, Instant)> {
@@ -1794,6 +1808,109 @@ mod tests {
     /// A hidden model — one no account's `/models` enumerates — routes ONLY to the accounts an
     /// operator/probe has declared support for. Without the declared overlay it would fail open to
     /// everyone (the case above); with it, `retain_accounts_supporting` narrows correctly.
+    /// A seat whose catalog fetch fails (a 503 at warmup, 2026-09-30) must not have its tiers
+    /// missing from the union for the whole TTL: the partial projection expires after the
+    /// failed-fetch retry delay, and the first refresh after that folds the seat back in.
+    #[tokio::test]
+    async fn a_partial_projection_is_retried_after_the_failed_fetch_delay_not_the_full_ttl() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        fn astra(tiers: &[&str]) -> UpstreamModel {
+            UpstreamModel {
+                slug: "gpt-6-astra".to_string(),
+                display_name: "Astra".to_string(),
+                context_window: None,
+                prefer_websockets: None,
+                raw: serde_json::json!({
+                    "slug": "gpt-6-astra",
+                    "supported_reasoning_levels": [],
+                    "service_tiers": tiers.iter().map(|t| serde_json::json!({"id": t})).collect::<Vec<_>>(),
+                }),
+            }
+        }
+        /// The Pro 500 seat fails its first fetch (503) and answers from the second on.
+        struct FlakyPro500(AtomicUsize);
+        #[async_trait]
+        impl ModelSource for FlakyPro500 {
+            async fn fetch(&self) -> Option<FetchedCatalog> {
+                None
+            }
+            async fn fetch_scoped(&self, account_ids: &[String]) -> Option<Vec<AccountCatalog>> {
+                let call = self.0.fetch_add(1, Ordering::SeqCst);
+                Some(
+                    account_ids
+                        .iter()
+                        .filter(|id| !(id.as_str() == "b-pro500" && call == 0))
+                        .map(|id| AccountCatalog {
+                            account_id: id.clone(),
+                            catalog: FetchedCatalog {
+                                models: vec![if id == "b-pro500" {
+                                    astra(&["priority", "ultrafast"])
+                                } else {
+                                    astra(&["priority"])
+                                }],
+                                etag: None,
+                            },
+                        })
+                        .collect(),
+                )
+            }
+        }
+        let ttl = Duration::from_secs(3600);
+        let cache = ModelCatalogCache::new(
+            Box::new(FlakyPro500(AtomicUsize::new(0))),
+            ttl,
+            default_floor(),
+        );
+        let scope = vec!["a-pro200".to_string(), "b-pro500".to_string()];
+        let tiers = |scoped: &ScopedCatalog| {
+            scoped
+                .models
+                .iter()
+                .find(|m| m.slug == "gpt-6-astra")
+                .map(|m| {
+                    m.raw["service_tiers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|t| t["id"].as_str().unwrap().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        let partial = cache.get_or_refresh_scoped(&scope).await;
+        assert_eq!(
+            tiers(&partial),
+            vec!["priority"],
+            "the seat's fetch failed: partial union"
+        );
+        let remaining = {
+            let guard = cache.scoped.read().unwrap();
+            let cached = guard.get(&scope).expect("partial projection cached");
+            ttl.saturating_sub(cached.fetched_at.elapsed())
+        };
+        assert!(
+            remaining <= cache.failed_refresh_retry_delay(),
+            "a partial projection must expire with the retry delay, not the TTL: {remaining:?}"
+        );
+
+        // Simulate the retry window elapsing: expire the partial projection and the seat's
+        // negative-cache entry, then the next request re-fetches the missing seat.
+        {
+            let mut guard = cache.scoped.write().unwrap();
+            if let Some(cached) = guard.get_mut(&scope) {
+                cached.fetched_at = Instant::now() - ttl;
+            }
+            cache.account_retry_after.write().unwrap().clear();
+        }
+        let strict = cache.get_or_refresh_scoped(&scope).await;
+        assert_eq!(
+            tiers(&strict),
+            vec!["priority", "ultrafast"],
+            "once the seat answers, its tiers are back in the union"
+        );
+    }
+
     /// The union a client sees must advertise every tier ANY member seat serves: with a Pro 200
     /// seat sorting first, its `priority`-only astra entry used to win and Ultrafast never
     /// reached the client's speed picker.
