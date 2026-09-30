@@ -2195,6 +2195,87 @@ mod relay_through {
         );
     }
 
+    /// 2026-09-30: the upstream emits a `response.metadata` frame right after the prelude and,
+    /// on a shed seat, right before the `server_is_overloaded` envelope. That frame must not
+    /// count as visible output, or the relay forwards the refusal instead of moving the turn.
+    #[tokio::test]
+    async fn an_overload_after_a_response_metadata_frame_is_still_retried_out_of_sight() {
+        let mock = MockWsUpstream::scripted(vec![
+            ScriptedTurn::ErrorAfterEvents {
+                events: vec![
+                    r#"{"type":"response.created","response":{"id":"resp_a"}}"#.to_string(),
+                    r#"{"type":"response.in_progress","response":{"id":"resp_a"}}"#.to_string(),
+                    r#"{"type":"response.metadata","response":{"id":"resp_a","routing":{"tier":"default"}}}"#.to_string(),
+                ],
+                status: 503,
+                code: "server_is_overloaded".to_string(),
+                message: "do not leak this".to_string(),
+            },
+            ScriptedTurn::normal(Vec::new()),
+        ])
+        .capturing_raw_frames();
+        let mock_base = mock.clone().spawn().await;
+        let (base, state) = spawn_with_two_accounts("acct-meta-a", "acct-meta-b", &mock_base).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/responses"))
+            .await
+            .expect("downstream WS handshake");
+        let frame = r#"{"type":"response.create","model":"gpt-6-astra","input":[{"role":"user","content":"a"}],"client_metadata":{"turn_id":"t-meta"}}"#.to_string();
+        ws.send(TMessage::Text(frame.clone().into())).await.unwrap();
+
+        // The relay forwards the owner's prelude as it arrives, so drain to the terminal frame:
+        // it must be the sibling's clean completion, and the refusal text must never appear.
+        let mut seen: Vec<String> = Vec::new();
+        let terminal = loop {
+            let TMessage::Text(reply) = tokio::time::timeout(Duration::from_secs(10), ws.next())
+                .await
+                .expect("a reply")
+                .expect("frame")
+                .expect("no WS error")
+            else {
+                panic!("expected a text frame");
+            };
+            let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+            let ty = reply["type"].as_str().unwrap_or("").to_string();
+            seen.push(reply.to_string());
+            if matches!(
+                ty.as_str(),
+                "response.completed" | "response.failed" | "error" | "response.incomplete"
+            ) {
+                break reply;
+            }
+        };
+        assert_eq!(
+            terminal["type"], "response.completed",
+            "the refusal after the metadata frame must be hidden behind the move: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|f| f.contains("do not leak this")),
+            "the refusal text must never reach the client: {seen:?}"
+        );
+        assert_eq!(
+            mock.raw_frames(),
+            vec![frame.clone(), frame],
+            "one refused attempt, one hidden retry — the client never had to resend"
+        );
+        // The capacity ladder's first rung is a same-account replay; a cross-account move is the
+        // second. Either is fine here — what matters is that a rung ran at all, which it cannot
+        // once the metadata frame is mistaken for visible output.
+        let snapshot = state.relay_metrics.snapshot();
+        let count = |k: &str| {
+            snapshot
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| *v)
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            count("capacity_replay_same_socket") + count("overload_move_cross_account"),
+            1,
+            "{snapshot:?}"
+        );
+    }
+
     #[tokio::test]
     async fn an_overload_walks_forward_through_the_fleet_never_back_to_a_tried_account() {
         // Rung 1 (the same-socket replay) consumes the first refusal; the second is what

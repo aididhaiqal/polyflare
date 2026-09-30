@@ -1304,9 +1304,13 @@ pub fn is_transient_capacity_refusal(err: &WatchdogError) -> bool {
 /// 11:28 on master: `keepalive`, which no fixture contained, closed the scan and the capacity
 /// envelope behind it was relayed as content).
 fn is_non_output_frame_type(ty: &str) -> bool {
+    // `response.metadata` (2026-09-30): a ~1.8 KB per-response bookkeeping frame the upstream now
+    // emits right after the prelude — and, on a shed seat, immediately BEFORE the
+    // `server_is_overloaded` envelope. Treating it as output committed the stream, relayed the
+    // refusal as content, and left a session pinned to that seat retrying into the same wall.
     matches!(
         ty,
-        "response.created" | "response.in_progress" | "keepalive" | "ping"
+        "response.created" | "response.in_progress" | "response.metadata" | "keepalive" | "ping"
     ) || ty.starts_with("codex.")
 }
 
@@ -2429,6 +2433,28 @@ mod tests {
             scan_buffered_frames(buf.as_bytes()),
             Some(ScanVerdict::Capacity("server_is_overloaded".into()))
         );
+    }
+
+    /// 2026-09-30 16:12–16:33: eight turns on one seat went created → in_progress → keepalive →
+    /// `response.metadata` → `server_is_overloaded`; the metadata frame closed the scan and the
+    /// refusal reached the client eight times in a row.
+    #[test]
+    fn scan_keeps_scanning_past_a_response_metadata_frame() {
+        let buf = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n",
+            "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"r\"}}\n\n",
+            "data: {\"type\":\"keepalive\"}\n\n",
+            "data: {\"type\":\"response.metadata\",\"response\":{\"id\":\"r\",\"routing\":{}}}\n\n",
+        );
+        assert_eq!(scan_buffered_frames(buf.as_bytes()), None);
+        let buf = format!(
+            "{buf}data: {{\"type\":\"error\",\"error\":{{\"code\":\"server_is_overloaded\"}}}}\n\n"
+        );
+        assert_eq!(
+            scan_buffered_frames(buf.as_bytes()),
+            Some(ScanVerdict::Capacity("server_is_overloaded".into()))
+        );
+        assert!(is_non_output_frame_type("response.metadata"));
     }
 
     #[test]

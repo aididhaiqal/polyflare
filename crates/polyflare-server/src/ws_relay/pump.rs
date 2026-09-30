@@ -2108,7 +2108,10 @@ fn is_non_output_frame(frame: &str) -> bool {
     // after a metadata frame can only re-deliver metadata, which the client overwrites as state —
     // the same argument that already makes a repeated `response.created` safe.
     frame_type.starts_with("codex.")
-        || matches!(frame_type, "response.created" | "response.in_progress")
+        || matches!(
+            frame_type,
+            "response.created" | "response.in_progress" | "response.metadata"
+        )
 }
 
 /// Whether `frame` is a lifecycle PRELUDE — the `response.created` / `response.in_progress` pair

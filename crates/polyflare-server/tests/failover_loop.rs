@@ -123,6 +123,10 @@ enum AttemptBehavior {
     /// (`codex.rate_limits`), then seconds later the capacity envelope. The metadata frame ended the
     /// scan as "decisive", the handler returned, and the refusal was relayed as content.
     AcceptedThenMetadataThenCapacityEnvelope,
+    /// The 2026-09-30 shape: prelude, a keepalive, the upstream's own `response.metadata` frame,
+    /// then the capacity envelope. `response.metadata` is not in the `codex.` namespace, so it
+    /// needs its own place in the non-output rule.
+    AcceptedThenResponseMetadataThenCapacityEnvelope,
     /// 2026-09-18 07:04 / 07:14: the prelude frames echo the whole request (62 KB each for a
     /// 158-item thread), so together they crossed the scan's old 64 KB cap and the envelope behind
     /// them was relayed as content.
@@ -281,6 +285,25 @@ impl Executor for FailoverStubExecutor {
                 Ok(ResponseStream::new(stream::iter(vec![
                     Ok::<Bytes, ExecError>(Bytes::from(format!("data: {created}\n\n"))),
                     Ok(Bytes::from(format!("data: {in_progress}\n\n"))),
+                    Ok(Bytes::from(format!("data: {metadata}\n\n"))),
+                    Ok(Bytes::from(format!("data: {envelope}\n\n"))),
+                ])))
+            }
+            AttemptBehavior::AcceptedThenResponseMetadataThenCapacityEnvelope => {
+                let id = format!("resp_{}", account.id);
+                let created =
+                    format!(r#"{{"type":"response.created","response":{{"id":"{id}"}}}}"#);
+                let in_progress =
+                    format!(r#"{{"type":"response.in_progress","response":{{"id":"{id}"}}}}"#);
+                let keepalive = r#"{"type":"keepalive"}"#;
+                let metadata = format!(
+                    r#"{{"type":"response.metadata","response":{{"id":"{id}","routing":{{"tier":"default"}}}}}}"#
+                );
+                let envelope = r#"{"type":"error","error":{"code":"server_is_overloaded","message":"do not leak this"}}"#;
+                Ok(ResponseStream::new(stream::iter(vec![
+                    Ok::<Bytes, ExecError>(Bytes::from(format!("data: {created}\n\n"))),
+                    Ok(Bytes::from(format!("data: {in_progress}\n\n"))),
+                    Ok(Bytes::from(format!("data: {keepalive}\n\n"))),
                     Ok(Bytes::from(format!("data: {metadata}\n\n"))),
                     Ok(Bytes::from(format!("data: {envelope}\n\n"))),
                 ])))
@@ -683,6 +706,49 @@ async fn an_accepted_capacity_envelope_on_sse_fails_over_before_any_byte_is_rela
         body.matches("response.created").count(),
         1,
         "one lifecycle: {body}"
+    );
+    assert_eq!(exec.calls(), vec!["A".to_string(), "B".to_string()]);
+}
+
+/// The upstream's `response.metadata` frame between the prelude and the refusal must not close
+/// the scan either (2026-09-30: it did, eight times in twenty minutes on one pinned session).
+#[tokio::test]
+async fn a_capacity_envelope_after_response_metadata_still_fails_over_before_any_byte_is_relayed() {
+    let (store, cipher, _dir) = spawn_store().await;
+    store
+        .accounts()
+        .insert(&account("A", false), &tokens("tokA"), &cipher)
+        .await
+        .unwrap();
+    store
+        .accounts()
+        .insert(&account("B", false), &tokens("tokB"), &cipher)
+        .await
+        .unwrap();
+    let exec = Arc::new(FailoverStubExecutor::new());
+    exec.script(
+        "A",
+        vec![AttemptBehavior::AcceptedThenResponseMetadataThenCapacityEnvelope],
+    );
+    exec.script("B", vec![AttemptBehavior::Success]);
+    let state = build_state(store, cipher, exec.clone());
+    let pf = spawn_app(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{pf}/responses"))
+        .json(&serde_json::json!({"model": "m", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the client gets B's clean stream");
+    let body = drain(resp).await;
+    assert!(
+        body.contains("response.completed") && body.contains("resp_B"),
+        "B's clean completion relayed: {body}"
+    );
+    assert!(
+        !body.contains("server_is_overloaded") && !body.contains("do not leak this"),
+        "the refusal must never reach the client: {body}"
     );
     assert_eq!(exec.calls(), vec!["A".to_string(), "B".to_string()]);
 }

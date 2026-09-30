@@ -197,7 +197,11 @@ impl TraceTurn {
             && !is_delta
             && !matches!(
                 ty,
-                "response.created" | "response.in_progress" | "keepalive" | "ping"
+                "response.created"
+                    | "response.in_progress"
+                    | "response.metadata"
+                    | "keepalive"
+                    | "ping"
             )
             && !ty.starts_with("codex.")
         {
