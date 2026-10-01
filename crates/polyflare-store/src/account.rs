@@ -343,11 +343,11 @@ async fn unique_account_row_id(
 /// upstream account id (2026-09-15: a second team member's login replaced the first member's
 /// seat). Matched loosely: upstream has shipped several spellings and an unknown plan must not
 /// silently become "personal" for a workspace that is not.
-/// One account's purchasable-credit balance as the usage poll last reported it.
+/// One account's plan-credit balance as the usage poll last reported it.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct AccountCredits {
     pub account_id: String,
-    /// USD.
+    /// In the plan's credit unit, not USD (a Pro 200 week starts at 62,500).
     pub balance: f64,
     pub has_credits: bool,
     pub unlimited: bool,

@@ -208,12 +208,14 @@ export function billingLabel(
 // @check billingLabel({ active_until: 1_793_243_736, last_checked: 1_790_651_761 }, 1_790_800_000_000)?.value === "Renews 29 Oct"
 // @check billingLabel(null, 1_790_800_000_000) === null
 
-/** A USD amount for the accounts list: cents under $100, whole dollars with separators above
- * (`usd(12.5) === "$12.50"`, `usd(1234) === "$1,234"`, `usd(0) === "$0.00"`). */
-export function usd(amount: number): string {
+/** A plan-credit balance for the accounts list. The usage endpoint's `credits.balance` is in the
+ * plan's own credit unit (a Pro 200 week starts at 62,500; an Ultrafast turn burns thousands),
+ * NOT dollars — so no currency sign, whole credits with separators, decimals only below 100
+ * (`credits(62500) === "62,500"`, `credits(12.5) === "12.5"`, `credits(0) === "0"`). */
+export function credits(amount: number): string {
   if (!Number.isFinite(amount)) return "—";
-  if (Math.abs(amount) >= 100) return `$${Math.round(amount).toLocaleString("en-US")}`;
-  return `$${amount.toFixed(2)}`;
+  if (Math.abs(amount) >= 100) return Math.round(amount).toLocaleString("en-US");
+  return Number(amount.toFixed(1)).toString();
 }
-// @check usd(12.5) === "$12.50"
-// @check usd(1234) === "$1,234"
+// @check credits(62500) === "62,500"
+// @check credits(12.5) === "12.5"

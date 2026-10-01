@@ -149,7 +149,8 @@ export interface AccountView {
   credits: CreditsView | null;
 }
 
-/** `read_api.rs::CreditsView` — `AccountView.credits`. `balance` is USD. */
+/** `read_api.rs::CreditsView` — `AccountView.credits`. `balance` is in the plan's credit unit (a
+ * Pro 200 week starts at 62,500), not dollars. */
 export interface CreditsView {
   balance: number;
   has_credits: boolean;

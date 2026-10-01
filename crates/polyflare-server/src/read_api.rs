@@ -150,15 +150,17 @@ struct AccountView {
     /// or the soft-drain tier after upstream errors. 2026-09-15: a degraded account was moved
     /// away from turn after turn while the dashboard showed it as plain "active".
     routing: RoutingHealthView,
-    /// Purchasable-credit balance from the last usage poll; `None` until the first poll reports
-    /// one (Anthropic seats never do).
+    /// Plan-credit balance from the last usage poll; `None` until the first poll reports one
+    /// (Anthropic seats never do).
     credits: Option<CreditsView>,
 }
 
-/// `AccountView::credits`: the seat's purchasable credits as `/wham/usage` last reported them.
+/// `AccountView::credits`: the seat's plan credits as `/wham/usage` last reported them. The
+/// balance is in the plan's own credit unit (a Pro 200 week starts at 62,500; an Ultrafast turn
+/// burns thousands), not dollars.
 #[derive(Serialize)]
 struct CreditsView {
-    /// USD.
+    /// Plan credits, not USD.
     balance: f64,
     has_credits: bool,
     unlimited: bool,

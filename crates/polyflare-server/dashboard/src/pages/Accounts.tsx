@@ -39,7 +39,7 @@ import type {
   WindowView,
 } from "../lib/api";
 import { accountLabel } from "../lib/accountDisplay";
-import { compactNum, countdown, pct, planLabel, usd } from "../lib/format";
+import { compactNum, countdown, credits, pct, planLabel } from "../lib/format";
 import {
   quotaDisplayLabel,
   quotaDisplayPercent,
@@ -604,7 +604,7 @@ function AccountCard({
               <>
                 {" · "}
                 <span className={clsx("font-medium text-fg", a.credits.has_credits ? "opacity-90" : "opacity-50")}>
-                  {a.credits.unlimited ? "unlimited credits" : `${usd(a.credits.balance)} credits`}
+                  {a.credits.unlimited ? "unlimited credits" : `${credits(a.credits.balance)} credits`}
                 </span>
               </>
             )}
@@ -907,10 +907,10 @@ function AccountsTable({
                   <td className="whitespace-nowrap px-2.5 py-2 tabular-nums">
                     {a.credits ? (
                       <span
-                        title={`Purchasable credits as of the last usage poll${a.credits.has_credits ? "" : " (none available)"}`}
+                        title={`Plan credits as of the last usage poll${a.credits.has_credits ? "" : " (none available)"}`}
                         className={clsx("text-fg", a.credits.has_credits ? "opacity-85" : "opacity-45")}
                       >
-                        {a.credits.unlimited ? "unlimited" : usd(a.credits.balance)}
+                        {a.credits.unlimited ? "unlimited" : credits(a.credits.balance)}
                       </span>
                     ) : (
                       <span className="text-fg opacity-35">—</span>
