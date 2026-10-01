@@ -175,6 +175,13 @@ impl WsTurnTelemetry {
         self.requested_service_tier.as_deref()
     }
 
+    /// The seat serving this turn cannot provide the requested paid tier and no seat that can
+    /// was eligible (the Pro 500 seat is quota-gated), so the upstream will serve it at the
+    /// default speed: bill it as default, keep `requested_service_tier` as the ask.
+    pub(crate) fn mark_tier_unserved(&mut self) {
+        self.service_tier = Some("default".to_string());
+    }
+
     pub(crate) fn logical_turn_key(&self) -> Option<&str> {
         self.log_request
             .then_some(self.logical_turn_key.as_deref())
@@ -651,6 +658,28 @@ mod tests {
         .unwrap();
         assert_eq!(turn.service_tier.as_deref(), Some("ultrafast"));
         assert_eq!(turn.actual_service_tier.as_deref(), Some("default"));
+    }
+
+    /// When the gate fell open — no eligible seat serves the tier — the turn runs at default speed
+    /// on a seat that cannot serve it, and must be billed as default even though the upstream will
+    /// answer `default` exactly as it does for a genuinely served paid turn.
+    #[test]
+    fn a_turn_whose_seat_cannot_serve_the_tier_is_billed_as_default() {
+        let headers = HeaderMap::new();
+        let mut turn = start_turn(
+            &headers,
+            r#"{"type":"response.create","model":"gpt-6-astra","service_tier":"ultrafast","input":[]}"#,
+            &super::super::session::ws_session_key(&headers, None),
+            None,
+        )
+        .unwrap();
+        turn.mark_tier_unserved();
+        turn.observe(
+            r#"{"type":"response.completed","response":{"service_tier":"default","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}"#,
+        )
+        .unwrap();
+        assert_eq!(turn.requested_service_tier.as_deref(), Some("ultrafast"));
+        assert_eq!(turn.service_tier.as_deref(), Some("default"));
     }
 
     /// The requested tier must survive an upstream downgrade, or "asked priority, got standard"

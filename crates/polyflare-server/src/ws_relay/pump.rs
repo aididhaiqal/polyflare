@@ -764,6 +764,12 @@ pub(crate) async fn run_pump<F, Fut, G, GFut, M, MFut, H, HFut>(
                                         upstream = Some(new_upstream);
                                         upstream_since = tokio::time::Instant::now();
                                         account_changed_since_completed = true;
+                                    } else {
+                                        // No seat that serves the tier is eligible (the Pro 500
+                                        // seat is quota-gated): the turn runs here at default
+                                        // speed, so bill it that way.
+                                        relay_metrics.record("tier_unserved_default_speed");
+                                        next_turn.mark_tier_unserved();
                                     }
                                 }
                             }

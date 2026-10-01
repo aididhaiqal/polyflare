@@ -1986,6 +1986,42 @@ async fn reroute_cyber_rejection(
 /// contract stays honest and any FUTURE change to the watchdog's `Err` shape can't silently
 /// reintroduce a double-relay risk without this loop's own logic changing to match.
 #[allow(clippy::too_many_arguments)]
+/// The seat about to serve `outcome` cannot provide the paid tier the request asked for (the
+/// gate fell open because no seat that can was eligible, e.g. the Pro 500 seat is quota-gated):
+/// the upstream will serve it at the default speed and report `default`, exactly as it does for
+/// a genuinely served paid turn — so the billed tier is downgraded here, where the seat is
+/// known, and `requested_service_tier` keeps the ask for the mismatch flag.
+fn downgrade_billed_tier_if_unserved(
+    state: &AppState,
+    snapshots: &[AccountSnapshot],
+    account_id: &AccountId,
+    model: &str,
+    outcome: &mut RouteOutcome,
+) {
+    let Some(tier) = crate::model_catalog::normalize_tier(outcome.service_tier.as_deref()) else {
+        return;
+    };
+    let plan_type = snapshots
+        .iter()
+        .find(|snapshot| &snapshot.id == account_id)
+        .map(|snapshot| snapshot.plan_type.as_str())
+        .unwrap_or("");
+    if state
+        .model_catalog
+        .account_serves_tier(account_id.as_str(), plan_type, model, &tier)
+        == Some(false)
+    {
+        tracing::info!(
+            target: "polyflare_server::routing",
+            account = %account_id,
+            tier = %tier,
+            model = %model,
+            "the serving seat cannot provide the requested tier; billing the turn at the default speed"
+        );
+        outcome.service_tier = Some("default".to_string());
+    }
+}
+
 /// The service tier a prepared request asks for: from `body` when the request was re-shaped,
 /// else a field-only pass over `raw_body`. Only the failover and starvation paths need this —
 /// the parsed inbound facts are out of scope there — so the hot path never pays for it.
@@ -3372,6 +3408,13 @@ async fn responses_handler_impl_with_max_attempts(
     let response = match route_decision {
         RouteDecision::Route(id) => {
             outcome.account_id = Some(id.as_str().to_string());
+            downgrade_billed_tier_if_unserved(
+                &state,
+                &snapshots,
+                &id,
+                &model_for_selection,
+                &mut outcome,
+            );
             let (account, provider) = match resolve_core_account(&state, &id, now).await {
                 Ok(a) => a,
                 Err(r) => {
@@ -3724,6 +3767,13 @@ async fn responses_handler_impl_with_max_attempts(
                     };
                     state.runtime.record_selected(&fresh, now);
                     outcome.account_id = Some(fresh.as_str().to_string());
+                    downgrade_billed_tier_if_unserved(
+                        &state,
+                        &snapshots,
+                        &fresh,
+                        &model_for_selection,
+                        &mut outcome,
+                    );
                     let (account, provider) = match resolve_core_account(&state, &fresh, now).await
                     {
                         Ok(a) => a,
@@ -3811,6 +3861,13 @@ async fn responses_handler_impl_with_max_attempts(
                     // but `owner` is the pinned account this request was scoped to, so it's still
                     // a meaningful (and content-free) identifier to surface.
                     outcome.account_id = Some(owner.as_str().to_string());
+                    downgrade_billed_tier_if_unserved(
+                        &state,
+                        &snapshots,
+                        &owner,
+                        &model_for_selection,
+                        &mut outcome,
+                    );
                     let stream =
                         signal_client_stream(state.continuity.clone(), ctx, owner, session_key)
                             .await;
@@ -3827,6 +3884,13 @@ async fn responses_handler_impl_with_max_attempts(
                         Some(fresh) => {
                             state.runtime.record_selected(&fresh, now);
                             outcome.account_id = Some(fresh.as_str().to_string());
+                            downgrade_billed_tier_if_unserved(
+                                &state,
+                                &snapshots,
+                                &fresh,
+                                &model_for_selection,
+                                &mut outcome,
+                            );
                             let (account, provider) =
                                 match resolve_core_account(&state, &fresh, now).await {
                                     Ok(a) => a,
