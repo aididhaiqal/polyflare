@@ -2,17 +2,25 @@
 # Master deploy (run FROM THE LAPTOP): wait for the release build on ultraflux, swap the binary atomically, then restart
 # only when polyflare_lease_inflight == 0 (polled FROM LOCAL — an on-master poller died silently once).
 TOK=$(cat ~/.polyflare/master-token)
-for i in {1..40}; do ssh -o ConnectTimeout=8 ultraflux 'grep -q "Finished" /tmp/pf-build.log' && break; sleep 15; done
-ssh -o ConnectTimeout=8 ultraflux 'tail -1 /tmp/pf-build.log; grep -c "^error" /tmp/pf-build.log'
-ssh -o ConnectTimeout=8 ultraflux 'cp ~/Development/Codex-LoadBalancer/polyflare/target/release/polyflare ~/.local/bin/polyflare.new && mv -f ~/.local/bin/polyflare.new ~/.local/bin/polyflare && echo "master binary swapped"'
+# Audit 2026-10-01: a failed or stale build must never be installed, and "not restarted" must
+# never read as success — the script did both on 2026-10-01 (timed out at inflight>0, printed
+# "HTTP 200 after restart" for yesterday's process).
+built=0
+for i in {1..40}; do ssh -o ConnectTimeout=8 ultraflux 'grep -q "Finished" /tmp/pf-build.log' && { built=1; break; }; sleep 15; done
+[ "$built" = 1 ] || { echo "master build did not finish within 10 min; nothing swapped"; exit 3; }
+errors=$(ssh -o ConnectTimeout=8 ultraflux 'tail -1 /tmp/pf-build.log >&2; grep -c "^error" /tmp/pf-build.log')
+[ "${errors:-1}" = "0" ] || { echo "master build has $errors error(s); nothing swapped"; exit 3; }
+ssh -o ConnectTimeout=8 ultraflux 'cp ~/Development/Codex-LoadBalancer/polyflare/target/release/polyflare ~/.local/bin/polyflare.new && mv -f ~/.local/bin/polyflare.new ~/.local/bin/polyflare && echo "master binary swapped"' || exit 3
+restarted=0
 for i in {1..240}; do
   n=$(curl -s -m 8 -H "Authorization: Bearer $TOK" https://ultraflux.tail6de914.ts.net/metrics | grep -E '^polyflare_lease_inflight ' | awk '{print $2}')
   echo "$(date +%T) inflight=$n"
   if [ "$n" = "0" ]; then
-    ssh -o ConnectTimeout=8 ultraflux 'launchctl kickstart -k gui/$(id -u)/com.polyflare.server && echo "master restarted"' && break
+    ssh -o ConnectTimeout=8 ultraflux 'launchctl kickstart -k gui/$(id -u)/com.polyflare.server && echo "master restarted"' && { restarted=1; break; }
   fi
   sleep 15
 done
+[ "$restarted" = 1 ] || { echo "NOT restarted: inflight never reached 0 in 60 min (binary on disk is new, process is old)"; exit 4; }
 # The drain + relaunch takes ~12 s; a fixed 5 s wait reported a false 502 / empty pid on 2026-09-30.
 for i in {1..20}; do
   code=$(curl -s -o /dev/null -w '%{http_code}' -m 8 https://ultraflux.tail6de914.ts.net/v1/models)
