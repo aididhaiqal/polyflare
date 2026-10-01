@@ -264,6 +264,39 @@ async fn accounts_endpoint_surfaces_usage_windows_and_reset_times() {
     assert!(b["five_hour"].is_null());
 }
 
+/// The accounts list carries each seat's purchasable-credit balance as the usage poll last
+/// saw it, and `null` for a seat no poll has reported on yet.
+#[tokio::test]
+async fn accounts_list_surfaces_the_credit_balance_the_usage_poll_recorded() {
+    let store = seed_store().await;
+    store
+        .accounts()
+        .upsert_credits("codex-a", 12.5, true, false, 1_790_000_000)
+        .await
+        .unwrap();
+    let (pf, _state) = spawn_with_state(store).await;
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/accounts"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = body.as_array().unwrap();
+    let by_id = |id: &str| arr.iter().find(|a| a["id"] == id).expect(id);
+    assert_eq!(by_id("codex-a")["credits"]["balance"], 12.5);
+    assert_eq!(by_id("codex-a")["credits"]["has_credits"], true);
+    assert_eq!(by_id("codex-a")["credits"]["unlimited"], false);
+    assert_eq!(by_id("codex-a")["credits"]["updated_at"], 1_790_000_000i64);
+    assert!(
+        by_id("codex-b")["credits"].is_null(),
+        "no poll yet: {}",
+        by_id("codex-b")
+    );
+}
+
 #[tokio::test]
 async fn accounts_list_surfaces_per_model_caps_like_the_detail_view() {
     // The Anthropic usage refresh records each seat's per-model weekly windows (e.g. `Fable`) on

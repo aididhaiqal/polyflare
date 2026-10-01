@@ -1,4 +1,4 @@
-export type ServiceTierKind = "priority" | "flex" | "default" | "other";
+export type ServiceTierKind = "ultrafast" | "priority" | "flex" | "default" | "other";
 
 export interface ServiceTierDisplay {
   kind: ServiceTierKind;
@@ -11,6 +11,9 @@ export function serviceTierDisplay(tier: string | null | undefined): ServiceTier
   const recordedValue = tier?.trim() || null;
   const normalized = recordedValue?.toLowerCase() ?? null;
 
+  if (normalized === "ultrafast") {
+    return { kind: "ultrafast", label: "Ultrafast", recordedValue };
+  }
   if (normalized === "priority" || normalized === "fast") {
     return { kind: "priority", label: "Priority", recordedValue };
   }

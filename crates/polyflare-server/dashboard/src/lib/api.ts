@@ -144,6 +144,17 @@ export interface AccountView {
    * selector reads: why selection is steering around an account whose `status` still says
    * "active" (a rate-limit / overload cooldown, or the soft-drain tier after upstream errors). */
   routing: RoutingHealthView;
+  /** `read_api.rs::CreditsView` — purchasable credits from the last usage poll; null until one
+   * reported them (Anthropic seats never do). */
+  credits: CreditsView | null;
+}
+
+/** `read_api.rs::CreditsView` — `AccountView.credits`. `balance` is USD. */
+export interface CreditsView {
+  balance: number;
+  has_credits: boolean;
+  unlimited: boolean;
+  updated_at: number;
 }
 
 /** `read_api.rs::RoutingHealthView` — one account's live routing health. */

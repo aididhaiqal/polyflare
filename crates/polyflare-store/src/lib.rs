@@ -19,8 +19,8 @@ pub mod store;
 pub mod translation_repo;
 
 pub use account::{
-    Account, AccountRepo, AccountSettingsUpdate, AuthMode, EncryptedTokens, NewUpstreamAuth,
-    PlainTokens, UpstreamAuth, UsageSnapshot, WindowUsage,
+    Account, AccountCredits, AccountRepo, AccountSettingsUpdate, AuthMode, EncryptedTokens,
+    NewUpstreamAuth, PlainTokens, UpstreamAuth, UsageSnapshot, WindowUsage,
 };
 pub use account_model_support_repo::{
     AccountModelSupportRepo, AccountModelSupportRow, SupportSource,

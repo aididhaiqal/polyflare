@@ -3,6 +3,7 @@ import clsx from "clsx";
 import { serviceTierDisplay } from "../lib/serviceTier";
 
 const TIER_CLASS = {
+  ultrafast: "border-accent/60 bg-accent/[0.28] text-accent",
   priority: "border-accent/30 bg-accent/[0.12] text-accent",
   flex: "border-warn/30 bg-warn/[0.1] text-warn",
   default: "border-border bg-muted text-fg opacity-55",

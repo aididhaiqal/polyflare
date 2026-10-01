@@ -50,6 +50,15 @@ struct UsagePayload {
     /// onboarding, so without this an upgraded or downgraded seat kept its onboarding tier —
     /// and its capacity weight — forever.
     plan_type: Option<String>,
+    /// Purchasable credits: `balance` arrives as a decimal STRING ("0", "12.50").
+    credits: Option<CreditsPayload>,
+}
+
+#[derive(Deserialize, Default)]
+struct CreditsPayload {
+    balance: Option<String>,
+    has_credits: Option<bool>,
+    unlimited: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -206,6 +215,22 @@ async fn refresh_account(
     }
     let payload: UsagePayload = resp.json().await?;
     sync_plan_type(repo, account, payload.plan_type.as_deref()).await?;
+    if let Some(credits) = payload.credits.as_ref() {
+        if let Some(balance) = credits
+            .balance
+            .as_deref()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+        {
+            repo.upsert_credits(
+                &account.id,
+                balance,
+                credits.has_credits.unwrap_or(balance > 0.0),
+                credits.unlimited.unwrap_or(false),
+                unix_now(),
+            )
+            .await?;
+        }
+    }
     let rl = payload.rate_limit.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1006,6 +1031,7 @@ mod tests {
         async fn usage() -> axum::Json<serde_json::Value> {
             axum::Json(serde_json::json!({
                 "plan_type": " ProMax ",
+                "credits": {"has_credits": true, "unlimited": false, "balance": "12.50"},
                 "rate_limit": {
                     "primary_window": {"used_percent": 12.0, "reset_at": 1793000000, "limit_window_seconds": 604800}
                 }
@@ -1087,6 +1113,10 @@ mod tests {
             "promax",
             "the reported slug is stored trimmed and lowercased"
         );
+        let credits = repo.list_credits().await.unwrap();
+        let mine = credits.get("codex-upgraded").expect("credits captured");
+        assert_eq!(mine.balance, 12.5);
+        assert!(mine.has_credits && !mine.unlimited);
 
         // A later poll that omits the plan (empty) must not blank what we know.
         assert!(

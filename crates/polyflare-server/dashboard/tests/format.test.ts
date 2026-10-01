@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { billingLabel, planLabel, ratePct, shortDate } from "../src/lib/format.ts";
+import { billingLabel, planLabel, ratePct, shortDate, usd } from "../src/lib/format.ts";
 
 test("ratePct never presents a non-perfect rate as 100%", () => {
   assert.equal(ratePct(99.95), "<100%");
@@ -23,4 +23,12 @@ test("billingLabel shows the renewal with its as-of date, and calls an elapsed p
   assert.equal(billingLabel(null, now), null);
   assert.equal(billingLabel({ active_until: null, last_checked: 1 }, now), null);
   assert.equal(shortDate(Date.UTC(2025, 7, 8) / 1000, now), "8 Aug 2025");
+});
+
+test("usd shows cents below a hundred dollars and whole dollars above", () => {
+  assert.equal(usd(0), "$0.00");
+  assert.equal(usd(12.5), "$12.50");
+  assert.equal(usd(99.999), "$100.00");
+  assert.equal(usd(1234.4), "$1,234");
+  assert.equal(usd(Number.NaN), "—");
 });

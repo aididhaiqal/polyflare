@@ -343,6 +343,17 @@ async fn unique_account_row_id(
 /// upstream account id (2026-09-15: a second team member's login replaced the first member's
 /// seat). Matched loosely: upstream has shipped several spellings and an unknown plan must not
 /// silently become "personal" for a workspace that is not.
+/// One account's purchasable-credit balance as the usage poll last reported it.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct AccountCredits {
+    pub account_id: String,
+    /// USD.
+    pub balance: f64,
+    pub has_credits: bool,
+    pub unlimited: bool,
+    pub updated_at: i64,
+}
+
 fn is_shared_workspace_plan(plan: &str) -> bool {
     let plan = plan.trim().to_ascii_lowercase();
     plan.contains("team") || plan.contains("enterprise") || plan.contains("business")
@@ -1289,6 +1300,47 @@ impl AccountRepo {
     /// Update an account's `plan_type` (the subscription tier slug). Codex derives it from the ID
     /// token at login; Anthropic has no such claim, so the usage poller sets it from the
     /// `/api/oauth/profile` `rate_limit_tier`. A no-op write is fine — callers only call on change.
+    /// Replace the account's purchasable-credit row with what the usage poll just saw.
+    pub async fn upsert_credits(
+        &self,
+        id: &str,
+        balance: f64,
+        has_credits: bool,
+        unlimited: bool,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO account_credits (account_id, balance, has_credits, unlimited, updated_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(account_id) DO UPDATE SET
+                balance = excluded.balance,
+                has_credits = excluded.has_credits,
+                unlimited = excluded.unlimited,
+                updated_at = excluded.updated_at",
+        )
+        .bind(id)
+        .bind(balance)
+        .bind(has_credits)
+        .bind(unlimited)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Every account's last-seen credit balance, keyed by account id.
+    pub async fn list_credits(&self) -> Result<HashMap<String, AccountCredits>, StoreError> {
+        let rows = sqlx::query_as::<_, AccountCredits>(
+            "SELECT account_id, balance, has_credits, unlimited, updated_at FROM account_credits",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.account_id.clone(), row))
+            .collect())
+    }
+
     pub async fn update_plan_type(&self, id: &str, plan_type: &str) -> Result<(), StoreError> {
         sqlx::query("UPDATE accounts SET plan_type = ? WHERE id = ?")
             .bind(plan_type)

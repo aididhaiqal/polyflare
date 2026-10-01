@@ -150,6 +150,20 @@ struct AccountView {
     /// or the soft-drain tier after upstream errors. 2026-09-15: a degraded account was moved
     /// away from turn after turn while the dashboard showed it as plain "active".
     routing: RoutingHealthView,
+    /// Purchasable-credit balance from the last usage poll; `None` until the first poll reports
+    /// one (Anthropic seats never do).
+    credits: Option<CreditsView>,
+}
+
+/// `AccountView::credits`: the seat's purchasable credits as `/wham/usage` last reported them.
+#[derive(Serialize)]
+struct CreditsView {
+    /// USD.
+    balance: f64,
+    has_credits: bool,
+    unlimited: bool,
+    /// Unix seconds of the poll that produced it.
+    updated_at: i64,
 }
 
 /// One account's live routing health (see `AccountView::routing`). Sourced from the runtime
@@ -302,6 +316,10 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         Err(_) => return Response::error(),
     };
     let mut routing_by_account = routing_health_by_account(&state, now).await;
+    let mut credits_by_account = match repo.list_credits().await {
+        Ok(credits) => credits,
+        Err(_) => return Response::error(),
+    };
     let mut views = Vec::with_capacity(accounts.len());
     for account in accounts {
         let usage = usage_by_account.remove(&account.id).unwrap_or_default();
@@ -348,6 +366,14 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         let routing = routing_by_account
             .remove(&account.id)
             .unwrap_or_else(RoutingHealthView::healthy);
+        let credits = credits_by_account
+            .remove(&account.id)
+            .map(|credits| CreditsView {
+                balance: credits.balance,
+                has_credits: credits.has_credits,
+                unlimited: credits.unlimited,
+                updated_at: credits.updated_at,
+            });
         views.push(AccountView {
             pools,
             id: account.id,
@@ -372,6 +398,7 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
             usage: usage_windows,
             token_health,
             request_count_24h,
+            credits,
             model_caps,
             routing,
         });
@@ -1078,12 +1105,11 @@ pub async fn requests_handler(
                 upstream_transport: r.upstream_transport,
                 profile_revision: r.profile_revision,
                 reasoning_effort: r.reasoning_effort,
-                service_tier_reported_mismatch: polyflare_core::pricing::is_priority_tier(
+                service_tier_reported_mismatch: polyflare_core::pricing::is_paid_speed_tier(
                     r.requested_service_tier.as_deref(),
-                ) && r
-                    .actual_service_tier
-                    .as_deref()
-                    .is_some_and(|actual| !polyflare_core::pricing::is_priority_tier(Some(actual))),
+                ) && r.actual_service_tier.as_deref().is_some_and(
+                    |actual| !polyflare_core::pricing::is_paid_speed_tier(Some(actual)),
+                ),
                 service_tier: r.service_tier,
                 transport: r.transport,
                 ttft_ms: tps_ttft_ms,

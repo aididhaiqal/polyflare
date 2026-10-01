@@ -29,3 +29,11 @@ test("serviceTierDisplay preserves flex and unfamiliar recorded tiers", () => {
     recordedValue: "batch",
   });
 });
+
+test("serviceTierDisplay names Ultrafast as its own paid tier", () => {
+  assert.deepEqual(serviceTierDisplay(" Ultrafast "), {
+    kind: "ultrafast",
+    label: "Ultrafast",
+    recordedValue: "Ultrafast",
+  });
+});

@@ -258,7 +258,12 @@ impl WsTurnTelemetry {
             "response.completed" => {
                 // Prefer the tier the RESPONSE reports over the one the policy asked for: an
                 // upstream may accept a priority request and still serve it as standard, and
-                // billing the premium for that turn would overstate cost.
+                // billing the premium for that turn would overstate cost. EXCEPT `default`: the
+                // ChatGPT backend reports `service_tier: "default"` on completion for every
+                // paid-tier turn it genuinely served and charged (priority and Ultrafast alike,
+                // verified 2026-09-30), so a paid request answered with `default` keeps its
+                // requested tier for billing — the SSE path has always done the same. A real
+                // downgrade names the lower tier (`standard`).
                 if let Some(reported) = value
                     .get("response")
                     .and_then(|response| response.get("service_tier"))
@@ -266,7 +271,12 @@ impl WsTurnTelemetry {
                     .filter(|tier| !tier.is_empty())
                 {
                     self.actual_service_tier = Some(reported.to_string());
-                    self.service_tier = Some(reported.to_string());
+                    let paid_request = polyflare_core::pricing::is_paid_speed_tier(
+                        self.requested_service_tier.as_deref(),
+                    );
+                    if !(paid_request && reported.eq_ignore_ascii_case("default")) {
+                        self.service_tier = Some(reported.to_string());
+                    }
                 }
                 Some(WsTurnTerminal {
                     status: StatusCode::OK,
@@ -621,8 +631,31 @@ mod tests {
         );
     }
 
+    /// The backend answers every paid-tier turn with `service_tier: "default"` (2026-09-30: 22
+    /// Ultrafast turns, all served faster, all reported `default`). That is not a downgrade, so
+    /// the turn stays billed at the tier it asked for; `actual_service_tier` still records what
+    /// the upstream said.
+    #[test]
+    fn a_paid_tier_reported_back_as_default_is_still_billed_as_requested() {
+        let headers = HeaderMap::new();
+        let mut turn = start_turn(
+            &headers,
+            r#"{"type":"response.create","model":"gpt-6-astra","service_tier":"ultrafast","input":[]}"#,
+            &super::super::session::ws_session_key(&headers, None),
+            None,
+        )
+        .unwrap();
+        turn.observe(
+            r#"{"type":"response.completed","response":{"service_tier":"default","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}"#,
+        )
+        .unwrap();
+        assert_eq!(turn.service_tier.as_deref(), Some("ultrafast"));
+        assert_eq!(turn.actual_service_tier.as_deref(), Some("default"));
+    }
+
     /// The requested tier must survive an upstream downgrade, or "asked priority, got standard"
-    /// is indistinguishable from "never asked for priority".
+    /// is indistinguishable from "never asked for priority". A downgrade is the upstream NAMING
+    /// a lower tier (`standard`) — `default` is how it reports every paid turn it served.
     #[test]
     fn a_downgrade_keeps_both_what_was_asked_and_what_was_served() {
         let headers = HeaderMap::new();
@@ -634,14 +667,14 @@ mod tests {
         )
         .unwrap();
         turn.observe(
-            r#"{"type":"response.completed","response":{"service_tier":"default","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}"#,
+            r#"{"type":"response.completed","response":{"service_tier":"standard","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}"#,
         )
         .unwrap();
         assert_eq!(turn.requested_service_tier.as_deref(), Some("priority"));
-        assert_eq!(turn.actual_service_tier.as_deref(), Some("default"));
+        assert_eq!(turn.actual_service_tier.as_deref(), Some("standard"));
         assert_eq!(
             turn.service_tier.as_deref(),
-            Some("default"),
+            Some("standard"),
             "billing follows what was served"
         );
     }

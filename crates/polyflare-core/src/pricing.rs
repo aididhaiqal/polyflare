@@ -40,8 +40,87 @@ pub struct ModelPrice {
 /// `DEFAULT_PRICING_MODELS` (`pricing.py:90-323`). 27 entries — every key
 /// present in the source at the time of the port.
 static PRICING_MODELS: LazyLock<HashMap<&'static str, ModelPrice>> = LazyLock::new(|| {
-    let mut m = HashMap::with_capacity(32);
+    let mut m = HashMap::with_capacity(40);
 
+    // GPT-6 family (API list prices, 2026-09; fast mode doubles, flex halves, long context past
+    // 272K doubles input/cache and lifts output 1.5x — same shape as the 5.6 rows). Until these
+    // rows existed (2026-10-01) ~95% of a day's turns carried no cost at all.
+    m.insert(
+        "gpt-6-astra",
+        ModelPrice {
+            input_per_1m: 10.0,
+            cached_input_per_1m: Some(1.0),
+            output_per_1m: 50.0,
+            priority_input_per_1m: Some(20.0),
+            priority_cached_input_per_1m: Some(2.0),
+            priority_output_per_1m: Some(100.0),
+            flex_input_per_1m: Some(5.0),
+            flex_cached_input_per_1m: Some(0.5),
+            flex_output_per_1m: Some(25.0),
+            long_context_threshold_tokens: Some(272_000.0),
+            long_context_input_per_1m: Some(20.0),
+            long_context_cached_input_per_1m: Some(2.0),
+            long_context_output_per_1m: Some(75.0),
+            ..ModelPrice::default()
+        },
+    );
+    m.insert(
+        "gpt-6.1-sol",
+        ModelPrice {
+            input_per_1m: 2.0,
+            cached_input_per_1m: Some(0.1),
+            output_per_1m: 10.0,
+            priority_input_per_1m: Some(4.0),
+            priority_cached_input_per_1m: Some(0.2),
+            priority_output_per_1m: Some(20.0),
+            flex_input_per_1m: Some(1.0),
+            flex_cached_input_per_1m: Some(0.05),
+            flex_output_per_1m: Some(5.0),
+            long_context_threshold_tokens: Some(272_000.0),
+            long_context_input_per_1m: Some(4.0),
+            long_context_cached_input_per_1m: Some(0.2),
+            long_context_output_per_1m: Some(15.0),
+            ..ModelPrice::default()
+        },
+    );
+    m.insert(
+        "gpt-6-sol",
+        ModelPrice {
+            input_per_1m: 2.0,
+            cached_input_per_1m: Some(0.1),
+            output_per_1m: 10.0,
+            priority_input_per_1m: Some(4.0),
+            priority_cached_input_per_1m: Some(0.2),
+            priority_output_per_1m: Some(20.0),
+            flex_input_per_1m: Some(1.0),
+            flex_cached_input_per_1m: Some(0.05),
+            flex_output_per_1m: Some(5.0),
+            long_context_threshold_tokens: Some(272_000.0),
+            long_context_input_per_1m: Some(4.0),
+            long_context_cached_input_per_1m: Some(0.2),
+            long_context_output_per_1m: Some(15.0),
+            ..ModelPrice::default()
+        },
+    );
+    m.insert(
+        "gpt-6-luna",
+        ModelPrice {
+            input_per_1m: 0.1,
+            cached_input_per_1m: Some(0.01),
+            output_per_1m: 0.5,
+            priority_input_per_1m: Some(0.2),
+            priority_cached_input_per_1m: Some(0.02),
+            priority_output_per_1m: Some(1.0),
+            flex_input_per_1m: Some(0.05),
+            flex_cached_input_per_1m: Some(0.005),
+            flex_output_per_1m: Some(0.25),
+            long_context_threshold_tokens: Some(272_000.0),
+            long_context_input_per_1m: Some(0.2),
+            long_context_cached_input_per_1m: Some(0.02),
+            long_context_output_per_1m: Some(0.75),
+            ..ModelPrice::default()
+        },
+    );
     m.insert(
         "gpt-5.6-sol",
         ModelPrice {
@@ -386,6 +465,12 @@ static PRICING_MODELS: LazyLock<HashMap<&'static str, ModelPrice>> = LazyLock::n
 /// *first* max-length match encountered in dict-insertion order — that
 /// requires preserving this exact order.
 static MODEL_ALIASES: &[(&str, &str)] = &[
+    ("gpt-6.1-sol*", "gpt-6.1-sol"),
+    ("gpt-6-astra*", "gpt-6-astra"),
+    ("gpt-6-sol*", "gpt-6-sol"),
+    ("gpt-6-luna*", "gpt-6-luna"),
+    ("gpt-6.1*", "gpt-6.1-sol"),
+    ("gpt-6*", "gpt-6-sol"),
     ("gpt-5.6", "gpt-5.6-sol"),
     ("gpt-5.6-sol*", "gpt-5.6-sol"),
     ("gpt-5.6-terra*", "gpt-5.6-terra"),
@@ -491,6 +576,18 @@ fn uses_priority_tier(service_tier: Option<&str>) -> bool {
 }
 
 /// Ports `_uses_flex_tier` (`pricing.py:401-405`).
+/// How much more of a subscription's included usage an Ultrafast (GPT-6 Astra, Pro 500) turn
+/// consumes than a standard one — OpenAI's published figure (fast mode is 2.5x, Ultrafast 8x).
+/// There is no API price for Ultrafast, so the dollar estimate scales the standard rates by it.
+pub const ULTRAFAST_USAGE_MULTIPLIER: f64 = 8.0;
+
+fn uses_ultrafast_tier(service_tier: Option<&str>) -> bool {
+    matches!(
+        normalize_service_tier(service_tier).as_deref(),
+        Some("ultrafast")
+    )
+}
+
 fn uses_flex_tier(service_tier: Option<&str>) -> bool {
     matches!(
         normalize_service_tier(service_tier).as_deref(),
@@ -517,6 +614,15 @@ fn effective_rates(
         .is_some_and(|threshold| input_tokens > threshold)
         && price.long_context_input_per_1m.is_some()
         && price.long_context_output_per_1m.is_some();
+
+    if uses_ultrafast_tier(service_tier) {
+        let (input, cached, output) = effective_rates(price, input_tokens, None);
+        return (
+            input * ULTRAFAST_USAGE_MULTIPLIER,
+            cached * ULTRAFAST_USAGE_MULTIPLIER,
+            output * ULTRAFAST_USAGE_MULTIPLIER,
+        );
+    }
 
     let mut input_rate = price.input_per_1m;
     let mut cached_rate = price.cached_input_per_1m.unwrap_or(input_rate);
@@ -643,6 +749,13 @@ impl CustomModelRates {
 
 /// Whether a reported service tier counts as priority for billing. Public so callers outside this
 /// module classify tiers exactly the way the rate selection does.
+/// A tier the subscription bills above standard: priority (fast mode) or Ultrafast. The upstream
+/// reports `service_tier: default` on completion for both, so "asked for a paid tier, got
+/// default back" is the normal shape of a paid turn, not evidence it was downgraded.
+pub fn is_paid_speed_tier(service_tier: Option<&str>) -> bool {
+    uses_priority_tier(service_tier) || uses_ultrafast_tier(service_tier)
+}
+
 pub fn is_priority_tier(service_tier: Option<&str>) -> bool {
     uses_priority_tier(service_tier)
 }
@@ -660,6 +773,54 @@ mod custom_rate_tests {
             priority_cached_input_per_1m: Some(1.0),
             priority_output_per_1m: Some(16.0),
         }
+    }
+
+    /// Every GPT-6 slug the fleet serves must resolve to a price row, variants included, or a
+    /// whole day's analytics show no cost (2026-10-01: 4,700 unpriced turns out of ~4,800).
+    #[test]
+    fn the_gpt_6_family_is_priced_variants_included() {
+        for (slug, expect_input) in [
+            ("gpt-6-astra", 10.0),
+            ("gpt-6-astra-ultra", 10.0),
+            ("gpt-6-sol", 2.0),
+            ("gpt-6.1-sol", 2.0),
+            ("gpt-6.1-sol-preview", 2.0),
+            ("gpt-6-luna", 0.1),
+            ("GPT-6-Luna-mini", 0.1),
+        ] {
+            let price = pricing_for_model(slug).unwrap_or_else(|| panic!("{slug} unpriced"));
+            assert_eq!(price.input_per_1m, expect_input, "{slug}");
+            assert!(price.priority_input_per_1m.is_some(), "{slug} fast mode");
+            assert!(
+                price.long_context_threshold_tokens.is_some(),
+                "{slug} long context"
+            );
+        }
+        // 100K input tokens stays under the 272K long-context threshold.
+        let astra = pricing_for_model("gpt-6-astra").unwrap();
+        assert!((cost_usd(astra, 100_000, 0, 0, None) - 1.0).abs() < 1e-9);
+        assert!((cost_usd(astra, 100_000, 0, 0, Some("priority")) - 2.0).abs() < 1e-9);
+        assert!((cost_usd(astra, 100_000, 0, 0, Some("ultrafast")) - 8.0).abs() < 1e-9);
+    }
+
+    /// An Ultrafast turn burns 8x a standard one and has no API price of its own, so the
+    /// estimate is the standard rate times the published multiplier — above priority, which
+    /// used to be the ceiling, and far above the standard rate it was silently billed at.
+    #[test]
+    fn ultrafast_bills_the_published_multiple_of_the_standard_rate() {
+        let p = pricing_for_model("gpt-6-astra")
+            .or_else(|| pricing_for_model("gpt-5.5"))
+            .expect("a priced flagship");
+        let standard = cost_usd(p, 100_000, 10_000, 20_000, None);
+        let ultrafast = cost_usd(p, 100_000, 10_000, 20_000, Some(" Ultrafast "));
+        assert!((ultrafast - standard * ULTRAFAST_USAGE_MULTIPLIER).abs() < 1e-9);
+        let priority = cost_usd(p, 100_000, 10_000, 20_000, Some("priority"));
+        assert!(
+            ultrafast > priority,
+            "ultrafast {ultrafast} must exceed priority {priority}"
+        );
+        assert!(is_paid_speed_tier(Some("ultrafast")) && is_paid_speed_tier(Some("fast")));
+        assert!(!is_paid_speed_tier(Some("default")) && !is_paid_speed_tier(None));
     }
 
     #[test]

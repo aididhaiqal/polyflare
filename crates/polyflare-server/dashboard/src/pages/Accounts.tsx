@@ -39,7 +39,7 @@ import type {
   WindowView,
 } from "../lib/api";
 import { accountLabel } from "../lib/accountDisplay";
-import { compactNum, countdown, pct, planLabel } from "../lib/format";
+import { compactNum, countdown, pct, planLabel, usd } from "../lib/format";
 import {
   quotaDisplayLabel,
   quotaDisplayPercent,
@@ -600,6 +600,14 @@ function AccountCard({
             <span className="font-medium text-fg opacity-90">
               {a.pools.length > 0 ? a.pools.join(", ") : "unpooled"}
             </span>
+            {a.credits && (
+              <>
+                {" · "}
+                <span className={clsx("font-medium text-fg", a.credits.has_credits ? "opacity-90" : "opacity-50")}>
+                  {a.credits.unlimited ? "unlimited credits" : `${usd(a.credits.balance)} credits`}
+                </span>
+              </>
+            )}
             </span>
           </div>
 
@@ -812,6 +820,7 @@ function AccountsTable({
               )}
               <th className={TABLE_HEAD_CLASS}>Token</th>
               <th className={TABLE_HEAD_CLASS}>Reset reserve</th>
+              <th className={TABLE_HEAD_CLASS}>Credits</th>
               <th className={clsx(TABLE_HEAD_CLASS, "text-right")}>Reqs 24h</th>
               <th className={TABLE_HEAD_CLASS}>
                 <span className="sr-only">Actions</span>
@@ -890,6 +899,18 @@ function AccountsTable({
                         )}
                       >
                         {reset.available_credits} banked
+                      </span>
+                    ) : (
+                      <span className="text-fg opacity-35">—</span>
+                    )}
+                  </td>
+                  <td className="whitespace-nowrap px-2.5 py-2 tabular-nums">
+                    {a.credits ? (
+                      <span
+                        title={`Purchasable credits as of the last usage poll${a.credits.has_credits ? "" : " (none available)"}`}
+                        className={clsx("text-fg", a.credits.has_credits ? "opacity-85" : "opacity-45")}
+                      >
+                        {a.credits.unlimited ? "unlimited" : usd(a.credits.balance)}
                       </span>
                     ) : (
                       <span className="text-fg opacity-35">—</span>

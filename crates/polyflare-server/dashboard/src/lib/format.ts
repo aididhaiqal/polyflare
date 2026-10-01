@@ -207,3 +207,13 @@ export function billingLabel(
 }
 // @check billingLabel({ active_until: 1_793_243_736, last_checked: 1_790_651_761 }, 1_790_800_000_000)?.value === "Renews 29 Oct"
 // @check billingLabel(null, 1_790_800_000_000) === null
+
+/** A USD amount for the accounts list: cents under $100, whole dollars with separators above
+ * (`usd(12.5) === "$12.50"`, `usd(1234) === "$1,234"`, `usd(0) === "$0.00"`). */
+export function usd(amount: number): string {
+  if (!Number.isFinite(amount)) return "—";
+  if (Math.abs(amount) >= 100) return `$${Math.round(amount).toLocaleString("en-US")}`;
+  return `$${amount.toFixed(2)}`;
+}
+// @check usd(12.5) === "$12.50"
+// @check usd(1234) === "$1,234"
