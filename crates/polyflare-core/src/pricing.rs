@@ -122,6 +122,18 @@ static PRICING_MODELS: LazyLock<HashMap<&'static str, ModelPrice>> = LazyLock::n
             ..ModelPrice::default()
         },
     );
+    // Sonnet 4.6: ASSUMED at the Sonnet 4-series rate ($3/$15) — superseded, no 2026 list price.
+    m.insert(
+        "claude-sonnet-4-6",
+        ModelPrice {
+            input_per_1m: 3.0,
+            cached_input_per_1m: Some(0.3),
+            output_per_1m: 15.0,
+            cache_write_5m_per_1m: Some(3.75),
+            cache_write_1h_per_1m: Some(6.0),
+            ..ModelPrice::default()
+        },
+    );
     // Sonnet 5: $2/$10.
     m.insert(
         "claude-sonnet-5",
@@ -577,6 +589,7 @@ static MODEL_ALIASES: &[(&str, &str)] = &[
     ("claude-opus-4-8*", "claude-opus-4-8"),
     ("claude-opus-4-7*", "claude-opus-4-7"),
     ("claude-sonnet-5*", "claude-sonnet-5"),
+    ("claude-sonnet-4-6*", "claude-sonnet-4-6"),
     ("claude-haiku-4-5*", "claude-haiku-4-5"),
     ("gpt-6.1-sol*", "gpt-6.1-sol"),
     ("gpt-6-astra*", "gpt-6-astra"),
@@ -948,6 +961,7 @@ mod custom_rate_tests {
             ("claude-opus-4-8", 15.0),
             ("claude-opus-4-7", 15.0),
             ("claude-sonnet-5", 2.0),
+            ("claude-sonnet-4-6", 3.0),
             ("claude-haiku-4-5", 1.0),
             ("claude-opus-5-5-20260815", 4.0),
         ] {
