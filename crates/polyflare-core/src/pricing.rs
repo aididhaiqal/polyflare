@@ -134,6 +134,19 @@ static PRICING_MODELS: LazyLock<HashMap<&'static str, ModelPrice>> = LazyLock::n
             ..ModelPrice::default()
         },
     );
+    // Sonnet 5.5: ASSUMED at the Sonnet 5 rate ($2/$10) — 2,281 messages on the first WSL import
+    // resolved to it through the `claude-sonnet-5*` alias; revisit when a list price appears.
+    m.insert(
+        "claude-sonnet-5-5",
+        ModelPrice {
+            input_per_1m: 2.0,
+            cached_input_per_1m: Some(0.2),
+            output_per_1m: 10.0,
+            cache_write_5m_per_1m: Some(2.5),
+            cache_write_1h_per_1m: Some(4.0),
+            ..ModelPrice::default()
+        },
+    );
     // Sonnet 5: $2/$10.
     m.insert(
         "claude-sonnet-5",
@@ -588,6 +601,7 @@ static MODEL_ALIASES: &[(&str, &str)] = &[
     ("claude-opus-5*", "claude-opus-5"),
     ("claude-opus-4-8*", "claude-opus-4-8"),
     ("claude-opus-4-7*", "claude-opus-4-7"),
+    ("claude-sonnet-5-5*", "claude-sonnet-5-5"),
     ("claude-sonnet-5*", "claude-sonnet-5"),
     ("claude-sonnet-4-6*", "claude-sonnet-4-6"),
     ("claude-haiku-4-5*", "claude-haiku-4-5"),
@@ -961,6 +975,7 @@ mod custom_rate_tests {
             ("claude-opus-4-8", 15.0),
             ("claude-opus-4-7", 15.0),
             ("claude-sonnet-5", 2.0),
+            ("claude-sonnet-5-5", 2.0),
             ("claude-sonnet-4-6", 3.0),
             ("claude-haiku-4-5", 1.0),
             ("claude-opus-5-5-20260815", 4.0),
