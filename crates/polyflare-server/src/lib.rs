@@ -12,6 +12,7 @@ pub mod auth;
 pub mod capacity_calibration;
 pub mod catalog;
 pub mod chatgpt_backend;
+pub mod claude_local_api;
 pub mod codex_sessions;
 pub mod collect_message;
 pub mod config;

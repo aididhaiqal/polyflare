@@ -6,6 +6,7 @@ pub mod account;
 pub mod account_model_support_repo;
 pub mod admin_token_repo;
 pub mod api_key_repo;
+pub mod claude_local_usage_repo;
 pub mod continuity_repo;
 pub mod crypto;
 pub mod import;
@@ -27,6 +28,9 @@ pub use account_model_support_repo::{
 };
 pub use admin_token_repo::{AdminTokenRepo, AdminTokenRow};
 pub use api_key_repo::{ApiKeyRepo, ApiKeyRow};
+pub use claude_local_usage_repo::{
+    ClaudeLocalAgg, ClaudeLocalSummary, ClaudeLocalUsageRepo, ClaudeLocalUsageRow,
+};
 pub use continuity_repo::{ContinuityRepo, SessionRow};
 pub use crypto::TokenCipher;
 pub use import::{import_from_codex_lb, ImportSummary};

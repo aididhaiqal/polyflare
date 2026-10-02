@@ -1487,6 +1487,8 @@ export const api = {
   overviewSeries: () => fetchJson<OverviewSeriesView>("/api/overview/series"),
   accounts: () => fetchJson<AccountView[]>("/api/accounts"),
   claudeUsage: () => fetchJson<ClaudeSeatUsageView[]>("/api/claude/usage"),
+  claudeLocalUsage: (range: string) =>
+    fetchJson<ClaudeLocalUsageView>(`/api/claude/local-usage?range=${encodeURIComponent(range)}`),
   account: (id: string) => fetchJson<AccountDetailView>(`/api/accounts/${encodeURIComponent(id)}`),
   accountTrends: (id: string) =>
     fetchJson<TrendsView>(`/api/accounts/${encodeURIComponent(id)}/trends`),
@@ -1568,4 +1570,32 @@ export interface ClaudeSeatUsageView {
   per_model: ClaudeUsageLine[];
   extra_usage_enabled: boolean | null;
   extra_usage_disabled_reason: string | null;
+}
+
+/** `claude_local_api.rs::AggView` — one aggregate line of Claude Code transcript usage. Token
+ * counts are per `message.usage`; `cost_usd` is the API list-price estimate over the
+ * `priced_messages` rows whose model has a price row. */
+export interface ClaudeLocalAggView {
+  key: string;
+  messages: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_write_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+  priced_messages: number;
+}
+
+/** `claude_local_api.rs::SummaryView` — `GET /api/claude/local-usage?range=`: Claude Code's
+ * transcript usage pushed from each machine by scripts/claude-usage-push. */
+export interface ClaudeLocalUsageView {
+  range: string;
+  since_ts: number;
+  latest_ts: number | null;
+  totals: ClaudeLocalAggView | null;
+  by_model: ClaudeLocalAggView[];
+  /** `key` is the UTC day `YYYY-MM-DD`, ascending. */
+  by_day: ClaudeLocalAggView[];
+  by_project: ClaudeLocalAggView[];
+  by_machine: ClaudeLocalAggView[];
 }

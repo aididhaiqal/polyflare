@@ -73,6 +73,7 @@ import {
   clearModelSupport,
   type ModelSupportDeclaration,
   type ClaudeSeatUsageView,
+  type ClaudeLocalUsageView,
 } from "./api";
 import { requestRefreshInterval } from "./requestLive";
 import { useToast } from "../ui/Toast";
@@ -87,6 +88,7 @@ export const queryKeys = {
   overviewSeries: ["overview", "series"] as const,
   accounts: ["accounts"] as const,
   claudeUsage: ["claude", "usage"] as const,
+  claudeLocalUsage: (range: string) => ["claude", "local-usage", range] as const,
   account: (id: string) => ["accounts", id] as const,
   accountTrends: (id: string) => ["accounts", id, "trends"] as const,
   pools: ["pools"] as const,
@@ -148,6 +150,15 @@ export function useClaudeUsage() {
   return useQuery<ClaudeSeatUsageView[]>({
     queryKey: queryKeys.claudeUsage,
     queryFn: api.claudeUsage,
+    refetchInterval: LIST_REFETCH_MS,
+    staleTime: LIST_REFETCH_MS,
+  });
+}
+
+export function useClaudeLocalUsage(range: string) {
+  return useQuery<ClaudeLocalUsageView>({
+    queryKey: queryKeys.claudeLocalUsage(range),
+    queryFn: () => api.claudeLocalUsage(range),
     refetchInterval: LIST_REFETCH_MS,
     staleTime: LIST_REFETCH_MS,
   });

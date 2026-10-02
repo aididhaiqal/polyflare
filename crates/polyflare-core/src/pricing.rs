@@ -34,13 +34,118 @@ pub struct ModelPrice {
     pub long_context_input_per_1m: Option<f64>,
     pub long_context_output_per_1m: Option<f64>,
     pub long_context_cached_input_per_1m: Option<f64>,
+    /// Anthropic prompt-cache WRITE rates (5-minute and 1-hour TTL), per 1M tokens. `None` on
+    /// every OpenAI row; a Claude row without them is priced as if writes cost the input rate.
+    pub cache_write_5m_per_1m: Option<f64>,
+    pub cache_write_1h_per_1m: Option<f64>,
 }
 
 /// The default per-model pricing table, ported verbatim from codex-lb's
 /// `DEFAULT_PRICING_MODELS` (`pricing.py:90-323`). 27 entries — every key
 /// present in the source at the time of the port.
 static PRICING_MODELS: LazyLock<HashMap<&'static str, ModelPrice>> = LazyLock::new(|| {
-    let mut m = HashMap::with_capacity(40);
+    let mut m = HashMap::with_capacity(48);
+
+    // Claude (Anthropic API list prices, 2026-10; cache reads 0.1x input except where Anthropic
+    // publishes a specific rate, 5-minute cache writes 1.25x input, 1-hour writes 2x input).
+    // These price the Claude Code transcripts imported into `claude_local_usage`; built-in Claude
+    // seats' relayed turns have no price row by design (subscription usage, not API billing).
+    // Fable 5.1: $10/$50, cache read $0.25.
+    m.insert(
+        "claude-fable-5-1",
+        ModelPrice {
+            input_per_1m: 10.0,
+            cached_input_per_1m: Some(0.25),
+            output_per_1m: 50.0,
+            cache_write_5m_per_1m: Some(12.5),
+            cache_write_1h_per_1m: Some(20.0),
+            ..ModelPrice::default()
+        },
+    );
+    // Fable 5 (superseded): priced as 5.1 — no separate list price published.
+    m.insert(
+        "claude-fable-5",
+        ModelPrice {
+            input_per_1m: 10.0,
+            cached_input_per_1m: Some(0.25),
+            output_per_1m: 50.0,
+            cache_write_5m_per_1m: Some(12.5),
+            cache_write_1h_per_1m: Some(20.0),
+            ..ModelPrice::default()
+        },
+    );
+    // Opus 5.5: $4/$20, cache read $0.20.
+    m.insert(
+        "claude-opus-5-5",
+        ModelPrice {
+            input_per_1m: 4.0,
+            cached_input_per_1m: Some(0.2),
+            output_per_1m: 20.0,
+            cache_write_5m_per_1m: Some(5.0),
+            cache_write_1h_per_1m: Some(8.0),
+            ..ModelPrice::default()
+        },
+    );
+    // Opus 5 (legacy): $5/$25.
+    m.insert(
+        "claude-opus-5",
+        ModelPrice {
+            input_per_1m: 5.0,
+            cached_input_per_1m: Some(0.5),
+            output_per_1m: 25.0,
+            cache_write_5m_per_1m: Some(6.25),
+            cache_write_1h_per_1m: Some(10.0),
+            ..ModelPrice::default()
+        },
+    );
+    // Opus 4.7: ASSUMED at the Opus 4-series rate ($15/$75) — no 2026 list price found; revisit.
+    m.insert(
+        "claude-opus-4-7",
+        ModelPrice {
+            input_per_1m: 15.0,
+            cached_input_per_1m: Some(1.5),
+            output_per_1m: 75.0,
+            cache_write_5m_per_1m: Some(18.75),
+            cache_write_1h_per_1m: Some(30.0),
+            ..ModelPrice::default()
+        },
+    );
+    // Opus 4.8: ASSUMED at the Opus 4-series rate ($15/$75) — no 2026 list price found; revisit.
+    m.insert(
+        "claude-opus-4-8",
+        ModelPrice {
+            input_per_1m: 15.0,
+            cached_input_per_1m: Some(1.5),
+            output_per_1m: 75.0,
+            cache_write_5m_per_1m: Some(18.75),
+            cache_write_1h_per_1m: Some(30.0),
+            ..ModelPrice::default()
+        },
+    );
+    // Sonnet 5: $2/$10.
+    m.insert(
+        "claude-sonnet-5",
+        ModelPrice {
+            input_per_1m: 2.0,
+            cached_input_per_1m: Some(0.2),
+            output_per_1m: 10.0,
+            cache_write_5m_per_1m: Some(2.5),
+            cache_write_1h_per_1m: Some(4.0),
+            ..ModelPrice::default()
+        },
+    );
+    // Haiku 4.5: $1/$5.
+    m.insert(
+        "claude-haiku-4-5",
+        ModelPrice {
+            input_per_1m: 1.0,
+            cached_input_per_1m: Some(0.1),
+            output_per_1m: 5.0,
+            cache_write_5m_per_1m: Some(1.25),
+            cache_write_1h_per_1m: Some(2.0),
+            ..ModelPrice::default()
+        },
+    );
 
     // GPT-6 family (API list prices, 2026-09; fast mode doubles, flex halves, long context past
     // 272K doubles input/cache and lifts output 1.5x — same shape as the 5.6 rows). Until these
@@ -465,6 +570,14 @@ static PRICING_MODELS: LazyLock<HashMap<&'static str, ModelPrice>> = LazyLock::n
 /// *first* max-length match encountered in dict-insertion order — that
 /// requires preserving this exact order.
 static MODEL_ALIASES: &[(&str, &str)] = &[
+    ("claude-fable-5-1*", "claude-fable-5-1"),
+    ("claude-fable-5*", "claude-fable-5"),
+    ("claude-opus-5-5*", "claude-opus-5-5"),
+    ("claude-opus-5*", "claude-opus-5"),
+    ("claude-opus-4-8*", "claude-opus-4-8"),
+    ("claude-opus-4-7*", "claude-opus-4-7"),
+    ("claude-sonnet-5*", "claude-sonnet-5"),
+    ("claude-haiku-4-5*", "claude-haiku-4-5"),
     ("gpt-6.1-sol*", "gpt-6.1-sol"),
     ("gpt-6-astra*", "gpt-6-astra"),
     ("gpt-6-sol*", "gpt-6-sol"),
@@ -683,6 +796,25 @@ fn effective_rates(
 ///
 /// `cached_input_tokens` is clamped into `[0, input_tokens]` before use,
 /// exactly like `_normalize_usage` (`pricing.py:58-70`) clamps it.
+/// API list-price estimate of one Claude message as Claude Code records it: fresh input, the two
+/// cache-write TTLs, cache reads and output, each at its own rate. A row without cache-write
+/// rates (an OpenAI row would never get here) charges writes at the input rate.
+pub fn claude_message_cost_usd(
+    price: &ModelPrice,
+    input_tokens: i64,
+    cache_write_5m_tokens: i64,
+    cache_write_1h_tokens: i64,
+    cache_read_tokens: i64,
+    output_tokens: i64,
+) -> f64 {
+    let m = |n: i64| n.max(0) as f64 / 1_000_000.0;
+    m(input_tokens) * price.input_per_1m
+        + m(cache_write_5m_tokens) * price.cache_write_5m_per_1m.unwrap_or(price.input_per_1m)
+        + m(cache_write_1h_tokens) * price.cache_write_1h_per_1m.unwrap_or(price.input_per_1m)
+        + m(cache_read_tokens) * price.cached_input_per_1m.unwrap_or(price.input_per_1m)
+        + m(output_tokens) * price.output_per_1m
+}
+
 pub fn cost_usd(
     price: &ModelPrice,
     input_tokens: i64,
@@ -801,6 +933,33 @@ mod custom_rate_tests {
         assert!((cost_usd(astra, 100_000, 0, 0, None) - 1.0).abs() < 1e-9);
         assert!((cost_usd(astra, 100_000, 0, 0, Some("priority")) - 2.0).abs() < 1e-9);
         assert!((cost_usd(astra, 100_000, 0, 0, Some("ultrafast")) - 8.0).abs() < 1e-9);
+    }
+
+    /// Every Claude slug Claude Code writes into its transcripts resolves to a price row, and a
+    /// message is charged at four distinct rates: fresh input, 5-minute and 1-hour cache writes,
+    /// cache reads, plus output.
+    #[test]
+    fn claude_transcript_models_are_priced_per_cache_tier() {
+        for (slug, input) in [
+            ("claude-fable-5-1", 10.0),
+            ("claude-fable-5", 10.0),
+            ("claude-opus-5-5", 4.0),
+            ("claude-opus-5", 5.0),
+            ("claude-opus-4-8", 15.0),
+            ("claude-opus-4-7", 15.0),
+            ("claude-sonnet-5", 2.0),
+            ("claude-haiku-4-5", 1.0),
+            ("claude-opus-5-5-20260815", 4.0),
+        ] {
+            let p = pricing_for_model(slug).unwrap_or_else(|| panic!("{slug} unpriced"));
+            assert_eq!(p.input_per_1m, input, "{slug}");
+        }
+        let fable = pricing_for_model("claude-fable-5-1").unwrap();
+        // 1M of each bucket: 10 + 12.5 + 20 + 0.25 + 50.
+        let cost =
+            claude_message_cost_usd(fable, 1_000_000, 1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        assert!((cost - 92.75).abs() < 1e-9, "{cost}");
+        assert_eq!(claude_message_cost_usd(fable, 0, 0, 0, 0, 0), 0.0);
     }
 
     /// An Ultrafast turn burns 8x a standard one and has no API price of its own, so the

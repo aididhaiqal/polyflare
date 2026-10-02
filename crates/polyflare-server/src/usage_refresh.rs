@@ -151,7 +151,7 @@ fn split_usage_by_duration(
     (five_hour_used, weekly_used)
 }
 
-fn unix_now() -> i64 {
+pub fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Push Claude Code's local transcript usage to PolyFlare (POST /api/claude/local-usage).
+
+Reads ~/.claude/projects/**/*.jsonl — the per-session transcripts Claude Code writes, the same
+source ccusage reads — and sends one row per assistant message: model, token counts (fresh
+input, 5-minute and 1-hour cache writes, cache reads, output), timestamp, request/message ids,
+session id and project path. Never message text. Stdlib only; runs anywhere Claude Code runs
+(macOS, Linux/WSL). Idempotent: the server keys rows by (machine, request_id, message_id), and a
+state file remembers how far into each file it has read, so a cron entry every few minutes is
+cheap.
+
+    claude-usage-push --master https://ultraflux.tail6de914.ts.net \
+        --token-file ~/.polyflare/master-token --machine macbook
+
+Options: --projects DIR (default ~/.claude/projects), --state FILE (default
+~/.polyflare/claude-usage-push.json), --batch N (default 500), --full (ignore the state file
+and re-send everything; harmless, the server ignores duplicates).
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+
+def iso_to_unix(value):
+    if not value:
+        return None
+    try:
+        return int(dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return None
+
+
+def rows_from_lines(lines, project_hint):
+    """Assistant records carrying usage, deduped by (requestId, message.id): Claude Code writes
+    several records per streamed message and the last one carries the final counts."""
+    rows = {}
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("type") != "assistant":
+            continue
+        msg = d.get("message") or {}
+        usage = msg.get("usage") if isinstance(msg, dict) else None
+        model = msg.get("model")
+        if not isinstance(usage, dict) or not model or model.startswith("<"):
+            continue  # "<synthetic>" records are Claude Code's own, not a billed model call
+        request_id = d.get("requestId") or ""
+        message_id = msg.get("id") or d.get("uuid") or ""
+        ts = iso_to_unix(d.get("timestamp"))
+        if not request_id or not message_id or not ts:
+            continue
+        cache_detail = usage.get("cache_creation") or {}
+        write_5m = int(cache_detail.get("ephemeral_5m_input_tokens") or 0)
+        write_1h = int(cache_detail.get("ephemeral_1h_input_tokens") or 0)
+        total_write = int(usage.get("cache_creation_input_tokens") or 0)
+        if write_5m + write_1h == 0 and total_write:
+            write_5m = total_write  # older transcripts: no TTL split, assume the 5-minute cache
+        rows[(request_id, message_id)] = {
+            "request_id": request_id,
+            "message_id": message_id,
+            "session_id": d.get("sessionId"),
+            "project": d.get("cwd") or project_hint,
+            "model": model,
+            "ts": ts,
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+            "cache_write_5m_tokens": write_5m,
+            "cache_write_1h_tokens": write_1h,
+            "cache_read_tokens": int(usage.get("cache_read_input_tokens") or 0),
+            "service_tier": usage.get("service_tier"),
+            "speed": usage.get("speed"),
+        }
+    return list(rows.values())
+
+
+def post(master, token, machine, rows):
+    body = json.dumps({"machine": machine, "rows": rows}).encode()
+    req = urllib.request.Request(
+        master.rstrip("/") + "/api/claude/local-usage",
+        data=body,
+        method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return json.load(resp)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--master", required=True)
+    ap.add_argument("--token-file", default=os.path.expanduser("~/.polyflare/master-token"))
+    ap.add_argument("--machine", required=True)
+    ap.add_argument("--projects", default=os.path.expanduser("~/.claude/projects"))
+    ap.add_argument("--state", default=os.path.expanduser("~/.polyflare/claude-usage-push.json"))
+    ap.add_argument("--batch", type=int, default=500)
+    ap.add_argument("--full", action="store_true")
+    args = ap.parse_args()
+
+    with open(args.token_file) as f:
+        token = f.read().strip()
+    state = {}
+    if not args.full and os.path.exists(args.state):
+        with open(args.state) as f:
+            state = json.load(f)
+
+    pending, touched = [], {}
+    for root, _dirs, files in os.walk(args.projects):
+        for name in files:
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            offset = int(state.get(path, {}).get("offset", 0))
+            if offset > size:
+                offset = 0  # truncated or rewritten: start over, the server dedupes
+            if offset == size:
+                continue
+            with open(path, "rb") as f:
+                f.seek(offset)
+                chunk = f.read()
+            # Only consume complete lines; the tail may still be mid-write.
+            last_nl = chunk.rfind(b"\n")
+            if last_nl < 0:
+                continue
+            consumed = offset + last_nl + 1
+            lines = chunk[: last_nl + 1].decode("utf-8", errors="replace").split("\n")
+            pending.extend(rows_from_lines(lines, os.path.basename(root)))
+            touched[path] = consumed
+
+    inserted = received = 0
+    unpriced = set()
+    for i in range(0, len(pending), args.batch):
+        batch = pending[i : i + args.batch]
+        try:
+            result = post(args.master, token, args.machine, batch)
+        except urllib.error.HTTPError as e:
+            print(f"push failed: HTTP {e.code} {e.read()[:200]!r}", file=sys.stderr)
+            sys.exit(1)
+        except (urllib.error.URLError, OSError) as e:
+            print(f"push failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        inserted += int(result.get("inserted", 0))
+        received += int(result.get("received", 0))
+        unpriced.update(result.get("unpriced_models") or [])
+
+    # Advance offsets only after every batch landed, so a failed run re-reads the same bytes.
+    for path, consumed in touched.items():
+        state[path] = {"offset": consumed}
+    os.makedirs(os.path.dirname(args.state), exist_ok=True)
+    tmp = args.state + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, args.state)
+    print(
+        f"{dt.datetime.now().isoformat(timespec='seconds')} machine={args.machine} files={len(touched)} "
+        f"rows={received} new={inserted}" + (f" unpriced={sorted(unpriced)}" if unpriced else "")
+    )
+
+
+if __name__ == "__main__":
+    main()

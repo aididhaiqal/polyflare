@@ -381,6 +381,79 @@ async fn claude_usage_lists_each_anthropic_seat_like_claude_codes_usage_command(
     assert_eq!(arr[1]["plan_type"], "max_20x");
 }
 
+/// Claude Code transcript rows pushed twice land once, are priced per model at ingest, and the
+/// summary breaks them down by model, day, project and machine over the requested range.
+#[tokio::test]
+async fn claude_local_usage_ingest_is_idempotent_and_the_summary_prices_each_model() {
+    let (pf, _state) = spawn_with_state(seed_store().await).await;
+    let client = reqwest::Client::new();
+    let ts = now() - 3600;
+    let push = serde_json::json!({
+        "machine": "macbook",
+        "rows": [
+            {"request_id": "req_1", "message_id": "msg_1", "session_id": "s1", "project": "/w/polyflare",
+             "model": "claude-fable-5-1", "ts": ts, "input_tokens": 1_000_000, "output_tokens": 0,
+             "cache_write_5m_tokens": 0, "cache_write_1h_tokens": 0, "cache_read_tokens": 0},
+            {"request_id": "req_2", "message_id": "msg_2", "project": "/w/polyflare",
+             "model": "claude-opus-5-5", "ts": ts + 60, "input_tokens": 0, "output_tokens": 1_000_000,
+             "cache_write_5m_tokens": 0, "cache_write_1h_tokens": 0, "cache_read_tokens": 0},
+            {"request_id": "req_3", "message_id": "msg_3", "project": "/w/other",
+             "model": "claude-mystery-9", "ts": ts + 120, "input_tokens": 10, "output_tokens": 10}
+        ]
+    });
+    for round in 0..2 {
+        let resp: serde_json::Value = client
+            .post(format!("{pf}/api/claude/local-usage"))
+            .header("authorization", "Bearer secret")
+            .json(&push)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(resp["received"], 3, "{resp}");
+        assert_eq!(resp["inserted"], if round == 0 { 3 } else { 0 }, "{resp}");
+        assert_eq!(
+            resp["unpriced_models"],
+            serde_json::json!(["claude-mystery-9"])
+        );
+    }
+
+    let body: serde_json::Value = client
+        .get(format!("{pf}/api/claude/local-usage?range=24h"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["totals"]["messages"], 3, "{body}");
+    assert_eq!(body["totals"]["priced_messages"], 2);
+    let by_model = body["by_model"].as_array().unwrap();
+    assert_eq!(
+        by_model[0]["key"], "claude-opus-5-5",
+        "costliest first: {body}"
+    );
+    assert_eq!(by_model[0]["cost_usd"], 20.0);
+    assert_eq!(by_model[1]["key"], "claude-fable-5-1");
+    assert_eq!(by_model[1]["cost_usd"], 10.0);
+    assert_eq!(by_model[2]["cost_usd"], 0.0);
+    assert_eq!(body["by_machine"][0]["key"], "macbook");
+    assert_eq!(body["by_project"][0]["key"], "/w/polyflare");
+    assert_eq!(body["by_day"].as_array().unwrap().len(), 1);
+    assert_eq!(body["latest_ts"], ts + 120);
+
+    let bad = client
+        .get(format!("{pf}/api/claude/local-usage?range=1y"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+}
+
 #[tokio::test]
 async fn accounts_list_surfaces_per_model_caps_like_the_detail_view() {
     // The Anthropic usage refresh records each seat's per-model weekly windows (e.g. `Fable`) on

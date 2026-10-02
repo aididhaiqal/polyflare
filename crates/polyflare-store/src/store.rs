@@ -227,6 +227,10 @@ impl Store {
         ResetCreditRepo::new(self.pool.clone())
     }
 
+    pub fn claude_local_usage(&self) -> crate::claude_local_usage_repo::ClaudeLocalUsageRepo {
+        crate::claude_local_usage_repo::ClaudeLocalUsageRepo::new(self.pool.clone())
+    }
+
     /// The current token/identity-write generation (see `token_generation` field). The server's
     /// `TokenCache` reads this to invalidate ONLY on token/identity writes, not on usage/status
     /// churn.

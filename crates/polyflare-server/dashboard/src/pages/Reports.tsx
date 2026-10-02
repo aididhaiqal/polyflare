@@ -24,8 +24,8 @@ import {
 } from "recharts";
 
 import type { ReportBreakdownView, ReportBucketView, ReportsView } from "../lib/api";
-import { compactNum, latency, pctTenths, ratePct } from "../lib/format";
-import { useClaudeUsage, useProviders, useReports, type ReportsParams } from "../lib/queries";
+import { compactNum, latency, pctTenths, ratePct, relTime } from "../lib/format";
+import { useClaudeLocalUsage, useClaudeUsage, useProviders, useReports, type ReportsParams } from "../lib/queries";
 import { Card } from "../ui/Card";
 import { Col, Grid } from "../ui/Grid";
 import { Activity, AlertTriangle, BarChart3, Clock, Coins, Layers, Zap } from "../ui/icons";
@@ -227,7 +227,101 @@ export function Reports() {
       )}
 
       <ClaudeUsageSection />
+      <ClaudeTranscriptSection range={range} />
     </div>
+  );
+}
+
+// Claude Code transcript usage — per-model tokens and API list-price estimates, imported from
+// each machine's ~/.claude/projects by scripts/claude-usage-push (the ccusage source). Follows
+// the page's range switch; "up to" says how fresh the newest pushed message is.
+const CLAUDE_TABLE_HEAD = "px-2 py-1.5 text-left text-[9px] font-medium uppercase tracking-wide text-fg opacity-60";
+const CLAUDE_TABLE_CELL = "px-2 py-1.5 text-[11px] tabular-nums";
+
+function ClaudeAggTable({ title, rows, firstColumn, nowMs }: { title: string; rows: ReportsClaudeAgg[]; firstColumn: string; nowMs?: number }) {
+  void nowMs;
+  if (rows.length === 0) return null;
+  return (
+    <div className="min-w-0 overflow-x-auto">
+      <div className="mb-1 text-[11px] font-semibold text-fg opacity-75">{title}</div>
+      <table className="w-full border-collapse">
+        <thead>
+          <tr className="border-b border-border/70">
+            <th className={CLAUDE_TABLE_HEAD}>{firstColumn}</th>
+            <th className={clsx(CLAUDE_TABLE_HEAD, "text-right")}>Messages</th>
+            <th className={clsx(CLAUDE_TABLE_HEAD, "text-right")}>Input</th>
+            <th className={clsx(CLAUDE_TABLE_HEAD, "text-right")}>Cache write</th>
+            <th className={clsx(CLAUDE_TABLE_HEAD, "text-right")}>Cache read</th>
+            <th className={clsx(CLAUDE_TABLE_HEAD, "text-right")}>Output</th>
+            <th className={clsx(CLAUDE_TABLE_HEAD, "text-right")}>Est. cost</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.key} className="border-b border-border/40 last:border-0">
+              <td className={clsx(CLAUDE_TABLE_CELL, "max-w-[260px] truncate text-fg")} title={r.key}>{r.key}</td>
+              <td className={clsx(CLAUDE_TABLE_CELL, "text-right text-fg opacity-80")}>{compactNum(r.messages)}</td>
+              <td className={clsx(CLAUDE_TABLE_CELL, "text-right text-fg opacity-80")}>{compactNum(r.input_tokens)}</td>
+              <td className={clsx(CLAUDE_TABLE_CELL, "text-right text-fg opacity-80")}>{compactNum(r.cache_write_tokens)}</td>
+              <td className={clsx(CLAUDE_TABLE_CELL, "text-right text-fg opacity-80")}>{compactNum(r.cache_read_tokens)}</td>
+              <td className={clsx(CLAUDE_TABLE_CELL, "text-right text-fg opacity-80")}>{compactNum(r.output_tokens)}</td>
+              <td className={clsx(CLAUDE_TABLE_CELL, "text-right font-medium text-fg")} title={r.priced_messages < r.messages ? `${r.messages - r.priced_messages} message(s) on an unpriced model` : undefined}>
+                ${r.cost_usd.toFixed(2)}{r.priced_messages < r.messages ? "*" : ""}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+type ReportsClaudeAgg = import("../lib/api").ClaudeLocalAggView;
+
+function ClaudeStat({ label, value, hint }: { label: string; value: string; hint?: string }) {
+  return (
+    <div className="rounded-lg border border-border/70 bg-bg/45 px-3 py-2">
+      <div className="text-[9.5px] font-semibold uppercase tracking-[0.08em] text-fg opacity-45">{label}</div>
+      <div className="mt-0.5 text-[15px] font-semibold tabular-nums text-fg">{value}</div>
+      {hint && <div className="text-[10px] text-fg opacity-50">{hint}</div>}
+    </div>
+  );
+}
+
+function ClaudeTranscriptSection({ range }: { range: string }) {
+  const { data, isError } = useClaudeLocalUsage(range);
+  if (isError) {
+    return (
+      <Card className="gap-2">
+        <div className="text-[13px] font-semibold uppercase tracking-wide text-fg opacity-70">Claude Code usage</div>
+        <p className="text-[11px] text-warn">Could not load Claude Code usage.</p>
+      </Card>
+    );
+  }
+  if (!data || !data.totals) return null;
+  const t = data.totals;
+  const cacheRate = t.input_tokens + t.cache_write_tokens + t.cache_read_tokens > 0
+    ? (100 * t.cache_read_tokens) / (t.input_tokens + t.cache_write_tokens + t.cache_read_tokens)
+    : 0;
+  return (
+    <Card className="gap-3">
+      <div className="text-[13px] font-semibold uppercase tracking-wide text-fg opacity-70">Claude Code usage</div>
+      <p className="-mt-1 text-[11px] text-fg opacity-55">
+        Per-model tokens and API list-price estimates from Claude Code's own transcripts on each machine, over the
+        selected window{data.latest_ts !== null ? ` · data up to ${relTime(data.latest_ts)}` : ""}. Subscription seats
+        are not billed per token; the estimate is what the same traffic would cost on the API.
+      </p>
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        <ClaudeStat label="Messages" value={compactNum(t.messages)} />
+        <ClaudeStat label="Est. cost" value={`$${t.cost_usd.toFixed(2)}`} hint={t.priced_messages < t.messages ? `${t.messages - t.priced_messages} unpriced` : "API list price"} />
+        <ClaudeStat label="Output tokens" value={compactNum(t.output_tokens)} />
+        <ClaudeStat label="Cache hit" value={`${cacheRate.toFixed(0)}%`} hint="of prompt tokens read from cache" />
+      </div>
+      <ClaudeAggTable title="By model" rows={data.by_model} firstColumn="Model" />
+      <ClaudeAggTable title="By day" rows={[...data.by_day].reverse().slice(0, 14)} firstColumn="Day (UTC)" />
+      <ClaudeAggTable title="By project" rows={data.by_project.slice(0, 10)} firstColumn="Project" />
+      {data.by_machine.length > 1 && <ClaudeAggTable title="By machine" rows={data.by_machine} firstColumn="Machine" />}
+    </Card>
   );
 }
 
