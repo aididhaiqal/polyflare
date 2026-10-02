@@ -9,6 +9,7 @@
 // CONTENT-SAFETY: `ReportsView` is sourced from the same content-free `request_log` aggregates the
 // rest of the dashboard already exposes (counts, cost, token COUNTS, timing) — never a body,
 // prompt, response, or key.
+import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import clsx from "clsx";
 import {
@@ -24,11 +25,12 @@ import {
 
 import type { ReportBreakdownView, ReportBucketView, ReportsView } from "../lib/api";
 import { compactNum, latency, pctTenths, ratePct } from "../lib/format";
-import { useProviders, useReports, type ReportsParams } from "../lib/queries";
+import { useClaudeUsage, useProviders, useReports, type ReportsParams } from "../lib/queries";
 import { Card } from "../ui/Card";
 import { Col, Grid } from "../ui/Grid";
 import { Activity, AlertTriangle, BarChart3, Clock, Coins, Layers, Zap } from "../ui/icons";
 import { MetricCard } from "../ui/MetricCard";
+import { ClaudeSeatCard } from "../ui/ClaudeSeatCard";
 import { ReportSection, type ReportSectionColumn } from "../ui/ReportSection";
 
 type RangeKey = "24h" | "7d" | "30d";
@@ -223,7 +225,40 @@ export function Reports() {
           <PerformanceSection data={data} dimensionLabel={dimensionLabel} />
         </>
       )}
+
+      <ClaudeUsageSection />
     </div>
+  );
+}
+
+// Claude usage — the `/usage` readout of every Claude seat, from PolyFlare's own poll. It sits
+// outside the reports window and the request-based sections on purpose: Claude Code talks to
+// Anthropic directly, so relayed traffic says nothing about these seats; the poll does.
+function ClaudeUsageSection() {
+  const { data, isError } = useClaudeUsage();
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNowMs(Date.now()), 30_000);
+    return () => window.clearInterval(id);
+  }, []);
+  if (!isError && (!data || data.length === 0)) return null;
+  return (
+    <Card className="gap-3">
+      <div className="text-[13px] font-semibold uppercase tracking-wide text-fg opacity-70">
+        Claude usage
+      </div>
+      <p className="-mt-1 text-[11px] text-fg opacity-55">
+        What <code className="rounded bg-muted px-1">/usage</code> shows in Claude Code, per seat — from PolyFlare's own
+        poll, independent of the window above.
+      </p>
+      {isError ? (
+        <p className="text-[11px] text-warn">Could not load Claude usage.</p>
+      ) : (
+        <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+          {data?.map((seat) => <ClaudeSeatCard key={seat.id} seat={seat} nowMs={nowMs} />)}
+        </div>
+      )}
+    </Card>
   );
 }
 
