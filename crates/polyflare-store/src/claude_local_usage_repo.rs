@@ -56,6 +56,23 @@ pub struct ClaudeLocalSummary {
     pub latest_ts: Option<i64>,
 }
 
+/// Claude transcript usage in the shape the Reports API merges into its own metrics. Token
+/// fields follow the Responses contract the dashboard assumes: `input_tokens` is the WHOLE
+/// prompt (fresh + cache writes + cache reads), `cached_tokens` the cache-read subset.
+#[derive(Debug, Clone, PartialEq, Default, FromRow)]
+pub struct ClaudeReportAgg {
+    pub key: String,
+    pub bucket_ts: i64,
+    pub messages: i64,
+    pub input_tokens: i64,
+    pub cached_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_usd: f64,
+}
+
+const REPORT_SELECT: &str = "COUNT(*) AS messages,      COALESCE(SUM(input_tokens + cache_write_5m_tokens + cache_write_1h_tokens + cache_read_tokens),0) AS input_tokens,      COALESCE(SUM(cache_read_tokens),0) AS cached_tokens,      COALESCE(SUM(cache_write_5m_tokens + cache_write_1h_tokens),0) AS cache_write_tokens,      COALESCE(SUM(output_tokens),0) AS output_tokens,      COALESCE(SUM(cost_usd),0.0) AS cost_usd";
+
 #[derive(Clone)]
 pub struct ClaudeLocalUsageRepo {
     pool: SqlitePool,
@@ -171,6 +188,54 @@ impl ClaudeLocalUsageRepo {
             by_machine,
             latest_ts,
         })
+    }
+
+    /// Per time bucket (`(ts / bucket_secs) * bucket_secs`) for the Reports time series.
+    pub async fn report_series(
+        &self,
+        since_ts: i64,
+        bucket_secs: i64,
+    ) -> Result<Vec<ClaudeReportAgg>, StoreError> {
+        let sql = format!(
+            "SELECT 'bucket' AS key, (ts / ?) * ? AS bucket_ts, {REPORT_SELECT}              FROM claude_local_usage WHERE ts >= ? GROUP BY bucket_ts ORDER BY bucket_ts"
+        );
+        Ok(sqlx::query_as::<_, ClaudeReportAgg>(&sql)
+            .bind(bucket_secs)
+            .bind(bucket_secs)
+            .bind(since_ts)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// Per Reports dimension: `model` is the transcript's model slug; `provider` and
+    /// `operation` collapse to `claude_code`; `account` is `claude-code:<machine>`.
+    pub async fn report_breakdown(
+        &self,
+        since_ts: i64,
+        dimension: &str,
+    ) -> Result<Vec<ClaudeReportAgg>, StoreError> {
+        let key_expr = match dimension {
+            "model" => "model",
+            "account" => "'claude-code:' || machine",
+            _ => "'claude_code'",
+        };
+        let sql = format!(
+            "SELECT {key_expr} AS key, 0 AS bucket_ts, {REPORT_SELECT}              FROM claude_local_usage WHERE ts >= ? GROUP BY 1 ORDER BY cost_usd DESC"
+        );
+        Ok(sqlx::query_as::<_, ClaudeReportAgg>(&sql)
+            .bind(since_ts)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    pub async fn report_totals(&self, since_ts: i64) -> Result<ClaudeReportAgg, StoreError> {
+        let sql = format!(
+            "SELECT 'all' AS key, 0 AS bucket_ts, {REPORT_SELECT} FROM claude_local_usage WHERE ts >= ?"
+        );
+        Ok(sqlx::query_as::<_, ClaudeReportAgg>(&sql)
+            .bind(since_ts)
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     /// Newest imported `ts` per machine — what each push script has delivered so far.

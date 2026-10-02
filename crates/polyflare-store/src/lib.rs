@@ -29,7 +29,7 @@ pub use account_model_support_repo::{
 pub use admin_token_repo::{AdminTokenRepo, AdminTokenRow};
 pub use api_key_repo::{ApiKeyRepo, ApiKeyRow};
 pub use claude_local_usage_repo::{
-    ClaudeLocalAgg, ClaudeLocalSummary, ClaudeLocalUsageRepo, ClaudeLocalUsageRow,
+    ClaudeLocalAgg, ClaudeLocalSummary, ClaudeLocalUsageRepo, ClaudeLocalUsageRow, ClaudeReportAgg,
 };
 pub use continuity_repo::{ContinuityRepo, SessionRow};
 pub use crypto::TokenCipher;

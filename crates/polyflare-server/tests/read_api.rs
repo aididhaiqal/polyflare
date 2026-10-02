@@ -2504,6 +2504,99 @@ fn report_endpoint_row(
 /// `totals` carrying the derived `error_rate`/`cache_hit_rate`. `?range=bogus` is a 400 (an
 /// explicit-but-unknown value, NOT defaulted); the endpoint sits behind the same admin gate as
 /// every other `/api/*` read, so a keyless request is a 401.
+/// Claude Code transcript rows join the relayed traffic in the Reports totals, time series and
+/// breakdown (as their own model keys), stay out of the passthrough-only scope and of a filter
+/// for another provider, and never disturb the latency averages.
+#[tokio::test]
+async fn reports_merge_claude_code_transcript_usage_into_the_top_sections() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let insert_ts = now();
+    store
+        .request_log()
+        .insert(&report_endpoint_row(
+            insert_ts, "model-a", 200, 1000, 400, 1.5,
+        ))
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+    let pf = spawn(store).await;
+    let client = reqwest::Client::new();
+    let push = serde_json::json!({
+        "machine": "macbook",
+        "rows": [
+            {"request_id": "r1", "message_id": "m1", "model": "claude-fable-5-1", "ts": insert_ts - 60,
+             "input_tokens": 100_000, "output_tokens": 100_000, "cache_read_tokens": 1_000_000},
+            {"request_id": "r2", "message_id": "m2", "model": "claude-fable-5-1", "ts": insert_ts - 30,
+             "input_tokens": 0, "output_tokens": 0, "cache_write_1h_tokens": 1_000_000}
+        ]
+    });
+    let ingest = client
+        .post(format!("{pf}/api/claude/local-usage"))
+        .header("authorization", "Bearer secret")
+        .json(&push)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ingest.status(), 200);
+
+    let get = |q: &str| {
+        let client = client.clone();
+        let url = format!("{pf}/api/reports?{q}");
+        async move {
+            client
+                .get(url)
+                .header("authorization", "Bearer secret")
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let body = get("range=7d&dimension=model").await;
+    // Fable: (0.1M*10 + 1M*0.25 + 0.1M*50) + (1M*20) = 1 + 0.25 + 5 + 20 = 26.25
+    assert_eq!(body["totals"]["requests"], 3, "{body}");
+    assert!(
+        (body["totals"]["cost_usd"].as_f64().unwrap() - 27.75).abs() < 1e-6,
+        "{body}"
+    );
+    // The relayed model-a row carries 400 cached tokens of its own; the Claude rows add 1M.
+    assert_eq!(body["totals"]["cached_tokens"], 1_000_400);
+    assert_eq!(body["totals"]["cache_write_tokens"], 1_000_000);
+    let fable = body["breakdown"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "claude-fable-5-1")
+        .expect("claude model in the breakdown");
+    assert_eq!(fable["requests"], 2);
+    assert!((fable["cost_usd"].as_f64().unwrap() - 26.25).abs() < 1e-6);
+    assert_eq!(fable["errors"], 0);
+    let series_requests: i64 = body["time_series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["requests"].as_i64().unwrap())
+        .sum();
+    assert_eq!(series_requests, 3, "{body}");
+
+    let by_provider = get("range=7d&dimension=provider").await;
+    assert!(by_provider["breakdown"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["key"] == "claude_code"));
+
+    let backend_only = get("range=7d&scope=backend").await;
+    assert_eq!(backend_only["totals"]["requests"], 0, "{backend_only}");
+    let codex_only = get("range=7d&provider=codex").await;
+    assert_eq!(codex_only["totals"]["requests"], 1, "{codex_only}");
+    let anthropic_only = get("range=7d&provider=anthropic").await;
+    assert_eq!(anthropic_only["totals"]["requests"], 2, "{anthropic_only}");
+}
+
 #[tokio::test]
 async fn reports_endpoint_assembles_zero_filled_series_breakdown_and_totals() {
     let dir = tempfile::tempdir().unwrap();

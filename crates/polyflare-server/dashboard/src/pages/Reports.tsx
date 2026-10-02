@@ -232,9 +232,10 @@ export function Reports() {
   );
 }
 
-// Claude Code transcript usage — per-model tokens and API list-price estimates, imported from
-// each machine's ~/.claude/projects by scripts/claude-usage-push (the ccusage source). Follows
-// the page's range switch; "up to" says how fresh the newest pushed message is.
+// Claude Code transcript usage — imported from each machine's ~/.claude/projects by
+// scripts/claude-usage-push (the ccusage source). The per-model numbers are MERGED into the
+// Cost/Usage sections above by `/api/reports`; this block keeps only what has no home up
+// there: the per-project and per-machine split. Follows the page's range switch.
 const CLAUDE_TABLE_HEAD = "px-2 py-1.5 text-left text-[9px] font-medium uppercase tracking-wide text-fg opacity-60";
 const CLAUDE_TABLE_CELL = "px-2 py-1.5 text-[11px] tabular-nums";
 
@@ -305,11 +306,12 @@ function ClaudeTranscriptSection({ range }: { range: string }) {
     : 0;
   return (
     <Card className="gap-3">
-      <div className="text-[13px] font-semibold uppercase tracking-wide text-fg opacity-70">Claude Code usage</div>
+      <div className="text-[13px] font-semibold uppercase tracking-wide text-fg opacity-70">Claude Code by project</div>
       <p className="-mt-1 text-[11px] text-fg opacity-55">
-        Per-model tokens and API list-price estimates from Claude Code's own transcripts on each machine, over the
-        selected window{data.latest_ts !== null ? ` · data up to ${relTime(data.latest_ts)}` : ""}. Subscription seats
-        are not billed per token; the estimate is what the same traffic would cost on the API.
+        Claude Code's transcript usage is already counted in the Cost and Usage sections above, keyed by model. This is
+        the split those sections cannot show: by project and by machine
+        {data.latest_ts !== null ? ` · data up to ${relTime(data.latest_ts)}` : ""}. Estimates are API list price; the
+        subscription seats are not billed per token.
       </p>
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
         <ClaudeStat label="Messages" value={compactNum(t.messages)} />
@@ -317,8 +319,6 @@ function ClaudeTranscriptSection({ range }: { range: string }) {
         <ClaudeStat label="Output tokens" value={compactNum(t.output_tokens)} />
         <ClaudeStat label="Cache hit" value={`${cacheRate.toFixed(0)}%`} hint="of prompt tokens read from cache" />
       </div>
-      <ClaudeAggTable title="By model" rows={data.by_model} firstColumn="Model" />
-      <ClaudeAggTable title="By day" rows={[...data.by_day].reverse().slice(0, 14)} firstColumn="Day (UTC)" />
       <ClaudeAggTable title="By project" rows={data.by_project.slice(0, 10)} firstColumn="Project" />
       {data.by_machine.length > 1 && <ClaudeAggTable title="By machine" rows={data.by_machine} firstColumn="Machine" />}
     </Card>

@@ -1999,6 +1999,20 @@ struct ReportsView {
 /// store's `reports_series` only emits buckets with >= 1 row, same contract `series_since` has;
 /// this handler fills the gaps, mirroring [`overview_series_handler`]'s zero-fill exactly (same
 /// aligned-grid-walk, same "remove-from-map-or-default" pattern).
+/// Fold one Claude transcript aggregate into Reports metrics under the Responses token contract:
+/// a message is a request, its whole prompt is `input_tokens`, cache reads are the cached subset,
+/// `tokens` is prompt + output, `effective_tokens` is uncached prompt + output. Errors, reasoning
+/// and orchestration tokens and the latency averages are untouched (transcripts carry none).
+fn add_claude_usage(m: &mut polyflare_store::ReportMetrics, c: &polyflare_store::ClaudeReportAgg) {
+    m.requests += c.messages;
+    m.cost_usd += c.cost_usd;
+    m.tokens += c.input_tokens + c.output_tokens;
+    m.input_tokens += c.input_tokens;
+    m.cached_tokens += c.cached_tokens;
+    m.cache_write_tokens += c.cache_write_tokens;
+    m.effective_tokens += (c.input_tokens - c.cached_tokens).max(0) + c.output_tokens;
+}
+
 pub async fn reports_handler(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ReportsQuery>,
@@ -2063,8 +2077,43 @@ pub async fn reports_handler(
     // Zero-fill the full grid from the aligned window start through the aligned "now" bucket —
     // byte-for-byte the same walk `overview_series_handler` does, just over `ReportBucket`/
     // `ReportMetrics` instead of `RequestBucket`.
+    // Claude Code transcript usage (imported from each machine, see `claude_local_api`) joins
+    // the relayed traffic in every logical scope: Claude Code never talks through PolyFlare, so
+    // without this the top sections would miss the fleet's largest Claude consumer. It is
+    // excluded from the `backend` scope (passthrough-only) and from a provider filter that
+    // names another provider; `anthropic` and `claude_code` both include it. It carries no
+    // latency, so the duration/TTFT averages stay those of the relayed turns.
+    let include_claude = !matches!(scope, ReportTrafficScope::Backend)
+        && provider.is_none_or(|p| matches!(p, "anthropic" | "claude_code"));
+    let claude_repo = state.store.claude_local_usage();
+    let (claude_totals, claude_series, claude_breakdown) = if include_claude {
+        match (
+            claude_repo.report_totals(since_ts).await,
+            claude_repo.report_series(since_ts, bucket_secs).await,
+            claude_repo.report_breakdown(since_ts, dimension).await,
+        ) {
+            (Ok(t), Ok(s), Ok(b)) => (Some(t), s, b),
+            _ => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
+        }
+    } else {
+        (None, Vec::new(), Vec::new())
+    };
+    let mut totals = totals;
+    if let Some(t) = claude_totals.as_ref() {
+        add_claude_usage(&mut totals, t);
+    }
+
     let mut by_ts: std::collections::BTreeMap<i64, polyflare_store::ReportBucket> =
         series_rows.into_iter().map(|b| (b.ts, b)).collect();
+    for agg in &claude_series {
+        let bucket = by_ts
+            .entry(agg.bucket_ts)
+            .or_insert_with(|| polyflare_store::ReportBucket {
+                ts: agg.bucket_ts,
+                metrics: polyflare_store::ReportMetrics::default(),
+            });
+        add_claude_usage(&mut bucket.metrics, agg);
+    }
     let aligned_start = (since_ts / bucket_secs) * bucket_secs;
     let aligned_now = (now / bucket_secs) * bucket_secs;
     let mut time_series = Vec::new();
@@ -2078,6 +2127,26 @@ pub async fn reports_handler(
         ts += bucket_secs;
     }
 
+    let mut breakdown_rows = breakdown_rows;
+    for agg in &claude_breakdown {
+        match breakdown_rows.iter_mut().find(|row| row.key == agg.key) {
+            Some(row) => add_claude_usage(&mut row.metrics, agg),
+            None => {
+                let mut metrics = polyflare_store::ReportMetrics::default();
+                add_claude_usage(&mut metrics, agg);
+                breakdown_rows.push(polyflare_store::ReportBreakdownRow {
+                    key: agg.key.clone(),
+                    metrics,
+                });
+            }
+        }
+    }
+    breakdown_rows.sort_by(|a, b| {
+        b.metrics
+            .cost_usd
+            .total_cmp(&a.metrics.cost_usd)
+            .then_with(|| b.metrics.requests.cmp(&a.metrics.requests))
+    });
     let breakdown = breakdown_rows
         .into_iter()
         .map(ReportBreakdownView::from)
