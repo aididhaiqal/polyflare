@@ -297,6 +297,90 @@ async fn accounts_list_surfaces_the_credit_balance_the_usage_poll_recorded() {
     );
 }
 
+/// `GET /api/claude/usage` lists every Anthropic seat with the `/usage`-style lines of its last
+/// poll; a seat with no poll yet falls back to the persisted windows and says so.
+#[tokio::test]
+async fn claude_usage_lists_each_anthropic_seat_like_claude_codes_usage_command() {
+    let store = seed_store().await;
+    let cipher = TokenCipher::from_key_bytes(&[13u8; 32]).unwrap();
+    for (id, plan) in [("claude-a", "max_20x"), ("claude-b", "max_5x")] {
+        let mut seat = account(id, &format!("{id}@example.test"), None);
+        seat.provider = "anthropic".to_string();
+        seat.plan_type = plan.to_string();
+        store
+            .accounts()
+            .insert(&seat, &tokens(), &cipher)
+            .await
+            .unwrap();
+    }
+    store
+        .accounts()
+        .insert_usage_window(
+            "claude-b",
+            "secondary",
+            55.0,
+            Some(1_900_000_000),
+            Some(10080),
+            now(),
+        )
+        .await
+        .unwrap();
+    let (pf, state) = spawn_with_state(store).await;
+    state.model_catalog.set_claude_usage(
+        "claude-a",
+        polyflare_server::anthropic_usage::ClaudeUsageSnapshot {
+            polled_at: 1_790_000_000,
+            session: Some(polyflare_server::anthropic_usage::ClaudeUsageLine {
+                kind: "session".into(),
+                model: None,
+                percent: 43.0,
+                resets_at: Some(1_790_003_600),
+                severity: Some("normal".into()),
+            }),
+            weekly_all: Some(polyflare_server::anthropic_usage::ClaudeUsageLine {
+                kind: "weekly_all".into(),
+                model: None,
+                percent: 12.0,
+                resets_at: Some(1_790_500_000),
+                severity: None,
+            }),
+            per_model: vec![polyflare_server::anthropic_usage::ClaudeUsageLine {
+                kind: "weekly_scoped".into(),
+                model: Some("Fable".into()),
+                percent: 100.0,
+                resets_at: Some(1_790_500_000),
+                severity: Some("limit_reached".into()),
+            }],
+            extra_usage_enabled: Some(false),
+            extra_usage_disabled_reason: Some("out_of_credits".into()),
+        },
+    );
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{pf}/api/claude/usage"))
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "codex seats are not listed: {body}");
+    // Most-used week first: claude-b (55% from history) before claude-a (12% from the poll).
+    assert_eq!(arr[0]["id"], "claude-b");
+    assert_eq!(arr[0]["source"], "history");
+    assert_eq!(arr[0]["weekly_all"]["percent"], 55.0);
+    assert!(arr[0]["session"].is_null());
+    assert_eq!(arr[1]["id"], "claude-a");
+    assert_eq!(arr[1]["source"], "poll");
+    assert_eq!(arr[1]["session"]["percent"], 43.0);
+    assert_eq!(arr[1]["per_model"][0]["model"], "Fable");
+    assert_eq!(arr[1]["per_model"][0]["severity"], "limit_reached");
+    assert_eq!(arr[1]["extra_usage_disabled_reason"], "out_of_credits");
+    assert_eq!(arr[1]["plan_type"], "max_20x");
+}
+
 #[tokio::test]
 async fn accounts_list_surfaces_per_model_caps_like_the_detail_view() {
     // The Anthropic usage refresh records each seat's per-model weekly windows (e.g. `Fable`) on

@@ -1486,6 +1486,7 @@ export const api = {
   overview: () => fetchJson<OverviewView>("/api/overview"),
   overviewSeries: () => fetchJson<OverviewSeriesView>("/api/overview/series"),
   accounts: () => fetchJson<AccountView[]>("/api/accounts"),
+  claudeUsage: () => fetchJson<ClaudeSeatUsageView[]>("/api/claude/usage"),
   account: (id: string) => fetchJson<AccountDetailView>(`/api/accounts/${encodeURIComponent(id)}`),
   accountTrends: (id: string) =>
     fetchJson<TrendsView>(`/api/accounts/${encodeURIComponent(id)}/trends`),
@@ -1539,4 +1540,32 @@ export function removeSsePin(threadId: string): Promise<SsePinsView> {
   return fetchJson<SsePinsView>(`/api/ws/sse-pins/${encodeURIComponent(threadId)}`, {
     method: "DELETE",
   });
+}
+
+/** `anthropic_usage.rs::ClaudeUsageLine` — one window of a Claude seat's `/usage` readout. */
+export interface ClaudeUsageLine {
+  kind: "session" | "weekly_all" | "weekly_scoped" | string;
+  model: string | null;
+  percent: number;
+  resets_at: number | null;
+  severity: string | null;
+}
+
+/** `read_api.rs::ClaudeSeatUsageView` — one row of `GET /api/claude/usage`: what Claude Code's
+ * `/usage` prints for that seat. `source` is `poll` when the last `/api/oauth/usage` poll is in
+ * memory (per-model lines, severities and extra-usage state only exist then) or `history` right
+ * after a restart, when only the persisted 5-hour/weekly windows are known. */
+export interface ClaudeSeatUsageView {
+  id: string;
+  email: string;
+  alias: string | null;
+  plan_type: string;
+  status: string;
+  source: "poll" | "history";
+  polled_at: number | null;
+  session: ClaudeUsageLine | null;
+  weekly_all: ClaudeUsageLine | null;
+  per_model: ClaudeUsageLine[];
+  extra_usage_enabled: boolean | null;
+  extra_usage_disabled_reason: string | null;
 }

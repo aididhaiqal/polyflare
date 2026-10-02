@@ -220,6 +220,85 @@ pub struct ModelCapWindow {
 /// EVERY per-model weekly window the payload carries — not only the exhausted ones — so the
 /// dashboard can show how close each model is to its own cap, while routing filters on `>= 100`.
 /// Per-model caps arrive ONLY as `weekly_scoped` entries with a `scope.model.display_name`.
+/// One line of a Claude seat's `/usage`-style readout: a window (session, weekly-all or one
+/// model's weekly cap), how full it is, when it resets, and the severity the upstream attached.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ClaudeUsageLine {
+    /// `session` | `weekly_all` | `weekly_scoped`.
+    pub kind: String,
+    /// The model this line is scoped to (`weekly_scoped` only), as the upstream names it.
+    pub model: Option<String>,
+    pub percent: f64,
+    pub resets_at: Option<i64>,
+    /// `normal` | `warning` | `limit_reached` (whatever the upstream sent), when present.
+    pub severity: Option<String>,
+}
+
+/// What Claude Code's `/usage` shows for one seat, assembled from the last successful poll of
+/// `/api/oauth/usage`: the 5-hour session, the all-models week, every per-model week the
+/// upstream reports, and the extra-usage (pay-as-you-go) state. Kept in memory per account and
+/// replaced on every poll; absent until the first poll after a restart.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ClaudeUsageSnapshot {
+    pub polled_at: i64,
+    pub session: Option<ClaudeUsageLine>,
+    pub weekly_all: Option<ClaudeUsageLine>,
+    pub per_model: Vec<ClaudeUsageLine>,
+    pub extra_usage_enabled: Option<bool>,
+    pub extra_usage_disabled_reason: Option<String>,
+}
+
+/// Build the `/usage`-style snapshot. The `five_hour`/`seven_day` windows are the authoritative
+/// percentages (they are what the gate uses); the `limits[]` entries of kind `session` /
+/// `weekly_all` only contribute their `severity`. Per-model lines come from `weekly_scoped`.
+pub fn claude_usage_snapshot(usage: &UsageResponse, now: i64) -> ClaudeUsageSnapshot {
+    let severity_for = |kind: &str| {
+        usage
+            .limits
+            .iter()
+            .find(|l| l.kind.as_deref() == Some(kind))
+            .and_then(|l| l.severity.clone())
+    };
+    let window_line = |kind: &str, w: Option<&UsageWindow>| {
+        w.and_then(|w| w.utilization)
+            .map(|percent| ClaudeUsageLine {
+                kind: kind.to_string(),
+                model: None,
+                percent,
+                resets_at: w
+                    .and_then(|w| w.resets_at.as_deref())
+                    .and_then(parse_iso_to_unix),
+                severity: severity_for(kind),
+            })
+    };
+    let per_model = usage
+        .limits
+        .iter()
+        .filter(|l| l.kind.as_deref() == Some("weekly_scoped"))
+        .filter_map(|l| {
+            let model = l.scope.as_ref()?.model.as_ref()?.display_name.clone()?;
+            Some(ClaudeUsageLine {
+                kind: "weekly_scoped".to_string(),
+                model: Some(model),
+                percent: l.percent.unwrap_or(0.0),
+                resets_at: l.resets_at.as_deref().and_then(parse_iso_to_unix),
+                severity: l.severity.clone(),
+            })
+        })
+        .collect();
+    ClaudeUsageSnapshot {
+        polled_at: now,
+        session: window_line("session", usage.five_hour.as_ref()),
+        weekly_all: window_line("weekly_all", usage.seven_day.as_ref()),
+        per_model,
+        extra_usage_enabled: usage.extra_usage.as_ref().and_then(|e| e.is_enabled),
+        extra_usage_disabled_reason: usage
+            .extra_usage
+            .as_ref()
+            .and_then(|e| e.disabled_reason.clone()),
+    }
+}
+
 pub fn model_cap_windows(usage: &UsageResponse) -> Vec<ModelCapWindow> {
     usage
         .limits
@@ -278,10 +357,44 @@ mod tests {
         assert_eq!(usage.five_hour.as_ref().unwrap().utilization, Some(7.0));
         assert_eq!(usage.seven_day.as_ref().unwrap().utilization, Some(76.0));
         assert_eq!(
-            parse_iso_to_unix(usage.five_hour.as_ref().unwrap().resets_at.as_deref().unwrap()),
+            parse_iso_to_unix(
+                usage
+                    .five_hour
+                    .as_ref()
+                    .unwrap()
+                    .resets_at
+                    .as_deref()
+                    .unwrap()
+            ),
             Some(1_787_063_399) // 2026-08-18T14:29:59Z
         );
         assert_eq!(usage.limits.len(), 3);
+    }
+
+    /// The `/usage`-style snapshot carries exactly what Claude Code prints: session and weekly
+    /// percentages with their resets and severities, every per-model week, and the extra-usage
+    /// state with its reason.
+    #[test]
+    fn the_usage_snapshot_mirrors_claude_codes_usage_readout() {
+        let usage: UsageResponse = serde_json::from_str(USAGE_JSON).unwrap();
+        let snap = claude_usage_snapshot(&usage, 1_787_000_000);
+        assert_eq!(snap.polled_at, 1_787_000_000);
+        let session = snap.session.as_ref().expect("session line");
+        assert_eq!(
+            (session.percent, session.resets_at),
+            (7.0, Some(1_787_063_399))
+        );
+        assert_eq!(session.severity.as_deref(), Some("normal"));
+        let weekly = snap.weekly_all.as_ref().expect("weekly line");
+        assert_eq!(weekly.percent, 76.0);
+        assert_eq!(snap.per_model.len(), 1);
+        assert_eq!(snap.per_model[0].model.as_deref(), Some("Fable"));
+        assert_eq!(snap.per_model[0].percent, 100.0);
+        assert_eq!(snap.extra_usage_enabled, Some(false));
+        assert_eq!(
+            snap.extra_usage_disabled_reason.as_deref(),
+            Some("out_of_credits")
+        );
     }
 
     #[test]
@@ -300,7 +413,7 @@ mod tests {
         assert_eq!(fable.display_name, "Fable");
         assert_eq!(fable.percent, 100.0);
         assert_eq!(fable.resets_at, Some(1_787_543_999)); // 2026-08-24T03:59:59Z
-        // The routing view is the >=100 subset of the same data — one source of truth.
+                                                          // The routing view is the >=100 subset of the same data — one source of truth.
         assert_eq!(models_at_cap(&usage), vec!["Fable".to_string()]);
     }
 
@@ -322,7 +435,12 @@ mod tests {
     fn detects_out_of_credits() {
         let usage: UsageResponse = serde_json::from_str(USAGE_JSON).unwrap();
         assert_eq!(
-            usage.extra_usage.as_ref().unwrap().disabled_reason.as_deref(),
+            usage
+                .extra_usage
+                .as_ref()
+                .unwrap()
+                .disabled_reason
+                .as_deref(),
             Some("out_of_credits")
         );
     }
@@ -339,7 +457,10 @@ mod tests {
 
     #[test]
     fn plan_slug_maps_known_tiers() {
-        assert_eq!(plan_slug_from_tier(Some("default_claude_max_20x")), "max_20x");
+        assert_eq!(
+            plan_slug_from_tier(Some("default_claude_max_20x")),
+            "max_20x"
+        );
         assert_eq!(plan_slug_from_tier(Some("default_claude_max_5x")), "max_5x");
         assert_eq!(plan_slug_from_tier(Some("default_claude_pro")), "pro");
         assert_eq!(plan_slug_from_tier(None), "unknown");

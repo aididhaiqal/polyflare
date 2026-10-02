@@ -408,6 +408,96 @@ pub async fn accounts_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
     Response::ok(views)
 }
 
+/// One Claude seat on `GET /api/claude/usage`: what Claude Code's `/usage` prints for it.
+/// `source` is `poll` when the in-memory snapshot of the last `/api/oauth/usage` poll is
+/// present (per-model lines, severities and the extra-usage state come only from it), or
+/// `history` right after a restart, when only the persisted 5-hour/weekly windows are known.
+#[derive(Serialize)]
+struct ClaudeSeatUsageView {
+    id: String,
+    email: String,
+    alias: Option<String>,
+    plan_type: String,
+    status: String,
+    source: &'static str,
+    polled_at: Option<i64>,
+    session: Option<crate::anthropic_usage::ClaudeUsageLine>,
+    weekly_all: Option<crate::anthropic_usage::ClaudeUsageLine>,
+    per_model: Vec<crate::anthropic_usage::ClaudeUsageLine>,
+    extra_usage_enabled: Option<bool>,
+    extra_usage_disabled_reason: Option<String>,
+}
+
+/// `GET /api/claude/usage` — every Anthropic seat's `/usage`-style readout, most-used week first.
+pub async fn claude_usage_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let repo = state.store.accounts();
+    let accounts = match repo.list().await {
+        Ok(a) => a,
+        Err(_) => return Response::error(),
+    };
+    let now = unix_now();
+    let mut usage_by_account = match repo.latest_usage_all().await {
+        Ok(usage) => usage,
+        Err(_) => return Response::error(),
+    };
+    let mut views: Vec<ClaudeSeatUsageView> = accounts
+        .into_iter()
+        .filter(|account| account.provider == "anthropic")
+        .map(|account| {
+            let line = |kind: &str, w: &Option<ResolvedWindow>| {
+                w.as_ref().map(|w| crate::anthropic_usage::ClaudeUsageLine {
+                    kind: kind.to_string(),
+                    model: None,
+                    percent: w.used_percent,
+                    resets_at: w.reset_at,
+                    severity: None,
+                })
+            };
+            match state.model_catalog.claude_usage_for(&account.id) {
+                Some(snap) => ClaudeSeatUsageView {
+                    id: account.id,
+                    email: account.email,
+                    alias: account.alias,
+                    plan_type: account.plan_type,
+                    status: account.status,
+                    source: "poll",
+                    polled_at: Some(snap.polled_at),
+                    session: snap.session,
+                    weekly_all: snap.weekly_all,
+                    per_model: snap.per_model,
+                    extra_usage_enabled: snap.extra_usage_enabled,
+                    extra_usage_disabled_reason: snap.extra_usage_disabled_reason,
+                },
+                None => {
+                    let usage = usage_by_account.remove(&account.id).unwrap_or_default();
+                    let resolved = resolve(&usage, now);
+                    ClaudeSeatUsageView {
+                        id: account.id,
+                        email: account.email,
+                        alias: account.alias,
+                        plan_type: account.plan_type,
+                        status: account.status,
+                        source: "history",
+                        polled_at: None,
+                        session: line("session", &resolved.five_hour),
+                        weekly_all: line("weekly_all", &resolved.weekly),
+                        per_model: Vec::new(),
+                        extra_usage_enabled: None,
+                        extra_usage_disabled_reason: None,
+                    }
+                }
+            }
+        })
+        .collect();
+    views.sort_by(|a, b| {
+        let pct = |v: &ClaudeSeatUsageView| v.weekly_all.as_ref().map_or(-1.0, |l| l.percent);
+        pct(b)
+            .total_cmp(&pct(a))
+            .then_with(|| a.email.cmp(&b.email))
+    });
+    Response::ok(views)
+}
+
 /// `AccountDetailView::identity`: the account's non-secret identity/workspace metadata. A subset of
 /// `Account`'s own fields — never a token, never `chatgpt_account_id`/`chatgpt_user_id` (those are
 /// upstream-facing identifiers, not dashboard-facing).

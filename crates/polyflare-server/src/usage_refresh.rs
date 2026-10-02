@@ -387,6 +387,10 @@ async fn refresh_anthropic_account(
     model_catalog.set_capped_models(&account.id, anthropic_usage::models_at_cap(&usage));
     // Display mirror: every per-model window (not just the exhausted ones) for the dashboard.
     model_catalog.set_model_windows(&account.id, anthropic_usage::model_cap_windows(&usage));
+    model_catalog.set_claude_usage(
+        &account.id,
+        anthropic_usage::claude_usage_snapshot(&usage, unix_now()),
+    );
 
     // Map the Anthropic windows onto the codex UsageWindow shape, tagged with their real durations
     // so classification by duration (not slot) works unchanged.

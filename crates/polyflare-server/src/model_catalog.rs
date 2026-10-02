@@ -170,6 +170,9 @@ pub struct ModelCatalogCache {
     /// reset, so the dashboard can show how close each model is to its own cap. Routing never reads
     /// this — it reads `capped_models` — so a change here can never move a request.
     model_windows: RwLock<HashMap<String, Vec<crate::anthropic_usage::ModelCapWindow>>>,
+    /// The `/usage`-style readout of each Claude seat from its last successful poll
+    /// (`anthropic_usage::ClaudeUsageSnapshot`), replaced every poll; empty until the first poll.
+    claude_usage: RwLock<HashMap<String, crate::anthropic_usage::ClaudeUsageSnapshot>>,
     /// Single-flight guard: only one refresh touches the network at a time (concurrent
     /// `get_or_refresh` callers on a cold/expired cache collapse to one upstream fetch).
     refresh_lock: tokio::sync::Mutex<()>,
@@ -203,6 +206,7 @@ impl ModelCatalogCache {
             account_models: RwLock::new(HashMap::new()),
             declared_support: RwLock::new(HashMap::new()),
             capped_models: RwLock::new(HashMap::new()),
+            claude_usage: RwLock::new(HashMap::new()),
             unavailable_models: RwLock::new(HashMap::new()),
             model_windows: RwLock::new(HashMap::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
@@ -723,6 +727,28 @@ impl ModelCatalogCache {
 
     /// Every account id declared (support = true) for `model`. Used to decide whether a hidden model
     /// should appear in a pool's catalog: it does when at least one member account supports it.
+    pub fn set_claude_usage(
+        &self,
+        account_id: &str,
+        snapshot: crate::anthropic_usage::ClaudeUsageSnapshot,
+    ) {
+        self.claude_usage
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(account_id.to_string(), snapshot);
+    }
+
+    pub fn claude_usage_for(
+        &self,
+        account_id: &str,
+    ) -> Option<crate::anthropic_usage::ClaudeUsageSnapshot> {
+        self.claude_usage
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(account_id)
+            .cloned()
+    }
+
     pub fn accounts_declaring_model(&self, model: &str) -> Vec<String> {
         self.declared_support
             .read()

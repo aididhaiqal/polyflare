@@ -21,6 +21,7 @@ import {
   Settings,
   Users,
   type LucideIcon,
+  Flame,
 } from "../ui/icons";
 import { ThemeToggle } from "./ThemeToggle";
 
@@ -46,6 +47,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: "/transport", label: "Transport", icon: Zap },
   { to: "/requests", label: "Requests", icon: List },
   { to: "/sessions", label: "Sessions", icon: Link2 },
+  { to: "/claude", label: "Claude usage", icon: Flame },
   { to: "/logs", label: "Live Logs", icon: Activity, requiresLiveLogs: true },
   { to: "/reports", label: "Analytics", icon: BarChart3 },
   { to: "/settings", label: "Settings", icon: Settings },

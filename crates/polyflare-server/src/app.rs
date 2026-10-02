@@ -295,6 +295,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         )
         .route("/api/accounts", get(crate::read_api::accounts_handler))
         .route(
+            "/api/claude/usage",
+            get(crate::read_api::claude_usage_handler),
+        )
+        .route(
             "/api/providers",
             get(crate::provider_api::list).post(crate::provider_api::create),
         )

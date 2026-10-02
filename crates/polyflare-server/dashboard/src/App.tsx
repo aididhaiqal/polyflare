@@ -20,6 +20,7 @@ import { Reports } from "./pages/Reports";
 import { ResetCredits } from "./pages/ResetCredits";
 import { Requests } from "./pages/Requests";
 import { Sessions } from "./pages/Sessions";
+import { ClaudeUsage } from "./pages/ClaudeUsage";
 import { Settings } from "./pages/Settings";
 import { Translations } from "./pages/Translations";
 import { Transport } from "./pages/Transport";
@@ -65,6 +66,7 @@ export function App() {
                 <Route path="transport" element={<Transport />} />
                 <Route path="requests" element={<Requests />} />
                 <Route path="sessions" element={<Sessions />} />
+                <Route path="claude" element={<ClaudeUsage />} />
                 <Route path="reports" element={<Reports />} />
                 <Route path="settings" element={<Settings />} />
                 <Route path="keys" element={<Keys />} />
