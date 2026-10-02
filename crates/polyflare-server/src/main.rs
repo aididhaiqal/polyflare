@@ -835,7 +835,46 @@ async fn passkeys_remove(id: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// The M2b server: store-backed multi-account pool selection.
+/// Lift the soft open-file limit to what the hard limit allows (capped at 65 536). A launchd
+/// agent inherits a soft limit of 256 unless its plist says otherwise; on 2026-10-02 the master
+/// — 154 downstream connections plus 77 upstream sockets — crossed it and spent an hour logging
+/// `accept error: Too many open files` while the usage poll and catalog fetch failed for the
+/// same reason. Each relayed thread costs two descriptors, so 256 is a few dozen threads.
+fn raise_fd_limit() {
+    const TARGET: libc::rlim_t = 65_536;
+    // SAFETY: plain getrlimit/setrlimit calls on a stack-allocated, fully initialized struct.
+    unsafe {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return;
+        }
+        let want = if limit.rlim_max == libc::RLIM_INFINITY {
+            TARGET
+        } else {
+            TARGET.min(limit.rlim_max)
+        };
+        if limit.rlim_cur >= want {
+            return;
+        }
+        let before = limit.rlim_cur;
+        limit.rlim_cur = want;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 {
+            tracing::info!(from = before, to = want, "raised the open-file soft limit");
+        } else {
+            tracing::warn!(
+                soft = before,
+                "could not raise the open-file soft limit; a launchd agent defaults to 256 — set \
+                 SoftResourceLimits/NumberOfFiles in the plist"
+            );
+        }
+    }
+}
+
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
+    raise_fd_limit();
     let mut config = ServeConfig::from_env()?;
     // Which half of a master/replica pair this process is. Announced at startup because the
     // difference is invisible at runtime until something goes wrong: a replica never rotates OAuth
